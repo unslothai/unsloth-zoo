@@ -397,7 +397,7 @@ def test_vlm_filter_caches_only_kept_formatted_rows():
                 labels.append([-100, 12, 13, 0])
         return {"labels": labels}
 
-    kept, removed, formatted_items = _filter_trainable_vlm_indices(
+    kept, removed, formatted_items, _supervision = _filter_trainable_vlm_indices(
         [{"text": "bad"}, {"text": "good"}],
         [0, 1],
         _ResponseMaskFilteringProcessor(),
@@ -804,6 +804,79 @@ def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
 
     assert "add_special_tokens" in processor.calls[0]
     assert "add_special_tokens" not in processor.calls[1]
+
+
+def test_vlm_processor_inputs_retry_only_exact_pytorch_output_error():
+    import torch
+
+    from unsloth_zoo.mlx.utils import _call_vlm_processor
+
+    class Batch(dict):
+        pass
+
+    calls = []
+    def pytorch_only(*_args, return_tensors=None, **_kwargs):
+        calls.append(return_tensors)
+        if return_tensors != "pt":
+            raise ValueError("Only returning PyTorch tensors is currently supported.")
+        return Batch({
+            "ids": torch.tensor([[1, 2]], dtype=torch.int64),
+            "nested": [torch.tensor([1.5], dtype=torch.float16), ("meta",)],
+        })
+
+    converted = _call_vlm_processor(
+        pytorch_only, (), {"return_tensors": "np"}
+    )
+    assert calls == ["np", "pt"] and isinstance(converted, Batch)
+    assert converted["ids"].dtype == np.int64
+    assert converted["nested"][0].dtype == np.float16
+    assert converted["nested"][1] == ("meta",)
+
+    converted = _call_vlm_processor(
+        pytorch_only, (), {"return_tensors": "mlx"}
+    )
+    # why: a sibling module can swap the util's `mx` for the simulation stub,
+    # whose `array` is a factory rather than a type.
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    if "mlx_simulation" not in str(getattr(mlx_utils.mx, "__file__", "")):
+        assert isinstance(converted["ids"], mx.array)
+        assert converted["ids"].dtype == mx.int64
+
+    native, native_calls = object(), []
+    assert _call_vlm_processor(lambda **kw: native_calls.append(kw["return_tensors"]) or native, (), {"return_tensors": "np"}) is native
+    assert native_calls == ["np"]
+    unrelated = ValueError("unrelated")
+    with pytest.raises(ValueError) as raised:
+        _call_vlm_processor(lambda **_kwargs: (_ for _ in ()).throw(unrelated), (), {"return_tensors": "np"})
+    assert raised.value is unrelated
+
+
+def test_vlm_processor_multimodal_token_type_ownership():
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    def call(self, text, **kwargs):
+        self.request = kwargs.get("return_mm_token_type_ids")
+        output = {"input_ids": np.ones((len(text), 2))}
+        if self.native_types or self.request is True:
+            output["token_type_ids"] = np.zeros((len(text), 2))
+        return output
+    def processor(model, name="Processor", base=object, native_types=False, inherit_call=False):
+        attrs = {"__module__": f"mlx_vlm.models.{model}.processing", "native_types": native_types}
+        if not inherit_call:
+            attrs["__call__"] = call
+        return type(name, (base,), attrs)()
+    gemma3n = processor("gemma3n", "Gemma3nProcessor", native_types=True)
+    relocated = processor("custom", "CustomGemma3nProcessor", type(gemma3n), True, True)
+    owners = [processor("gemma3", "Gemma3NextProcessor")]
+    for model in ("gemma3", "gemma4", "qwen3_vl", "qwen3_5"):
+        native = processor(model)
+        owners.extend((native, processor("custom", f"Custom{model}Processor", type(native), inherit_call=True)))
+    owners.append(processor("custom", "Gemma3nFlagProcessor", type(gemma3n)))
+    owners.append(processor("custom", "Gemma3nProcessor", type(gemma3n)))
+    for candidate in owners:
+        assert "token_type_ids" in _processor_vlm_inputs(candidate, ["x"], [[]], 8) and candidate.request is True
+    for candidate in (gemma3n, relocated):
+        assert "token_type_ids" in _processor_vlm_inputs(candidate, ["x"], [[]], 8) and candidate.request is None
 
 
 def test_deepseek_ocr_loader_patches_removed_llama_flash_attention(monkeypatch):
@@ -1440,3 +1513,28 @@ def test_vlm_prefetch_opaque_lazy_mx_processor_paths(monkeypatch):
     proc.tokenizer = _PoisonedTokenizer()
     poisoned = U._finalize_vlm_batch(staged)
     assert np.asarray(poisoned["input_ids"]).tolist() == sync_seq[0][0]
+
+
+def test_gemma3n_token_type_ownership_survives_module_relocation():
+    """Gemma3n builds token types itself however its module is named."""
+    from unsloth_zoo.mlx.utils import _vlm_processor_requests_mm_token_type_ids
+
+    def processor(module, name="Gemma3nProcessor"):
+        def __call__(self, *_args, **_kwargs):
+            return {}
+        return type(name, (object,), {"__module__": module, "__call__": __call__})()
+
+    # Remote-code and single-file loads expose the marker only as a suffix of
+    # the module name, never as a standalone path component.
+    for module in (
+        "transformers.models.gemma3n.processing_gemma3n",
+        "google.gemma-3n-E4B-it.a1b2c3.processing_gemma3n",
+        "processing_gemma3n",
+        "mlx_vlm.models.gemma3n.processing",
+    ):
+        assert _vlm_processor_requests_mm_token_type_ids(processor(module)) is False
+
+    # Gemma3 proper still asks the processor for the multimodal token types.
+    assert _vlm_processor_requests_mm_token_type_ids(
+        processor("transformers.models.gemma3.processing_gemma3", "Gemma3Processor")
+    ) is True

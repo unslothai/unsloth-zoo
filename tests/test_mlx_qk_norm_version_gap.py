@@ -136,3 +136,96 @@ def test_vlm_retry_qk_norm_mismatch_raises_actionable_error():
     assert "mlx-lm" in msg and "q_norm" in msg and "gemma4" in msg
     assert "unsloth-zoo" in msg and "mlx-audio" in msg and "!=0.31.3" not in msg
     assert calls["n"] == 2  # it must have entered the filtered retry
+
+
+def test_vlm_retry_filters_only_owned_shared_kv(monkeypatch):
+    import threading, types
+
+    import mlx.nn as nn
+    import unsloth_zoo.mlx.loader as loader
+
+    def unused(self, key):
+        layer = int(key.removeprefix("language_model.model.layers.").split(".", 1)[0])
+        return layer < len(self.model.layers) and self.model.layers[layer].self_attn.is_kv_shared_layer
+
+    class LanguageModel:
+        __module__ = "mlx_vlm.models.gemma4.language"
+        _is_unused_shared_kv_weight = unused
+
+    language = LanguageModel()
+    language.model = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(
+            self_attn=types.SimpleNamespace(is_kv_shared_layer=value)
+        ) for value in (False, True)]
+    )
+    model = types.SimpleNamespace(language_model=language)
+    expected_hash = "e859b50eb966089f8966a38ca2e69c3b68ccf48c5b4a264fbc01f415be60003f"
+    assert loader._GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256 == expected_hash
+    fingerprint = loader._source_token_sha256(loader._safe_getsource(unused))
+    monkeypatch.setattr(loader, "_GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256", fingerprint)
+    prefix = "language_model.model.layers."
+    known = [f"{prefix}1.self_attn.{name}" for name in ("k_norm.weight", "k_proj.scales", "v_proj.biases")]
+    assert all(loader._gemma4_unused_shared_kv_weight(model, key) for key in known)
+    bad = tuple(f"{prefix}{suffix}" for suffix in (
+        "-1.self_attn.k_proj.weight", "01.self_attn.k_proj.weight",
+        "1.self_attn.q_proj.weight", "1.self_attn.k_proj.garbage",
+    ))
+    assert not any(loader._gemma4_unused_shared_kv_weight(model, key) for key in bad)
+
+    monkeypatch.setattr(loader, "_GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256", "unknown")
+    assert not loader._gemma4_unused_shared_kv_weight(model, known[0])
+    monkeypatch.setattr(loader, "_GEMMA4_UNUSED_SHARED_KV_TOKEN_SHA256", fingerprint)
+    LanguageModel.__name__ = "Other"
+    assert not loader._gemma4_unused_shared_kv_weight(model, known[0])
+    LanguageModel.__name__, LanguageModel.__module__ = "LanguageModel", "foreign"
+    assert not loader._gemma4_unused_shared_kv_weight(model, known[0])
+    LanguageModel.__module__ = "mlx_vlm.models.gemma4.language"
+    Inherited = type("LanguageModel", (LanguageModel,), {"__module__": LanguageModel.__module__})
+    inherited = Inherited()
+    inherited.model = language.model
+    assert not loader._gemma4_unused_shared_kv_weight(
+        types.SimpleNamespace(language_model=inherited), known[0]
+    )
+
+    initial = "Received parameters not in model: " + ", ".join(known)
+    state = {"attempt": 0, "weights": [(key, object()) for key in known], "concurrent": True}
+    seen, foreign = [], []
+
+    def strict_load(_self, weights, strict=True):
+        keys = [key for key, _ in weights]
+        seen.append((keys, strict))
+        if weights:
+            raise ValueError("Received parameters not in model: " + ", ".join(keys))
+        return "loaded"
+
+    def foreign_load():
+        try:
+            nn.Module.load_weights(model, state["weights"])
+        except ValueError as error:
+            foreign.append(str(error))
+
+    def vlm_load(_model_name, **_kwargs):
+        state["attempt"] += 1
+        if state["attempt"] == 1:
+            raise ValueError(initial)
+        if state.pop("concurrent", False):
+            thread = threading.Thread(target=foreign_load)
+            thread.start()
+            thread.join()
+        return nn.Module.load_weights(model, state["weights"])
+
+    monkeypatch.setattr(nn.Module, "load_weights", strict_load)
+
+    def partial(*_args, **_kwargs):
+        raise ValueError("parameters not in model: self_attn.k_proj")
+
+    with pytest.raises(ValueError, match="k_proj"):
+        loader._load_mlx_vlm_with_extra_weight_filter("model", "gemma4", partial, {})
+    assert nn.Module.load_weights is strict_load
+    native = loader._load_mlx_vlm_with_extra_weight_filter(
+        "model", "gemma4", lambda *_a, **_k: "native", {})
+    assert native == "native"
+    assert loader._load_mlx_vlm_with_extra_weight_filter("model", "gemma4", vlm_load, {}) == "loaded"
+    assert seen == [(known, True), ([], True)]
+    assert known[0] in foreign[0]
+    assert nn.Module.load_weights is strict_load
