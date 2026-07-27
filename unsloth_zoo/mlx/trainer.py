@@ -901,9 +901,12 @@ def _require_complete_resume_checkpoint(resume_from):
         )
 
 
-def _prune_stale_checkpoints(output_dir, save_total_limit):
+def _prune_stale_checkpoints(output_dir, save_total_limit, keep_step=None):
     """Keep the newest ``save_total_limit`` checkpoint-* dirs (HF Trainer parity).
 
+    ``keep_step`` is never rotated out, mirroring HF's _rotate_checkpoints, which
+    protects best_model_checkpoint: without it a best result at an early step is
+    deleted by a later worse save and the state field is left pointing at nothing.
     ``-1`` / ``0`` / ``None`` preserve the existing "no limit" contract.
     """
     if not save_total_limit or save_total_limit < 1:
@@ -925,7 +928,12 @@ def _prune_stale_checkpoints(output_dir, save_total_limit):
     if len(checkpoints) <= save_total_limit:
         return
     checkpoints.sort()
-    for _, stale in checkpoints[:-save_total_limit]:
+    protected = None if keep_step is None else int(keep_step)
+    stale_dirs = [
+        child for step, child in checkpoints[:-save_total_limit]
+        if step != protected
+    ]
+    for stale in stale_dirs:
         try:
             shutil.rmtree(stale)
         except Exception as exc:
@@ -6018,6 +6026,7 @@ class MLXTrainer:
                             _prune_stale_checkpoints(
                                 args.output_dir,
                                 args.save_total_limit,
+                                keep_step=self.state.best_global_step,
                             )
                 except BaseException as e:
                     checkpoint_error = e
@@ -6047,8 +6056,9 @@ class MLXTrainer:
                 _best_step = self.state.best_global_step
                 if _best_step:
                     _best_dir = f"{args.output_dir}/checkpoint-{int(_best_step)}"
-                    if os.path.isdir(_best_dir):
-                        self.state.best_model_checkpoint = _best_dir
+                    self.state.best_model_checkpoint = (
+                        _best_dir if os.path.isdir(_best_dir) else None
+                    )
                 _fire("on_save")
 
         def _run_callback_control_actions(current_step, grad_norm):
@@ -6877,6 +6887,11 @@ class MLXTrainer:
             final_save_error,
         )
 
+        try:
+            _rows_per_pass = len(self._train_dataset_for_batches())
+        except Exception:
+            _rows_per_pass = 0
+        _train_samples = _rows_per_pass * float(self.state.epoch or 0)
         # The run's aggregate metrics, dispatched below and returned unchanged so
         # a caller reading MLXTrainOutput and a callback reading on_log agree.
         final_metrics = {
@@ -6885,7 +6900,16 @@ class MLXTrainer:
             "train_steps": completed_steps,
             "total_train_steps": total_steps,
             "trained_tokens": trained_tokens,
+            # Two rates, not one. This payload now reaches HF integrations, and
+            # train_samples_per_second is their standard sample-throughput key, so
+            # publishing the token rate under it recorded a length-dependent number
+            # as samples/s. Samples follow HF's own approximation in speed_metrics
+            # (rows in one pass times the epochs run); the token rate keeps its own
+            # key, as HF does when num_tokens is available.
             "train_samples_per_second": (
+                _train_samples / total_time if total_time > 0 else 0
+            ),
+            "train_tokens_per_second": (
                 trained_tokens / total_time if total_time > 0 else 0
             ),
         }
@@ -7315,6 +7339,11 @@ class MLXTrainer:
                         and text_dataset_order == "torch_randperm"
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
+                        # The builder quantizes a fractional epoch count to whole
+                        # accumulation windows, as HF does, so it needs the factor.
+                        batch_kwargs["grad_accum"] = (
+                            args.gradient_accumulation_steps
+                        )
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = _create_ordered_text_plan(**batch_kwargs)

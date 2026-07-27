@@ -4493,6 +4493,44 @@ def test_wandb_watch_is_neutralized_for_the_on_train_begin_dispatch():
     assert "finally:\n            self._restore_wandb_watch(" in source
 
 
+def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
+    # HF's _rotate_checkpoints never deletes best_model_checkpoint. Ours pruned
+    # by age alone, so save_total_limit=1 with a best result at step 1 and a worse
+    # save at step 2 deleted checkpoint-1 and left callbacks a dangling path.
+    from unsloth_zoo.mlx.trainer import _prune_stale_checkpoints
+
+    for step in (1, 2, 3):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+
+    _prune_stale_checkpoints(str(tmp_path), 1, keep_step=1)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "checkpoint-1", "checkpoint-3",
+    ]
+    # No protected step: unchanged behaviour, newest only.
+    _prune_stale_checkpoints(str(tmp_path), 1)
+    assert [p.name for p in tmp_path.iterdir()] == ["checkpoint-3"]
+
+
+def test_final_metrics_separate_sample_and_token_throughput(monkeypatch):
+    # train_samples_per_second is HF's standard sample-throughput key and this
+    # payload now reaches integration callbacks, so publishing tokens/s under it
+    # recorded a sequence-length-dependent number as samples/s.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    trainer, _batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=4, grad_accum=2, epochs=1,
+    )
+    result = trainer.train()
+    metrics = result.metrics if hasattr(result, "metrics") else dict(result)
+
+    assert metrics["train_tokens_per_second"] > 0
+    # 4 rows over one epoch, not the token count.
+    assert metrics["train_samples_per_second"] == pytest.approx(
+        4 / metrics["train_runtime"], rel=1e-6,
+    )
+    assert metrics["train_samples_per_second"] != metrics["train_tokens_per_second"]
+
+
 def test_pre_loop_stop_still_reports_a_numeric_epoch(monkeypatch):
     # A callback that stops the run from on_train_begin exits before the loop
     # sets state.epoch. HF's TrainerState defaults it to 0, and stock callbacks
@@ -6468,26 +6506,26 @@ def test_ragged_epoch_schedule_matches_transformers(monkeypatch):
 
 
 def test_fractional_prebuilt_schedule_keeps_every_pass_boundary(monkeypatch):
-    # The torch_randperm path prebuilds every epoch, so 1.5 epochs of 5
-    # micro-batches is one plan of 8 and int(num_train_epochs) does not divide
-    # it. Reading the pass length as len(plan) // 1 made the whole plan one
-    # epoch: the boundary at micro-batch 5 vanished, the accumulation window
-    # never restarted there, and the budget fell to 4 where HF takes
-    # ceil(1.5 * ceil(5 / 2)) == 5. The plan's own cycle_length is the pass.
+    # The torch_randperm path prebuilds every epoch, so 1.5 epochs of a
+    # 5-micro-batch pass is ONE plan spanning two passes and int(num_train_epochs)
+    # does not divide it. Reading the pass length as len(plan) // 1 made the whole
+    # plan a single epoch: the boundary at micro-batch 5 vanished and the
+    # accumulation window never restarted there. The plan's own cycle_length is
+    # the pass. Shape measured from a real transformers Trainer: 5 optimizer
+    # steps over 9 micro-batches.
     _patch_value_and_grad_with_aux(monkeypatch)
 
     spy = _EpochScheduleSpy()
     trainer, batches = _epoch_flush_loop_trainer(
-        tempfile.mkdtemp(), microbatches_per_epoch=8, grad_accum=2, epochs=1.5,
+        tempfile.mkdtemp(), microbatches_per_epoch=9, grad_accum=2, epochs=1.5,
         cycle_length=5, callbacks=[spy],
     )
     trainer.train()
 
     assert trainer.state.max_steps == 5 == trainer._global_step
-    assert spy.epoch_end == [(3, 1.0), (5, 1.6)]
-    # Each micro-batch exactly once: the ragged tail forces its update on the
-    # plan's last micro-batch instead of pulling an unauthorized ninth.
-    assert batches.visits == [0, 1, 2, 3, 4, 5, 6, 7]
+    # The pass boundary at micro-batch 5 forces its own update (step 3).
+    assert spy.epoch_end == [(3, 1.0), (5, 1.8)]
+    assert batches.visits == [0, 1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_divisible_epoch_schedule_is_unchanged(monkeypatch):

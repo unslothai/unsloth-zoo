@@ -207,6 +207,35 @@ def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
     assert len(plan_for(2)) == 10
 
 
+def test_ordered_text_fractional_epochs_match_transformers_step_budget():
+    # Golden values measured by running a real transformers.Trainer on the same
+    # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
+    # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
+    # and accum 2 is one update over 4 rows, not a proportional 3 rows.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def rows_for(n_rows, batch_size, grad_accum, num_epochs):
+        batches = create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(n_rows)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=batch_size,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+            grad_accum=grad_accum,
+        )
+        return sum(int(lengths.shape[0]) for _b, lengths, _l in batches)
+
+    # (rows, batch, accum, epochs): rows consumed by transformers.Trainer
+    assert rows_for(5, 2, 2, 0.5) == 4
+    assert rows_for(5, 2, 2, 1.0) == 5
+    assert rows_for(5, 2, 2, 1.5) == 9
+    assert rows_for(10, 2, 2, 0.75) == 10
+    assert rows_for(10, 2, 2, 1.5) == 18
+
+
 def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_vlm_batches
