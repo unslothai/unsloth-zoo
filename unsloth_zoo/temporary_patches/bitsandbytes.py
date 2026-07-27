@@ -50,18 +50,12 @@ def patch_bitsandbytes_linear4bit_forward():
         return raise_error("bitsandbytes.Linear4bit", e)
 
     # Fix Params4bit.__torch_function__ infinite recursion under torch.compile.
-    # bitsandbytes >= 0.46 added a __torch_function__ to Params4bit that calls
-    # super().__torch_function__() for all ops except chunk/split. The super()
-    # call goes to Parameter.__torch_function__ which re-dispatches back to
-    # Params4bit.__torch_function__ since Params4bit is still in the types tuple.
-    # In eager mode, torch's _disabled_torch_function_impl prevents this, but
-    # under torch.compile's AOT autograd runtime, the re-dispatch is not blocked,
-    # causing infinite recursion (observed on T4 with torch 2.8.0 + bnb 0.49.2).
-    #
-    # Fix: remove Params4bit's __torch_function__ entirely so it inherits from
-    # Parameter/Tensor which use C-level dispatch that cannot recurse. The bnb
-    # implementation only adds chunk/split handling (rarely used for 4-bit weights)
-    # and delegates everything else to super() anyway.
+    # bnb >= 0.46's Params4bit.__torch_function__ delegates to super() (except
+    # chunk/split), which re-dispatches back to it since Params4bit is still in
+    # the types tuple. Eager mode blocks this via _disabled_torch_function_impl,
+    # but torch.compile's AOT autograd runtime does not (seen on T4 with torch
+    # 2.8.0 + bnb 0.49.2). Removing it falls back to Parameter/Tensor C-level
+    # dispatch that cannot recurse; bnb only added chunk/split handling anyway.
     if hasattr(Params4bit, "__torch_function__") and \
        "__torch_function__" in Params4bit.__dict__:
         delattr(Params4bit, "__torch_function__")

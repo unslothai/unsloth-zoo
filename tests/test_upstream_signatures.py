@@ -6,15 +6,11 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Signature pins for upstream functions / methods ``unsloth_zoo``
-monkey-patches, wraps, or calls with positional shape assumptions.
-
-DRIFT-DETECTED framing: each test uses ``inspect.signature(...)`` on the
-INSTALLED upstream symbol and asserts the parameter list the matching
-zoo override assumes. Real drift -> ``pytest.fail("DRIFT DETECTED:
-...")``; optional deps gated with ``pytest.importorskip``. Source-of-truth
-zoo callsite cited in every docstring.
-"""
+"""Signature pins for upstream functions/methods that unsloth_zoo patches,
+wraps, or calls with positional assumptions. Each test inspects the INSTALLED
+symbol and asserts the params the zoo override assumes; real drift ->
+pytest.fail("DRIFT DETECTED: ..."), optional deps gated by importorskip. The
+zoo callsite is cited in every docstring."""
 
 from __future__ import annotations
 
@@ -34,11 +30,8 @@ except Exception:
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
-    """Skip when transformers 5.x removed the named param the drift
-    detector anchors on. The companion zoo patch wraps with **kwargs
-    via patch_function(match_level='relaxed'), so the runtime call
-    still works -- the source-string anchor just isn't there to probe.
-    Keep the detector strict on 4.57.6."""
+    """Skip on transformers 5.x (zoo patch wraps via **kwargs relaxed
+    match, so runtime still works); keep the detector strict on 4.57.6."""
     if _TX_IS_5X:
         pytest.skip(
             f"transformers {_TX_VERSION}: {reason} (zoo patch silently "
@@ -66,8 +59,7 @@ def _assert_params_superset(
     zoo_callsite: str,
 ):
     """Assert every name in ``required`` appears in ``func``'s params.
-    Upstream may add NEW params (zoo just won't forward them) but MUST
-    NOT drop a param that zoo forwards by name."""
+    Upstream may add params, but must not drop one zoo forwards by name."""
     got = _param_names(func)
     missing = [name for name in required if name not in got]
     if missing:
@@ -83,8 +75,8 @@ def _assert_positional_arity_at_least(
     arity: int,
     zoo_callsite: str,
 ):
-    """Assert ``func`` accepts >= ``arity`` non-self positionals. Catches
-    ``super().forward(a, b, c, d)`` when upstream dropped a positional."""
+    """Assert ``func`` accepts >= ``arity`` non-self positionals (catches a
+    dropped upstream positional in ``super().forward(...)``)."""
     sig = inspect.signature(func)
     params = list(sig.parameters.values())
     if params and params[0].name in ("self", "cls"):
@@ -104,8 +96,7 @@ def _assert_positional_arity_at_least(
         )
 
 
-# Single module-level importorskip so missing transformers gives one
-# clean failure instead of N hard import errors.
+# Module-level importorskip: one clean skip if transformers is missing.
 pytest.importorskip("transformers")
 
 
@@ -647,21 +638,14 @@ def test_Gemma3nModel_get_placeholder_mask_signature():
 # ===========================================================================
 
 def test_MinistralAttention_forward_signature():
-    """ministral.py:99 patches MinistralAttention.forward with
-    match_level='relaxed'. Pin ``hidden_states``,
-    ``position_embeddings``, ``attention_mask``.
+    """ministral.py:99 patches MinistralAttention.forward (relaxed). Pin
+    hidden_states / position_embeddings / attention_mask.
 
-    Zoo's patch wraps the actual implementation with
-    ``def forward(self, *args, **kwargs): return _full_forward(...)``
-    so ``check_args_kwargs`` accepts removed params on 5.x. After the
-    wrap, ``inspect.signature(MinistralAttention.forward)`` is the
-    generic wrapper. The pre-wrap implementation (with the real named
-    params) is stashed under
-    ``_original_modeling_ministral_MinistralAttention_forward``; probe
-    that when it exists, else fall back to the live attr. If the live
-    attr is the relaxed wrapper, the named-param probe isn't applicable
-    -- the runtime call still works because the wrapper forwards via
-    kwargs.
+    The relaxed wrap turns the live signature into (self, *args, **kwargs), so
+    probe the pre-wrap impl stashed under
+    ``_original_modeling_ministral_MinistralAttention_forward`` when present;
+    if only the wrapper is available the named-param probe doesn't apply
+    (runtime still works via kwargs forwarding).
     """
     try:
         from transformers.models.ministral.modeling_ministral import (
@@ -956,8 +940,8 @@ def test_CsmForConditionalGeneration_merge_input_ids_signature():
 
 def test_MllamaVisionEncoderLayer_forward_signature():
     """misc.py:1146-1172 -- ``MllamaVisionEncoderLayer.forward(self,
-    hidden_state, attention_mask=None)``. NOTE: upstream uses
-    ``hidden_state`` (singular), not ``hidden_states``."""
+    hidden_state, attention_mask=None)``. Upstream uses ``hidden_state``
+    (singular), not ``hidden_states``."""
     try:
         from transformers.models.mllama.modeling_mllama import (
             MllamaVisionEncoderLayer,
@@ -979,10 +963,9 @@ def test_MllamaVisionEncoderLayer_forward_signature():
 # ===========================================================================
 
 def test_SiglipEncoderLayer_forward_signature():
-    """misc.py:1187-1228 -- ``SiglipEncoderLayer.forward(self,
-    hidden_states, attention_mask, output_attentions=False)``. zoo's
-    body still references ``output_attentions`` so upstream removing it
-    leaves the patched body broken when callers stop passing it."""
+    """misc.py:1187-1228 -- ``SiglipEncoderLayer.forward(self, hidden_states,
+    attention_mask, output_attentions=False)``. zoo's body still references
+    ``output_attentions``, so upstream removing it breaks the patched body."""
     from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
     _assert_params_superset(
         SiglipEncoderLayer.forward,
@@ -1028,11 +1011,8 @@ def test_Qwen3VLMoeTextSparseMoeBlock_forward_signature():
 
 
 def test_Qwen3VLMoeTextExperts_forward_signature():
-    """qwen3_vl_moe.py:376 patches ``Qwen3VLMoeTextExperts.forward``.
-    Zoo's replacement is ``(self, hidden_states, top_k_index,
-    top_k_weights)`` while upstream uses ``(hidden_states,
-    routing_weights, router_indices)``; pin only positional arity (3
-    after self)."""
+    """qwen3_vl_moe.py:376 patches ``Qwen3VLMoeTextExperts.forward``. Zoo's
+    replacement renames the params, so pin only positional arity (3 after self)."""
     try:
         from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
             Qwen3VLMoeTextExperts,

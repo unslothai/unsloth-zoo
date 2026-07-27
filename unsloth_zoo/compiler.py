@@ -629,11 +629,9 @@ pass
 
 def fix_attention_dtype_consistency(source):
     """
-    Fix dtype mismatch between Q/K and V in attention modules.
-    After apply_rotary_pos_emb, Q and K may be promoted to a different dtype
-    (e.g. float32) while V stays in the original dtype (e.g. float16/bfloat16).
-    This happens in 4-bit BNB mode when cos/sin from RoPE are in float32.
-    We insert a cast to align V's dtype with Q's dtype.
+    Fix Q/K vs V dtype mismatch in attention. apply_rotary_pos_emb may promote
+    Q/K (e.g. to float32 in 4-bit BNB when RoPE cos/sin are float32) while V stays
+    float16/bfloat16; insert a cast aligning V's dtype with Q's.
     """
     pattern = re.compile(
         r"([ \t]*)(query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\([^\)]+\))"
@@ -972,13 +970,12 @@ def create_new_function(
                     and f"def {b}(" not in new_source
                 ):
                     items.append(b)
-    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    # Pull in any create_*_mask functions referenced in the source
     mask_functions = get_mask_functions()
     for mask_function in mask_functions:
         if mask_function in new_source:
             items += [mask_function]
     pass
-    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
@@ -1234,6 +1231,143 @@ def create_new_function(
 pass
 
 
+def fix_gemma4_audio_feature_dtype(source):
+    """Align Gemma 4 audio features with the destination embedding dtype."""
+    rewritten, count = re.subn(
+        r"audio_features\.to\(\s*inputs_embeds\.device\s*\)",
+        "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)",
+        source,
+    )
+    if count != 1:
+        return source
+    return rewritten
+pass
+
+
+_GEMMA4_PLE_CAST_HELPER = """
+def _unsloth_gemma4_ple_cast_input(module, x):
+    get_base_layer = getattr(module, "get_base_layer", None)
+    base_layer = get_base_layer() if callable(get_base_layer) else getattr(module, "base_layer", module)
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(base_layer, "weight", None)
+    if weight is None:
+        return x
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return x
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    if getattr(dtype, "itemsize", 2) < 2:
+        return x
+    return x if x.dtype == dtype else x.to(dtype)
+pass
+"""
+
+
+def fix_gemma4_forced_float32_ple_dtype(source, module = None):
+    """Align only Gemma 4 PLE Linear inputs for forced-float32 residuals."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1":
+        return source
+
+    replacements_by_module = {
+        "Gemma4TextModel": (
+            (
+            "self.per_layer_model_projection(inputs_embeds)",
+            "self.per_layer_model_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
+            ),
+        ),
+        "Gemma4TextDecoderLayer": (
+            (
+            "self.per_layer_input_gate(hidden_states)",
+            "self.per_layer_input_gate(_unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states))",
+            ),
+            (
+            "self.per_layer_projection(hidden_states)",
+            "self.per_layer_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states))",
+            ),
+        ),
+    }
+    replacements = (
+        tuple(item for group in replacements_by_module.values() for item in group)
+        if module is None else replacements_by_module.get(module, ())
+    )
+    if not replacements:
+        return source
+    rewritten = source
+    counts = [rewritten.count(old) for old, _ in replacements]
+    if not any(counts):
+        return source
+    if (module is None and any(count > 1 for count in counts)) or \
+        (module is not None and any(count != 1 for count in counts)):
+        return source
+    for old, new in replacements:
+        if old in rewritten:
+            rewritten = rewritten.replace(old, new, 1)
+    return rewritten
+pass
+
+
+def _unwrap_undecorated_method(func, owner_qualname):
+    """
+    Recover the real, undecorated method hidden behind a decorator that returns
+    a bare closure without `functools.wraps`.
+
+    `functools.wraps` copies `__qualname__` and sets `__wrapped__`, and both
+    `inspect.getsource` and `inspect.signature` already follow `__wrapped__`, so
+    well behaved decorators need no help here and are returned unchanged by the
+    `__qualname__` fast path below.
+
+    A decorator that does NOT use `functools.wraps` leaves a class attribute
+    whose source and signature belong to the wrapper, not to the method. One
+    such decorator is transformers' `@force_accelerate_hooks(...)` in
+    `transformers/integrations/accelerate.py`, applied to
+    `Qwen3_5GatedDeltaNet.forward`: it leaves behind
+    `force_accelerate_hooks.<locals>.decorator.<locals>.wrapped`, so
+    `inspect.getsource` returns the wrapper (which lives in another file and
+    closes over free variables that do not exist at module scope) and
+    `inspect.signature` returns `(self, *args, **kwargs)`. Generating a
+    standalone function from that emits `return wrapped(self, *args, **kwargs)`
+    under the real named signature, which is a `NameError` at the first forward.
+
+    Walk `__wrapped__` and then single function closure cells until we land on a
+    function that really belongs to `owner_qualname`. If no such function is
+    found, return `func` unchanged so nothing else changes behaviour.
+    """
+    prefix = owner_qualname + "."
+    if getattr(func, "__qualname__", "").startswith(prefix):
+        return func
+    seen = set()
+    current = func
+    for _ in range(10):
+        candidate = getattr(current, "__wrapped__", None)
+        if candidate is None:
+            cells = getattr(current, "__closure__", None)
+            if getattr(current, "__code__", None) is None or not cells:
+                break
+            inner = []
+            for cell in cells:
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if inspect.isfunction(value):
+                    inner.append(value)
+            # More than one candidate is ambiguous, so leave `func` alone.
+            if len(inner) != 1:
+                break
+            candidate = inner[0]
+        if not inspect.isfunction(candidate) or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        current = candidate
+        if getattr(current, "__qualname__", "").startswith(prefix):
+            return current
+    return func
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1255,13 +1389,20 @@ def create_standalone_class(
      replacement so indentation and whitespace should be handled ahead of time!
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # Create optimized standalone forward function
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
-    old_source = inspect.getsource(f.forward)
+    # A decorator that returns a bare closure (no `functools.wraps`) hides the
+    # real method behind the wrapper, so read the source and the signature off
+    # the undecorated function instead of off the class attribute.
+    real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
+    old_source = inspect.getsource(real_forward)
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+    if module == "Gemma4Model":
+        forward_source = fix_gemma4_audio_feature_dtype(forward_source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        forward_source = fix_gemma4_forced_float32_ple_dtype(forward_source, module)
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
@@ -1275,19 +1416,16 @@ def create_standalone_class(
         "use_kernelized_func",
         "auto_docstring",
         "merge_with_config_defaults",
-        "capture_outputs",
         # add more here if needed
     }
 
     if full_class.lstrip().startswith("@"):
         start = re.search(r"^class ", full_class, flags=re.MULTILINE)
         if start:
-            # Found class definition - now check decorators
             class_start = start.start()
             preamble = full_class[:class_start]
             class_def = full_class[class_start:]
 
-            # Split preamble into lines
             lines = preamble.split('\n')
             new_lines = []
 
@@ -1302,7 +1440,7 @@ def create_standalone_class(
 
             for line in lines:
                 if skipping:
-                    # Continue skipping decorator args until balanced
+                    # Skip decorator args until parens balance
                     paren_depth += line.count("(") - line.count(")")
                     if paren_depth <= 0:
                         skipping = False
@@ -1390,7 +1528,7 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(f.forward).parameters
+    parameters = inspect.signature(real_forward).parameters
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
@@ -1476,7 +1614,7 @@ def create_standalone_class(
     _PAREN_GROUP = r"(?P<grp>\((?:[^()'\"]|'[^'\\]*(?:\\.[^'\\]*)*'|\"[^\"\\]*(?:\\.[^\"\\]*)*\"|(?P>grp))*\))"
     for _dec in (
         "auto_docstring", "use_kernelized_func", "check_model_inputs",
-        "merge_with_config_defaults", "capture_outputs",
+        "merge_with_config_defaults",
     ):
         source = regex.sub(rf"@{_dec}\s*(?:{_PAREN_GROUP})?", "", source)
 
@@ -1512,6 +1650,19 @@ def create_standalone_class(
         source,
     )
 
+    if module == "Gemma4Model":
+        source = fix_gemma4_audio_feature_dtype(source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        source = fix_gemma4_forced_float32_ple_dtype(source, module)
+
+    # Append the PLE cast helper only once a call to it actually exists in the
+    # generated source (from the rewrite above, or from already-cast eager source
+    # read back through inspect.getsource). This keeps the emitted helper name in
+    # sync with the eager patch and avoids appending dead code when nothing was
+    # rewritten (drift / already-fixed upstream / flag off).
+    if "_unsloth_gemma4_ple_cast_input(" in source and \
+        "def _unsloth_gemma4_ple_cast_input" not in source:
+        source += _GEMMA4_PLE_CAST_HELPER
     return source
 
 
@@ -1557,6 +1708,11 @@ class EmptyLogits:
     __getattr__ = raise_getattr_error
     def __repr__(self): return LOGITS_ERROR_STRING
     def __str__ (self): return LOGITS_ERROR_STRING
+    # Stateless pickling so accelerate gather_object works on the sentinel
+    def __reduce__(self): return (type(self), ())
+    # Gathered copies must compare equal in accelerate debug mode
+    def __eq__(self, other): return type(other).__name__ == "EmptyLogits"
+    __hash__ = object.__hash__
 pass
 EMPTY_LOGITS = EmptyLogits()
 functions = dir(torch.Tensor)
@@ -1565,6 +1721,11 @@ for j, function in enumerate(functions):
         exec(f"def raise_{j}(*args, **kwargs): print('{function}')", globals(), locals())
         try: exec(f"EMPTY_LOGITS.{function} = raise_{j}", globals(), locals())
         except: continue
+pass
+# The loop above stomps pickle hooks with stubs returning None; restore them.
+for function in ("__reduce__", "__reduce_ex__", "__getstate__", "__setstate__"):
+    try: delattr(EMPTY_LOGITS, function)
+    except Exception: pass
 pass
 
 
@@ -2265,7 +2426,6 @@ pass
 # Patch remaining functions
 def convert_attention_masks_to_bool(module, old_source):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Convert attention mask creation functions to boolean
     source = re.sub(r"\([\s]{0,}", "(", old_source)
     source = re.sub(r"[\s]{0,}\)", ")", source)
     all_splits = source.strip().split("\n")
@@ -2968,7 +3128,6 @@ def patch_gradient_accumulation(modeling_file, module):
     else:
         return None
 
-    # Now replace old forward with new one
     source = inspect.getsource(module).replace(inspect.getsource(forward), source)
     return source
 
@@ -3273,11 +3432,69 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
+    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
+    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    "DeepseekV4HyperConnection",
+    "DeepseekV4HyperHead",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
     "WhisperDecoder",
 ]
+
+
+def patch_output_capture_targets(modeling_file, replacement_classes=None):
+    """Return captured target names and retarget them after class replacement."""
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except ImportError:
+        return set()
+
+    replacement_classes = replacement_classes or {}
+    target_names = set()
+
+    def patch_capture_spec(spec):
+        if isinstance(spec, (list, tuple)):
+            patched = [patch_capture_spec(x) for x in spec]
+            return tuple(patched) if isinstance(spec, tuple) else patched
+        if isinstance(spec, OutputRecorder) and spec.target_class is not None:
+            target_names.add(spec.target_class.__name__)
+            replacement_class = replacement_classes.get(spec.target_class.__name__)
+            if replacement_class is not None:
+                spec.target_class = replacement_class
+        elif isinstance(spec, type):
+            target_names.add(spec.__name__)
+            return replacement_classes.get(spec.__name__, spec)
+        return spec
+
+    for item_name in dir(modeling_file):
+        try:
+            item = getattr(modeling_file, item_name)
+            capture_flags = getattr(item, "_can_record_outputs", None)
+        except Exception:
+            continue
+        if not isinstance(capture_flags, dict):
+            continue
+        for flag_name, capture_spec in capture_flags.items():
+            capture_flags[flag_name] = patch_capture_spec(capture_spec)
+    return target_names
+
+
+def calls_output_capture_target(init, source, target_names):
+    """Detect direct calls to submodules targeted by Transformers output hooks."""
+    # A forward decorated with @capture_outputs installs the hooks itself, even
+    # when its captured submodules are built indirectly (e.g. via helpers).
+    if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
+        return True
+    for target_name in target_names:
+        assigned_names = re.findall(
+            rf"self\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*{re.escape(target_name)}\(",
+            init,
+        )
+        for assigned_name in assigned_names:
+            if f"self.{assigned_name}(" in source:
+                return True
+    return False
 
 
 def unsloth_compile_transformers(
@@ -3308,7 +3525,6 @@ def unsloth_compile_transformers(
     return_logits: bool = False,
     supports_sdpa: list = None,
 ):
-    # import transformers logging module and instantiate model_type logging instance.
     from transformers import logging as transformers_logging
 
     try:
@@ -3389,6 +3605,55 @@ def unsloth_compile_transformers(
         multi_kernel=False,  # Sometimes fails
         use_block_ptr=False,  # Sometimes fails
     )
+
+    # Pre-load persisted torch.compile artifacts (Mega-cache) for this exact
+    # environment + model + compile configuration. This runs during
+    # from_pretrained, strictly before any @torch.compile region executes, so
+    # a hit lets the first training step skip Inductor codegen and Triton
+    # autotuning. A miss is silent and falls back to a normal local compile;
+    # the artifacts are then saved at process exit for the next run.
+    # On by default on POSIX; opt-in (=1) on Windows; kill switch =0. See compile_cache.py.
+    try:
+        from .compile_cache import megacache_load
+        # Env vars override these arguments below (and the generated forwards
+        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # values or one mode's bundle would be a false hit for another.
+        _effective_fullgraph = os.environ.get(
+            "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"
+        ) == "1"
+        _effective_return_logits = os.environ.get(
+            "UNSLOTH_RETURN_LOGITS", "1" if return_logits else "0"
+        ) == "1"
+        _return_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        megacache_load(
+            model_type,
+            compile_kwargs = {
+                "sdpa_dynamic_mask"     : sdpa_dynamic_mask,
+                "sdpa_bool_masks"       : sdpa_bool_masks,
+                "sdpa_gqa_replace"      : sdpa_gqa_replace,
+                "sdpa_dynamic_compile"  : sdpa_dynamic_compile,
+                "compile_attention"     : compile_attention,
+                "disable_causal_masks"  : disable_causal_masks,
+                "compile_torch_modules" : compile_torch_modules,
+                "compile_custom_modules": compile_custom_modules,
+                "compile_function_calls": compile_function_calls,
+                "fuse_lm_head"          : fuse_lm_head,
+                "gradient_checkpointing": gradient_checkpointing,
+                "manual_replacements"   : manual_replacements,
+                "fast_lora_forwards"    : fast_lora_forwards,
+                "fast_residual_stream"  : fast_residual_stream,
+                "accurate_accumulation" : accurate_accumulation,
+                "fullgraph"             : _effective_fullgraph,
+                "disable"               : disable,
+                "return_logits"         : _effective_return_logits,
+                "return_hidden_states"  : _return_hidden_states,
+            },
+            torch_compile_options = torch_compile_options,
+        )
+    except Exception as _megacache_error:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Mega-cache skipped ({_megacache_error})")
+    pass
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
@@ -3769,8 +4034,10 @@ def unsloth_compile_transformers(
     # Remove modules which have attention mechanisms
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
+    no_fullgraph_modules = set()
     # actively disable certain modules
     disable_modules = set()
+    output_capture_target_names = patch_output_capture_targets(modeling_file)
     for module, fullgraph in torch_modules.items():
         try:
             source = eval(f"{model_location}.{module}")
@@ -3824,6 +4091,17 @@ def unsloth_compile_transformers(
                 f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
+        pass
+
+        if (
+            fullgraph
+            and len(output_capture_target_names) > 0
+            and calls_output_capture_target(init, source, output_capture_target_names)
+        ):
+            print(
+                f"Unsloth: Will compile {module} without fullgraph since output capture hooks run inside it."
+            )
+            no_fullgraph_modules.add(module)
         pass
 
         # Remove decoder layers
@@ -3914,7 +4192,7 @@ def unsloth_compile_transformers(
                     module,
                     model_location,
                     functions,
-                    fullgraph=fullgraph,
+                    fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
                 )
                 print(f"Unsloth: Compiled module {module}.")
@@ -4476,10 +4754,15 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    if compile_torch_modules and not disable:
-        from .patch_torch_functions import patch_torch_functions
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
+    if compile_torch_modules:
+        if not disable:
+            # Compiled global F.layer_norm: only when compiling is allowed
+            from .patch_torch_functions import patch_torch_functions
 
-        patch_torch_functions()
+            patch_torch_functions()
 
         _conv_modules = frozenset([
             "Conv1d", "Conv2d", "Conv3d",
@@ -4523,7 +4806,23 @@ def unsloth_compile_transformers(
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
                 param_name = m.group(1) if m else "input"
-                append_str = f".to({param_name}.dtype)\n"
+                if disable:
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
+                    lines = source.split("\n")
+                    def_line = lines[0]
+                    body_lines = lines[1:]
+                    first_body = next((l for l in body_lines if l.strip()), "")
+                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    prologue = [
+                        body_indent + f"original_dtype = {param_name}.dtype",
+                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                    ]
+                    source = "\n".join([def_line] + prologue + body_lines)
+                    append_str = ".to(original_dtype)\n"
+                else:
+                    append_str = f".to({param_name}.dtype)\n"
 
             forward = create_new_function(
                 module,
@@ -4575,6 +4874,7 @@ def unsloth_compile_transformers(
         return
 
     # Import and replace with new module
+    replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
             exec(
@@ -4582,9 +4882,12 @@ def unsloth_compile_transformers(
                 globals(),
                 locals(),
             )
+            replacement_classes[module] = getattr(combined_module, module)
         except:
             pass
     pass
+
+    patch_output_capture_targets(modeling_file, replacement_classes)
 
     # Finally edit dictionary items inside the target file
     replaced_classes = all_standalone_classes.keys()

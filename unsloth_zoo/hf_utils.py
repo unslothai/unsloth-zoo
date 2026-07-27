@@ -51,7 +51,6 @@ def dtype_from_config(config):
 
 def set_dtype_in_config(config, dtype):
     try:
-        # if dtype is not a string, convert it to a string
         string_dtype = str(dtype).split(".")[-1] if isinstance(dtype, torch.dtype) else dtype
         if HAS_TORCH_DTYPE:
             setattr(config, "torch_dtype", string_dtype)
@@ -81,10 +80,9 @@ def add_dtype_kwargs(dtype, kwargs_dict=None):
     return kwargs_dict
 
 def _dtype_stringify(x):
-    # Convert *values* (not the config) into JSON-safe strings when they are dtypes
+    # Convert dtype *values* into JSON-safe strings ("torch.float16" -> "float16")
     try:
         if isinstance(x, torch.dtype):
-            # str(torch.float16) -> "torch.float16" -> "float16"
             return str(x).split(".", 1)[-1]
         if isinstance(x, str) and x.startswith("torch."):
             tail = x.split(".", 1)[-1]
@@ -128,16 +126,16 @@ def get_transformers_model_type(config, trust_remote_code=False):
         if len(model_type_list) == 0:
             logger.info("*** `model_type_list` in `get_transformers_model_type` is None!")
         if len(model_type_list) != 0:
-            # Use transformers.models.gpt_oss.modeling_gpt_oss
+            # e.g. transformers.models.gpt_oss.modeling_gpt_oss
             model_type = model_type_list[0].group(1)
             model_types = [model_type]
         elif getattr(config, "auto_mapping", None) is not None:
-            # Use GptOssForCausalLM
+            # e.g. GptOssForCausalLM
             model_type = config.auto_mapping.get("base_model_class", None)
             if model_type is not None:
                 model_type = str(model_type)
                 model_type = model_type.rsplit("For", 1)[0].lower()
-                # Find exact name of modeling path
+                # Find exact modeling-path name
                 import transformers.models
                 supported_model_types = dir(transformers.models)
                 for modeling_file in supported_model_types:
@@ -155,7 +153,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
         # Set model name for patching purposes
         os.environ["UNSLOTH_MODEL_NAME"] = base_model_name_or_path.lower()
 
-        # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
+        # Last resort: derive from base model name via AutoConfig
         if model_types is None:
             from transformers import AutoConfig
             try:
@@ -181,7 +179,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
         retry_config = True
     pass
 
-    # Check since we might have tried AutoConfig fallback last resort for LoRA
+    # May have tried the AutoConfig fallback as a last resort for LoRA
     if retry_config:
         from collections.abc import Mapping, Sequence
         def find(data, target_key):
@@ -189,13 +187,11 @@ def get_transformers_model_type(config, trust_remote_code=False):
             while stack:
                 obj = stack.pop()
                 if isinstance(obj, Mapping):
-                    # Emit values for matches
                     if target_key in obj:
                         yield obj[target_key]
-                    # Keep walking into nested values
                     stack.extend(obj.values())
                 elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
-                    # Walk sequences (lists/tuples/sets), but not strings/bytes
+                    # Walk sequences but not strings/bytes
                     stack.extend(obj)
         model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
@@ -223,7 +219,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
         if model_type in _REMOTE_CODE_MODEL_TYPES:
             found_type = True
         elif model_type not in all_model_types:
-            # Try splitting on _ gemma3_text -> gemma3
+            # Try trimming, e.g. gemma3_text -> gemma3
             model_types = list(model_type)
             model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
             for current_model_type in model_types:
@@ -271,7 +267,7 @@ pass
 
 
 def get_auto_processor(name, **kwargs):
-    # Allow AutoProcessor to work if config.json does not exist
+    # Allow AutoProcessor to work when config.json does not exist
     if not os.path.exists(name):
         return None
     try:
@@ -295,7 +291,7 @@ def get_auto_processor(name, **kwargs):
                 with open(processor_config, "r", encoding="utf-8") as f:
                     config = json.load(f)
                 processor_class = config["processor_class"]
-                # Strip _Unsloth_Patched_ prefix from old saves (issue #4085)
+                # Strip _Unsloth_Patched_ prefix from old saves (unsloth issue 4085)
                 if processor_class.startswith("_Unsloth_Patched_"):
                     processor_class = processor_class[len("_Unsloth_Patched_"):]
                 model_type = reversal_map[processor_class]
@@ -326,11 +322,11 @@ def get_auto_processor(name, **kwargs):
             raise TypeError(f"Unsloth: Failed loading a AutoProcessor from `{name}`")
     pass
 
-    # Make a temporary directory to copy all files
+    # Temp directory to copy all files into
     temp_directory = tempfile.TemporaryDirectory()
     temp_name = temp_directory.name
 
-    # Make a fake config.json file with just the model_type
+    # Fake config.json with just the model_type
     config_file = {"model_type" : model_type}
     with open(os.path.join(temp_name, "config.json"), "w") as f:
         f.write(json.dumps(config_file))
@@ -345,7 +341,7 @@ def get_auto_processor(name, **kwargs):
                 pass
     pass
 
-    # Fix _Unsloth_Patched_ prefix in copied config files (issue #4085)
+    # Fix _Unsloth_Patched_ prefix in copied config files (unsloth issue 4085)
     for cfg_name in ["processor_config.json", "preprocessor_config.json", "tokenizer_config.json"]:
         cfg_path = os.path.join(temp_name, cfg_name)
         if os.path.exists(cfg_path):

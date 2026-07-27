@@ -8,22 +8,16 @@
 
 """Regression for unslothai/unsloth#5441.
 
-PreTrainedModel.__init__ resolves loss_type from the class name. Anything
-whose name doesn't appear as a literal LOSS_MAPPING key falls back to a
-regex match, which means `Qwen3_5ForConditionalGeneration` lands on
-`LOSS_MAPPING["ForConditionalGeneration"]`. That entry, plus
-`CsmForConditionalGeneration`, is aliased to the stock `ForCausalLMLoss`
-in transformers. `patch_loss_functions()` only rewrote
-`LOSS_MAPPING["ForCausalLM"]`, leaving those aliases pointing at the
-un-patched loss which does `logits.float()` and OOMs on <= 24 GB GPUs at
-large vocab sizes.
+PreTrainedModel.__init__ resolves loss_type from the class name via regex when
+it isn't a literal LOSS_MAPPING key, so `Qwen3_5ForConditionalGeneration` lands
+on `LOSS_MAPPING["ForConditionalGeneration"]` (aliased, like
+`CsmForConditionalGeneration`, to stock `ForCausalLMLoss`). `patch_loss_functions()`
+only rewrote `LOSS_MAPPING["ForCausalLM"]`, leaving those aliases on the
+un-patched loss that does `logits.float()` and OOMs on <= 24 GB GPUs at large
+vocab sizes.
 
-This suite pins:
-  - Every key originally aliased to ForCausalLMLoss is replaced with
-    the Unsloth kernel.
-  - Keys aliased to other loss types (ForMaskedLMLoss, segmentation,
-    detection, etc.) are not overwritten.
-  - The patch is idempotent.
+Pins: every key aliased to ForCausalLMLoss is replaced with the Unsloth kernel;
+keys aliased to other loss types are not; the patch is idempotent.
 """
 
 from __future__ import annotations

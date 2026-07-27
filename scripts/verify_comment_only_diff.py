@@ -11,20 +11,14 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""Deterministic comment / docstring-only verifier.
+"""Deterministic comment / docstring-only diff verifier.
 
-Compares a list of changed files between two git refs and reports whether
-each diff is strictly comments / docstrings (Python) or comments
-(YAML / GitHub Actions). Useful for gating a "comment trim" /
-"docstring refactor" PR against accidental code drift.
-
-Per .py file: parse both revs into AST, strip module / class / function
-docstrings, then compare ast.unparse output. Pure Python comments are
-discarded by the parser by construction, so any post-strip diff is real
-code. Per .yml file: yaml.safe_load both sides and compare the parsed
-Python object; if scalar values differ, also strip shell comments inside
-``run: |`` block bodies before comparing. Exit code 0 = all OK, 1 = at
-least one file has a real (non-comment) diff or an error.
+Reports whether each file's diff between two git refs is strictly comments /
+docstrings, to gate a "comment trim" PR against accidental code drift.
+Per .py: AST-parse both revs, strip docstrings, compare ast.unparse (pure
+comments are dropped by the parser). Per .yml: yaml.safe_load and compare the
+parsed object, also stripping shell comments in ``run: |`` bodies. Exit 0 =
+all OK, 1 = a real (non-comment) diff or error.
 
 Usage:
     python scripts/verify_comment_only_diff.py [--base REF] [--head REF] path ...
@@ -54,9 +48,8 @@ def _git_show(rev: str, path: str) -> str:
 
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
-    """Remove every string-literal docstring (Module / FunctionDef /
-    AsyncFunctionDef / ClassDef). Empty body becomes ``pass`` so
-    ast.unparse stays valid."""
+    """Remove docstrings from Module / FunctionDef / AsyncFunctionDef /
+    ClassDef; an emptied body becomes ``pass`` so ast.unparse stays valid."""
     for node in ast.walk(tree):
         if isinstance(
             node,
@@ -84,9 +77,8 @@ def _normalize_py(src: str) -> str:
 
 
 def _strip_shell_comments(s: str) -> str:
-    """Strip pure-comment lines and inline trailing comments from a shell
-    snippet, then collapse runs of blank lines. Heuristic only: leaves a
-    line untouched if it has an odd quote count (open string)."""
+    """Strip comment lines + inline trailing comments from a shell snippet and
+    collapse blank runs. Heuristic: leaves lines with an odd quote count alone."""
     out = []
     for line in s.splitlines():
         stripped = line.lstrip()
@@ -113,9 +105,8 @@ def _strip_shell_comments(s: str) -> str:
 
 
 def _normalize_yaml_run_strings(obj: Any) -> Any:
-    """Walk the parsed YAML object; for any multi-line string (i.e. a
-    ``run: |`` script body), strip shell comments. Returns a normalised
-    copy."""
+    """Return a copy with shell comments stripped from every multi-line string
+    (i.e. ``run: |`` script bodies)."""
     if isinstance(obj, dict):
         return {k: _normalize_yaml_run_strings(v) for k, v in obj.items()}
     if isinstance(obj, list):

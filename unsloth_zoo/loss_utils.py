@@ -138,10 +138,9 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
     # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
-    # resolves loss_type via regex on the class name, so classes like
-    # Qwen3_5ForConditionalGeneration land on LOSS_MAPPING["ForConditionalGeneration"]
-    # (and CsmForConditionalGeneration on its own key), both of which point at the
-    # stock ForCausalLMLoss. Without this sweep those models keep the un-patched
+    # resolves loss_type by regex on the class name, so e.g.
+    # Qwen3_5ForConditionalGeneration / CsmForConditionalGeneration land on keys
+    # pointing at the stock loss; without this sweep they keep the un-patched
     # loss and OOM via logits.float() at large vocab sizes.
     for _key, _fn in list(LOSS_MAPPING.items()):
         if getattr(_fn, "__name__", "") == "ForCausalLMLoss":
@@ -226,17 +225,8 @@ ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
-# Check for DataParallel
-#
-# DataParallel uses scatter and gather
-# cpu->0 scatter 0 --> 0 gather 0
-# cpu->0 scatter 1 --> 1 gather 0
-# cpu->0 scatter 2 --> 2 gather 0
-#
-# DistributedDataParallel is faster and launches multiple processes
-# cpu->0 ------------> 0 gather 0
-# cpu->1 ------------> 1 gather 0
-# cpu->2 ------------> 2 gather 0
+# ParallelMode distinguishes DataParallel (scatter/gather from one process)
+# from the faster DistributedDataParallel (one process per device).
 from transformers.training_args import ParallelMode
 
 # Cannot use sadly
@@ -277,9 +267,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                         forward = __wrapped__
             pass
             name = forward.__qualname__
-            # Also check the class name as a fallback - patched forward methods
-            # (e.g. from temporary_patches) may have qualnames that don't contain
-            # the original class identifiers like "CausalLM".
+            # Fall back to the class name: patched forwards (temporary_patches)
+            # may have qualnames lacking identifiers like "CausalLM".
             class_name = type(m).__name__
             if "ForConditionalGeneration" in name or "ForConditionalGeneration" in class_name \
                 or "VisionText2Text" in name:
@@ -327,8 +316,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 count = token_count.sum()
                 seq_lengths = x.get("packed_seq_lengths")
                 if seq_lengths is not None:
-                    # When packing N sequences, there are N-1 internal boundaries
-                    # that shouldn't be counted as valid training positions
+                    # Packing N sequences has N-1 internal boundaries that
+                    # aren't valid training positions.
                     count -= torch.count_nonzero(seq_lengths > 0).item() - 1
                 token_counts.append(count)
             pass

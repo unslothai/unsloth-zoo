@@ -74,9 +74,8 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
 
     cmd = captured["cmd"]
     assert isinstance(cmd, str), f"command should be a shell string (existing convention); got {type(cmd)!r}"
-    # The literal preset name must NOT reach llama-quantize.
+    # Preset name must NOT reach llama-quantize; expanded ftype must, as a token.
     assert "q2_k_l" not in cmd, f"q2_k_l leaked into llama-quantize command: {cmd!r}"
-    # The expanded ftype must appear, as a standalone token.
     assert " q2_k " in cmd, f"q2_k token missing: {cmd!r}"
     # All four preset flags must appear.
     assert "--output-tensor-type Q6_K" in cmd, f"--output-tensor-type Q6_K missing: {cmd!r}"
@@ -93,7 +92,6 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
     assert first_tt < cmd.index("/tmp/in.gguf"), (
         f"--tensor-type must precede positional args: {cmd!r}"
     )
-    # Sanity: input/output paths and thread count are still present.
     assert "/tmp/in.gguf" in cmd
     assert "/tmp/out.gguf" in cmd
     assert " 4" in cmd, f"n_threads missing: {cmd!r}"
@@ -133,7 +131,7 @@ def test_q2_k_l_ffn_down_pattern_order_is_specific_first(monkeypatch):
 
 
 def test_q2_k_l_is_case_insensitive(monkeypatch):
-    """Studio frontend may send Q2_K_L / Q2_k_L / etc. Treat them identically."""
+    """Unsloth frontend may send Q2_K_L / Q2_k_L / etc. Treat them identically."""
 
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
@@ -158,11 +156,9 @@ def test_q2_k_l_is_case_insensitive(monkeypatch):
 
 
 def test_other_quant_types_are_untouched(monkeypatch):
-    """Non-preset ftypes must traverse the original code path byte-for-byte.
+    """Non-preset ftypes traverse the original code path unchanged.
 
-    Linux + Windows non-regression: ensures the q2_k_l branch does not affect
-    any other ftype. q3_k_l is a real llama.cpp ftype distinct from q2_k_l and
-    must be passed through verbatim.
+    q3_k_l is a real llama.cpp ftype distinct from q2_k_l and must pass through verbatim.
     """
 
     llama_cpp = _load_llama_cpp_module()
@@ -248,3 +244,170 @@ def test_q2_k_l_error_message_keeps_original_preset_name(monkeypatch):
         assert "q2_k_l" in str(exc), f"error msg should keep preset name: {exc}"
     else:
         raise AssertionError("expected RuntimeError")
+
+
+# --- imatrix option ------------------------------------------------------------------------------
+
+
+def test_imatrix_flag_is_prepended_before_positional_args(tmp_path, monkeypatch):
+    """A provided imatrix must reach llama-quantize as --imatrix in the option region."""
+
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    imat = tmp_path / "imatrix.dat"
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=False,
+        imatrix=str(imat),
+    )
+
+    cmd = captured["cmd"]
+    assert "--imatrix" in cmd, f"--imatrix missing: {cmd!r}"
+    assert str(imat) in cmd, f"imatrix path missing: {cmd!r}"
+    # Options must precede the positional input/output/type/threads.
+    assert cmd.index("--imatrix") < cmd.index("/tmp/in.gguf"), (
+        f"--imatrix must precede positional args: {cmd!r}"
+    )
+
+
+def test_imatrix_none_or_blank_is_a_noop(tmp_path, monkeypatch):
+    """None / empty / whitespace-only imatrix adds no flag (and is not validated)."""
+
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    for value in (None, "", "   "):
+        captured.clear()
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type="q4_k_m",
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+            imatrix=value,
+        )
+        assert "--imatrix" not in captured["cmd"], f"imatrix={value!r}: {captured['cmd']!r}"
+
+
+def test_imatrix_missing_file_raises(tmp_path):
+    """A non-existent imatrix path fails fast with a clear error, not a cryptic subprocess one."""
+
+    llama_cpp = _load_llama_cpp_module()
+    missing = tmp_path / "nope.dat"
+    try:
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type="iq2_xxs",
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+            imatrix=str(missing),
+        )
+    except FileNotFoundError as exc:
+        assert "nope.dat" in str(exc), f"error should name the missing file: {exc}"
+    else:
+        raise AssertionError("expected FileNotFoundError for a missing imatrix")
+
+
+def test_imatrix_windows_quotes_metacharacters(tmp_path, monkeypatch):
+    """On Windows (shell=True) the imatrix path is double-quoted so cmd metachars stay literal."""
+
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
+
+    imat = tmp_path / "a&b.dat"  # '&' is a cmd.exe command separator if left bare
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="C:\\tmp\\in.gguf",
+        output_gguf="C:\\tmp\\out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="C:\\llama\\llama-quantize.exe",
+        n_threads=4,
+        print_output=False,
+        imatrix=str(imat),
+    )
+
+    cmd = captured["cmd"]
+    assert f'--imatrix "{imat}"' in cmd, f"imatrix path must be double-quoted on Windows: {cmd!r}"
+
+
+def test_imatrix_quant_does_not_log_q2_k_l_preset(tmp_path, capsys, monkeypatch):
+    """An imatrix makes _extra_flags non-empty; the preset log must still be gated on q2_k_l only."""
+
+    llama_cpp = _load_llama_cpp_module()
+    _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    imat = tmp_path / "imatrix.dat"
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=True,
+        imatrix=str(imat),
+    )
+
+    out = capsys.readouterr().out
+    assert "Quantizing to iq2_xxs" in out, out
+    assert "Expanding Q2_K_L preset" not in out, f"imatrix quant must not claim Q2_K_L expansion: {out!r}"
+
+
+def test_imatrix_non_path_value_raises_cleanly(monkeypatch):
+    """A non-path value such as True must raise a clear error, not let os.path.exists() treat the
+    bool as file descriptor 1 and silently emit --imatrix "True"."""
+
+    llama_cpp = _load_llama_cpp_module()
+    _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+    try:
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type="iq2_xxs",
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+            imatrix=True,
+        )
+    except FileNotFoundError as exc:
+        assert "True" in str(exc), f"error should name the bogus value: {exc}"
+    else:
+        raise AssertionError("expected FileNotFoundError for a non-path imatrix value")
+
+
+def test_imatrix_path_is_stripped(tmp_path, monkeypatch):
+    """A space-padded imatrix path is trimmed before the existence check and quoting."""
+
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    imat = tmp_path / "imatrix.dat"
+    imat.write_bytes(b"\x00")
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="iq2_xxs",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=False,
+        imatrix=f"  {imat}  ",
+    )
+    cmd = captured["cmd"]
+    assert f"--imatrix {imat}" in cmd or f'--imatrix "{imat}"' in cmd, cmd
+    assert f"  {imat}  " not in cmd, f"padding must be stripped: {cmd!r}"

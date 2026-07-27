@@ -16,16 +16,12 @@
 
 """Regression coverage for save_lora_adapters / save_trainable_adapters.
 
-- save_lora_adapters keeps only module-anchored lora_a / lora_b tensors,
-  even when base weights are listed as trainable, and raises if no
-  LoRA modules are present.
-- save_trainable_adapters preserves every trainable tensor for in-loop
-  checkpoints.
-- The module-anchored filter does not leak paths that merely contain
-  "lora_" (e.g. router.lora_gate.weight).
+- save_lora_adapters keeps only module-anchored lora_a/lora_b, even when base
+  weights are trainable, and raises if no LoRA modules are present.
+- save_trainable_adapters preserves every trainable tensor for in-loop checkpoints.
+- The filter does not leak paths that merely contain "lora_" (e.g. router.lora_gate.weight).
 
-Runs on Linux + Windows via the mlx_simulation shim, on macOS against
-real MLX.
+Runs on Linux/Windows via the mlx_simulation shim, on macOS against real MLX.
 """
 
 from __future__ import annotations
@@ -1196,7 +1192,7 @@ def test_enrich_stamps_fine_tune_type_dora_when_dora_modules_present():
     assert cfg.get("fine_tune_type") == "dora", cfg
 
 
-def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head():
+def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head(monkeypatch):
     # After reload, mlx-lm wrappers may leak the inner base .weight as
     # trainable. For a LoRA-wrapped lm_head the leaked lm_head.weight is
     # not real user intent; treating it as trainable defeats the CCE
@@ -1227,8 +1223,18 @@ def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head():
             yield "lm_head", self._lm
 
     # lm_head.weight under a LoRA-wrapped lm_head must be filtered out;
-    # the trainable check should return False (LoRA-only training).
-    assert _is_lm_head_trainable(_Model()) is False
+    # the trainable check should return False (LoRA-only training). The
+    # descriptor is stubbed to resolve this head so the leaked-base filter
+    # is actually on the decision path (an unresolved head would return
+    # False before reaching it, making this test vacuous).
+    import unsloth_zoo.mlx.utils as _U
+
+    model = _Model()
+    monkeypatch.setattr(
+        _U, "describe_output_head",
+        lambda m: type("_Desc", (), {"module": model._lm})(),
+    )
+    assert _is_lm_head_trainable(model) is False
 
 
 def test_push_lora_adapters_uses_allow_patterns_to_avoid_stale_uploads(
@@ -1542,3 +1548,51 @@ def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
     assert calls["folder"] == 1
     assert len(calls["large"]) == 1, calls
     assert calls["large"][0]["repo_id"] == "me/adapter"
+
+
+def test_save_lora_adapters_method_ignores_a_fully_unfrozen_tree(tmp_path):
+    # load_adapters() never freezes: every base weight reads trainable, which
+    # is not CPT state, so keep the LoRA-only writer.
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({
+        "q_proj": _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "up_proj": _MockPlainLinear(16, 32),
+    })
+    _mlx_save_lora_adapters(model, tmp_path)
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {"q_proj.lora_a", "q_proj.lora_b"}, sorted(keys)
+
+
+def test_save_lora_adapters_method_raises_when_no_lora_modules(tmp_path):
+    # A base model must still error, not write a whole-model "adapter".
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({"up_proj": _MockPlainLinear(16, 32)})
+    with pytest.raises(ValueError, match="LoRA adapter tensors"):
+        _mlx_save_lora_adapters(model, tmp_path)
+
+
+def test_save_lora_adapters_method_keeps_continued_pretraining_tensors(tmp_path):
+    # Real CPT state: embed_tokens.weight trainable, the rest frozen.
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({
+        "q_proj": _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "embed_tokens": _MockPlainLinear(16, 32),
+    })
+    everything = model.parameters()
+    model.trainable_parameters = lambda: {
+        key: everything[key] for key in (
+            "embed_tokens.weight", "q_proj.lora_a", "q_proj.lora_b",
+        )
+    }
+    _mlx_save_lora_adapters(model, tmp_path)
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {
+        "q_proj.lora_a", "q_proj.lora_b", "embed_tokens.weight",
+    }, sorted(keys)

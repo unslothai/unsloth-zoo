@@ -41,17 +41,13 @@ PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
 
 
 def _parse_version(value: str):
-    """Best-effort PEP 440 parser. Falls back to packaging.version if
-    available; otherwise a lexicographic numeric-aware split that's
-    safe for the simple `X.Y.Z[.devN|rcN|postN]` shape zoo uses.
-    """
+    """Best-effort PEP 440 parser; uses packaging.version, else a numeric-aware
+    split safe for the simple X.Y.Z[.devN|rcN|postN] shape zoo uses."""
     try:
         from packaging.version import Version
         return Version(value)
     except Exception:
-        # Tuple of ints + suffix string -- monotonically orderable for
-        # versions of the same shape. Good enough for the simple bump
-        # case this test guards against.
+        # Int tuple, orderable for same-shape versions; enough for simple bumps.
         parts = value.split("+", 1)[0].split("-", 1)[0]
         nums, _, _suffix = parts.partition("rc")
         ints = []
@@ -64,11 +60,8 @@ def _parse_version(value: str):
 
 
 def _get_pypi_latest_version(timeout: float = 10.0):
-    """Fetch the latest published version of unsloth_zoo from PyPI's
-    JSON API. Returns None on network failure (we skip the test
-    rather than fail it -- the gate only matters when PyPI is
-    reachable).
-    """
+    """Fetch unsloth_zoo's latest published version from PyPI's JSON API;
+    returns None on network failure so the test skips rather than fails."""
     request = urllib.request.Request(
         PYPI_JSON_URL,
         headers = {"User-Agent": "unsloth-zoo-ci/test_pypi_version_sync"},
@@ -86,18 +79,13 @@ def _get_pypi_latest_version(timeout: float = 10.0):
 
 
 def _get_main_version():
-    """Read the `__version__` attribute zoo's setuptools dynamic
-    metadata reads from `unsloth_zoo/__init__.py`. We do this WITHOUT
-    importing `unsloth_zoo` because importing the package on a
-    CI runner without CUDA / XPU / HIP fires the device-type
-    detection which is intercepted by tests/conftest.py only when
-    pytest is collecting -- safer to read the source file directly.
-    """
+    """Read `__version__` from unsloth_zoo/__init__.py WITHOUT importing the
+    package: importing on a CI runner without CUDA/XPU/HIP fires device-type
+    detection, so reading the source file directly is safer."""
     import pathlib
     import re
 
-    # __file__ is .../<repo-root>/tests/test_pypi_version_sync.py
-    # so the repo root is parents[1] (parents[0] = tests/).
+    # repo root is parents[1] (parents[0] = tests/).
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     init_py = repo_root / "unsloth_zoo" / "__init__.py"
     text = init_py.read_text(encoding = "utf-8")

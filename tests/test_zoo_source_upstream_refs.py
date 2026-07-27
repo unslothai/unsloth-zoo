@@ -6,13 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or (at
 # your option) any later version.
 
-"""Importable-symbol pins for upstream references in ``unsloth_zoo`` source.
-
-Flat enumeration of every ``from <upstream> import <symbol>`` /
-``<upstream>.X.Y`` reference visible in ``unsloth_zoo/**.py``, exercised
-against the INSTALLED versions of transformers / trl / peft / datasets
-/ accelerate / vllm. Each test cites the zoo file:line it pins.
-"""
+"""Importable-symbol pins for every upstream reference in unsloth_zoo source,
+exercised against the INSTALLED transformers / trl / peft / datasets /
+accelerate / vllm. Each test cites the zoo file:line it pins."""
 
 from __future__ import annotations
 
@@ -28,14 +24,8 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _resolve(dotted: str) -> object:
-    """``importlib.import_module`` + ``getattr`` chain.
-
-    DRIFT-DETECTED policy: any failure to resolve is reported as an
-    AssertionError -- never a SKIP. Three failure modes all surface as
-    DRIFT: module-file missing, module-file present but import raises
-    (transitively-broken optional dep), or attribute missing on a
-    successfully-imported module.
-    """
+    """import_module + getattr chain. Any resolution failure (missing module,
+    import raises, or missing attribute) surfaces as DRIFT, never a SKIP."""
     parts = dotted.split(".")
     obj: object = None
     consumed: list[str] = []
@@ -714,23 +704,11 @@ def test_qwen2_vl_image_processor_class():
 
 
 def test_qwen2_5_vl_image_processor_class_gated_on_v5():
-    """unsloth_zoo/temporary_patches/misc.py:1501 --
-    Qwen2_5_VLImageProcessor.
+    """misc.py:1501 -- Qwen2_5_VLImageProcessor.
 
-    Originally added because zoo's patch site at misc.py:1501 references
-    this exact path; the version gate skipped on 4.x where the patch is
-    inert. transformers 5.x then DROPPED the slow image processors
-    entirely (no image_processing_qwen2_5_vl.py, no
-    image_processing_qwen2_5_vl_fast.py either): Qwen2.5-VL now reuses
-    ``Qwen2VLImageProcessor`` directly. zoo's misc.py:1500-1506 is
-    try/except ImportError-wrapped, so the no-longer-resolvable import
-    silently no-ops on 5.x and the runtime shim still fires via the
-    Qwen2VLImageProcessor patch at misc.py:1485-1498 (which is the
-    same class Qwen2.5-VL inherits at runtime).
-
-    On 4.57.6 the path still exists -- keep the strict drift check.
-    On 5.x the path is gone but the runtime is covered elsewhere --
-    skip.
+    On 4.57.6 the path exists -- keep the strict drift check. On 5.x the slow
+    image processors are gone (Qwen2.5-VL reuses Qwen2VLImageProcessor, covered
+    by the misc.py:1485-1498 patch); zoo's try/except import no-ops, so skip.
     """
     import transformers
     from packaging.version import Version

@@ -8,12 +8,10 @@
 
 """CPU-pure unit tests for `unsloth_zoo.rl_replacements`.
 
-The GRPO replacement helpers in `rl_replacements.py` are normally
-exercised inside a torch.compile'd GRPO training step on a real
-GPU. Several of them are pure-Python / pure-torch shape ops with
-well-defined IO contracts, though: this module pins their
-behaviour with tiny CPU tensor fixtures so future refactors of
-the GRPO step cannot silently break the contract.
+The GRPO replacement helpers are normally exercised inside a torch.compile'd
+GRPO step on GPU. Several are pure-torch shape ops with well-defined IO
+contracts; this pins them with tiny CPU fixtures so refactors can't silently
+break the contract.
 
 Covers:
   - `calculate_pad_tokens_in_prompt` (left-pad counter)
@@ -202,7 +200,7 @@ def test_RL_REPLACEMENTS_values_are_callables_or_source_strings():
 
 
 def test_RL_REPLACEMENTS_contains_public_api_keys():
-    # The known-good keys that downstream unsloth + Studio code calls
+    # The known-good keys that downstream unsloth + Unsloth code calls
     # by name. If any of these go missing the consumer side breaks.
     expected = {
         "calculate_pad_tokens_in_prompt",

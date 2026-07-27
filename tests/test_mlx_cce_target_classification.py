@@ -7,12 +7,11 @@
 # (at your option) any later version.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# MLX CCE target-classification coverage that runs on non-Apple-Silicon
-# hosts via the simulation shim. The companion file
-# tests/test_mlx_runtime_cce_compile.py gates on real Metal and skips
-# under the shim, leaving the pure-Python validation, in-vocab
-# ignore_index precedence, and logit_softcap fallback paths without
-# Linux CI coverage. This file fills those gaps.
+# MLX CCE target-classification coverage on non-Apple-Silicon hosts via the
+# simulation shim. tests/test_mlx_runtime_cce_compile.py gates on real Metal
+# and skips under the shim, leaving the pure-Python validation, in-vocab
+# ignore_index precedence, and logit_softcap fallback paths uncovered on Linux
+# CI. This file fills those gaps.
 
 from __future__ import annotations
 
@@ -92,6 +91,46 @@ def test_runtime_cce_rejects_target_length_mismatch():
 
     with pytest.raises(ValueError, match="targets length does not match"):
         runtime_cce(hidden, weight, targets_wrong_len)
+
+
+def test_runtime_cce_chunk_plan_cache_canonicalizes_bounds_and_recreates():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    runtime_cce, _ = make_chunked_cross_entropy_loss(chunk_size=4)
+    cache_info = runtime_cce._unsloth_chunk_plan_cache_info
+
+    def loss_value(vocab_size, *, n_tokens=1, dtype=mx.float32):
+        hidden = mx.ones((n_tokens, 4), dtype=dtype)
+        weight = mx.ones((vocab_size, 4), dtype=dtype)
+        targets = mx.zeros((n_tokens,), dtype=mx.int32)
+        loss = runtime_cce(hidden, weight, targets).sum()
+        mx.eval(loss)
+        return loss.item()
+
+    expected = loss_value(4)
+    loss_value(4, n_tokens=2)
+    after_same_plan = cache_info()
+    assert after_same_plan["entries"] == 1
+    assert after_same_plan["hits"] > 0
+
+    loss_value(4, dtype=mx.float16)
+    loss_value(4, dtype=mx.bfloat16)
+    assert cache_info()["entries"] == 3
+
+    for vocab_size in range(5, 23):
+        loss_value(vocab_size)
+    bounded = cache_info()
+    assert set(bounded) == {
+        "entries", "max_entries", "hits", "misses", "evictions",
+    }
+    assert bounded["entries"] == bounded["max_entries"] == 16
+    assert bounded["evictions"] > 0
+
+    misses_before = bounded["misses"]
+    assert loss_value(4) == expected
+    assert cache_info()["misses"] > misses_before
 
 
 # ----------------------------------------------------------------------

@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 # Auto-install missing notebook-only Python deps on first use.
 #
 # Four notebooks failed in the Blackwell docker validation because the slim
@@ -22,6 +38,7 @@ import subprocess
 import sys
 
 from ..log import logger
+from .common import TEMPORARY_PATCHES
 
 # pypi-name -> import-name (None means same).
 _ALLOW_LIST = {
@@ -206,19 +223,59 @@ def patch_check_imports_autoinstall():
     dmu.check_imports = check_imports
 
 
+def _ipython_chain_is_broken() -> bool:
+    """
+    True only when IPython is installed but its hard dependency ``traitlets``
+    is missing, i.e. the environment is already broken and the very next
+    ``from IPython...`` import will die with a bare ModuleNotFoundError.
+
+    This is deliberately narrow. A plain ``import unsloth`` in a script,
+    container or CI job that never had IPython in the first place must not
+    reach the package manager at all. ``find_spec`` only inspects the local
+    metadata, so the probe itself is offline and cannot import IPython (which
+    would need the very traitlets we are checking for).
+    """
+    return (
+        importlib.util.find_spec("IPython") is not None
+        and importlib.util.find_spec("traitlets") is None
+    )
+
+
 def _ensure_notebook_chain():
     """
-    Pre-emptive ensure for deps that raise bare ModuleNotFoundError outside
-    transformers (the Jupyter/IPython chain). Kept tiny: only ``traitlets``
-    is touched today; expand only when a new failure mode appears.
+    Repair deps that raise a bare ModuleNotFoundError outside transformers
+    (the Jupyter/IPython chain), so no wrapper hook can catch them. Kept tiny:
+    only ``traitlets`` is touched today; expand only when a new failure mode
+    appears.
     """
     if not _AUTO_INSTALL or _NO_NETWORK:
+        return
+    if not _ipython_chain_is_broken():
         return
     for pkg in ("traitlets",):
         if importlib.util.find_spec(pkg) is None:
             _try_install_and_import(pkg)
 
 
-patch_requires_backends_autoinstall()
-patch_check_imports_autoinstall()
-_ensure_notebook_chain()
+def patch_notebook_deps_autoinstall():
+    """Install all three hooks. Idempotent, so it is safe to run at import time
+    and again from the ``TEMPORARY_PATCHES`` pass."""
+    patch_requires_backends_autoinstall()
+    patch_check_imports_autoinstall()
+    _ensure_notebook_chain()
+
+
+TEMPORARY_PATCHES.append(patch_notebook_deps_autoinstall)
+
+# Install the two wrappers at import time as well, since a trust_remote_code
+# modeling file can be loaded before the TEMPORARY_PATCHES pass runs. Both are
+# pure monkeypatches with no network or package-manager side effects; the only
+# hook that can reach pip is `_ensure_notebook_chain`, and it no-ops unless the
+# IPython chain is already broken. Set UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN=1 to
+# suppress just this import-time run (the TEMPORARY_PATCHES pass still applies),
+# mirroring UNSLOTH_VENDORED_FLA_NO_AUTORUN in fla_vendor.py.
+if os.environ.get("UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN", "0") != "1":
+    try:
+        patch_notebook_deps_autoinstall()
+    except Exception as _e:
+        logger.warning(f"Unsloth: notebook dependency hooks deferred: {_e}")

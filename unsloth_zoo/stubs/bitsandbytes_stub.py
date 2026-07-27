@@ -40,7 +40,10 @@ class _Noop:
     Optional-feature probes that use ``hasattr`` or ``if bnb.foo`` still
     work via ``__getattr__`` and ``__bool__``.
     """
-    def __init__(self, name="stub"): self._name = name
+    def __init__(self, *args, **kwargs):
+        # Accept any args, incl. the (name, bases, namespace) triple Python
+        # passes when a stubbed class is subclassed at import (e.g. Linear4bit).
+        self._name = args[0] if args else kwargs.get("name", "stub")
     def __call__(self, *a, **kw):
         raise NotImplementedError(
             f"Unsloth: '{self._name}' was called on Apple Silicon / MLX, "
@@ -88,6 +91,8 @@ class _BnbFinder(MetaPathFinder):
 
 __version__ = "0.46.0"
 __path__ = []
+# Lets callers tell this stub from real bitsandbytes (e.g. drift tests skip on it).
+IS_UNSLOTH_STUB = True
 
 def __getattr__(name):
     """Module-level __getattr__ (Python 3.7+): any missing attr returns a _Noop."""

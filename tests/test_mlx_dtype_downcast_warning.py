@@ -59,9 +59,8 @@ def test_force_float32_list_exported():
 
 
 def test_force_float32_matches_config_json_model_types():
-    """Entries are HuggingFace `config.json` `model_type` values (the same
-    strings returned by `get_transformers_model_type`). The MLX matcher
-    must accept the real on-disk variants verbatim."""
+    """Entries are real config.json `model_type` strings; the MLX matcher must
+    accept the on-disk variants verbatim."""
     from unsloth_zoo.mlx.loader import _is_force_float32_arch
     # Real config.json model_type strings as they appear on the Hub.
     real_world = [
@@ -125,12 +124,10 @@ def test_no_warning_for_safe_architecture():
 
 
 def test_gemma3_comma_does_not_match_gemma3n():
-    """The trailing-comma trick: 'gemma3,' must NOT match 'gemma3n_audio'."""
+    """The trailing-comma trick: 'gemma3,' must NOT prefix-match other variants."""
     import torch
     from unsloth_zoo.mlx.loader import _is_force_float32_arch
-    # gemma3n is its own entry and DOES match; we're testing that the
-    # 'gemma3,' entry doesn't accidentally swallow gemma3n variants by
-    # prefix match. gemma3n itself still matches via its own entry.
+    # gemma3n matches via its own entry, not by 'gemma3,' prefix-swallowing.
     assert _is_force_float32_arch("gemma3") is True
     assert _is_force_float32_arch("gemma3n") is True
     assert _is_force_float32_arch("gemma3text") is True

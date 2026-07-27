@@ -14,20 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""
-Tier 0 LoRA merge correctness tests for unsloth_zoo/saving_utils.py.
+"""Tier 0 LoRA merge correctness tests for unsloth_zoo/saving_utils.py.
 
-These run on Linux+CUDA without any MLX shim.  They exercise:
-
-1. _active_merge_device() returns the active accelerator family string
-   (cuda on a CUDA host).  This is the recently-pushed fix that replaced
-   the W-based helper which leaked device indices across device types.
-2. _merge_lora computes  W + alpha * lora_B @ lora_A  with the right
-   shapes, dtypes, and device placement.
-3. _merge_lora handles the vocab-resize case (lora_B taller than W).
-4. _merge_lora raises on non-finite values.
-5. The 5 MoE expert-merge variants compute the correct per-expert
-   updates against a numpy reference.
+Run on Linux+CUDA without an MLX shim. Cover _active_merge_device(), _merge_lora
+(base merge, vocab-resize, non-finite guard), and the 5 MoE expert-merge variants
+against a numpy reference.
 """
 
 from __future__ import annotations
@@ -110,11 +101,8 @@ def test_merge_lora_standard(dtype):
 def test_merge_lora_moves_cpu_inputs_to_active_device():
     """W on CPU should land on the active device after _merge_lora.
 
-    Pre-fix: the W-based helper returned torch.device('cuda') (no index)
-    when W was on CPU, which delegates to current_device() — mostly
-    correct on single-GPU but unreliable on multi-GPU.
-    Post-fix: returns the string 'cuda', .to('cuda') uses current_device
-    consistently.
+    The W-based helper returned an indexless torch.device('cuda') for CPU W
+    (unreliable on multi-GPU); the fix returns the string 'cuda' instead.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -127,10 +115,7 @@ def test_merge_lora_moves_cpu_inputs_to_active_device():
 
 
 def test_merge_lora_vocab_resize():
-    """When lora_B has more rows than W, the merge expands W with zero-padding.
-
-    This path is used when fine-tuning grows the vocab (added tokens).
-    """
+    """lora_B taller than W: merge zero-pads W (vocab-grow / added-tokens path)."""
     torch.manual_seed(SEED)
     old_vocab, new_vocab, dim, rank = 100, 128, 32, 8
     alpha = 16.0

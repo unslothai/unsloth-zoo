@@ -223,7 +223,6 @@ def get_device_type():
         return "cuda"
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return "xpu"
-    # Check torch.accelerator
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
             # Test-only CPU fallback. The env var is read exactly once per
@@ -283,10 +282,7 @@ if DEVICE_TYPE == "hip":
 pass
 
 def device_synchronize():
-    """
-    Synchronize the current device (CUDA, XPU, or HIP).
-    This is a cross-platform replacement for torch.cuda.synchronize().
-    """
+    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, or HIP)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -297,10 +293,7 @@ def device_synchronize():
 pass
 
 def device_empty_cache():
-    """
-    Empty the active device cache (CUDA, XPU, or HIP).
-    Cross-platform replacement for torch.cuda.empty_cache().
-    """
+    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, or HIP)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -311,10 +304,7 @@ def device_empty_cache():
 pass
 
 def device_is_bf16_supported():
-    """
-    Whether the active device (CUDA, XPU, or HIP) supports bfloat16.
-    Cross-platform replacement for torch.cuda.is_bf16_supported().
-    """
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, or HIP)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()

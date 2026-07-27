@@ -19,19 +19,45 @@ except ImportError:
         def __init__(self, device):
             self.device = device
 
-from vllm.config import LoRAConfig
-from vllm.logger import init_logger
+# Guard vLLM imports so this module imports without vLLM (real LoRA work needs it).
+try:
+    from vllm.config import LoRAConfig, VllmConfig
+except ImportError:
+    class LoRAConfig: pass
+    class VllmConfig: pass
+try:
+    from vllm.logger import init_logger
+except ImportError:
+    import logging
+    def init_logger(name): return logging.getLogger(name)
 try:
     from vllm.lora.models import (LoRAModel, LoRAModelManager,
                                 LRUCacheLoRAModelManager, create_lora_manager)
 except ImportError:
     # Newer vLLM version moved/split lora methods
     # https://github.com/vllm-project/vllm/pull/30253
-    from vllm.lora.lora_model import LoRAModel
-    from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
-from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.request import LoRARequest
-from vllm.lora.utils import get_adapter_absolute_path
+    try:
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
+    except ImportError:
+        class LoRAModel: pass
+        class LoRAModelManager: pass
+        class LRUCacheLoRAModelManager: pass
+        def create_lora_manager(*args, **kwargs):
+            raise RuntimeError("vLLM is required for LoRA worker manager")
+try:
+    from vllm.lora.peft_helper import PEFTHelper
+except ImportError:
+    class PEFTHelper: pass
+try:
+    from vllm.lora.request import LoRARequest
+except ImportError:
+    class LoRARequest: pass
+try:
+    from vllm.lora.utils import get_adapter_absolute_path
+except ImportError:
+    def get_adapter_absolute_path(*args, **kwargs):
+        raise RuntimeError("vLLM is required for LoRA worker manager")
 
 logger = init_logger(__name__)
 
@@ -122,18 +148,21 @@ class WorkerLoRAManager(AbstractWorkerManager):
             else:
                 lora_request.lora_config["vllm_max_position_embeddings"] = self.max_position_embeddings
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
 
-            # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
-            # to ensure correct loading of lora weights.
+            # For some models like Qwen2VL, we need hf_to_vllm_mapper for correct
+            # lora loading. On vLLM >= 0.25.0 it also folds q/k/v (and gate/up)
+            # into orig_to_new_stacked; _map_name drops the shard id so they
+            # collide onto one key -> IndexError. Drop the stacked maps (keeping
+            # genuine renames) like vLLM's own worker_manager; absent on <0.25.0.
             hf_to_vllm_mapper = None
             if (hasattr(model, "hf_to_vllm_mapper")
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
+                unstack = getattr(hf_to_vllm_mapper, "get_unstacked_mapper", None)
+                if callable(unstack):
+                    hf_to_vllm_mapper = unstack()
 
-            # Prepare common arguments
             lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
             kwargs = {
                 "lora_model_id": lora_request.lora_int_id,
@@ -208,6 +237,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)
+
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM >= 0.23 queries this before LoRA warmup profiling; older vLLM has
+        # no such method on the model manager, so fall back to the given rank.
+        manager = getattr(self, "_adapter_manager", None)
+        inner = getattr(manager, "get_dummy_lora_warmup_rank", None)
+        return inner(default_rank) if inner is not None else default_rank
 
     def pin_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.pin_adapter(adapter_id)
@@ -312,7 +348,6 @@ def old_init(
     # Lazily initialized by create_lora_manager.
     self._adapter_manager: LoRAModelManager
 
-from vllm.config import VllmConfig
 def new_init(
     self,
     vllm_config: VllmConfig,

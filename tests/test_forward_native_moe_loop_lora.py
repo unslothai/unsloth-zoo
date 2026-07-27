@@ -1,18 +1,10 @@
 """Regression tests for forward_native_moe_loop LoRA application.
 
-These tests cover the gate_up_proj and down_proj transpose-on-mismatch checks
-plus the once-per-forward dtype pre-cast that PR #618 introduces. They are
-PEFT-version-agnostic: they construct LoRA factors by hand in the same shape
-the extractor would produce, then verify that
-
-    forward_native_moe_loop(experts, x, top_k_idx, top_k_weights)
-
-produces the same per-expert output as the naive reference
-
-    base_out + (X @ first[e]) @ second[e] * scaling
-
-for both the canonical (E, 2*I, H) / (E, H, I) Qwen3-MoE storage AND the
-transposed (E, H, 2*I) / (E, I, H) Qwen3-VL-MoE storage.
+Cover the gate_up_proj/down_proj transpose-on-mismatch checks and the
+once-per-forward dtype pre-cast (PR #618). PEFT-version-agnostic: build LoRA
+factors by hand and check forward_native_moe_loop matches the naive reference
+base_out + (X @ first[e]) @ second[e] * scaling, for both canonical Qwen3-MoE
+and transposed Qwen3-VL-MoE storage.
 """
 
 import pytest
@@ -24,8 +16,7 @@ from unsloth_zoo.temporary_patches.moe_utils import forward_native_moe_loop
 
 
 def _build_experts(num_experts, hidden, intermediate, transposed_storage):
-    """Build a minimal `experts` module that exposes the surface area
-    `forward_native_moe_loop` reads."""
+    """Minimal `experts` module exposing what `forward_native_moe_loop` reads."""
     experts = nn.Module()
     experts.num_experts = num_experts
     if transposed_storage:
@@ -180,10 +171,8 @@ def test_forward_native_moe_loop_no_lora_matches_naive(transposed_storage):
 
 
 def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
-    """When `intermediate_dim == hidden_dim`, the shape-based transpose check
-    cannot tell which orientation the per-expert weight is stored in. The
-    explicit `_unsloth_grouped_mm_format` flag must take precedence so that
-    transposed storage is detected even at square dims.
+    """At square dims (intermediate_dim == hidden_dim) the shape check can't tell
+    the weight orientation; the `_unsloth_grouped_mm_format` flag must win.
     """
     torch.manual_seed(13)
     num_experts = 3
@@ -192,8 +181,7 @@ def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
     num_tokens = 5
     top_k = 2
 
-    # Use intermediate = dim so that down_proj is (E, dim, dim) — square.
-    # gate_up_proj is (E, 2*dim, dim) which is non-square so easy.
+    # intermediate = dim makes down_proj (E, dim, dim) square; gate_up stays easy.
     intermediate = dim
     hidden = dim
 
@@ -272,3 +260,46 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
     rtol = 1e-4 if dtype == torch.float32 else 1e-1
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
     assert out.dtype == dtype
+
+
+class GptOssExperts(nn.Module):
+    """Stock gpt-oss layout: (E, in, out) weights, biases, clamped swiglu."""
+
+    def __init__(self, num_experts=4, hidden=16, intermediate=12):
+        super().__init__()
+        self.num_experts = num_experts
+        self.alpha = 1.702
+        self.limit = 7.0
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(num_experts, hidden, 2 * intermediate) * 0.1)
+        self.gate_up_proj_bias = nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate) * 0.1)
+        self.down_proj = nn.Parameter(
+            torch.randn(num_experts, intermediate, hidden) * 0.1)
+        self.down_proj_bias = nn.Parameter(torch.randn(num_experts, hidden) * 0.1)
+        self._unsloth_grouped_mm_format = True
+
+
+def test_forward_native_moe_loop_gpt_oss_matches_naive():
+    torch.manual_seed(0)
+    num_experts, hidden, num_tokens, top_k = 4, 16, 8, 2
+    experts = GptOssExperts(num_experts, hidden)
+    hidden_states = torch.randn(num_tokens, hidden)
+    top_k_index = torch.stack(
+        [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)])
+    top_k_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
+
+    out = forward_native_moe_loop(experts, hidden_states, top_k_index, top_k_weights)
+
+    ref = torch.zeros_like(hidden_states)
+    for t in range(num_tokens):
+        for k in range(top_k):
+            e = top_k_index[t, k].item()
+            h = hidden_states[t] @ experts.gate_up_proj[e] + experts.gate_up_proj_bias[e]
+            gate, up = h[::2], h[1::2]
+            gate = gate.clamp(max=experts.limit)
+            up = up.clamp(min=-experts.limit, max=experts.limit)
+            inter = (up + 1.0) * (gate * torch.sigmoid(gate * experts.alpha))
+            ref[t] += top_k_weights[t, k] * (
+                inter @ experts.down_proj[e] + experts.down_proj_bias[e])
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)

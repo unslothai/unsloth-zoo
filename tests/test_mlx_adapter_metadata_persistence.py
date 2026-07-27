@@ -1,19 +1,8 @@
 """Coverage for MLX LoRA adapter save/reload metadata persistence.
 
-Targets the helpers that infer rank/scale/dropout from live MLX LoRA
-modules and the reload-time wrapper that recreates non-language LoRA
-paths before loading adapter weights:
-
-  - _get_mlx_dropout_probability prefers MLX Dropout._p_1 keep-probability
-    over the stale .p attribute used by compatibility shims.
-  - _infer_mlx_lora_rank reads MoE/Switch rank from lora_a.shape[-2] and
-    cross-checks lora_b shape, returning None on mismatch and handling
-    None/missing-shape inputs without raising.
-  - _enrich_mlx_adapter_config persists rank/scale/dropout under an
-    explicit filter that does NOT borrow metadata from unselected modules
-    while still honoring caller-provided topology metadata exactly.
-  - _apply_lora_at_paths TypeError-fallback restores both scale AND
-    dropout when older mlx-lm wrappers reject those kwargs.
+Targets the helpers that infer rank/scale/dropout from live MLX LoRA modules
+(_get_mlx_dropout_probability, _infer_mlx_lora_rank, _enrich_mlx_adapter_config)
+and the reload-time wrapper that restores scale/dropout on older mlx-lm wrappers.
 """
 
 import os
@@ -477,12 +466,9 @@ def test_enrich_mlx_adapter_config_normalizes_pathlike_explicit_paths():
 
 
 def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
-    # _enrich_mlx_adapter_config previously used raw float(module.scale).
-    # A LoRASwitchLinear that exposes scale as a multi-element mx.array
-    # made float() raise, which the outer try/except: pass swallowed -
-    # silently dropping unsloth_mlx_lora_module_paths so the reload path
-    # could not re-attach vision/projector LoRA wrappers. Mirror the
-    # trainer-side .item() / fallback-1.0 coercion in enrich too.
+    # A multi-element mx.array scale used to make float() raise, swallowed by an
+    # outer try/except that dropped unsloth_mlx_lora_module_paths. Enrich must
+    # mirror the trainer-side .item() / fallback-1.0 coercion.
     mlx_utils = _load_utils()
 
     class _MultiExpertScale:

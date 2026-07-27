@@ -33,9 +33,9 @@ from ..device_type import DEVICE_TYPE
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
 N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 
-# Register grad_and_value_impl in trace_rules as defense-in-depth.
-# grad_impl is registered but grad_and_value_impl is not, which can cause
-# GB0149 "Unsupported functorch tracing attempt" in some configurations.
+# Register grad_and_value_impl in trace_rules (grad_impl is registered but
+# grad_and_value_impl is not, which can cause GB0149 "Unsupported functorch
+# tracing attempt" in some configurations).
 try:
     from torch._dynamo.trace_rules import manual_torch_name_rule_map as _trace_map
     from torch._dynamo.variables.higher_order_ops import FunctorchHigherOrderVariable as _FHOV
@@ -138,13 +138,15 @@ pass
 
 @functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None):
-    """ Gets chunk size that fits the target max memory usage (1GB) """
+    """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
         free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
-        target_gb = free_gb
+        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
+        # single chunk, materializing full float32 logits and dominating peak memory.
+        target_gb = min(free_gb, 4.0)
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -157,17 +159,22 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
 pass
 
 def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
-    """ Gets chunk size that fits the target max memory usage (1GB) """
+    """Number of chunks that fits the target max memory usage."""
     multiplier = _get_chunk_multiplier(vocab_size, target_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits = max(round(n_splits / 4) * 4, 1) # Output only multiples of 4
-    n_splits = max(round(n_splits) * 4, 1)
-    return n_splits
+    # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
+    # chunks needed to keep every chunk within target. Round UP to the next
+    # multiple of 4 so the target stays a real ceiling. Nearest-rounding could
+    # round down (round(0.5) -> 0) and collapse a 4-8 GiB logits transient into
+    # a single uncapped chunk; a config that already fits one chunk stays at one.
+    exact = n_splits * 4
+    if exact <= 1.0 + 1e-9:
+        return 1
+    return math.ceil(exact / 4 - 1e-9) * 4
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
-    # One-time flag so the "scaling=0" info message is logged at most once per
-    # process, even if the condition triggers on every backward call.
+    # Log the "scaling=0" info message at most once per process.
     _scaling_zero_logged = False
 
     @staticmethod
@@ -514,11 +521,9 @@ class UnslothFusedLoss(torch.autograd.Function):
                         f"Fused losses grad_output scaled by {scale_factor_val} (got {grad_scale_val}, expected {scaling})"
                     )
 
-        # Out-of-place mul so that ctx.saved_tensors' version counter does not
-        # bump; this keeps retain_graph / double-backward-capable flows working.
-        # Measured peak-memory delta vs. in-place mul is <3 MB across 14
-        # configurations (LoRA, full-FT, MoE, vision, bsz up to 16, seq up to
-        # 8192) because the temporary is freed before peak-setting allocations.
+        # Out-of-place mul so ctx.saved_tensors' version counter doesn't bump,
+        # keeping retain_graph / double-backward flows working. Measured peak
+        # memory delta vs in-place is <3 MB across 14 configs.
         grad_inputs = grad_inputs * scale_factor
         if grad_lm_head is not None: grad_lm_head = grad_lm_head * scale_factor
         if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias * scale_factor

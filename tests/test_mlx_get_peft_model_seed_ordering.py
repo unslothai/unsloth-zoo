@@ -1,13 +1,9 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Pin the seed-immediately-before-linear_to_lora_layers ordering in
 # FastMLXModel.get_peft_model so we match mlx-lm CLI's basin family.
-#
-# The actual numerical test (lora_a values bit-identical to
-# `mlx_lm.tuner.utils.linear_to_lora_layers` after `mx.random.seed`)
-# needs real MLX runtime; that's covered by probe 39 on
-# danielhanchen/unsloth-staging-2. Locally we guard against a future
-# refactor reverting to a single `_seed_mlx_random_state` call far
-# above `linear_to_lora_layers` again.
+# The numerical test (bit-identical lora_a) needs real MLX and is
+# covered by probe 39 on danielhanchen/unsloth-staging-2; locally we
+# guard against a refactor moving the seed call far from the LoRA init.
 
 from __future__ import annotations
 
@@ -19,8 +15,11 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
-    simulate_mlx_on_torch()
+    try:
+        import mlx  # noqa: F401
+    except ImportError:
+        from mlx_simulation import simulate_mlx_on_torch
+        simulate_mlx_on_torch()
 
 
 def _get_peft_model_source():
@@ -29,16 +28,12 @@ def _get_peft_model_source():
 
 
 def test_seed_immediately_precedes_each_linear_to_lora_layers_call():
-    """Every `linear_to_lora_layers(...)` call inside get_peft_model
-    must be preceded -- within ~20 source lines, with no other MLX op
-    or model-tree walk in between -- by a `_seed_mlx_random_state` call.
+    """Every `linear_to_lora_layers(...)` in get_peft_model must be
+    preceded within ~20 lines by `_seed_mlx_random_state`.
 
-    Background: empirically (Round BQ probe 39 on Apple Silicon), having
-    the seed call >100 lines above the LoRA construction allows lazy MLX
-    state advances to slip in between seeding and lora_a init, producing
-    lora_a matrices different from mlx-lm CLI's despite both paths
-    re-seeding to the same int. The fix is to seed immediately above
-    each `linear_to_lora_layers` call.
+    Empirically (probe 39 on Apple Silicon), a far-away seed lets lazy
+    MLX state advances slip in before lora_a init, diverging from mlx-lm
+    CLI; fix is to seed immediately above each LoRA construction.
     """
     src = _get_peft_model_source()
     lines = src.splitlines()
@@ -70,15 +65,15 @@ def test_get_peft_model_still_accepts_random_state_arg():
 
 
 def test_no_other_mlx_op_between_seed_and_linear_to_lora_layers():
-    """Between the seed-just-above-LoRA call and the linear_to_lora_layers
-    call itself, the only allowed code is the LoRA call. Anything else --
-    even pure Python -- is a tripwire because it makes it easy to slip
-    in an mx.eval/random call later. Enforced as a regex tripwire."""
+    """Only comment lines may sit between the seed call and the
+    linear_to_lora_layers call; anything else risks an mx.eval/random op
+    slipping in later. Enforced as a regex tripwire."""
     src = _get_peft_model_source()
     pattern = re.compile(
         r"_seed_mlx_random_state\(random_state\)\s*"
         r"(?:\n\s*#[^\n]*)*"
-        r"\s*\n\s*linear_to_lora_layers\(",
+        r"\s*\n\s*(?:[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*=\s*)?"
+        r"linear_to_lora_layers\(",
     )
     matches = pattern.findall(src)
     assert len(matches) >= 2, (

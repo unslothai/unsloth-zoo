@@ -46,12 +46,9 @@ from .moe_utils import (
 )
 
 def patch_deepseek_v3():
-    """
-    Patches DeepSeekV3 MoE to support Split LoRA using grouped GEMM.
-    """
+    """Patch DeepSeekV3 MoE to support Split LoRA via grouped GEMM."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Try to import the DeepSeekV3 MoE classes
     try:
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             DeepseekV3NaiveMoe,
@@ -60,19 +57,15 @@ def patch_deepseek_v3():
             DeepseekV3Config,
         )
     except Exception as e:
-        # DeepSeekV3 not available yet
-        return
+        return  # DeepSeekV3 not available yet
 
-    # Check if already patched
     if hasattr(DeepseekV3NaiveMoe, "_unsloth_already_patched"):
         return
 
     # Patch PEFT ParamWrapper for separated LoRA weights
     patch_param_wrapper_for_moe()
 
-    # ====================================================================
-    # Define LoRA extraction function for DeepSeekV3 (Standard Format)
-    # ====================================================================
+    # LoRA extraction function for DeepSeekV3 (standard format)
     def _deepseek_v3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         return extract_moe_lora_weights_for_grouped_mm(
             wrapper,
@@ -85,27 +78,16 @@ def patch_deepseek_v3():
             logger_obj=logger,
         )
 
-    # Register the extractor on the NaiveMoe class (avoid binding as instance method)
+    # Register extractor on the class (staticmethod, not bound) + mark model type
     DeepseekV3NaiveMoe._unsloth_lora_extractor_fn = staticmethod(_deepseek_v3_lora_extractor)
-    # Also mark the model type for weight preprocessing
     DeepseekV3NaiveMoe._unsloth_model_type = "deepseek_v3"
     DeepseekV3NaiveMoe._unsloth_already_patched = True
 
-    # ====================================================================
-    # Patch DeepseekV3NaiveMoe.forward to use backend dispatch in moe_utils
-    # ====================================================================
-
-    # Apply patch to DeepseekV3NaiveMoe
+    # DeepseekV3NaiveMoe.forward -> backend dispatch in moe_utils
     patch_function(DeepseekV3NaiveMoe, "forward", get_forward_moe_backend())
 
-    # ====================================================================
-    # Patch DeepseekV3MoE.forward to mark model type
-    # ====================================================================
-
     def patched_moe_forward(self, hidden_states):
-        """
-        Patched forward that adds model type marker for proper LoRA extraction.
-        """
+        """Forward that marks model type for proper LoRA extraction."""
         residuals = hidden_states
         orig_shape = hidden_states.shape
         router_logits = self.gate(hidden_states)
@@ -121,16 +103,13 @@ def patch_deepseek_v3():
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
 
-    # Apply patch to DeepseekV3MoE
     patch_function(DeepseekV3MoE, "forward", patched_moe_forward)
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched DeepSeekV3 MoE for Split LoRA support.")
 
-    # ====================================================================
-    # Patch DeepseekV3ForCausalLM.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
-    # ====================================================================
+    # Patch DeepseekV3ForCausalLM.forward for GRPO: return hidden_states instead
+    # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             DeepseekV3ForCausalLM,
@@ -158,7 +137,6 @@ def patch_deepseek_v3():
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
             if not RETURN_HIDDEN_STATES:
-                # Normal forward pass
                 return _original_causal_lm_forward(
                     self,
                     input_ids=input_ids,
@@ -174,7 +152,6 @@ def patch_deepseek_v3():
                     **kwargs,
                 )
 
-            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -189,14 +166,12 @@ def patch_deepseek_v3():
 
             hidden_states = outputs.last_hidden_state
 
-            # Apply slice_indices to hidden_states (same indexing as for logits)
-
-            # DeepSeekV3 implementation of logits_to_keep handling:
+            # Slice hidden_states the same way logits would be (logits_to_keep)
             if logits_to_keep != 0:
                 slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
                 hidden_states = hidden_states[:, slice_indices, :]
 
-            # Return hidden_states as "logits" for GRPO to use
+            # Return hidden_states as "logits" for GRPO
             return CausalLMOutputWithPast(
                 loss=None,
                 logits=hidden_states,
@@ -221,5 +196,4 @@ def patch_deepseek_v3():
     return True
 
 
-# Register the patch - it will be called when unsloth is imported
 TEMPORARY_PATCHES.append(patch_deepseek_v3)

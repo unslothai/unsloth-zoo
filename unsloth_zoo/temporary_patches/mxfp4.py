@@ -24,9 +24,8 @@ import math
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 
-# MXFP4 configuration
-# Set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 to keep MXFP4 weights quantized (requires triton_kernels)
-# Otherwise, MXFP4 weights will be dequantized to bf16 for LoRA training
+# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels);
+# otherwise weights dequantize to bf16 for LoRA training.
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
 
 
@@ -49,15 +48,9 @@ def is_triton_kernels_available():
 
 
 def should_dequantize_mxfp4():
-    """
-    Check if MXFP4 should be dequantized to bf16 for training.
+    """Whether MXFP4 should be dequantized to bf16 for training.
 
-    Returns True if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE is not set or "0", OR
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" but triton_kernels is not available
-
-    Returns False if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available
+    True unless UNSLOTH_MXFP4_NO_DEQUANTIZE="1" and triton_kernels is available.
     """
     if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
         return True  # Default: dequantize for compatibility
@@ -74,16 +67,10 @@ def should_dequantize_mxfp4():
 
 
 def get_mxfp4_config_for_training():
-    """
-    Get the appropriate Mxfp4Config for training.
-
-    Returns Mxfp4Config with dequantize=True unless:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE=1 AND triton_kernels is available
+    """Return the Mxfp4Config for training (dequantize=True unless
+    UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and triton_kernels is available).
 
     Usage:
-        from unsloth_zoo.temporary_patches.mxfp4 import get_mxfp4_config_for_training
-        from transformers import AutoModelForCausalLM
-
         model = AutoModelForCausalLM.from_pretrained(
             "unsloth/gpt-oss-20b",
             quantization_config=get_mxfp4_config_for_training(),
@@ -105,9 +92,7 @@ def get_mxfp4_config_for_training():
     return Mxfp4Config(dequantize=dequantize)
 
 def patch_convert_moe_packed_tensors():
-    """
-    Pin the original GPU-optimized version of convert_moe_packed_tensors with smaller default chunk size.
-    """
+    """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
     try:
         import transformers.integrations.mxfp4
         from transformers.integrations.mxfp4 import FP4_VALUES
@@ -121,17 +106,8 @@ def patch_convert_moe_packed_tensors():
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 32768 * 1024,
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights again, dequantizing and makes them compatible with the forward
-        pass of GPT_OSS.
-
-        Args:
-            blocks: Packed quantized weights
-            scales: Quantization scales
-            dtype: Output data type
-            rows_per_chunk: Number of rows to process per chunk. .
-        """
-        # Check if blocks and scales are on CPU, and move to GPU if so
+        """Dequantize mxfp4 weights into GPT_OSS-compatible form (GPU path)."""
+        # Move CPU tensors to GPU if available.
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
@@ -235,21 +211,13 @@ def patch_convert_moe_packed_tensors():
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 1024 * 1024,  # CPU-optimized default (~2.6GB temp memory)
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights again, dequantizing and makes them compatible with the forward
-        pass of GPT_OSS. CPU-optimized version with smaller default chunk size.
+        """Dequantize mxfp4 weights into GPT_OSS-compatible form (CPU path,
+        smaller default chunk).
 
-        Args:
-            blocks: Packed quantized weights
-            scales: Quantization scales
-            dtype: Output data type
-            rows_per_chunk: Number of rows to process per chunk. CPU-optimized default: 1M rows.
-                           Memory usage per chunk (assuming B=128):
-                           - 8192: ~22 MB
-                           - 1048576 (1M): ~2.6 GB
-                           - 33554432 (32M): ~90 GB
+        rows_per_chunk default 1M rows; per-chunk memory at B=128: 8192 ~22 MB,
+        1M ~2.6 GB, 32M ~90 GB.
         """
-        # Ensure tensors are on CPU
+        # Force tensors onto CPU.
         if blocks.is_cuda:
             blocks = blocks.cpu()
         if scales.is_cuda:
@@ -259,7 +227,6 @@ def patch_convert_moe_packed_tensors():
 
         assert blocks.shape[:-1] == scales.shape, f"{blocks.shape[:-1]=} does not match {scales.shape=}"
 
-        # Create LUT on CPU
         lut = torch.tensor(FP4_VALUES, dtype=dtype, device='cpu')
 
         *prefix_shape, G, B = blocks.shape
@@ -268,7 +235,6 @@ def patch_convert_moe_packed_tensors():
         blocks = blocks.reshape(rows_total, B)
         scales = scales.reshape(rows_total, 1)
 
-        # Create output tensor on CPU
         out = torch.empty(rows_total, B * 2, dtype=dtype, device='cpu')
 
         for r0 in range(0, rows_total, rows_per_chunk):
@@ -292,7 +258,6 @@ def patch_convert_moe_packed_tensors():
         del blocks, scales, lut
         return out
 
-    # Add the new CPU function to the mxfp4 module
     if hasattr(transformers.integrations.mxfp4, 'convert_moe_packed_tensors'):
         transformers.integrations.mxfp4.convert_moe_packed_tensors_cpu = convert_moe_packed_tensors_cpu
         if UNSLOTH_ENABLE_LOGGING:

@@ -19,7 +19,7 @@ Smoke + Tier 1 + Tier 2 tests for the mlx_stub package.
 
 Verifies:
 1. simulate_mlx_on_torch() succeeds and registers all named submodules.
-2. PR-B's 5 fresh symbols (mx.metal.is_available, set_wired_limit,
+2. Unsloth backend's 5 fresh symbols (mx.metal.is_available, set_wired_limit,
    device_info, clear_cache, synchronize) work as expected.
 3. The ~70 trivial passthroughs round-trip vs torch on random inputs.
 4. Sub-architecture VLM submodules auto-resolve via the MetaPathFinder.
@@ -33,9 +33,8 @@ import pytest
 import torch
 
 
-# Install the shim once at session start.  All later `import mlx*` calls
-# resolve to the stubs.  The shim package lives at workspace_1/mlx_simulation/
-# (loaded via the workspace conftest.py that puts the workspace on sys.path).
+# Install the shim once at session start so all later `import mlx*` resolve to
+# the stubs (loaded via the workspace conftest.py that puts it on sys.path).
 @pytest.fixture(autouse=True, scope="session")
 def _install_mlx_shim():
     from mlx_simulation import simulate_mlx_on_torch
@@ -100,7 +99,7 @@ def test_vlm_subarch_auto_resolve(submodule):
 
 
 # ---------------------------------------------------------------------------
-# 2. Tier 1: PR-B fresh symbols.
+# 2. Tier 1: Unsloth backend fresh symbols.
 # ---------------------------------------------------------------------------
 
 def test_metal_is_available_returns_false():
@@ -219,6 +218,55 @@ def test_finfo_and_dtype_kinds():
     assert mx.issubdtype(mx.float32, mx.floating) is True
     assert mx.issubdtype(mx.int32, mx.floating) is False
     assert mx.issubdtype(mx.int32, mx.integer) is True
+
+
+def test_module_children_preserves_direct_child_tree():
+    import mlx.nn as nn
+
+    class PropertyModule(nn.Module):
+        @property
+        def virtual(self):
+            return self
+
+    model = nn.Module()
+    model.direct = nn.Module()
+    model.alias = model.direct
+    model.layers = [nn.Module(), object()]
+    model.named = {
+        "leaf": nn.Module(),
+        "nested": [nn.Module(), 1],
+        "tupled": (nn.Module(),),
+    }
+    model.tupled = (nn.Module(),)
+    model.loop = model
+
+    children = model.children()
+    assert children["direct"] is model.direct
+    assert children["alias"] is model.direct
+    assert children["layers"] == [model.layers[0], {}]
+    assert children["named"] == {
+        "leaf": model.named["leaf"],
+        "nested": [model.named["nested"][0], {}],
+        "tupled": {},
+    }
+    assert "tupled" not in children and children["loop"] is model
+    assert "direct" in model and "virtual" not in PropertyModule()
+    linear, embedding = nn.Linear(2, 2, bias=False), nn.Embedding(2, 2)
+    linear.extra = model.direct
+    assert "weight" in linear and "weight" in embedding and "extra" in linear
+    linear.weight = embedding.weight = None
+    assert "weight" not in linear and "weight" not in embedding
+    linear.weight = embedding.weight = torch.ones(2, 2)
+    linear.bias = torch.zeros(2)
+    assert "weight" in linear and "weight" in embedding and "bias" in linear
+    assert linear.weight.requires_grad and embedding.weight.requires_grad
+    assert linear.bias.requires_grad
+    quantized = nn.QuantizedLinear(2, 2, bias=False)
+    quantized.weight = torch.zeros(2, 2)
+    assert "weight" in quantized
+    assert [name for name, _ in model.named_modules()] == [
+        "", "direct", "layers.0", "named.leaf", "tupled.0",
+    ]
 
 
 # ---------------------------------------------------------------------------

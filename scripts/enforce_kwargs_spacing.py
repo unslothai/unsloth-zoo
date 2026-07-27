@@ -15,12 +15,8 @@ from pathlib import Path
 
 
 def _atomic_write_text(path: Path, data: str, encoding: str) -> None:
-    """Write ``data`` to ``path`` atomically.
-
-    Stages a tmp file in the same directory (so it's on the same
-    filesystem as the destination), fsyncs, then `os.replace`s into
-    place. A crash mid-write therefore leaves either the previous
-    content or the fully new content -- never a truncated source file.
+    """Write ``data`` to ``path`` atomically: stage a same-dir tmp file, fsync,
+    then os.replace, so a crash leaves old or new content, never a truncated file.
     """
     dirpath = str(path.parent) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".kwargs_fix.", dir=dirpath)
