@@ -676,9 +676,12 @@ def _materialize_mlx_vlm_config_override(
     if not local_path:
         return local_path, config_data
     patched_files = {}
-    source_config = _read_json_file(os.path.join(local_path, "config.json"))
-    if source_config != config_data:
-        patched_files["config.json"] = config_data
+    # why: persist a caller-corrected config only when a sidecar exists to
+    # differ from. An absent config.json must not force a temporary view.
+    source_config_path = os.path.join(local_path, "config.json")
+    if os.path.exists(source_config_path):
+        if _read_json_file(source_config_path) != config_data:
+            patched_files["config.json"] = config_data
 
     corrected_model_type = _deepseek_ocr_config_model_type(config_data)
     patched_config = config_data
