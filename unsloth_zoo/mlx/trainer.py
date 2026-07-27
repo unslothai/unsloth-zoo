@@ -1682,6 +1682,14 @@ class MLXTrainer:
                 "resume_from_checkpoint path."
             )
         if int(missing_total.item()) > 0:
+            # missing_total is all-reduced, so every rank enters this branch
+            # together and raising here cannot strand a peer in a later
+            # collective. A rank that can see adapters.safetensors but not the
+            # rest is holding a saved adapter directory, so give it the same
+            # warm-start guidance the single-process path gives; the plain
+            # visibility failure keeps the coordinated message below.
+            if (path / "adapters.safetensors").is_file():
+                _require_complete_resume_checkpoint(str(path))
             raise RuntimeError(
                 "Unsloth MLX DDP: resume checkpoint is incomplete or not "
                 "visible on every rank. Expected adapters.safetensors, "
