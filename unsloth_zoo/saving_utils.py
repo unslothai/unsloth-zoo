@@ -4421,9 +4421,19 @@ pass
 from huggingface_hub.errors import (
     EntryNotFoundError,
     GatedRepoError,
+    HFValidationError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
+from huggingface_hub.utils import validate_repo_id
+
+try:
+    # huggingface_hub >= 1.0 parses paths as `hf://` URIs and reports a malformed
+    # one as HfUriError. Older releases have no such class.
+    from huggingface_hub.errors import HfUriError
+    _HUB_INVALID_ID_ERRORS = (HFValidationError, HfUriError)
+except ImportError:
+    _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
 # Exceptions that genuinely mean "this repo is not there / not usable".
 # `HfFileSystem.ls` reports an absent repo, revision or path as a plain
@@ -4438,7 +4448,54 @@ _HUB_ABSENT_ERRORS = (
     RevisionNotFoundError,
     EntryNotFoundError,
     GatedRepoError,
-)
+# Plus the invalid-repo-id errors: "this string cannot name a repo" is a
+# statement about the argument, never about connectivity, so it answers False
+# rather than raising. Both are ValueError subclasses, and naming the two
+# specific types keeps a genuine transport failure that happens to surface as a
+# plain ValueError from being swallowed along with them.
+) + _HUB_INVALID_ID_ERRORS
+
+def _is_hub_repo_id(model_name):
+    """False for a string that is plainly a filesystem path, not a Hub repo id.
+
+    `determine_base_model_source` hands its `model_name` to the Hub, and that
+    name is very often a local directory. A local path is not a repo id, and the
+    error it provokes says nothing about whether the Hub is reachable:
+
+        huggingface_hub 1.x          huggingface_hub 0.x
+        `./base`     HfUriError      FileNotFoundError
+        `/abs/base`  FileNotFoundError online, OfflineModeIsEnabled offline
+
+    Deciding that from the string rather than from whichever exception the
+    installed version happens to raise is stable across versions, and it skips a
+    pointless network round trip for every local base model.
+
+    Only shapes that cannot be a repo id are rejected. A single segment name is
+    NOT rejected: `gpt2` and `bert-base-uncased` are canonical repos that
+    huggingface_hub 0.x lists happily, so `check_hf_model_exists` still probes
+    them and classifies the answer there.
+    """
+    name = str(model_name)
+    # `ls` addresses at most `namespace/name`, so a deeper path
+    # (`/home/me/base`, `models/base/checkpoint-500`) or a leading `.`, `/`, `~`
+    # (`./base`, `/base`, `~/base`) is a filesystem path and nothing else.
+    if name.count("/") > 1: return False
+    if name.startswith((".", "/", "~")): return False
+    if "\\" in name: return False
+    try:
+        validate_repo_id(name)
+    except Exception:
+        return False
+    return True
+pass
+
+def _hub_unreachable_error(model_name, e):
+    return RuntimeError(
+        f"Unsloth: could not reach the Hugging Face Hub while checking whether "
+        f"`{model_name}` exists ({type(e).__name__}: {e}). This is a connectivity "
+        f"or rate limiting problem, not a missing model. Retry, or pass a local path."
+    )
+pass
 
 def check_hf_model_exists(model_name, token=None):
     """Check if model exists on HuggingFace.
@@ -4448,17 +4505,28 @@ def check_hf_model_exists(model_name, token=None):
     DNS or proxy error, read timeout, HF_HUB_OFFLINE) into "this model does not
     exist", and the caller then silently exports nothing.
     """
+    # Not a repo id at all (typically a local directory): absent, not unreachable.
+    if not _is_hub_repo_id(model_name): return False
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
         return any(x["name"].endswith(".safetensors") for x in file_list)
     except _HUB_ABSENT_ERRORS:
         return False
+    except NotImplementedError:
+        # "I will not list that" (a namespace or bucket listing, which is what
+        # 0.x falls back to for a single segment name with no canonical repo).
+        # Never a transport failure in any version.
+        return False
+    except ValueError as e:
+        # huggingface_hub >= 1.0 dropped canonical single segment ids and
+        # rejects them with a *plain* ValueError, which is a statement about the
+        # argument, not about the network. Scoped to single segment names so a
+        # genuine transport failure surfacing as a ValueError on a
+        # `namespace/name` repo still raises below.
+        if str(model_name).count("/") == 0: return False
+        raise _hub_unreachable_error(model_name, e) from e
     except Exception as e:
-        raise RuntimeError(
-            f"Unsloth: could not reach the Hugging Face Hub while checking whether "
-            f"`{model_name}` exists ({type(e).__name__}: {e}). This is a connectivity "
-            f"or rate limiting problem, not a missing model. Retry, or pass a local path."
-        ) from e
+        raise _hub_unreachable_error(model_name, e) from e
 pass
 
 def check_local_model_exists(model_path):
@@ -4695,17 +4763,13 @@ def determine_base_model_source(model_name, token=None):
     Returns: (final_model_name, is_local_path, source_info, is_quantized, quant_type)
     """
 
-    # Check availability
-    hf_exists = check_hf_model_exists(model_name, token)
+    # Look on disk first. It needs no network, and priorities 1 and 2 below
+    # outrank every Hub answer, so consulting the Hub cannot change the outcome
+    # for them. Probing it first only created a way for an unreachable Hub to
+    # kill a request a local directory could have satisfied outright.
     local_path = check_local_model_exists(model_name)
 
-    # Get quantization status for both if they exist
-    hf_is_quantized, hf_quant_type = None, None
     local_is_quantized, local_quant_type = None, None
-
-    if hf_exists:
-        hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
-
     if local_path:
         local_is_quantized, local_quant_type = check_model_quantization_status(local_path)
 
@@ -4716,6 +4780,19 @@ def determine_base_model_source(model_name, token=None):
     # Priority 2: Local mxfp4
     if local_path and local_is_quantized and local_quant_type == "mxfp4":  # local_quant_type == "mxfp4"
         return (local_path, True, "local_mxfp4", True, "mxfp4")
+
+    # Only now can the Hub change the answer, so only now is it consulted, and
+    # an unreachable Hub still propagates. Falling back to the priority 5 local
+    # copy here would be worse than it looks: for a 16bit merge of an nf4/fp4
+    # base `merge_and_overwrite_lora` answers `warnings.warn` plus `return None`
+    # and writes nothing, which is the exact silent no-op this branch exists to
+    # remove. Raising is the honest answer, and it is what the parent commit
+    # already did for every input that reaches this line.
+    hf_exists = check_hf_model_exists(model_name, token)
+
+    hf_is_quantized, hf_quant_type = None, None
+    if hf_exists:
+        hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
 
     # Priority 3: HF unquantized
     if hf_exists and not hf_is_quantized:
