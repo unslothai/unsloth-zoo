@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import collections
 import inspect
+import json
+import os
 
 import numpy as np
 import pytest
@@ -1182,6 +1184,20 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
     if resume_step:
         checkpoint = os.path.join(output_dir, f"checkpoint-{resume_step}")
         os.makedirs(checkpoint, exist_ok=True)
+        # Write the files a real checkpoint carries. The loaders below are
+        # stubbed, but the trainer refuses a checkpoint whose resume state is
+        # missing rather than silently restarting from step 0, so a directory
+        # that only pretends to exist is no longer a usable fixture.
+        mx.save_safetensors(
+            os.path.join(checkpoint, "adapters.safetensors"),
+            {"placeholder": mx.zeros((1,))},
+        )
+        mx.save_safetensors(
+            os.path.join(checkpoint, "optimizer_state.safetensors"),
+            {"placeholder": mx.zeros((1,))},
+        )
+        with open(os.path.join(checkpoint, "trainer_state.json"), "w") as f:
+            json.dump({"global_step": resume_step}, f)
         monkeypatch.setattr(
             trainer_mod, "load_optimizer_state", lambda *a, **k: None,
         )
