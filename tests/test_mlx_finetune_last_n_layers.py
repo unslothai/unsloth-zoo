@@ -33,8 +33,11 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
-    from mlx_simulation import simulate_mlx_on_torch
-    simulate_mlx_on_torch()
+    try:
+        import mlx  # noqa: F401
+    except ImportError:
+        from mlx_simulation import simulate_mlx_on_torch
+        simulate_mlx_on_torch()
 
 
 def test_get_peft_model_has_finetune_last_n_layers_param():
@@ -45,14 +48,13 @@ def test_get_peft_model_has_finetune_last_n_layers_param():
     assert sig.parameters["finetune_last_n_layers"].default is None
 
 
-def test_get_peft_model_passes_finetune_last_n_layers_through():
+def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
     """linear_to_lora_layers receives the right num_layers value.
 
-    Patches mlx_lm.tuner.utils.linear_to_lora_layers to record num_layers and
+    Patches the loader's linear_to_lora_layers to record num_layers and
     runs against a synthetic text model (we assert the passed value, not real
     side effects).
     """
-    import sys
     import unsloth_zoo.mlx.loader as loader_mod
 
     # Build a minimal text-only fake model with .model.layers of len=8.
@@ -72,23 +74,20 @@ def test_get_peft_model_passes_finetune_last_n_layers_through():
 
     # Capture num_layers values seen by linear_to_lora_layers.
     captured = {"calls": []}
-    def fake_linear_to_lora_layers(model, num_layers, config, use_dora=False):
+    def fake_linear_to_lora_layers(model, num_layers, config):
         captured["calls"].append(num_layers)
+        return 1
 
     # Stub out the helpers get_peft_model uses internally so the test
     # doesn't need to walk a real model tree.
     import unsloth_zoo.mlx.loader as L
-    L._fix_missing_no_grad = lambda m: None
-    L._resolve_lora_keys = lambda m, t: [
+    monkeypatch.setattr(L, "_fix_missing_no_grad", lambda m: None)
+    monkeypatch.setattr(L, "_resolve_lora_keys", lambda m, t: [
         "model.layers.0.self_attn.q_proj",
         "model.layers.1.mlp.gate_proj",
-    ]
-    L._apply_mlx_lora_initialization = lambda m, init: None
-    L.linear_to_lora_layers = fake_linear_to_lora_layers
-    # mlx_lm.tuner.utils is imported inside the function:
-    fake_mod = type(sys)("mlx_lm.tuner.utils")
-    fake_mod.linear_to_lora_layers = fake_linear_to_lora_layers
-    sys.modules["mlx_lm.tuner.utils"] = fake_mod
+    ])
+    monkeypatch.setattr(L, "_apply_mlx_lora_initialization", lambda m, init: None)
+    monkeypatch.setattr(L, "linear_to_lora_layers", fake_linear_to_lora_layers)
 
     # Case 1: default (None) -> all 8 layers
     captured["calls"].clear()
