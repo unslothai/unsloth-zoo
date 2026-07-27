@@ -6004,6 +6004,9 @@ def _filter_trainable_vlm_indices(
     formatted_items = {} if formatting_func is not None else None
     supervision = {}
     removed = 0
+    # Formatted rows are kept for the batch builder, so they outlive the rows
+    # read after them and carry the same reuse-buffer exposure as the planner.
+    media_pins = []
     for idx in indices:
         item = dataset[idx]
         if formatting_func is not None:
@@ -6033,7 +6036,9 @@ def _filter_trainable_vlm_indices(
             kept_indices.append(idx)
             supervision[idx] = checker_good
             if formatted_items is not None:
-                formatted_items[idx] = item
+                formatted_items[idx] = _snapshot_formatted_vlm_row(
+                    item, _pins=media_pins,
+                )
             continue
         if valid_rows is not None and len(valid_rows) == 1 and not valid_rows[0]:
             removed += 1
@@ -6041,7 +6046,10 @@ def _filter_trainable_vlm_indices(
         kept_indices.append(idx)
         supervision[idx] = checker_good
         if formatted_items is not None:
-            formatted_items[idx] = item
+            formatted_items[idx] = _snapshot_formatted_vlm_row(
+                item, _pins=media_pins,
+            )
+    _verify_vlm_media_pins(media_pins)
     return kept_indices, removed, formatted_items, supervision
 
 
@@ -6050,21 +6058,129 @@ def _filter_trainable_vlm_indices(
 _VLM_ROW_SNAPSHOT_DEPTH = 8
 
 
-def _snapshot_formatted_vlm_row(item, _depth=0):
+# Sample count stays small so the probe is O(1) per payload; a reused decode
+# buffer is rewritten whole, so any spread of samples catches it.
+_VLM_MEDIA_PROBE_SAMPLES = 16
+
+
+def _vlm_pil_image_is_decoded(image):
+    """True when a PIL image already holds a decoded raster.
+
+    Pillow 11+ raises on ``.im`` before the load and exposes ``._im``; earlier
+    releases only expose ``.im``, left as None until then. Reading ``_im``
+    first keeps this correct on both, and under ``python -O``.
+    """
+    for attribute in ("_im", "im"):
+        try:
+            return getattr(image, attribute) is not None
+        except Exception:
+            continue
+    return True
+
+
+def _vlm_media_fingerprint(payload):
+    """Cheap content probe for a mutable media payload, or None to skip it.
+
+    Rows are stored by reference, so a dataset that decodes into one reused
+    buffer silently rewrites rows already collected. Copying every payload
+    instead would cost one image per scheduled slot rather than per row, so
+    the plan probes content and reports the corruption rather than paying to
+    prevent it. Undecoded PIL handles are skipped: probing one would force the
+    decode this path exists to defer.
+    """
+    try:
+        if isinstance(payload, np.ndarray):
+            flat = payload.reshape(-1)
+            if flat.size == 0:
+                return ("ndarray", payload.shape, str(payload.dtype), ())
+            step = max(1, flat.size // _VLM_MEDIA_PROBE_SAMPLES)
+            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
+            return ("ndarray", payload.shape, str(payload.dtype), sample.tobytes())
+        if isinstance(payload, bytearray):
+            step = max(1, len(payload) // _VLM_MEDIA_PROBE_SAMPLES)
+            return ("bytearray", len(payload), bytes(payload[::step][:_VLM_MEDIA_PROBE_SAMPLES]))
+        pil_image = sys.modules.get("PIL.Image")
+        if pil_image is not None and isinstance(payload, pil_image.Image):
+            if not _vlm_pil_image_is_decoded(payload):
+                return None
+            width, height = payload.size
+            if width <= 0 or height <= 0:
+                return ("image", payload.mode, payload.size, ())
+            span = max(1, (width * height) // _VLM_MEDIA_PROBE_SAMPLES)
+            spots = tuple(
+                payload.getpixel((offset % width, (offset // width) % height))
+                for offset in range(0, width * height, span)
+            )
+            return ("image", payload.mode, payload.size, spots[:_VLM_MEDIA_PROBE_SAMPLES])
+        torch_module = sys.modules.get("torch")
+        if torch_module is not None and isinstance(payload, torch_module.Tensor):
+            flat = payload.detach().reshape(-1)
+            if flat.numel() == 0:
+                return ("tensor", tuple(payload.shape), str(payload.dtype), ())
+            step = max(1, flat.numel() // _VLM_MEDIA_PROBE_SAMPLES)
+            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
+            return ("tensor", tuple(payload.shape), str(payload.dtype),
+                    tuple(sample.tolist()))
+        # mlx arrays support in-place __setitem__, so an mlx-native dataset can
+        # alias exactly like a numpy one.
+        if isinstance(payload, _MX_ARRAY_TYPE):
+            flat = payload.reshape(-1)
+            if flat.size == 0:
+                return ("mx", payload.shape, ())
+            step = max(1, flat.size // _VLM_MEDIA_PROBE_SAMPLES)
+            sample = flat[::step][:_VLM_MEDIA_PROBE_SAMPLES]
+            return ("mx", payload.shape, tuple(sample.tolist()))
+    except Exception:
+        # An unprobeable payload is simply not covered by the check.
+        return None
+    return None
+
+
+def _verify_vlm_media_pins(pins):
+    """Raise when a stored payload changed after the row that holds it was read."""
+    for payload, taken in pins:
+        if taken is None:
+            continue
+        if _vlm_media_fingerprint(payload) != taken:
+            raise ValueError(
+                "Unsloth MLX VLM: a dataset image changed after the row "
+                "holding it was read, so stored rows no longer match their "
+                "own samples. This happens when __getitem__ decodes into one "
+                "reused buffer (or returns a view over one) instead of "
+                "returning a fresh image per row. Return a copy from "
+                "__getitem__, for example image.copy() or array.copy()."
+            )
+
+
+def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
     """Snapshot one stored VLM row. A ``formatting_func`` (or dataset) that
     mutates and returns its argument hands every visit the same object, so
     without this a later visit's mutation would rewrite earlier stored visits.
     Nested containers are rebuilt too, but payloads such as images are only
-    ever referenced, never copied."""
+    ever referenced, never copied. Passing ``_pins`` records a content probe
+    per media payload so the caller can verify none was rewritten later."""
     if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
         return item
     if isinstance(item, dict):
         snapshot = copy.copy(item)
         for key, value in item.items():
-            snapshot[key] = _snapshot_formatted_vlm_row(value, _depth + 1)
+            snapshot[key] = _snapshot_formatted_vlm_row(value, _depth + 1, _pins)
         return snapshot
     if isinstance(item, list):
-        return [_snapshot_formatted_vlm_row(value, _depth + 1) for value in item]
+        return [
+            _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
+        ]
+    if type(item) is tuple:
+        # A tuple is immutable but its elements are not, and the image helpers
+        # accept a tuple wherever they accept a list. Subclasses (namedtuples)
+        # are left alone rather than rebuilt through the wrong constructor.
+        return tuple(
+            _snapshot_formatted_vlm_row(value, _depth + 1, _pins) for value in item
+        )
+    if _pins is not None:
+        fingerprint = _vlm_media_fingerprint(item)
+        if fingerprint is not None:
+            _pins.append((item, fingerprint))
     return item
 
 
@@ -6433,6 +6549,123 @@ def _preserved_preprocessing_rng():
                 pass
 
 
+class _LazyVLMImage:
+    """Stand-in for a file-backed PIL handle whose descriptor was released.
+
+    ``PIL.Image.open`` leaves the file open until the raster is loaded, so
+    storing one row per scheduled slot would pin one descriptor per row and
+    exhaust the process limit on a few hundred rows. The path is re-opened at
+    materialization instead, which keeps the plan at O(1) descriptors without
+    forcing the O(N) decode that eagerly loading every row would cost.
+    """
+
+    __slots__ = ("path",)
+
+    def __init__(self, path):
+        self.path = path
+
+    def open(self):
+        from PIL import Image as _PIL_Image
+
+        return _PIL_Image.open(self.path)
+
+
+def _vlm_releasable_image_path(value):
+    """Absolute path of an undecoded, PIL-owned, file-backed image, else None.
+
+    Every clause is a reason it would be wrong to release the descriptor:
+    a caller-owned stream cannot be re-opened from a path, an already decoded
+    raster has no descriptor left to save, and a seeked multi-frame handle
+    would come back on frame zero.
+    """
+    if not getattr(value, "_exclusive_fp", False):
+        return None
+    if getattr(value, "fp", None) is None:
+        return None
+    if getattr(value, "_im", None) is not None:
+        return None
+    filename = getattr(value, "filename", None)
+    if not isinstance(filename, str) or not filename:
+        return None
+    tell = getattr(value, "tell", None)
+    if callable(tell):
+        try:
+            if tell() != 0:
+                return None
+        except Exception:
+            return None
+    try:
+        # Absolute so a later chdir cannot break the re-open, and checked now
+        # so an unreadable source fails at build time rather than mid-epoch.
+        path = os.path.abspath(filename)
+        if not os.path.isfile(path):
+            return None
+    except Exception:
+        return None
+    return path
+
+
+def _release_vlm_row_image_handles(item, _depth=0):
+    """Swap file-backed lazy PIL handles in a stored row for path references.
+
+    Returns ``item`` itself when nothing is releasable, so rows that hold no
+    such handle keep their exact identity and behaviour. Never closes the
+    payload: the dataset may still own it, so the descriptor is freed only
+    when the caller's own reference goes away.
+    """
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
+    path = _vlm_releasable_image_path(item)
+    if path is not None:
+        return _LazyVLMImage(path)
+    if isinstance(item, dict):
+        released = None
+        for key, value in item.items():
+            new_value = _release_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if released is None:
+                    released = copy.copy(item)
+                released[key] = new_value
+        return item if released is None else released
+    if isinstance(item, list):
+        released = None
+        for position, value in enumerate(item):
+            new_value = _release_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if released is None:
+                    released = list(item)
+                released[position] = new_value
+        return item if released is None else released
+    return item
+
+
+def _restore_vlm_row_image_handles(item, _depth=0):
+    """Re-open the handles ``_release_vlm_row_image_handles`` put aside."""
+    if _depth >= _VLM_ROW_SNAPSHOT_DEPTH:
+        return item
+    if isinstance(item, _LazyVLMImage):
+        return item.open()
+    if isinstance(item, dict):
+        restored = None
+        for key, value in item.items():
+            new_value = _restore_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if restored is None:
+                    restored = copy.copy(item)
+                restored[key] = new_value
+        return item if restored is None else restored
+    if isinstance(item, list):
+        restored = None
+        for position, value in enumerate(item):
+            new_value = _restore_vlm_row_image_handles(value, _depth + 1)
+            if new_value is not value:
+                if restored is None:
+                    restored = list(item)
+                restored[position] = new_value
+        return item if restored is None else restored
+    return item
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -6536,7 +6769,10 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def _build_batch(self, index, target_width=None):
         """Build one batch through the complete existing VLM builder,
         right-padded to ``target_width`` when an endpoint is given."""
-        batch_items = [self._rows[i].item for i in self._schedule[index]]
+        batch_items = [
+            _restore_vlm_row_image_handles(self._rows[i].item)
+            for i in self._schedule[index]
+        ]
         batch_dict = _build_response_masked_vlm_batch(
             batch_items,
             self._processor,
@@ -6769,7 +7005,14 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         final width (never ``max_seq_length``, which post-expansion widths may
         exceed) and bumped off the union of untouched-array extents; declined
         batches keep their raw widths. Deterministic given the survey, so
-        planning and installation derive identical widths."""
+        planning and installation derive identical widths.
+
+        The bump outranks the cap, so an endpoint may land above the surveyed
+        maximum: a width the finalizer would reject as an untouched extent is
+        no endpoint at all, and stepping up costs a few pad columns (at most
+        one per member of the finite union) while declining the capped width
+        instead would split one shared endpoint back into one per raw width --
+        the signature count this plan exists to bound."""
         if self._descriptors is None:
             raise RuntimeError(
                 "Unsloth MLX: VLM batch widths have not been surveyed; "
@@ -6948,16 +7191,34 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         # refresh on every revisit. Consuming it here still keeps user code out
         # of re-materialization, and each result is snapshotted so a later
         # visit cannot rewrite an earlier one.
+        # Media payloads stay referenced: copying them would cost one image per
+        # scheduled slot rather than per row. `media_pins` probes their content
+        # instead, so a dataset that reuses one decode buffer is reported.
+        # The processor also no longer runs between one slot and the next, so a
+        # pipeline whose formatter and processor draw the SAME process-global
+        # RNG sees a different interleaving than the eager builder gave it.
+        # Restoring it would mean processing at construction, which is the
+        # memory this plan exists to save.
+        media_pins = []
         rows = tuple(
             _FiniteVLMRow(
+                # Release before pinning, not after: a pin holds its payload so
+                # the probe can re-read it, which would keep every row's file
+                # open for the whole collection. A released image is re-opened
+                # from a stable path at materialize, so no reused decode buffer
+                # can reach it and it needs no content pin.
                 _snapshot_formatted_vlm_row(
-                    dataset[idx] if formatting_func is None
-                    else formatting_func(dataset[idx])
+                    _release_vlm_row_image_handles(
+                        dataset[idx] if formatting_func is None
+                        else formatting_func(dataset[idx])
+                    ),
+                    _pins=media_pins,
                 ),
                 True if _supervision is None else _supervision[idx],
             )
             for batch in schedule for idx in batch
         )
+        _verify_vlm_media_pins(media_pins)
         remapped = []
         offset = 0
         for batch in schedule:
@@ -6977,7 +7238,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         position = {idx: pos for pos, idx in enumerate(used)}
         rows = tuple(
             _FiniteVLMRow(
-                formatted_items[idx],
+                _release_vlm_row_image_handles(formatted_items[idx]),
                 True if _supervision is None else _supervision[idx],
             )
             for idx in used

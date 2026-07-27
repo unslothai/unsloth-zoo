@@ -687,6 +687,77 @@ def test_vlm_plan_survey_releases_each_batch_before_the_next_build(monkeypatch):
     assert all(ref() is None for ref in live)
 
 
+def _open_fd_count():
+    """Count this process's open descriptors, or None where we cannot."""
+    import os
+
+    for probe in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(probe):
+            try:
+                return len(os.listdir(probe))
+            except OSError:
+                pass
+    return None
+
+
+def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
+    """FILE ownership, the counterpart to the tensor-ownership survey above.
+
+    ``PIL.Image.open`` leaves the file open until the raster is loaded, so a
+    plan that stores one row per scheduled slot must not pin one descriptor
+    per row: a few hundred rows would blow past the 256 soft limit that macOS,
+    the platform MLX runs on, hands every process by default.
+    """
+    Image = pytest.importorskip("PIL.Image")
+    import gc
+
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    n_rows = 64
+    paths = []
+    for i in range(n_rows):
+        path = tmp_path / f"row{i}.png"
+        Image.fromarray(np.full((8, 8, 3), i % 251, dtype=np.uint8)).save(path)
+        paths.append(str(path))
+
+    class _LazyImageRows:
+        """The textbook dataset idiom: open in __getitem__, decode later."""
+
+        def __len__(self):
+            return n_rows
+
+        def __getitem__(self, index):
+            return {
+                "text": str(index % 7),
+                "images": [Image.open(paths[index])],
+            }
+
+    gc.collect()
+    before = _open_fd_count()
+    if before is None:
+        pytest.skip("no portable descriptor count on this platform")
+
+    plan = _create_vlm_batch_plan(
+        dataset=_LazyImageRows(),
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+    )
+    gc.collect()
+    growth = _open_fd_count() - before
+
+    assert len(plan) == n_rows // 2
+    assert growth <= 8, (
+        f"the plan pinned {growth} descriptors for {n_rows} rows; a stored "
+        f"row must not keep its image file open until materialization"
+    )
+
+    # Releasing the descriptor has to leave a row that still materializes.
+    batch = plan[0]
+    assert batch["input_ids"].shape[0] == 2
+
+
 def test_vlm_family_drift_check_fails_hard_with_location():
     """The runtime drift seam accepts a faithful rebuild against its OWN
     index and hard-fails on added keys, dtype drift, shape drift, key-order
@@ -1692,6 +1763,57 @@ def test_vlm_widening_plan_still_requires_a_pad_token():
         _vlm_shape_plan(strict_plan, "strict")
 
 
+def test_vlm_planned_width_steps_above_the_surveyed_maximum_on_collision():
+    """The forbidden-extent bump outranks the surveyed-maximum cap.
+
+    Declining the capped width instead would split one shared endpoint back
+    into one per raw width, so the overflow is the cheaper of the two; it
+    still has to produce endpoints every member batch can actually reach.
+    """
+    _skip_if_mlx_core_was_replaced()
+
+    class _ForeignExtentProcessor(_UniformNoPadProcessor):
+        # The last two batches carry a sidecar whose extent equals the widest
+        # surveyed text width, so the union forbids that width for everyone.
+        _ROWS = ((20, 6), (32, 6), (20, 6), (32, 6), (20, 32), (20, 32))
+
+        def __init__(self):
+            super().__init__(width=20)
+            self.tokenizer.pad_token_id = 7
+            self.row = 0
+
+        def __call__(self, text, **kwargs):
+            self.width, sidecar = self._ROWS[self.row % len(self._ROWS)]
+            self.row += 1
+            batch = super().__call__(text, **kwargs)
+            batch["pixel_values"] = np.zeros(
+                (len(batch["input_ids"]), sidecar), dtype=np.float32,
+            )
+            return batch
+
+    plan = _plan_for(_ForeignExtentProcessor())
+    plan.ensure_descriptors()
+    raw = tuple(plan.batch_width(index) for index in range(len(plan)))
+    surveyed_max = max(
+        width for width, padable in zip(raw, plan._padable) if padable
+    )
+    planned = plan.planned_event_widths()
+
+    assert raw == (20, 32, 20, 32, 20, 20)
+    assert surveyed_max == 32
+    assert planned == (33,) * len(plan)
+    assert all(width > surveyed_max for width in planned)
+    # One shared endpoint, and every batch reaches it: above its own prepared
+    # width and clear of every extent the pipeline does not pad.
+    assert [
+        int(
+            plan.materialize(index, target_width=planned[index])
+            ["input_ids"].shape[1]
+        )
+        for index in range(len(plan))
+    ] == [33] * len(plan)
+
+
 def test_vlm_plan_rejects_a_rebuild_that_leaves_its_frozen_endpoint():
     """Endpoints freeze at survey time, so a processor that rebuilds at a new
     width hard-fails on the planned fetch whether or not a pad id exists."""
@@ -1793,3 +1915,125 @@ def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
     del again
 
 
+
+def _reused_buffer_vlm_datasets():
+    """Datasets whose __getitem__ hands back memory it later overwrites."""
+    from PIL import Image
+
+    class _SameArray:
+        """Refills and returns one preallocated ndarray."""
+        def __init__(self): self.buffer = np.zeros((4, 4, 3), np.uint8)
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            self.buffer[:] = index + 1
+            return {"text": str(index), "images": [self.buffer]}
+
+    class _SharedMemoryView:
+        """Fresh ndarray per read, but a view over one reused byte buffer."""
+        def __init__(self): self.raw = bytearray(4 * 4 * 3)
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            self.raw[:] = bytes([index + 1]) * len(self.raw)
+            return {
+                "text": str(index),
+                "images": [np.frombuffer(memoryview(self.raw), np.uint8).reshape(4, 4, 3)],
+            }
+
+    class _MutatedImage:
+        """Repaints and returns one PIL image."""
+        def __init__(self): self.image = Image.new("RGB", (4, 4))
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            self.image.paste((index + 1,) * 3, (0, 0, 4, 4))
+            return {"text": str(index), "images": [self.image]}
+
+    class _TupleWrapped:
+        """Reused ndarray delivered inside a tuple rather than a list."""
+        def __init__(self): self.buffer = np.zeros((4, 4, 3), np.uint8)
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            self.buffer[:] = index + 1
+            return {"text": str(index), "images": (self.buffer,)}
+
+    return [_SameArray(), _SharedMemoryView(), _MutatedImage(), _TupleWrapped()]
+
+
+def test_vlm_plan_reports_a_dataset_that_overwrites_a_media_buffer():
+    """Every scheduled row is collected before any is processed, so a dataset
+    that reuses one decode buffer leaves earlier rows holding the last image.
+    Copying each payload would cost one image per scheduled slot rather than
+    per row, so the plan probes content and reports it instead."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    for dataset in _reused_buffer_vlm_datasets():
+        with pytest.raises(ValueError, match="changed after the row"):
+            _create_vlm_batch_plan(
+                dataset=dataset,
+                processor=_ContentProcessor(),
+                config={"image_size": 16, "image_token_id": 200},
+                batch_size=2,
+                max_seq_length=8,
+                num_batches=2,
+                dataset_order="sequential",
+            )
+
+
+def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
+    """The probe must stay a probe: a dataset that returns its images by
+    reference on every revisit keeps ONE object per row across all scheduled
+    slots, because copying them would scale with steps rather than rows."""
+    _skip_if_mlx_core_was_replaced()
+    from PIL import Image
+
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    dataset = [
+        {"text": str(i), "images": [Image.new("RGB", (4, 4), (i + 1,) * 3)]}
+        for i in range(3)
+    ]
+    plan = _create_vlm_batch_plan(
+        dataset=dataset,
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        num_batches=9,          # three full revisits of every row
+        dataset_order="sequential",
+    )
+
+    assert len(plan.rows) == 9
+    stored = [row.item["images"][0] for row in plan.rows]
+    # Nine slots, still only the three images the dataset owns.
+    assert len({id(image) for image in stored}) == 3
+    assert all(image is dataset[i % 3]["images"][0] for i, image in enumerate(stored))
+
+
+def test_vlm_plan_accepts_a_dataset_that_returns_a_fresh_image_per_read():
+    """The probe must not fire on a dataset that decodes fresh, which is what
+    HuggingFace `datasets` and a plain list of rows both do."""
+    _skip_if_mlx_core_was_replaced()
+    from PIL import Image
+
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _FreshImages:
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            return {
+                "text": str(index),
+                "images": [Image.new("RGB", (4, 4), (index + 1,) * 3)],
+            }
+
+    plan = _create_vlm_batch_plan(
+        dataset=_FreshImages(),
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=2,
+        dataset_order="sequential",
+    )
+    plan.materialize_all()
+    assert [int(np.asarray(row.item["images"][0]).reshape(-1)[0]) for row in plan.rows] \
+        == [1, 2, 3, 4]
