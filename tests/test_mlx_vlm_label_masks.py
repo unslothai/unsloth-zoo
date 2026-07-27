@@ -2098,3 +2098,262 @@ def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
         model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
     assert not _fix_gemma3n_altup_batch(model)
     assert cls.correct is fixed, "an already-correct release must be left alone"
+# --- Audio input collation -------------------------------------------------
+
+
+class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
+    """Gemma-style: one delimited soft-token run per clip."""
+    tokenizer = type("_AudioTok", (_FakeTokenizer,), {
+        "audio_token": "<audio_soft_token>",
+        "_vocab": dict(_FakeTokenizer._vocab, **{"<audio_soft_token>": 300})})()
+    feature_extractor = type("_Extractor", (), {"sampling_rate": 16000})()
+    soft_tokens = 3
+    def __init__(self, truncates=False):
+        super().__init__()
+        self.truncates = truncates
+    def apply_chat_template(self, messages, tokenize=False,
+                            add_generation_prompt=False):
+        # Real templates emit a placeholder per audio part.
+        marked = [dict(m, content=[
+            {"type": "text", "text": "<audio>"} if p.get("type") == "audio" else p
+            for p in m.get("content", [])
+        ] if isinstance(m.get("content"), list) else m.get("content", ""))
+            for m in messages]
+        return super().apply_chat_template(marked, tokenize=tokenize,
+                                           add_generation_prompt=add_generation_prompt)
+    def __call__(self, text, audio=None, max_length=None, **_kwargs):
+        # Delimited (301/302) as real templates do, so runs stay separable.
+        rows = [[101] + sum(([301] + [300] * self.soft_tokens + [302]
+                             for _ in range(v.count("<audio>"))), []) + [11]
+                for v in text]
+        width = max(len(r) for r in rows)
+        cut = max_length if self.truncates else width
+        pad = lambda r, v: r + [v] * (width - len(r))
+        out = {
+            "input_ids": np.array([pad(r, 0) for r in rows], np.int32)[:, :cut],
+            "attention_mask": np.array(
+                [pad([1] * len(r), 0) for r in rows], np.int32)[:, :cut],
+        }
+        if audio:  # equal-length clips; ragged batches are qualification work
+            feats = np.stack([np.asarray(c) for c in audio]).astype(np.float32)
+            out["input_features"] = feats
+            out["input_features_mask"] = np.ones(feats.shape, dtype=bool)
+        return out
+
+
+class _FakeAudioDecoder:  # datasets 4.x: output rate fixed at construction
+    def __init__(self, data, sample_rate=16000):
+        self._s = type("_D", (), {"data": data, "sample_rate": sample_rate})()
+    def get_all_samples(self):
+        return self._s
+
+
+def _audio_row(clip, text="hi", placeholder_only=False):
+    part = {"type": "audio"} if placeholder_only else {"type": "audio", "audio": clip}
+    content = [part] if placeholder_only or clip is not None else []
+    return {"messages": [
+        {"role": "user", "content": content + [{"type": "text", "text": text}]},
+        {"role": "assistant", "content": "ok"}]}
+
+
+def _qualify(monkeypatch, processor=None, version=None):
+    """Open the family allow-gate for one test."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+    family = mlx_utils._audio_family_from_processor(
+        processor or _FakeGemmaAudioProcessor())
+    monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {family: frozenset(
+        {version or mlx_utils._installed_mlx_vlm_version()})})
+
+
+@pytest.mark.parametrize("setup,message", [
+    (None, "not enabled for any model family"),
+    ("other_family", "is not supported for"),
+    ("other_version", "only been verified"),
+])
+def test_audio_gate_refuses_unverified_family_or_version(monkeypatch, setup, message):
+    if setup == "other_family":
+        from unsloth_zoo.mlx import utils as mlx_utils
+        monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES",
+                            {"otherfam": frozenset({"9.9.9"})})
+    elif setup:
+        _qualify(monkeypatch, version="0.0.1-never")
+    with pytest.raises(NotImplementedError, match=message):
+        _finalized_collate([_audio_row(_CLIP)], _FakeGemmaAudioProcessor(), 16, None)
+
+
+_MONO = np.full(10, 0.5, dtype=np.float32)
+_STEREO = np.stack([np.zeros(10, np.float32), np.ones(10, np.float32)])
+_CLIP = {"array": _MONO, "sampling_rate": 16000}
+
+
+def _audio_hiding_plan_kwargs(**extra):
+    dataset = [
+        {"audio": [{"array": np.zeros(1600, dtype=np.float32),
+                    "sampling_rate": 16000}],
+         "text": "a"},
+    ]
+    return dict(
+        dataset=dataset,
+        processor=_FakeProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=1,
+        max_seq_length=8,
+        formatting_func=lambda row: {"text": row["text"]},
+        **extra,
+    )
+
+
+def test_batch_plan_gates_audio_a_formatter_hides_under_response_masking():
+    """With a response mask the plan filters rows first, formatting there and
+    collating with no formatter, so it needs the same gate."""
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    with pytest.raises((NotImplementedError, ValueError), match="audio"):
+        _create_vlm_batch_plan(**_audio_hiding_plan_kwargs(
+            response_mask_fn=lambda b: {"labels": b["input_ids"]},
+        ))
+
+
+def test_batch_plan_gates_audio_that_a_formatter_would_hide():
+    """The plan formats at construction and collates with no formatter, so the
+    collation gate never sees the audio the user actually supplied."""
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    dataset = [
+        {"audio": [{"array": np.zeros(1600, dtype=np.float32),
+                    "sampling_rate": 16000}],
+         "text": "a"},
+    ]
+    with pytest.raises((NotImplementedError, ValueError), match="audio"):
+        _create_vlm_batch_plan(
+            dataset=dataset,
+            processor=_FakeProcessor(),
+            config={"image_size": 16, "image_token_id": 200},
+            batch_size=1,
+            max_seq_length=8,
+            formatting_func=lambda row: {"text": row["text"]},
+        )
+
+
+# Channel-first stereo must average to the same mono waveform, never flatten
+# into a 20-sample concatenation of both channels.
+@pytest.mark.parametrize("clip", [_CLIP, _FakeAudioDecoder(_MONO),
+                                  _FakeAudioDecoder(_STEREO)],
+                         ids=["datasets3_mapping", "datasets4_decoder", "stereo"])
+def test_audio_source_forms_reach_the_processor_as_mono(monkeypatch, clip):
+    _qualify(monkeypatch)
+    row = _audio_row(clip)
+    feats = np.asarray(_finalized_collate([row], _FakeGemmaAudioProcessor(),
+                                          16, None)["input_features"])
+    assert feats.shape == (1, 10) and np.allclose(feats[0], 0.5)  # mono, averaged
+    # A bare message list must reach extraction; a single dict rendering
+    # without a placeholder must be refused, not trained on.
+    bare = _finalized_collate([row["messages"]], _FakeGemmaAudioProcessor(), 16, None)
+    assert np.asarray(bare["input_features"]).shape[0] == 1
+    with pytest.raises(ValueError, match="0 placeholder run"):
+        _finalized_collate([dict(row["messages"][0], text="hi")],
+                           _FakeGemmaAudioProcessor(), 16, None)
+
+
+def test_multiple_clips_keep_their_order_and_untyped_parts_count(monkeypatch):
+    _qualify(monkeypatch)
+    quiet = {"array": np.full(10, 0.25, np.float32), "sampling_rate": 16000}
+    loud = {"array": np.full(10, 0.75, np.float32), "sampling_rate": 16000}
+    row = {"messages": [{"role": "user", "content": [
+        {"type": "audio", "audio": quiet},
+        {"audio": loud},  # untyped part must still be inferred as audio
+        {"type": "text", "text": "hi"}]}, {"role": "assistant", "content": "ok"}]}
+    feats = np.asarray(_finalized_collate([row], _FakeGemmaAudioProcessor(),
+                                          32, None)["input_features"])
+    # Clip order must survive extraction, or features pair with the wrong runs.
+    assert np.allclose(feats[0], 0.25) and np.allclose(feats[1], 0.75)
+
+
+# over_cap models a processor diverting truncation to its audio extractor.
+@pytest.mark.parametrize("clip,message,max_len", [
+    ({"path": "a.wav", "bytes": b""}, "datasets.Audio", 16),
+    (_MONO, "must carry their sampling rate", 16),  # no rate: untrustworthy
+    ({"array": _MONO, "sampling_rate": 8000}, "8000 Hz", 16),
+    (None, "no audio data", 16),
+    (_CLIP, "did not apply truncation", 3),
+], ids=["undecoded", "no_rate", "rate_mismatch", "no_data", "over_cap"])
+def test_unusable_audio_rows_are_rejected(monkeypatch, clip, message, max_len):
+    processor = _FakeGemmaAudioProcessor()
+    _qualify(monkeypatch, processor=processor)
+    row = _audio_row(clip, placeholder_only=clip is None)
+    with pytest.raises(ValueError, match=message):
+        _finalized_collate([row], processor, max_len, None)
+
+
+def test_placeholders_without_features_are_rejected(monkeypatch):
+    _qualify(monkeypatch)
+    # Pre-rendered text can keep the placeholder after the clip is gone.
+    with pytest.raises(ValueError, match="returned no audio features"):
+        _finalized_collate([{"raw": "x"}], _FakeGemmaAudioProcessor(), 16, None,
+                           formatting_func=lambda _: {"text": "<audio>hi"})
+
+
+def test_audio_placeholders_masked_and_mixed_batches_collate(monkeypatch):
+    from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
+    _qualify(monkeypatch)
+    processor = _FakeGemmaAudioProcessor()
+    audio_row = dict(_audio_row(None, placeholder_only=True), audio=_CLIP)
+    batch = _finalized_collate(
+        [audio_row, _audio_row(None, text="plain")], processor, 16, None,
+        ignore_token_ids=_get_vlm_ignore_token_ids(processor=processor))
+    ids, labels = np.asarray(batch["input_ids"]), np.asarray(batch["labels"])
+    # The column feeds only the row carrying the placeholder.
+    assert ids.shape[0] == 2 and np.asarray(batch["input_features"]).shape[0] == 1
+    assert (ids[1] != 300).all() and (labels[ids == 300] == -100).all()
+
+
+_PC_AUDIO_ROW = {
+    "prompt": [{"role": "user", "content": [
+        {"type": "audio", "audio": _CLIP},
+        {"type": "text", "text": "transcribe"}]}],
+    "completion": [{"role": "assistant", "content": "done"}],
+}
+
+
+def test_prompt_completion_audio_rides_the_prompt_half(monkeypatch):
+    _qualify(monkeypatch)
+    batch, is_pc = _finalized_collate([_PC_AUDIO_ROW], _FakeGemmaAudioProcessor(),
+                                      16, None, return_prompt_completion=True)
+    assert is_pc and "input_features" in batch
+    # The host combine re-verifies after truncating: here the run is dropped.
+    with pytest.raises(ValueError, match="0 placeholder run"):
+        _finalized_collate([_PC_AUDIO_ROW], _FakeGemmaAudioProcessor(truncates=True),
+                           2, None, return_prompt_completion=True)
+    # Audio may not sit in the completion half, payload or not.
+    for part in ({"type": "audio", "audio": _CLIP}, {"type": "audio"}):
+        moved = {"prompt": [{"role": "user",
+                             "content": [{"type": "text", "text": "q"}]}],
+                 "completion": [{"role": "assistant", "content": [part]}]}
+        with pytest.raises(ValueError, match="audio in the completion half"):
+            _finalized_collate([moved], _FakeGemmaAudioProcessor(), 16, None,
+                               return_prompt_completion=True)
+
+
+def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
+    """Production must build the pc_audio carrier and honor it at finalize."""
+    import mlx.core as current_mx
+    if current_mx is not mx:
+        pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch, _finalize_vlm_batch
+
+    class _MLXValued(_FakeGemmaAudioProcessor):  # forces the deferred path
+        def __call__(self, text, audio=None, max_length=None, **_kw):
+            return {k: mx.array(v)
+                    for k, v in super().__call__(text, audio, max_length).items()}
+
+    processor = _MLXValued()
+    _qualify(monkeypatch, processor=processor)
+    staged, _ = _collate_vlm_batch([_PC_AUDIO_ROW], processor, 2, None,
+                                   reject_mlx_valued=True,
+                                   return_prompt_completion=True)
+    # MLX-valued halves defer the combine, so the counts must ride pc_audio for
+    # the post-combine check to be possible on the consumer thread.
+    assert staged.pc_opaque is not None and staged.pc_audio == ([1], [300])
+    # Truncation drops the run; the deferred check must catch it.
+    with pytest.raises(ValueError, match="0 placeholder run"):
+        _finalize_vlm_batch(staged)
