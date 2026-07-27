@@ -54,6 +54,7 @@ _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 _QWEN3_VISION_NORM_CAST_OUTPUT = True
 _QWEN3_VISUAL_STATE_KEY = "_unsloth_qwen3_visual_state"
 _QWEN3_VISUAL_POSITIONS_KEY = "_unsloth_qwen3_visual_positions"
+_QWEN3_VISUAL_WIDTH_KEY = "_unsloth_qwen3_visual_width"
 
 
 def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
@@ -2438,25 +2439,33 @@ def _qwen3_visual_window(
     visual_positions,
     *,
     mask_offsets,
-    feature_offsets,
+    position_widths=None,
     window,
 ):
-    """Restore flattened Qwen3 features for one compact-state window."""
+    """Restore flattened Qwen3 features for one compact-state window.
+
+    Compact positions follow the mask coordinate system in which they were
+    packed. A shorter live mask is a chunk sliced from that full coordinate
+    row; otherwise a whole-row mask starts at zero.
+    """
 
     batch_size = int(visual_pos_masks.shape[0])
     mask_offsets = tuple(int(offset) for offset in mask_offsets)
-    feature_offsets = tuple(int(offset) for offset in feature_offsets)
+    if position_widths is None:
+        position_widths = (int(visual_pos_masks.shape[-1]),) * batch_size
+    else:
+        position_widths = tuple(int(width) for width in position_widths)
     if len(mask_offsets) == 1 and batch_size > 1:
         mask_offsets *= batch_size
-    if len(feature_offsets) == 1 and batch_size > 1:
-        feature_offsets *= batch_size
-    if len(mask_offsets) != batch_size or len(feature_offsets) != batch_size:
+    if len(position_widths) == 1 and batch_size > 1:
+        position_widths *= batch_size
+    if len(mask_offsets) != batch_size or len(position_widths) != batch_size:
         raise ValueError("Qwen3 visual state does not match the cache batch")
 
     window_masks = []
     feature_slices = [[] for _ in range(visual_state.shape[2])]
-    for row, (mask_start, feature_start) in enumerate(
-        zip(mask_offsets, feature_offsets)
+    for row, (mask_start, position_width) in enumerate(
+        zip(mask_offsets, position_widths)
     ):
         whole_row = visual_pos_masks.shape[-1] == window
         if whole_row:
@@ -2477,14 +2486,14 @@ def _qwen3_visual_window(
         window_masks.append(active_mask[None, :])
 
         row_positions = visual_positions[row]
-        if whole_row:
+        if whole_row and visual_pos_masks.shape[-1] >= position_width:
             # why: the whole mask row is consumed, so the feature window spans
             # the whole row too -- a non-zero cache offset here belongs to an
             # earlier prompt, not to this mask.
             feature_start, feature_stop = 0, int(visual_pos_masks.shape[-1])
         else:
+            feature_start = max(0, mask_start)
             feature_stop = max(0, feature_start + window)
-            feature_start = max(0, feature_start)
         feature_before = int(
             ((row_positions >= 0) & (row_positions < feature_start)).sum().item()
         )
@@ -2607,6 +2616,11 @@ def _attach_qwen3_visual_state(features, visual_state, visual_positions):
         values = original_to_dict()
         values[_QWEN3_VISUAL_STATE_KEY] = visual_state
         values[_QWEN3_VISUAL_POSITIONS_KEY] = visual_positions
+        values[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+            (visual_positions.shape[0],),
+            int(features.visual_pos_masks.shape[-1]),
+            dtype=mx.int32,
+        )
         return values
 
     features.deepstack_visual_embeds = None
@@ -2680,6 +2694,16 @@ def _pad_qwen3_prompt_rows(prompt_kwargs_list):
             kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = positions
         state = kwargs[_QWEN3_VISUAL_STATE_KEY]
         positions = kwargs[_QWEN3_VISUAL_POSITIONS_KEY]
+        visual_mask = kwargs.get("visual_pos_masks")
+        if (
+            kwargs.get(_QWEN3_VISUAL_WIDTH_KEY) is None
+            and visual_mask is not None
+        ):
+            kwargs[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                (positions.shape[0],),
+                int(visual_mask.shape[-1]),
+                dtype=mx.int32,
+            )
         pad = max_features - state.shape[1]
         if pad <= 0:
             continue
@@ -2703,7 +2727,33 @@ def _qwen3_prompt_merge_adapter(original):
 
     @wraps(original)
     def patched(prompt_kwargs_list, input_ids):
-        return original(_pad_qwen3_prompt_rows(prompt_kwargs_list), input_ids)
+        prompt_rows = _pad_qwen3_prompt_rows(prompt_kwargs_list)
+        max_length = max((len(ids) for ids in input_ids), default=0)
+        shifted_rows = prompt_rows
+        for row, (kwargs, ids) in enumerate(zip(prompt_rows, input_ids)):
+            positions = (
+                kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY)
+                if kwargs
+                else None
+            )
+            left_padding = max_length - len(ids)
+            if positions is None or left_padding <= 0:
+                continue
+            if shifted_rows is prompt_rows:
+                shifted_rows = list(prompt_rows)
+            shifted = dict(kwargs)
+            shifted[_QWEN3_VISUAL_POSITIONS_KEY] = mx.where(
+                positions >= 0,
+                positions + left_padding,
+                positions,
+            )
+            shifted[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                (positions.shape[0],),
+                max_length,
+                dtype=mx.int32,
+            )
+            shifted_rows[row] = shifted
+        return original(shifted_rows, input_ids)
 
     patched._unsloth_qwen3_prompt_merge = True
     return patched
@@ -2724,7 +2774,18 @@ def _qwen3_mixed_prompt_batch_adapter(original):
                 (*sequence[:3], kwargs, *sequence[4:])
                 for sequence, kwargs in zip(sequences, padded_rows)
             ]
-        return original(self, sequences)
+        batch = original(self, sequences)
+        prompt_kwargs = getattr(batch, "_prompt_kwargs", None)
+        if prompt_kwargs is not None:
+            visual_mask = prompt_kwargs.get("visual_pos_masks")
+            position_widths = prompt_kwargs.get(_QWEN3_VISUAL_WIDTH_KEY)
+            if visual_mask is not None and position_widths is not None:
+                prompt_kwargs[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                    (int(visual_mask.shape[0]),),
+                    int(visual_mask.shape[-1]),
+                    dtype=position_widths.dtype,
+                )
+        return batch
 
     patched._unsloth_qwen3_mixed_prompt_batch = True
     return patched
@@ -2815,8 +2876,9 @@ def _qwen3_visual_state_adapter(original):
         if visual_pos_masks is not None:
             compact_state = kwargs.pop(_QWEN3_VISUAL_STATE_KEY, None)
             visual_positions = kwargs.pop(_QWEN3_VISUAL_POSITIONS_KEY, None)
+            position_widths = kwargs.pop(_QWEN3_VISUAL_WIDTH_KEY, None)
             if compact_state is not None and visual_positions is not None:
-                feature_offsets, mask_offsets = _qwen3_cache_offsets(
+                _unpadded_offsets, mask_offsets = _qwen3_cache_offsets(
                     cache,
                     int(visual_pos_masks.shape[0]),
                 )
@@ -2825,7 +2887,7 @@ def _qwen3_visual_state_adapter(original):
                     compact_state,
                     visual_positions,
                     mask_offsets=mask_offsets,
-                    feature_offsets=feature_offsets,
+                    position_widths=position_widths,
                     window=int(inputs.shape[1]),
                 )
                 kwargs.pop("n_to_process", None)

@@ -2948,8 +2948,8 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     masks = mx.array([[0, 1, 1, 0, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=mx.bool_)
     embeds = [mx.array([[10], [11], [12], [20], [21], [22]])]
 
-    padded_cache = [types.SimpleNamespace(offset=mx.array([0, -2]), left_padding=mx.array([0, 2]))]
-    assert mc._qwen3_cache_offsets(padded_cache, batch_size=2) == ((0, -2), (0, 0))
+    padded_cache = [types.SimpleNamespace(offset=mx.array([1, -2]), left_padding=mx.array([3, 2]))]
+    assert mc._qwen3_cache_offsets(padded_cache, batch_size=2) == ((1, -2), (4, 0))
 
     packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
     assert packed.shape == (2, 3, 1, 1)
@@ -2960,15 +2960,40 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
         _unsloth_qwen3_visual_state=packed[:1],
         _unsloth_qwen3_visual_positions=positions[:1],
     )
-    text_row = dict(inputs_embeds=mx.zeros((1, 4, 1)))
+    text_row = dict(inputs_embeds=mx.zeros((1, 9, 1)))
     cold = mc._qwen3_prompt_merge_adapter(lambda rows, _ids: rows)
-    aligned = cold([visual_row, text_row], [range(6), range(4)])
+    aligned = cold([visual_row, text_row], [range(6), range(9)])
     assert aligned[0]["_unsloth_qwen3_visual_state"].tolist() == packed[:1].tolist()
+    assert aligned[0]["_unsloth_qwen3_visual_positions"].tolist() == [[4, 5, 7]]
+    assert aligned[0]["_unsloth_qwen3_visual_width"].tolist() == [9]
     assert aligned[1]["_unsloth_qwen3_visual_state"].shape == (1, 3, 1, 1)
     assert not aligned[1]["_unsloth_qwen3_visual_state"].any().item()
     assert aligned[1]["_unsloth_qwen3_visual_positions"].tolist() == [[-1, -1, -1]]
-    assert aligned[1]["visual_pos_masks"].shape == (1, 4)
+    assert aligned[1]["visual_pos_masks"].shape == (1, 9)
     assert not aligned[1]["visual_pos_masks"].any().item()
+    apc_batch = types.SimpleNamespace(
+        _prompt_kwargs={
+            "visual_pos_masks": mx.zeros((2, 9), dtype=mx.bool_),
+            "_unsloth_qwen3_visual_width": mx.array([6, 9], dtype=mx.int32),
+        },
+    )
+    apc = mc._qwen3_mixed_prompt_batch_adapter(
+        lambda _self, _sequences: apc_batch
+    )
+    assert apc(
+        object(),
+        [(None, None, None, visual_row), (None, None, None, text_row)],
+    )._prompt_kwargs["_unsloth_qwen3_visual_width"].tolist() == [9, 9]
+    apc_masks, apc_embeds = mc._qwen3_visual_window(
+        mx.array([[0, 0, 0, 0], [1, 1, 0, 0]], dtype=mx.bool_),
+        mx.array([[[[10]], [[0]]], [[[20]], [[21]]]]),
+        mx.array([[1, -1], [4, 5]]),
+        mask_offsets=(4, 4),
+        position_widths=(9, 9),
+        window=4,
+    )
+    assert apc_masks.tolist() == [[0, 0, 0, 0], [1, 1, 0, 0]]
+    assert apc_embeds[0].tolist() == [[20], [21]]
     cached_row = dict(
         inputs_embeds=visual_row["inputs_embeds"],
         visual_pos_masks=masks[:1],
@@ -2979,7 +3004,7 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     assert mc._pad_qwen3_prompt_rows([]) == []
     assert mc._pad_qwen3_prompt_rows([text_row])[0] is text_row
     window_masks, window_embeds = mc._qwen3_visual_window(
-        masks, packed, positions, mask_offsets=(1, 1), feature_offsets=(1, 1), window=2
+        masks, packed, positions, mask_offsets=(1, 1), window=2
     )
     assert window_masks.tolist() == [[1, 1], [0, 1]]
     assert window_embeds[0].tolist() == [[10], [11], [21]]
@@ -3019,15 +3044,16 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     language_adapter = mc._qwen3_visual_state_adapter(native_language)
     language_adapter(
         object(),
-        mx.zeros((1, 2)),
-        cache=[types.SimpleNamespace(offset=1, left_padding=0)],
-        visual_pos_masks=masks[:1],
+        mx.zeros((1, 4)),
+        cache=[types.SimpleNamespace(offset=1, left_padding=3)],
+        visual_pos_masks=mx.pad(masks[:1], [(0, 0), (3, 0)])[:, 4:8],
         deepstack_visual_embeds=None,
         _unsloth_qwen3_visual_state=packed[:1],
-        _unsloth_qwen3_visual_positions=positions[:1],
+        _unsloth_qwen3_visual_positions=aligned[0]["_unsloth_qwen3_visual_positions"],
+        _unsloth_qwen3_visual_width=aligned[0]["_unsloth_qwen3_visual_width"],
     )
-    assert language_calls[0][0].tolist() == [[1, 1]]
-    assert language_calls[0][1][0].tolist() == [[10], [11]]
+    assert language_calls[0][0].tolist() == [[1, 1, 0, 1]]
+    assert language_calls[0][1][0].tolist() == [[10], [11], [12]]
 
 
 def test_qwen_video_tensor_adapter_is_exact_and_composable():
