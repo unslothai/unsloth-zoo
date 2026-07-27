@@ -5352,6 +5352,19 @@ def _ensure_vlm_prompt_utils_patched():
         if getattr(module, "apply_chat_template", None) is _original_vlm_apply_chat_template:
             module.apply_chat_template = patched_apply_chat_template
 
+    # why: the list above only force-imports mlx-vlm's entry points, so an
+    # already-loaded alias keeps the original -- `mlx_vlm` itself re-exports
+    # this. Sweep loaded mlx-vlm modules by identity instead. Read __dict__
+    # rather than getattr so a lazy module __getattr__ is not woken.
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("mlx_vlm"):
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if namespace is None:
+            continue
+        if namespace.get("apply_chat_template") is _original_vlm_apply_chat_template:
+            namespace["apply_chat_template"] = patched_apply_chat_template
+
     _vlm_prompt_utils_patched = True
 
 

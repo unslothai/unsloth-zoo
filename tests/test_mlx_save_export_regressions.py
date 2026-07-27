@@ -482,6 +482,45 @@ def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
         assert render(messages, num_images=1) == "fallback"
 
 
+def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
+    """No loaded mlx-vlm module may keep the original chat-template callable.
+
+    The hard-coded list only force-imports mlx-vlm's entry points, so aliases in
+    modules that are already loaded -- `mlx_vlm` itself re-exports this one --
+    survive the patch and render multi-turn prompts the old way.
+    """
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    def original(*_args, **_kwargs):
+        return "original"
+
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+
+    # Aliases mlx-vlm really holds: the package re-export and a submodule that
+    # any `import mlx_vlm` already pulls in through mlx_vlm/trainer/__init__.py.
+    aliased = ("mlx_vlm", "mlx_vlm.trainer.datasets")
+    for name in aliased:
+        module = sys.modules.get(name) or types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setattr(module, "apply_chat_template", original, raising=False)
+
+    # A same-named alias outside mlx-vlm must stay untouched.
+    outsider = types.ModuleType("unsloth_zoo_y952_outsider")
+    outsider.apply_chat_template = original
+    monkeypatch.setitem(sys.modules, outsider.__name__, outsider)
+
+    loader._ensure_vlm_prompt_utils_patched()
+
+    patched = prompt_utils.apply_chat_template
+    assert patched is not original
+    stale = [name for name in aliased if sys.modules[name].apply_chat_template is original]
+    assert stale == [], f"stale mlx-vlm chat-template aliases: {stale}"
+    assert outsider.apply_chat_template is original
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj
