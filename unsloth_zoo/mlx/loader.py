@@ -320,6 +320,17 @@ def linear_to_lora_layers(model, num_layers, config):
             layer.update_modules(tree_unflatten(replacements))
             attached += len(replacements)
 
+    # Root-module pass (mlx-lm parity): a head named in `keys` lives beside the
+    # layers, not inside them, so the layer walk above never reaches it.
+    root_replacements = [
+        (name, _mlx_lora_from_base(module, config, specs=type_specs))
+        for name, module in model.named_modules()
+        if name in keys
+    ]
+    if root_replacements:
+        model.update_modules(tree_unflatten(root_replacements))
+        attached += len(root_replacements)
+
     return attached
 
 
@@ -2868,6 +2879,7 @@ def _unfreeze_saved_mlx_non_adapter_parameters(model, adapter_weights_file):
     live_keys = {name for name, _ in tree_flatten(model.parameters())}
     adapter_keys = set(collect_mlx_lora_adapter_tensors(model))
     modules = {"": model, **dict(model.named_modules())}
+    restored = set()
     for path in (saved_keys & live_keys) - adapter_keys:
         parts = path.split(".")
         for split in range(len(parts) - 1, -1, -1):
@@ -2877,7 +2889,36 @@ def _unfreeze_saved_mlx_non_adapter_parameters(model, adapter_weights_file):
                 continue
             key = ".".join(parts[split:])
             module.unfreeze(keys=[key], recurse=False, strict=False)
+            restored.add(path)
             break
+    _rebuild_cpt_full_module_weight_keys(model, restored)
+
+
+def _rebuild_cpt_full_module_weight_keys(model, restored_keys):
+    """Re-derive the CPT scoped-LR key set after an adapter reload.
+
+    ``get_peft_model`` records it; this path never runs it, so without a
+    rebuild ``embedding_learning_rate`` falls back to the literal
+    ``embed_tokens`` / ``lm_head`` names and misses every other layout.
+    """
+    if not restored_keys:
+        return
+    from .utils import describe_output_head
+
+    specs = []
+    embedding, embedding_path = _resolve_embedding_module(model)
+    if embedding is not None:
+        specs.append((embedding_path, embedding))
+    head = describe_output_head(model)
+    if head.module is not None:
+        specs.append((head.path, head.module))
+    if not specs:
+        return
+    # Only tensors this reload actually made trainable: a saved weight the
+    # descriptors do not own stays on the main learning rate.
+    keys = _full_module_weight_keys(model, specs) & set(restored_keys)
+    if keys:
+        model._unsloth_cpt_full_module_weight_keys = keys
 
 
 def _saved_mlx_lora_tensor_shapes(adapter_weights_file):

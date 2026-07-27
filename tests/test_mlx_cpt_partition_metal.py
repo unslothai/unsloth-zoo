@@ -251,3 +251,82 @@ def test_unusable_lm_head_still_raises_when_nothing_else_trains():
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["q_proj"],
               modules_to_save=["lm_head"])
+
+
+class _VlmCore(nn.Module):
+    """VLM wrapper: the head is a root module of the language stack."""
+
+    def __init__(s):
+        super().__init__()
+        s.language_model = _Core(False, "embed_tokens")
+        s._is_vlm_model = True
+
+    @property
+    def layers(s):
+        return s.language_model.layers
+
+    def __call__(s, x):
+        return s.language_model(x)
+
+
+def test_root_lm_head_lora_is_attached_outside_the_layer_walk():
+    # The head is a root module, not a layer submodule, so a layer-only walk
+    # never reaches it: head-only must attach it, mixed must not freeze it.
+    head_only = _tiny()
+    _peft(head_only, target_modules=["lm_head"])
+    assert {"lm_head.lora_a", "lm_head.lora_b"} <= set(
+        dict(mu.tree_flatten(head_only.trainable_parameters())))
+
+    mixed = _tiny()
+    _peft(mixed, target_modules=["q_proj", "lm_head"])
+    trn = set(dict(mu.tree_flatten(mixed.trainable_parameters())))
+    assert {"lm_head.lora_a", "lm_head.lora_b"} <= trn
+    assert any(k.endswith("q_proj.lora_a") for k in trn)
+
+    # CPT recipe: an lm_head adapter plus a full embedding, no layer targets.
+    cpt = _tiny()
+    _peft(cpt, target_modules=["embed_tokens", "lm_head"])
+    trn = set(dict(mu.tree_flatten(cpt.trainable_parameters())))
+    assert {"lm_head.lora_a", "lm_head.lora_b",
+            "model.embed_tokens.weight"} <= trn
+
+    vlm = _VlmCore()
+    _peft(vlm, target_modules=["q_proj", "lm_head"],
+          finetune_vision_layers=False, train_projector=False)
+    trn = set(dict(mu.tree_flatten(vlm.trainable_parameters())))
+    assert {"language_model.lm_head.lora_a",
+            "language_model.lm_head.lora_b"} <= trn
+
+
+def test_reloaded_cpt_adapter_rebuilds_the_scoped_lr_keys():
+    # Reload restores the full module's trainability, so the scoped-LR key set
+    # must come back too or embedding_learning_rate degrades to the main LR
+    # for every embedding not literally named embed_tokens.
+    import json
+
+    from unsloth_zoo.mlx.loader import (
+        _apply_lora_at_paths,
+        _mlx_save_lora_adapters,
+        _unfreeze_saved_mlx_non_adapter_parameters,
+    )
+
+    m = _tiny(emb="tok_embeddings")
+    _peft(m, target_modules=["q_proj", "embed_tokens"])
+    assert m._unsloth_cpt_full_module_weight_keys == {
+        "model.tok_embeddings.weight"}
+    d = tempfile.mkdtemp()
+    _mlx_save_lora_adapters(m, d)
+    weights = os.path.join(d, "adapters.safetensors")
+    with open(os.path.join(d, "adapter_config.json")) as fh:
+        cfg = json.load(fh)
+
+    r = _tiny(emb="tok_embeddings")
+    r.freeze()
+    _apply_lora_at_paths(r, cfg.get("unsloth_mlx_lora_module_paths"), cfg,
+                         adapter_weights_file=weights)
+    r.load_weights(weights, strict=False)
+    _unfreeze_saved_mlx_non_adapter_parameters(r, weights)
+    assert "model.tok_embeddings.weight" in set(
+        dict(mu.tree_flatten(r.trainable_parameters())))
+    assert getattr(r, "_unsloth_cpt_full_module_weight_keys", set()) == {
+        "model.tok_embeddings.weight"}
