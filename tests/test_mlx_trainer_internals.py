@@ -3648,12 +3648,12 @@ def test_on_optimizer_step_defers_callback_stop_until_after_same_step_eval():
     src = inspect.getsource(MLXTrainer._train_inner)
     opt_step = src.index('_fire("on_optimizer_step")')
     # The shared post-update bookkeeping begins once the do_update branch closes
-    # (the `if batches_per_epoch:` epoch update that runs every microstep); bound
-    # the inspected region there so we only look at what runs between the
-    # on_optimizer_step event and the rest of the same step. (num_input_tokens_seen
-    # is now incremented ahead of on_optimizer_step, so it no longer marks the
-    # branch close.)
-    region_end = src.index("if batches_per_epoch:", opt_step)
+    # (the pending-window timing that runs every microstep); bound the inspected
+    # region there so we only look at what runs between the on_optimizer_step
+    # event and the rest of the same step. (num_input_tokens_seen is now
+    # incremented ahead of on_optimizer_step, and the epoch update moved into the
+    # optimizer-step path, so neither marks the branch close any more.)
+    region_end = src.index("pending_time += time.perf_counter() - tic", opt_step)
     tail_stop = src.index("if _sync_stop():", region_end)
     # Strip comment lines so the prose describing the deferral is not mistaken
     # for the code that performs it.
@@ -4138,6 +4138,95 @@ def test_on_save_skip_broadcasts_to_peer_ddp(monkeypatch):
     rank1w = make_trainer(1)
     peer["value"] = 1  # rank 0 contributes its written flag into the reduction
     assert (rank1w._distributed_status_mask(0) > 0) is True
+
+
+def test_on_save_requires_a_resumable_checkpoint(monkeypatch):
+    # Regression: the adapter write set checkpoint_written, then a failing
+    # save_optimizer_state / save_trainer_state was swallowed with a printed
+    # warning -- so on_save still fired and integrations (hub uploaders,
+    # checkpoint trackers) recorded checkpoint-N as a resume point. It is not
+    # one: save_trainer_state opens trainer_state.json before json.dump raises,
+    # leaving the file truncated and unparseable.
+    #
+    # HF never reaches on_save here. _save_checkpoint calls
+    # _save_optimizer_and_scheduler and state.save_to_json with no fallback, so
+    # the failure propagates out of _maybe_log_save_evaluate before
+    # callback_handler.on_save. Measured on transformers 5.14.1 and 4.57.6 with
+    # an ExportableState callback returning a datetime: train() raises
+    # TypeError("Object of type datetime is not JSON serializable") and the
+    # on_save log stays empty. _prune_stale_checkpoints in this same function
+    # is already gated on the completeness flag, for the same reason.
+    import json
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class SaveSpy:
+        """Shape of a stock integration reacting to on_save."""
+        def __init__(self):
+            self.advertised = []
+
+        def on_save(self, args, state, control, **kwargs):
+            self.advertised.append(f"checkpoint-{state.global_step}")
+            return control
+
+    class UnserializableState:
+        """A callback exporting bookkeeping json.dump cannot encode.
+        _export_callback_states is duck-typed on state(), so this reaches the
+        stateful_callbacks payload."""
+        def state(self):
+            import datetime
+
+            return {"started_at": datetime.datetime(2020, 1, 1)}
+
+    def run(extra_callbacks):
+        spy = SaveSpy()
+        out_dir = tempfile.mkdtemp()
+        args = MLXTrainingConfig(
+            max_steps=2,
+            gradient_accumulation_steps=1,
+            logging_steps=10 ** 6,
+            save_steps=2,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=[spy] + extra_callbacks,
+        )
+        trainer._batches = _make_shape_guard_text_plan((10,) * 2)
+        trainer._callback_batches_per_epoch = lambda _batches: 2
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        trainer.train()
+        return spy, os.path.join(out_dir, "checkpoint-2")
+
+    # Control: nothing fails, so the checkpoint is resumable and on_save fires.
+    healthy, healthy_dir = run([])
+    assert healthy.advertised == ["checkpoint-2"]
+    with open(os.path.join(healthy_dir, "trainer_state.json")) as fh:
+        assert json.load(fh)["global_step"] == 2
+
+    # The resume state could not be written, so nothing may advertise it.
+    broken, broken_dir = run([UnserializableState()])
+    assert broken.advertised == []
+    # The adapters are still kept on disk: the swallow itself is deliberate,
+    # only the advertisement was wrong.
+    assert os.path.exists(os.path.join(broken_dir, "adapters.safetensors"))
+    # ... and the directory really is unresumable, which is what on_save claimed.
+    with open(os.path.join(broken_dir, "trainer_state.json")) as fh:
+        with pytest.raises(json.JSONDecodeError):
+            json.load(fh)
 
 
 def test_epoch_end_fires_on_substep_boundary():
@@ -6211,6 +6300,19 @@ def test_callback_batches_per_epoch_uses_prepared_plan_cycle():
     assert trainer._callback_batches_per_epoch(list(range(8))) == 6
 
 
+def _periodic_log_steps(state):
+    """Steps of the per-window training logs, with the final summary dropped.
+
+    train() ends with one aggregate on_log (train_loss / train_runtime / ...),
+    like HF's Trainer.log(metrics) immediately before on_train_end, so the tail
+    entry is a run summary rather than a training-window log. Asserted here so
+    callers keep pinning both the cadence and the summary.
+    """
+    entries = list(state.log_history)
+    assert entries and "train_runtime" in entries[-1], entries[-1:]
+    return [entry["step"] for entry in entries[:-1]]
+
+
 def test_log_history_persisted_and_restored_across_resume(monkeypatch):
     # trainer_state.json carried the native loss history but not the
     # callback-visible TrainerState.log_history, which _init_callback_state reset
@@ -6259,7 +6361,7 @@ def test_log_history_persisted_and_restored_across_resume(monkeypatch):
 
     first = build()
     first.train()
-    assert [entry["step"] for entry in first.state.log_history] == [1, 2, 3, 4]
+    assert _periodic_log_steps(first.state) == [1, 2, 3, 4]
 
     with open(os.path.join(out_dir, "checkpoint-2", "trainer_state.json")) as fh:
         saved = json.load(fh)
@@ -6267,12 +6369,12 @@ def test_log_history_persisted_and_restored_across_resume(monkeypatch):
 
     resumed = build()
     resumed.train(resume_from_checkpoint=os.path.join(out_dir, "checkpoint-2"))
-    assert [entry["step"] for entry in resumed.state.log_history] == [1, 2, 3, 4]
+    assert _periodic_log_steps(resumed.state) == [1, 2, 3, 4]
 
     # Reusing that SAME trainer for a fresh run must start from an empty history
     # (HF only loads trainer_state.json when resume_from_checkpoint is given).
     resumed.train()
-    assert [entry["step"] for entry in resumed.state.log_history] == [1, 2, 3, 4]
+    assert _periodic_log_steps(resumed.state) == [1, 2, 3, 4]
 
     # A pre-fix checkpoint has no log_history key and must stay resumable.
     legacy_dir = os.path.join(out_dir, "checkpoint-2")
@@ -6283,7 +6385,7 @@ def test_log_history_persisted_and_restored_across_resume(monkeypatch):
         json.dump(legacy, fh)
     legacy_run = build()
     legacy_run.train(resume_from_checkpoint=legacy_dir)
-    assert [entry["step"] for entry in legacy_run.state.log_history] == [3, 4]
+    assert _periodic_log_steps(legacy_run.state) == [3, 4]
 
 
 def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
@@ -6356,7 +6458,7 @@ def test_fractional_step_intervals_resolve_against_total_steps(monkeypatch):
     assert trainer.state.save_steps == 2
     assert trainer.state.eval_steps == 1
     assert flow.logged_at == [2, 4]
-    assert [entry["step"] for entry in trainer.state.log_history] == [2, 4]
+    assert _periodic_log_steps(trainer.state) == [2, 4]
     checkpoints = sorted(
         name for name in os.listdir(out_dir) if name.startswith("checkpoint-")
     )
@@ -6710,6 +6812,79 @@ def test_callback_num_train_epochs_honors_max_steps_over_configured_epochs():
     assert trainer._callback_num_train_epochs(60, None) == 3
 
 
+def test_fractional_num_train_epochs_reports_a_ceiled_callback_total(monkeypatch):
+    # num_train_epochs is a float in TrainingArguments/SFTConfig and a
+    # fractional value is supported. HF reports the CEILED count in
+    # TrainerState -- `num_train_epochs = math.ceil(args.num_train_epochs)`
+    # (transformers set_initial_training_values, identical in 5.14.1 and
+    # 4.57.6) -- which is the same rounding its step budget uses
+    # (`max_steps = ceil(num_train_epochs * num_update_steps_per_epoch)`), and
+    # the MLX budget already matched. The callback total truncated instead, so
+    # a 1.5-epoch run advertised 1 epoch while state.epoch climbed to 1.5:
+    # every callback normalizing progress by the total read 150 percent, and
+    # the two numbers HF keeps consistent contradicted each other.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    class EpochTotalSpy:
+        def __init__(self):
+            self.at_train_begin = None
+            self.progress = []
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.at_train_begin = state.num_train_epochs
+            return control
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            self.progress.append(state.epoch / state.num_train_epochs)
+            return control
+
+    spy = EpochTotalSpy()
+    trainer, _batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=4, grad_accum=2, epochs=1.5,
+        callbacks=[spy],
+    )
+    trainer.train()
+
+    # Real transformers on this shape (4 rows at batch 1, grad_accum 2,
+    # num_train_epochs=1.5): max_steps = ceil(1.5 * 2) = 3, num_train_epochs =
+    # ceil(1.5) = 2, final state.epoch = 1.5. Measured on 5.14.1 and 4.57.6.
+    assert trainer.state.max_steps == 3
+    assert spy.at_train_begin == 2
+    assert trainer.state.num_train_epochs == 2
+    assert trainer.state.epoch == pytest.approx(1.5)
+    # Progress never exceeds 100 percent now that the total covers the epochs
+    # the run actually reports.
+    assert spy.progress == [pytest.approx(0.5), pytest.approx(0.75)]
+    assert max(spy.progress) <= 1.0
+
+
+def test_callback_num_train_epochs_ceils_like_hf():
+    # Unit coverage of the rounding itself, including the values one run cannot
+    # reach. transformers uses math.ceil for the epoch-based branch, so any
+    # fraction rounds UP and whole counts are untouched.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    def total(epochs):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = MLXTrainingConfig(num_train_epochs=epochs, max_steps=-1)
+        trainer._prepared_batches_include_epochs = True
+        return trainer._callback_num_train_epochs(0, list(range(12)))
+
+    assert total(1.5) == 2
+    assert total(2.5) == 3
+    assert total(0.5) == 1
+    assert total(0.01) == 1
+    assert total(2.000001) == 3
+    # Whole counts, int or float, are byte-identical to the old behaviour.
+    for epochs in (1, 2, 3, 10):
+        assert total(epochs) == epochs
+        assert total(float(epochs)) == epochs
+    # The "use max_steps instead" sentinel and 0 stay at 0, so the max_steps
+    # derivation below them still runs.
+    assert total(-1) == 0
+    assert total(0) == 0
+
+
 def test_callback_best_metric_persisted_across_resume_without_native_tracking(monkeypatch):
     # The callback-visible watermark (TrainerState.best_metric) advances on every
     # eval whenever metric_for_best_model is set, but the NATIVE best fields are
@@ -6959,6 +7134,183 @@ def test_missing_best_weights_clears_callback_best_state(monkeypatch, best_weigh
         assert resumed.state.best_metric == pytest.approx(1.3)
         assert resumed.state.best_global_step == 8
         assert [m for _, m, *_ in spy.seen] == [None, pytest.approx(1.5), pytest.approx(1.4)]
+
+
+def test_externally_cancelled_eval_is_not_dispatched_to_callbacks(monkeypatch):
+    # Regression: stop_requested is an externally owned property -- a controller
+    # (the Studio cancel button) may set it at any time -- and
+    # _evaluate_batch_totals deliberately skips every remaining eval batch while
+    # it is set. With zero batches scored _evaluate returns eval_loss 0.0, yet
+    # _run_eval dispatched that phantom result anyway: EarlyStoppingCallback read
+    # 0.0 as an improvement and reset its patience counter, and
+    # _update_callback_best_metric latched a watermark no real evaluation can
+    # ever beat. _run_checkpoint then persisted both into checkpoint-N, so the
+    # corruption survived into the resumed run.
+    #
+    # A CALLBACK stop must keep its real evaluation: it is deliberately left in
+    # control.should_training_stop until after this step's log/eval/save (HF's
+    # _maybe_log_save_evaluate runs _determine_best_metric and the checkpoint
+    # before the loop honors should_training_stop), so it never reaches this
+    # gate. The second half of this test pins that.
+    import inspect
+    import json
+
+    import mlx.core as mx
+    import mlx.nn as nn
+    from transformers import EarlyStoppingCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def eval_capable_lm():
+        """_tiny_lm_for_loop_tests' train() takes no mode, so nn.Module.eval()
+        (which calls train(False)) raises. The real _evaluate needs both."""
+        class TinyLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(128, 4)
+                self.proj = nn.Linear(4, 128, bias=False)
+                self._config = {"model_type": "tiny"}
+
+            def __call__(self, input_ids):
+                return self.proj(self.embed(input_ids))
+
+            def train(self, mode=True):
+                return self
+
+            def eval(self):
+                return self
+
+            @property
+            def state(self):
+                return []
+
+        return TinyLM()
+
+    def make_batch(width):
+        ids = mx.array([list(range(1, width + 1))], dtype=mx.int32)
+        lengths = mx.array([[0, width - 1]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    class EvalSpy:
+        def __init__(self):
+            self.evaluated = []
+            self.logged = []
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            self.evaluated.append((state.global_step, (metrics or {}).get("eval_loss")))
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and "eval_loss" in logs:
+                self.logged.append((state.global_step, logs["eval_loss"]))
+            return control
+
+    class StopAtLastEval:
+        """external=True stands in for a controller cancelling the run;
+        external=False is an ordinary callback stop."""
+        def __init__(self, step, external):
+            self.step = step
+            self.external = external
+            self.trainer = None
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == self.step:
+                if self.external:
+                    self.trainer.stop_requested = True
+                else:
+                    control.should_training_stop = True
+            return control
+
+    def run(external):
+        out_dir = tempfile.mkdtemp()
+        spy = EvalSpy()
+        early = EarlyStoppingCallback(early_stopping_patience=5)
+        stopper = StopAtLastEval(6, external)
+        args = MLXTrainingConfig(
+            max_steps=6,
+            gradient_accumulation_steps=1,
+            logging_steps=10 ** 6,
+            eval_steps=2,
+            save_steps=6,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            # Native tracking off: this pins the callback-visible state only.
+            load_best_model_at_end=False,
+            early_stopping_patience=0,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=out_dir,
+        )
+        mx.random.seed(1234)
+        trainer = MLXTrainer(
+            eval_capable_lm(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [{"text": f"row {i}"} for i in range(6)],
+            eval_dataset=[{"input_ids": [1, 2, 3, 4]}],
+            args=args,
+            callbacks=[spy, early, stopper],
+        )
+        stopper.trainer = trainer
+        trainer._prepare_data = lambda _is_vlm: (
+            [make_batch(10) for _ in range(6)], None,
+        )
+        # Real eval batches: the abort under test lives in _evaluate_batch_totals,
+        # so _evaluate must not be stubbed out.
+        trainer._eval_batches_labeled = [make_batch(10)]
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        output = trainer.train()
+        with open(os.path.join(out_dir, "checkpoint-6", "trainer_state.json")) as fh:
+            saved = json.load(fh)
+        return trainer, spy, early, output, saved
+
+    cancelled, spy, early, output, saved = run(external=True)
+    # Steps 2 and 4 scored real batches; the frozen optimizer makes them equal.
+    real_loss = spy.evaluated[0][1]
+    assert real_loss > 0.0
+    # Step 6 evaluated nothing, so it must not reach on_log or on_evaluate.
+    assert spy.evaluated == [(2, real_loss), (4, real_loss)]
+    assert spy.logged == [(2, real_loss), (4, real_loss)]
+    # The watermark stays on the last real evaluation instead of a phantom 0.0.
+    assert cancelled.state.best_metric == pytest.approx(real_loss)
+    assert cancelled.state.best_global_step == 2
+    # Step 4 failed to improve on step 2, and no phantom improvement reset it.
+    assert early.early_stopping_patience_counter == 1
+    assert output["eval_metrics"]["eval_loss"] == pytest.approx(real_loss)
+    # None of it reaches the checkpoint a resume would restore from.
+    assert saved["callback_best_metric"] == pytest.approx(real_loss)
+    assert saved["callback_best_step"] == 2
+    assert saved["stateful_callbacks"]["EarlyStoppingCallback"]["attributes"] == {
+        "early_stopping_patience_counter": 1,
+    }
+
+    # A callback stop is untouched: step 6 still runs and dispatches a real eval.
+    _, cb_spy, cb_early, cb_output, cb_saved = run(external=False)
+    assert cb_spy.evaluated == [
+        (2, real_loss), (4, real_loss), (6, real_loss),
+    ]
+    assert cb_early.early_stopping_patience_counter == 2
+    assert cb_output["eval_metrics"]["eval_loss"] == pytest.approx(real_loss)
+    assert cb_saved["stateful_callbacks"]["EarlyStoppingCallback"]["attributes"] == {
+        "early_stopping_patience_counter": 2,
+    }
+
+    # The rank agreement is invisible at world size 1, so pin it at the source:
+    # the suppression is decided by the OR-reduce, or a cancel landing on one
+    # rank after _evaluate's last eval-status collective returns that rank alone
+    # and strands its peers inside _fire.
+    src = inspect.getsource(MLXTrainer._train_inner)
+    eval_body = src[src.index("def _run_eval("):src.index("def _run_best_tracking(")]
+    guard = eval_body.index("if self._distributed_should_stop():")
+    assert guard < eval_body.index('_fire("on_log", logs=dict(metrics))')
+    assert guard < eval_body.index("self._update_callback_best_metric(metrics)")
 
 
 def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
@@ -7284,7 +7636,9 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
     # does its host I/O exactly once across the world.
     assert rank0_io_cb.peer_flags and all(rank0_io_cb.peer_flags)
     assert rank1_io_cb.peer_flags and not any(rank1_io_cb.peer_flags)
-    assert rank0_io_cb.writes == 2
+    # Two cadence logs (logging_steps=2 over 4 steps) plus the run summary
+    # train() dispatches before on_train_end.
+    assert rank0_io_cb.writes == 3
     assert rank1_io_cb.writes == 0
 
 
@@ -8238,6 +8592,12 @@ class _EpochScheduleSpy:
     def __init__(self):
         self.epoch_end = []
         self.step_end = []
+        self.substep_end = []
+        self.epoch_begin = []
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        self.epoch_begin.append((state.global_step, round(float(state.epoch), 6)))
+        return control
 
     def on_epoch_end(self, args, state, control, **kwargs):
         self.epoch_end.append((state.global_step, round(float(state.epoch), 6)))
@@ -8245,6 +8605,10 @@ class _EpochScheduleSpy:
 
     def on_step_end(self, args, state, control, **kwargs):
         self.step_end.append((state.global_step, round(float(state.epoch), 6)))
+        return control
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        self.substep_end.append((state.global_step, round(float(state.epoch), 6)))
         return control
 
 
@@ -8293,6 +8657,56 @@ def test_divisible_epoch_schedule_is_unchanged(monkeypatch):
     assert spy.epoch_end == [(2, 1.0), (4, 2.0)]
     assert spy.step_end == [(1, 0.5), (2, 1.0), (3, 1.5), (4, 2.0)]
     assert batches.visits == [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "microbatches_per_epoch,grad_accum,epochs,expect_substep_end",
+    [
+        # Golden values measured on real transformers 5.14.1 AND 4.57.6, which
+        # agree cell for cell. per_device_train_batch_size=1, so
+        # microbatches_per_epoch == len(dataloader) == steps_in_epoch.
+        # Divisible epoch: substeps at micro-batches 1 and 3 of each epoch.
+        (4, 2, 2, [(0, 0.0), (1, 0.5), (2, 1.0), (3, 1.5)]),
+        # More substeps per epoch.
+        (6, 2, 2, [(0, 0.0), (1, 0.333333), (2, 0.666667),
+                   (3, 1.0), (4, 1.333333), (5, 1.666667)]),
+        # Ragged epoch: the epoch's last micro-batch forces its own update, so
+        # it is a step and not a substep.
+        (5, 2, 2, [(0, 0.0), (1, 0.4), (3, 1.0), (4, 1.4)]),
+        # Fractional epoch count, partial final epoch.
+        (5, 2, 1.5, [(0, 0.0), (1, 0.4), (3, 1.0), (4, 1.4)]),
+    ],
+)
+def test_substep_end_reports_the_last_completed_step_epoch(
+    monkeypatch, microbatches_per_epoch, grad_accum, epochs, expect_substep_end,
+):
+    # HF advances the callback-visible epoch only on an optimizer step, next to
+    # the global_step it belongs with:
+    #   state.global_step += 1
+    #   state.epoch = epoch + (step + 1) / steps_in_epoch
+    #   on_step_end(...)
+    # and the non-sync branch fires on_substep_end with the epoch UNTOUCHED
+    # (transformers _inner_training_loop, identical in 5.14.1 and 4.57.6). The
+    # MLX loop advanced state.epoch after EVERY micro-batch, so on_substep_end
+    # reported an epoch one micro-batch AHEAD of the last completed step -- a
+    # substep callback saw 0.25 where HF reports 0.0, and the value disagreed
+    # with the global_step handed to it in the same call.
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    spy = _EpochScheduleSpy()
+    trainer, _batches = _epoch_flush_loop_trainer(
+        tempfile.mkdtemp(), microbatches_per_epoch=microbatches_per_epoch,
+        grad_accum=grad_accum, epochs=epochs, callbacks=[spy],
+    )
+    trainer.train()
+
+    assert spy.substep_end == expect_substep_end
+    # The invariant behind the goldens: a substep never moves the epoch, so it
+    # always reports whatever the previous event left there.
+    seen = dict(spy.epoch_begin)
+    seen.update(dict(spy.step_end))
+    for step, epoch in spy.substep_end:
+        assert epoch == seen[step], (step, epoch, seen[step])
 
 
 def test_short_epoch_saves_one_checkpoint_per_epoch(monkeypatch):
@@ -8988,14 +9402,18 @@ def test_no_consensus_site_captures_bare_exception():
     assert offenders == [], offenders
 
 
-def _hf_flow_args(*, eval_strategy, eval_steps, eval_delay):
+def _hf_flow_args(
+    *, eval_strategy="no", eval_steps=10 ** 6, eval_delay=0,
+    logging_strategy="steps", logging_steps=10 ** 6, logging_first_step=False,
+    save_strategy="no", save_steps=10 ** 6,
+):
     """Stand in for TrainingArguments when driving DefaultFlowCallback.
 
     A real TrainingArguments cannot be built on Apple Silicon: pyproject omits
     accelerate there, and the constructor hard-requires accelerate>=1.1.0
     whenever torch is importable. Since that is the platform MLX actually runs
     on, building one would make this file uncollectable for its own users.
-    Only the five attributes DefaultFlowCallback reads matter, and
+    Only the attributes DefaultFlowCallback reads matter, and
     IntervalStrategy/SaveStrategy are str enums, so plain strings compare equal
     to them. test_hf_flow_args_stand_in_matches_real_training_arguments pins
     the equivalence wherever a real one can be constructed.
@@ -9004,11 +9422,11 @@ def _hf_flow_args(*, eval_strategy, eval_steps, eval_delay):
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
         eval_delay=eval_delay,
-        logging_strategy="steps",
-        logging_steps=10 ** 6,
-        logging_first_step=False,
-        save_strategy="no",
-        save_steps=10 ** 6,
+        logging_strategy=logging_strategy,
+        logging_steps=logging_steps,
+        logging_first_step=logging_first_step,
+        save_strategy=save_strategy,
+        save_steps=save_steps,
     )
 
 
@@ -9031,40 +9449,49 @@ def test_hf_flow_args_stand_in_matches_real_training_arguments():
         "eval_strategy", "eval_delay", "logging_strategy",
         "logging_first_step", "save_strategy",
     )
+    # Every strategy on every axis, so the stand-in is pinned for the log and
+    # save cadences as well as the eval one.
     for strategy, steps, delay in (
         ("no", 2, 0), ("steps", 2, 0), ("epoch", 2, 0), ("steps", 2, 3),
     ):
+        fields = dict(
+            eval_strategy=strategy, eval_steps=steps, eval_delay=delay,
+            logging_strategy=strategy, logging_steps=steps,
+            save_strategy=strategy, save_steps=steps,
+        )
         real = TrainingArguments(
-            output_dir=tempfile.mkdtemp(),
-            eval_strategy=strategy, eval_steps=steps, eval_delay=delay,
-            logging_steps=10 ** 6, save_strategy="no", report_to=[],
+            output_dir=tempfile.mkdtemp(), report_to=[], **fields,
         )
-        stub = _hf_flow_args(
-            eval_strategy=strategy, eval_steps=steps, eval_delay=delay,
-        )
+        stub = _hf_flow_args(**fields)
         for field in read_by_flow:
             assert getattr(stub, field) == getattr(real, field), (
                 strategy, delay, field,
             )
         # Equal as strings is not enough: the flow compares against enum
         # members, so the stub must land on the same side of those tests.
-        assert (
-            _flow_fires(stub, total_steps=4, steps_per_epoch=2)
-            == _flow_fires(real, total_steps=4, steps_per_epoch=2)
-        ), (strategy, delay)
+        for action in ("evaluate", "log", "save"):
+            assert (
+                _flow_fires(
+                    stub, total_steps=6, steps_per_epoch=3, action=action,
+                )
+                == _flow_fires(
+                    real, total_steps=6, steps_per_epoch=3, action=action,
+                )
+            ), (strategy, delay, action)
 
 
-def _flow_fires(args, *, total_steps, steps_per_epoch):
-    """Steps DefaultFlowCallback asks to evaluate, for a given args object."""
+def _flow_fires(args, *, total_steps, steps_per_epoch, action="evaluate"):
+    """Steps DefaultFlowCallback asks to log/evaluate/save, for an args object."""
     from transformers.trainer_callback import (
         DefaultFlowCallback,
         TrainerControl,
         TrainerState,
     )
 
+    flag = f"should_{action}"
     state = TrainerState(
         max_steps=total_steps, eval_steps=args.eval_steps,
-        logging_steps=10 ** 6, save_steps=10 ** 6,
+        logging_steps=args.logging_steps, save_steps=args.save_steps,
     )
     flow = DefaultFlowCallback()
     fires = []
@@ -9072,11 +9499,11 @@ def _flow_fires(args, *, total_steps, steps_per_epoch):
         state.global_step = step
         state.epoch = step / steps_per_epoch
         control = flow.on_step_end(args, state, TrainerControl())
-        # HF clears should_evaluate inside on_evaluate, so a step can only be
-        # evaluated once however many hooks asked for it.
-        if not control.should_evaluate and step % steps_per_epoch == 0:
+        # HF clears the flag when it runs the action, so a step can only run it
+        # once however many hooks asked for it.
+        if not getattr(control, flag) and step % steps_per_epoch == 0:
             control = flow.on_epoch_end(args, state, TrainerControl())
-        if control.should_evaluate:
+        if getattr(control, flag):
             fires.append(step)
     return fires
 
@@ -9218,6 +9645,541 @@ def test_static_eval_cadence_keeps_legacy_behaviour_without_a_strategy():
     assert trainer._static_eval_cadence_enabled() is False
     trainer.args = types.SimpleNamespace(eval_strategy="steps", eval_delay="oops")
     assert trainer._eval_delay_satisfied(0) is True
+
+
+def test_static_log_and_save_cadences_keep_legacy_behaviour_without_a_strategy():
+    # Same contract as the eval cadence for the log and save axes: a missing
+    # field means the args object never went through _ensure_callback_args_compat
+    # and must keep the interval-only cadence rather than going silent.
+    from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = types.SimpleNamespace()
+    assert trainer._static_log_cadence_enabled() is True
+    assert trainer._static_save_cadence_enabled() is True
+
+    for member, expected in (
+        (IntervalStrategy.STEPS, True),
+        (IntervalStrategy.EPOCH, False),
+        (IntervalStrategy.NO, False),
+    ):
+        trainer.args = types.SimpleNamespace(logging_strategy=member)
+        assert trainer._static_log_cadence_enabled() is expected, member
+    for member, expected in (
+        (SaveStrategy.STEPS, True),
+        (SaveStrategy.EPOCH, False),
+        (SaveStrategy.NO, False),
+    ):
+        trainer.args = types.SimpleNamespace(save_strategy=member)
+        assert trainer._static_save_cadence_enabled() is expected, member
+
+
+def _run_log_save_cadence_probe(
+    monkeypatch, *, logging_steps, save_steps, total_steps=6,
+    steps_per_epoch=3, eval_steps=None, with_flow=True, extra_callbacks=(),
+    **arg_overrides,
+):
+    """Run the real loop and report the steps that logged, saved and evaluated.
+
+    6 steps over 2 epochs of 3, so an interval of 2 lands off the epoch
+    boundaries and the steps/epoch/no strategies are told apart.
+
+    Passing eval_steps attaches an eval dataset and a stub _evaluate, so the
+    third cadence axis runs on the same 6-step/2-epoch geometry as the other
+    two; leaving it None keeps the run eval-free.
+
+    with_flow=False drops DefaultFlowCallback from the callback list.
+    MLXTrainer does not install one itself (transformers' Trainer always does),
+    so that is the configuration a caller who passes their own callbacks
+    actually gets, and each cadence must hold in both.
+    """
+    import tempfile
+
+    from transformers.trainer_callback import (
+        DefaultFlowCallback,
+        ProgressCallback,
+    )
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    out_dir = tempfile.mkdtemp()
+    args = MLXTrainingConfig(
+        max_steps=total_steps,
+        gradient_accumulation_steps=1,
+        logging_steps=logging_steps,
+        save_steps=save_steps,
+        eval_steps=eval_steps if eval_steps is not None else 10 ** 6,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=out_dir,
+    )
+    logged, saved, summaries, evaluated = [], [], [], []
+
+    class _Spy:
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            payload = logs or {}
+            # The run summary train() dispatches before on_train_end is not a
+            # cadence log, and an evaluation dispatches its metrics through
+            # on_log too, so keep all three apart.
+            if "train_runtime" in payload:
+                summaries.append((state.global_step, dict(payload)))
+            elif "eval_loss" in payload:
+                pass
+            else:
+                logged.append(state.global_step)
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            saved.append(state.global_step)
+            return control
+
+        def on_evaluate(self, args, state, control, **kwargs):
+            evaluated.append(state.global_step)
+            return control
+
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+        eval_dataset=(
+            [{"input_ids": [1, 2, 3, 4]}] if eval_steps is not None else None
+        ),
+        # ProgressCallback is a real stock consumer of on_log, so the payloads
+        # below are exercised through shipped transformers code, not just a spy.
+        callbacks=(
+            ([DefaultFlowCallback()] if with_flow else [])
+            + [ProgressCallback(), _Spy()] + list(extra_callbacks)
+        ),
+    )
+    # Both strategies were synthesized from the positive MLX intervals, so an
+    # override below is a genuine caller-supplied strategy -- exactly what
+    # _sync_synthesized_arg preserves for a hand-set field.
+    assert trainer.args.logging_strategy == "steps"
+    assert trainer.args.save_strategy == "steps"
+    if eval_steps is not None:
+        assert trainer.args.eval_strategy == "steps"
+    for name, value in arg_overrides.items():
+        setattr(trainer.args, name, value)
+
+    trainer._batches = _make_shape_guard_text_plan((10,) * total_steps)
+    trainer._callback_batches_per_epoch = lambda _batches: steps_per_epoch
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    if eval_steps is not None:
+        trainer._eval_batches_labeled = ["batch-0"]
+
+        def _fake_evaluate(batches, loss_fn, is_vlm=False):
+            trainer._last_eval_metrics = {
+                "eval_loss": 1.25, "eval_perplexity": 3.5,
+            }
+            return 1.25, 3.5
+
+        trainer._evaluate = _fake_evaluate
+    result = trainer.train()
+    checkpoints = sorted(
+        int(name.split("-")[1])
+        for name in os.listdir(out_dir) if name.startswith("checkpoint-")
+    )
+    return {
+        "logged": logged,
+        "saved": saved,
+        "evaluated": evaluated,
+        "checkpoints": checkpoints,
+        "summaries": summaries,
+        "result": result,
+        "state": trainer.state,
+    }
+
+
+def _hf_flow_steps(action, *, total_steps=6, steps_per_epoch=3, **fields):
+    """Ask the installed DefaultFlowCallback which steps run `action`."""
+    return _flow_fires(
+        _hf_flow_args(**fields),
+        total_steps=total_steps, steps_per_epoch=steps_per_epoch,
+        action=action,
+    )
+
+
+def test_static_save_cadence_honors_caller_supplied_save_strategy(monkeypatch):
+    # Regression: the loop checkpointed purely from save_steps, so a
+    # caller-supplied save_strategy -- which _sync_synthesized_arg explicitly
+    # preserves -- was ignored. save_strategy="no" still wrote checkpoint-N and
+    # dispatched on_save on the step cadence (with HF's default save_steps=500
+    # that is a surprise checkpoint every 500 steps), and save_strategy="epoch"
+    # wrote the step checkpoints on top of the epoch ones, doubling on_save at
+    # every boundary and advertising checkpoints the strategy never asked for.
+    for strategy in ("no", "epoch", "steps"):
+        expected = _hf_flow_steps(
+            "save", save_strategy=strategy, save_steps=2,
+        )
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=2,
+            save_strategy=strategy,
+        )
+        assert probe["saved"] == expected, (strategy, probe["saved"], expected)
+        # on_save must advertise exactly the checkpoints that exist on disk.
+        assert probe["checkpoints"] == sorted(set(expected)), strategy
+    # The three strategies really are distinguishable at these parameters, so
+    # the assertions above cannot pass by coincidence.
+    assert _hf_flow_steps("save", save_strategy="no", save_steps=2) == []
+    assert _hf_flow_steps("save", save_strategy="epoch", save_steps=2) == [3, 6]
+    assert _hf_flow_steps("save", save_strategy="steps", save_steps=2) == [2, 4, 6]
+
+
+def test_static_log_cadence_honors_caller_supplied_logging_strategy(monkeypatch):
+    # Regression: the loop logged purely from logging_steps, so a
+    # caller-supplied logging_strategy was ignored. logging_strategy="no" still
+    # emitted a log every logging_steps, and "epoch" logged on both the step
+    # cadence and DefaultFlowCallback's epoch end.
+    for strategy in ("no", "epoch", "steps"):
+        expected = _hf_flow_steps(
+            "log", logging_strategy=strategy, logging_steps=2,
+        )
+        # The loop always flushes the run's last window at the final step so the
+        # returned train_loss covers it; HF folds the same trailing window into
+        # its returned train_loss silently. That flush is the one cadence entry
+        # MLX adds, and it lands on the final step whatever the strategy.
+        expected = sorted(set(expected) | {6})
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=2, save_steps=10 ** 6,
+            logging_strategy=strategy,
+        )
+        assert probe["logged"] == expected, (
+            strategy, probe["logged"], expected,
+        )
+    assert _hf_flow_steps("log", logging_strategy="no", logging_steps=2) == []
+    assert _hf_flow_steps("log", logging_strategy="epoch", logging_steps=2) == [3, 6]
+    assert _hf_flow_steps("log", logging_strategy="steps", logging_steps=2) == [2, 4, 6]
+
+
+# The three cadence axes, each as (DefaultFlowCallback action name, the args
+# field that selects its strategy, the probe key recording where it fired).
+_CADENCE_AXES = (
+    ("log", "logging_strategy", "logged"),
+    ("save", "save_strategy", "saved"),
+    ("evaluate", "eval_strategy", "evaluated"),
+)
+
+
+def _run_one_axis_cadence_probe(monkeypatch, action, strategy, *, with_flow):
+    """Probe one cadence axis at one strategy, with/without the HF flow."""
+    field = dict((a, f) for a, f, _ in _CADENCE_AXES)[action]
+    key = dict((a, k) for a, _, k in _CADENCE_AXES)[action]
+    # Every axis gets an interval of 2 on a 6-step/3-per-epoch run, so "steps"
+    # (2, 4, 6) and "epoch" (3, 6) cannot be confused. The other two axes keep
+    # an interval far past the run so they never interfere.
+    # 2 divides 6 deliberately: DefaultFlowCallback.on_step_end ALSO forces a
+    # final-step save (both 4.x and 5.x) and, on 5.x, a final-step evaluation
+    # once state.global_step >= state.max_steps. The loop has no equivalent of
+    # that tail, so an interval that does not divide total_steps would compare
+    # the epoch cadence against a separate, still-open gap on the steps axis.
+    kwargs = dict(logging_steps=10 ** 6, save_steps=10 ** 6, with_flow=with_flow)
+    kwargs[{"log": "logging_steps", "save": "save_steps",
+            "evaluate": "eval_steps"}[action]] = 2
+    kwargs[field] = strategy
+    return _run_log_save_cadence_probe(monkeypatch, **kwargs)[key]
+
+
+def _hf_cadence_reference(action, strategy):
+    """HF's cadence for one axis, from the installed DefaultFlowCallback."""
+    field = dict((a, f) for a, f, _ in _CADENCE_AXES)[action]
+    steps_field = {"log": "logging_steps", "save": "save_steps",
+                   "evaluate": "eval_steps"}[action]
+    expected = _hf_flow_steps(action, **{field: strategy, steps_field: 2})
+    if action == "log":
+        # The loop always flushes the run's last window at the final step so the
+        # returned train_loss covers it, whatever the strategy (see
+        # test_static_log_cadence_honors_caller_supplied_logging_strategy).
+        expected = sorted(set(expected) | {6})
+    return expected
+
+
+def test_epoch_cadence_fires_without_a_default_flow_callback(monkeypatch):
+    # Regression: gating the loop's static log/save/eval interval on the
+    # caller-supplied strategy is only half of DefaultFlowCallback.on_step_end.
+    # The other half is on_epoch_end, and MLXTrainer -- unlike transformers'
+    # Trainer, which always installs DefaultFlowCallback -- installs no flow
+    # callback of its own. So a caller who hand-sets "epoch" and passes their own
+    # callbacks got the step cadence switched off with nothing put in its place:
+    # no periodic checkpoint, no periodic log and no periodic evaluation for the
+    # whole run, which is strictly worse than the wrong-cadence bug being fixed.
+    # The loop must raise the epoch action itself, so all three axes match HF
+    # whether or not a flow callback happens to be installed.
+    # Collected rather than asserted per cell so a failure names every cell that
+    # drifted, not just the first.
+    mismatches = []
+    for action, _field, _key in _CADENCE_AXES:
+        for strategy in ("steps", "epoch", "no"):
+            expected = _hf_cadence_reference(action, strategy)
+            for with_flow in (True, False):
+                got = _run_one_axis_cadence_probe(
+                    monkeypatch, action, strategy, with_flow=with_flow,
+                )
+                if got != expected:
+                    mismatches.append(
+                        (action, strategy, "with_flow" if with_flow
+                         else "no_flow", got, expected)
+                    )
+    assert mismatches == [], mismatches
+    # The strategies really are distinguishable at these parameters on every
+    # axis, so the assertions above cannot pass by coincidence.
+    for action in ("log", "save", "evaluate"):
+        assert _hf_cadence_reference(action, "steps") == [2, 4, 6], action
+        assert _hf_cadence_reference(action, "epoch") == [3, 6], action
+        # Only the log axis carries the loop's extra final-window flush.
+        assert _hf_cadence_reference(action, "no") == (
+            [6] if action == "log" else []
+        ), action
+
+
+def test_epoch_cadence_request_is_deduplicated_against_default_flow(monkeypatch):
+    # The loop's epoch request and DefaultFlowCallback's on_epoch_end ask for the
+    # same action on the same step, so a second mechanism (running the action
+    # directly at the boundary) would double-fire it: two on_save events and two
+    # writes of the same checkpoint-N, a duplicate eval_loss in log_history that
+    # EarlyStoppingCallback would count twice. Both go through the one
+    # control.should_* request the loop already clears when it runs the action,
+    # which makes the pair idempotent.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=2, save_steps=2, eval_steps=2,
+        logging_strategy="epoch", save_strategy="epoch", eval_strategy="epoch",
+    )
+    assert probe["saved"] == [3, 6], probe["saved"]
+    assert probe["checkpoints"] == [3, 6], probe["checkpoints"]
+    assert probe["evaluated"] == [3, 6], probe["evaluated"]
+    assert probe["logged"] == [3, 6], probe["logged"]
+    # One evaluation record per boundary in the history the callbacks read.
+    history = list(probe["state"].log_history)
+    assert [
+        entry["step"] for entry in history if "eval_loss" in entry
+    ] == [3, 6], history
+
+
+def test_epoch_cadence_closes_a_truncated_final_epoch(monkeypatch):
+    # HF fires on_epoch_end for a truncated final epoch after its inner step
+    # loop breaks and feeds the result straight into _maybe_log_save_evaluate,
+    # so an "epoch" strategy still gets that boundary's action. 5 steps over
+    # epochs of 3 leaves exactly that shape: a natural boundary at 3 and a
+    # truncated close at 5. Raising the request only at natural boundaries would
+    # drop the run's LAST checkpoint, the one a caller most wants.
+    for action, field, key, interval in (
+        ("log", "logging_strategy", "logged", "logging_steps"),
+        ("save", "save_strategy", "saved", "save_steps"),
+        ("evaluate", "eval_strategy", "evaluated", "eval_steps"),
+    ):
+        for with_flow in (True, False):
+            kwargs = dict(
+                logging_steps=10 ** 6, save_steps=10 ** 6,
+                total_steps=5, steps_per_epoch=3, with_flow=with_flow,
+            )
+            kwargs[interval] = 2
+            if action == "evaluate":
+                kwargs["eval_steps"] = 2
+            kwargs[field] = "epoch"
+            probe = _run_log_save_cadence_probe(monkeypatch, **kwargs)
+            assert probe[key] == [3, 5], (action, with_flow, probe[key])
+            if action == "save":
+                assert probe["checkpoints"] == [3, 5], with_flow
+
+
+def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
+    # The third on_epoch_end site: a callback that sets control.should_epoch_stop
+    # mid-epoch. HF breaks its inner step loop, fires on_epoch_end and feeds
+    # _maybe_log_save_evaluate, so its flow raises the epoch action for the
+    # epoch the callback just closed -- at the fractional epoch, not a snapped
+    # one. The loop must raise it on the same terms, or the checkpoint an
+    # early-stopping integration expects at the cut is silently missing.
+    class _EndEpochAtStep2:
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == 2:
+                control.should_epoch_stop = True
+            return control
+
+    for with_flow in (True, False):
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            save_strategy="epoch", with_flow=with_flow,
+            extra_callbacks=[_EndEpochAtStep2()],
+        )
+        # Step 2 is the truncated first epoch (2 of 3 micro-batches), and the
+        # skip lands the loop on the next boundary.
+        assert probe["saved"][0] == 2, (with_flow, probe["saved"])
+        assert probe["checkpoints"][0] == 2, (with_flow, probe["checkpoints"])
+    # And the two configurations agree exactly, which is the whole point.
+    runs = [
+        _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            save_strategy="epoch", with_flow=flow,
+            extra_callbacks=[_EndEpochAtStep2()],
+        )["saved"]
+        for flow in (True, False)
+    ]
+    assert runs[0] == runs[1], runs
+
+
+def test_epoch_eval_cadence_without_an_eval_dataset_is_inert(monkeypatch):
+    # A hand-set eval_strategy="epoch" on a run with no eval dataset must not
+    # raise and must not dispatch a phantom on_evaluate. _run_eval already
+    # returns early on empty eval batches (identically on every rank), which is
+    # the same thing that happens today when DefaultFlowCallback raises the
+    # request, so the request must not gain a divergent guard of its own.
+    for with_flow in (True, False):
+        probe = _run_log_save_cadence_probe(
+            monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
+            eval_strategy="epoch", with_flow=with_flow,
+        )
+        assert probe["evaluated"] == [], (with_flow, probe["evaluated"])
+
+
+def test_epoch_cadence_request_precedes_every_on_epoch_end_dispatch():
+    # Placement is what makes the request both HF-faithful and DDP-safe.
+    # HF's DefaultFlowCallback sits at index 0 of the callback list, so it raises
+    # the epoch action before any other on_epoch_end callback observes control;
+    # requesting before the fire puts the loop in the same position. And every
+    # on_epoch_end dispatch is followed by _distributed_sync_control_actions, so
+    # the request lands on the near side of the all-reduce that makes log/eval/
+    # save rank-consistent -- no rank can enter a collective its peers skip.
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    fires = [
+        idx for idx in range(len(src))
+        if src.startswith('_fire("on_epoch_end")', idx)
+    ]
+    assert len(fires) == 3, fires
+    for fire_at in fires:
+        window = src[:fire_at]
+        request_at = window.rindex("_request_epoch_cadence_actions()")
+        # Nothing but whitespace/comments between the request and the fire.
+        between = src[request_at:fire_at]
+        assert "_fire(" not in between[len("_request_epoch_cadence_actions()"):], (
+            between
+        )
+        sync_at = src.index("_distributed_sync_control_actions()", fire_at)
+        assert fire_at < sync_at
+    # The request itself is pure local reads of args/state, both rank-consistent,
+    # so it adds no collective of its own and cannot desynchronize the ranks.
+    import ast
+    import textwrap
+
+    request_src = inspect.getsource(MLXTrainer._request_epoch_cadence_actions)
+    called = {
+        node.func.attr
+        for node in ast.walk(ast.parse(textwrap.dedent(request_src)))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert not any(name.startswith("_distributed") for name in called), called
+
+
+def test_epoch_cadence_helpers_keep_legacy_behaviour_without_a_strategy():
+    # Same contract as the static cadences: an args object that never went
+    # through _ensure_callback_args_compat has no strategy field at all, and must
+    # keep the legacy interval-only behaviour rather than gaining an epoch
+    # cadence it never asked for.
+    from transformers.trainer_callback import TrainerControl
+    from transformers.trainer_utils import IntervalStrategy, SaveStrategy
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    def _requested(args, epoch=1.0):
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer.args = args
+        trainer.state = types.SimpleNamespace(epoch=epoch)
+        trainer.control = TrainerControl()
+        trainer._request_epoch_cadence_actions()
+        return (
+            trainer.control.should_log,
+            trainer.control.should_evaluate,
+            trainer.control.should_save,
+        )
+
+    assert _requested(types.SimpleNamespace()) == (False, False, False)
+    # The enum members and their plain-string spellings normalize the same way.
+    for member in (IntervalStrategy.EPOCH, "epoch"):
+        assert _requested(types.SimpleNamespace(
+            logging_strategy=member, eval_strategy=member,
+        )) == (True, True, False), member
+    for member in (SaveStrategy.EPOCH, "epoch"):
+        assert _requested(
+            types.SimpleNamespace(save_strategy=member)
+        ) == (False, False, True), member
+    for member in (IntervalStrategy.STEPS, IntervalStrategy.NO, "steps", "no"):
+        assert _requested(types.SimpleNamespace(
+            logging_strategy=member, eval_strategy=member,
+            save_strategy=member,
+        )) == (False, False, False), member
+    # DefaultFlowCallback.on_epoch_end gates its epoch evaluation on
+    # `args.eval_delay <= state.epoch` -- the EPOCH, not the step, unlike its
+    # on_step_end gate. An unparseable delay falls back to "no delay" so a bad
+    # override cannot disable evaluation outright.
+    delayed = types.SimpleNamespace(eval_strategy="epoch", eval_delay=2)
+    assert _requested(delayed, epoch=1.0) == (False, False, False)
+    assert _requested(delayed, epoch=2.0) == (False, True, False)
+    assert _requested(
+        types.SimpleNamespace(eval_strategy="epoch", eval_delay="oops"),
+        epoch=1.0,
+    ) == (False, True, False)
+    # A state with no epoch yet cannot be compared against the delay at all, so
+    # the request is raised rather than dropped. The three loop call sites all
+    # set state.epoch first, so this only guards helper paths.
+    assert _requested(delayed, epoch=None) == (False, True, False)
+
+
+def test_final_training_metrics_are_dispatched_before_on_train_end(monkeypatch):
+    # Regression: the aggregate train_loss / train_runtime / throughput /
+    # completed-step metrics were only assembled into the returned
+    # MLXTrainOutput. HF logs the same summary through Trainer.log immediately
+    # before on_train_end (trainer.py _finalize_training on 5.x, the tail of
+    # _inner_training_loop on 4.x), which is how it reaches state.log_history
+    # and on_log -- and so how WandbCallback.on_log promotes train_runtime /
+    # train_loss into the run summary. Without it no integration ever saw them.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=2, save_steps=10 ** 6,
+    )
+    assert len(probe["summaries"]) == 1, probe["summaries"]
+    step, payload = probe["summaries"][0]
+    assert step == 6
+    assert set(payload) == {
+        "train_loss", "train_runtime", "train_steps", "total_train_steps",
+        "trained_tokens", "train_samples_per_second", "epoch",
+    }, sorted(payload)
+    # The dispatched payload and the returned output must not drift apart.
+    result = probe["result"]
+    for key, value in payload.items():
+        if key == "epoch":
+            continue
+        assert result[key] == value, key
+    # It lands in state.log_history too, as the tail entry, exactly like HF.
+    history = list(probe["state"].log_history)
+    assert "train_runtime" in history[-1]
+    assert history[-1]["step"] == 6
+    assert sum("train_runtime" in entry for entry in history) == 1
+
+
+def test_final_training_metrics_dispatch_survives_logging_strategy_no(monkeypatch):
+    # The summary is not a DefaultFlowCallback cadence, so gating the periodic
+    # interval on logging_strategy must not suppress it: HF calls
+    # Trainer.log(metrics) unconditionally, and logging_strategy="no" is exactly
+    # the case where that is the run's only log.
+    probe = _run_log_save_cadence_probe(
+        monkeypatch, logging_steps=2, save_steps=10 ** 6,
+        logging_strategy="no",
+    )
+    assert len(probe["summaries"]) == 1, probe["summaries"]
+    assert probe["summaries"][0][0] == 6
+    assert "train_loss" in probe["summaries"][0][1]
 
 
 def test_on_prediction_step_fires_once_per_eval_batch():
