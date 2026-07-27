@@ -114,6 +114,9 @@ _GENERATION_MODE_DEPTH = 0
 _GENERATION_LIMIT_SNAPSHOT: dict[str, int] | None = None
 
 
+_KV_QUANT_CONTROLS = ("kv_bits", "kv_group_size", "kv_quant_scheme", "quantized_kv_start")
+
+
 @dataclass(frozen=True)
 class SamplingParams:
     """Sampling controls understood by mlx-lm's sampler factory."""
@@ -153,8 +156,10 @@ class GenerationDefaults:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     max_kv_size: int | None = None
-    kv_bits: int | None = None
+    kv_bits: float | None = None
     kv_group_size: int | None = None
+    kv_quant_scheme: str | None = None
+    quantized_kv_start: int | None = None
 
     def __post_init__(self):
         _validate_positive_int(self.max_tokens, "defaults.max_tokens")
@@ -168,18 +173,6 @@ class GenerationDefaults:
         )
         if self.max_kv_size is not None:
             _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
-        unsupported_kv = [
-            name
-            for name in ("kv_bits", "kv_group_size")
-            if getattr(self, name) is not None
-        ]
-        if unsupported_kv:
-            names = " and ".join(unsupported_kv)
-            raise ValueError(
-                f"{names} are not forwarded by this engine's mlx-lm text "
-                f"path (installed: {_installed_mlx_lm_version()}); omit these "
-                "controls."
-            )
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
@@ -300,6 +293,15 @@ def _validate_text_requests(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+    refused_kv = [
+        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
+    ]
+    if refused_kv:
+        raise ValueError(
+            f"{' and '.join(refused_kv)} are not forwarded by this engine's "
+            f"mlx-lm text path (installed: {_installed_mlx_lm_version()}); "
+            "omit these controls."
+        )
     return validated
 
 
@@ -332,11 +334,6 @@ def _validate_vlm_requests(
         if isinstance(request.image, os.PathLike):
             # mlx-vlm's loader opens str paths only.
             validated[index] = replace(request, image=os.fspath(request.image))
-    if defaults.stop_strings:
-        raise ValueError(
-            "stop_strings are not supported for batched vision generation yet; "
-            "omit them or post-process the returned text."
-        )
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -344,6 +341,18 @@ def _validate_vlm_requests(
             "prefill_batch_size must not exceed completion_batch_size for "
             "batched vision generation (got "
             f"{defaults.prefill_batch_size} > {defaults.completion_batch_size})."
+        )
+    refused_kv = [
+        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
+    ]
+    if refused_kv:
+        # Whether these bound anything depends on the release, the rest of the
+        # configuration, and the model's own cache classes, which upstream
+        # resolves per layer. None is forwarded rather than promise a bound
+        # that may not exist.
+        raise ValueError(
+            f"{' and '.join(refused_kv)} are not forwarded by this engine's "
+            "batched vision path; omit these controls, or use model.generate."
         )
     if defaults.max_kv_size is not None:
         # No supported BatchGenerator takes a KV-window control, so say so rather
@@ -696,8 +705,13 @@ class _DecodeStreamingDetokenizer:
 
     @property
     def last_segment(self):
-        segment = self.text[self.offset :]
-        self.offset = len(self.text)
+        text = self.text
+        if self.offset > len(text):
+            # A decode can shorten when a trailing character becomes incomplete.
+            # The offset only advances; lowering it would re-emit that tail.
+            return ""
+        segment = text[self.offset :]
+        self.offset = len(text)
         return segment
 
 
@@ -1047,7 +1061,35 @@ def _probe_vlm_api(batch_module):
         raise _vlm_api_shape_error(
             f"BatchGenerator constructor missing {', '.join(absent)}"
         )
-    return constructor, insert
+    return constructor, insert, _resolve_cancel(generator)
+
+
+def _resolve_cancel(generator):
+    """How this generator cancels one sequence, decided once.
+
+    Retrying the other form on TypeError would re-run a partially applied
+    cancel against an already mutated batch.
+    """
+
+    remove = getattr(generator, "remove", None)
+    if not callable(remove):
+        return None
+    try:
+        params = [
+            name
+            for name, param in inspect.signature(remove).parameters.items()
+            if name != "self"
+            and param.kind
+            in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+        ]
+    except (TypeError, ValueError):
+        return None
+    if not params:
+        return None
+    plural = params[0].endswith("s")
+    return (lambda gen, uid: gen.remove([uid])) if plural else (
+        lambda gen, uid: gen.remove(uid)
+    )
 
 
 def _is_mrope_position_ids(key: str, value) -> bool:
@@ -1109,7 +1151,11 @@ class _VLMBatchAdapter:
                 batch_module = importlib.import_module(defining)
             except Exception:
                 pass
-        self.constructor_params, insert_params = _probe_vlm_api(batch_module)
+        (
+            self.constructor_params,
+            insert_params,
+            self.cancel,
+        ) = _probe_vlm_api(batch_module)
         self.batch_module = batch_module
         self.generator_type = batch_module.BatchGenerator
         self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
@@ -1420,7 +1466,7 @@ class _VLMBatchAdapter:
         pending = {
             uid: _PendingResult(
                 detokenizer=_new_detokenizer(tokenizer, require_independent=True),
-                scanner=_StopStringScanner(()),
+                scanner=_StopStringScanner(self.defaults.stop_strings),
             )
             for uid in uids
         }
@@ -1451,7 +1497,19 @@ class _VLMBatchAdapter:
                     continue
                 finish_reason = event.finish_reason
                 if finish_reason is None:
-                    state.append(tokenizer, int(event.token), _event_logprob(event))
+                    stopped = state.append(
+                        tokenizer,
+                        int(event.token),
+                        _event_logprob(event),
+                    )
+                    if stopped:
+                        # Where the release cannot cancel, the sequence keeps
+                        # decoding upstream and its later events are ignored;
+                        # results match either way, only wasted decode differs.
+                        if self.cancel is not None:
+                            self.cancel(generator, event.uid)
+                        completed[event.uid] = state.result(tokenizer)
+                        del pending[event.uid]
                     continue
                 if finish_reason not in ("stop", "length"):
                     raise RuntimeError(

@@ -211,3 +211,31 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     assert [item.text for item in chunked] == [item.text for item in results]
     # Independent buffers: no result may carry another's decoded text appended.
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
+
+
+@metal_only
+def test_vlm_stop_strings_cut_generation_through_the_public_path():
+    from PIL import Image
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults,
+        GenerationRequest,
+        generate_batch,
+    )
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
+    request = GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), "red"))
+    free = generate_batch(model, processor, [request],
+                          defaults=GenerationDefaults(max_tokens=12))[0]
+    assert len(free.text) > 1
+    # The whole public path must carry stop strings, not just the event loop.
+    stop = free.text[1]
+    stopped = generate_batch(model, processor, [request], defaults=GenerationDefaults(
+        max_tokens=12, stop_strings=(stop,)))[0]
+    assert (stopped.finish_reason, stopped.stop_match) == ("stop_string", stop)
+    # Trimming is token-aligned: whole tokens before the match survive, possibly
+    # none, and never the stop string itself.
+    assert free.text.startswith(stopped.text) and stop not in stopped.text
+    assert len(stopped.token_ids) < len(free.token_ids)

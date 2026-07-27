@@ -126,9 +126,13 @@ def test_text_api_probe_accepts_supported_shape_and_names_gap_on_mismatch():
 def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.raises(TypeError, match="defaults"):
         generate_batch(object(), None, [], defaults={})
-    for name in ("kv_bits", "kv_group_size"):
+    # Refused per backend, not by the container, so each reason is true.
+    from unsloth_zoo.mlx.generate import _validate_text_requests
+    for name in ("kv_bits", "kv_group_size", "kv_quant_scheme", "quantized_kv_start"):
+        value = "affine" if name == "kv_quant_scheme" else 4
         with pytest.raises(ValueError, match=rf"{name} are not forwarded by this engine"):
-            GenerationDefaults(**{name: 4})
+            _validate_text_requests([GenerationRequest(prompt="a")],
+                                    GenerationDefaults(**{name: value}))
     for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size"):
         for value in (-1, 0, True, 1.5):
             with pytest.raises((TypeError, ValueError), match=name):
@@ -313,12 +317,23 @@ def test_inverted_batch_sizes_are_rejected_for_vision_but_kept_for_text():
     assert _validate_text_requests([GenerationRequest(prompt="a")], inverted)
 
 
-def test_vlm_requests_reject_audio_token_ids_and_stop_strings():
+def test_vlm_requests_accept_stop_strings():
+    # Reinstating the old blanket rejection left every _drive-level test green.
+    from unsloth_zoo.mlx.generate import _validate_vlm_requests
+    assert _validate_vlm_requests([GenerationRequest(prompt="a")],
+                                  GenerationDefaults(stop_strings=("STOP",)))
+
+
+def test_vlm_requests_reject_audio_and_token_id_prompts():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
     cases = ((GenerationRequest(prompt="a", audio=object()), GenerationDefaults(), "carries audio"),
         (GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
-        (GenerationRequest(prompt="a"), GenerationDefaults(stop_strings=("x",)), "stop_strings are not supported"),
-        (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"))
+        (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
+        # One that stopped being refused would reach generation and be dropped.
+        *((GenerationRequest(prompt="a"), GenerationDefaults(**{name: value}),
+           "not forwarded by this engine")
+          for name, value in (("kv_bits", 4), ("kv_group_size", 64),
+                              ("kv_quant_scheme", "affine"), ("quantized_kv_start", 100))))
     for request, defaults, message in cases:
         with pytest.raises(ValueError, match=message):
             _validate_vlm_requests([request], defaults)
@@ -504,6 +519,7 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
         def insert(self, prompts, max_tokens, prompt_kwargs=None,
                    logits_processors=None): pass
         def next(self): pass
+        def remove(self, uid): pass
         def close(self): pass
     Generator.__module__ = "mlx_vlm.generate.ar"
     ar = types.ModuleType("mlx_vlm.generate.ar")
@@ -523,6 +539,8 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
     assert adapter._split_prompt_kwargs({}, 3) == [{}, {}, {}]  # upstream splitter chosen
     assert adapter._chunked_prefill_kwargs(input_ids=None, prefill_kwargs={}) == {}
     assert policy_calls  # the policy helper was consulted, not bypassed
+    # The probed capability must reach the adapter, not merely exist on the module.
+    assert adapter.cancel is not None
 
 
 def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
@@ -574,3 +592,103 @@ def test_vlm_requests_group_by_sampling_params():
     adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="b", sampling=hot),
                       GenerationRequest(prompt="c")])
     assert sorted(chunks) == [[0, 2], [1]]
+
+
+@pytest.mark.parametrize("plural", (True, False))
+def test_vlm_stop_strings_trim_and_cancel_in_the_release_form(plural):
+    # Both signature forms, collection and single uid, must drive correctly.
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _resolve_cancel
+    cancelled = []
+    class Generator(_vlm_stub(True, events=[[(0, 2, None)], [(0, 3, None)]])):
+        if plural:
+            def remove(self, uids): cancelled.append(list(uids))
+        else:
+            def remove(self, uid): cancelled.append([uid])
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.defaults = GenerationDefaults(stop_strings=("STOP",))
+    adapter.per_row_prompt_kwargs = True
+    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.cancel = _resolve_cancel(Generator)
+    result = adapter._drive(Generator(object(), object()), [0], {})[0]
+    # "<ST" + "OP>" completes the stop string: trimmed back to the boundary.
+    assert (result.token_ids, result.finish_reason, result.stop_match) == ([], "stop_string", "STOP")
+    assert cancelled == [[0]]
+
+
+def test_vlm_stop_strings_drop_later_events_when_the_release_cannot_cancel():
+    # Without remove(), a stopped sequence keeps decoding: its later events must
+    # not reach its result, and the sibling must still complete.
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _resolve_cancel
+    Generator = _vlm_stub(False, events=[
+        [(0, 2, None), (1, 1, None)],
+        [(0, 3, None), (1, 1, None)],       # uid 0 completes "<STOP>" here
+        [(0, 1, None), (1, 1, "length")]])  # uid 0's late token must be ignored
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.defaults = GenerationDefaults(stop_strings=("STOP",))
+    adapter.per_row_prompt_kwargs = False
+    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.cancel = _resolve_cancel(Generator)
+    assert adapter.cancel is None  # no cancellation on this release
+    stopped, sibling = adapter._drive(Generator(object(), object()), [0, 1], {})
+    assert (stopped.token_ids, stopped.finish_reason, stopped.stop_match) == (
+        [], "stop_string", "STOP")
+    assert (sibling.token_ids, sibling.finish_reason) == ([1, 1, 1], "length")
+
+
+def test_generation_mode_serializes_threads_and_rejects_overlapping_tasks():
+    # Process-global MLX state is shared by neither threads nor async tasks.
+    import asyncio
+    import concurrent.futures
+    import threading
+    from unsloth_zoo.mlx.generate import generation_mode
+    model = types.SimpleNamespace(training=True, eval=lambda: None)
+    model.named_modules = lambda: [("", model)]
+    held, release = threading.Event(), threading.Event()
+    def hold():
+        with generation_mode(model):
+            held.set()
+            release.wait(5)  # held open until the probe has run: no timing race
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        task = pool.submit(hold)
+        try:
+            assert held.wait(5)
+            acquired = _GENERATION_MODE_LOCK.acquire(True, 0.05)
+            if acquired:  # never leak global lock state on failure
+                _GENERATION_MODE_LOCK.release()
+            assert acquired is False  # serialized across threads
+        finally:
+            release.set()
+            task.result()
+    async def overlap():
+        async def inner():
+            with generation_mode(model):
+                pass
+        with generation_mode(model):
+            with pytest.raises(RuntimeError, match="async tasks"):
+                await asyncio.create_task(inner())
+    asyncio.run(overlap())
+
+
+def test_detokenizer_buffers_partial_characters_and_emits_once():
+    # A replacement character is an incomplete sequence: it contributes nothing
+    # until resolved, then appears exactly once.
+    from unsloth_zoo.mlx.generate import _PendingResult, _StopStringScanner
+    tokenizer = _TableTokenizer({(1,): "hi ", (1, 2): "hi \ufffd", (1, 2, 3): "hi ok"})
+    state = _PendingResult(detokenizer=_new_detokenizer(tokenizer),
+                           scanner=_StopStringScanner(()))
+    for token in (1, 2, 3):
+        state.append(tokenizer, token, -0.1)
+    state.finish(tokenizer, "length")
+    assert state.result(tokenizer).text == "hi ok"
+
+
+def test_detokenizer_never_re_emits_after_a_shortening_decode():
+    # A shortening decode must not push the offset back and re-emit that tail.
+    from unsloth_zoo.mlx.generate import _PendingResult, _StopStringScanner
+    tokenizer = _TableTokenizer({(1,): "hello", (1, 2): "he", (1, 2, 3): "hello there"})
+    state = _PendingResult(detokenizer=_new_detokenizer(tokenizer),
+                           scanner=_StopStringScanner(()))
+    for token in (1, 2, 3):
+        state.append(tokenizer, token, -0.1)
+    state.finish(tokenizer, "length")
+    assert state.result(tokenizer).text == "hello there"
