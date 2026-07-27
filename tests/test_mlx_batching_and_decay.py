@@ -989,6 +989,190 @@ def test_vlm_plan_refreshes_visit_dependent_formatting_per_occurrence():
     assert [int(plan[i]["input_ids"][0, 0].item()) for i in range(len(plan))] == heads
 
 
+class _RandomAugmentingProcessor(_ContentProcessor):
+    """A processor whose augmentation draws from the process-global RNG.
+
+    The drawn value is stamped into the produced ids, so a batch's contents
+    reveal which position of the preprocessing stream built it.
+    """
+
+    def __call__(self, text, **_kwargs):
+        import random
+
+        draw = random.random()
+        stamp = 300 + int(draw * 1e9) % 997
+        rows = [[int(item), 200, stamp, 2] for item in text]
+        return {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array([[1] * 4 for _ in rows], dtype=np.int32),
+        }
+
+
+def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
+                          eval_dataset=None, grad_accum=1, max_steps=4,
+                          seed=3407):
+    """Run the real training loop and return the ids each micro-step saw.
+
+    The model maths are stubbed; every data path (plan construction, eval
+    batch construction, resume handling, batch fetch) stays real.
+    """
+    import os
+    import random
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    import unsloth_zoo.mlx.trainer as trainer_mod
+    import unsloth_zoo.mlx.utils as utils_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    consumed = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(4096, 4)
+            self._config = {"image_size": 16, "image_token_id": 200,
+                            "model_type": "tinyvlm"}
+            self._hf_repo = None
+
+        def __call__(self, input_ids, **_kwargs):
+            return self.embed(input_ids)
+
+        def train(self):
+            return self
+
+        def load_weights(self, *_args, **_kwargs):
+            return None
+
+    processor = _RandomAugmentingProcessor()
+    output_dir = str(tmp_path)
+    trainer = MLXTrainer(
+        model=Model(),
+        tokenizer=processor,
+        train_dataset=[{"text": str(i)} for i in range(8)],
+        eval_dataset=eval_dataset,
+        args=MLXTrainingConfig(
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=grad_accum,
+            max_steps=max_steps,
+            max_seq_length=16,
+            seed=seed,
+            output_dir=output_dir,
+            report_to="none",
+            logging_steps=10 ** 6,
+            save_steps=0,
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            # Large enough that evaluation never fires inside the loop; the
+            # eval BATCHES are still built before it.
+            eval_steps=(10 ** 6 if eval_dataset is not None else 0),
+        ),
+        processor=processor,
+    )
+    trainer._is_vlm = True
+
+    def fake_value_and_grad(model, _loss_fn):
+        params = model.trainable_parameters()
+
+        def wrapped(_model, batch_data, *_rest):
+            consumed.append(batch_data["input_ids"].tolist())
+            return (mx.array(1.0), mx.array(4)), tree_map(mx.zeros_like, params)
+
+        return wrapped
+
+    monkeypatch.setattr(nn, "value_and_grad", fake_value_and_grad)
+    monkeypatch.setattr(trainer_mod.nn, "value_and_grad", fake_value_and_grad)
+
+    class _Optimizer:
+        def __init__(self):
+            self.learning_rate = mx.array(1e-4)
+            self.state = {}
+
+        def update(self, *_args, **_kwargs):
+            return None
+
+    trainer._build_optimizer = lambda _total_steps: _Optimizer()
+    trainer.save_model = lambda *_args, **_kwargs: None
+    trainer._install_neftune = lambda *_args, **_kwargs: None
+
+    checkpoint = None
+    if resume_step:
+        checkpoint = os.path.join(output_dir, f"checkpoint-{resume_step}")
+        os.makedirs(checkpoint, exist_ok=True)
+        monkeypatch.setattr(
+            trainer_mod, "load_optimizer_state", lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            trainer_mod, "load_trainer_state",
+            lambda *a, **k: {"global_step": resume_step,
+                             "train_loss_history": []},
+        )
+
+    # Warm one-time lazy imports (some draw from the global RNG when first
+    # loaded) so only the processor's own draws are measured.
+    utils_mod.create_vlm_batches(
+        dataset=[{"text": "0"}, {"text": "1"}],
+        processor=_RandomAugmentingProcessor(),
+        config=trainer.model._config,
+        batch_size=2,
+        max_seq_length=16,
+        dataset_order="sequential",
+    )
+
+    random.seed(seed)
+    trainer.train(resume_from_checkpoint=checkpoint)
+    return consumed
+
+
+def test_vlm_resume_replays_the_skipped_preprocessing_stream(
+    monkeypatch, tmp_path,
+):
+    """Resuming must hand the first resumed batch the augmentation an
+    uninterrupted run used there, not the opening draw.
+
+    The eager builder created every scheduled batch up front, so the skipped
+    micro-batches had still run the processor; the lazy plan has to replay
+    them or a stochastic preprocessing pipeline restarts its stream at the
+    resume point.
+    """
+    _skip_if_mlx_core_was_replaced()
+
+    full = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "full", grad_accum=2, max_steps=4,
+    )
+    resumed = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "resumed", grad_accum=2, max_steps=4,
+        resume_step=2,
+    )
+
+    assert len(full) == 8 and len(resumed) == 4
+    assert resumed == full[4:]
+
+
+def test_vlm_eval_batches_leave_the_training_preprocessing_stream_alone(
+    monkeypatch, tmp_path,
+):
+    """Building eval batches must not consume the draws the first training
+    batch is owed. Eager training batches were built before the eval ones, so
+    adding an eval split never moved the training augmentation stream."""
+    _skip_if_mlx_core_was_replaced()
+
+    without_eval = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "plain", max_steps=4,
+    )
+    with_eval = _train_stochastic_vlm(
+        monkeypatch, tmp_path / "with_eval", max_steps=4,
+        eval_dataset=[{"text": str(100 + i)} for i in range(4)],
+    )
+
+    assert len(without_eval) == 4
+    assert with_eval == without_eval
+
+
 def test_vlm_plan_pins_each_visit_against_an_in_place_formatting_func():
     """A formatting_func that mutates and returns its argument must not let a
     later visit rewrite the row an earlier visit already stored, so every batch

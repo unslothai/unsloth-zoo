@@ -6660,6 +6660,33 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                     return seen_bad, seen_good
         return seen_bad, seen_good
 
+    def advance_preprocessing(self, visits):
+        """Replay the processor over the first ``visits`` visits, discarding
+        the batches.
+
+        ``resume_from_checkpoint`` starts the loop past the micro-batches the
+        killed run already consumed. The eager builder had produced every one
+        of them through the real processor, so a preprocessing pipeline that
+        draws from the shared RNGs was already past them when the killed run
+        reached this point; a lazy plan that simply skips them would hand the
+        first resumed batch the opening draw instead. Rebuilding here (MRU
+        dropped, one batch alive at a time) restores that progression exactly,
+        the way the streaming path fast-forwards its iterator. Unlike the
+        descriptor survey this deliberately does NOT preserve RNG state.
+
+        Visits past the stored schedule replayed prebuilt batches eagerly, so
+        the processor ran at most once per scheduled batch however far the
+        killed run reached; the count is clamped to match.
+        """
+        visits = min(operator.index(visits), len(self._schedule))
+        if visits <= 0:
+            return
+        self._mru = None
+        for visit in range(visits):
+            batch = self._build_batch(self.batch_index_for_visit(visit))
+            del batch
+        self._mru = None
+
     def ensure_descriptors(self):
         """Survey every scheduled batch's compile-key family, once.
 

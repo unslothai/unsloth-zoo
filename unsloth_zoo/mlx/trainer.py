@@ -341,6 +341,7 @@ from .utils import (
     _finite_text_pad_width,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
+    _preserved_preprocessing_rng,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
@@ -3888,20 +3889,27 @@ class MLXTrainer:
                         processor = self._resolve_vlm_processor()
                         config = getattr(self.model, "_config", {})
                         _vlm_mask_fn = getattr(self, '_vlm_response_mask_fn', None)
-                        return create_vlm_batches(
-                            dataset=eval_dataset,
-                            processor=processor,
-                            config=config,
-                            batch_size=eval_batch_size,
-                            max_seq_length=args.max_seq_length,
-                            image_size=getattr(args, "image_size", None),
-                            seed=args.seed,
-                            response_mask_fn=_vlm_mask_fn,
-                            formatting_func=self.formatting_func,
-                            completion_only_loss=text_completion_only_loss,
-                            comm_group=self.distributed_world,
-                            distributed_pad_mode="empty",
-                        )
+                        # Eager VLM training batches used to be built before
+                        # this point, so eval preprocessing could never reach
+                        # the training augmentation stream. A lazy training
+                        # plan builds nothing yet, so these eval builds would
+                        # otherwise consume the draws the first training batch
+                        # is owed; keep them out of that stream.
+                        with _preserved_preprocessing_rng():
+                            return create_vlm_batches(
+                                dataset=eval_dataset,
+                                processor=processor,
+                                config=config,
+                                batch_size=eval_batch_size,
+                                max_seq_length=args.max_seq_length,
+                                image_size=getattr(args, "image_size", None),
+                                seed=args.seed,
+                                response_mask_fn=_vlm_mask_fn,
+                                formatting_func=self.formatting_func,
+                                completion_only_loss=text_completion_only_loss,
+                                comm_group=self.distributed_world,
+                                distributed_pad_mode="empty",
+                            )
                     return self._create_text_eval_batches(
                         eval_dataset,
                         eval_batch_size,
@@ -4016,6 +4024,30 @@ class MLXTrainer:
                     )
                 elif fast_forward_error is not None:
                     raise fast_forward_error
+
+        # Finite VLM plans: replay the skipped micro-batches' preprocessing.
+        # The eager builder produced every scheduled batch up front, so the
+        # killed run had already run the processor over the skipped region and
+        # a stochastic preprocessing pipeline was past it. Rebuilding (and
+        # discarding) them here keeps the resumed run on the same augmentation
+        # stream an uninterrupted run used, exactly as the streaming branch
+        # above fast-forwards its iterator.
+        if _resume_step > 0 and batch_iter is None and isinstance(
+            batches, FiniteVLMBatchPlan,
+        ):
+            fast_forward_error = None
+            try:
+                batches.advance_preprocessing(_resume_step * grad_accum)
+            except BaseException as e:
+                fast_forward_error = e
+            if distributed_world_size > 1:
+                self._raise_distributed_failure(
+                    fast_forward_error is not None,
+                    "fast-forwarding VLM preprocessing",
+                    fast_forward_error,
+                )
+            elif fast_forward_error is not None:
+                raise fast_forward_error
 
         def _run_ddp_local_step(batch_data, prev_state, do_update):
             """Run local DDP work, then synchronize failures before collectives."""
