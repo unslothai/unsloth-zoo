@@ -2092,6 +2092,42 @@ def test_vlm_plan_reports_a_dataset_that_overwrites_a_media_buffer():
             )
 
 
+def test_vlm_plan_rechecks_media_between_setup_and_the_batch_that_uses_it():
+    """Batches are built on demand, so a payload mutated after setup is still
+    live when the processor finally reads it. The eager builder had already
+    converted every row to tensors, so the same mutation could not reach it."""
+    _skip_if_mlx_core_was_replaced()
+    import numpy as np
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class _OwnArrayPerRow:
+        """Distinct array per row, handed out by reference on every read."""
+        def __init__(self):
+            self.arrays = [np.full((4, 4, 3), i + 1, np.uint8) for i in range(4)]
+        def __len__(self): return 4
+        def __getitem__(self, index):
+            return {"text": str(index), "images": [self.arrays[index]]}
+
+    dataset = _OwnArrayPerRow()
+    plan = _create_vlm_batch_plan(
+        dataset=dataset,
+        processor=_ContentProcessor(),
+        config={"image_size": 16, "image_token_id": 200},
+        batch_size=2,
+        max_seq_length=8,
+        num_batches=2,
+        dataset_order="sequential",
+    )
+    # Clean at setup: nothing aliases, so every batch builds.
+    assert plan.materialize(0) is not None
+
+    dataset.arrays[2][:] = 99
+    with pytest.raises(ValueError, match="between trainer setup and the batch"):
+        plan.materialize(1)
+    # The untouched batch still builds, so the check is per row, not per plan.
+    assert plan.materialize(0) is not None
+
+
 def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
     """The probe must stay a probe: a dataset that returns its images by
     reference on every revisit keeps ONE object per row across all scheduled

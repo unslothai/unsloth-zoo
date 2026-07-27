@@ -6137,7 +6137,7 @@ def _vlm_media_fingerprint(payload):
     return None
 
 
-def _verify_vlm_media_pins(pins):
+def _verify_vlm_media_pins(pins, *, since_construction=False):
     """Raise when a stored payload changed after the row that holds it was read."""
     for payload, taken in pins:
         if taken is None:
@@ -6145,6 +6145,15 @@ def _verify_vlm_media_pins(pins):
         if _vlm_media_fingerprint(payload) != taken:
             if isinstance(payload, _LazyVLMImage):
                 _raise_vlm_lazy_file_changed(payload.path)
+            if since_construction:
+                raise ValueError(
+                    "Unsloth MLX VLM: a dataset image changed between "
+                    "trainer setup and the batch that uses it, so this batch "
+                    "would train on pixels the sample no longer holds. "
+                    "Batches are built on demand, so a payload mutated in "
+                    "place after setup is still live here. Keep dataset "
+                    "images immutable for the run, or hand the trainer a copy."
+                )
             raise ValueError(
                 "Unsloth MLX VLM: a dataset image changed after the row "
                 "holding it was read, so stored rows no longer match their "
@@ -6188,13 +6197,35 @@ def _snapshot_formatted_vlm_row(item, _depth=0, _pins=None):
 
 
 class _FiniteVLMRow:
-    """CPU-side formatted VLM item plus its checker-supervision flag."""
+    """CPU-side formatted VLM item plus its checker-supervision flag.
 
-    __slots__ = ("item", "checker_good")
+    ``pins`` keeps this row's media probes alive past construction. The eager
+    builder converted every payload to tensors up front, so a caller that
+    mutated one afterwards could not reach training; this plan holds the
+    payload itself until materialize, so the same probe has to be re-read
+    there. The probes cost a stat for a released file and one crc32 pass
+    otherwise, both far below the processor call they precede.
+    """
 
-    def __init__(self, item, checker_good=True):
+    __slots__ = ("item", "checker_good", "pins")
+
+    def __init__(self, item, checker_good=True, pins=()):
         self.item = item
         self.checker_good = bool(checker_good)
+        self.pins = pins
+
+
+def _pinned_finite_vlm_row(item, checker_good=True, *, _all_pins=None, snapshot=True):
+    """Build one plan row, keeping its media probes for the materialize check."""
+    pins = []
+    stored = _snapshot_formatted_vlm_row(item, _pins=pins)
+    if _all_pins is not None:
+        _all_pins.extend(pins)
+    return _FiniteVLMRow(
+        stored if snapshot else item,
+        checker_good,
+        tuple(pins),
+    )
 
 
 # The serializer trusts a genuine mlx.core at import time, the same trust the
@@ -6835,6 +6866,11 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
     def _build_batch(self, index, target_width=None):
         """Build one batch through the complete existing VLM builder,
         right-padded to ``target_width`` when an endpoint is given."""
+        # Re-read the probes before the payloads reach the processor: the
+        # construction check only covers the read window, and these rows are
+        # still the caller's own objects until here.
+        for i in self._schedule[index]:
+            _verify_vlm_media_pins(self._rows[i].pins, since_construction=True)
         batch_items = [
             _restore_vlm_row_image_handles(self._rows[i].item)
             for i in self._schedule[index]
@@ -7276,20 +7312,18 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         # memory this plan exists to save.
         media_pins = []
         rows = tuple(
-            _FiniteVLMRow(
-                # Release before pinning, not after: a pin holds its payload so
-                # the probe can re-read it, which would keep every row's file
-                # open for the whole collection. The released stand-in is
-                # pinned by identity instead, which costs a stat and catches a
-                # dataset that rewrites one shared path per row.
-                _snapshot_formatted_vlm_row(
-                    _release_vlm_row_image_handles(
-                        dataset[idx] if formatting_func is None
-                        else formatting_func(dataset[idx])
-                    ),
-                    _pins=media_pins,
+            # Release before pinning, not after: a pin holds its payload so
+            # the probe can re-read it, which would keep every row's file
+            # open for the whole collection. The released stand-in is
+            # pinned by identity instead, which costs a stat and catches a
+            # dataset that rewrites one shared path per row.
+            _pinned_finite_vlm_row(
+                _release_vlm_row_image_handles(
+                    dataset[idx] if formatting_func is None
+                    else formatting_func(dataset[idx])
                 ),
                 True if _supervision is None else _supervision[idx],
+                _all_pins=media_pins,
             )
             for batch in schedule for idx in batch
         )
@@ -7311,10 +7345,13 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
                     seen_used.add(idx)
                     used.append(idx)
         position = {idx: pos for pos, idx in enumerate(used)}
+        # The filter already formatted these, so they are referenced rather
+        # than snapshotted, but they reach the processor just as late.
         rows = tuple(
-            _FiniteVLMRow(
+            _pinned_finite_vlm_row(
                 _release_vlm_row_image_handles(formatted_items[idx]),
                 True if _supervision is None else _supervision[idx],
+                snapshot=False,
             )
             for idx in used
         )
