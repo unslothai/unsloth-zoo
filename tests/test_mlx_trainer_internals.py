@@ -6164,6 +6164,8 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
     clock = _FakeClock(_time)
     monkeypatch.setattr(trainer_mod, "time", clock)
 
+    # The per-micro-batch input-token count is this test's clock hook, and it only
+    # runs when include_num_input_tokens_seen is enabled, so opt in explicitly.
     consumed = {"i": 0}
     real_count = trainer_mod._mlx_batch_input_token_count
 
@@ -6193,6 +6195,7 @@ def test_forced_epoch_log_splits_pending_wall_clock_from_committed(monkeypatch):
         disable_memory_limits=True,
         output_dir=tempfile.mkdtemp(),
     )
+    args.include_num_input_tokens_seen = "all"
     trainer = MLXTrainer(
         _tiny_lm_for_loop_tests(),
         types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
@@ -7333,3 +7336,84 @@ def test_appended_config_fields_union_keeps_legacy_dumps_wholesale():
         if f.name not in appended
     }
     assert MLXTrainingConfig(**legacy)._unsloth_mlx_warmup_steps_explicit is False
+
+def test_input_token_counting_is_gated_on_its_argument(monkeypatch):
+    # HF counts input tokens only when args.include_num_input_tokens_seen is
+    # enabled; "no"/False (the default _ensure_callback_args_compat applies) skips
+    # the whole block, so state.num_input_tokens_seen stays 0 and no gather runs
+    # (transformers trainer.py: _track_num_input_tokens on 5.x, the inline
+    # include_num_input_tokens_seen block on 4.57.x). The MLX loop counted and
+    # all-reduced unconditionally, so an opted-out run showed callbacks a nonzero
+    # counter and paid an extra lockstep collective on every micro-batch.
+    import tempfile
+
+    from transformers import TrainerCallback
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    widths = (8, 9, 10, 11)
+
+    class TokenSpy(TrainerCallback):
+        def __init__(self):
+            self.per_step = []
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.per_step.append(int(state.num_input_tokens_seen))
+            return control
+
+    def run(flag):
+        spy = TokenSpy()
+        args = MLXTrainingConfig(
+            max_steps=len(widths),
+            gradient_accumulation_steps=1,
+            logging_steps=len(widths),
+            use_cce=False,
+            compile=False,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        )
+        if flag is not None:
+            args.include_num_input_tokens_seen = flag
+        trainer = MLXTrainer(
+            _tiny_lm_for_loop_tests(),
+            types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+            [],
+            args=args,
+            callbacks=[spy],
+        )
+        collectives = []
+        inner = trainer._distributed_all_sum
+
+        def counting_all_sum(value, stream=None):
+            collectives.append(1)
+            return inner(value, stream=stream)
+
+        trainer._distributed_all_sum = counting_all_sum
+        trainer._batches = _make_shape_guard_text_plan(widths)
+        trainer._build_optimizer = _frozen_optimizer()
+        trainer.save_model = lambda *_a, **_kw: None
+        trainer.train()
+        return spy.per_step, len(collectives), trainer.state.num_input_tokens_seen
+
+    # Enabled: the running global total of forwarded input positions, matching
+    # real transformers.Trainer on the same widths.
+    on_steps, on_collectives, on_final = run("all")
+    assert on_steps == [8, 17, 27, 38]
+    assert on_final == 38
+
+    # Every disabled spelling HF accepts leaves the counter untouched.
+    for disabled in (None, False, "no"):
+        off_steps, off_collectives, off_final = run(disabled)
+        assert off_steps == [0, 0, 0, 0], disabled
+        assert off_final == 0, disabled
+        # ...and skips exactly one all-reduce per micro-batch.
+        assert off_collectives == on_collectives - len(widths), disabled
+
+    # "non_padding" is an enabled mode, not an opt-out.
+    assert run("non_padding")[0] == [8, 17, 27, 38]

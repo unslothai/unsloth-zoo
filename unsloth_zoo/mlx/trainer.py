@@ -4393,6 +4393,12 @@ class MLXTrainer:
 
         # Training loop — mlx-lm pattern
         model.train()
+        # HF's include_num_input_tokens_seen gate: "no"/False (its default, and the
+        # one _ensure_callback_args_compat applies) skips input-token counting
+        # entirely. Read once so the branch is identical on every rank.
+        track_input_tokens = getattr(
+            args, "include_num_input_tokens_seen", False,
+        ) not in ("no", False)
         start_time = time.perf_counter()
         # Metric accumulators are split into a "committed" window (loss/tokens
         # from optimizer steps that have already been APPLIED to the model but not
@@ -5187,27 +5193,32 @@ class MLXTrainer:
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
-            # Global INPUT-token count for HF's num_input_tokens_seen. global_toks
-            # above is the loss mask's supervised-token count (used for the
-            # zero-token guard), not the input-token count HF's field reports, so
-            # counting it would undercount prompts and masked tokens. Sum the batch
-            # input numel and all-reduce it (same global gather semantics as HF and
-            # as global_toks). Unconditional on every rank, so DDP lockstep holds.
-            global_input_toks = self._distributed_all_sum(
-                mx.array(_mlx_batch_input_token_count(batch_data), dtype=mx.int32),
-                stream=mx.cpu,
-            )
-            mx.eval(global_input_toks)
-            # HF's TrainerState.num_input_tokens_seen is a global (all-rank
-            # gathered) count of INPUT tokens; callbacks that report or stop on a
-            # token budget read it directly. Use the all-reduced input-token count
-            # (not global_toks, which is the supervised/label-token count, nor the
-            # rank-local value which would undercount by ~world_size under DDP).
-            # Increment BEFORE on_optimizer_step: HF advances num_input_tokens_seen
-            # right after the forward, ahead of the on_optimizer_step callback
-            # (transformers trainer.py), so a token-budget callback observes this
-            # microbatch's tokens at the step it fires on.
-            self.state.num_input_tokens_seen += int(global_input_toks.item())
+            # Global INPUT-token count for HF's num_input_tokens_seen, only when the
+            # run opted in (track_input_tokens). global_toks above is the loss mask's
+            # supervised-token count (used for the zero-token guard), not the
+            # input-token count HF's field reports, so counting it would undercount
+            # prompts and masked tokens. Sum the batch input numel and all-reduce it
+            # (same global gather semantics as HF and as global_toks). The gate is
+            # rank-uniform config, so every rank skips or runs it together.
+            if track_input_tokens:
+                global_input_toks = self._distributed_all_sum(
+                    mx.array(
+                        _mlx_batch_input_token_count(batch_data), dtype=mx.int32,
+                    ),
+                    stream=mx.cpu,
+                )
+                mx.eval(global_input_toks)
+                # HF's TrainerState.num_input_tokens_seen is a global (all-rank
+                # gathered) count of INPUT tokens; callbacks that report or stop on a
+                # token budget read it directly. Use the all-reduced input-token
+                # count (not global_toks, which is the supervised/label-token count,
+                # nor the rank-local value which would undercount by ~world_size
+                # under DDP). Increment BEFORE on_optimizer_step: HF advances
+                # num_input_tokens_seen right after the forward, ahead of the
+                # on_optimizer_step callback (transformers trainer.py), so a
+                # token-budget callback observes this microbatch's tokens at the step
+                # it fires on.
+                self.state.num_input_tokens_seen += int(global_input_toks.item())
             if do_update:
                 _fire("on_optimizer_step")
                 # Do NOT latch a callback should_training_stop into stop_requested
