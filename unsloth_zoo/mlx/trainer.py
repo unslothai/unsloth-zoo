@@ -928,12 +928,17 @@ def _prune_stale_checkpoints(output_dir, save_total_limit, keep_step=None):
     if len(checkpoints) <= save_total_limit:
         return
     checkpoints.sort()
+    # Move the protected entry to the end before slicing, as HF does, so the
+    # limit still binds: excluding it from the stale slice instead retained
+    # save_total_limit + 1 directories from then on.
     protected = None if keep_step is None else int(keep_step)
-    stale_dirs = [
-        child for step, child in checkpoints[:-save_total_limit]
-        if step != protected
-    ]
-    for stale in stale_dirs:
+    limit = save_total_limit
+    if limit == 1 and protected is not None:
+        # HF raises the limit to 2 here so the best and the latest both survive.
+        limit = 2
+    ordered = [child for step, child in checkpoints if step != protected]
+    ordered += [child for step, child in checkpoints if step == protected]
+    for stale in ordered[:max(0, len(ordered) - limit)]:
         try:
             shutil.rmtree(stale)
         except Exception as exc:
@@ -1472,7 +1477,16 @@ def _plan_single_process_vlm_shapes(
     # planned_event_widths() reduces the maximum padable width and the union of
     # untouched extents over EVERY batch -- narrowing that input would silently
     # move the endpoints of the batches that do train.
-    total_microsteps = total_steps * args.gradient_accumulation_steps
+    grad_accum = args.gradient_accumulation_steps
+    # Same epoch-aware mapping the runtime loop uses, as the text planner does.
+    # A ragged epoch turns its tail micro-batch into an update phase, and
+    # cataloging the flat phase left that signature unadmitted, so compiled VLM
+    # training aborted at the first ragged boundary.
+    epoch_microbatches = _mlx_epoch_microbatches(args, batches)
+    total_microsteps = (
+        _mlx_microstep_for_step(total_steps, epoch_microbatches, grad_accum)
+        if epoch_microbatches else total_steps * grad_accum
+    )
     executed = sorted({
         batches.batch_index_for_visit(microstep)
         for microstep in range(total_microsteps)
@@ -1503,10 +1517,11 @@ def _plan_single_process_vlm_shapes(
         key = (
             batches.batch_family(batch_index),
             planned_widths[batch_index],
-            phase_for_microstep(
+            _mlx_microstep_phase(
                 compile_scope,
-                args.gradient_accumulation_steps,
+                grad_accum,
                 microstep,
+                epoch_microbatches,
             ),
             len(batches.schedule[batch_index]),
         )

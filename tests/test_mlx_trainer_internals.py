@@ -4502,6 +4502,7 @@ def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
     for step in (1, 2, 3):
         (tmp_path / f"checkpoint-{step}").mkdir()
 
+    # limit 1 keeps the best AND the latest, as HF does by raising its own limit.
     _prune_stale_checkpoints(str(tmp_path), 1, keep_step=1)
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "checkpoint-1", "checkpoint-3",
@@ -4509,6 +4510,15 @@ def test_best_checkpoint_survives_save_total_limit_rotation(tmp_path):
     # No protected step: unchanged behaviour, newest only.
     _prune_stale_checkpoints(str(tmp_path), 1)
     assert [p.name for p in tmp_path.iterdir()] == ["checkpoint-3"]
+
+    # Protecting an old best must not stop the limit binding: excluding it from
+    # the stale slice instead retained save_total_limit + 1 from then on.
+    for step in (1, 2, 3, 4):
+        (tmp_path / f"checkpoint-{step}").mkdir(exist_ok=True)
+    _prune_stale_checkpoints(str(tmp_path), 2, keep_step=1)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "checkpoint-1", "checkpoint-4",
+    ]
 
 
 def test_final_metrics_separate_sample_and_token_throughput(monkeypatch):
