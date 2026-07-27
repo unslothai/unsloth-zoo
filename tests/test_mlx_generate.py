@@ -324,10 +324,9 @@ def test_vlm_requests_accept_stop_strings():
                                   GenerationDefaults(stop_strings=("STOP",)))
 
 
-def test_vlm_requests_reject_audio_and_token_id_prompts():
+def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
-    cases = ((GenerationRequest(prompt="a", audio=object()), GenerationDefaults(), "carries audio"),
-        (GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+    cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One that stopped being refused would reach generation and be dropped.
         *((GenerationRequest(prompt="a"), GenerationDefaults(**{name: value}),
@@ -692,3 +691,141 @@ def test_detokenizer_never_re_emits_after_a_shortening_decode():
         state.append(tokenizer, token, -0.1)
     state.finish(tokenizer, "length")
     assert state.result(tokenizer).text == "hello there"
+
+
+class _EosTokenizer(_CharTokenizer):
+    eos_token_id = 3
+
+def _audio_events(*specs):
+    """Sequential events; `finish` omitted models releases carrying no reason.
+
+    Each event carries a distinct logprob, so committing a successor's value
+    against its predecessor's token shifts alignment visibly.
+    """
+    made = []
+    for position, (token, finish) in enumerate(specs):
+        fields = {"token": token, "logprobs": {token: -0.5 - position}}
+        if finish is not None:
+            fields["finish_reason"] = finish
+        made.append(types.SimpleNamespace(**fields))
+    return made
+
+def _audio_adapter(events, tokenizer=None, stops=()):
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.defaults = GenerationDefaults(stop_strings=stops)
+    adapter.processor = types.SimpleNamespace(tokenizer=tokenizer or _CharTokenizer())
+    adapter.model = object()
+    adapter.sampler = object()
+    adapter.sampler_kwargs = {}
+    adapter.make_sampler = lambda **k: (adapter.sampler_kwargs.update(k), adapter.sampler)[1]
+    adapter._wired_limit = contextlib.nullcontext
+    adapter.stream_calls = []
+    def stream(*args, **kwargs):
+        adapter.stream_calls.append((args, kwargs))
+        return iter(events)
+    adapter.stream_module = types.SimpleNamespace(stream_generate=stream)
+    return adapter
+
+
+class _CriteriaTokenizer(_CharTokenizer):
+    # Processors stop on ids their eos attribute never lists, so these disagree.
+    eos_token_id = 1
+    stopping_criteria = staticmethod(lambda token: token == 3)
+
+
+@pytest.mark.parametrize("specs,tokenizer,expected", [
+    # The terminal event repeats the last token; committing it would duplicate.
+    (((1, None), (2, None), (2, None)), None, ([1, 2], "length")),
+    # No finish reason on the terminal event, but its token is end-of-sequence.
+    (((1, None), (3, None)), _EosTokenizer(), ([1], "stop")),
+    # The release stops through criteria the tokenizer's eos id does not list.
+    (((1, None), (3, None)), _CriteriaTokenizer(), ([1], "stop")),
+    # ... and that same authority reports an ordinary token as a length cut-off.
+    (((1, None), (2, None), (2, None)), _CriteriaTokenizer(), ([1, 2], "length")),
+    # A reported reason is believed, not re-inferred, in both directions.
+    (((1, None), (2, "stop")), None, ([1], "stop")),
+    (((1, None), (3, "length")), _CriteriaTokenizer(), ([1], "length")),
+    # Nothing generated at all: newer releases emit one event with no token.
+    (((None, "length"),), None, ([], "length")),
+])
+def test_audio_fallback_keeps_the_batched_result_contract(specs, tokenizer, expected):
+    result = _audio_adapter(_audio_events(*specs), tokenizer)._generate_sequentially(
+        GenerationRequest(prompt="p", audio="a.wav"))
+    assert (result.token_ids, result.finish_reason) == expected
+    # Logprobs must belong to the tokens they sit beside, not to their successors.
+    assert result.logprobs == [-0.5 - n for n in range(len(result.token_ids))]
+    assert result.text == "".join(_CharTokenizer.pieces[t] for t in result.token_ids)
+
+
+def test_audio_terminal_event_flushes_text_held_back_during_streaming():
+    # Cleanup withholds a trailing space until finalize; losing it truncates.
+    tokenizer = _TableTokenizer({(1,): "a ", (1, 2): "a b "}, clean=True)
+    result = _audio_adapter(_audio_events((1, None), (2, None), (2, None)),
+                            tokenizer)._generate_sequentially(
+        GenerationRequest(prompt="p", audio="a.wav"))
+    assert (result.token_ids, result.text) == ([1, 2], "a b ")
+
+
+def test_audio_fallback_forwards_the_request_to_the_stream():
+    # A dropped audio payload or ignored control shows up in the stream call.
+    adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
+    adapter._generate_sequentially(GenerationRequest(
+        prompt="p", audio="a.wav", max_tokens=9,
+        sampling=SamplingParams(temperature=0.25, top_k=7)))
+    args, kwargs = adapter.stream_calls[0]
+    assert args[2] == "p"  # the rendered prompt, after model and processor
+    assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)
+    assert kwargs["sampler"] is adapter.sampler
+    # Per-request sampling, not the batch-wide default.
+    assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
+
+
+def test_audio_fallback_honours_stop_strings():
+    # Audio reaches the same scanner: "<ST" + "OP>" completes the stop string.
+    result = _audio_adapter(_audio_events((2, None), (3, None), (3, "length")),
+                            stops=("STOP",))._generate_sequentially(
+        GenerationRequest(prompt="p", audio="a.wav"))
+    assert (result.token_ids, result.finish_reason, result.stop_match) == (
+        [], "stop_string", "STOP")
+
+
+def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkeypatch):
+    # The tests above drive the adapter directly and would stay green if the
+    # old blanket audio rejection came back.
+    from unsloth_zoo.mlx import generate as engine
+    seen = []
+    monkeypatch.setattr(engine._VLMBatchAdapter, "__init__",
+                        lambda self, *a: setattr(self, "per_row_prompt_kwargs", True))
+    monkeypatch.setattr(engine._VLMBatchAdapter, "_decode_image", lambda self, r: r)
+    monkeypatch.setattr(engine._VLMBatchAdapter, "_generate_sequentially",
+                        lambda self, request: seen.append(request.audio) or "audio")
+    model = types.SimpleNamespace(_is_vlm_model=True, training=False, eval=lambda: None)
+    model.named_modules = lambda: [("", model)]
+    with pytest.warns(RuntimeWarning, match="decode one at a time"):
+        results = engine.generate_batch(
+            model, object(), [GenerationRequest(prompt="p", audio="a.wav")])
+    assert (results, seen) == (["audio"], ["a.wav"])
+    # The at-most-one-media invariant has to survive audio becoming supported.
+    with pytest.raises(ValueError, match="both an image and audio"):
+        engine.generate_batch(model, object(),
+                              [GenerationRequest(prompt="p", image=object(), audio="a.wav")])
+
+
+def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches():
+    # Audio has no batched path, but must not drag the others out of theirs.
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+    adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
+    batched = []
+    adapter._decode_image = lambda request: request
+    adapter._group_key = lambda request: "g"
+    adapter.per_row_prompt_kwargs = True
+    adapter._run_chunk = lambda chunk, indices: (
+        batched.append(list(indices)), ["batched"] * len(chunk))[1]
+    requests = [GenerationRequest(prompt="a"), GenerationRequest(prompt="b", audio="a.wav"),
+                GenerationRequest(prompt="c")]
+    with pytest.warns(RuntimeWarning, match="decode one at a time"):
+        results = _VLMBatchAdapter.generate(adapter, requests)
+    assert batched == [[0, 2]]  # the audio row never reached the batched path
+    assert [results[0], results[2]] == ["batched", "batched"]
+    assert results[1].token_ids == [1]

@@ -196,7 +196,9 @@ class GenerationRequest:
     Rendered prompt strings are encoded as-is; chat templating belongs to the
     caller. ``image`` (vision models only) accepts a PIL image, an array, or a
     str/os.PathLike filesystem path or URL, decoded once before grouping; raw
-    bytes and file-like objects are rejected. ``audio`` is not yet supported.
+    bytes and file-like objects are rejected. ``audio`` (vision models only) is
+    accepted but decodes one request at a time, since no supported mlx-vlm
+    release batches it. At most one of ``image`` and ``audio`` per request.
     """
 
     prompt: str | None = None
@@ -320,10 +322,10 @@ def _validate_vlm_requests(
             )
         if not isinstance(request.prompt, str):
             raise TypeError(f"requests[{index}].prompt must be a string.")
-        if request.audio is not None:
+        if request.image is not None and request.audio is not None:
             raise ValueError(
-                f"requests[{index}] carries audio, which batched vision "
-                "generation does not support; use model.generate instead."
+                f"requests[{index}] carries both an image and audio; batched "
+                "vision generation takes at most one medium per request."
             )
         if request.max_tokens is not None:
             _validate_positive_int(request.max_tokens, f"requests[{index}].max_tokens")
@@ -1319,9 +1321,23 @@ class _VLMBatchAdapter:
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         requests = [self._decode_image(request) for request in requests]
         results: list[GenerationResult | None] = [None] * len(requests)
+        audio_indices = [
+            index for index, request in enumerate(requests) if request.audio is not None
+        ]
+        if audio_indices:
+            # No supported release batches audio.
+            warnings.warn(
+                f"{len(audio_indices)} audio request(s) decode one at a time: "
+                f"{_installed_mlx_vlm_version()} batches text and images only.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            for index in audio_indices:
+                results[index] = self._generate_sequentially(requests[index])
         groups: dict[Any, list[int]] = {}
         for index, request in enumerate(requests):
-            groups.setdefault(self._group_key(request), []).append(index)
+            if request.audio is None:
+                groups.setdefault(self._group_key(request), []).append(index)
         # Older releases slice shared kwargs from row zero on every prefill
         # batch, pairing later prompts with earlier embeddings, so they run one
         # chunk per generator. Per-row releases keep the configured sizes.
@@ -1340,6 +1356,78 @@ class _VLMBatchAdapter:
                 for index, result in zip(chunk, self._run_chunk(requests, chunk)):
                     results[index] = result
         return [result for result in results if result is not None]
+
+    def _generate_sequentially(self, request: GenerationRequest) -> GenerationResult:
+        """One audio request through the release's sequential stream.
+
+        The stream's terminal event carries no new token: it repeats the last
+        one on budget exhaustion, or is the stopping token, which this contract
+        excludes. So an event is committed only once a successor arrives, and
+        the terminal one contributes text alone.
+        """
+
+        stream = getattr(self.stream_module, "stream_generate", None)
+        if not callable(stream):
+            raise _vlm_api_shape_error("no importable module exposes stream_generate")
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        sampling = request.sampling or self.defaults.sampling
+        state = _PendingResult(
+            detokenizer=_new_detokenizer(tokenizer, require_independent=True),
+            scanner=_StopStringScanner(self.defaults.stop_strings),
+        )
+        previous = None
+        # No wrap here: the sequential stream owns its own wired-limit window.
+        events = stream(
+            self.model,
+            self.processor,
+            request.prompt,
+            audio=request.audio,
+            max_tokens=int(request.max_tokens or self.defaults.max_tokens),
+            sampler=self.make_sampler(
+                temp=sampling.temperature,
+                top_p=sampling.top_p,
+                top_k=sampling.top_k,
+                min_p=sampling.min_p,
+            ),
+        )
+        for event in events:
+            if previous is not None and state.append(
+                tokenizer,
+                int(previous.token),
+                _event_logprob(previous),
+            ):
+                return state.result(tokenizer)
+            previous = event
+        if previous is None:
+            raise RuntimeError(
+                "mlx-vlm produced no events for an audio request."
+            )
+        state.finish(tokenizer, self._terminal_reason(previous, tokenizer))
+        return state.result(tokenizer)
+
+    @staticmethod
+    def _terminal_reason(event, tokenizer) -> Literal["stop", "length"]:
+        reason = getattr(event, "finish_reason", None)
+        if reason in ("stop", "length"):
+            return reason
+        if reason is not None:
+            raise RuntimeError(
+                f"mlx-vlm emitted an unsupported finish reason: {reason!r}."
+            )
+        token = getattr(event, "token", None)
+        if token is None:
+            return "length"
+        # Ask the criteria object that actually ended the loop: processors carry
+        # stop ids the tokenizer's EOS attributes do not list, so rebuilding the
+        # set would report a genuine stop as a length cut-off.
+        criteria = getattr(tokenizer, "stopping_criteria", None)
+        if callable(criteria):
+            try:
+                return "stop" if criteria(int(token)) else "length"
+            except Exception:
+                pass
+        eos = {ids[0] for ids in _eos_stop_tokens(tokenizer)}
+        return "stop" if int(token) in eos else "length"
 
     def _run_chunk(
         self,
