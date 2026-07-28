@@ -413,7 +413,9 @@ def replace_sdpa_with_amd_aiter(source):
     # Excludes: disable_compile_scaled_dot_product_attention (opt-out shim)
     # Uses ((?:[^)]|\([^)]*\))*) to handle one level of nested parens in args
     sdpa_call_pattern = (
-        r"([ \t]*)([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*"
+        # Negative lookbehind: reject attribute assignments like self.attn_output = ...
+        # which would leave "self." dangling before the generated if/else block.
+        r"([ \t]*)(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*"
         r"(?:(?:torch\.nn\.functional|F|nn\.functional)\.)?scaled_dot_product_attention"
         r"\("
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
