@@ -380,15 +380,27 @@ def replace_sdpa_with_amd_aiter(source):
     For AMD ROCm with amd-aiter installed: replace scaled_dot_product_attention
     calls with amd-aiter Flash Attention in the compiled source.
 
-    Safety requirements (all must hold for the aiter path to activate):
+    Activation requirements (ALL must hold):
       1. get_amd_attention_implementation() == "amd_aiter"
-      2. is_causal=True as a literal (not a complex expression)
-      3. No extra SDPA args that aiter does not support:
-         attn_mask, dropout_p, scale, enable_gqa
-      4. q/k seq lengths equal (non-square causal has different bias alignment)
-      5. Input dtype is float16 or bfloat16 (aiter does not support float32)
+         — requires ROCm >= 7.0, aiter installed, gfx942 or gfx950 arch
+      2. rest_args is exactly ", is_causal=True" (optional trailing comma/whitespace)
+         — any other argument (positional or keyword) leaves the call unchanged
+      3. Call is not immediately followed by a method chain, subscript, or operator
+         — .transpose(), * scale, [0], etc. are rejected (negative lookahead)
+      4. At runtime, _aiter_ok additionally checks:
+         - q/k seq lengths equal (causal mask alignment differs between SDPA and aiter)
+         - input dtype is float16 or bfloat16 (aiter does not support float32)
+         - no input has requires_grad=True (aiter asserts return_lse for backward;
+           we omit return_lse, so the fast path is inference-only)
+      5. aiter call wrapped in try/except with SDPA fallback for unsupported head dims
+         or JIT failures
 
-    No-op on NVIDIA and on ROCm without amd-aiter or ROCm < 7.0.
+    Known limitation: the rewrite currently only matches user-code SDPA calls with
+    the bare is_causal=True form. Unsloth's own compiled SDPA paths emit attn_mask=
+    or is_causal=<variable> which are correctly rejected by guard 2. Wiring this
+    to Unsloth's SDPA shim requires a separate follow-up PR.
+
+    No-op on NVIDIA and on ROCm without amd-aiter, ROCm < 7.0, or unsupported arch.
     """
     # Import inside function — avoids compile-time NameError in caller scope
     from unsloth_zoo.device_type import get_amd_attention_implementation
@@ -408,7 +420,7 @@ def replace_sdpa_with_amd_aiter(source):
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
         r"((?:[^)]|\([^)]*\))*)\)"
-        r"(?![ \t]*\.)"  # reject chained calls: .transpose(), .view(), etc.
+        r"(?![ \t]*[^\s#])"  # reject any non-ws/non-comment suffix (* scale, [0], .method)
     )
 
     def aiter_replacement(m):
@@ -437,10 +449,11 @@ def replace_sdpa_with_amd_aiter(source):
         # Clean leading newlines from rest_args
         rest_args_clean = rest_args.lstrip("\r\n").strip()
         # rest_args already starts with a comma when non-empty; do NOT add another
-        # rest_args is ", is_causal=True" at this point — pass it through to the
-        # SDPA fallback so the original call semantics are preserved.
-        rest_args_clean = rest_args.lstrip("\r\n").strip()
-        rest_args_formatted = rest_args_clean  # already starts with comma
+        # rest_args is ", is_causal=True" at this point (fullmatch guarantees this).
+        # Pass it through to the SDPA fallback as-is.
+        rest_args_formatted = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
+        # Reconstruct with leading comma for the SDPA fallback call
+        rest_args_formatted = (", " + rest_args_formatted) if rest_args_formatted else ""
 
         # Generate the replacement block.
         # All symbols used at runtime are imported inside the generated code so
@@ -455,10 +468,11 @@ def replace_sdpa_with_amd_aiter(source):
             f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",  # equal seq lengths
             f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",  # dtype guard
             # Inference-only: aiter.flash_attn_func asserts return_lse=True when
-            # any input has requires_grad=True (autograd path). We omit return_lse,
-            # so calling it during training would raise AssertionError on every
-            # forward, making the fast path exception-driven double work.
-            f"{indent}    and not {q_var}.requires_grad",  # inference-only guard
+            # any input has requires_grad=True (aiter/ops/mha.py:2502,2536). We
+            # omit return_lse, so calling it during training raises AssertionError.
+            # Must check all three of q/k/v: a LoRA targeting k_proj/v_proj but
+            # not q_proj leaves k and v with grad while q.requires_grad is False.
+            f"{indent}    and not ({q_var}.requires_grad or {k_var}.requires_grad or {v_var}.requires_grad)",
             f"{indent})",
             f"{indent}if _aiter_ok:",
             f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
