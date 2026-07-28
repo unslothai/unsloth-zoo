@@ -790,3 +790,212 @@ def test_full_state_shape_mismatch_rejected(tmp_path, base_dir):
     from unsloth_zoo.mlx.loader import FastMLXModel
     with pytest.raises(Exception, match="shape mismatch"):
         FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+
+
+def test_nested_text_tower_bridge(tmp_path, base_dir):
+    """A PEFT adapter names modules one level shallower than an mlx-vlm
+    tree nests them; the import resolves that nesting and the export emits
+    Hugging-Face-native paths again."""
+    peft_dir = str(tmp_path / "peft")
+    wrapped, cfg = _make_peft_adapter(base_dir, peft_dir)
+    model, _ = load_model(Path(base_dir))
+
+    class _Tower(nn.Module):
+        """Stand-in for the mlx-vlm wrapper: the text model nested one level."""
+        def __init__(self, inner):
+            super().__init__()
+            self.language_model = inner
+
+        def __call__(self, *args, **kwargs):
+            return self.language_model(*args, **kwargs)
+
+    nested = _Tower(model)
+    assert attach_and_bind_peft_adapter(
+        nested, peft_dir, normalize_peft_adapter_config(cfg),
+    ) == 2 * LAYERS
+    assert nested._unsloth_tree_prefix == "language_model."
+    np.testing.assert_allclose(
+        _mlx_logits(nested), _peft_logits(wrapped), atol=5e-3,
+    )
+    # Live state is keyed by the real (nested) module paths.
+    assert all(
+        k.startswith("language_model.")
+        for k in nested._unsloth_lora_module_scales
+    )
+
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    out = str(tmp_path / "back")
+    save_lora_adapters(nested, out, adapter_format="peft")
+    back_cfg = json.load(open(os.path.join(out, "adapter_config.json")))
+    keys = st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE))
+    assert all(t.startswith("model.layers.") for t in back_cfg["target_modules"])
+    assert all("language_model" not in k for k in keys)
+    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
+    reloaded = peft.PeftModel.from_pretrained(base, out)
+    np.testing.assert_allclose(
+        _peft_logits(reloaded), _peft_logits(wrapped), atol=5e-3,
+    )
+
+
+def test_nested_tower_is_never_guessed(tmp_path, base_dir):
+    """A tower outside the known text-tower names is not inferred, and a
+    natively nested adapter without import provenance is not unnested: both
+    keep the named refusal rather than binding the wrong module set."""
+    from unsloth_zoo.mlx.utils import _resolve_tree_prefix, save_lora_adapters
+    from mlx_lm.tuner.lora import LoRALinear
+
+    paths = ["model.layers.0.self_attn.q_proj"]
+    assert _resolve_tree_prefix({"vision_tower." + paths[0]: 1}, paths) is None
+    assert _resolve_tree_prefix({"language_model." + paths[0]: 1}, paths) == "language_model."
+
+    class _Tower(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.language_model = inner
+
+    inner, _ = load_model(Path(base_dir))
+    model = _Tower(inner)
+    attn = model.language_model.model.layers[0].self_attn
+    attn.q_proj = LoRALinear.from_base(attn.q_proj, r=8, dropout=0.0, scale=2.0)
+    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring|not possible"):
+        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
+
+
+def _nested(model):
+    """Wrap a text model the way mlx-vlm nests it."""
+    class _Tower(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.language_model = inner
+        def __call__(self, *a, **kw):
+            return self.language_model(*a, **kw)
+    return _Tower(model)
+
+
+def test_tree_prefix_bridge_resolution():
+    """The nesting resolver: unique prefix wins, ambiguity and unknown
+    layouts fall through to the caller's per-path report."""
+    from unsloth_zoo.mlx.utils import _resolve_tree_prefix
+
+    flat = {"model.layers.0.self_attn.q_proj": 1, "model.layers.1.self_attn.q_proj": 1}
+    nested = {"language_model." + k: v for k, v in flat.items()}
+    paths = list(flat)
+
+    assert _resolve_tree_prefix(flat, paths) == ""
+    assert _resolve_tree_prefix(nested, paths) == "language_model."
+    # A vision tower is never a candidate, even when its shapes would fit:
+    # binding a language adapter onto it would be silently wrong.
+    vision_only = {"vision_tower." + k: v for k, v in flat.items()}
+    assert _resolve_tree_prefix(vision_only, paths) is None
+    both = dict(nested)
+    both.update(vision_only)
+    assert _resolve_tree_prefix(both, paths) == "language_model."
+    # A tail that exists nowhere resolves to nothing.
+    assert _resolve_tree_prefix(nested, ["decoder.layers.0.attn.q_proj"]) is None
+    # A prefix must map EVERY path, not just one.
+    partial = dict(nested)
+    partial.pop("language_model.model.layers.1.self_attn.q_proj")
+    assert _resolve_tree_prefix(partial, paths) is None
+
+
+def test_nested_tower_survives_mlx_reload_and_dir_conversion(tmp_path, base_dir):
+    """The nesting marker persists through MLX save -> reload -> re-save, so a
+    later directory-only conversion still emits Hugging-Face-native paths."""
+    from pathlib import Path
+    from unsloth_zoo.mlx.utils import (
+        attach_and_bind_peft_adapter, normalize_peft_adapter_config,
+        save_lora_adapters,
+    )
+    from unsloth_zoo.saving_utils import convert_mlx_dir_to_peft
+
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    cfg = normalize_peft_adapter_config(
+        json.load(open(os.path.join(peft_dir, "adapter_config.json")))
+    )
+    inner, _ = load_model(Path(base_dir))
+    model = _nested(inner)
+    attach_and_bind_peft_adapter(model, peft_dir, cfg)
+
+    first = str(tmp_path / "mlx1")
+    save_lora_adapters(model, first)
+    saved = json.load(open(os.path.join(first, "adapter_config.json")))
+    assert saved["unsloth_mlx_tree_prefix"] == "language_model."
+    assert any(k.startswith("language_model.")
+               for k in mx.load(os.path.join(first, MLX_WEIGHTS_FILE)))
+
+    # Directory-only conversion honours the recorded marker.
+    back = str(tmp_path / "back")
+    convert_mlx_dir_to_peft(first, back)
+    keys = st_load_file(os.path.join(back, PEFT_WEIGHTS_FILE))
+    assert keys and all("language_model" not in k for k in keys)
+
+    # An explicit empty prefix means "do not unnest", unlike omitting it.
+    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring"):
+        convert_mlx_dir_to_peft(first, str(tmp_path / "raw"), strip_prefix="")
+
+
+def test_nested_tower_ambiguity_and_collisions_refuse(tmp_path, base_dir):
+    """Two towers that both fit, or that collapse onto one path, refuse."""
+    from unsloth_zoo.mlx.utils import _resolve_tree_prefix
+    from unsloth_zoo.saving_utils import convert_mlx_dir_to_peft
+
+    flat = {"model.layers.0.self_attn.q_proj": 1}
+    both = dict(flat, **{"language_model.model.layers.0.self_attn.q_proj": 1})
+    with pytest.raises(ValueError, match="match both the root"):
+        _resolve_tree_prefix(both, list(flat))
+
+    # An artifact carrying the same module in two towers cannot unnest.
+    d = str(tmp_path / "mlx")
+    os.makedirs(d)
+    mx.save_safetensors(os.path.join(d, MLX_WEIGHTS_FILE), {
+        "language_model.model.layers.0.self_attn.q_proj.lora_a": mx.zeros((HIDDEN, 8)),
+        "language_model.model.layers.0.self_attn.q_proj.lora_b": mx.zeros((8, HIDDEN)),
+        "model.layers.0.self_attn.q_proj.lora_a": mx.zeros((HIDDEN, 8)),
+        "model.layers.0.self_attn.q_proj.lora_b": mx.zeros((8, HIDDEN)),
+    })
+    json.dump({"fine_tune_type": "lora", "lora_parameters": {"rank": 8, "scale": 2.0},
+               "unsloth_mlx_tree_prefix": "language_model."},
+              open(os.path.join(d, "adapter_config.json"), "w"))
+    with pytest.raises(ValueError, match="collapses"):
+        convert_mlx_dir_to_peft(d, str(tmp_path / "out"))
+
+
+def test_nested_tower_mixed_dropout_is_still_caught(tmp_path, base_dir):
+    """The dropout guard must see through the nesting, not skip it."""
+    from pathlib import Path
+    from unsloth_zoo.mlx.utils import (
+        attach_and_bind_peft_adapter, normalize_peft_adapter_config,
+        save_lora_adapters,
+    )
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir, lora_dropout=0.1)
+    cfg = normalize_peft_adapter_config(
+        json.load(open(os.path.join(peft_dir, "adapter_config.json")))
+    )
+    inner, _ = load_model(Path(base_dir))
+    model = _nested(inner)
+    attach_and_bind_peft_adapter(model, peft_dir, cfg)
+    wrappers = [m for _n, m in model.named_modules() if hasattr(m, "lora_a")]
+    drop = getattr(wrappers[0], "dropout", None)
+    if drop is not None and hasattr(drop, "_p_1"):
+        drop._p_1 = 1.0 - 0.5   # diverge one module's dropout
+    with pytest.raises(ValueError, match="different lora_dropout"):
+        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
+
+
+def test_native_nested_adapter_is_not_guessed_on_export(tmp_path, base_dir):
+    """Without import provenance the Hugging Face counterpart of a nested
+    tower is unknowable (a VLM class nests it the other way round), so the
+    export refuses instead of emitting paths that bind the wrong modules."""
+    from pathlib import Path
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    from mlx_lm.tuner.lora import LoRALinear
+
+    inner, _ = load_model(Path(base_dir))
+    model = _nested(inner)
+    layer = model.language_model.model.layers[0].self_attn
+    layer.q_proj = LoRALinear.from_base(layer.q_proj, r=8, dropout=0.0, scale=2.0)
+    assert not getattr(model, "_unsloth_tree_prefix", "")
+    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring|not possible"):
+        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")

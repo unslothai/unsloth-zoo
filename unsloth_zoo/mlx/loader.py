@@ -7301,6 +7301,12 @@ class FastMLXModel:
                         # Provenance survives load/save: derivatives keep their
                         # peft-parity guarantees.
                         model._unsloth_peft_converted = True
+                    if adapter_cfg.get("unsloth_mlx_tree_prefix"):
+                        # Same for the text-tower nesting, so a re-save keeps the
+                        # marker a later PEFT conversion needs.
+                        model._unsloth_tree_prefix = adapter_cfg[
+                            "unsloth_mlx_tree_prefix"
+                        ]
                     _fs_map = dict(adapter_cfg.get("full_state_modules") or {})
                     if _fs_map and not adapter_cfg.get("_unsloth_peft_import"):
                         # After the freeze, never before: restores
