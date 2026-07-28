@@ -31,6 +31,7 @@ Hermetic CPU tests with stub processors, no model or network needed:
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -735,6 +736,65 @@ def test_vision_processor_still_constructs():
     # Vision path is byte-identical: image_processor present -> gate not triggered.
     collator = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
     assert hasattr(collator.processor, "image_processor")
+
+
+class _VoxtralLikeProcessor(_ChatTemplateMixin):
+    # Mirrors transformers' VoxtralProcessor: an audio-only processor whose
+    # __call__ is (text, **kwargs) with NO audio= parameter. Voxtral requires
+    # audio to go through apply_chat_template and raises if the rendered text
+    # contains its audio token, so the collator's self.processor(text=..., audio=...)
+    # call cannot work -- the guard must reject it at construction.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def __call__(self, text, **kwargs):  # no audio= -> unsupported by the collator
+        raise AssertionError("collator must reject before ever calling __call__")
+
+
+class _AudioKwargProcessor(_ChatTemplateMixin):
+    # Qwen2-Audio / Granite-Speech shape: audio-only processor whose __call__
+    # declares a named audio= parameter and processes it -> supported.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_audio_processor_without_audio_kwarg_rejected():
+    # A Voxtral-shaped processor passes the acceptance guard (it has a
+    # feature_extractor) but its __call__ takes no audio=, so audio cannot be
+    # batched through the collator. Reject up front with an actionable message
+    # that points at apply_chat_template rather than failing later inside collation.
+    with pytest.raises(TypeError, match="does not yet support|apply_chat_template"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_VoxtralLikeProcessor())
+
+
+def test_audio_processor_with_audio_kwarg_constructs():
+    # The capability check must NOT reject a working audio processor: __call__
+    # declares audio=, so construction succeeds as before.
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioKwargProcessor())
+    assert collator.processor.__class__.__name__ == "_AudioKwargProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+
+
+def test_capability_check_matches_real_transformers_processors():
+    # Lock the guard's signal against the real classes: the unsupported processor
+    # (Voxtral) has no audio= on __call__; a supported one (Qwen2-Audio) does.
+    # Importing the classes needs no audio backend -- only from_pretrained does.
+    transformers = pytest.importorskip("transformers")
+    Voxtral = getattr(transformers, "VoxtralProcessor", None)
+    Qwen2Audio = getattr(transformers, "Qwen2AudioProcessor", None)
+    if Voxtral is None or Qwen2Audio is None:
+        pytest.skip("Voxtral/Qwen2Audio not present in this transformers build")
+    vox = inspect.signature(Voxtral.__call__).parameters
+    qwen = inspect.signature(Qwen2Audio.__call__).parameters
+    assert "audio" not in vox and "audios" not in vox, (
+        "VoxtralProcessor.__call__ unexpectedly grew an audio= param; revisit the guard"
+    )
+    assert "audio" in qwen or "audios" in qwen
 
 
 class _RoundTripAudioProcessor(_AudioOnlyProcessor):

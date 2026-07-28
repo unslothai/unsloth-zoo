@@ -46,6 +46,7 @@ import math
 import time
 import warnings
 import os
+import inspect
 from functools import lru_cache
 from collections.abc import Mapping
 
@@ -798,6 +799,48 @@ class UnslothVisionDataCollator:
             raise TypeError(
                 "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
             )
+
+        # An audio-only processor (no image_processor) reaches the collator's
+        # audio path, which calls self.processor(text=..., audio=...). Some audio
+        # processors do not accept an `audio=` argument in __call__ -- notably
+        # transformers' VoxtralProcessor, whose __call__ is (text, **kwargs) with
+        # no audio parameter and which raises when the rendered text contains its
+        # audio token (it requires audio to go through apply_chat_template). Such a
+        # processor passes the acceptance guard above (it has a feature_extractor)
+        # but then fails inside the collate call. Reject it up front instead.
+        #
+        # Capability check rather than a class-name check: the audio processors the
+        # collator does support (Qwen2-Audio, Granite-Speech, ...) declare a named
+        # `audio` parameter on __call__ and process it, while Voxtral does not --
+        # so the presence of a named audio parameter is a reliable, forward-
+        # compatible signal. Both spellings are checked: `audio`, and `audios`
+        # for the only two audio processors that name it in the plural today,
+        # Clap and SeamlessM4T (both of which also expose `audio`). If __call__
+        # cannot be introspected we fail open (accept) rather than regress a
+        # working processor.
+        #
+        # The check is signature-based: a processor that consumed audio only
+        # through **kwargs, with no named audio/audios parameter, would be
+        # rejected here despite working -- none of transformers' audio processors
+        # do this today.
+        if getattr(processor, "image_processor", None) is None:
+            try:
+                _call_params = inspect.signature(processor.__call__).parameters
+            except (AttributeError, TypeError, ValueError):
+                # No/uninspectable __call__ (e.g. a minimal stub): fail open.
+                _call_params = None
+            if _call_params is not None and not (
+                "audio" in _call_params or "audios" in _call_params
+            ):
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator does not yet support "
+                    f"{type(processor).__name__}: its processor __call__ takes no "
+                    "`audio=` argument, so audio cannot be batched through the "
+                    "collator (e.g. VoxtralProcessor requires audio to go through "
+                    "apply_chat_template and rejects text containing its audio "
+                    "token). Prepare audio with processor.apply_chat_template("
+                    "..., tokenize=True, return_dict=True) instead."
+                )
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
