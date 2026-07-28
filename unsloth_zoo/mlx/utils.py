@@ -13235,13 +13235,9 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
             if tower_prefix and _name.startswith(tower_prefix):
                 _name = _name[len(tower_prefix):]
             if _name in module_types:
-                _d = getattr(_module, "dropout", None)
-                # mlx nn.Dropout keeps 1-p internally; older builds exposed p.
-                _p = getattr(_d, "p", None)
-                if _p is None and hasattr(_d, "_p_1"):
-                    _p = 1.0 - float(_d._p_1)
-                if _p is not None:
-                    _dropouts.add(round(float(_p), 6))
+                _dropouts.add(round(_get_mlx_dropout_probability(
+                    getattr(_module, "dropout", None)
+                ), 6))
         if len(_dropouts) > 1:
             raise ValueError(
                 "Unsloth MLX: modules carry different lora_dropout values "
