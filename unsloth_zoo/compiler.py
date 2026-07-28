@@ -1231,6 +1231,143 @@ def create_new_function(
 pass
 
 
+def fix_gemma4_audio_feature_dtype(source):
+    """Align Gemma 4 audio features with the destination embedding dtype."""
+    rewritten, count = re.subn(
+        r"audio_features\.to\(\s*inputs_embeds\.device\s*\)",
+        "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)",
+        source,
+    )
+    if count != 1:
+        return source
+    return rewritten
+pass
+
+
+_GEMMA4_PLE_CAST_HELPER = """
+def _unsloth_gemma4_ple_cast_input(module, x):
+    get_base_layer = getattr(module, "get_base_layer", None)
+    base_layer = get_base_layer() if callable(get_base_layer) else getattr(module, "base_layer", module)
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(base_layer, "weight", None)
+    if weight is None:
+        return x
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return x
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    if getattr(dtype, "itemsize", 2) < 2:
+        return x
+    return x if x.dtype == dtype else x.to(dtype)
+pass
+"""
+
+
+def fix_gemma4_forced_float32_ple_dtype(source, module = None):
+    """Align only Gemma 4 PLE Linear inputs for forced-float32 residuals."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1":
+        return source
+
+    replacements_by_module = {
+        "Gemma4TextModel": (
+            (
+            "self.per_layer_model_projection(inputs_embeds)",
+            "self.per_layer_model_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
+            ),
+        ),
+        "Gemma4TextDecoderLayer": (
+            (
+            "self.per_layer_input_gate(hidden_states)",
+            "self.per_layer_input_gate(_unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states))",
+            ),
+            (
+            "self.per_layer_projection(hidden_states)",
+            "self.per_layer_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states))",
+            ),
+        ),
+    }
+    replacements = (
+        tuple(item for group in replacements_by_module.values() for item in group)
+        if module is None else replacements_by_module.get(module, ())
+    )
+    if not replacements:
+        return source
+    rewritten = source
+    counts = [rewritten.count(old) for old, _ in replacements]
+    if not any(counts):
+        return source
+    if (module is None and any(count > 1 for count in counts)) or \
+        (module is not None and any(count != 1 for count in counts)):
+        return source
+    for old, new in replacements:
+        if old in rewritten:
+            rewritten = rewritten.replace(old, new, 1)
+    return rewritten
+pass
+
+
+def _unwrap_undecorated_method(func, owner_qualname):
+    """
+    Recover the real, undecorated method hidden behind a decorator that returns
+    a bare closure without `functools.wraps`.
+
+    `functools.wraps` copies `__qualname__` and sets `__wrapped__`, and both
+    `inspect.getsource` and `inspect.signature` already follow `__wrapped__`, so
+    well behaved decorators need no help here and are returned unchanged by the
+    `__qualname__` fast path below.
+
+    A decorator that does NOT use `functools.wraps` leaves a class attribute
+    whose source and signature belong to the wrapper, not to the method. One
+    such decorator is transformers' `@force_accelerate_hooks(...)` in
+    `transformers/integrations/accelerate.py`, applied to
+    `Qwen3_5GatedDeltaNet.forward`: it leaves behind
+    `force_accelerate_hooks.<locals>.decorator.<locals>.wrapped`, so
+    `inspect.getsource` returns the wrapper (which lives in another file and
+    closes over free variables that do not exist at module scope) and
+    `inspect.signature` returns `(self, *args, **kwargs)`. Generating a
+    standalone function from that emits `return wrapped(self, *args, **kwargs)`
+    under the real named signature, which is a `NameError` at the first forward.
+
+    Walk `__wrapped__` and then single function closure cells until we land on a
+    function that really belongs to `owner_qualname`. If no such function is
+    found, return `func` unchanged so nothing else changes behaviour.
+    """
+    prefix = owner_qualname + "."
+    if getattr(func, "__qualname__", "").startswith(prefix):
+        return func
+    seen = set()
+    current = func
+    for _ in range(10):
+        candidate = getattr(current, "__wrapped__", None)
+        if candidate is None:
+            cells = getattr(current, "__closure__", None)
+            if getattr(current, "__code__", None) is None or not cells:
+                break
+            inner = []
+            for cell in cells:
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if inspect.isfunction(value):
+                    inner.append(value)
+            # More than one candidate is ambiguous, so leave `func` alone.
+            if len(inner) != 1:
+                break
+            candidate = inner[0]
+        if not inspect.isfunction(candidate) or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        current = candidate
+        if getattr(current, "__qualname__", "").startswith(prefix):
+            return current
+    return func
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1254,10 +1391,18 @@ def create_standalone_class(
     # All Unsloth Zoo code licensed under LGPLv3
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
-    old_source = inspect.getsource(f.forward)
+    # A decorator that returns a bare closure (no `functools.wraps`) hides the
+    # real method behind the wrapper, so read the source and the signature off
+    # the undecorated function instead of off the class attribute.
+    real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
+    old_source = inspect.getsource(real_forward)
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+    if module == "Gemma4Model":
+        forward_source = fix_gemma4_audio_feature_dtype(forward_source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        forward_source = fix_gemma4_forced_float32_ple_dtype(forward_source, module)
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
@@ -1383,7 +1528,7 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(f.forward).parameters
+    parameters = inspect.signature(real_forward).parameters
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
@@ -1505,6 +1650,19 @@ def create_standalone_class(
         source,
     )
 
+    if module == "Gemma4Model":
+        source = fix_gemma4_audio_feature_dtype(source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        source = fix_gemma4_forced_float32_ple_dtype(source, module)
+
+    # Append the PLE cast helper only once a call to it actually exists in the
+    # generated source (from the rewrite above, or from already-cast eager source
+    # read back through inspect.getsource). This keeps the emitted helper name in
+    # sync with the eager patch and avoids appending dead code when nothing was
+    # rewritten (drift / already-fixed upstream / flag off).
+    if "_unsloth_gemma4_ple_cast_input(" in source and \
+        "def _unsloth_gemma4_ple_cast_input" not in source:
+        source += _GEMMA4_PLE_CAST_HELPER
     return source
 
 
@@ -3447,6 +3605,55 @@ def unsloth_compile_transformers(
         multi_kernel=False,  # Sometimes fails
         use_block_ptr=False,  # Sometimes fails
     )
+
+    # Pre-load persisted torch.compile artifacts (Mega-cache) for this exact
+    # environment + model + compile configuration. This runs during
+    # from_pretrained, strictly before any @torch.compile region executes, so
+    # a hit lets the first training step skip Inductor codegen and Triton
+    # autotuning. A miss is silent and falls back to a normal local compile;
+    # the artifacts are then saved at process exit for the next run.
+    # On by default on POSIX; opt-in (=1) on Windows; kill switch =0. See compile_cache.py.
+    try:
+        from .compile_cache import megacache_load
+        # Env vars override these arguments below (and the generated forwards
+        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # values or one mode's bundle would be a false hit for another.
+        _effective_fullgraph = os.environ.get(
+            "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"
+        ) == "1"
+        _effective_return_logits = os.environ.get(
+            "UNSLOTH_RETURN_LOGITS", "1" if return_logits else "0"
+        ) == "1"
+        _return_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        megacache_load(
+            model_type,
+            compile_kwargs = {
+                "sdpa_dynamic_mask"     : sdpa_dynamic_mask,
+                "sdpa_bool_masks"       : sdpa_bool_masks,
+                "sdpa_gqa_replace"      : sdpa_gqa_replace,
+                "sdpa_dynamic_compile"  : sdpa_dynamic_compile,
+                "compile_attention"     : compile_attention,
+                "disable_causal_masks"  : disable_causal_masks,
+                "compile_torch_modules" : compile_torch_modules,
+                "compile_custom_modules": compile_custom_modules,
+                "compile_function_calls": compile_function_calls,
+                "fuse_lm_head"          : fuse_lm_head,
+                "gradient_checkpointing": gradient_checkpointing,
+                "manual_replacements"   : manual_replacements,
+                "fast_lora_forwards"    : fast_lora_forwards,
+                "fast_residual_stream"  : fast_residual_stream,
+                "accurate_accumulation" : accurate_accumulation,
+                "fullgraph"             : _effective_fullgraph,
+                "disable"               : disable,
+                "return_logits"         : _effective_return_logits,
+                "return_hidden_states"  : _return_hidden_states,
+            },
+            torch_compile_options = torch_compile_options,
+        )
+    except Exception as _megacache_error:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Mega-cache skipped ({_megacache_error})")
+    pass
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)

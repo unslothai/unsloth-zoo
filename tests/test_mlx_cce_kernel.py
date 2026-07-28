@@ -259,3 +259,279 @@ def test_transpose_two_args_unchanged():
     t = torch.zeros(2, 3, 4)
     out = t.transpose(0, 1)
     assert out.shape == (3, 2, 4)
+
+
+# 7. logit_scale discovery/normalization feeding CCE loss selection.
+
+def _stub_model(where=None, value=None):
+    class _Holder:
+        pass
+
+    model = _Holder()
+    if where == "attr":
+        model.logit_scale = value
+    elif where in ("args", "config"):
+        setattr(model, where, _Holder())
+        getattr(model, where).logit_scale = value
+    return model
+
+
+@pytest.mark.parametrize(
+    "where,value,expected",
+    [
+        (None, None, (None, False)),
+        ("attr", 0.0625, (None, False)),       # direct attr deliberately ignored
+        ("args", 0.0625, (0.0625, False)),     # mlx-lm cohere / cohere2_moe
+        ("config", 0.0625, (0.0625, False)),   # mlx-vlm aya_vision
+        ("args", 0.0, (0.0, False)),           # honored: matches model forward
+        ("args", 1.0, (None, False)),          # identity -> no-op path
+        ("args", True, (None, True)),          # bool is not a scale
+        ("args", 8.0, (None, True)),           # above supported range
+    ],
+)
+def test_get_logit_scale_normalization(where, value, expected):
+    from unsloth_zoo.mlx.utils import _get_logit_scale
+
+    assert _get_logit_scale(_stub_model(where, value)) == expected
+
+
+def _knobbed(_where="args", **attrs):
+    model = type("Model", (), {})()
+    setattr(model, _where, type("Holder", (), attrs)())
+    return model
+
+
+@pytest.mark.parametrize(
+    "attrs,status,expected",
+    [
+        # Each row mirrors its consuming forward's arithmetic and branch.
+        (dict(logits_scaling=4.0), "untied", (0.25, None)),  # granite divide
+        (dict(lm_head_multiplier=2.0, embedding_multiplier=1.0), "tied", (2.0, None)),
+        (dict(lm_head_multiplier=0.0390625, embedding_multiplier=5.656854249492381),
+         "tied", "outside the range"),  # Falcon-H1 defaults ~x0.0069 -> fallback
+        (dict(dim_model_base=16, hidden_size=32), "untied", (0.5, None)),  # minicpm, untied only
+        (dict(mup_width_multiplier=2.0), "untied", "cannot reproduce"),  # phi3small masked tail
+        (dict(logit_scale=None), "tied", "present but None"),  # malformed -> fail closed
+        (dict(logit_scale=0.0625, logits_scaling=4.0), "tied", "multiple output-transform knobs"),
+    ],
+)
+def test_detect_head_transform_rows(attrs, status, expected):
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    scale, problem = _detect_head_transform(_knobbed(**attrs), status)
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (scale, problem) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (30.0, (30.0, None)),
+        (None, (0.0, None)),   # falsy: the forward skips the cap
+        (-5.0, "positive"),
+        (True, "not a finite real scalar"),
+    ],
+)
+def test_softcap_alias_value_domain(value, expected):
+    from unsloth_zoo.mlx.utils import _detect_logit_softcap
+
+    softcap, problem = _detect_logit_softcap(_knobbed(logits_soft_cap=value))
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (softcap, problem) == expected
+
+
+def test_dead_tie_flag_fails_closed_to_unknown():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    head = lambda: nn.Linear(32, 96, bias=False)
+    # Qwen2-MoE hazard: True flag never referenced + unconditional lm_head call.
+    desc = U.describe_output_head(
+        _lm(nn, args_flag=True, head=head(), call_src="calls_lm_head"))
+    assert desc.status == "unknown" and desc.candidate_path == "lm_head"
+    assert U._cce_head_ineligibility(desc) is not None
+    # A referenced flag keeps tied (flag_ref pins the `not references_flag` conjunct).
+    for src in ("flag_guarded", "flag_ref_calls_lm_head"):
+        d = U.describe_output_head(_lm(nn, args_flag=True, head=head(), call_src=src))
+        assert d.status == "tied" and d.path == "model.embed_tokens"
+    # False flag resolves the live head; no live head keeps the True flag tied.
+    assert U.describe_output_head(
+        _lm(nn, args_flag=False, head=head(), call_src="calls_lm_head")).status == "untied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag=True, emb_name="tok_embeddings")).status == "tied"
+    # A non-bool truthy tie flag (int 1 or string "true"; from_dict does not
+    # coerce) is read by truthiness like the forward -> tied, not a fall-through
+    # to lm_head; a falsy value ("" / 0) stays untied.
+    for truthy in (1, "true"):
+        assert U.describe_output_head(
+            _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag="", head=head(), call_src="calls_lm_head")).status == "untied"
+    # A config-only truthy flag is read; with no resolvable anchor it fails
+    # closed to unknown, never falling through to a (dead) lm_head.
+    cfg = _lm(nn, head=head(), call_src="calls_lm_head")
+    cfg.model, cfg.config = nn.Module(), type("C", (), {"tie_word_embeddings": True})()
+    assert U.describe_output_head(cfg).status == "unknown"
+
+
+def test_is_lm_head_trainable_follows_descriptor_path():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    # Alt-named tied embedding (InternLM2 tok_embeddings) trains under full
+    # fine-tuning: name segments used to miss it and drop the head gradient.
+    assert U._is_lm_head_trainable(
+        _lm(nn, tied_flag=True, emb_name="tok_embeddings")) is True
+    # Property-backed wrapper: language_model returns self, so the descriptor
+    # access path is not a registered prefix — module identity must still find
+    # the head in the parameter tree.
+    class _PropWrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(32, 96, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+    assert U._is_lm_head_trainable(_PropWrapped()) is True
+    # Unresolved head never reports trainable, even with an empty tree.
+    unresolved = _lm(nn)
+    unresolved.freeze()
+    assert U._is_lm_head_trainable(unresolved) is False
+
+
+def test_backboneless_text_model_selects_baseline_fallback(capsys):
+    # nanochat shape (stack under .transformer, no separable .model): the
+    # biased head would trip the eligibility gate, so seeing ONLY the topology
+    # notice pins topology as decided first, at construction not first use.
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+
+    class _BackbonelessLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.lm_head = nn.Linear(32, 96, bias=True)
+
+    fn = U.make_cce_loss_fn(_BackbonelessLM())
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+    out = capsys.readouterr().out
+    assert "separable hidden-state backbone" in out and "output head" not in out
+
+
+@pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale",
+                                  "masked_tail_knob"])
+def test_vlm_cce_fallbacks_are_marked(case):
+    # Every VLM fallback path returns a loss fn carrying the eager marker,
+    # including the knob-table routes (invalid scale, masked-tail knob).
+    from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
+
+    from unsloth_zoo.mlx import utils as U
+
+    model = _stub_model()
+    if case in ("invalid_scale", "masked_tail_knob"):
+        lm = _lm(U.nn, head=U.nn.Linear(32, 96, bias=False))
+        lm.args = type("A", (), {})()
+        if case == "invalid_scale":
+            lm.args.logit_scale = float("nan")
+        else:
+            lm.args.mup_width_multiplier = 2.0
+        model.language_model = lm
+    else:
+        model.language_model = _stub_model("args", 0.0625)
+        if case != "no_backbone":
+            model.language_model.model = object()  # separable backbone present
+    if case != "no_embeddings":
+        model.get_input_embeddings = lambda: None
+    warns = case in ("no_embeddings", "no_backbone")
+    with pytest.warns(UserWarning) if warns else _no_warning():
+        fn = make_vlm_cce_loss_fn(model)
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+
+
+def _no_warning():
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
+_UNSET = object()
+
+
+def _lm(nn, tied_flag=_UNSET, args_flag=_UNSET, head=None, emb_name="embed_tokens",
+        alt=None, call_src="plain"):
+    class _Backbone(nn.Module):
+        pass
+
+    backbone = _Backbone()
+    setattr(backbone, emb_name, nn.Embedding(96, 32))
+    if alt is not None:
+        setattr(backbone, alt, nn.Linear(32, 96, bias=False))
+
+    if call_src == "as_linear":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.model.embed_tokens.as_linear(x)
+    elif call_src == "calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.lm_head(x)
+    elif call_src == "flag_guarded":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                if self.args.tie_word_embeddings:
+                    return self.model.embed_tokens.as_linear(x)
+                return self.lm_head(x)
+    elif call_src == "flag_ref_calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                _ = self.args.tie_word_embeddings
+                return self.lm_head(x)
+    else:
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return x
+
+    lm = _LM()
+    lm.model = backbone
+    if tied_flag is not _UNSET:
+        lm.tie_word_embeddings = tied_flag
+    if args_flag is not _UNSET:
+        lm.args = type("A", (), {})()
+        lm.args.tie_word_embeddings = args_flag
+    if head is not None:
+        lm.lm_head = head
+    return lm
+
+
+def test_describe_output_head_evidence_ladder():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    rows = [
+        # (model, status, path, candidate_path)
+        (_lm(nn, head=nn.Linear(32, 96, bias=False)), "untied", "lm_head", None),
+        # Helium-style dead lm_head + True flag -> tied via embedding
+        (_lm(nn, args_flag=True, head=nn.Linear(32, 96, bias=False)),
+         "tied", "model.embed_tokens", None),
+        # flag False blocks source evidence; alt head -> candidate
+        (_lm(nn, tied_flag=False, alt="output", call_src="as_linear"),
+         "unknown", None, "model.output"),
+        # Conflicting flags fail closed; the head surfaces as an exclusion
+        # candidate (identity, not proof of tying)
+        (_lm(nn, tied_flag=True, args_flag=False, head=nn.Linear(32, 96, bias=False)),
+         "unknown", None, "lm_head"),
+        # No flag: unconditional as_linear source evidence -> tied
+        (_lm(nn, call_src="as_linear"), "tied", "model.embed_tokens", None),
+        # GPT-NeoX embed_in/embed_out shapes -> alt-name candidate
+        (_lm(nn, emb_name="embed_in", alt="embed_out"), "unknown", None, "model.embed_out"),
+    ]
+    for i, (model, status, path, cand) in enumerate(rows):
+        d = U.describe_output_head(model)
+        assert (d.status, d.path, d.candidate_path) == (status, path, cand), (i, d)
