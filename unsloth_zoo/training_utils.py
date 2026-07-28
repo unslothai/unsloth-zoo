@@ -683,10 +683,6 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     print(debug_info)
 
-    # Note: check_amd_vram_utilization() was removed from this call site.
-    # This zoo unsloth_train() is only reached on transformers <= 4.45.2;
-    # on current installs (4.46+) unsloth core uses a pass-through wrapper.
-    # The advisory should be wired in unsloth core's Trainer setup instead.
 
     # Get per epoch counter
     max_iters_per_epoch = math.ceil(n_training_samples / total_train_batch_size)

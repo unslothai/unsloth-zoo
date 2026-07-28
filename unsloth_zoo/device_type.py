@@ -333,11 +333,12 @@ def get_recommended_attn_implementation():
     returns "sdpa"|"amd_aiter" for AMD-internal dispatch and is not intended as a
     top-level attn_implementation selector.
 
-    **Important:** This is a preference, not a directive. Callers must validate that
-    the model supports SDPA before using this value as `attn_implementation`.
-    Some models (e.g. Pixtral, Mistral 3) do not support SDPA — Unsloth's compiler
-    detects this via `_supports_sdpa` / `ALL_ATTENTION_FUNCTIONS` and falls back to
-    eager automatically.
+    **Important:** This is a preference, not a directive. Callers MUST validate that
+    the specific model supports SDPA before passing this value as `attn_implementation`.
+    Some models (e.g. Pixtral, Mistral 3, GptOss, Mamba, Bloom, GPT-J, MPT) do not
+    support SDPA and must use "eager"; passing "sdpa" to them will raise an error
+    during model loading. Check `_supports_sdpa` or `ALL_ATTENTION_FUNCTIONS` on
+    the model config before applying this preference.
     """
     if is_hip():
         return "sdpa"
