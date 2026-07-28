@@ -392,7 +392,10 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    vllm_importance_sampling_mode = kwargs.get("vllm_importance_sampling_mode", "sequence_mask")
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
+    vllm_importance_sampling_clip_min = kwargs.get("vllm_importance_sampling_clip_min", None)
+    vllm_importance_sampling_clip_max = kwargs.get("vllm_importance_sampling_clip_max", 3.0)
     get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
     sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
     sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
@@ -404,6 +407,8 @@ def grpo_compute_loss(
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
+
+    importance_sampling_ratio = None
 
     # exp(new - old) and exp(ref - new) below are taken before `mask` is applied. A sequence-packed
     # logp path leaves the masked (prompt/pad) columns at 0 while a padded one fills them with a real
@@ -431,10 +436,44 @@ def grpo_compute_loss(
     with torch.no_grad():
         if use_vllm and sampling_per_token_logps is not None:
             # Filter out extra leading prompt tokens after left-padding input_ids.
-            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-            importance_sampling_ratio = torch.clamp(
-                importance_sampling_ratio, max=vllm_importance_sampling_cap
-            )
+            # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
+            importance_sampling_ratio = (old - sampling_per_token_logps) * mask
+
+            if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
+                importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+
+            importance_sampling_ratio = torch.exp(importance_sampling_ratio)
+
+            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+                importance_sampling_ratio = torch.clamp(
+                    importance_sampling_ratio, 
+                    min=vllm_importance_sampling_clip_min,
+                    max=vllm_importance_sampling_clip_max
+                )
+            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+                min_val = (
+                    vllm_importance_sampling_clip_min
+                    if vllm_importance_sampling_clip_min is not None
+                    else -math.inf
+                )
+
+                max_val = (
+                    vllm_importance_sampling_clip_max
+                    if vllm_importance_sampling_clip_max is not None
+                    else math.inf
+                )
+
+                invalid_mis_mask = (importance_sampling_ratio < min_val) | (
+                        importance_sampling_ratio > max_val
+                )
+
+                importance_sampling_ratio = importance_sampling_ratio.masked_fill(
+                        invalid_mis_mask, value=0.0
+                )
+            else:
+                raise ValueError(
+                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                )
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -470,7 +509,7 @@ def grpo_compute_loss(
     if loss_type == "cispo":
         clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
         loss_i = -clamped_ratios * advantages * new
-    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
         coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
         if delta is not None:
@@ -481,20 +520,9 @@ def grpo_compute_loss(
         loss_2 = coef_2 * advantages
         loss_i = -torch.min(loss_1, loss_2)
     elif loss_type == "sapo":
-        if get_sapo_token_loss is None:
-            raise Exception(f"sapo is only available in TRL 0.26.0+")
-        loss_i = torch.empty_like(coef_1)
-        positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
-        # With n_chunks some tensors may be empty; guard the indexing.
-        if coef_1[positive_advantages_mask].numel() != 0:
-            loss_i[positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[positive_advantages_mask], sapo_temperature_pos
-            )
-        if coef_1[~positive_advantages_mask].numel() != 0:
-            loss_i[~positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[~positive_advantages_mask], sapo_temperature_neg
-            )
-        loss_i = -loss_i * advantages
+        temperatures = torch.where(advantages > 0, sapo_temperature_pos, sapo_temperature_neg)
+        soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+        loss_i = -soft_coef_1 * advantages
     elif loss_type == "vespo":
         if get_gamma_weights is None:
             raise Exception("vespo is only available in TRL 0.26.0+")
@@ -502,7 +530,7 @@ def grpo_compute_loss(
             advantages=advantages,
             log_ratio_per_token=log_ratio,
             mask=mask,
-            importance_sampling_ratio=kwargs.get("importance_sampling_ratio"),
+            importance_sampling_ratio=importance_sampling_ratio,
             k_pos=vespo_k_pos,
             lambda_pos=vespo_lambda_pos,
             k_neg=vespo_k_neg,
@@ -516,7 +544,9 @@ def grpo_compute_loss(
         loss_i = loss_i * off_policy_mask
 
     if use_vllm and sampling_per_token_logps is not None:
-        loss_i = loss_i * importance_sampling_ratio
+        # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
+        if loss_type != "vespo":
+            loss_i = loss_i * importance_sampling_ratio
         # delta for the metric.
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
@@ -544,6 +574,10 @@ def grpo_compute_loss(
     elif loss_type in ["cispo", "dapo", "vespo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
+    elif loss_type == "luspo":
+        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        normalizer = current_gradient_accumulation_steps
+        loss = loss / normalizer
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -751,7 +785,11 @@ def grpo_accumulated_loss(
 
     # Pop from kwargs to avoid downstream issues.
     _ = kwargs.pop("sampling_per_token_logps", None)
-    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
+    kwargs["vllm_importance_sampling_cap"] = getattr(trainer.args, "vllm_importance_sampling_cap", None)
+    # Older TRL lacks this arg; fall back to token_truncate (legacy clamp(max=cap) behavior).
+    kwargs["vllm_importance_sampling_mode"] = getattr(trainer.args, "vllm_importance_sampling_mode", None) or "token_truncate"
+    kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
+    kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
@@ -767,6 +805,10 @@ def grpo_accumulated_loss(
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+
+    if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
+        kwargs["vllm_importance_sampling_clip_min"] = 0
+        kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16

@@ -58,6 +58,782 @@ def _install_shim():
     sys.modules.update(real_mlx_modules)
 
 
+def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    plan = FiniteTextBatchPlan(
+        (
+            _FiniteTextRow((1, 2, 3), offset=1),
+            _FiniteTextRow((4, 5), offset=0),
+        ),
+        ((0, 1),),
+        max_seq_length=8,
+        pad_id=9,
+    )
+
+    assert all(not isinstance(value, mx.array) for value in plan.rows)
+    batch, lengths, labels = plan[0]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 9]]
+    assert lengths.tolist() == [[1, 3], [0, 2]]
+    assert labels is None
+
+
+def test_finite_text_batch_plan_preserves_label_padding():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    plan = FiniteTextBatchPlan(
+        (
+            _FiniteTextRow((1, 2, 3), labels=(-100, 2, 3)),
+            _FiniteTextRow((4, 5), labels=(-100, 5)),
+        ),
+        ((0, 1),),
+        max_seq_length=8,
+        pad_id=7,
+    )
+
+    batch, lengths, labels = plan[0]
+    assert batch.tolist() == [[1, 2, 3], [4, 5, 7]]
+    assert lengths.tolist() == [[0, 3], [0, 2]]
+    assert labels.tolist() == [[-100, 2, 3], [-100, 5, -100]]
+    assert labels.dtype == mx.int64
+
+
+def test_finite_text_training_plan_keeps_long_schedule_cpu_only():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        FiniteTextBatchPlan,
+        _create_text_batch_plan,
+        create_batches,
+    )
+
+    dataset = [
+        {"input_ids": [1, 2]},
+        {"input_ids": [3, 4, 5]},
+        {"input_ids": [6, 7, 8, 9]},
+        {"input_ids": [10, 11, 12, 13, 14]},
+    ]
+    tokenizer = types.SimpleNamespace(pad_token_id=7)
+    plan = _create_text_batch_plan(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=16,
+        num_batches=120,
+        seed=11,
+        completion_only_loss=False,
+    )
+
+    assert isinstance(plan, FiniteTextBatchPlan)
+    assert len(plan) == 120
+    assert all(not isinstance(row.input_ids, mx.array) for row in plan.rows)
+    assert all(
+        isinstance(row_index, int)
+        for batch_indices in plan.schedule
+        for row_index in batch_indices
+    )
+
+    expected = create_batches(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        batch_size=2,
+        max_seq_length=16,
+        num_batches=1,
+        seed=11,
+        completion_only_loss=False,
+    )[0]
+    actual = plan[0]
+    assert [value.tolist() if value is not None else None for value in actual] == [
+        value.tolist() if value is not None else None for value in expected
+    ]
+
+
+def test_default_text_plan_uses_mlx_lm_padding():
+    # Regression: the default (non-pretokenized) finite text plan must pad to
+    # mlx-lm's 1 + 32*ceil(len/32) width, not the raw row length, so it keeps
+    # the causal-shift contract and the bounded compile signatures.
+    from unsloth_zoo.mlx.utils import _create_default_text_plan
+
+    class _DS:
+        def __init__(self, lengths):
+            self._rows = [(list(range(1, n + 1)), 1) for n in lengths]
+
+        def __len__(self):
+            return len(self._rows)
+
+        def __getitem__(self, index):
+            return self._rows[index]
+
+        def itemlen(self, index):
+            return len(self._rows[index][0])
+
+    plan = _create_default_text_plan(
+        _DS([14]), batch_size=1, max_seq_length=2048, num_batches=1, seed=0,
+    )
+    assert plan.batch_width(0) == 33  # 1 + 32*ceil(14/32)
+
+
+def _make_shape_guard_text_plan(widths, *, schedules=None, labeled=True):
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    rows = tuple(
+        _FiniteTextRow(
+            tuple(range(1, width + 1)),
+            offset=1,
+            labels=(tuple(range(1, width + 1)) if labeled else None),
+        )
+        for width in widths
+    )
+    return FiniteTextBatchPlan(
+        rows,
+        schedules or tuple((index,) for index in range(len(rows))),
+        max_seq_length=64,
+        pad_id=99,
+    )
+
+
+def test_single_process_text_shape_guard_buckets_and_validates_before_materializing():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    batches = _make_shape_guard_text_plan((10, 11, 30))
+    args = MLXTrainingConfig(
+        max_steps=6,
+        gradient_accumulation_steps=1,
+        compile_max_variants=2,
+    )
+    shape_plan, report, compile_allowed, _ = _plan_single_process_text_shapes(
+        batches,
+        None,
+        args=args,
+        total_steps=6,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+
+    assert compile_allowed is True
+    assert report.action == "bucket"
+    assert report.raw_signatures == 3
+    assert report.planned_signatures == 2
+    assert len(shape_plan.planned_catalog) == 2
+    batch, lengths, labels = batches.materialize(0, phase="single")
+    assert batch.shape == (1, 11)
+    assert batch[0, -1].item() == 99
+    assert labels[0, -1].item() == -100
+    assert lengths.tolist() == [[1, 10]]
+    assert batches[0][0].shape == (1, 10)
+    with pytest.raises(RuntimeError, match="was not admitted"):
+        batches.materialize(0, phase="unknown")
+
+
+def test_automatic_text_shape_guard_installs_deterministic_budgeted_plan():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    args = MLXTrainingConfig(max_steps=40, gradient_accumulation_steps=1)
+    batches = _make_shape_guard_text_plan(tuple(range(10, 50)))
+    shape_plan, report, allowed, frontier = _plan_single_process_text_shapes(
+        batches,
+        None,
+        args=args,
+        total_steps=40,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+
+    assert allowed is True and frontier is not None
+    assert report.cap_selection == "padding_budget"
+    assert report.configured_cap == 128
+    assert report.effective_cap == report.cap == 15
+    assert report.planned_signatures == 15
+    assert report.padding_work_fraction <= 0.05
+    assert report.max_width_stretch <= 1.5
+    assert report.budget_satisfied is True
+    batch, lengths, labels = batches.materialize(0, phase="single")
+    assert batch.shape == labels.shape == (1, 13)
+    assert batch[0, :10].tolist() == list(range(1, 11))
+    assert labels[0, 10:].tolist() == [-100, -100, -100]
+    assert lengths.tolist() == [[1, 10]]
+    assert shape_plan.report == report
+
+
+def test_ddp_automatic_shape_guard_reuses_frontier_at_shared_maximum_cap():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import (
+        DDP_LOCAL_GRAD_SCOPE,
+        TextShapeEvent,
+        build_text_shape_frontier,
+        select_text_shape_padding_budget,
+    )
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    events = [
+        TextShapeEvent(("text",), width, "none")
+        for width in range(10, 50)
+    ]
+    frontier = build_text_shape_frontier(
+        events, compile_scope=DDP_LOCAL_GRAD_SCOPE,
+    )
+    local_plan = select_text_shape_padding_budget(frontier)
+    shared_cap = local_plan.report.effective_cap + 4
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda cap: shared_cap
+
+    plan, report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan,
+        frontier,
+        local_plan.report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True,
+    )
+
+    assert allowed is True
+    assert report.effective_cap == report.cap == shared_cap <= 128
+    assert report.planned_signatures <= shared_cap
+    assert report.budget_satisfied is True
+    assert plan.report == report
+
+    trainer._distributed_max_int = lambda _cap: 129
+    failure_consensus = iter((False, True))
+    trainer._distributed_any_flag = lambda _failed: next(failure_consensus)
+    plan, failed_report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan,
+        frontier,
+        local_plan.report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True,
+    )
+
+    assert plan is None and allowed is False
+    assert failed_report.action == "eager"
+    assert failed_report.cap_selection == "not_applicable"
+    assert failed_report.effective_cap == failed_report.cap == 128
+
+
+def test_ddp_vlm_exact_rank_keeps_local_plan_and_neutral_cap_share():
+    """An exact rank must not export its catalog size as the shared cap
+    (widening budget-bucketed peers) and keeps its local plan."""
+    from unsloth_zoo.mlx import shape_guard as sg
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    events = [sg.TextShapeEvent(("vlm",), w, "none") for w in range(10, 50)]
+    frontier = sg.build_text_shape_frontier(
+        events, compile_scope=sg.FULL_STEP_SCOPE,
+    )
+    local_plan = sg.select_text_shape_padding_budget(
+        frontier, exact_signature_threshold=sg.AUTOMATIC_TEXT_COMPILE_CEILING,
+    )
+    assert local_plan.report.action == "exact"
+    contributed = []
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = (
+        lambda cap: contributed.append(cap) or 14  # peer's budget cap wins
+    )
+
+    plan, report, allowed = trainer._coordinate_text_shape_guard(
+        local_plan, frontier, local_plan.report, True,
+        build_compile_policy(args=MLXTrainingConfig()),
+        automatic=True, keep_exact_local=True,
+    )
+
+    assert contributed == [1]  # neutral share, never the catalog size
+    assert allowed is True and plan is local_plan
+    assert report is local_plan.report and report.action == "exact"
+
+
+def test_ddp_not_applicable_auto_shape_guard_skips_cap_synchronization():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda _cap: (_ for _ in ()).throw(
+        AssertionError("not-applicable paths must not synchronize a cap")
+    )
+    report = _shape_guard_report(
+        "not_applicable", "streaming", 128, lazy_batches=False,
+    )
+
+    plan, coordinated, allowed = trainer._coordinate_text_shape_guard(
+        None,
+        None,
+        report,
+        True,
+        build_compile_policy(args=MLXTrainingConfig(streaming=True)),
+        automatic=True,
+    )
+
+    assert plan is None and allowed is True
+    assert coordinated == report
+
+
+def test_ddp_synchronizes_bounded_padding_budget_cap():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    args = MLXTrainingConfig(max_steps=40)
+    policy = build_compile_policy(args=args)
+    local_plan, report, allowed, frontier = _plan_single_process_text_shapes(
+        _make_shape_guard_text_plan(tuple(range(10, 50))),
+        None,
+        args=args,
+        total_steps=40,
+        is_vlm=False,
+        distributed_world_size=2,
+        compile_policy=policy,
+        install_plan=False,
+    )
+    shared_cap = min(128, report.effective_cap + 3)
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: False
+    trainer._distributed_max_int = lambda _cap: shared_cap
+
+    final_plan, final_report, final_allowed = trainer._coordinate_text_shape_guard(
+        local_plan, frontier, report, allowed, policy, automatic=True,
+    )
+
+    assert final_allowed is True
+    assert final_report.cap_selection == "padding_budget"
+    assert final_report.effective_cap == shared_cap
+    assert final_report.planned_signatures <= shared_cap
+    assert final_plan.report == final_report
+
+
+def test_text_shape_guard_exact_and_compile_disabled_paths_add_no_padding():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    exact_batches = _make_shape_guard_text_plan((10, 11, 30), labeled=False)
+    exact_args = MLXTrainingConfig(
+        max_steps=3,
+        gradient_accumulation_steps=1,
+        compile_max_variants=3,
+    )
+    _, exact_report, exact_allowed, _ = _plan_single_process_text_shapes(
+        exact_batches,
+        None,
+        args=exact_args,
+        total_steps=3,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=exact_args),
+    )
+    assert exact_allowed is True
+    assert exact_report.action == "exact"
+    assert exact_batches.materialize(0, phase="single")[0].shape == (1, 10)
+
+    eager_batches = _make_shape_guard_text_plan((10, 11, 30), labeled=False)
+    eager_args = MLXTrainingConfig(compile=False, compile_max_variants=1)
+    shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
+        eager_batches,
+        None,
+        args=eager_args,
+        total_steps=3,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=eager_args),
+    )
+    assert shape_plan is None and allowed is True
+    assert (report.action, report.reason) == ("not_applicable", "compile_disabled")
+    assert eager_batches[0][0].shape == (1, 10)
+
+
+def test_text_shape_guard_failure_obeys_best_effort_and_strict_modes():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    schedules = ((0,), (1, 0))
+    best_effort = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=1,
+        compile_max_variants=1,
+    )
+    _, report, allowed, _ = _plan_single_process_text_shapes(
+        _make_shape_guard_text_plan((10, 11), schedules=schedules),
+        None,
+        args=best_effort,
+        total_steps=2,
+        is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=best_effort),
+    )
+    assert allowed is False
+    assert (report.action, report.reason) == ("eager", "irreducible_signatures")
+
+    strict = MLXTrainingConfig(
+        max_steps=2,
+        gradient_accumulation_steps=1,
+        compile_mode="strict",
+        compile_max_variants=1,
+    )
+    with pytest.raises(RuntimeError, match="shape planning failed"):
+        _plan_single_process_text_shapes(
+            _make_shape_guard_text_plan((10, 11), schedules=schedules),
+            None,
+            args=strict,
+            total_steps=2,
+            is_vlm=False,
+            distributed_world_size=1,
+            compile_policy=build_compile_policy(args=strict),
+        )
+
+
+def test_strict_text_shape_rejection_precedes_model_setup():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer(
+        Model(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=MLXTrainingConfig(
+            max_steps=1,
+            gradient_accumulation_steps=2,
+            compile_mode="strict",
+            compile_max_variants=1,
+        ),
+    )
+    trainer._batches = _make_shape_guard_text_plan((10, 11), labeled=False)
+    setup_calls = []
+    trainer._install_neftune = lambda: setup_calls.append("neftune")
+
+    with pytest.raises(RuntimeError, match="shape planning failed"):
+        trainer.train()
+
+    assert setup_calls == []
+
+
+def test_ddp_text_shape_preparation_failure_is_coordinated_before_setup():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        _config = {}
+
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer(
+        Model(),
+        types.SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        [],
+        args=MLXTrainingConfig(max_steps=1),
+    )
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_rank = 0
+    trainer._distributed_is_main_process = True
+    trainer._prepare_data = lambda _is_vlm: (_ for _ in ()).throw(
+        KeyError("rank-local preparation failure")
+    )
+    calls = []
+
+    def coordinated_abort(failed, context, exc):
+        calls.append((failed, context, type(exc)))
+        raise RuntimeError("coordinated preparation failure")
+
+    trainer._raise_distributed_failure = coordinated_abort
+    trainer._install_neftune = lambda: calls.append("model setup")
+
+    with pytest.raises(RuntimeError, match="coordinated preparation failure"):
+        trainer.train()
+
+    assert calls == [
+        (True, "preparing finite text shape guard", KeyError),
+    ]
+
+
+def test_text_shape_guard_dispositions_for_vlm_streaming_and_clipped_accum():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    cases = (
+        # VLM with no resolved compile decision: planning must not run before
+        # qualification.
+        (True, None, MLXTrainingConfig(), "vlm_compile_unqualified"),
+        (False, iter(()), MLXTrainingConfig(), "streaming"),
+        # Compiled global-norm clipping with accumulation is eligible, so the
+        # guard plans instead of declining.
+        (False, None, MLXTrainingConfig(gradient_accumulation_steps=2,
+                                        max_grad_norm=1.0), None),
+    )
+    for is_vlm, batch_iter, args, reason in cases:
+        batches = _make_shape_guard_text_plan((10, 30), labeled=False)
+        shape_plan, report, compile_allowed, _ = _plan_single_process_text_shapes(
+            batches,
+            batch_iter,
+            args=args,
+            total_steps=2,
+            is_vlm=is_vlm,
+            distributed_world_size=1,
+            compile_policy=build_compile_policy(args=args),
+        )
+        assert compile_allowed is True
+        if reason is None:
+            assert shape_plan is not None
+        else:
+            assert shape_plan is None
+            assert (report.action, report.reason) == ("not_applicable", reason)
+            assert batches[0][0].shape == (1, 10)
+
+
+def test_ddp_text_shape_guard_uses_local_phases_and_rank_local_endpoints():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import DDP_LOCAL_GRAD_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+
+    args = MLXTrainingConfig(
+        max_steps=3,
+        gradient_accumulation_steps=2,
+        compile_max_variants=2,
+    )
+    endpoints = []
+    for widths in ((10, 11, 30), (10, 11)):
+        schedules = (
+            ((0,), (1,), (1,), (0,)) if len(widths) == 2 else None
+        )
+        batches = _make_shape_guard_text_plan(
+            widths, schedules=schedules, labeled=False,
+        )
+        shape_plan, report, allowed, _ = _plan_single_process_text_shapes(
+            batches,
+            None,
+            args=args,
+            total_steps=3 if len(widths) == 3 else 2,
+            is_vlm=False,
+            distributed_world_size=2,
+            compile_policy=build_compile_policy(args=args),
+        )
+        assert allowed is True
+        assert report.compile_scope == DDP_LOCAL_GRAD_SCOPE
+        assert (report.raw_signatures, report.planned_signatures) == (
+            2 * len(widths), 2,
+        )
+        endpoints.append(shape_plan.endpoint_for(batches.batch_family(0), 10))
+
+    assert endpoints == [30, 11]
+
+
+def test_ddp_text_shape_guard_coordinates_peer_failure_and_strict_mode():
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _shape_guard_report,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_world_size = 2
+    trainer._distributed_any_flag = lambda _failed: True
+    local_report = _shape_guard_report(
+        "exact", "schedule_within_cap", 32, "ddp_local_grad",
+    )
+    policy = build_compile_policy(args=MLXTrainingConfig())
+    _, report, allowed = trainer._coordinate_text_shape_guard(
+        None, None, local_report, True, policy,
+    )
+    assert allowed is False
+    assert (report.action, report.reason) == ("eager", "peer_planner_failure")
+    assert report.planned_signatures is None
+
+    strict_policy = build_compile_policy(
+        args=MLXTrainingConfig(compile_mode="strict"),
+    )
+    with pytest.raises(RuntimeError, match="at least one DDP rank"):
+        trainer._coordinate_text_shape_guard(
+            None, None, local_report, True, strict_policy,
+        )
+
+
+@pytest.mark.parametrize("compile_failure", [None, "setup", "runtime"])
+def test_text_trainer_bounds_compiled_signatures_and_unpads_fallback(
+    monkeypatch, tmp_path, compile_failure,
+):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(128, 4)
+            self.proj = nn.Linear(4, 128, bias=False)
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, input_ids):
+            return self.proj(self.embed(input_ids))
+
+        def train(self):
+            return self
+
+        @property
+        def state(self):
+            return []
+
+    seen = set()
+    executed_widths = set()
+    failed_runtime = False
+
+    def compile_spy(fn, **_kwargs):
+        if compile_failure == "setup":
+            raise RuntimeError("compile setup failure")
+
+        def compiled(*args):
+            nonlocal failed_runtime
+            batch, prev_state, do_update = args
+            seen.add((int(batch[0].shape[-1]), prev_state is None, bool(do_update)))
+            if compile_failure == "runtime" and not failed_runtime:
+                failed_runtime = True
+                raise RuntimeError("compile runtime failure")
+            return fn(*args)
+        return compiled
+
+    def value_and_grad_with_aux(model, fn):
+        from mlx.utils import tree_map
+
+        def wrapped(*args):
+            executed_widths.add(int(args[1].shape[-1]))
+            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
+
+        return wrapped
+
+    monkeypatch.setattr(mx, "compile", compile_spy)
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+    args = MLXTrainingConfig(
+        max_steps=6,
+        gradient_accumulation_steps=1,
+        compile=True,
+        compile_max_variants=2,
+        use_cce=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        logging_steps=6,
+        output_dir=str(tmp_path),
+    )
+    trainer = MLXTrainer(
+        TinyLM(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+    )
+    trainer._batches = _make_shape_guard_text_plan(
+        (10, 11, 30), labeled=False,
+    )
+    trainer._build_optimizer = lambda _total_steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5),
+        state={},
+        update=lambda _model, _grad: None,
+    )
+    trainer.save_model = lambda *_args, **_kwargs: None
+
+    result = trainer.train()
+
+    assert result["compile_shape_guard"]["action"] == "bucket"
+    assert result["compile_shape_guard"]["planned_signatures"] == 2
+    if compile_failure is None:
+        assert result["compile_enabled"] is True
+        assert {signature[0] for signature in seen} == {11, 30}
+        assert executed_widths == {11, 30}
+        assert len(seen) == 2
+    else:
+        assert result["compile_enabled"] is False
+        assert result["compile_scope"] == "fallback_eager"
+        assert executed_widths == {10, 11, 30}
+
+
+def test_response_masked_text_batches_can_remain_a_lazy_plan():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _create_labeled_batches
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan
+
+    tokenizer = types.SimpleNamespace(
+        chat_template=None,
+        eos_token_id=None,
+        pad_token_id=7,
+        encode=lambda text, add_special_tokens=True: [
+            int(part) for part in str(text).split()
+        ],
+    )
+
+    def mask_fn(batch):
+        ids = batch["input_ids"][0]
+        return {"labels": [[-100] + ids[1:]]}
+
+    kwargs = dict(
+        dataset=[{"text": "1 2"}, {"text": "3 4 5"}],
+        tokenizer=tokenizer,
+        mask_fn=mask_fn,
+        batch_size=2,
+        max_seq_length=64,
+        dataset_order="sequential",
+    )
+    plan = _create_labeled_batches(**kwargs, return_plan=True)
+    eager = _create_labeled_batches(**kwargs)[0]
+
+    assert isinstance(plan, FiniteTextBatchPlan)
+    assert plan.widths == (33,)
+    actual = plan[0]
+    assert [value.tolist() for value in actual] == [
+        value.tolist() for value in eager
+    ]
+    assert actual[2].dtype == mx.int32
+    assert eager[2].dtype == mx.int32
+
+
 # ---------------------------------------------------------------------------
 # 1. MLXTrainingConfig: full surface check.
 # ---------------------------------------------------------------------------
@@ -120,6 +896,14 @@ def test_mlx_training_config_exposes_completion_only_loss():
         MLXTrainingConfig(assistant_only_loss=True)
     ) is True
     assert _text_assistant_only_loss_arg(MLXTrainingConfig()) is False
+
+
+@pytest.mark.parametrize("value", [True, False, 0, 257, 1.5, "32"])
+def test_mlx_training_config_validates_compile_max_variants(value):
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    with pytest.raises(ValueError, match="compile_max_variants"):
+        MLXTrainingConfig(compile_max_variants=value)
 
 
 def test_mlx_trainer_distributed_defaults_world_size_one():
@@ -218,13 +1002,14 @@ def test_distributed_text_batches_use_tokenizer_pad_without_global_rng():
     batches = _create_distributed_text_batches(
         dataset,
         batch_size=2,
-        max_seq_length=8,
+        max_seq_length=64,
         seed=7,
         comm_group=FakeWorld(),
         tokenizer=Tokenizer(),
     )
 
     assert np.random.random(3) == pytest.approx(expected)
+    assert batches[0][0].shape == (2, 33)
     rows = batches[0][0].tolist()
     assert rows[0][:2] == [5, 6]
     assert rows[0][2:] == [99] * (len(rows[0]) - 2)
@@ -379,6 +1164,20 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     )
     assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
+    from unsloth_zoo.mlx.trainer import _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    legacy_fields = [
+        field for field in dataclasses.fields(MLXTrainingConfig)
+        if field.init and field.name not in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    ]
+    legacy_values = [getattr(MLXTrainingConfig(), field.name) for field in legacy_fields]
+    _legacy_names = [field.name for field in legacy_fields]
+    legacy_values[_legacy_names.index("warmup_ratio")] = 0.1
+    # image_size is no longer the last legacy field, so set it by name.
+    legacy_values[_legacy_names.index("image_size")] = (128, 256)
+    copied_ratio_trainer.args = MLXTrainingConfig(*legacy_values)
+    assert copied_ratio_trainer.args.image_size == (128, 256)
+    assert copied_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
     explicit_default_trainer = MLXTrainer.__new__(MLXTrainer)
     explicit_default_trainer.args = MLXTrainingConfig(
         learning_rate=5e-5,
@@ -530,13 +1329,12 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
 def test_global_norm_clip_reduces_in_float32():
     import inspect
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32
+    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
 
-    source = inspect.getsource(_clip_grad_norm_fp32)
-
-    assert "g.astype(mx.float32)" in source
-    assert "scale.astype(g.dtype)" in source
-    assert "tree_reduce" in source
+    norm_source = inspect.getsource(_global_grad_norm_fp32)
+    assert "g.astype(mx.float32)" in norm_source
+    assert "tree_reduce" in norm_source
+    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
 
 
 @pytest.mark.parametrize(
@@ -586,7 +1384,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
 
 
 def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
-    """Studio formatting owns EOS decisions; MLX batching must not add one."""
+    """Unsloth formatting owns EOS decisions; MLX batching must not add one."""
     import sys
 
     class CacheDataset:
@@ -617,7 +1415,7 @@ def test_mlx_text_dataset_does_not_append_eos(monkeypatch):
             assert text == "hello"
             return [1, 2, 3]
 
-    # append_eos=False is what Studio passes (chat-template renders EOS).
+    # append_eos=False is what Unsloth passes (chat-template renders EOS).
     dataset = _prepare_dataset([{"text": "hello"}], Tokenizer(), append_eos=False)
     assert dataset[0] == ([1, 2, 3], 0)
 
@@ -893,6 +1691,413 @@ def test_text_completion_probe_keeps_one_shot_iterables_reusable():
     assert list(dataset) == [{"text": "1 2"}]
 
 
+class _StreamingTextTokenizer:
+    chat_template = None
+    eos_token_id = None
+
+    def __init__(self, offset=0, pad_token_id=0):
+        self.offset = offset
+        self.pad_token_id = pad_token_id
+
+    def encode(self, text, add_special_tokens=True):
+        return [int(part) + self.offset for part in str(text).split()]
+
+    def __call__(self, text, **_kwargs):
+        return types.SimpleNamespace(
+            input_ids=self.encode(text, add_special_tokens=False),
+        )
+
+    def apply_chat_template(self, messages, tokenize=False, **_kwargs):
+        ids = []
+        for message in messages:
+            ids.append(20 if message["role"] == "assistant" else 10)
+            ids.extend(int(part) for part in message["content"].split())
+        return ids if tokenize else " ".join(str(token) for token in ids)
+
+
+class _MinimalTextModel:
+    _config = {}
+    def trainable_parameters(self): return {}
+
+
+class _CountingTextRows:
+    def __init__(self, rows, infinite=False):
+        self.rows = tuple(rows)
+        self.pulls = 0
+        self._unsloth_mlx_infinite = infinite
+
+    def __iter__(self):
+        while True:
+            for row in self.rows:
+                self.pulls += 1
+                yield row
+            if not self._unsloth_mlx_infinite:
+                return
+
+
+class _DeclaredTextRows(_CountingTextRows):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.epochs = []
+    def __len__(self): return len(self.rows)
+    def set_epoch(self, epoch): self.epochs.append(epoch)
+
+
+def _streaming_text_tokenizer(pad_token_id=0):
+    return _StreamingTextTokenizer(pad_token_id=pad_token_id)
+
+
+def _streaming_text_trainer(**kwargs):
+    MLXTrainer, trainer = _make_mlx_text_trainer(streaming=True, **kwargs)
+    trainer.tokenizer = _streaming_text_tokenizer()
+    trainer._distributed_initialized = True
+    trainer._distributed_world = None
+    trainer._distributed_world_size = 1
+    return MLXTrainer, trainer
+
+
+def _streaming_text_batches(dataset, tokenizer=None, **kwargs):
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+
+    options = dict(batch_size=1, max_seq_length=8, dataset_order="sequential")
+    return iterate_training_batches(
+        dataset, tokenizer or _streaming_text_tokenizer(), **(options | kwargs),
+    )
+
+
+def _streaming_batch_signature(batch):
+    tokens, lengths, labels = batch
+    return tokens.tolist(), lengths.tolist(), None if labels is None else labels.tolist()
+
+
+@pytest.mark.parametrize("use_hf", [False, True])
+def test_text_streaming_yields_without_sizing_indexing_or_preconsumption(use_hf):
+    from datasets import IterableDataset
+
+    class GuardedRows:
+        def __init__(self):
+            self.pulls = 0
+
+        def __len__(self):
+            raise AssertionError("streaming source length must not be requested")
+
+        def __getitem__(self, _index):
+            raise AssertionError("streaming source must not be indexed")
+
+        def __iter__(self):
+            while True:
+                if self.pulls >= 2:
+                    raise AssertionError("source was consumed past the first batch")
+                self.pulls += 1
+                yield {"text": f"{self.pulls} {self.pulls + 10}"}
+
+    guarded = GuardedRows()
+    source = IterableDataset.from_generator(lambda: iter(guarded)) if use_hf else guarded
+    batch = next(_streaming_text_batches(
+        source,
+        batch_size=2,
+        completion_only_loss=False,
+    ))
+
+    assert guarded.pulls == 2
+    assert [row[:2] for row in batch[0].tolist()] == [[1, 11], [2, 12]]
+
+
+def test_streaming_trainer_exposes_lazy_prepared_iterable_view():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Rows:
+        def __init__(self):
+            self.pulls = 0; self.features = {"value": "int64"}; self.column_names = ["value"]; self.split = "train"; self.restored = []
+        def __len__(self): raise AssertionError("must stay unsized")
+        def __getitem__(self, _index): raise AssertionError("must stay unindexed")
+        def take(self, _count): return [{"value": "raw"}]
+        def state_dict(self): return {"pulls": self.pulls}
+        def load_state_dict(self, state): self.restored.append(state)
+        def __iter__(self):
+            self.pulls += 1
+            yield {"value": 1}
+
+    rows = Rows()
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(), rows,
+        formatting_func=lambda row: {"text": f"{row['value']} 2"},
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, completion_only_loss=False,
+            max_seq_length=8,
+        ),
+    )
+
+    assert rows.pulls == 0
+    assert not hasattr(trainer.train_dataset, "__len__")
+    assert not hasattr(trainer.train_dataset, "__getitem__")
+    assert not hasattr(trainer.train_dataset, "take")
+    assert not hasattr(trainer.train_dataset, "state_dict")
+    assert not hasattr(trainer.train_dataset, "load_state_dict")
+    assert not hasattr(trainer.train_dataset, "features")
+    assert not hasattr(trainer.train_dataset, "column_names")
+    assert trainer.train_dataset.split == "train"
+    assert rows.restored == []
+    assert next(iter(trainer.train_dataset)) == {"value": 1, "input_ids": [1, 2]}
+    assert rows.pulls == 1
+
+
+def test_train_on_responses_only_masks_unsized_text_lazily():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+
+    source_rows = (
+        {"text": "10 1"},
+        {"text": "10 1 20 2 3"},
+        {"messages": [
+            {"role": "user", "content": "4"},
+            {"role": "assistant", "content": "5"},
+        ]},
+    )
+    rows = _CountingTextRows(source_rows)
+    lazy_eval = _CountingTextRows(source_rows)
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(offset=100), rows,
+        eval_dataset={
+            "sized": [{"text": "10 6 20 7"}],
+            "lazy": lazy_eval,
+        },
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, per_device_train_batch_size=1,
+            completion_only_loss=False, dataset_order="sequential",
+            max_seq_length=8, chat_template="{{ messages }}",
+        ),
+    )
+    train_on_responses_only(
+        trainer, instruction_part="10", response_part="20", force_match=True,
+        tokenizer=_StreamingTextTokenizer(),
+    )
+
+    assert rows.pulls == 0
+    prepared_rows = iter(trainer.train_dataset)
+    public_row = next(prepared_rows)
+    assert public_row == source_rows[1] | {"input_ids": [10, 1, 20, 2, 3], "labels": [-100, -100, -100, 2, 3]}
+    assert rows.pulls == 2  # the fully masked first row is legitimately filtered
+    assert next(prepared_rows) == source_rows[2] | {"input_ids": [10, 4, 20, 5], "labels": [-100, -100, -100, 5]}
+    assert trainer.eval_dataset["sized"][0]["labels"] == [-100, -100, -100, 7]
+    assert lazy_eval.pulls == 0
+
+def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+
+    eval_rows = _CountingTextRows([{"text": "10 1 20 2"}])
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(100),
+        [{"text": "10 1 20 2"}],
+        eval_dataset=eval_rows,
+        args=MLXTrainingConfig(
+            streaming=True, max_steps=1, completion_only_loss=False,
+            per_device_train_batch_size=1,
+        ),
+    )
+    override = _StreamingTextTokenizer()
+    train_on_responses_only(
+        trainer, instruction_part="10", response_part="20",
+        tokenizer=override,
+    )
+
+    assert eval_rows.pulls == 0
+    eval_batches = trainer._create_text_eval_batches(
+        trainer.eval_dataset, 1, False, False,
+    )
+    batch = next(iter(eval_batches))
+    assert batch[0].tolist() == [[10, 1, 20, 2]]
+    assert batch[2].tolist() == [[-100, -100, -100, 2]]
+
+
+def test_length_declaring_text_stream_supports_epoch_replay():
+    MLXTrainer, trainer = _streaming_text_trainer(
+        max_steps=0, num_train_epochs=2,
+        completion_only_loss=False, dataset_order="sequential",
+        per_device_train_batch_size=2, gradient_accumulation_steps=1,
+    )
+    trainer.train_dataset = _DeclaredTextRows([
+        {"text": f"{value} {value + 10}"} for value in range(1, 6)
+    ])
+    batches, iterator = MLXTrainer._prepare_data(trainer, is_vlm=False)
+
+    assert batches is None
+    assert trainer._streaming_epoch_batch_count == 3
+    signatures = [_streaming_batch_signature(next(iterator)) for _ in range(4)]
+    assert signatures[3] == signatures[0]
+    assert trainer.train_dataset.epochs == [0, 1]
+
+
+def test_raw_text_streaming_matches_sized_sequential_order():
+    rows = [{"value": value} for value in range(1, 6)]
+    kwargs = {
+        "batch_size": 2,
+        "completion_only_loss": False,
+        "formatting_func": lambda row: {
+            "text": f"{row['value']} {row['value'] + 10}"
+        },
+    }
+    expected = _streaming_text_batches(rows, **kwargs)
+    actual = _streaming_text_batches(_CountingTextRows(rows), **kwargs)
+    assert [_streaming_batch_signature(next(actual)) for _ in range(3)] == [
+        _streaming_batch_signature(next(expected)) for _ in range(3)
+    ]
+
+
+def test_streaming_prompt_completion_and_assistant_labels():
+    completion_batch = next(_streaming_text_batches(iter([
+        {"prompt": "1 2", "completion": " 3"},
+        {"prompt": "4", "completion": " 5 6"},
+    ]), batch_size=2))
+    assert completion_batch[0].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert completion_batch[2].tolist() == [[-100, -100, 3], [-100, 5, 6]]
+
+    assistant_batch = next(_streaming_text_batches(
+        iter([{
+            "messages": [
+                {"role": "user", "content": "1"},
+                {"role": "assistant", "content": "2 3"},
+            ],
+        }]),
+        tokenizer=_AssistantMaskTokenizer(),
+        completion_only_loss=False,
+        assistant_only_loss=True,
+    ))
+    assert assistant_batch[0].tolist() == [[10, 1, 20, 2, 3]]
+    assert assistant_batch[2].tolist() == [[-100, -100, -100, 2, 3]]
+
+
+def test_pretokenized_streaming_preserves_supported_label_fields():
+    from unsloth_zoo.mlx.utils import _MLXIterableTokenizedDatasetView
+
+    explicit = next(_streaming_text_batches(
+        iter([{
+            "input_ids": [1, 2],
+            "labels": [-100, 2],
+            "attention_mask": [0, 0],
+        }]),
+        tokenizer=types.SimpleNamespace(pad_token_id=9),
+        completion_only_loss=False,
+        formatting_func=lambda _row: pytest.fail(
+            "pretokenized rows must bypass formatting"
+        ),
+    ))
+    assert explicit[0].tolist() == [[1, 2]]
+    assert explicit[2].tolist() == [[-100, 2]]
+
+    masked_row = next(iter(_MLXIterableTokenizedDatasetView(iter([{
+        "input_ids": [4, 5, 6], "completion_mask": [1, 1, 1],
+        "assistant_masks": [0, 1, 1],
+    }]), types.SimpleNamespace(), max_seq_length=2)))
+    assert masked_row["completion_mask"] == [1, 1] and masked_row["assistant_masks"] == [0, 1]
+    masked = next(_streaming_text_batches(
+        iter([masked_row]),
+        tokenizer=types.SimpleNamespace(pad_token_id=0),
+    ))
+    assert masked[2].tolist() == [[-100, 5]]
+
+
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        ([{"text": "1 2"}, {"input_ids": [3, 4]}], "cannot be mixed"),
+        (
+            [
+                {"input_ids": [1, 2], "labels": [-100, 2]},
+                {"input_ids": [3, 4]},
+            ],
+            "must not be mixed",
+        ),
+    ],
+)
+def test_text_streaming_rejects_incremental_schema_drift(rows, match):
+    batches = _streaming_text_batches(
+        iter(rows),
+        completion_only_loss=False,
+    )
+
+    next(batches)
+    with pytest.raises(ValueError, match=match):
+        next(batches)
+
+def test_hf_stream_replays_in_source_order_and_sets_epoch():
+    from datasets import IterableDataset
+
+    source = IterableDataset.from_generator(
+        lambda: iter([{"text": "1"}, {"prompt": "2", "completion": " 3"}])
+    )
+    epochs = []
+    original_set_epoch = source.set_epoch
+
+    def record_epoch(epoch):
+        epochs.append(epoch)
+        original_set_epoch(epoch)
+
+    source.set_epoch = record_epoch
+    batches = _streaming_text_batches(source)
+    first = _streaming_batch_signature(next(batches))
+
+    assert first == ([[2, 3]], [[0, 2]], [[-100, 3]])
+    assert _streaming_batch_signature(next(batches)) == first
+    assert epochs == [0, 1]
+
+
+def test_one_shot_stream_exhaustion_and_resume_are_actionable():
+    batches = _streaming_text_batches(
+        iter([{"text": "1 2"}, {"text": "3 4"}]),
+        batch_size=2,
+        completion_only_loss=False,
+    )
+    next(batches)
+    with pytest.raises(RuntimeError, match="one-shot.*exhausted"):
+        next(batches)
+
+    MLXTrainer, trainer = _make_mlx_text_trainer(
+        max_steps=2,
+        streaming=True,
+        dataset_order="sequential",
+    )
+    trainer.train_dataset = iter([{"text": "1 2"}, {"text": "3 4"}])
+    trainer._resume_from_checkpoint = "checkpoint-1"
+    _, resumed = MLXTrainer._prepare_data(trainer, is_vlm=False)
+    with pytest.raises(RuntimeError, match="replayable iterable"):
+        next(resumed)
+
+    MLXTrainer, evaluator = _streaming_text_trainer(
+        max_steps=1, completion_only_loss=False,
+    )
+    source = ({"text": "1 2"} for _ in range(1))
+    eval_batches = evaluator._create_text_eval_batches(source, 1, False, False)
+    with pytest.raises(RuntimeError, match="replayable iterable"):
+        next(iter(eval_batches))
+    assert next(source) == {"text": "1 2"}
+
+
+def test_unsized_stream_rejects_randperm_before_consumption():
+    pulls = 0
+
+    def rows():
+        nonlocal pulls
+        pulls += 1
+        yield {"text": "1 2"}
+
+    with pytest.raises(ValueError, match="torch_randperm.*unsized"):
+        next(_streaming_text_batches(rows(), dataset_order="torch_randperm"))
+    assert pulls == 0
+
+    class SizedRows(torch.utils.data.Dataset):
+        rows = [{"text": "1 2"}, {"text": "3 4"}]
+        def __len__(self): return len(self.rows)
+        def __getitem__(self, index): return self.rows[index]
+
+    batch = next(_streaming_text_batches(SizedRows(), batch_size=2,
+        completion_only_loss=False, dataset_order="torch_randperm"))
+    assert sorted(row[0] for row in batch[0].tolist()) == [1, 3]
+
+
 def test_text_pretokenized_create_batches_preserves_input_ids():
     from unsloth_zoo.mlx.utils import create_batches
 
@@ -1009,16 +2214,16 @@ def test_text_pretokenized_ordered_and_streaming_batches_emit_labels():
         assert labels.tolist() == [[-100, 2, -100], [-100, 4, 5]]
 
 
-def test_text_prepare_data_passes_completion_only_loss_to_create_batches(monkeypatch):
+def test_text_prepare_data_passes_completion_only_loss_to_batch_plan(monkeypatch):
     from unsloth_zoo.mlx import trainer as mlx_trainer
 
     received = {}
 
-    def fake_create_batches(**kwargs):
+    def fake_create_plan(**kwargs):
         received.update(kwargs)
         return [("batch", "lengths", "labels")]
 
-    monkeypatch.setattr(mlx_trainer, "create_batches", fake_create_batches)
+    monkeypatch.setattr(mlx_trainer, "_create_text_batch_plan", fake_create_plan)
 
     MLXTrainer, trainer = _make_mlx_text_trainer(
         max_steps=1,
@@ -1102,6 +2307,7 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
     from unsloth_zoo.mlx.trainer import train_on_responses_only
 
     class CallableTokenizer:
+        chat_template = None
         def __call__(self, text, **kwargs):
             return {"input_ids": [1, 2, 3]}
 
@@ -1114,30 +2320,17 @@ def test_train_on_responses_only_forwards_last_response_only(monkeypatch):
         return lambda batch: batch
 
     monkeypatch.setattr(dataset_utils, "train_on_responses_only", fake_hf)
+    tokenizer = CallableTokenizer()
     train_on_responses_only(
         None,
         instruction_part="<user>",
         response_part="<assistant>",
-        tokenizer=CallableTokenizer(),
+        tokenizer=tokenizer,
         return_function=True,
         last_response_only=True,
     )
 
     assert received["last_response_only"] is True
-
-
-def test_response_mask_tokenizer_rejects_encode_only_tokenizer():
-    from unsloth_zoo.mlx.trainer import _resolve_response_mask_tokenizer
-
-    class EncodeOnlyTokenizer:
-        def encode(self, text):
-            return [1, 2, 3]
-
-        def convert_tokens_to_ids(self, token):
-            return 1
-
-    with pytest.raises(TypeError, match="requires a callable"):
-        _resolve_response_mask_tokenizer(EncodeOnlyTokenizer())
 
 
 def test_vlm_eval_batches_define_completion_only_loss_before_use():
@@ -1147,12 +2340,10 @@ def test_vlm_eval_batches_define_completion_only_loss_before_use():
 
     source = inspect.getsource(MLXTrainer._train_inner)
     definition = source.index("text_completion_only_loss = _text_completion_only_loss_arg(args)")
-    eval_use = source.index("completion_only_loss=text_completion_only_loss")
-    text_eval_start = source.index("return create_batches(")
-    text_eval_end = source.index("if isinstance(self.eval_dataset, dict)")
-    text_eval_block = source[text_eval_start:text_eval_end]
+    eval_use = source.index("text_completion_only_loss,")
+    text_eval_block = inspect.getsource(MLXTrainer._create_text_eval_batches)
     assert definition < eval_use
-    assert "completion_only_loss=text_completion_only_loss" in text_eval_block
+    assert "completion_only_loss=completion_only_loss" in text_eval_block
 
 
 def test_evaluate_dict_eval_datasets_records_split_metrics():
@@ -1252,9 +2443,26 @@ def test_eval_callback_stop_request_synced_before_best_model_track():
     assert src.find("self._distributed_should_stop()", cb_idx, track_idx) != -1
 
 
+def _all_masked_vlm_plan():
+    # Response-mask filtering drops all-masked rows, so an all-bad checked plan
+    # only arises from rows that bypass it (pad slots, prompt/completion rows).
+    # Model that directly through the class contract (checker_good=False rows).
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _FiniteVLMRow
+
+    return FiniteVLMBatchPlan(
+        rows=[_FiniteVLMRow({"text": "0"}, False)],
+        schedule=((0,),),
+        empty_masks=None,
+        processor=object(),
+        config={},
+        max_seq_length=8,
+        image_size=None,
+    )
+
+
 def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
-    # VLM mirror of the text-path mask check: a fully-masked local shard must
-    # not raise alone in DDP; counts are all-summed before deciding.
+    # VLM mirror of the text-path mask check: a fully-masked local shard must not
+    # raise alone in DDP, since supervision counts are all-summed first.
     import mlx.core as mx
 
     import unsloth_zoo.mlx.trainer as trainer_mod
@@ -1265,18 +2473,16 @@ def test_check_vlm_all_masked_reduces_counts_across_ranks(monkeypatch):
 
     monkeypatch.setattr(trainer_mod.mx.distributed, "all_sum", fake_all_sum)
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
-    _check_vlm_all_masked(all_bad, comm_group=object(), world_size=2)
+    _check_vlm_all_masked(
+        _all_masked_vlm_plan(), comm_group=object(), world_size=2,
+    )
 
 
 def test_check_vlm_all_masked_single_process_still_raises():
-    import mlx.core as mx
-
     from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
 
-    all_bad = [{"labels": mx.array([[-100, -100]])}]
     with pytest.raises(ZeroDivisionError):
-        _check_vlm_all_masked(all_bad)
+        _check_vlm_all_masked(_all_masked_vlm_plan())
 
 
 def test_reset_run_state_clears_last_eval_metrics():
@@ -1375,7 +2581,8 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
 
     forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
-    prepare_source = inspect.getsource(mlx_utils._prepare_vlm_batch_for_compile)
+    # The marker is set by the position-recording prepare phase.
+    prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)
     assert '"_unsloth_collated_position_ids"' in prepare_source
     assert 'not k.startswith("_unsloth_")' in forward_source
     assert 'use_collated_position_ids and "position_ids" in extra_kwargs' in forward_source
@@ -1820,6 +3027,366 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_qwen3_visual_window_preserves_batched_row_ownership():
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0, 1, 0], [1, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[10], [11], [12], [20], [21], [22]])]
+
+    padded_cache = [types.SimpleNamespace(offset=mx.array([1, -2]), left_padding=mx.array([3, 2]))]
+    assert mc._qwen3_cache_offsets(padded_cache, batch_size=2) == ((1, -2), (4, 0))
+
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+    assert packed.shape == (2, 3, 1, 1)
+    assert positions.tolist() == [[1, 2, 4], [0, 2, 3]]
+    visual_row = dict(
+        inputs_embeds=mx.zeros((1, 6, 1)),
+        visual_pos_masks=masks[:1],
+        _unsloth_qwen3_visual_state=packed[:1],
+        _unsloth_qwen3_visual_positions=positions[:1],
+    )
+    text_row = dict(inputs_embeds=mx.zeros((1, 9, 1)))
+    cold = mc._qwen3_prompt_merge_adapter(lambda rows, _ids: rows)
+    aligned = cold([visual_row, text_row], [range(6), range(9)])
+    assert aligned[0]["_unsloth_qwen3_visual_state"].tolist() == packed[:1].tolist()
+    assert aligned[0]["_unsloth_qwen3_visual_positions"].tolist() == [[4, 5, 7]]
+    assert aligned[0]["_unsloth_qwen3_visual_width"].tolist() == [9]
+    assert aligned[1]["_unsloth_qwen3_visual_state"].shape == (1, 3, 1, 1)
+    assert not aligned[1]["_unsloth_qwen3_visual_state"].any().item()
+    assert aligned[1]["_unsloth_qwen3_visual_positions"].tolist() == [[-1, -1, -1]]
+    assert aligned[1]["visual_pos_masks"].shape == (1, 9)
+    assert not aligned[1]["visual_pos_masks"].any().item()
+    apc_batch = types.SimpleNamespace(
+        _prompt_kwargs={
+            "visual_pos_masks": mx.zeros((2, 9), dtype=mx.bool_),
+            "_unsloth_qwen3_visual_width": mx.array([6, 9], dtype=mx.int32),
+        },
+    )
+    apc = mc._qwen3_mixed_prompt_batch_adapter(
+        lambda _self, _sequences: apc_batch
+    )
+    assert apc(
+        object(),
+        [(None, None, None, visual_row), (None, None, None, text_row)],
+    )._prompt_kwargs["_unsloth_qwen3_visual_width"].tolist() == [9, 9]
+    apc_masks, apc_embeds = mc._qwen3_visual_window(
+        mx.array([[0, 0, 0, 0], [1, 1, 0, 0]], dtype=mx.bool_),
+        mx.array([[[[10]], [[0]]], [[[20]], [[21]]]]),
+        mx.array([[1, -1], [4, 5]]),
+        mask_offsets=(4, 4),
+        position_widths=(9, 9),
+        window=4,
+    )
+    assert apc_masks.tolist() == [[0, 0, 0, 0], [1, 1, 0, 0]]
+    assert apc_embeds[0].tolist() == [[20], [21]]
+    cached_row = dict(
+        inputs_embeds=visual_row["inputs_embeds"],
+        visual_pos_masks=masks[:1],
+    )
+    cached = cold([cached_row, visual_row], [range(6)] * 2)[0]
+    assert not cached["_unsloth_qwen3_visual_state"].any().item()
+    assert cached["_unsloth_qwen3_visual_positions"].tolist() == [[1, 2, 4]]
+    assert mc._pad_qwen3_prompt_rows([]) == []
+    assert mc._pad_qwen3_prompt_rows([text_row])[0] is text_row
+    window_masks, window_embeds = mc._qwen3_visual_window(
+        masks, packed, positions, mask_offsets=(1, 1), window=2
+    )
+    assert window_masks.tolist() == [[1, 1], [0, 1]]
+    assert window_embeds[0].tolist() == [[10], [11], [21]]
+
+    def drops_deepstack(self):
+        deepstack_visual_embeds = mx.eval([])
+        return deepstack_visual_embeds
+
+    assert mc._qwen3_drops_deepstack_after_eval(drops_deepstack)
+
+    language_calls = []
+
+    def native_language(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        **kwargs,
+    ):
+        if visual_pos_masks.shape[-1] != inputs.shape[-1]:
+            start = int(cache[0].offset)
+            window = inputs.shape[1]
+            n_before = int(visual_pos_masks[:, :start].sum().item())
+            n_window = int(
+                visual_pos_masks[:, start : start + window].sum().item()
+            )
+            deepstack_visual_embeds = [
+                layer[n_before : n_before + n_window]
+                for layer in deepstack_visual_embeds
+            ]
+            visual_pos_masks = visual_pos_masks[:, start : start + window]
+        language_calls.append((visual_pos_masks, deepstack_visual_embeds))
+
+    language_adapter = mc._qwen3_visual_state_adapter(native_language)
+    language_adapter(
+        object(),
+        mx.zeros((1, 4)),
+        cache=[types.SimpleNamespace(offset=1, left_padding=3)],
+        visual_pos_masks=mx.pad(masks[:1], [(0, 0), (3, 0)])[:, 4:8],
+        deepstack_visual_embeds=None,
+        _unsloth_qwen3_visual_state=packed[:1],
+        _unsloth_qwen3_visual_positions=aligned[0]["_unsloth_qwen3_visual_positions"],
+        _unsloth_qwen3_visual_width=aligned[0]["_unsloth_qwen3_visual_width"],
+    )
+    assert language_calls[0][0].tolist() == [[1, 1, 0, 1]]
+    assert language_calls[0][1][0].tolist() == [[10], [11], [12]]
+
+
+def test_qwen_video_tensor_adapter_is_exact_and_composable():
+    from functools import wraps
+
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    def legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return ("text", grid_thw, mask)
+        calls.append((input_ids, pixel_values, kwargs))
+        return pixel_values
+
+    video, image = object(), object()
+    adapted = mc._qwen_video_tensor_adapter(legacy)
+    assert adapted(object(), 1, pixel_values_videos=video, video_grid_thw=2) is video
+    assert adapted(
+        object(), 1, image, pixel_values_videos=video, video_grid_thw=2
+    ) is image
+    expected_kwargs = {"pixel_values_videos": video, "video_grid_thw": 2}
+    assert calls == [(1, video, expected_kwargs), (1, image, expected_kwargs)]
+    assert adapted.__wrapped__ is legacy
+    assert mc._qwen_video_tensor_adapter(adapted) is adapted
+
+    def fixed(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        return pixel_values, video_grid_thw
+
+    assert mc._qwen_video_tensor_adapter(fixed) is fixed
+
+    def unknown(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            kwargs.pop("pixel_values_videos", None)
+            return ("text", video_grid_thw)
+
+    assert mc._qwen_video_tensor_adapter(unknown) is unknown
+
+    def unreachable(self, input_ids=None, pixel_values=None, **kwargs):
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if pixel_values is None:
+            return video_grid_thw
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
+    assert not mc._qwen_video_contract_matches(unreachable, "fixed")
+
+    def unreachable_guard(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        return grid_thw, mask
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
+    assert not mc._qwen_video_contract_matches(unreachable_guard, "fixed")
+    assert not mc._qwen_video_contract_matches(unreachable_guard, "legacy")
+
+    @wraps(legacy)
+    def keyword_outer(self, *, input_ids=None, pixel_values=None, **kwargs):
+        return legacy(
+            self,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    composed = mc._qwen_video_tensor_adapter(keyword_outer)
+    assert composed(object(), input_ids=3, pixel_values_videos=video) is video
+
+
+    def staged_legacy(self, input_ids=None, pixel_values=None, **kwargs):
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        mask = kwargs.get("mask", None)
+        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        if pixel_values is None:
+            return grid_thw, mask, mx.eval([])
+
+    staged = mc._qwen3_batch_embedding_adapter(
+        staged_legacy, replace_visual_inference=True
+    )
+    assert mc._qwen_video_tensor_adapter(staged) is not staged
+    replacing = mc._qwen3_batch_embedding_adapter(
+        staged_legacy, fixed, replace_visual_inference=True
+    )
+    assert mc._qwen_video_tensor_adapter(replacing) is replacing
+
+
+def test_qwen_installers_bind_exact_release_owners(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    expected = (
+        "mlx_vlm.models.qwen2_vl.qwen2_vl",
+        "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
+        "mlx_vlm.models.qwen3_5.qwen3_5",
+        "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe",
+    )
+    assert mc._QWEN_VIDEO_TENSOR_OWNER_MODULES == expected
+    owners = {
+        name: type(name, (), {"get_input_embeddings": lambda self: None})
+        for name in expected
+    }
+    patched, imported = [], []
+
+    def import_module(module_name):
+        imported.append(module_name)
+        return types.SimpleNamespace(Model=owners[module_name])
+
+    monkeypatch.setattr(mc.importlib, "import_module", import_module)
+    monkeypatch.setattr(mc, "_patch_qwen_video_tensor", patched.append)
+    mc._install_qwen_video_tensor_patches()
+    assert imported == list(expected)
+    assert patched == [owners[module_name] for module_name in expected]
+
+    method_names = (
+        "__call__", "_deepstack_process", "get_input_embeddings",
+        "merge_input_ids_with_image_features", "rot_pos_emb",
+        "fast_pos_embed_interpolate", "_build_mixed_prompt_batch",
+    )
+
+    def owner(name):
+        methods = {
+            key: lambda *_args, _name=f"{name}.{key}", **_kwargs: _name
+            for key in method_names
+        }
+        methods["merge_input_ids_with_image_features"] = staticmethod(
+            methods["merge_input_ids_with_image_features"]
+        )
+        return type(name, (), methods)
+
+    dense_model, dense_language = owner("DenseModel"), owner("DenseLanguage")
+    moe_model, moe_language = owner("MoeModel"), owner("MoeLanguage")
+    cold_batch, apc_batch = owner("ColdBatch"), owner("ApcBatch")
+    vision = types.SimpleNamespace(
+        Attention=owner("Attention"),
+        Qwen3VLMoEVisionBlock=owner("VisionBlock"),
+        VisionModel=owner("VisionModel"),
+    )
+    namespace = types.SimpleNamespace
+    generate = namespace(
+        _merge_prefill_prompt_kwargs=cold_batch.get_input_embeddings,
+        BatchGenerator=cold_batch,
+    )
+    generate_ar = namespace(
+        _merge_prefill_prompt_kwargs=apc_batch.get_input_embeddings,
+        BatchGenerator=apc_batch,
+    )
+    modules = {
+        "mlx_vlm.models.qwen3_vl.qwen3_vl": namespace(Model=dense_model),
+        "mlx_vlm.models.qwen3_vl.vision": vision,
+        "mlx_vlm.models.qwen3_5.qwen3_5": namespace(Model=owner("Qwen35")),
+        "mlx_vlm.models.qwen3_vl.language": namespace(
+            Qwen3VLModel=owner("DenseBackbone"), LanguageModel=dense_language),
+        "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe": namespace(Model=moe_model),
+        "mlx_vlm.models.qwen3_vl_moe.vision": vision,
+        "mlx_vlm.models.qwen3_vl_moe.language": namespace(
+            Qwen3VLMoEModel=owner("MoeBackbone"), LanguageModel=moe_language),
+        "mlx_vlm.generate": generate,
+        "mlx_vlm.generate.ar": generate_ar,
+    }
+    bindings = (
+        (dense_model, "get_input_embeddings", "_unsloth_qwen3_batch_visual_state"),
+        (moe_model, "get_input_embeddings", "_unsloth_qwen3_batch_visual_state"),
+        (dense_language, "__call__", "_unsloth_qwen3_visual_state"),
+        (moe_language, "__call__", "_unsloth_qwen3_visual_state"),
+        (cold_batch, "_build_mixed_prompt_batch", "_unsloth_qwen3_mixed_prompt_batch"),
+        (apc_batch, "_build_mixed_prompt_batch", "_unsloth_qwen3_mixed_prompt_batch"),
+        (generate, "_merge_prefill_prompt_kwargs", "_unsloth_qwen3_prompt_merge"),
+        (generate_ar, "_merge_prefill_prompt_kwargs", "_unsloth_qwen3_prompt_merge"),
+    )
+    originals = [getattr(owner, name) for owner, name, _marker in bindings]
+    monkeypatch.setattr(mc.importlib, "import_module", modules.__getitem__)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_qwen3_family_compile_patches()
+    for (owner, name, marker), original in zip(bindings, originals):
+        wrapped = getattr(owner, name)
+        assert getattr(wrapped, marker)
+        assert wrapped.__wrapped__ is original
+    called = []
+    monkeypatch.setattr(mc, "_PATCHES_INSTALLED", False)
+    monkeypatch.setattr(mc, "_PATCHED_PATTERN_BUNDLES", set())
+    monkeypatch.setattr(mc, "_install_safe_fused_sdpa_mask_patches", lambda: None)
+    monkeypatch.setattr(mc, "list_compile_pattern_bundles", lambda: ())
+    monkeypatch.setattr(mc, "_install_qwen_video_tensor_patches", lambda: called.append(True))
+    monkeypatch.setattr(mc, "_invalidate_qualification_cache", lambda: None)
+    monkeypatch.setattr(mc, "build_compile_qualifications", lambda: {})
+    assert mc.install_mlx_compile_patches() == {} and called == [True]
+
+
+def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+    upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: "upstream"
+    replacement = lambda self, input_ids=None, pixel_values=None, **kwargs: "replacement"
+    adapted = mc._explicit_position_embedding_adapter(upstream, replacement)
+    assert adapted(types.SimpleNamespace(training=True)) == "upstream"
+    assert adapted(types.SimpleNamespace(training=False), position_ids=object()) == "upstream"
+    assert adapted(types.SimpleNamespace(training=True), position_ids=object()) == "replacement"
+    batched = types.SimpleNamespace(VisionModel=type("V", (), {"_forward_same_grid_batch": lambda self: None}))
+    assert mc._paddleocr_vl_has_batched_vision(batched)
+    assert mc._gemma3n_language_contract(len) is None
+    assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=700, _idx=188)]) == 700
+    assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=mx.array([650, 700]), _idx=188)]) == 700
+
+
+def test_legacy_llava_prefill_adapter_is_signature_gated(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    def strict(self, inputs, cache=None):
+        calls.append((inputs, cache))
+        return "strict"
+
+    class LegacyLanguage:
+        __call__ = strict
+
+    module = types.SimpleNamespace(LanguageModel=LegacyLanguage)
+    monkeypatch.setattr(mc.importlib, "import_module", lambda name: module)
+    mc._install_legacy_llava_prefill_patch()
+    inputs = object()
+    assert LegacyLanguage()(inputs, cache="cache", n_to_process=4) == "strict"
+    assert calls == [(inputs, "cache")]
+    assert LegacyLanguage.__call__.__wrapped__ is strict
+    assert mc._legacy_vlm_prefill_kwargs_adapter(LegacyLanguage.__call__) is LegacyLanguage.__call__
+    def explicit(self, inputs, n_to_process=None):
+        return n_to_process
+
+    @mc.wraps(strict)
+    def permissive(self, *args, **kwargs):
+        return kwargs
+    assert mc._legacy_vlm_prefill_kwargs_adapter(explicit) is explicit
+    assert mc._legacy_vlm_prefill_kwargs_adapter(permissive) is permissive
+    monkeypatch.setattr(mc.importlib, "import_module", lambda name: (_ for _ in ()).throw(RuntimeError))
+    mc._install_legacy_llava_prefill_patch()
+
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
     import unsloth_zoo.mlx.utils as mlx_utils
@@ -1853,6 +3420,50 @@ def test_compile_patch_primitives_exist():
     import unsloth_zoo.mlx.compile as mc
     primitives = mc.list_compile_patch_primitives()
     assert len(primitives) > 0
+
+
+def test_shared_family_installers_import_only_allowlisted_models(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+    native = lambda *_args, **_kwargs: None
+    qwen_arches = frozenset({"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"})
+    masked_arches = frozenset({"gemma3", "gemma4", "idefics2", "idefics3"})
+    idefics_arches = frozenset({"idefics2", "idefics3"})
+    assert (mc._QWEN_LIKE_MERGE_ARCHES, mc._MASKED_SCATTER_PATCH_ARCHES, mc._IDEFICS_SHARED_PATCH_ARCHES) == (qwen_arches, masked_arches, idefics_arches)
+    methods = {
+        "merge_input_ids_with_image_features": staticmethod(native),
+        "_prepare_inputs_for_multimodal": native,
+        "get_input_embeddings": native,
+    }
+    modules = {
+        arch: types.SimpleNamespace(
+            masked_scatter=native,
+            Model=type(f"{arch}Model", (), methods),
+        )
+        for arch in qwen_arches | masked_arches
+    }
+    paddle_vision = types.SimpleNamespace(
+        VisionModel=type("PaddleVision", (), {"_forward_same_grid_batch": native})
+    )
+    imported = []
+    def import_module(name):
+        imported.append(name)
+        if name == "mlx_vlm.models.paddleocr_vl.vision":
+            return paddle_vision
+        parts = name.split(".")
+        return modules.get(parts[-1]) if parts[-2:] == [parts[-1], parts[-1]] else None
+    monkeypatch.setattr(mc, "_try_import_module", import_module)
+    monkeypatch.setattr(mc, "build_compile_trait_reports", lambda: pytest.fail("runtime traits"))
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(mc, "_VERIFIED_TRAINING_ARCHES", set(mc._VERIFIED_TRAINING_ARCHES))
+    mc._install_qwen_like_image_merge_patches()
+    mc._install_masked_scatter_multimodal_patches()
+    mc._install_idefics_family_compile_patches()
+    assert not any(name.split(".")[-1] in {"lfm2_vl", "minicpmo", "phi4mm"} for name in imported)
+    assert all(modules[arch].masked_scatter is mc._masked_scatter_no_numpy for arch in masked_arches)
+    assert modules["paddleocr_vl"].Model.merge_input_ids_with_image_features is native
+    assert all(modules[arch].Model.merge_input_ids_with_image_features is mc._merge_special_token_features_only for arch in qwen_arches - {"paddleocr_vl"})
+    assert all(modules[arch].Model.get_input_embeddings is not native for arch in idefics_arches)
 
 
 def test_compile_protocol_requirements_exist():
@@ -3252,3 +4863,589 @@ def test_unknown_loss_type_rejected_before_batching():
     _pin_distributed(trainer, world_size=2)
     with pytest.raises(NotImplementedError):
         MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+
+def _first_tokens(stream, count):
+    return [[row[0] for row in batch.tolist()]
+            for batch, _l, _lab in (next(stream) for _ in range(count))]
+
+
+def _window_rows(lengths):
+    # Row index rides in the first token so batch order is observable.
+    return [" ".join([str(100 + idx)] + ["7"] * (n - 1)) for idx, n in enumerate(lengths)]
+
+
+def _window_stream(rows, *, window, order="default", repeat=False, seed=3407,
+                   source=None, **kwargs):
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+    return iterate_training_batches(
+        dataset=_CountingTextRows(rows) if source is None else source,
+        tokenizer=_streaming_text_tokenizer(), batch_size=2, max_seq_length=64,
+        seed=seed, dataset_order=order, repeat=repeat,
+        length_window_batches=window, **kwargs,
+    )
+
+
+def _window_batches(rows, *, max_batches=None, **kwargs):
+    out = []
+    for batch, _l, _lab in _window_stream(rows, **kwargs):
+        out.append(([row[0] for row in batch.tolist()], batch.shape[1]))
+        if max_batches is not None and len(out) >= max_batches:
+            break
+    return out
+
+
+_WINDOW_LENGTHS = (40, 3, 44, 4, 2, 46, 3, 41)
+
+
+def test_streaming_window_identity_grouping_padding_gate_and_ddp_slice():
+    rows, arrival = _window_rows(_WINDOW_LENGTHS), [[100, 101], [102, 103], [104, 105], [106, 107]]
+    assert [ids for ids, _ in _window_batches(rows, window=1)] == arrival
+    assert [ids for ids, _ in _window_batches(rows, window=8, order="sequential")] == arrival
+
+    class FakeWorld:
+        def rank(self): return 1
+        def size(self): return 2
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    ddp = _iterate_lazy_text_training_batches(
+        _CountingTextRows(rows), _streaming_text_tokenizer(), 1, 64,
+        comm_group=FakeWorld(), repeat=False, length_window_batches=1)
+    assert _first_tokens(ddp, 4) == [[101], [103], [105], [107]]
+
+    grouped, baseline = _window_batches(rows, window=4), _window_batches(rows, window=1)
+    assert sorted(t for ids, _ in grouped for t in ids) == [100 + i for i in range(8)]
+    assert sum(w for _, w in grouped) < sum(w for _, w in baseline)
+    assert grouped == _window_batches(rows, window=4) != baseline
+    assert [ids for ids, _ in _window_batches(rows, window=4, seed=1)] != [ids for ids, _ in grouped]
+
+    # Single process: pad_source must be empty (cycle padding is multi-rank only)
+    # and the partial tail stays short.
+    from unsloth_zoo.mlx import utils as mlx_utils
+    odd, seen_pads = _window_rows(_WINDOW_LENGTHS[:7]), []
+    original = mlx_utils._rank_slice_distributed_batch
+    def spy(items, n, comm_group=None, pad_source=None, pad_mode="cycle"):
+        seen_pads.append([] if not pad_source else list(pad_source))
+        return original(items, n, comm_group=comm_group, pad_source=pad_source, pad_mode=pad_mode)
+    mlx_utils._rank_slice_distributed_batch = spy
+    try:
+        tail = _window_batches(odd, window=3)[-1]
+    finally:
+        mlx_utils._rank_slice_distributed_batch = original
+    assert len(tail[0]) == 1 and seen_pads and all(p == [] for p in seen_pads)
+
+
+def test_streaming_window_epochs_cardinality_oneshot_and_knob():
+    odd_rows = _window_rows(_WINDOW_LENGTHS[:7])  # 7 rows -> 4 batches/pass
+    source = _DeclaredTextRows(odd_rows)
+    crossing = _window_batches(odd_rows, window=3, repeat=True, source=source, max_batches=6)
+    assert source.epochs[:2] == [0, 1]
+    assert sorted(t for ids, _ in crossing[:4] for t in ids) == [100 + i for i in range(7)]
+    assert _window_batches(odd_rows, window=3, repeat=True, max_batches=6) == crossing
+    assert [ids for ids, _ in crossing[4:6]] != [ids for ids, _ in crossing[:2]]  # epoch reaches seed
+
+    skipped = _window_stream(odd_rows, window=3, repeat=True, require_replayable=True)
+    for _ in range(5):
+        next(skipped)
+    assert _first_tokens(skipped, 1) == [crossing[5][0]]  # resume fast-forward
+
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    def exact_stream(expected):
+        return _iterate_lazy_text_training_batches(
+            _DeclaredTextRows(odd_rows), _streaming_text_tokenizer(), 2, 64,
+            repeat=True, length_window_batches=3, window_seed=3407,
+            expected_rows_per_pass=expected)
+    two_passes = _first_tokens(exact_stream(7), 8)
+    assert sorted(t for ids in two_passes[:4] for t in ids) == [100 + i for i in range(7)]
+    emitted = []
+    with pytest.raises(ValueError, match="declared length"):
+        for batch in exact_stream(6):
+            emitted.append(batch)
+    assert len(emitted) < 4  # buffered final window withheld on overrun
+
+    one_shot = _window_stream(odd_rows, window=3, repeat=True,
+                              source=iter(list(_CountingTextRows(odd_rows))))
+    for _ in range(4):
+        next(one_shot)
+    with pytest.raises(RuntimeError, match="one-shot"):
+        next(one_shot)
+
+    assert next(iter(_window_stream(odd_rows, window=4, seed=None)))[0].shape[0] == 2
+
+    for bad in (True, False, 0, -2, 2.0, "4"):
+        probe = _CountingTextRows(_window_rows((3, 2)))
+        with pytest.raises(ValueError, match="streaming_text_length_window"):
+            next(iter(_window_stream([], window=bad, source=probe)))
+        assert probe.pulls == 0
+
+
+def test_streaming_window_trainer_routing_and_config_copy():
+    rows, arrival = _window_rows(_WINDOW_LENGTHS), [[100, 101], [102, 103], [104, 105], [106, 107]]
+
+    def prepared(**config_kwargs):
+        _T, trainer = _streaming_text_trainer(
+            per_device_train_batch_size=2, max_seq_length=64, **config_kwargs)
+        trainer.train_dataset = _CountingTextRows(rows)
+        _batches, stream = trainer._prepare_data(is_vlm=False)
+        return _first_tokens(stream, 4)
+
+    windowed = prepared(streaming_text_length_window_batches=4)
+    assert sorted(t for ids in windowed for t in ids) == [100 + i for i in range(8)]
+    assert windowed != arrival
+    assert prepared(streaming_text_length_window_batches=4,
+                    preserve_dataset_order=True) == arrival
+
+    _T, bad_trainer = _streaming_text_trainer(
+        per_device_train_batch_size=2, max_seq_length=64,
+        streaming_text_length_window_batches=0)
+    probe = _DeclaredTextRows(rows)
+    bad_trainer.train_dataset = probe
+    with pytest.raises(ValueError, match="streaming_text_length_window"):
+        bad_trainer._prepare_data(is_vlm=False)
+    assert probe.pulls == 0 and probe.epochs == []
+
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+    base = MLXTrainingConfig(warmup_ratio=0.25)
+    for omitted in (("streaming_text_length_window_batches",),
+                    ("streaming_text_length_window_batches", "max_eval_batches")):
+        copied = {f.name: getattr(base, f.name)
+                  for f in dataclasses.fields(MLXTrainingConfig)
+                  if f.init and f.name not in omitted}
+        clone = MLXTrainingConfig(**copied)
+        assert clone.streaming_text_length_window_batches == 8
+        assert clone._unsloth_mlx_warmup_steps_explicit is False
+
+
+def test_host_staging_seam_parity_and_host_valued_flag():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (
+        _HostStagedTextBatch, _finalize_text_batch, _stage_tokenized_text_batch,
+    )
+    rows = _window_rows((5, 3, 4, 2))
+
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    def _direct(**kwargs):
+        return _iterate_lazy_text_training_batches(
+            _CountingTextRows(rows), _streaming_text_tokenizer(), 2, 64,
+            repeat=False, length_window_batches=2, window_seed=3407, **kwargs)
+    staged_stream = _direct(yield_host_staged=True)
+    finalized_stream = _direct()
+    for _ in range(2):
+        staged = next(staged_stream)
+        assert isinstance(staged, _HostStagedTextBatch)
+        assert isinstance(staged.ids, np.ndarray) and staged.host_valued
+        batch, lengths, labels = next(finalized_stream)
+        f_batch, f_lengths, f_labels = _finalize_text_batch(staged)
+        assert f_batch.tolist() == batch.tolist()
+        assert f_lengths.tolist() == lengths.tolist()
+        assert f_labels is None and labels is None
+
+    # MLX-valued rows via the REAL pipeline: origin recorded pre-.tolist().
+    class MxRows:
+        def __iter__(self):
+            return iter([
+                {"input_ids": mx.array([7, 8, 9])},
+                {"input_ids": [1, 2, 3]},
+            ])
+    mx_staged = next(_iterate_lazy_text_training_batches(
+        MxRows(), _streaming_text_tokenizer(), 2, 8,
+        repeat=False, yield_host_staged=True))
+    assert mx_staged.host_valued is False       # flagged for the prefetch producer
+    ids, _lengths, _labels = _finalize_text_batch(mx_staged)
+    assert ids.tolist()[0][:3] == [7, 8, 9]     # sync mode still accepts it
+
+    assert not _stage_tokenized_text_batch(
+        [(mx.array([7, 8]), None), ([1, 2], None)], 8).host_valued
+
+    # An mx-returning tokenizer must stage host_valued=False end to end.
+    class MxRawTok(_StreamingTextTokenizer):
+        def encode(self, text, add_special_tokens=True):
+            return mx.array(super().encode(text, add_special_tokens))
+    raw_staged = next(_iterate_lazy_text_training_batches(
+        _CountingTextRows(["5 6 7", "8 9 10"]), MxRawTok(), 2, 8,
+        repeat=False, yield_host_staged=True))
+    assert raw_staged.host_valued is False
+
+    # User chat-template variables named 'state' must keep working.
+    from unsloth_zoo.mlx.utils import _tokenize_mlx_prompt_completion_row
+    seen_kwargs = {}
+    class TemplateTok(_StreamingTextTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            seen_kwargs.update(kwargs)
+            return [10, 11, 12]
+    row = {"prompt": [{"role": "user", "content": "1 2"}],
+           "completion": [{"role": "assistant", "content": "3 4"}],
+           "chat_template_kwargs": {"state": "CA", "_unsloth_state": "USER"}}
+    assert _tokenize_mlx_prompt_completion_row(TemplateTok(), row) is not None
+    assert seen_kwargs.get("state") == "CA" and seen_kwargs.get("_unsloth_state") == "USER"
+
+
+def test_streaming_prefetch_identity_laziness_and_knob():
+    rows = _window_rows(_WINDOW_LENGTHS)
+    sync = _window_batches(rows, window=4)
+    prefetched = _window_batches(rows, window=4, prefetch_batches=2)
+    assert prefetched == sync  # bit-for-bit consumer-visible sequence
+
+    probe = _CountingTextRows(rows)
+    from unsloth_zoo.mlx.utils import iterate_training_batches
+    stream = iterate_training_batches(
+        dataset=probe, tokenizer=_streaming_text_tokenizer(), batch_size=2,
+        max_seq_length=64, seed=3407, dataset_order="default", repeat=False,
+        length_window_batches=4, prefetch_batches=2)
+    assert probe.pulls == 0  # construction-lazy at P>0
+    first = next(iter(stream))
+    assert first[0].shape[0] == 2 and probe.pulls >= 2
+
+    for bad in (True, -1, 1.5):
+        with pytest.raises(ValueError, match="streaming_prefetch_batches"):
+            next(iter(_window_stream(rows, window=1, prefetch_batches=bad)))
+
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig, _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert "streaming_prefetch_batches" in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert MLXTrainingConfig().streaming_prefetch_batches == 0  # default OFF
+
+    # Resume skip parity: first batch equals sync at the skip offset, once only.
+    sync_all = _window_batches(rows, window=4)
+    skipped = _window_stream(rows, window=4, prefetch_batches=2,
+                             prefetch_skip_batches=2)
+    first_after_skip = [row[0] for row in next(iter(skipped))[0].tolist()]
+    assert first_after_skip == sync_all[2][0]
+
+    # Eligibility is recorded synchronously and the orphan gate survives teardown.
+    _T, trainer = _streaming_text_trainer(
+        per_device_train_batch_size=2, max_seq_length=64,
+        streaming_prefetch_batches=2)
+    trainer.train_dataset = _CountingTextRows(rows)
+    _b, _stream = trainer._prepare_data(is_vlm=False)
+    assert trainer._mlx_prefetch_control.get("eligible") is True
+
+    class FakeOrphan:
+        orphaned = True
+        def close(self): pass
+        def orphan_alive(self): return True
+    trainer._mlx_prefetch_control = {"prefetcher": FakeOrphan()}
+    trainer._active_batch_iter = None
+    trainer._close_active_batch_iterator()  # exceptional-teardown path
+    assert trainer._mlx_prefetch_orphan.orphan_alive()
+
+
+def test_prefetcher_lifecycle_quiescence_orphan_and_positioned_error():
+    import threading
+    import time
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.utils import _LazyTextPrefetcher
+
+    tok = _streaming_text_tokenizer()
+
+    def staged(rows, **kwargs):
+        return lambda: mlx_utils._iterate_lazy_text_training_batches(
+            _CountingTextRows(rows), tok, 1, 64, repeat=False,
+            yield_host_staged=True, **kwargs)
+
+    # Quiesce/resume mid-stream, then clean terminal close (no orphan).
+    pf = _LazyTextPrefetcher(staged(["1 2", "3 4", "5 6"]), depth=1)
+    next(pf)
+    pf.quiesce()
+    pf.resume()
+    next(pf)
+    assert pf.close() and not pf.orphan_alive()
+
+    # A blocked source orphans within the bounded join and gates trainer reuse.
+    gate, entered = threading.Event(), threading.Event()
+    class Blocked:
+        def __iter__(self):
+            def _gen():
+                entered.set()
+                gate.wait()
+                yield {"text": "1 2"}
+            return _gen()
+    stuck = _LazyTextPrefetcher(
+        lambda: mlx_utils._iterate_lazy_text_training_batches(
+            Blocked(), tok, 1, 64, repeat=False, yield_host_staged=True),
+        depth=1)
+    stuck._JOIN_TIMEOUT = 0.2
+    try:
+        stuck._ensure_started()
+        assert entered.wait(timeout=2.0)  # deterministically inside the pull
+        assert not stuck.close() and stuck.orphan_alive()
+        from unsloth_zoo.mlx.trainer import MLXTrainer
+        trainer = MLXTrainer.__new__(MLXTrainer)
+        trainer._mlx_prefetch_orphan = stuck
+        trainer._mlx_prefetch_control = {}
+        with pytest.raises(RuntimeError, match="refusing to serialize"):
+            trainer._quiesce_prefetcher_for_save()
+    finally:
+        gate.set()
+        assert stuck._done.wait(timeout=2.0)
+        stuck._thread.join(timeout=2.0)
+        assert not stuck._thread.is_alive()  # no daemon leak beyond the test
+
+    # Producer exceptions arrive positioned after prior good batches.
+    class Exploding(_StreamingTextTokenizer):
+        def __init__(self): super().__init__(); self.count = 0
+        def encode(self, text, add_special_tokens=True):
+            self.count += 1
+            if self.count > 2:
+                raise RuntimeError("late tokenizer failure")
+            return super().encode(text, add_special_tokens)
+    boom = _LazyTextPrefetcher(
+        lambda: mlx_utils._iterate_lazy_text_training_batches(
+            _CountingTextRows(["1 2", "3 4", "5 6"]), Exploding(), 1, 64,
+            repeat=False, yield_host_staged=True),
+        depth=2)
+    assert next(boom) is not None and next(boom) is not None
+    with pytest.raises(RuntimeError, match="late tokenizer failure"):
+        next(boom)
+    boom.close()
+
+
+def test_lazy_text_producer_rejects_mlx_valued_rows_before_parsing():
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+
+    def _reject_probe(row=None, formatting_func=None):
+        def _src():
+            yield row if row is not None else {"text": "hello"}
+        with pytest.raises(ValueError, match="streaming_prefetch_batches=0"):
+            next(_iterate_lazy_text_training_batches(
+                _src(), None, 1, 32, formatting_func=formatting_func,
+                yield_host_staged=True, reject_mlx_valued=True))
+
+    _reject_probe({"text": mx.array([1, 2])})
+    _reject_probe({"messages": mx.array([1, 2])})
+    _reject_probe(formatting_func=lambda item: {"text": mx.array([3, 4])})
+
+
+def test_max_eval_batches_rejects_non_integer_values():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
+    for bad in (True, 1.9, 0, "2"):
+        trainer.args.max_eval_batches = bad
+        with pytest.raises(ValueError, match="max_eval_batches"):
+            trainer._create_text_eval_batches(
+                _CountingTextRows(({"text": "10 1"},)), 1, False, False)
+
+
+def test_distributed_failure_reraises_interrupts_unwrapped():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
+    for interrupt in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(interrupt):
+            trainer._raise_distributed_failure_from_any(True, "save", interrupt())
+        assert not trainer.stop_requested  # reuse must not inherit a stop
+    with pytest.raises(RuntimeError, match="failed during save"):
+        trainer._raise_distributed_failure_from_any(True, "save", ValueError("x"))
+    assert trainer.stop_requested
+
+
+def test_lazy_text_mixed_plain_and_prompt_completion_rejects_any_order():
+    from unsloth_zoo.mlx.utils import _iterate_lazy_text_training_batches
+    rows = [{"text": "10 1"}, {"prompt": "10", "completion": " 1 2"}]
+    for ordering in (rows, rows[::-1]):
+        with pytest.raises(ValueError, match="mixed|requires prompt"):
+            list(_iterate_lazy_text_training_batches(
+                iter(list(ordering)), _StreamingTextTokenizer(), 1, 8, repeat=False))
+
+
+def test_eval_batch_totals_aborts_before_pull_when_stopped():
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    tr = MLXTrainer(_MinimalTextModel(), _streaming_text_tokenizer(),
+        _CountingTextRows(({"text": "10 1"},)),
+        args=MLXTrainingConfig(streaming=True, max_steps=1, max_seq_length=8))
+    class _Boom:
+        def __iter__(self): raise AssertionError("pulled despite stop")
+    tr.stop_requested = True
+    assert int(tr._evaluate_batch_totals(_Boom(), loss_fn=None)[1]) == 0
+def test_epoch_permuted_visits_are_deterministic_and_guard_enumerated():
+    # Golden pure epoch permutations; guard raw catalog equals resolved visits.
+    import numpy as np
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.shape_guard import phase_for_microstep
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _plan_single_process_text_shapes,
+    )
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan, _FiniteTextRow
+
+    np.random.seed(999)  # ambient state must not influence visits
+    rows = tuple(
+        _FiniteTextRow(tuple(range(1, w + 1)), 1, tuple(range(1, w + 1)))
+        for w in (10, 11, 30, 50)
+    )
+    plan = FiniteTextBatchPlan(
+        rows, tuple((i,) for i in range(4)), max_seq_length=64, pad_id=99,
+        visit_policy="epoch_permute", visit_seed=1,
+    )
+    assert [plan.batch_index_for_visit(v) for v in range(12)] == [
+        0, 1, 2, 3, 2, 3, 1, 0, 3, 1, 0, 2,
+    ]
+    args = MLXTrainingConfig(max_steps=4, gradient_accumulation_steps=2)
+    shape_plan, report, _ok, _ = _plan_single_process_text_shapes(
+        plan, None, args=args, total_steps=4, is_vlm=False,
+        distributed_world_size=1,
+        compile_policy=build_compile_policy(args=args),
+    )
+    assert shape_plan.raw_catalog == frozenset(
+        (
+            report.compile_scope,
+            phase_for_microstep(report.compile_scope, 2, m),
+            plan.batch_family(plan.batch_index_for_visit(m)),
+            plan.batch_width(plan.batch_index_for_visit(m)),
+        )
+        for m in range(8)
+    )
+
+
+def test_vlm_checker_consumes_plan_metadata_only():
+    """Call-path contract after the eager internals were deleted: the
+    all-masked checker reads construction-time plan supervision counts and
+    no longer iterates materialized batch dicts."""
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import _check_vlm_all_masked
+
+    source = inspect.getsource(_check_vlm_all_masked)
+    assert "supervision_counts" in source
+    assert "for batch_dict in batches" not in source
+    assert "tolist" not in source
+
+
+def test_concat_streaming_eval_is_infinite_when_any_child_is():
+    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
+
+    class RepeatExamplesIterable:  # HF infinite marker: num_times=None
+        num_times = None
+        ex_iterable = None
+
+    class _FiniteChild:  # no infinite markers -> finite
+        ex_iterable = None
+
+    class HorizontallyConcatenatedMultiSourcesExamplesIterable:
+        def __init__(self, children): self.ex_iterables = children
+
+    class VerticallyConcatenatedMultiSourcesExamplesIterable:
+        def __init__(self, children): self.ex_iterables = children
+
+    class _Src:
+        def __init__(self, ex): self._ex_iterable = ex
+
+    inf, fin = RepeatExamplesIterable(), _FiniteChild()
+    # Horizontal concat ends with the longest child, so any infinite child wins.
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([fin, inf]))) is True
+    assert _mlx_stream_declares_infinite(
+        _Src(HorizontallyConcatenatedMultiSourcesExamplesIterable([fin, fin]))) is False
+    # Vertical (sequential) is infinite if any child is.
+    assert _mlx_stream_declares_infinite(
+        _Src(VerticallyConcatenatedMultiSourcesExamplesIterable([inf, fin]))) is True
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_real_hf_concat_infinite_detection_matches_actual_termination(axis):
+    """Pin the detector against real ``datasets`` concat termination."""
+    from datasets import IterableDataset, concatenate_datasets
+    from unsloth_zoo.mlx.trainer import _mlx_stream_declares_infinite
+
+    # Generator-backed: the arrow path rejects a ragged axis=1 concat.
+    def rows(column, n):
+        return lambda: ({column: str(i)} for i in range(n))
+
+    finite = IterableDataset.from_generator(rows("a", 3))
+    other = IterableDataset.from_generator(rows("b" if axis else "a", 2))
+    for children, expected in (
+        ((finite, other), False),
+        ((finite, other.repeat(None)), True),
+        ((finite.repeat(None), other), True),
+    ):
+        combined = concatenate_datasets(list(children), axis=axis)
+        assert _mlx_stream_declares_infinite(combined) is expected
+        if not expected:  # a finite stream must actually terminate
+            assert sum(1 for _ in combined) < 1000
+        else:  # an infinite stream must keep producing past every child's length
+            produced = 0
+            for _ in combined:
+                produced += 1
+                if produced > 1000:
+                    break
+            assert produced > 1000
+
+
+def test_qwen3_visual_window_keeps_features_when_mask_spans_whole_window():
+    """A reused prompt cache must not shift the feature window off the mask."""
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.bool_)
+    embeds = [mx.array([[1], [2]])]
+    packed, positions = mc._pack_qwen3_visual_state(masks, embeds)
+
+    # The mask already covers only the new turn, so an offset carried over from
+    # an earlier turn must not be applied to it a second time.
+    for carried_offset in (0, 6, 20):
+        window_masks, window_embeds = mc._qwen3_visual_window(
+            masks,
+            packed,
+            positions,
+            mask_offsets=(carried_offset,),
+            window=6,
+        )
+        assert window_masks.tolist() == [[0, 0, 1, 1, 0, 0]]
+        assert window_embeds[0].tolist() == [[1], [2]]
+
+
+def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
+    """A row carrying mlx-vlm's own deepstack features keeps them.
+
+    Synthesizing empty compact state for such a row hands the language call
+    zeros in place of its real visual features.
+    """
+    import mlx.core as mx
+    import unsloth_zoo.mlx.compile as mc
+
+    masks = mx.array([[0, 1, 1, 0]], dtype=mx.bool_)
+    state, positions = mc._pack_qwen3_visual_state(masks, [mx.array([[1.0], [2.0]])])
+    compact_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        mc._QWEN3_VISUAL_STATE_KEY: state,
+        mc._QWEN3_VISUAL_POSITIONS_KEY: positions,
+    }
+    native_row = {
+        "inputs_embeds": mx.zeros((1, 4, 1)),
+        "visual_pos_masks": masks,
+        # A bare array is what _pack_qwen3_visual_state declines to compact.
+        "deepstack_visual_embeds": mx.array([[7.0], [8.0]]),
+    }
+
+    rows = [native_row, compact_row]
+    assert mc._pad_qwen3_prompt_rows(rows) is rows
+
+    seen = []
+
+    def language(self, inputs, inputs_embeds=None, mask=None, cache=None,
+                 visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs):
+        seen.append(deepstack_visual_embeds)
+
+    padded = mc._pad_qwen3_prompt_rows(rows)[0]
+    call_kwargs = dict(padded)
+    call_kwargs.pop("inputs_embeds")
+    mc._qwen3_visual_state_adapter(language)(
+        object(), mx.zeros((1, 4)), cache=None, **call_kwargs
+    )
+    assert seen[0].tolist() == [[7.0], [8.0]]
+
+    # A mask-only row owns no features, so it still gets an empty state to keep
+    # its slot in the batch.
+    mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
+    filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
+    assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
