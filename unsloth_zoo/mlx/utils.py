@@ -15670,6 +15670,11 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
+    # Older mlx-lm wheels reject scale/dropout on from_base(); the native
+    # adapter path patches that gap and this path builds the same wrappers.
+    from .loader import _patch_mlx_lora_from_base_compat
+    _patch_mlx_lora_from_base_compat()
+
     from unsloth_zoo.saving_utils import _reject_dora_dropout
     _reject_dora_dropout(cfg)
     use_dora = bool(cfg.get("use_dora"))
