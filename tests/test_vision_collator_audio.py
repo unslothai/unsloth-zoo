@@ -294,6 +294,18 @@ def test_right_padded_feature_extractor_untouched():
     assert proc.feature_extractor.padding_side == "right"
 
 
+def test_left_padded_audio_processor_reset_to_right():
+    # Granite-Speech exposes the audio sub-processor as "audio_processor", not
+    # "feature_extractor"; its left padding must be normalized too.
+    class _AudioProcessorOnly:
+        def __init__(self):
+            self.audio_processor = _FakeFeatureExtractor()
+    proc = _AudioProcessorOnly()
+    proc.audio_processor.padding_side = "left"
+    _fix_audio_feature_extractor_padding_side(proc)
+    assert proc.audio_processor.padding_side == "right"
+
+
 def test_processor_without_feature_extractor_noop():
     class _TextOnly:
         pass

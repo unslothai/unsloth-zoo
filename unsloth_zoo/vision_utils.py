@@ -547,9 +547,14 @@ def _fix_audio_feature_extractor_padding_side(processor):
     # The loader's padding_side="left" (a text setting) leaks into the audio
     # feature extractor via from_pretrained. Frame-validity masks assume right
     # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
-    feature_extractor = getattr(processor, "feature_extractor", None)
-    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
-        feature_extractor.padding_side = "right"
+    # Audio processors do not agree on the sub-processor attribute name
+    # (feature_extractor for Qwen2-Audio/Voxtral, audio_processor for
+    # Granite-Speech), so normalize whichever is present -- matching the
+    # sampling-rate fallback in _extract_audio_for_example.
+    for attr in ("feature_extractor", "audio_processor"):
+        sub = getattr(processor, attr, None)
+        if sub is not None and getattr(sub, "padding_side", None) == "left":
+            sub.padding_side = "right"
 
 
 @lru_cache(maxsize=1)
