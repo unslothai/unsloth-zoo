@@ -408,6 +408,7 @@ def replace_sdpa_with_amd_aiter(source):
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
         r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
         r"((?:[^)]|\([^)]*\))*)\)"
+        r"(?![ \t]*\.)"  # reject chained calls: .transpose(), .view(), etc.
     )
 
     def aiter_replacement(m):
@@ -453,6 +454,11 @@ def replace_sdpa_with_amd_aiter(source):
             f"{indent}    _aiter_fn is not None",
             f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",  # equal seq lengths
             f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",  # dtype guard
+            # Inference-only: aiter.flash_attn_func asserts return_lse=True when
+            # any input has requires_grad=True (autograd path). We omit return_lse,
+            # so calling it during training would raise AssertionError on every
+            # forward, making the fast path exception-driven double work.
+            f"{indent}    and not {q_var}.requires_grad",  # inference-only guard
             f"{indent})",
             f"{indent}if _aiter_ok:",
             f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
