@@ -7208,13 +7208,10 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
                     "source does not match the adapter's base model."
                 )
             out[f"{_PEFT_PREFIX}{_p}.base_layer.weight"] = _w
-    elif _unsourced_emb:
-        logger.info(
-            "Unsloth MLX: exporting embedding LoRA for "
-            f"{_unsourced_emb} without base embedding weights (no "
-            "base_weights_source); PEFT loads such adapters cleanly and "
-            "takes the embeddings from the base model."
-        )
+    # An embedding adapter exported without base_weights_source simply omits
+    # those weights; peft resolves them from the base model. Nothing is logged
+    # here on purpose -- this module stays importable and usable without torch,
+    # and the shared logger pulls in a torch-importing module on first use.
     # Same stage-then-atomic-rename destination contract as
     # convert_peft_dir_to_mlx; see the note there.
     dst = os.fspath(dst)
