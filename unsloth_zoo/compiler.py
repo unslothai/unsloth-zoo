@@ -418,24 +418,26 @@ def replace_sdpa_with_amd_aiter(source):
         v_var   = m.group(5)
         rest_args = m.group(6)
 
-        # Only rewrite when is_causal=True as a literal — aiter is causal-only;
-        # complex expressions like `is_causal=self.is_causal and mask is None`
-        # cannot be safely evaluated at rewrite time.
-        causal_match = re.search(r"is_causal\s*=\s*(True)\b", rest_args)
-        if causal_match is None:
-            # Not a plain literal True — leave this call unchanged
-            return m.group(0)
-
-        # If any SDPA-only arguments are present, fall back — aiter does not
-        # support attn_mask, dropout_p, scale, or enable_gqa
-        unsupported = ("attn_mask", "dropout_p", "scale", "enable_gqa")
-        if any(kw in rest_args for kw in unsupported):
+        # Only rewrite when rest_args is exactly ", is_causal=True" (with optional
+        # whitespace). aiter accepts only (q, k, v, causal=True) — any additional
+        # argument (positional or keyword) may carry semantics the kernel ignores
+        # (e.g. positional dropout_p, attn_mask, scale, enable_gqa). Keyword-name
+        # checking alone is insufficient: positional calls like
+        # scaled_dot_product_attention(q, k, v, None, 0.1, is_causal=True) contain
+        # no keyword named "dropout_p" yet silently drop the positional dropout value.
+        # Accepting only the bare causal-only form guarantees correctness.
+        rest_args_stripped = rest_args.strip().lstrip(",").strip()
+        if not re.fullmatch(r"is_causal\s*=\s*True", rest_args_stripped):
+            # rest_args has more than just is_causal=True — leave call unchanged
             return m.group(0)
 
         # Clean leading newlines from rest_args
         rest_args_clean = rest_args.lstrip("\r\n").strip()
         # rest_args already starts with a comma when non-empty; do NOT add another
-        rest_args_formatted = rest_args_clean  # already starts with comma when non-empty
+        # rest_args is ", is_causal=True" at this point — pass it through to the
+        # SDPA fallback so the original call semantics are preserved.
+        rest_args_clean = rest_args.lstrip("\r\n").strip()
+        rest_args_formatted = rest_args_clean  # already starts with comma
 
         # Generate the replacement block.
         # All symbols used at runtime are imported inside the generated code so
