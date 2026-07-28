@@ -368,11 +368,15 @@ def main():
     ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
     ap.add_argument("--maxtok", type=int, default=0,
                     help="per-turn context budget; 0 = auto-size the largest that fits VRAM")
+    ap.add_argument("--ngl", type=int, default=None,
+                    help="layers to offload to GPU; omit for all, 0 for CPU-only. Lower this when "
+                         "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
     _STATE["player"] = open(_PLAYER_TEMPLATE).read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
-    _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok)
+    _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
+    print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
     print(f"DiffusionGemma OpenAI shim ready on http://{args.host}:{args.port}  (model={MODEL_ID})",
           flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
