@@ -260,12 +260,7 @@ def test_fast_generate_binds_text_and_vision_models_and_maps_shared_controls(mon
     vlm = types.SimpleNamespace(_is_vlm_model=True)
     _patch_mlx_saving(vlm, tokenizer)
     assert vlm.fast_generate(["look"]) is expected
-    # A text-only multimodal load publishes its inner tokenizer; the vision
-    # adapter needs the processor.
-    processor = object()
-    vlm._processor = processor
-    vlm.fast_generate(["look"])
-    assert captured["tokenizer"] is processor
+    assert vlm.fast_generate(["look"]) is expected
 
 
 @contextlib.contextmanager
@@ -845,3 +840,20 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     assert batched == [[0, 2]]  # the audio row never reached the batched path
     assert [results[0], results[2]] == ["batched", "batched"]
     assert results[1].token_ids == [1]
+
+
+def test_vision_generation_resolves_the_saved_processor(monkeypatch):
+    # A text-only multimodal load publishes its inner tokenizer, so the typed
+    # core resolves the saved processor for both it and fast_generate.
+    from unsloth_zoo.mlx.generate import generate_batch as engine_generate_batch
+    from unsloth_zoo.mlx import generate as engine
+    seen = {}
+    class _Adapter:
+        def __init__(self, model, tok, defaults): seen["tok"] = tok
+        def generate(self, requests): return ["ok"]
+    monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
+    monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
+    processor = object()
+    model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
+    assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
+    assert seen["tok"] is processor

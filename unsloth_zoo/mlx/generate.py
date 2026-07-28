@@ -1656,6 +1656,12 @@ def generate_batch(
     )
     if not validated:
         return []
+    if is_vlm:
+        # A text-only multimodal load stays on the vision path but publishes its
+        # inner tokenizer, which cannot drive mlx-vlm preprocessing.
+        tokenizer_or_processor = (
+            getattr(model, "_processor", None) or tokenizer_or_processor
+        )
     if tokenizer_or_processor is None:
         raise ValueError(
             "Batched generation requires a processor."
@@ -1697,10 +1703,6 @@ def fast_generate(
     """
 
     tokenizer = getattr(self, "_tokenizer", None)
-    if getattr(self, "_is_vlm_model", False):
-        # A text-only multimodal load stays on the vision path but publishes its
-        # inner tokenizer, which cannot drive mlx-vlm preprocessing.
-        tokenizer = getattr(self, "_processor", None) or tokenizer
     if tokenizer is None:
         raise ValueError("Unsloth MLX: fast_generate requires model._tokenizer.")
     if isinstance(prompts, str):
