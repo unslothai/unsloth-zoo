@@ -1720,3 +1720,24 @@ def test_collation_does_not_require_a_pad_id(honours_side):
     assert mask[:, 0].tolist() == [1, 1] and (ids[mask == 0] == 0).all()
 
 
+# --- KV-shared layers borrow their K/V through the cache --------------------
+
+
+def test_baseline_loss_fn_forwards_real_shared_kv_slots():
+    # Slots, not placeholders, and one per producer: a list of Nones forwards
+    # the same shape while every shared layer rebuilds K/V from its own
+    # projections, and one slot repeated leaves them all reading the last.
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+
+    seen, _batch = _run_loss("gemma4", kv_shared=20)
+    caches = seen["cache"]
+    assert caches is not None and len(caches) == 15
+    assert all(isinstance(c, _SharedKVSlot) for c in caches)
+    assert len({id(c) for c in caches}) == 15
+    keys, values = object(), object()
+    # The producer stores through `update_and_fetch`, shared layers read `state`.
+    assert caches[0].offset == 0 and caches[0].borrow() is None
+    assert caches[0].update_and_fetch(keys, values) == (keys, values)
+    assert caches[0].state == (keys, values)
+
+

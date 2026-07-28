@@ -434,10 +434,26 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
+        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        if slot is None:
+            def inner_fn(params, *args, **kwargs):
+                self.update(params)
+                return fn(self, *args, **kwargs)
+            return mx.checkpoint(inner_fn)(
+                self.trainable_parameters(), *args, **kwargs)
+
+        # Shared K/V crosses the checkpoint boundary as a traced argument and a
+        # traced result; read off the slot and the VJP drops the gradient.
+        def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
-            return fn(self, *args, **kwargs)
-        return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
+            slot.install(borrowed)
+            out = fn(self, *args, **kwargs)
+            return out, slot.recorded()
+
+        out, recorded = mx.checkpoint(inner_fn)(
+            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+        slot.install(recorded)
+        return out
 
     layer_cls.__call__ = checkpointed_fn
 
@@ -552,6 +568,74 @@ def _keeps_forwarded_mask(model):
     # mlx-vlm lower-cases model_type to resolve the module but leaves the
     # config's own spelling alone, so match the way it resolves.
     return str(model_type).lower() in _VLM_FAMILIES_KEEPING_FORWARDED_MASK
+
+
+class _SharedKVSlot:
+    """A cache with training semantics, so KV-shared layers borrow rather than
+    rebuild K/V that the reference implementation never recomputes.
+
+    Position stays 0 and nothing is ever trimmed; a prompt cache would forget
+    past its sliding window and re-rope queries at an advancing offset. No
+    version gate: gemma4 from mlx-vlm 0.5.0 reads shared K/V from its layer
+    results instead; the slots still travel with the batch, but stop being where
+    the sharing is read and leave the training result unchanged.
+
+    `borrow`/`install`/`recorded` exist because gradient checkpointing cannot
+    see an attribute read -- the recomputed VJP drops the gradient while the
+    forward stays correct -- so the wrapper passes K/V in as an argument and
+    takes it back as a result.
+    """
+
+    __slots__ = ("keys", "values")
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+
+    @property
+    def offset(self):
+        return 0
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    def update_and_fetch(self, keys, values):
+        self.keys, self.values = keys, values
+        return keys, values
+
+    def borrow(self):
+        """K/V to pass into the next layer's traced region, if any."""
+        return None if self.keys is None else (self.keys, self.values)
+
+    def install(self, borrowed):
+        if borrowed is not None:
+            self.keys, self.values = borrowed
+
+    def recorded(self):
+        return self.keys, self.values
+
+
+def _shared_kv_slot_count(model):
+    """How many cache slots this stack needs, or 0 when it shares no K/V.
+
+    Not `first_kv_shared_layer_idx > 0`: upstream derives that as
+    `num_hidden_layers - num_kv_shared_layers`, so it is positive with zero
+    sharing too, as gemma4 12B/26B declare.
+    """
+    backbone = getattr(_get_text_model(model), "model", None)
+    if backbone is None:
+        return 0
+    config = getattr(backbone, "config", None)
+    if not (_config_get(config, "num_kv_shared_layers") or 0):
+        return 0
+    return getattr(backbone, "first_kv_shared_layer_idx", 0) or 0
+
+
+def _build_shared_kv_caches(model):
+    """Fresh per-forward slots for a stack that shares K/V, else None."""
+    slots = _shared_kv_slot_count(model)
+    return [_SharedKVSlot() for _ in range(slots)] if slots else None
 
 
 def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
@@ -1889,6 +1973,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         fwd_kwargs["mask"] = (
             attention_mask if _keeps_forwarded_mask(model) else None
         )
+        shared_kv = _build_shared_kv_caches(model)
+        if shared_kv is not None:
+            fwd_kwargs["cache"] = shared_kv
         output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
@@ -2084,6 +2171,10 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+
+    shared_kv = _build_shared_kv_caches(model)
+    if shared_kv is not None:
+        backbone_kwargs["cache"] = shared_kv
 
     hidden = _forward_text_hidden_states(
         model,
