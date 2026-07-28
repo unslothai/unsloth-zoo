@@ -320,25 +320,24 @@ pass
 
 def get_recommended_attn_implementation():
     """
-    Return the device-level attention preference for the current device.
+    Return the AMD-specific attention implementation preference, or None if not on AMD.
 
-    On AMD ROCm, PyTorch SDPA routes to MIOpen's fused attention kernel, which
-    is functionally equivalent to flash_attention_2 and available with zero extra
-    dependencies.  Benchmarks on MI325X show SDPA is +37% faster than eager for
-    inference and reduces VRAM by ~9%.  For sequence lengths >= 2048, SDPA is
-    effectively required: eager OOMs approximately 3x sooner due to the O(n^2)
-    attention matrix.
+    On AMD ROCm, PyTorch SDPA routes to MIOpen's fused attention kernel, which is
+    functionally equivalent to flash_attention_2 with zero extra dependencies.
+    Benchmarks on MI325X: +37% prefill throughput, -9% VRAM vs eager.
 
-    **Important:** This returns a device-level *preference*, not a directive.
-    Callers must validate that the specific model supports SDPA before passing
-    this value as `attn_implementation`.  Some models (e.g. Pixtral, Mistral 3)
-    do not support SDPA and must use "eager"; passing "sdpa" to them will raise
-    an error during model loading.  Check `_supports_sdpa` or
-    `ALL_ATTENTION_FUNCTIONS` on the model config before applying this preference.
+    Returns "sdpa" on AMD ROCm, None on all other devices (NVIDIA, CPU, XPU, MPS).
+    None means "no AMD-specific override" — callers should keep their own default.
 
-    On NVIDIA and other devices returns None (caller keeps its own default).
+    Note: this differs from get_amd_attention_implementation() (PR #920) which
+    returns "sdpa"|"amd_aiter" for AMD-internal dispatch and is not intended as a
+    top-level attn_implementation selector.
 
-    Returns: "sdpa" on AMD ROCm, None on all other devices.
+    **Important:** This is a preference, not a directive. Callers must validate that
+    the model supports SDPA before using this value as `attn_implementation`.
+    Some models (e.g. Pixtral, Mistral 3) do not support SDPA — Unsloth's compiler
+    detects this via `_supports_sdpa` / `ALL_ATTENTION_FUNCTIONS` and falls back to
+    eager automatically.
     """
     if is_hip():
         return "sdpa"
@@ -399,8 +398,8 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
         # current batch_size, the workload's per-batch memory cost is already
         # substantial relative to free VRAM and we stay silent.
         suggested = min(16, int(free_vram_gb / 8))
-        if suggested <= batch_size:
-            return  # Computed suggestion doesn't improve on current batch — skip
+        if suggested < 2 * batch_size:
+            return  # Increment too small relative to benchmark (batch 4->16); stay silent
         _AMD_VRAM_ADVISORY_EMITTED = True
         # Keep benchmark attribution fixed to its actual conditions (batch 4->16, seq=512).
         # Report the runtime suggestion separately so the claim is not applied to

@@ -311,9 +311,15 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
+    # On AMD ROCm, prefer SDPA (MIOpen fused kernel) over eager when supported.
+    # get_recommended_attn_implementation() returns "sdpa" on ROCm, None elsewhere.
+    # The model's SDPA support is checked by the compiler downstream; if unsupported,
+    # Unsloth falls back to eager via _supports_sdpa / ALL_ATTENTION_FUNCTIONS.
+    from unsloth_zoo.device_type import get_recommended_attn_implementation
+    _attn_impl = get_recommended_attn_implementation() or "eager"
     new_model = AutoModelForCausalLM.from_config(
         new_config,
-        attn_implementation = "eager",
+        attn_implementation = _attn_impl,
     )
 
     return new_model, original_meta_model, causal_config.num_hidden_layers

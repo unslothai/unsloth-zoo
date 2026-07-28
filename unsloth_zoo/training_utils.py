@@ -683,6 +683,13 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     print(debug_info)
 
+    # AMD ROCm: emit a one-time advisory if batch size under-utilizes a large GPU
+    from unsloth_zoo.device_type import check_amd_vram_utilization
+    check_amd_vram_utilization(
+        batch_size = training_args.per_device_train_batch_size,
+        seq_len    = getattr(training_args, 'max_seq_length', 512),
+    )
+
     # Get per epoch counter
     max_iters_per_epoch = math.ceil(n_training_samples / total_train_batch_size)
     leftover_samples = n_training_samples % total_train_batch_size
