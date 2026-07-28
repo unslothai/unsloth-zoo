@@ -320,23 +320,15 @@ pass
 
 def get_recommended_attn_implementation():
     """
-    Return the AMD-specific attention implementation preference, or None if not on AMD.
+    Return "sdpa" on AMD ROCm, None on all other devices.
 
-    On AMD ROCm, PyTorch SDPA routes to MIOpen's fused attention kernel, which is
-    functionally equivalent to flash_attention_2 with zero extra dependencies.
-    Benchmarks on MI325X: +37% prefill throughput, -9% VRAM vs eager.
+    None means no AMD-specific override — callers keep their own default.
 
-    Returns "sdpa" on AMD ROCm, None on all other devices (NVIDIA, CPU, XPU, MPS).
-    None means "no AMD-specific override" — callers should keep their own default.
-
-
-    **Important:** This is a preference, not a directive. Callers MUST validate that
-    the specific model supports SDPA before passing this value as `attn_implementation`.
-    Some models (e.g. Pixtral, Mistral 3, GptOss, Mamba, Bloom, GPT-J, MPT) do not
-    support SDPA and must use "eager"; passing "sdpa" to them will raise an error
-    during model loading. Check `_supports_sdpa` on the resolved model class
-    (e.g. `AutoModelForCausalLM._model_mapping[type(config)]`) before applying
-    this preference — `_supports_sdpa` is a class attribute, not on the config.
+    Callers MUST validate model SDPA support before using this as
+    `attn_implementation`. Many architectures (e.g. GptOss, Mamba, Bloom,
+    GPT-J, MPT — 43 total on transformers 4.57) set `_supports_sdpa = False`
+    and raise ValueError if "sdpa" is passed to `from_config`. Check via
+    `AutoModelForCausalLM._model_mapping[type(config)]._supports_sdpa`.
     """
     if is_hip():
         return "sdpa"
@@ -384,10 +376,11 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
             device = torch.cuda.current_device()
         total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
         if total_vram_gb < 128:
-            return  # Not a data-center GPU — advice doesn't apply
+            return
         if batch_size > 4:
-            return  # Already using a reasonable batch size
-        # Use free VRAM, not total: if a large model is loaded, don't suggest OOM batch
+            return
+        # Use free VRAM (not total): a loaded model may have already consumed most
+        # of the device; recommending a larger batch on 20 GB free risks OOM.
         free_bytes, _ = torch.cuda.mem_get_info(device)
         free_vram_gb = free_bytes / (1024 ** 3)
         if free_vram_gb < 20:
@@ -398,7 +391,7 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
         # substantial relative to free VRAM and we stay silent.
         suggested = min(16, int(free_vram_gb / 8))
         if suggested < 2 * batch_size:
-            return  # Increment too small relative to benchmark (batch 4->16); stay silent
+            return
         _AMD_VRAM_ADVISORY_EMITTED = True
         # Keep benchmark attribution fixed to its actual conditions (batch 4->16, seq=512).
         # Report the runtime suggestion separately so the claim is not applied to

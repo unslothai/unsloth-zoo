@@ -311,11 +311,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
-    # Do not pass attn_implementation='sdpa' here: from_config enforces
-    # _supports_sdpa and raises ValueError for model classes that set it False
-    # (e.g. GptOssForCausalLM, Mamba, Bloom, GPT-J — 43 total on transformers
-    # 4.57.6). This skeleton only receives weights during vLLM->HF conversion;
-    # SDPA provides no benefit on it.
+    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
+    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",
