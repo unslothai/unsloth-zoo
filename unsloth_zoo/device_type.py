@@ -337,8 +337,9 @@ def get_recommended_attn_implementation():
     the specific model supports SDPA before passing this value as `attn_implementation`.
     Some models (e.g. Pixtral, Mistral 3, GptOss, Mamba, Bloom, GPT-J, MPT) do not
     support SDPA and must use "eager"; passing "sdpa" to them will raise an error
-    during model loading. Check `_supports_sdpa` or `ALL_ATTENTION_FUNCTIONS` on
-    the model config before applying this preference.
+    during model loading. Check `_supports_sdpa` on the resolved model class
+    (e.g. `AutoModelForCausalLM._model_mapping[type(config)]`) before applying
+    this preference — `_supports_sdpa` is a class attribute, not on the config.
     """
     if is_hip():
         return "sdpa"
