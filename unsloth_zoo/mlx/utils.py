@@ -3035,7 +3035,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     if images_spatial_crop is not None:
         batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:
-        batch_dict["audio_embed_sizes"] = audio_embed_sizes
+        # The model calls .item() on each entry, so hand over an array; the
+        # tuple above is only for this function's span arithmetic.
+        batch_dict["audio_embed_sizes"] = mx.array(list(audio_embed_sizes))
 
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
@@ -5470,20 +5472,19 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
     "<|endoftext11|>",
 )
 
-# Model families whose audio training contract has been verified, mapped to the
-# exact mlx-vlm versions whose probe suite passed. Audio rows for a family or an
-# installed version outside this table are refused rather than trained on: the
-# per-family merge contracts differ (variable-length token budgets versus a fixed
-# budget with learned padding embeddings), and mlx-vlm has changed audio
-# preprocessing within its supported span, so an unprobed combination cannot be
-# assumed correct. Entries are added only alongside verified merge contracts.
-#
-# gemma3n merges a fixed 188 positions per clip, which lets collation verify the
-# placeholder budget outright; its probes (forward, audio conditioning, ragged
-# collation, LoRA training smoke) pass on mlx-vlm 0.4.4.
+# Families and the exact mlx-vlm versions their audio path was validated on.
+# Anything else is refused: merge contracts differ per family and mlx-vlm has
+# changed audio preprocessing within its supported span.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
     "gemma3n": frozenset({"0.4.4"}),
+    "gemma4": frozenset({"0.4.4"}),
+    "phi4mm": frozenset({"0.4.4"}),
 }
+
+# Families probed only on a newer transformers than this package pins, at the
+# version the probes ran on. Older releases expand their audio tokens
+# differently, so they are refused rather than assumed compatible.
+_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
 
 _AUDIO_CAST_HINT = (
     "Cast the dataset column with "
@@ -5527,12 +5528,38 @@ def _installed_mlx_vlm_version():
             return ""
 
 
+def _check_audio_transformers_floor(family):
+    """Refuse a family probed only on a newer transformers than is installed."""
+    floor = _AUDIO_MIN_TRANSFORMERS.get(family)
+    if not floor:
+        return
+    try:
+        import transformers
+
+        version = transformers.__version__
+        parts = tuple(int(x) for x in version.split(".")[:2])
+    except Exception:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training for '{family}' requires transformers "
+            f"{floor[0]}.{floor[1]} or newer, and the installed version could "
+            f"not be determined."
+        ) from None
+    if parts < floor:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training for '{family}' was verified on "
+            f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "
+            f"older releases handle its audio token expansion differently. "
+            f"Upgrade transformers to train on audio with this model."
+        )
+
+
 def _check_audio_family_gate(processor):
     """Refuse audio rows for families/versions without a verified contract."""
     family = _audio_family_from_processor(processor)
     probed = _AUDIO_QUALIFIED_FAMILIES.get(family)
     installed = _installed_mlx_vlm_version()
     if probed and installed in probed:
+        _check_audio_transformers_floor(family)
         return family
     if not _AUDIO_QUALIFIED_FAMILIES:
         raise NotImplementedError(
@@ -7424,6 +7451,152 @@ _AUDIO_TOWER_ATTRS = (
 )
 
 
+_AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
+_AUDIO_MERGE_HOLDERS = "_unsloth_audio_merge_holders"
+_AUDIO_MERGE_ORIGINAL = "_unsloth_audio_merge_original"
+
+# Families whose merge walks a flattened feature block with a running
+# placeholder count, so a padded row's tail is consumed by the next row. Gemma 3n
+# (fixed budget, merges its own padding) and Phi-4 (row by row) must not get it.
+_AUDIO_MERGE_PATCH_FAMILIES = frozenset({"gemma4"})
+
+
+def audio_merge_patch_needed(config):
+    """Whether this model family's audio merge must be corrected for training."""
+    return _config_get(config, "model_type") in _AUDIO_MERGE_PATCH_FAMILIES
+
+
+def _compact_audio_features(embeddings, padding_mask, placeholders_per_row):
+    """Concatenate every clip's valid audio embeddings, in clip order.
+
+    The upstream merge flattens the whole padded feature block and walks it with
+    a running count of placeholder positions, so a short clip's padding is
+    consumed by the placeholders that follow it. Feeding that walk only the
+    valid embeddings, in the order the clips appear, makes the count line up
+    again -- collation emits clips row by row, so clip order is row order.
+
+    The encoder yields one entry per clip while placeholders are counted per
+    text row, and a row may hold several clips or none. Clips are therefore
+    assigned to rows in order and each row must be satisfied exactly: a batch
+    whose totals happen to agree while individual rows do not is still
+    mispaired, and is rejected here rather than trained on.
+
+    ``padding_mask`` marks padded frames (the encoder's own polarity), so valid
+    positions are its complement.
+    """
+    selected = []
+    counts = []
+    for index in range(embeddings.shape[0]):
+        keep = ~np.asarray(padding_mask[index]).astype(bool)
+        counts.append(int(keep.sum()))
+        if counts[-1]:
+            selected.append(embeddings[index][mx.array(np.nonzero(keep)[0])])
+
+    clip = 0
+    for row, wanted in enumerate(int(n) for n in placeholders_per_row):
+        filled = 0
+        while filled < wanted and clip < len(counts):
+            filled += counts[clip]
+            clip += 1
+        if filled != wanted:
+            raise ValueError(
+                f"Unsloth MLX: row {row} has {wanted} audio placeholder(s) but "
+                f"its clips produced {filled} valid audio position(s). Audio "
+                f"and text cannot be paired for this row."
+            )
+    if clip != len(counts):
+        raise ValueError(
+            f"Unsloth MLX: this batch carries {len(counts)} audio clip(s) but "
+            f"only {clip} could be matched to placeholder runs."
+        )
+    if not selected:
+        return embeddings[:0].reshape(0, embeddings.shape[-1])
+    return mx.concatenate(selected, axis=0)
+
+
+def install_audio_merge_patch(model, audio_token_id):
+    """Correct a model's audio merge for the duration of training.
+
+    Bound on the instance rather than the class, so a patch cannot leak into
+    inference on other models of the same type. Installs are counted: two
+    trainers sharing one model both hold a reference, and the correction stays
+    until the last of them releases it. Returns True when a hold was taken, so
+    every caller that gets True must release exactly once.
+    """
+    holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+    if holders:
+        # Another run holds it: take a hold so it outlives whoever finishes first.
+        setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
+        return True
+    original = model.get_input_embeddings
+    had_instance_attr = "get_input_embeddings" in vars(model)
+    audio_keys = ("input_features", "input_features_mask",
+                  "audio_features", "audio_mask")
+
+    def patched(input_ids=None, pixel_values=None, **kwargs):
+        features = kwargs.get("input_features", kwargs.get("audio_features"))
+        valid = kwargs.get("input_features_mask")
+        if features is None or valid is None:
+            return original(input_ids=input_ids, pixel_values=pixel_values, **kwargs)
+        # Model builds text and vision embeddings; audio is merged here.
+        rest = {k: v for k, v in kwargs.items() if k not in audio_keys}
+        result = original(input_ids=input_ids, pixel_values=pixel_values, **rest)
+        embeds = getattr(result, "inputs_embeds", result)
+        encoded, padding = model.audio_tower(features, ~valid)
+        audio_embeds = model.embed_audio(encoded)
+        placeholders = np.asarray(input_ids == audio_token_id).sum(axis=1)
+        source = _compact_audio_features(audio_embeds, padding, placeholders)
+        # Without this cast the merge widens the whole LM input to float32.
+        source = source.astype(embeds.dtype)
+        mask = mx.broadcast_to(
+            mx.expand_dims(input_ids == audio_token_id, -1), embeds.shape,
+        )
+        merged = _masked_scatter_rowwise(embeds, mask, source)
+        if hasattr(result, "inputs_embeds"):
+            result.inputs_embeds = merged
+            return result
+        return merged
+
+    model.get_input_embeddings = patched
+    setattr(model, _AUDIO_MERGE_SENTINEL, True)
+    setattr(model, _AUDIO_MERGE_HOLDERS, 1)
+    # Put back exactly what was there: deleting would discard someone else's
+    # instance-level wrapper.
+    setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
+    return True
+
+
+def remove_audio_merge_patch(model):
+    """Release one hold on the corrected merge, restoring it at the last."""
+    holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+    if holders <= 0:
+        return False
+    if holders > 1:
+        setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
+        return False
+    previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
+    if previous is not None:
+        model.get_input_embeddings = previous
+    else:
+        try:
+            del model.get_input_embeddings
+        except AttributeError:
+            pass
+    setattr(model, _AUDIO_MERGE_SENTINEL, False)
+    setattr(model, _AUDIO_MERGE_HOLDERS, 0)
+    setattr(model, _AUDIO_MERGE_ORIGINAL, None)
+    return True
+
+
+def _masked_scatter_rowwise(embeds, mask, source):
+    """Place ``source`` rows at the masked positions, in order."""
+    flat_mask = mask.flatten().astype(mx.int32)
+    indices = mx.cumsum(flat_mask) - 1
+    flat_source = source.flatten()
+    aligned = flat_source[mx.clip(indices, 0, flat_source.size - 1)]
+    return mx.where(flat_mask, aligned, embeds.flatten()).reshape(embeds.shape)
+
+
 def freeze_audio_modules(model):
     """Freeze the audio tower and its projection.
 
@@ -8208,6 +8381,23 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         eager before surveying anything."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
+
+    def carries_audio_hint(self):
+        """Whether this plan carries audio, without forcing a full survey.
+
+        Uses the survey when one has run, else builds a single batch. Callers
+        that must materialize nothing should survey and ask ``carries_audio``.
+        """
+        if self._audio_flags is not None:
+            return any(self._audio_flags)
+        if not len(self._schedule):
+            return False
+        with _preserved_preprocessing_rng():
+            batch = self._build_batch(0)
+        try:
+            return _vlm_batch_carries_audio(batch)
+        finally:
+            del batch
 
     def carries_audio(self):
         """Whether any surveyed batch carries audio feature tensors."""

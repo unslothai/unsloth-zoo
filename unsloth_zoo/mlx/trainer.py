@@ -491,8 +491,12 @@ def _mlx_declared_iterable_length(dataset):
 
 
 from .utils import (
+    _config_get,
     _vlm_batch_carries_audio,
+    audio_merge_patch_needed,
     freeze_audio_modules,
+    install_audio_merge_patch,
+    remove_audio_merge_patch,
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -4312,6 +4316,7 @@ class MLXTrainer:
                 stream_carries_audio, batch_iter = (
                     self._peek_stream_carries_audio(batch_iter)
                 )
+                self._stream_carries_audio = stream_carries_audio
                 local_plan_error = None
                 shape_plan = None
                 frontier = None
@@ -4503,6 +4508,10 @@ class MLXTrainer:
                 self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
+            # The correction belongs to this run only.
+            if getattr(self, "_audio_merge_patched", False):
+                remove_audio_merge_patch(self.model)
+                self._audio_merge_patched = False
             self._close_active_batch_iterator()
             _handles = getattr(self, "_report_to_handles", (None, None))
             _wb, _tb = _handles
@@ -4773,11 +4782,19 @@ class MLXTrainer:
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
 
-        # Audio towers are never trained here (their encoders are poor training
-        # subjects and the merge assumes their output is a fixed function of the
-        # clip). LoRA runs already freeze everything, but a full fine-tune would
-        # pull the encoder and its projection into the optimizer, so freeze them
-        # before it is built.
+        # Whole run, not just when audio is spotted up front: audio-free
+        # batches pass straight through, and audio may start in a later row.
+        config = getattr(self.model, "config", None)
+        if self._is_vlm and audio_merge_patch_needed(config):
+            token_id = _config_get(config, "audio_token_id")
+            if token_id is not None and install_audio_merge_patch(
+                self.model, int(token_id),
+            ):
+                self._audio_merge_patched = True
+                print(
+                    "Unsloth: corrected this model's audio merge for training "
+                    "(its own merge misplaces padded rows)."
+                )
         if self._is_vlm:
             frozen_audio = freeze_audio_modules(self.model)
             if frozen_audio:

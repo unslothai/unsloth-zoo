@@ -2405,3 +2405,114 @@ def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
     # Truncation drops the run; the deferred check must catch it.
     with pytest.raises(ValueError, match="0 placeholder run"):
         _finalize_vlm_batch(staged)
+
+
+def test_audio_merge_compacts_valid_features_per_row():
+    """Padded rows must not spill their tails into the next row's placeholders."""
+    import mlx.core as mx_
+    from unsloth_zoo.mlx.utils import _compact_audio_features
+
+    embeds = mx_.array([[[1.0], [2.0], [9.0]], [[3.0], [4.0], [5.0]]])
+    padded = mx_.array([[False, False, True], [False, False, False]])
+    # Row 0 keeps 2 of 3 positions, row 1 keeps 3: the compacted source is the
+    # valid ones in row order, so the merge's running count lines up again.
+    out = _compact_audio_features(embeds, padded, [2, 3])
+    assert out.flatten().tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+    # Each row must come out exact: [2, 3] clips against [3, 2] rows sums to
+    # five either way while everything after the first position is mispaired.
+    with pytest.raises(ValueError, match="cannot be paired for this row"):
+        _compact_audio_features(embeds, padded, [3, 2])
+    with pytest.raises(ValueError, match="cannot be paired for this row"):
+        _compact_audio_features(embeds, padded, [2, 4])
+
+
+def test_qualified_families_carry_their_probed_requirements():
+    """The shipped gate names the families whose probes actually ran."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    gate = mlx_utils._AUDIO_QUALIFIED_FAMILIES
+    # Exact versions: a stray one would enable code no probe ran against.
+    assert gate == {
+        "gemma3n": frozenset({"0.4.4"}),
+        "gemma4": frozenset({"0.4.4"}),
+        "phi4mm": frozenset({"0.4.4"}),
+    }
+    # Gemma 4 was probed only on a newer transformers; this env pins an older.
+    gemma4_like = type("Proc", (), {})
+    gemma4_like.__module__ = "mlx_vlm.models.gemma4.processing_gemma4"
+    assert mlx_utils._audio_family_from_processor(gemma4_like()) == "gemma4"
+    with pytest.raises(NotImplementedError, match="transformers"):
+        mlx_utils._check_audio_family_gate(gemma4_like())
+    mlx_utils._check_audio_transformers_floor("gemma3n")  # no floor recorded
+
+
+def test_audio_merge_patch_is_held_and_restored_exactly():
+    """Overlapping runs share the correction; the last one puts it back."""
+    from unsloth_zoo.mlx.utils import (
+        install_audio_merge_patch, remove_audio_merge_patch,
+    )
+
+    class _Model:
+        def get_input_embeddings(self, *a, **k):
+            return "class method"
+
+    model = _Model()
+    original = model.get_input_embeddings
+    # Every caller taking a hold is told so, and releases exactly one.
+    assert install_audio_merge_patch(model, 1) is True
+    assert install_audio_merge_patch(model, 1) is True    # second holder
+    assert remove_audio_merge_patch(model) is False       # first release
+    assert model.get_input_embeddings.__name__ == "patched"
+    assert remove_audio_merge_patch(model) is True        # last release
+    assert model.get_input_embeddings() == original()
+    assert remove_audio_merge_patch(model) is False
+
+    # Someone else's instance-level wrapper must survive.
+    model.get_input_embeddings = lambda *a, **k: "instance wrapper"
+    install_audio_merge_patch(model, 1)
+    remove_audio_merge_patch(model)
+    assert model.get_input_embeddings() == "instance wrapper"
+
+
+
+def test_patched_audio_merge_places_each_row_own_features():
+    """The correction must actually re-pair features, not just wrap the call."""
+    import mlx.core as current_mx
+    if current_mx is not mx:
+        pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
+    mx_ = mx
+    from unsloth_zoo.mlx.utils import (
+        install_audio_merge_patch, remove_audio_merge_patch,
+    )
+
+    embed_dim, token = 1, 7
+
+    class _Tower:
+        def __call__(self, features, padding):
+            # Row 0 has one valid frame, row 1 two; the tail is what leaks.
+            return features, mx_.array([[False, True], [False, False]])
+
+    class _Model:
+        audio_tower = _Tower()
+        embed_audio = staticmethod(lambda x: x)
+
+        def get_input_embeddings(self, input_ids=None, pixel_values=None, **kw):
+            # Text embeddings carry the model dtype; audio arrives wider.
+            return mx_.zeros((*input_ids.shape, embed_dim), dtype=mx_.bfloat16)
+
+    model = _Model()
+    install_audio_merge_patch(model, token)
+    try:
+        # Row 0 wants 1 placeholder, row 1 wants 2.
+        features = mx_.array([[[1.0], [99.0]], [[2.0], [3.0]]], dtype=mx_.float32)
+        ids = mx_.array([[token, 0], [token, token]])
+        out = model.get_input_embeddings(
+            input_ids=ids, input_features=features,
+            input_features_mask=mx_.array([[True, False], [True, True]]),
+        )
+        # 99.0 is padding: it must not appear; row 1 keeps its own values.
+        assert out.flatten().tolist() == [1.0, 0.0, 2.0, 3.0]
+        # Merging must not widen the LM input dtype.
+        assert out.dtype == mx_.bfloat16
+    finally:
+        remove_audio_merge_patch(model)
