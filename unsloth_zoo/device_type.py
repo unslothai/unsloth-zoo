@@ -329,9 +329,6 @@ def get_recommended_attn_implementation():
     Returns "sdpa" on AMD ROCm, None on all other devices (NVIDIA, CPU, XPU, MPS).
     None means "no AMD-specific override" — callers should keep their own default.
 
-    Note: this differs from get_amd_attention_implementation() (PR #920) which
-    returns "sdpa"|"amd_aiter" for AMD-internal dispatch and is not intended as a
-    top-level attn_implementation selector.
 
     **Important:** This is a preference, not a directive. Callers MUST validate that
     the specific model supports SDPA before passing this value as `attn_implementation`.
