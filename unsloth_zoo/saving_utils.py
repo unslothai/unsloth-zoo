@@ -208,6 +208,15 @@ def _is_bnb_4bit_base(module):
 pass
 
 
+def _absmax(t):
+    # max|t| via a single fused reduction. torch.abs(t) would materialize a
+    # second full-size float32 tensor (multi-GB for embed_tokens / lm_head /
+    # fused expert weights) and could OOM a merge that otherwise fits.
+    amin, amax = torch.aminmax(t)
+    return max(abs(amin.item()), abs(amax.item()))
+pass
+
+
 def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
     device = _active_merge_device()
@@ -238,7 +247,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
         # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
-    W_base_absmax = torch.amax(torch.abs(W)).item()
+    W_base_absmax = _absmax(W)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
@@ -269,7 +278,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     # still alive) folds FINITE garbage (~1e12+) into the export, which the
     # isfinite gate above cannot catch. A healthy LoRA delta cannot inflate the
     # merged magnitude by orders of magnitude over the base weight.
-    W_absmax = torch.amax(torch.abs(W)).item()
+    W_absmax = _absmax(W)
     if W_absmax > max(64.0 * W_base_absmax, 1e4):
         raise ValueError(
             f"Unsloth: Merge failed for {name}: merged |W|max = {W_absmax:.3e} vs "

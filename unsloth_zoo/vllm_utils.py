@@ -2978,11 +2978,17 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         #     memory, so later readers (save_pretrained_merged with the engine
         #     alive) race the engine's allocator churn.
         # A LoRA-sized clone (a few MB) per hot-load is negligible.
-        state_dict = {
-            k.replace(".default", ""): v.detach().clone()
-            for k, v in items
-            if ".lora_A." in k or ".lora_B." in k
-        }
+        # inference_mode(False): load_lora runs under @torch.inference_mode, so
+        # a plain clone would be an inference tensor and vLLM's later in-place
+        # LoRALayerWeights.optimize() scaling (`lora_b *= scaling`) would raise
+        # "Inplace update to inference tensor outside InferenceMode" on
+        # dispatch paths that do not wrap _load_adapter in inference mode.
+        with torch.inference_mode(False):
+            state_dict = {
+                k.replace(".default", ""): v.detach().clone()
+                for k, v in items
+                if ".lora_A." in k or ".lora_B." in k
+            }
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
