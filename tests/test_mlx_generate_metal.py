@@ -5,8 +5,8 @@ try:
     import mlx.core as mx
     import mlx.nn as nn
     _METAL = mx.metal.is_available()
-except Exception:
-    _METAL = False
+except Exception:  # module-level nn.Module subclasses below need mlx to exist
+    pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
