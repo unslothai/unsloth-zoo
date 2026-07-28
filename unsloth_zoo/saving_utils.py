@@ -6868,7 +6868,7 @@ def _load_base_weight(source, key):
 
 
 def convert_mlx_dir_to_peft(src, dst, module_types=None,
-                            base_weights_source=None):
+                            base_weights_source=None, strip_prefix=None):
     """Convert an mlx-lm adapter directory to a PEFT LoRA directory.
 
     ``module_types`` optionally maps module paths to ``"linear"`` /
@@ -6905,6 +6905,8 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
             f"Unsloth MLX: fine_tune_type={cfg.get('fine_tune_type')!r} "
             "adapters cannot be exported to PEFT format."
         )
+    if strip_prefix is None:
+        strip_prefix = cfg.get("unsloth_mlx_tree_prefix") or ""
     fs_origins = dict(cfg.get("full_state_modules") or {})
     # PEFT expresses trainable module state ONLY as modules_to_save, and no
     # module can be both a LoRA target and a modules_to_save entry, so a
@@ -6933,6 +6935,39 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
             "'embedding_auto'."
         )
     tensors = load_file(os.path.join(src, MLX_WEIGHTS_FILE))
+    if strip_prefix:
+        # An mlx-vlm tree nests the text tower one level deeper than the HF
+        # model it mirrors; normalize every keyed map to HF-native paths so the
+        # adapter binds in peft. A key without the nesting is left alone for the
+        # layout gate below rather than silently renamed.
+        def _unnest(key):
+            return key[len(strip_prefix):] if key.startswith(strip_prefix) else key
+
+        def _unnest_map(mapping, what):
+            out = {}
+            for key, value in mapping.items():
+                unnested = _unnest(key)
+                if unnested in out:
+                    raise ValueError(
+                        f"Unsloth MLX: unnesting {strip_prefix!r} collapses "
+                        f"{what} {key!r} onto {unnested!r}; the artifact "
+                        "carries entries for more than one tower, which a "
+                        "single PEFT adapter cannot represent."
+                    )
+                out[unnested] = value
+            return out
+
+        tensors = _unnest_map(tensors, "tensor")
+        fs_origins = _unnest_map(fs_origins, "full-state entry")
+        for _key in (
+            "unsloth_mlx_lora_module_scales", "unsloth_mlx_lora_module_ranks",
+        ):
+            if isinstance(cfg.get(_key), dict):
+                cfg[_key] = _unnest_map(cfg[_key], _key)
+        if isinstance(cfg.get("full_state_trainable"), list):
+            cfg["full_state_trainable"] = [
+                _unnest(k) for k in cfg["full_state_trainable"]
+            ]
     pairs = {}
     rejected = {}
     full_state_out = {}
