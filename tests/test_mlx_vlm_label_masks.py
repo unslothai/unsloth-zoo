@@ -2297,6 +2297,42 @@ def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
         _finalized_collate([_audio_row(_CLIP)], processor, 4, None)
 
 
+def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
+    """Some processors want (samples, rate) pairs and reject add_special_tokens."""
+    class _PairsOnly(_FakeGemmaAudioProcessor):
+        """Takes (samples, rate) pairs and no add_special_tokens, like phi4mm.
+
+        It also exposes no sampling rate of its own, so the only source for the
+        pair's rate is the one extraction verified on the clip.
+        """
+        feature_extractor = None
+        seen = {}
+
+        def __call__(self, text, audio=None, padding=True, return_tensors="np",
+                     truncation=False, max_length=None):
+            # Accepts neither add_special_tokens nor padding_side, like phi4mm.
+            self.seen["pairs"] = [isinstance(c, tuple) for c in (audio or [])]
+            if audio and not all(self.seen["pairs"]):
+                raise ValueError("too many values to unpack (expected 2)")
+            self.seen["rates"] = [r for _, r in (audio or [])]
+            return _FakeGemmaAudioProcessor.__call__(
+                self, text, [s for s, _ in (audio or [])], max_length)
+
+    processor = _PairsOnly()
+    _qualify(monkeypatch, processor=processor)
+    batch = _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+    assert "input_features" in batch
+    # The paired form is retried with the rate extraction verified.
+    assert processor.seen["pairs"] == [True] and processor.seen["rates"] == [16000]
+    # Prompt/completion also sends padding_side: one-at-a-time recovery fails.
+    pc_row = {"prompt": _audio_row(_CLIP)["messages"][:1],
+              "completion": [{"role": "assistant", "content": "ok"}]}
+    batch, is_pc = _finalized_collate([pc_row], processor, 16, None,
+                                      return_prompt_completion=True)
+    assert is_pc and "input_features" in batch
+
+
+
 def test_placeholders_without_features_are_rejected(monkeypatch):
     _qualify(monkeypatch)
     # Pre-rendered text can keep the placeholder after the clip is gone.

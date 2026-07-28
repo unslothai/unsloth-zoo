@@ -5560,7 +5560,12 @@ def _check_audio_family_gate(processor):
 
 def _audio_extractor_sampling_rate(processor):
     """The sampling rate this processor's audio feature extractor expects."""
-    for holder in (getattr(processor, "feature_extractor", None), processor):
+    for holder in (
+        getattr(processor, "feature_extractor", None),
+        # Some name their audio extractor separately, and only it knows the rate.
+        getattr(processor, "audio_processor", None),
+        processor,
+    ):
         rate = getattr(holder, "sampling_rate", None)
         if rate:
             try:
@@ -5568,6 +5573,29 @@ def _audio_extractor_sampling_rate(processor):
             except (TypeError, ValueError):
                 continue
     return None
+
+
+class _AudioClip(np.ndarray):
+    """A mono waveform that remembers the rate it was decoded at.
+
+    Processors normally take bare waveforms, but some want
+    ``(samples, sampling_rate)`` pairs and do not expose a rate of their own, so
+    the value verified during extraction has to travel with the samples.
+
+    The rate survives views, slicing and copies, which is all collation does to
+    a clip. It does not survive concatenation, stacking, ``np.asarray`` or
+    pickling; anything that grows such a step must pass the rate explicitly
+    rather than expect it to ride along.
+    """
+
+    def __new__(cls, samples, sampling_rate):
+        obj = np.asarray(samples, dtype=np.float32).view(cls)
+        obj.sampling_rate = int(sampling_rate)
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is not None:
+            self.sampling_rate = getattr(obj, "sampling_rate", None)
 
 
 def _audio_samples_to_mono(samples, *, channel_first):
@@ -5646,7 +5674,7 @@ def _normalize_audio_clip(clip, expected_rate):
             f"feature extractor expects {expected_rate} Hz, and resampling is "
             f"not performed during training. {_AUDIO_CAST_HINT}"
         )
-    return np.asarray(samples, dtype=np.float32)
+    return _AudioClip(np.asarray(samples, dtype=np.float32), int(rate))
 
 
 def _vlm_audio_part_state(messages):
@@ -6211,6 +6239,25 @@ def _mlx_vlm_process_inputs_adapter(original):
     return patched
 
 
+def _drop_unsupported_processor_kwargs(processor, kwargs):
+    """Remove keyword arguments this processor's ``__call__`` does not take.
+
+    Processors disagree on which collation keywords they accept, and discovering
+    that by exception does not compose: a processor rejecting two of them raises
+    again inside the first retry. Filtering up front handles any number of them,
+    and a processor whose signature absorbs ``**kwargs`` keeps everything (the
+    per-keyword retries below still cover a signature that promises more than it
+    honours).
+    """
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -6227,9 +6274,12 @@ def _processor_vlm_inputs(
         return_tensors="np",
         add_special_tokens=False,
     )
+    base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
     audio = _format_vlm_audio_for_processor(all_audio)
+    audio_kwarg = None
     if audio is not None:
-        base_kwargs[_vlm_processor_audio_kwarg(processor)] = audio
+        audio_kwarg = _vlm_processor_audio_kwarg(processor)
+        base_kwargs[audio_kwarg] = audio
     if truncation:
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
@@ -6250,52 +6300,75 @@ def _processor_vlm_inputs(
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
-    first_error = None
-    for image_layout in image_layouts:
-        proc_kwargs = dict(base_kwargs)
-        if image_layout is not None:
-            proc_kwargs["images"] = _format_vlm_images_for_processor(
-                all_images,
-                processor=processor,
-                image_layout=image_layout,
-            )
+    def _run_layouts():
+        first_error = None
+        for image_layout in image_layouts:
+            proc_kwargs = dict(base_kwargs)
+            if image_layout is not None:
+                proc_kwargs["images"] = _format_vlm_images_for_processor(
+                    all_images,
+                    processor=processor,
+                    image_layout=image_layout,
+                )
+            try:
+                return _call_vlm_processor(processor, (), proc_kwargs)
+            except TypeError as exc:
+                if (
+                    "add_special_tokens" in str(exc)
+                    # Bound twice, or not accepted: both mean drop and retry.
+                    and ("multiple values" in str(exc)
+                         or "unexpected keyword argument" in str(exc))
+                    and "add_special_tokens" in proc_kwargs
+                ):
+                    proc_kwargs.pop("add_special_tokens", None)
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
+                if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
+                    proc_kwargs.pop("padding_side", None)
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
+                if first_error is None:
+                    first_error = exc
+                if len(image_layouts) == 1:
+                    raise
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                if len(image_layouts) == 1:
+                    raise
+        raise first_error
+
+    if audio_kwarg is None:
+        return _run_layouts()
+    try:
+        return _run_layouts()
+    except ValueError as exc:
+        if "unpack" not in str(exc):
+            raise
+        # Some take (samples, rate) pairs, which surfaces as an unpacking
+        # error. The rate rides on the clip: such processors expose none.
+        default_rate = _audio_extractor_sampling_rate(processor)
+        base_kwargs[audio_kwarg] = [
+            (np.asarray(clip), getattr(clip, "sampling_rate", None) or default_rate)
+            for clip in audio
+        ]
         try:
-            return _call_vlm_processor(processor, (), proc_kwargs)
-        except TypeError as exc:
-            if (
-                "add_special_tokens" in str(exc)
-                and "multiple values" in str(exc)
-                and "add_special_tokens" in proc_kwargs
-            ):
-                proc_kwargs.pop("add_special_tokens", None)
-                try:
-                    return _call_vlm_processor(processor, (), proc_kwargs)
-                except Exception as retry_exc:
-                    if first_error is None:
-                        first_error = retry_exc
-                    if len(image_layouts) == 1:
-                        raise
-                    continue
-            if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
-                proc_kwargs.pop("padding_side", None)
-                try:
-                    return _call_vlm_processor(processor, (), proc_kwargs)
-                except Exception as retry_exc:
-                    if first_error is None:
-                        first_error = retry_exc
-                    if len(image_layouts) == 1:
-                        raise
-                    continue
-            if first_error is None:
-                first_error = exc
-            if len(image_layouts) == 1:
-                raise
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
-            if len(image_layouts) == 1:
-                raise
-    raise first_error
+            return _run_layouts()
+        except Exception:
+            # Guess was wrong: report what the processor first said.
+            raise exc from None
 
 
 def _as_numpy_vlm_field(inputs, key):
