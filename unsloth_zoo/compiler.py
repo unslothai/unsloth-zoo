@@ -426,7 +426,9 @@ def replace_sdpa_with_amd_aiter(source):
         # scaled_dot_product_attention(q, k, v, None, 0.1, is_causal=True) contain
         # no keyword named "dropout_p" yet silently drop the positional dropout value.
         # Accepting only the bare causal-only form guarantees correctness.
-        rest_args_stripped = rest_args.strip().lstrip(",").strip()
+        # Strip leading/trailing whitespace, leading comma, and optional trailing
+        # comma (Black/multiline formatting). Then fullmatch the bare keyword.
+        rest_args_stripped = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
         if not re.fullmatch(r"is_causal\s*=\s*True", rest_args_stripped):
             # rest_args has more than just is_causal=True — leave call unchanged
             return m.group(0)

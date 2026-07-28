@@ -236,6 +236,18 @@ def _detect_gfx_arch():
             return m.group(0)
     except Exception:
         pass
+    # Final fallback: query torch directly — available in all ROCm wheel installs
+    # even when rocminfo and hipconfig are absent (e.g. runtime-only containers).
+    try:
+        if torch.cuda.is_available():
+            arch = torch.cuda.get_device_properties(0).gcnArchName
+            # gcnArchName may be e.g. "gfx942:sramecc+:xnack-" — extract gfxNNNN
+            import re as _re2
+            m = _re2.match(r"gfx[0-9a-f]+", arch)
+            if m:
+                return m.group(0)
+    except Exception:
+        pass
     return None
 pass
 
@@ -254,13 +266,22 @@ def get_amd_attention_implementation():
     if not is_hip():
         return "sdpa"
 
-    # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dep on libamdhip64.so.7)
+    # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dep on libamdhip64.so.7).
+    # Prefer torch.version.hip — always present in ROCm PyTorch wheels and not
+    # affected by rocm-smi which reports the kernel driver version, not the
+    # ROCm runtime version (the two can differ on wheel-only installs).
     try:
-        rocm_version = _detect_rocm_major_minor()
-        if rocm_version is not None:
-            major = int(rocm_version.split(".")[0])
-            if major < 7:
+        _hip_ver = getattr(torch.version, "hip", None)
+        if _hip_ver is not None:
+            _hip_major = int(str(_hip_ver).split(".")[0])
+            if _hip_major < 7:
                 return "sdpa"
+        else:
+            # Fallback for unusual builds without torch.version.hip
+            rocm_version = _detect_rocm_major_minor()
+            if rocm_version is not None:
+                if int(rocm_version.split(".")[0]) < 7:
+                    return "sdpa"
     except Exception:
         return "sdpa"
 
