@@ -32,6 +32,7 @@ import copy
 import inspect
 import importlib
 import json
+import math
 import numbers
 import operator
 import textwrap
@@ -4783,6 +4784,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_policy",
         "_visit_seed",
         "_visit_epoch_cache",
+        "_cycle_length",
     )
 
     def __init__(
@@ -4798,6 +4800,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         label_dtype=np.int64,
         visit_policy="identity",
         visit_seed=None,
+        cycle_length=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(batch) for batch in schedule)
@@ -4816,6 +4819,13 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
             else _normalize_seed(visit_seed)
         )
         self._visit_epoch_cache = None
+        # Micro-batches in ONE dataset pass, which len(schedule) is not once a
+        # num_batches horizon cycles the plan. Batching drops sub-two-token rows
+        # and can expand one source item into several, so only the plan itself
+        # knows this count; callback epoch accounting reads it.
+        self._cycle_length = (
+            None if cycle_length is None else max(1, int(cycle_length))
+        )
         if self.max_seq_length < 1:
             raise ValueError("max_seq_length must be positive")
         if self.minimum_width < 0:
@@ -4844,6 +4854,11 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
 
     def __len__(self):
         return len(self._schedule)
+
+    @property
+    def cycle_length(self):
+        """Micro-batches in one dataset pass (<= len(self))."""
+        return self._cycle_length
 
     def batch_width(self, index):
         # Explicit widths are authoritative; skip the per-row length scan
@@ -5017,9 +5032,9 @@ def _shuffled_full_batch_schedule(
         for group_index in rng.permutation(len(groups)):
             schedule.append(groups[int(group_index)])
             if num_batches is not None and len(schedule) >= num_batches:
-                return tuple(schedule)
+                return tuple(schedule), len(groups)
         if num_batches is None:
-            return tuple(schedule)
+            return tuple(schedule), len(groups)
 
 
 def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
@@ -5029,15 +5044,17 @@ def _create_tokenized_text_plan(tokenized, batch_size, max_seq_length,
         row for row in tokenized
         if _labeled_row_has_supervision(row[1], max_seq_length)
     ]
+    schedule, cycle_length = _shuffled_full_batch_schedule(
+        len(tokenized),
+        batch_size,
+        sort_key=lambda index: len(tokenized[index][0]),
+        num_batches=num_batches,
+        seed=seed,
+    )
     return FiniteTextBatchPlan(
         _finite_text_rows(tokenized),
-        _shuffled_full_batch_schedule(
-            len(tokenized),
-            batch_size,
-            sort_key=lambda index: len(tokenized[index][0]),
-            num_batches=num_batches,
-            seed=seed,
-        ),
+        schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=pad_id,
         # One reusable shuffled cycle: eligible for epoch-permuted visits.
@@ -6937,6 +6954,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_forbidden",
         "_shape_plan",
         "_planned_widths",
+        "_cycle_length",
     )
 
     def __init__(
@@ -6952,6 +6970,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         response_mask_fn=None,
         ignore_token_ids=None,
         completion_only_loss=None,
+        cycle_length=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(int(i) for i in batch) for batch in schedule)
@@ -6972,6 +6991,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._response_mask_fn = response_mask_fn
         self._ignore_token_ids = ignore_token_ids
         self._completion_only_loss = completion_only_loss
+        self._cycle_length = (
+            None if cycle_length is None else max(1, int(cycle_length))
+        )
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
@@ -7005,6 +7027,11 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
 
     def __len__(self):
         return len(self._schedule)
+
+    @property
+    def cycle_length(self):
+        """Micro-batches in one dataset pass (<= len(self))."""
+        return self._cycle_length
 
     def _build_batch(self, index, target_width=None):
         """Build one batch through the complete existing VLM builder,
@@ -7499,6 +7526,21 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             for idx in used
         )
         schedule = [tuple(position[idx] for idx in batch) for batch in schedule]
+    # Micro-batches in ONE dataset pass, counted through the same rank slicing the
+    # schedule uses. The trainer needs the exact figure to force the epoch-final
+    # optimizer step; without it the dataset-size approximation still fired the
+    # epoch callbacks while no update was forced there, so on_epoch_end saw
+    # weights missing the epoch's last batch and its gradient crossed the boundary.
+    cycle_length = sum(
+        1 for start in range(0, len(base_indices), global_batch_size)
+        if _rank_slice_distributed_batch(
+            base_indices[start : start + global_batch_size],
+            batch_size,
+            comm_group=comm_group,
+            pad_source=base_indices,
+            pad_mode=distributed_pad_mode,
+        )
+    )
     return FiniteVLMBatchPlan(
         rows,
         schedule,
@@ -7510,6 +7552,7 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
         response_mask_fn=response_mask_fn,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
+        cycle_length=cycle_length,
     )
 
 
@@ -8049,7 +8092,7 @@ def _create_default_text_plan(
     seed=42,
 ):
     """Build the CPU equivalent of mlx-lm's finite text batch schedule."""
-    schedule = _shuffled_full_batch_schedule(
+    schedule, cycle_length = _shuffled_full_batch_schedule(
         len(dataset),
         batch_size,
         sort_key=dataset.itemlen,
@@ -8063,6 +8106,7 @@ def _create_default_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0,
         # Match mlx-lm iterate_batches padding (1 + 32*ceil(len/32)) so the
@@ -8406,6 +8450,19 @@ def _create_distributed_text_plan(
     rng = np.random.RandomState(_normalize_seed(seed))
 
     schedule = []
+    # Micro-batches in ONE dataset pass. Every permutation visits all global
+    # batches and a local slice is non-empty regardless of visit order, so this
+    # holds for every pass even if num_batches truncates the first one.
+    cycle_length = sum(
+        1 for group in batch_idx
+        if _rank_slice_distributed_batch(
+            group,
+            batch_size,
+            comm_group=comm_group,
+            pad_source=idx,
+            pad_mode=distributed_pad_mode,
+        )
+    )
     while True:
         indices = rng.permutation(len(batch_idx))
         for i in indices:
@@ -8434,6 +8491,7 @@ def _create_distributed_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
@@ -8495,6 +8553,7 @@ def _create_ordered_text_plan(
     model_name=None,
     model_type=None,
     num_epochs=None,
+    grad_accum=None,
     append_eos=True,
     completion_only_loss=None,
     assistant_only_loss=False,
@@ -8607,18 +8666,43 @@ def _create_ordered_text_plan(
     order_pos = 0
     seen = 0
     global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    target_items = (
-        len(tokenized) * (1 if num_epochs is None else int(num_epochs))
-        if num_batches is None else None
+    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
+    # same length and a chunk's local slice is non-empty whatever rows it holds,
+    # so this is constant across epochs even under num_batches truncation.
+    cycle_length = sum(
+        1 for start in range(0, len(order), global_batch_size)
+        if _rank_slice_distributed_batch(
+            order[start : start + global_batch_size],
+            batch_size,
+            comm_group=comm_group,
+            pad_source=order,
+        )
     )
+    # why: HF quantizes a fractional num_train_epochs to whole accumulation
+    # windows and re-iterates the dataloader rather than taking a proportional
+    # slice of rows, so 0.5 epochs of 5 rows at batch 2 / accum 2 is one update
+    # over 4 rows, not 3 rows. Build to that step budget: whole passes plus the
+    # windows of the partial one, where a pass's last micro-batch forces its own
+    # update. int(num_epochs) instead built 0 batches for 0 < epochs < 1, which
+    # surfaced as "No training batches created", and one pass for 1.5.
+    target_batches = None
+    if num_batches is None:
+        if num_epochs is None:
+            target_batches = cycle_length
+        else:
+            accum = max(1, int(grad_accum or 1))
+            per_epoch = max(1, math.ceil(cycle_length / accum))
+            budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+            whole, rem = divmod(budget, per_epoch)
+            target_batches = whole * cycle_length + rem * accum
     while num_batches is None or len(schedule) < num_batches:
         # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
         # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
         if order_pos >= len(order):
-            # Stop when num_batches or num_epochs*len(dataset) reached.
+            # Stop when num_batches or the epoch step budget is reached.
             if (
                 num_batches is None
-                and (target_items is None or seen >= target_items)
+                and (target_batches is None or len(schedule) >= target_batches)
             ):
                 break
             epoch += 1
@@ -8630,9 +8714,6 @@ def _create_ordered_text_plan(
             break
         order_pos += len(chunk)
         seen += len(chunk)
-        if num_batches is None and target_items is not None and seen > target_items:
-            chunk = chunk[: len(chunk) - (seen - target_items)]
-            seen = target_items
         chunk = _rank_slice_distributed_batch(
             chunk,
             batch_size,
@@ -8643,7 +8724,11 @@ def _create_ordered_text_plan(
             break
         schedule.append(tuple(chunk))
 
-        if num_batches is None and target_items is not None and seen >= target_items:
+        if (
+            num_batches is None
+            and target_batches is not None
+            and len(schedule) >= target_batches
+        ):
             break
 
     if labeled:
@@ -8657,6 +8742,7 @@ def _create_ordered_text_plan(
     return FiniteTextBatchPlan(
         rows,
         schedule,
+        cycle_length=cycle_length,
         max_seq_length=max_seq_length,
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
@@ -8668,7 +8754,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
                            dataset_text_field="text",
                            formatting_func=None, chat_template=None,
                            model_name=None, model_type=None,
-                           num_epochs=None, append_eos=True,
+                           num_epochs=None, grad_accum=None, append_eos=True,
                            completion_only_loss=None, assistant_only_loss=False,
                            comm_group=None):
     """Eagerly create text batches with an explicit dataset order."""
@@ -8686,6 +8772,7 @@ def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
         model_name=model_name,
         model_type=model_type,
         num_epochs=num_epochs,
+        grad_accum=grad_accum,
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,

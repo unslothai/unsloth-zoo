@@ -182,6 +182,60 @@ def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     assert first_epoch != second_epoch
 
 
+def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
+    # int(num_epochs) rounded the requested row count down: 0 < epochs < 1 built
+    # an empty plan, surfacing later as "No training batches created" and
+    # blaming the dataset, and 1.5 built a single pass. Five rows at batch 1 is
+    # 3 batches for half an epoch and 8 for one and a half.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def plan_for(num_epochs):
+        return create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(5)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=1,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+        )
+
+    assert len(plan_for(0.5)) == 3
+    assert len(plan_for(1.5)) == 8
+    # Whole counts are unchanged.
+    assert len(plan_for(2)) == 10
+
+
+def test_ordered_text_fractional_epochs_match_transformers_step_budget():
+    # Golden values measured by running a real transformers.Trainer on the same
+    # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
+    # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
+    # and accum 2 is one update over 4 rows, not a proportional 3 rows.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def rows_for(n_rows, batch_size, grad_accum, num_epochs):
+        batches = create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(n_rows)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=batch_size,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+            grad_accum=grad_accum,
+        )
+        return sum(int(lengths.shape[0]) for _b, lengths, _l in batches)
+
+    # (rows, batch, accum, epochs): rows consumed by transformers.Trainer
+    assert rows_for(5, 2, 2, 0.5) == 4
+    assert rows_for(5, 2, 2, 1.0) == 5
+    assert rows_for(5, 2, 2, 1.5) == 9
+    assert rows_for(10, 2, 2, 0.75) == 10
+    assert rows_for(10, 2, 2, 1.5) == 18
+
+
 def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_vlm_batches
@@ -1169,7 +1223,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
         def __call__(self, input_ids, **_kwargs):
             return self.embed(input_ids)
 
-        def train(self):
+        def train(self, mode=True):
             return self
 
         def load_weights(self, *_args, **_kwargs):
