@@ -1538,3 +1538,185 @@ def test_gemma3n_token_type_ownership_survives_module_relocation():
     assert _vlm_processor_requests_mm_token_type_ids(
         processor("transformers.models.gemma3.processing_gemma3", "Gemma3Processor")
     ) is True
+
+
+# --- causality: a padding mask must never become the attention mask ---------
+
+
+def _utils_mx():
+    """The mlx the module under test is bound to (a sibling test may shim it)."""
+    from unsloth_zoo.mlx import utils
+    return utils.mx
+
+
+def _run_loss(model_type, kv_shared=0):
+    """Run the baseline loss and report what the model was handed."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import make_vlm_baseline_loss_fn
+
+    mx_ = _utils_mx()
+    seen = {}
+    ids = mx_.array([[1, 2, 3, 4]], dtype=mx_.int32)
+    batch = {"input_ids": ids, "labels": ids,
+             "attention_mask": mx_.ones(ids.shape, dtype=mx_.int32)}
+
+    class _Model:
+        config = SimpleNamespace(model_type=model_type)
+
+        # Declared and never read, exactly as molmo_point declares it.
+        def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None):
+            return None
+
+        # Keyword-only and required, as thirteen families declare it: omitting
+        # it is a TypeError, so every case below also proves it is always sent.
+        def __call__(self, inputs, pixel_values=None, *, mask, cache=None, **kw):
+            seen["mask"], seen["cache"] = mask, cache
+            return SimpleNamespace(
+                logits=mx_.zeros((*inputs.shape, 16), dtype=mx_.float32))
+
+    model = _Model()
+    if kv_shared:
+        model.language_model = SimpleNamespace(model=SimpleNamespace(
+            first_kv_shared_layer_idx=15,
+            config=SimpleNamespace(num_kv_shared_layers=kv_shared)))
+    make_vlm_baseline_loss_fn(model=None, ignore_token_ids=[])(model, batch)
+    return seen, batch
+
+
+# mlx-vlm model_type values, not module names: FastVLM reports either.
+_MASK_KEEPING_FAMILIES = (
+    "gemma3", "paligemma", "llava_qwen2", "fastvlm",
+    "falcon_ocr", "falcon_perception", "falcon-perception",
+)
+
+
+@pytest.mark.parametrize("model_type,keeps", [
+    *[(family, True) for family in _MASK_KEEPING_FAMILIES],
+    # mlx-vlm resolves the module case-insensitively, the config keeps its own.
+    ("Gemma3", True), ("FALCON-PERCEPTION", True),
+    ("qwen2_vl", False),
+    ("molmo_point", False),
+])
+def test_baseline_loss_fn_sends_the_padding_mask_only_where_it_is_read(
+        model_type, keeps):
+    # Elsewhere it reaches the layers verbatim and replaces causality, letting
+    # every supervised position read the token it is scored on.
+    seen, batch = _run_loss(model_type)
+    assert seen["mask"] is (batch["attention_mask"] if keeps else None)
+
+
+def test_mask_keeping_allowlist_is_exactly_these_families_and_all_their_aliases():
+    from unsloth_zoo.mlx.utils import _VLM_FAMILIES_KEEPING_FORWARDED_MASK as listed
+    assert set(listed) == set(_MASK_KEEPING_FAMILIES)
+    # A config keeps its model_type through mlx-vlm's remap, so an alias onto a
+    # listed module has to be listed under its own spelling too.
+    remap = pytest.importorskip("mlx_vlm.utils").MODEL_REMAPPING
+    assert not {a for a, t in remap.items() if t in listed and a not in listed}
+
+
+class _NoPadIdTokenizer(_FakeTokenizer):
+    pad_token_id = None
+
+
+class _LayoutProcessor(_FakeProcessor):
+    """Emits one fixed layout, honouring `padding_side` only when told to.
+
+    Instruct checkpoints ship `padding_side: left`; deepseek_vl_v2 and the
+    falcon pair left-pad multimodal rows whichever side they are asked for.
+    """
+
+    def __init__(self, rows, masks, honours_side=False, tokenizer=None, **extras):
+        self.rows, self.masks, self.extras = rows, masks, extras
+        self.honours_side = honours_side
+        self.tokenizer = tokenizer or _FakeTokenizer()
+
+    def __call__(self, text, padding_side=None, **_kwargs):
+        flush = self.honours_side and padding_side == "right"
+        ids, mask = [], []
+        for row, keep in zip(self.rows, self.masks):
+            body = [t for t, k in zip(row, keep) if k]
+            pad = [0] * (len(row) - len(body))
+            ids.append(body + pad if flush else list(row))
+            mask.append([1] * len(body) + pad if flush else list(keep))
+        out = {"input_ids": np.array(ids, dtype=np.int32),
+               "attention_mask": np.array(mask, dtype=np.int32)}
+        out.update({key: np.asarray(value) for key, value in self.extras.items()})
+        return out
+
+
+# One row already flush, one left-padded, so a repair has something to move.
+_RAGGED = ([[101, 10, 200, 11], [0, 0, 101, 200]],
+           [[1, 1, 1, 1], [0, 0, 1, 1]])
+_MARKS = np.array([[0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.int32)
+
+
+@pytest.mark.parametrize("honours_side", [True, False])
+def test_collation_delivers_content_then_padding(honours_side):
+    # Causality is all that excludes the pads once the mask is withheld, and it
+    # excludes a trailing pad, not a leading one.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2, _LayoutProcessor(*_RAGGED, honours_side=honours_side),
+        8, None)
+    ids, mask = np.asarray(batch["input_ids"]), np.asarray(batch["attention_mask"])
+    assert mask.tolist() == [[1, 1, 1, 1], [1, 1, 0, 0]]
+    assert ids[1][:2].tolist() == [101, 200]
+
+
+@pytest.mark.parametrize("key", ["mm_token_type_ids", "images_seq_mask"])
+def test_collation_moves_token_aligned_sidecars_with_their_tokens(key):
+    # gemma4 builds its bidirectional multimodal blocks from
+    # `mm_token_type_ids`, the deepseek pair place image embeddings at
+    # `images_seq_mask` indices; left behind, row 1's mark sits on a pad.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2,
+        _LayoutProcessor(*_RAGGED, mm_token_type_ids=_MARKS,
+                         images_seq_mask=_MARKS.astype(bool)), 8, None)
+    ids, marked = np.asarray(batch["input_ids"]), np.asarray(batch[key]).astype(bool)
+    assert marked.sum() == 2 and (ids[marked] == 200).all()
+    assert marked[1].tolist() == [False, True, False, False]
+
+
+@pytest.mark.parametrize("key", ["image_grid_hw", "some_unlisted_field"])
+def test_collation_leaves_an_unlisted_field_alone(key):
+    # Three images of two columns, in a batch of three rows two tokens wide:
+    # per-image metadata shaped exactly like a per-token array. Recognising
+    # sidecars by shape would compact row 1's to [5, 0], losing its height.
+    grid = np.array([[2, 3], [4, 5], [6, 7]], dtype=np.int32)
+    batch = _finalized_collate(
+        [{"text": "a"}] * 3,
+        _LayoutProcessor([[101, 200], [0, 200], [101, 200]],
+                         [[1, 1], [0, 1], [1, 1]],
+                         image_grid_hw=grid, some_unlisted_field=grid + 10),
+        8, None)
+    assert np.asarray(batch["input_ids"])[1].tolist() == [200, 0]
+    assert np.asarray(batch[key]).tolist() == (grid if key == "image_grid_hw"
+                                               else grid + 10).tolist()
+
+
+@pytest.mark.parametrize("key", ["position_ids", "rope_deltas"])
+def test_collation_refuses_a_processor_authored_layout_coordinate(key, monkeypatch):
+    # Sidecars label tokens and travel with them; these are coordinates of the
+    # layout the repair replaces. `rope_deltas` is injected into the pipeline's
+    # own collection, so naming "position_ids" inline would fail this.
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_VLM_WIDTH_GENERATED_KEYS",
+                        tuple(utils._VLM_WIDTH_GENERATED_KEYS) + ("rope_deltas",))
+    coords = np.tile(np.arange(4), (2, 1))
+    with pytest.raises(ValueError, match=key):
+        _finalized_collate([{"text": "a"}] * 2,
+                           _LayoutProcessor(*_RAGGED, **{key: coords}), 8, None)
+
+
+@pytest.mark.parametrize("honours_side", [True, False])
+def test_collation_does_not_require_a_pad_id(honours_side):
+    # falcon_ocr and falcon_perception ship no pad id and pad with 0, so
+    # demanding one would refuse batches they collate fine, repair or not.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2,
+        _LayoutProcessor(*_RAGGED, honours_side=honours_side,
+                         tokenizer=_NoPadIdTokenizer()), 8, None)
+    ids, mask = np.asarray(batch["input_ids"]), np.asarray(batch["attention_mask"])
+    assert mask[:, 0].tolist() == [1, 1] and (ids[mask == 0] == 0).all()
+
+
