@@ -39,6 +39,8 @@ class _CharTokenizer:
         return _CharDetokenizer(self)
     def decode(self, tokens):
         return "".join(self.pieces[item] for item in tokens)
+    def encode(self, text, **kwargs):
+        return [0] * len(text)
 
 class _TableTokenizer:
     def __init__(self, pieces, clean=False):
@@ -595,7 +597,14 @@ def test_vlm_requests_group_by_sampling_params():
     adapter._run_chunk = lambda requests, indices: (
         chunks.append(list(indices)) or [object() for _ in indices])
     hot = SamplingParams(temperature=0.9)
+    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
     adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="b", sampling=hot),
+                      GenerationRequest(prompt="c")])
+    assert sorted(chunks) == [[0, 2], [1]]
+    # Preprocessing stacks a group without padding, so differing prompt lengths
+    # must not share a chunk; upstream raises when they do.
+    chunks.clear()
+    adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="bb"),
                       GenerationRequest(prompt="c")])
     assert sorted(chunks) == [[0, 2], [1]]
 

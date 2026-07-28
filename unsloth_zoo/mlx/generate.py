@@ -1259,8 +1259,12 @@ class _VLMBatchAdapter:
         )
 
     def _group_key(self, request: GenerationRequest):
+        # Prompt length is part of the key: preprocessing stacks a group without
+        # padding, so mixing lengths raises instead of generating. Grouping by
+        # length keeps varied batches working, at the cost of smaller groups.
         sampling = request.sampling or self.defaults.sampling
         shape = self._image_shape(request.image)
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
         return (
             sampling.temperature,
             sampling.top_p,
@@ -1268,6 +1272,7 @@ class _VLMBatchAdapter:
             sampling.min_p,
             request.image is None,
             shape,
+            len(tokenizer.encode(request.prompt)),
         )
 
     def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
