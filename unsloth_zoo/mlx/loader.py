@@ -3734,21 +3734,29 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
     mx.eval(list(new_weights.values()))
 
     temp_dir = tempfile.mkdtemp(prefix="unsloth_mlx_dequant_")
-    for filename in os.listdir(local_path):
-        src = os.path.join(local_path, filename)
-        if not os.path.isfile(src):
-            continue
-        if _is_dropped_dequant_sidecar(filename):
-            continue
-        shutil.copy(src, os.path.join(temp_dir, filename))
+    # Populate the temp checkpoint under try/except: a failure while copying
+    # sidecars, writing config.json, or saving the (multi-GB) safetensors would
+    # otherwise leak the directory in the system temp. Catch BaseException so an
+    # interrupt during the large save cleans up too, then re-raise.
+    try:
+        for filename in os.listdir(local_path):
+            src = os.path.join(local_path, filename)
+            if not os.path.isfile(src):
+                continue
+            if _is_dropped_dequant_sidecar(filename):
+                continue
+            shutil.copy(src, os.path.join(temp_dir, filename))
 
-    new_config_data = dict(config_data)
-    new_config_data.pop("quantization_config", None)
-    new_config_data.pop("quantization", None)
-    with open(os.path.join(temp_dir, "config.json"), "w") as f:
-        json.dump(new_config_data, f, indent=2)
+        new_config_data = dict(config_data)
+        new_config_data.pop("quantization_config", None)
+        new_config_data.pop("quantization", None)
+        with open(os.path.join(temp_dir, "config.json"), "w") as f:
+            json.dump(new_config_data, f, indent=2)
 
-    mx.save_safetensors(os.path.join(temp_dir, "model.safetensors"), new_weights)
+        mx.save_safetensors(os.path.join(temp_dir, "model.safetensors"), new_weights)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     return temp_dir, new_config_data
 
 

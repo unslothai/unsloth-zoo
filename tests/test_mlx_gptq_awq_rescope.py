@@ -292,6 +292,32 @@ def test_materialize_gptq_drops_quant_sidecars():
         assert "quantization_config" not in json.load(f)
 
 
+def test_materialize_cleans_up_temp_dir_on_save_failure(monkeypatch):
+    # If populating the temp checkpoint fails partway (here save_safetensors
+    # raises after the temp dir is created), the multi-GB scratch dir must be
+    # removed rather than leaked in the system temp.
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    gs = 8
+    tmp = tempfile.mkdtemp(prefix="rescope_gptq_fail_")
+    _write_gptq_repo(tmp, with_g_idx=True, gs=gs)  # uses mx.save_safetensors
+    quant_config = {"quant_method": "gptq", "bits": 4, "group_size": gs}
+    cfg = {"model_type": "llama", "quantization_config": quant_config}
+
+    # Patch only after the input repo is written, so the failure lands on the
+    # materializer's own save of the dense checkpoint.
+    def _boom(*a, **k):
+        raise RuntimeError("simulated save failure")
+    monkeypatch.setattr(mx, "save_safetensors", _boom)
+
+    pat = os.path.join(tempfile.gettempdir(), "unsloth_mlx_dequant_*")
+    before = set(glob.glob(pat))
+    with pytest.raises(RuntimeError, match="simulated save failure"):
+        ml._materialize_dequantized_hf_checkpoint(tmp, cfg, "gptq", quant_config)
+    leaked = set(glob.glob(pat)) - before
+    assert not leaked, f"materialize leaked temp dir(s) on failure: {leaked}"
+
+
 # ---------------------------------------------------------------------------
 # FIX 3: dense / 16-bit / full-finetuning requests resolve to a disabled spec,
 # which the loader uses to force the fp16 dequant path (never a quantized base).
