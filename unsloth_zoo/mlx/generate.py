@@ -1355,7 +1355,13 @@ class _VLMBatchAdapter:
                 chunk = indices[start : start + step]
                 for index, result in zip(chunk, self._run_chunk(requests, chunk)):
                     results[index] = result
-        return [result for result in results if result is not None]
+        if any(result is None for result in results):
+            raise RuntimeError(
+                "Internal error: batched vision generation produced no result "
+                f"for {sum(result is None for result in results)} of "
+                f"{len(results)} requests."
+            )
+        return results
 
     def _generate_sequentially(self, request: GenerationRequest) -> GenerationResult:
         """One audio request through the release's sequential stream.
@@ -1686,6 +1692,10 @@ def fast_generate(
     """
 
     tokenizer = getattr(self, "_tokenizer", None)
+    if getattr(self, "_is_vlm_model", False):
+        # A text-only multimodal load stays on the vision path but publishes its
+        # inner tokenizer, which cannot drive mlx-vlm preprocessing.
+        tokenizer = getattr(self, "_processor", None) or tokenizer
     if tokenizer is None:
         raise ValueError("Unsloth MLX: fast_generate requires model._tokenizer.")
     if isinstance(prompts, str):

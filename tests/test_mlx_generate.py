@@ -89,7 +89,8 @@ def test_one_shot_prompt_ids_are_normalized_during_validation():
 def test_text_api_probe_accepts_supported_shape_and_names_gap_on_mismatch():
     Response = make_dataclass(
         "Response",
-        [("uid", int), ("token", int), ("logprobs", object), ("finish_reason", str | None)],
+        # make_dataclass evaluates these, so no PEP 604 union: the package supports 3.9.
+        [("uid", int), ("token", int), ("logprobs", object), ("finish_reason", object)],
     )
     GenerationBatch = type("GenerationBatch", (), {"Response": Response})
     class BatchGenerator:
@@ -257,6 +258,12 @@ def test_fast_generate_binds_text_and_vision_models_and_maps_shared_controls(mon
     vlm = types.SimpleNamespace(_is_vlm_model=True)
     _patch_mlx_saving(vlm, tokenizer)
     assert vlm.fast_generate(["look"]) is expected
+    # A text-only multimodal load publishes its inner tokenizer; the vision
+    # adapter needs the processor.
+    processor = object()
+    vlm._processor = processor
+    vlm.fast_generate(["look"])
+    assert captured["tokenizer"] is processor
 
 
 @contextlib.contextmanager
