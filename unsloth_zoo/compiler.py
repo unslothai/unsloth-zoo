@@ -478,13 +478,20 @@ def replace_sdpa_with_amd_aiter(source):
             f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
             f"{indent}    _aiter_k = {k_var}.transpose(1, 2)",
             f"{indent}    _aiter_v = {v_var}.transpose(1, 2)",
-            # Wrap in try/except: unsupported head dim, arch mismatch, or JIT build
-            # failure inside flash_attn_func must fail-soft to SDPA, not crash training.
-            f"{indent}    try:",
-            f"{indent}        {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal=True).transpose(1, 2)",
-            f"{indent}    except Exception:",
+            # Call aiter via a wrapper that returns None on any exception.
+            # A bare try/except in the generated forward would break
+            # torch.compile(fullgraph=True) — TorchDynamo cannot trace
+            # Python exception handling in fullgraph mode.
+            f"{indent}    def _call_aiter_safe(_fn, _q, _k, _v):",
+            f"{indent}        try: return _fn(_q, _k, _v, causal=True)",
+            f"{indent}        except Exception: return None",
+            f"{indent}    _aiter_out = _call_aiter_safe(_aiter_fn, _aiter_q, _aiter_k, _aiter_v)",
+            f"{indent}    if _aiter_out is not None:",
+            f"{indent}        {out_var} = _aiter_out.transpose(1, 2)",
+            f"{indent}    else:",
             f"{indent}        {out_var} = torch.nn.functional.scaled_dot_product_attention(",
             f"{indent}            {q_var}, {k_var}, {v_var}{rest_args_formatted})",
+            # else: _aiter_ok is False — fall back to plain SDPA directly
             f"{indent}else:",
             f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(",
             f"{indent}        {q_var}, {k_var}, {v_var}{rest_args_formatted})",

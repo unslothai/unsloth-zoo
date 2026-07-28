@@ -218,10 +218,30 @@ pass
 
 @functools.cache
 def _detect_gfx_arch():
-    """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable."""
-    import subprocess, re as _re
+    """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable.
+
+    Uses the PyTorch-active device first so that HIP_VISIBLE_DEVICES and multi-arch
+    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) scan
+    system-wide output and may return a different arch than the active device.
+    """
+    import re as _re
+    # First: query the currently active PyTorch device — always returns the right
+    # arch for the GPU PyTorch is using, respects HIP_VISIBLE_DEVICES.
     try:
-        # rocminfo is the most reliable source
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            arch = torch.cuda.get_device_properties(dev).gcnArchName
+            # gcnArchName may include suffixes e.g. "gfx942:sramecc+:xnack-"
+            m = _re.match(r"gfx[0-9a-f]+", arch)
+            if m:
+                return m.group(0)
+    except Exception:
+        pass
+    # Subprocess fallbacks for environments where PyTorch cannot query the device
+    # (unusual builds). These may be unreliable on mixed-arch hosts but are better
+    # than returning None when torch device properties are unavailable.
+    import subprocess
+    try:
         r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
         m = _re.search(r"gfx[0-9a-f]+", r.stdout)
         if m:
@@ -229,23 +249,10 @@ def _detect_gfx_arch():
     except Exception:
         pass
     try:
-        # hipconfig fallback
         r = subprocess.run(["hipconfig", "--full"], capture_output=True, text=True, timeout=10)
         m = _re.search(r"gfx[0-9a-f]+", r.stdout)
         if m:
             return m.group(0)
-    except Exception:
-        pass
-    # Final fallback: query torch directly — available in all ROCm wheel installs
-    # even when rocminfo and hipconfig are absent (e.g. runtime-only containers).
-    try:
-        if torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName
-            # gcnArchName may be e.g. "gfx942:sramecc+:xnack-" — extract gfxNNNN
-            import re as _re2
-            m = _re2.match(r"gfx[0-9a-f]+", arch)
-            if m:
-                return m.group(0)
     except Exception:
         pass
     return None
