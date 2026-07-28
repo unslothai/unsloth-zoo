@@ -237,9 +237,7 @@ def _detect_gfx_arch():
                 return m.group(0)
     except Exception:
         pass
-    # Subprocess fallbacks for environments where PyTorch cannot query the device
-    # (unusual builds). These may be unreliable on mixed-arch hosts but are better
-    # than returning None when torch device properties are unavailable.
+    # Subprocess fallbacks for unusual builds where PyTorch cannot query the device.
     import subprocess
     try:
         r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
@@ -292,17 +290,15 @@ def get_amd_attention_implementation():
     except Exception:
         return "sdpa"
 
-    # Gate on GPU architecture — aiter's CK/ASM kernels are CDNA-only.
-    # flash_attn_func is always importable on any arch where aiter installs,
-    # but the underlying kernels only work on gfx942 (MI300X/MI325X) and
-    # gfx950 (MI355X). Consumer RDNA (gfx1100, gfx1200, etc.) is not supported.
+    # aiter's CK/ASM kernels are CDNA-only: gfx942 (MI300X/MI325X) and gfx950
+    # (MI355X). flash_attn_func imports on all archs but only runs on these two.
     try:
         _gfx = _detect_gfx_arch()
         _AITER_SUPPORTED_ARCHS = ("gfx942", "gfx950")  # CDNA3, CDNA4
         if _gfx not in _AITER_SUPPORTED_ARCHS:
             return "sdpa"
     except Exception:
-        return "sdpa"  # fail safe: unknown arch → use SDPA
+        return "sdpa"
 
     # Check for amd-aiter (AMD AI Tensor Engine for ROCm)
     try:

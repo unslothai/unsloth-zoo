@@ -431,33 +431,19 @@ def replace_sdpa_with_amd_aiter(source):
         v_var   = m.group(5)
         rest_args = m.group(6)
 
-        # Only rewrite when rest_args is exactly ", is_causal=True" (with optional
-        # whitespace). aiter accepts only (q, k, v, causal=True) — any additional
-        # argument (positional or keyword) may carry semantics the kernel ignores
-        # (e.g. positional dropout_p, attn_mask, scale, enable_gqa). Keyword-name
-        # checking alone is insufficient: positional calls like
-        # scaled_dot_product_attention(q, k, v, None, 0.1, is_causal=True) contain
-        # no keyword named "dropout_p" yet silently drop the positional dropout value.
-        # Accepting only the bare causal-only form guarantees correctness.
-        # Strip leading/trailing whitespace, leading comma, and optional trailing
-        # comma (Black/multiline formatting). Then fullmatch the bare keyword.
+        # Only bare is_causal=True (optional trailing comma/whitespace) is rewritten.
+        # Any other argument — positional or keyword — is left unchanged;
+        # positional args like (q, k, v, None, 0.1, ...) carry semantics aiter ignores.
         rest_args_stripped = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
         if not re.fullmatch(r"is_causal\s*=\s*True", rest_args_stripped):
-            # rest_args has more than just is_causal=True — leave call unchanged
             return m.group(0)
 
-        # Clean leading newlines from rest_args
-        rest_args_clean = rest_args.lstrip("\r\n").strip()
-        # rest_args already starts with a comma when non-empty; do NOT add another
-        # rest_args is ", is_causal=True" at this point (fullmatch guarantees this).
-        # Pass it through to the SDPA fallback as-is.
-        rest_args_formatted = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
-        # Reconstruct with leading comma for the SDPA fallback call
-        rest_args_formatted = (", " + rest_args_formatted) if rest_args_formatted else ""
+        # rest_args is ", is_causal=True" here (fullmatch guarantees it).
+        # Reconstruct with leading comma for the SDPA fallback.
+        _kw = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
+        rest_args_formatted = (", " + _kw) if _kw else ""
 
-        # Generate the replacement block.
-        # All symbols used at runtime are imported inside the generated code so
-        # that the exec()'d module namespace is self-contained (no NameError).
+        # Generated code is exec()'d in isolation — all symbols must be imported inside.
         lines = [
             f"{indent}# AMD aiter Flash Attention (MFMA + causal tile skip)",
             f"{indent}# Requires: pip install amd-aiter  (ROCm >= 7.0)",
@@ -478,10 +464,8 @@ def replace_sdpa_with_amd_aiter(source):
             f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
             f"{indent}    _aiter_k = {k_var}.transpose(1, 2)",
             f"{indent}    _aiter_v = {v_var}.transpose(1, 2)",
-            # Call aiter via a wrapper that returns None on any exception.
-            # A bare try/except in the generated forward would break
-            # torch.compile(fullgraph=True) — TorchDynamo cannot trace
-            # Python exception handling in fullgraph mode.
+            # _call_aiter_safe returns None on failure; avoids try/except in
+            # generated code which breaks torch.compile(fullgraph=True).
             f"{indent}    def _call_aiter_safe(_fn, _q, _k, _v):",
             f"{indent}        try: return _fn(_q, _k, _v, causal=True)",
             f"{indent}        except Exception: return None",
