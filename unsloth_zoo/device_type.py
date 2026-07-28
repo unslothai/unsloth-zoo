@@ -368,7 +368,7 @@ def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None
 
     Args:
         batch_size: per-device training batch size.
-        seq_len:    training sequence length (for context in the message).
+        seq_len:    kept for API compatibility; no longer interpolated in the message.
         log_fn:     callable(str) for the warning; defaults to print().
         device:     torch device index or None (defaults to current CUDA device).
     """
