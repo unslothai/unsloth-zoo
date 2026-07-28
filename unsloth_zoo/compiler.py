@@ -435,7 +435,7 @@ def replace_sdpa_with_amd_aiter(source):
         # Clean leading newlines from rest_args
         rest_args_clean = rest_args.lstrip("\r\n").strip()
         # rest_args already starts with a comma when non-empty; do NOT add another
-        rest_args_formatted = (", " + rest_args_clean) if rest_args_clean else ""
+        rest_args_formatted = rest_args_clean  # already starts with comma when non-empty
 
         # Generate the replacement block.
         # All symbols used at runtime are imported inside the generated code so
@@ -454,7 +454,13 @@ def replace_sdpa_with_amd_aiter(source):
             f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
             f"{indent}    _aiter_k = {k_var}.transpose(1, 2)",
             f"{indent}    _aiter_v = {v_var}.transpose(1, 2)",
-            f"{indent}    {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal=True).transpose(1, 2)",
+            # Wrap in try/except: unsupported head dim, arch mismatch, or JIT build
+            # failure inside flash_attn_func must fail-soft to SDPA, not crash training.
+            f"{indent}    try:",
+            f"{indent}        {out_var} = _aiter_fn(_aiter_q, _aiter_k, _aiter_v, causal=True).transpose(1, 2)",
+            f"{indent}    except Exception:",
+            f"{indent}        {out_var} = torch.nn.functional.scaled_dot_product_attention(",
+            f"{indent}            {q_var}, {k_var}, {v_var}{rest_args_formatted})",
             f"{indent}else:",
             f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(",
             f"{indent}        {q_var}, {k_var}, {v_var}{rest_args_formatted})",
@@ -3902,7 +3908,14 @@ def unsloth_compile_transformers(
                 disabled_scaled_dot_product_attention_modules.append(module)
             pass
         pass
-        # AMD ROCm: replace SDPA with amd-aiter Flash Attention if available
+        # AMD ROCm: replace SDPA with amd-aiter Flash Attention if available.
+        # Note: this fires on the model's compiled source after Unsloth's SDPA
+        # rewriting. The Unsloth-rewritten SDPA calls carry attn_mask= or
+        # is_causal=is_causal (variable, not literal True) and will not match
+        # the aiter guards. User-added model code with bare
+        # scaled_dot_product_attention(q, k, v, is_causal=True) will match.
+        # A future PR can also rewrite the Unsloth SDPA shim to emit
+        # is_causal=True literally where provably safe.
         new_source = replace_sdpa_with_amd_aiter(new_source)
         scaled_dot_product_attention_modules[module] = new_source
     pass

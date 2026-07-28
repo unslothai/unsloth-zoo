@@ -217,6 +217,30 @@ pass
 
 
 @functools.cache
+def _detect_gfx_arch():
+    """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable."""
+    import subprocess, re as _re
+    try:
+        # rocminfo is the most reliable source
+        r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    try:
+        # hipconfig fallback
+        r = subprocess.run(["hipconfig", "--full"], capture_output=True, text=True, timeout=10)
+        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    return None
+pass
+
+
+@functools.cache
 def get_amd_attention_implementation():
     """
     Return the best available attention implementation for AMD ROCm.
@@ -239,6 +263,18 @@ def get_amd_attention_implementation():
                 return "sdpa"
     except Exception:
         return "sdpa"
+
+    # Gate on GPU architecture — aiter's CK/ASM kernels are CDNA-only.
+    # flash_attn_func is always importable on any arch where aiter installs,
+    # but the underlying kernels only work on gfx942 (MI300X/MI325X) and
+    # gfx950 (MI355X). Consumer RDNA (gfx1100, gfx1200, etc.) is not supported.
+    try:
+        _gfx = _detect_gfx_arch()
+        _AITER_SUPPORTED_ARCHS = ("gfx942", "gfx950")  # CDNA3, CDNA4
+        if _gfx not in _AITER_SUPPORTED_ARCHS:
+            return "sdpa"
+    except Exception:
+        return "sdpa"  # fail safe: unknown arch → use SDPA
 
     # Check for amd-aiter (AMD AI Tensor Engine for ROCm)
     try:
