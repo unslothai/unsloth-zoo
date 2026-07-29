@@ -221,3 +221,11 @@ def test_kto_rejects_non_kto_loss_type():
     with pytest.raises(ValueError, match="loss_type='kto'"):
         MLXKTOTrainer(object(), object(), [],
                       args=MLXKTOConfig(loss_type="apo_zero_unpaired"))
+
+
+def test_kto_rejects_ref_model_kwarg():
+    # KTO's reference is the adapter-off forward; a passed ref_model would be
+    # swallowed by **kwargs and ignored, so reject it.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+    with pytest.raises(ValueError, match="ref_model"):
+        MLXKTOTrainer(object(), object(), [], args=MLXKTOConfig(), ref_model=object())

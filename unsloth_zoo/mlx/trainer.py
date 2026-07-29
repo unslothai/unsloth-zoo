@@ -8391,6 +8391,17 @@ class MLXKTOTrainer(MLXTrainer):
                 f"{_loss_type!r}). Other TRL KTO variants are not implemented on "
                 "the MLX KTO path. Set loss_type='kto'."
             )
+        # KTO's reference is the adapter-disabled (LoRA scale=0) forward of the
+        # same model -- there is no separate reference copy. A caller porting
+        # from TRL's KTOTrainer(ref_model=...) would otherwise have it silently
+        # swallowed by **kwargs and ignored. Reject it loudly.
+        if kwargs.get("ref_model") is not None:
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer does not take a separate ref_model. The "
+                "KTO reference is the adapter-disabled (LoRA scale=0) forward of "
+                "the policy model, so a passed ref_model would be ignored. Remove "
+                "ref_model."
+            )
         self._is_vlm = False
         # Raw KTO rows: do NOT wrap in the SFT tokenized dataset view.
         self.train_dataset = train_dataset
