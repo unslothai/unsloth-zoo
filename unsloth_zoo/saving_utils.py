@@ -4535,11 +4535,15 @@ def _is_hub_repo_id(model_name):
     return True
 pass
 
-def _hub_unreachable_error(model_name, e):
+def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missing model"):
+    """`action` and `mistaken_for` name the specific question the Hub was asked,
+    because "not a missing model" is the wrong reassurance for a caller that was
+    asking about quantization rather than existence."""
+    action = action or f"checking whether `{model_name}` exists"
     return RuntimeError(
-        f"Unsloth: could not reach the Hugging Face Hub while checking whether "
-        f"`{model_name}` exists ({type(e).__name__}: {e}). This is a connectivity "
-        f"or rate limiting problem, not a missing model. Retry, or pass a local path."
+        f"Unsloth: could not reach the Hugging Face Hub while {action} "
+        f"({type(e).__name__}: {e}). This is a connectivity "
+        f"or rate limiting problem, not {mistaken_for}. Retry, or pass a local path."
     )
 pass
 
@@ -4720,7 +4724,17 @@ def _is_fp8_quant_config(quant_config):
 pass
 
 def check_model_quantization_status(model_name_or_path, token=None):
-    """Check if a model is quantized (works for both HF and local)"""
+    """Check if a model is quantized (works for both HF and local)
+
+    Failing to READ the config is not the same as "this model is not quantized".
+    A bare `except:` here answered `(False, None)` for a 429 or a 5xx on the
+    config fetch, so an nf4 or fp8 base came back as `HF_unquantized`, the
+    nf4/fp4 guard in `merge_and_overwrite_lora` was skipped, and a 16bit merge
+    proceeded against weights it believed were already 16bit. That is the same
+    mistake as reporting an unreachable Hub as a missing model, one call later,
+    and it is worse: it produces a wrong merge rather than no merge. So it is
+    classified the same way.
+    """
     config = None
     # Local path
     if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
@@ -4729,7 +4743,12 @@ def check_model_quantization_status(model_name_or_path, token=None):
             try:
                 with open(config_path, 'r', encoding = "utf-8") as f:
                     config = json.load(f)
-            except:
+            except (OSError, ValueError):
+                # Unreadable or malformed local config.json. Left as "no config"
+                # rather than raised: nothing about it is transient, the directory
+                # is the one the caller named, and the merge reads the same file
+                # again and fails loudly there. Narrowed from a bare `except:`
+                # only so KeyboardInterrupt and SystemExit stop being swallowed.
                 pass
     # HF repo
     else:
@@ -4743,8 +4762,20 @@ def check_model_quantization_status(model_name_or_path, token=None):
             )
             with open(config_path, 'r', encoding="utf-8") as f:
                 config = json.load(f)
-        except:
+        except _HUB_ABSENT_ERRORS:
+            # No config.json in the repo, or no repo at all. Nothing there says
+            # the weights are quantized, so `(False, None)` is the honest answer.
             pass
+        except ValueError:
+            # A malformed body once the file is in hand. Same reasoning as the
+            # local branch: not transient, and the merge re-reads it.
+            pass
+        except Exception as e:
+            raise _hub_unreachable_error(
+                model_name_or_path, e,
+                action = f"reading the quantization config of `{model_name_or_path}`",
+                mistaken_for = "an unquantized model",
+            ) from e
 
     # Detection keys off config.json["quantization_config"]. NVIDIA ModelOpt FP8 checkpoints
     # (e.g. *-Nemotron-*-FP8) instead carry their spec in a separate hf_quant_config.json
@@ -4891,17 +4922,22 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     # answer it gives back is the one priority 5 would have given, so this is
     # only ever "a request that used to fail now resolves". Nothing that used to
     # resolve changes, and nothing that used to raise now silently returns None.
+    # Both Hub calls sit inside this, not just the existence probe. The
+    # quantization lookup is a second, independent round trip, and a partial
+    # outage that lets `ls` through but rate limits the config fetch has to reach
+    # the same fallback: a local 4bit or fp8 base still needs nothing from the
+    # network, so an unreachable Hub must not decide it there either.
+    hf_exists = False
+    hf_is_quantized, hf_quant_type = None, None
     try:
         hf_exists = check_hf_model_exists(model_name, token)
+        if hf_exists:
+            hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
     except RuntimeError:
         if local_path and local_is_quantized and \
             _local_base_completes_without_the_hub(local_quant_type, save_method):
             return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
         raise
-
-    hf_is_quantized, hf_quant_type = None, None
-    if hf_exists:
-        hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
 
     # Priority 3: HF unquantized
     if hf_exists and not hf_is_quantized:
