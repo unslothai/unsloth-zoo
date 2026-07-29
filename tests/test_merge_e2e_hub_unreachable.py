@@ -30,10 +30,18 @@ whether anything was actually written. So the two things asserted here are the t
 things a user experiences: an exception is raised, and no output directory is left
 behind that could be mistaken for a successful export.
 
-Uses the tiny synthetic models from `_merge_e2e_helpers`, so this is CPU-only and
-sub-second. `set_offline_cpu_env()` there already forbids the network; the Hub
-entry points are monkeypatched on top so a failure is deterministic rather than
-dependent on being genuinely offline.
+Uses the tiny synthetic models from `_merge_e2e_helpers`, so this is sub-second.
+`set_offline_cpu_env()` there already forbids the network; the Hub entry points are
+monkeypatched on top so a failure is deterministic rather than dependent on being
+genuinely offline.
+
+The merge math is pinned to CPU. `set_offline_cpu_env()` sets `UNSLOTH_ALLOW_CPU`,
+which permits CPU rather than requiring it, so `_active_merge_device()` still
+prefers whatever accelerator is present: CUDA on a training box, MPS on a Mac. What
+is under test here is control flow, whether the merge raises and whether it writes,
+so the device is incidental, and leaving it to the host makes the result depend on
+hardware these assertions have no opinion about. macos-14 showed why: its
+virtualized MPS reports 7.93 GiB available and then refuses a 256 byte allocation.
 """
 
 from __future__ import annotations
@@ -48,6 +56,16 @@ from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 
 
 FAMILY = "llama"
+
+
+@pytest.fixture(autouse = True)
+def _merge_on_the_cpu(monkeypatch):
+    """Pin `_merge_lora`'s device, for the reason in the module docstring.
+
+    `_active_merge_device` is `lru_cache`d, so replacing the module attribute is
+    both what takes effect and what gets undone cleanly by monkeypatch.
+    """
+    monkeypatch.setattr(saving_utils, "_active_merge_device", lambda: "cpu")
 
 
 def _skip_if_missing():

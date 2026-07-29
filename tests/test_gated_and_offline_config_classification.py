@@ -79,6 +79,28 @@ _REQUESTED = "Outputs/MyModel"
 _ON_DISK = ("outputs", "mymodel")
 
 
+def _require_a_case_sensitive_filesystem(tmp_path):
+    """Same precondition, same reason as in that sibling file, stated not assumed.
+
+    A case difference is the only thing that makes `os.path.exists(name)` miss
+    while `check_local_model_exists(name)` hits, so the shape cannot be written
+    filesystem independently. On macOS APFS and Windows NTFS `os.path.exists`
+    answers True for `Outputs/MyModel`, the local branch is taken, and the
+    resolved path comes back in the requested casing instead of the on-disk one.
+
+    macos-14 and windows-latest both fail here without this: macOS on the path
+    comparison, Windows on `resolved[1] is True`.
+    """
+    probe = tmp_path / "case_probe"
+    probe.mkdir(exist_ok = True)
+    if os.path.exists(str(tmp_path / "CASE_PROBE")):
+        pytest.skip(
+            "case insensitive filesystem: os.path.exists would resolve "
+            f"{_REQUESTED!r} locally and skip the Hub branch under test"
+        )
+    pass
+
+
 class _StubResponse:
     """The attributes `HfHubHTTPError.__init__` actually reads on 1.x."""
     status_code = 403
@@ -284,6 +306,7 @@ def test_a_local_4bit_copy_still_merges_when_the_config_fetch_is_offline(
 ):
     """The new raise must still reach the local fallback, exactly as a 429 does.
     Both 4bit merges fold LoRA into weights already in memory."""
+    _require_a_case_sensitive_filesystem(tmp_path)
     directory = _make_local_model(tmp_path.joinpath(*_ON_DISK), quant_config = _NF4)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
