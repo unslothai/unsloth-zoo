@@ -8446,6 +8446,30 @@ class MLXKTOTrainer(MLXTrainer):
                 "adapter-disabled forward (there is no separate reference copy)."
             )
 
+        # KTO is a text-LoRA-only path: it does NOT replicate the base trainer's
+        # architecture setup (patch_gated_delta) or its VLM batch/forward handling.
+        # Both unsupported cases already hard-fail, so this is UX clarity, not a
+        # correctness fix -- reject up front with a clear message instead of a
+        # cryptic downstream crash:
+        #  - gated-delta (Qwen3.5 / Qwen3-Next): the backward fails with
+        #    "[Primitive::vjp] Not implemented for CustomKernel" (no VJP patch).
+        #  - VLM: the processor has no pad_token_id (batch build) and the model
+        #    returns LanguageModelOutput, not raw logits (forward).
+        if model_has_gated_delta_layers(model):
+            raise NotImplementedError(
+                "Unsloth: MLXKTOTrainer does not support gated-delta models "
+                "(e.g. Qwen3.5 / Qwen3-Next) yet: the KTO loop bypasses the base "
+                "trainer's patch_gated_delta setup, so the backward fails with a "
+                "missing custom-kernel VJP. Use a non-gated-delta model for KTO."
+            )
+        if hasattr(self.tokenizer, "image_processor"):
+            raise NotImplementedError(
+                "Unsloth: MLXKTOTrainer is text-LoRA only and does not support "
+                "vision-language models yet (the VLM processor has no pad_token_id "
+                "and the model returns structured outputs, not raw logits). Use a "
+                "text model + tokenizer for KTO."
+            )
+
         # LoRA+ needs per-leaf gradient scaling (a higher LR on lora_b), which
         # the base trainer weaves into its update path but this KTO loop does
         # not implement. Rather than silently train lora_b at the wrong LR,

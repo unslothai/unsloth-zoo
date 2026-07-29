@@ -269,3 +269,32 @@ def test_kto_rejects_ref_model_kwarg():
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
     with pytest.raises(ValueError, match="ref_model"):
         MLXKTOTrainer(object(), object(), [], args=MLXKTOConfig(), ref_model=object())
+
+
+def test_kto_rejects_gated_delta_and_vlm(monkeypatch):
+    # KTO bypasses the base trainer's patch_gated_delta and VLM handling; both
+    # cases already hard-fail downstream, so train() rejects them up front.
+    import unsloth_zoo.mlx.trainer as T
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+
+    def _mk(tokenizer):
+        tr = MLXKTOTrainer.__new__(MLXKTOTrainer)  # skip __init__ (needs a real model)
+        tr.args = MLXKTOConfig()
+        tr.model = object()
+        tr.tokenizer = tokenizer
+        return tr
+
+    monkeypatch.setattr(T, "iter_mlx_lora_modules", lambda m: [("m", object())])
+
+    # gated-delta model -> reject
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: True)
+    with pytest.raises(NotImplementedError, match="gated-delta"):
+        _mk(object()).train()
+
+    # VLM tokenizer (has image_processor) -> reject
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: False)
+
+    class _VLMTok:
+        image_processor = object()
+    with pytest.raises(NotImplementedError, match="vision-language"):
+        _mk(_VLMTok()).train()
