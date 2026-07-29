@@ -4538,11 +4538,14 @@ def _as_hub_addressed(model_name):
     """
     name = str(model_name)
     if name.startswith("hf://"): name = name[len("hf://"):]
-    # Split a revision only when what precedes it is itself `namespace/name`, so
-    # an `@` inside an ordinary path is left alone.
+    # Split a revision only when what precedes it is addressable, so an `@` inside
+    # an ordinary path is left alone. `gpt2@main` counts: the zero-slash branch of
+    # `resolve_path` splits `@` too, so a canonical single segment id carries a
+    # revision on every release before the 1.16 guard, and 0.36.2 answers repo_id
+    # `gpt2` for it. Requiring exactly one slash here reported that as absent.
     if "@" in name:
         repo_id = name.split("@", 1)[0]
-        if repo_id.count("/") == 1: name = repo_id
+        if repo_id.count("/") <= 1: name = repo_id
     return name
 pass
 

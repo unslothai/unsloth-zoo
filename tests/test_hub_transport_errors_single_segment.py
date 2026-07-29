@@ -239,6 +239,33 @@ def test_a_revision_suffix_does_not_launder_a_filesystem_path(name):
     assert saving_utils._is_hub_repo_id(name) is False
 
 
+@pytest.mark.parametrize("name", ["gpt2@main", "hf://gpt2@main", "bert-base-uncased@main"])
+def test_a_single_segment_id_keeps_its_revision(name):
+    """A revision on a canonical single segment id, which the first version of the
+    split dropped by requiring exactly one slash.
+
+    The zero-slash branch of `resolve_path` splits `@` as well, so this is valid
+    syntax on every release before the 1.16 guard. Verified on 0.36.2:
+
+        resolve_path("gpt2@main")             -> repo_id 'gpt2',              rev 'main'
+        resolve_path("bert-base-uncased@main")-> repo_id 'bert-base-uncased', rev 'main'
+
+    On 1.16+ the id is unaddressable with or without the revision, and there the
+    rejection has to be recognised rather than reported as connectivity, which is
+    the cell below. Caught by Codex on this branch.
+    """
+    assert saving_utils._is_hub_repo_id(name) is True
+
+
+@pytest.mark.parametrize("name", ["gpt2@main", "hf://gpt2@main"])
+def test_a_revisioned_single_segment_id_is_absent_not_unreachable(monkeypatch, name):
+    """1.25.1 names the whole `gpt2@main` in the rejection, so the classifier has to
+    normalise before counting segments or it calls this a transport failure."""
+    message = _REJECTION_MESSAGE.replace("gpt2", "gpt2@main", 1)
+    _patch_ls(monkeypatch, ValueError(message))
+    assert saving_utils.check_hf_model_exists(name) is False
+
+
 def test_rejection_message_on_a_namespaced_name_still_raises(monkeypatch):
     """Scoping stays: `namespace/name` is addressable on every supported
     version, so nothing about it is an id rejection."""
