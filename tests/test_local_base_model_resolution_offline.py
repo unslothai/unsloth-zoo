@@ -143,6 +143,28 @@ def test_local_path_is_absent_not_unreachable(monkeypatch, model_name):
     assert saving_utils.check_hf_model_exists(model_name) is False
 
 
+@pytest.mark.parametrize("model_name", _NOT_REPO_IDS)
+@pytest.mark.parametrize("typed_uris", [False, True])
+def test_a_path_stays_a_path_on_either_huggingface_hub(monkeypatch, model_name, typed_uris):
+    """The same contract, asserted against both answers the Hub parser can give.
+
+    These cells decide whether a string reaches the network at all, and one of the
+    inputs (`models/base/checkpoint-500`) is classified by logic that is gated on
+    whether the installed release maps the `models/` type prefix. A job only ever
+    installs one version, so running under whichever one that is leaves the other
+    branch untested: the version-gated strip landed green here and still broke this
+    file on 1.25.1, which Codex found by running it there.
+
+    Forcing both answers is cheap and removes the dependence on what the runner
+    resolved, which is the whole failure mode this branch is about.
+    """
+    monkeypatch.setattr(
+        saving_utils, "_hub_addresses_typed_model_uris", lambda: typed_uris,
+    )
+    _forbid_hub(monkeypatch)
+    assert saving_utils.check_hf_model_exists(model_name) is False
+
+
 def test_valid_repo_id_is_still_probed(monkeypatch):
     """The gate must not quietly stop checking the Hub for real repo ids.
 
