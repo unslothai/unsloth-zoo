@@ -81,12 +81,48 @@ def _make_local_model(directory, quant_config = None):
     return directory
 
 
-class _RateLimited(HfHubHTTPError):
-    pass
+class _StubResponse:
+    """The attributes `HfHubHTTPError.__init__` actually reads on 1.x."""
+    status_code = 429
+    reason      = "Too Many Requests"
+    url         = "https://huggingface.co/api/models/test"
+    headers     = {}
+    content     = b""
+    text        = ""
+    request     = None
 
 
-class _ServerError(HfHubHTTPError):
-    pass
+def _hub_http_error(message):
+    """Build a real `HfHubHTTPError` whichever way the installed version wants.
+
+    0.x takes a bare message. From 1.0 `response` is keyword-only and required,
+    and the constructor reads `.headers` and `.request` off it. Doing this by
+    signature rather than by version keeps these cells describing the class the
+    Hub really raises across the whole supported range, and `pyproject.toml`
+    allows huggingface_hub>=0.34.0, so the range is wide.
+    """
+    try:
+        return HfHubHTTPError(message)
+    except TypeError:
+        return HfHubHTTPError(message, response = _StubResponse())
+
+
+def _hub_error(cls, message):
+    """Same signature-not-version handling for the other HTTP-backed classes.
+    `RepositoryNotFoundError` and `GatedRepoError` inherit the required `response`
+    on 1.x; `EntryNotFoundError` and `OfflineModeIsEnabled` do not."""
+    try:
+        return cls(message)
+    except TypeError:
+        return cls(message, response = _StubResponse())
+
+
+def _RateLimited(message = "429 Client Error: Too Many Requests"):
+    return _hub_http_error(message)
+
+
+def _ServerError(message = "503 Server Error: Service Unavailable"):
+    return _hub_http_error(message)
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +130,8 @@ class _ServerError(HfHubHTTPError):
 # ---------------------------------------------------------------------------
 
 _TRANSPORT_ERRORS = [
-    pytest.param(lambda: _RateLimited("429 Client Error: Too Many Requests"), id = "rate-limited-429"),
-    pytest.param(lambda: _ServerError("503 Server Error: Service Unavailable"), id = "server-error-503"),
+    pytest.param(_RateLimited, id = "rate-limited-429"),
+    pytest.param(_ServerError, id = "server-error-503"),
     pytest.param(lambda: ConnectionError("Temporary failure in name resolution"), id = "dns-failure"),
     pytest.param(lambda: TimeoutError("Read timed out"), id = "read-timeout"),
     pytest.param(lambda: OfflineModeIsEnabled("Offline mode is enabled"), id = "hf-hub-offline"),
@@ -121,7 +157,7 @@ def test_the_error_says_it_is_not_a_statement_about_quantization(monkeypatch):
     """"not a missing model" is the wrong reassurance for this caller, which was
     asking whether the weights are quantized, not whether the repo is there."""
     _patch_ls_present(monkeypatch)
-    _patch_config_fetch(monkeypatch, _RateLimited("429"))
+    _patch_config_fetch(monkeypatch, _RateLimited())
 
     with pytest.raises(RuntimeError) as excinfo:
         saving_utils.check_model_quantization_status(_REPO)
@@ -148,8 +184,8 @@ def test_transport_failure_does_not_return_false(monkeypatch, make_error):
 # ---------------------------------------------------------------------------
 
 _ABSENT_ERRORS = [
-    pytest.param(lambda: EntryNotFoundError("config.json not found"), id = "no-config-in-repo"),
-    pytest.param(lambda: RepositoryNotFoundError("404 repo not found"), id = "repo-absent"),
+    pytest.param(lambda: _hub_error(EntryNotFoundError, "config.json not found"), id = "no-config-in-repo"),
+    pytest.param(lambda: _hub_error(RepositoryNotFoundError, "404 repo not found"), id = "repo-absent"),
     pytest.param(lambda: FileNotFoundError("config.json"), id = "fsspec-file-not-found"),
     pytest.param(lambda: ValueError("Expecting value: line 1 column 1"), id = "malformed-body"),
 ]
@@ -222,7 +258,7 @@ def test_local_4bit_still_resolves_when_only_the_config_fetch_fails(
     )
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
-    _patch_config_fetch(monkeypatch, _RateLimited("429"))
+    _patch_config_fetch(monkeypatch, _RateLimited())
 
     resolved = saving_utils.determine_base_model_source(_REQUESTED, None, save_method)
     import os
@@ -240,7 +276,7 @@ def test_local_4bit_plus_16bit_merge_still_raises(monkeypatch, tmp_path):
     )
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
-    _patch_config_fetch(monkeypatch, _RateLimited("429"))
+    _patch_config_fetch(monkeypatch, _RateLimited())
 
     with pytest.raises(RuntimeError):
         saving_utils.determine_base_model_source(_REQUESTED, None, "merged_16bit")
@@ -255,7 +291,7 @@ def test_local_fp8_resolves_for_a_16bit_merge(monkeypatch, tmp_path):
     )
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
-    _patch_config_fetch(monkeypatch, _RateLimited("429"))
+    _patch_config_fetch(monkeypatch, _RateLimited())
 
     resolved = saving_utils.determine_base_model_source(_REQUESTED, None, "merged_16bit")
     import os
@@ -268,7 +304,7 @@ def test_no_local_copy_propagates(monkeypatch, tmp_path):
     what the caller sees, rather than a `(None, ...)` that writes no files."""
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
-    _patch_config_fetch(monkeypatch, _RateLimited("429"))
+    _patch_config_fetch(monkeypatch, _RateLimited())
 
     with pytest.raises(RuntimeError):
         saving_utils.determine_base_model_source("ns/absent", None, "merged_16bit")
