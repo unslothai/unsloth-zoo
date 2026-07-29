@@ -6179,6 +6179,8 @@ def _reject_dora_dropout(cfg):
             "training-mode formulas. Zero the dropout before converting."
         )
 _PEFT_NEUTRAL_KEYS = {
+    # task_type is checked explicitly above; listed here so the unknown-field
+    # sweep does not reject the CAUSAL_LM value that check accepts.
     "task_type", "inference_mode", "init_lora_weights", "peft_version",
     "auto_mapping", "fan_in_fan_out", "exclude_modules",
     # EVA redistributes ranks/alphas through the supported pattern fields and
@@ -6222,10 +6224,23 @@ def normalize_peft_adapter_config(cfg, adapter_dir=None):
     ValueError naming the first unsupported field, so an adapter is refused
     before the expensive base-model load.
     """
-    if str(cfg.get("peft_type", "")).upper() != "LORA":
+    # A dict straight from LoraConfig.to_dict() carries peft's enums, whose
+    # str() is "PeftType.LORA"; adapter JSON carries the bare value.
+    peft_type = cfg.get("peft_type", "")
+    if str(getattr(peft_type, "value", peft_type)).upper() != "LORA":
         raise ValueError(
             f"Unsloth MLX: only peft_type='LORA' adapters can be imported; "
             f"got {cfg.get('peft_type')!r}."
+        )
+    # The MLX backend builds a causal language model, so an adapter trained
+    # for another task would attach its backbone factors and then answer with
+    # vocabulary logits instead of what it was trained to produce.
+    task_type = cfg.get("task_type")
+    task_type = getattr(task_type, "value", task_type)
+    if task_type is not None and str(task_type).upper() != "CAUSAL_LM":
+        raise ValueError(
+            f"Unsloth MLX: task_type={task_type!r} adapters cannot be "
+            "imported; the MLX backend serves CAUSAL_LM only."
         )
     _reject_dora_dropout(cfg)
     if cfg.get("bias") not in (None, "none"):
