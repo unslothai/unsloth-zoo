@@ -8135,6 +8135,7 @@ def test_stream_width_policy_and_registry_contracts():
     from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
     from unsloth_zoo.mlx.trainer import (
         _StreamSignatureRegistry, _StreamWidthPolicy, _stream_batch_signature,
+        _stream_guard_report,
     )
     from unsloth_zoo.mlx.utils import (
         _stage_text_batch_from_items, _stage_tokenized_text_batch,
@@ -8170,6 +8171,22 @@ def test_stream_width_policy_and_registry_contracts():
     # Widened, with true lengths kept so masking never sees the tail.
     assert guarded.ids.shape == (2, 65)
     assert np.array_equal(guarded.lengths_info, plain.lengths_info)
+
+    # Armed through the production path, which derives the allowance itself.
+    gated, counted = _StreamWidthPolicy(StreamShapeGrid(anchor=512)), _StreamSignatureRegistry(128)
+    gated.arm(counted)
+    assert (gated.armed, gated.exact_ceiling) == (True, 32)
+    assert gated.observed is counted.observed
+    gated.exact_ceiling = 2
+    rep = lambda: _stream_guard_report(gated, counted, "full_step")
+    for index in range(3):
+        assert gated(55) is None, index
+        counted.record(("k", index))
+    assert (rep().action, rep().gate_released, rep().exact_ceiling) == (
+        "stream_exact", False, 2)
+    # One signature past the allowance the same object widens.
+    assert gated(55) == 65 and gated.gate_released
+    assert rep().action == "stream_grid"
 
     registry = _StreamSignatureRegistry(1)
 

@@ -561,6 +561,7 @@ from .shape_guard import (
     TextShapeGuardReport,
     build_text_shape_frontier,
     describe_stream_shape_grid,
+    stream_exact_ceiling,
     materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
@@ -1396,16 +1397,46 @@ class _StreamWidthPolicy:
     Handed over disarmed (returns None, so staging keeps its own rule) because
     staging is wired before the compile decision resolves; the trainer arms
     this same object later, which also reaches a running prefetch thread.
+
+    An armed policy still declines while the run has compiled no more than
+    ``exact_ceiling`` signatures, so a stream whose diversity never justifies
+    a grid pays no padding. Declining is per batch rather than a disarm
+    because the prefetch seams pick their finalizer once from ``armed``: a
+    policy armed later than that would never widen at all.
     """
 
-    __slots__ = ("grid", "armed")
+    __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
 
     def __init__(self, grid):
         self.grid = grid
         self.armed = False
+        self.exact_ceiling = None
+        self.observed = None
+        self.gate_released = False
+
+    def arm(self, registry):
+        """Arm against the set the cap binds on, so the exact allowance and
+        the bound it protects are counted in the same units."""
+        self.observed = registry.observed
+        self.exact_ceiling = stream_exact_ceiling(self.grid, registry.cap)
+        self.armed = True
+
+    @property
+    def holding(self):
+        """True while the exact allowance still applies. Lets a caller skip
+        work whose only purpose is choosing an endpoint."""
+        return (
+            self.armed
+            and self.exact_ceiling is not None
+            and self.observed is not None
+            and len(self.observed) <= self.exact_ceiling
+        )
 
     def __call__(self, width):
-        return self.grid.endpoint_for(width) if self.armed else None
+        if not self.armed or self.holding:
+            return None
+        self.gate_released = True
+        return self.grid.endpoint_for(width)
 
 
 def _stream_execution_key():
@@ -1486,7 +1517,11 @@ def _stream_guard_report(policy, registry, compile_scope):
     """Final streaming-guard telemetry, built once the counts are settled."""
     grid = policy.grid
     return StreamShapeGuardReport(
-        action="stream_grid",
+        # A run whose policy never released its exact allowance must not
+        # report a grid action. Tracks the policy's own transition, not
+        # per-batch outcomes: a released policy may still hand back an
+        # endpoint equal to the width it was given.
+        action="stream_grid" if policy.gate_released else "stream_exact",
         reason="streaming",
         cap=registry.cap,
         compile_scope=compile_scope,
@@ -1497,6 +1532,8 @@ def _stream_guard_report(policy, registry, compile_scope):
         observed_signatures=len(registry.observed),
         tripped=registry.tripped,
         trip_reason=registry.trip_reason,
+        exact_ceiling=policy.exact_ceiling,
+        gate_released=policy.gate_released,
     )
 
 
@@ -6570,15 +6607,16 @@ class MLXTrainer:
             # Armed only now: compile setup can still fall back to eager, and
             # arming earlier would grid-pad that run, add a collective it does
             # not need, and report a plan that never existed.
-            _stream_policy.armed = True
             _stream_registry = _StreamSignatureRegistry(
                 resolve_compile_max_variants(args.compile_max_variants),
             )
+            _stream_policy.arm(_stream_registry)
             # A later fallback rewrites _compile_scope, which would make the
             # report describe a callable that compiled none of these.
             _stream_scope = _compile_scope
             _main_print(describe_stream_shape_grid(
                 _stream_policy.grid, _stream_registry.cap,
+                _stream_policy.exact_ceiling,
             ))
         while self._global_step < total_steps:
             it = microstep + 1

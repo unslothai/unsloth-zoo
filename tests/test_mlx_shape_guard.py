@@ -8,6 +8,7 @@ from unsloth_zoo.mlx.shape_guard import (
     AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
+    SMALL_EXACT_SIGNATURE_THRESHOLD,
     STREAM_GRID_FLOOR_WIDTH,
     StreamShapeGrid,
     StreamShapeGuardReport,
@@ -20,6 +21,7 @@ from unsloth_zoo.mlx.shape_guard import (
     plan_text_shape_padding_budget,
     resolve_compile_max_variants,
     select_text_shape_padding_budget,
+    stream_exact_ceiling,
 )
 
 
@@ -473,17 +475,27 @@ def test_stream_grid_anchor_and_report_contract():
         action="stream_grid", reason="streaming", cap=128,
         compile_scope=FULL_STEP_SCOPE, grid_ratio="21/20", grid_floor=2,
         grid_anchor=4096, grid_endpoints=60, observed_signatures=7,
+        gate_released=True,
     )
 
     payload = report.to_dict()
     assert set(payload) == {
         "action", "reason", "cap", "compile_scope", "grid_ratio", "grid_floor",
         "grid_anchor", "grid_endpoints", "observed_signatures", "tripped",
-        "trip_reason", "exact_width_only",
+        "trip_reason", "exact_width_only", "exact_ceiling", "gate_released",
     }
-    assert payload["action"] == "stream_grid"
+    assert (payload["action"], payload["gate_released"]) == ("stream_grid", True)
     assert (payload["observed_signatures"], payload["tripped"]) == (7, False)
     assert (payload["grid_endpoints"], payload["grid_anchor"]) == (60, 4096)
     # Reports the grid it was handed, not the default ratio.
     assert "1.05" in describe_stream_shape_grid(StreamShapeGrid(anchor=4096), 128)
     assert "2.00" in describe_stream_shape_grid(StreamShapeGrid(ratio=2), 128)
+
+    # Tightest clamp wins, and the allowance vanishes once endpoints or the
+    # cap leave nothing to spend. 60 endpoints here, so cap 64 leaves only 4.
+    wide = StreamShapeGrid(anchor=4096)
+    assert [stream_exact_ceiling(g, c) for g, c in (
+        (wide, 128), (wide, 64), (StreamShapeGrid(), 64), (wide, 60),
+    )] == [SMALL_EXACT_SIGNATURE_THRESHOLD, 4, 16, None]
+    assert "at most 32 signatures" in describe_stream_shape_grid(wide, 128, 32)
+    assert "stay exact" not in describe_stream_shape_grid(wide, 128, None)

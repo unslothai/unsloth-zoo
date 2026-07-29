@@ -138,6 +138,8 @@ class StreamShapeGuardReport:
     tripped: bool = False
     trip_reason: str = ""
     exact_width_only: bool = False
+    exact_ceiling: int | None = None
+    gate_released: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -235,15 +237,48 @@ class StreamShapeGrid:
         return len(self._endpoints)
 
 
-def describe_stream_shape_grid(grid, cap):
-    """One-line summary of the endpoint policy a streaming run will use."""
+def stream_exact_ceiling(grid, cap):
+    """Signatures a stream may compile before widths widen onto the grid.
+
+    Staging precedes admission, so the batch introducing the signature past
+    this count is itself staged exact and a synchronous run compiles one more
+    than the ceiling. A text prefetch producer consults this while staging and
+    can queue further exact batches ahead of the consumer; the VLM prefetch
+    path decides after dequeue, so it adds none.
+
+    Below this a width grid cannot pay for itself, the same judgement the
+    finite path makes with ``SMALL_EXACT_SIGNATURE_THRESHOLD``. Exact
+    signatures are sunk in the compile cache, so the allowance is also held
+    to a quarter of the cap and, for an anchored grid, to whatever the
+    endpoints leave unclaimed. ``None`` disables it: widen from the first
+    batch, which is the behaviour of a run with no headroom to spend.
+    """
+    cap = int(cap)
+    ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)
+    endpoints = grid.endpoint_count
+    if endpoints is not None:
+        ceiling = min(ceiling, cap - endpoints)
+    return ceiling if ceiling > 0 else None
+
+
+def describe_stream_shape_grid(grid, cap, exact_ceiling=None):
+    """One-line summary of the endpoint policy a streaming run will use.
+
+    States configuration, not outcome: at startup a run that stays exact and
+    one that later widens are indistinguishable.
+    """
 
     count = grid.endpoint_count
     reach = "unbounded" if count is None else f"{count} endpoints"
+    allowance = (
+        "" if exact_ceiling is None else
+        f" widths stay exact while at most {exact_ceiling} signatures have "
+        f"been compiled, after which"
+    )
     return (
-        f"Unsloth: streaming compile shapes are bounded to {cap} signatures "
-        f"over a {reach} width grid (ratio {float(grid.ratio):.2f}, floor "
-        f"{STREAM_GRID_FLOOR_WIDTH})."
+        f"Unsloth: streaming compile shapes are bounded to {cap} signatures;"
+        f"{allowance} widths widen over a {reach} grid (ratio "
+        f"{float(grid.ratio):.2f}, floor {STREAM_GRID_FLOOR_WIDTH})."
     )
 
 
@@ -953,6 +988,7 @@ __all__ = (
     "StreamShapeGrid",
     "StreamShapeGuardReport",
     "describe_stream_shape_grid",
+    "stream_exact_ceiling",
     "TextShapeEvent",
     "TextShapeFrontier",
     "TextShapeGuardReport",

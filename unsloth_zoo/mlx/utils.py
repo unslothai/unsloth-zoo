@@ -7643,6 +7643,10 @@ def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
     tokenizer = getattr(processor, "tokenizer", processor)
     if getattr(tokenizer, "pad_token_id", None) is None:
         return None
+    # The survey exists only to pick an endpoint; skip it while the policy is
+    # not choosing one.
+    if getattr(width_policy, "holding", False):
+        return None
     width, _axes, padable, forbidden = _vlm_width_survey(
         batch_dict, disposable_keys=_vlm_pipeline_disposable_keys(config),
     )
