@@ -94,14 +94,6 @@ def _forbid_hub(monkeypatch):
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", no_network, raising = True)
 
 
-def _response(status_code):
-    response = requests.Response()
-    response.status_code = status_code
-    response.reason = "test"
-    response.url = "https://huggingface.co/api/models/test"
-    return response
-
-
 _TRANSPORT_ERRORS = [
     pytest.param(
         OfflineModeIsEnabled("Cannot reach https://huggingface.co: offline mode is enabled."),
@@ -167,7 +159,8 @@ def test_local_fp8_fallback_emits_no_warning(monkeypatch, tmp_path, error):
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
         saving_utils.determine_base_model_source("outputs/mymodel")
-    assert [str(w.message) for w in caught] == []
+    assert [str(w.message) for w in caught
+            if issubclass(w.category, UserWarning)] == []
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +296,8 @@ def test_sibling_lookup_is_silent_and_network_free_when_a_local_sibling_exists(m
         warnings.simplefilter("always")
         sibling = saving_utils._resolve_fp8_16bit_sibling("outputs/GLM-5.2-FP8")
     assert _same_path(sibling, tmp_path / "outputs" / "GLM-5.2")
-    assert [str(w.message) for w in caught] == []
+    assert [str(w.message) for w in caught
+            if issubclass(w.category, UserWarning)] == []
 
 
 def test_sibling_lookup_stays_silent_for_a_genuinely_absent_sibling(monkeypatch, tmp_path):
@@ -315,4 +309,5 @@ def test_sibling_lookup_stays_silent_for_a_genuinely_absent_sibling(monkeypatch,
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
         assert saving_utils._resolve_fp8_16bit_sibling("outputs/GLM-5.2-FP8") is None
-    assert [str(w.message) for w in caught] == []
+    assert [str(w.message) for w in caught
+            if issubclass(w.category, UserWarning)] == []

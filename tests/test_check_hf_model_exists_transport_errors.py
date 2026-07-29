@@ -147,7 +147,51 @@ _ABSENT_ERRORS = [
 @pytest.mark.parametrize("error", _ABSENT_ERRORS)
 def test_absent_repo_still_returns_false(monkeypatch, error):
     _patch_ls(monkeypatch, error)
-    assert saving_utils.check_hf_model_exists("unslothai/definitely-not-a-real-repo") is False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert saving_utils.check_hf_model_exists("unslothai/definitely-not-a-real-repo") is False
+
+
+# ---------------------------------------------------------------------------
+# A gated repo answers False like an absent one, but it is not absent, and the
+# difference is the only actionable thing the user can act on.
+# ---------------------------------------------------------------------------
+
+def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
+    """It stays False on purpose, so a local copy still wins and gated bases keep
+    working. But a gated repo demonstrably exists, and reporting it as missing
+    sends the user looking for a typo they do not have."""
+    _patch_ls(monkeypatch, GatedRepoError("403 gated repo", response = _response(403)))
+
+    with pytest.warns(UserWarning) as caught:
+        assert saving_utils.check_hf_model_exists("meta-llama/Llama-3.2-1B") is False
+
+    message = "\n".join(str(w.message) for w in caught)
+    assert "gated" in message
+    assert "meta-llama/Llama-3.2-1B" in message
+    assert "token" in message
+
+
+def test_gated_repo_is_not_swallowed_by_its_base_class(monkeypatch):
+    """GatedRepoError subclasses RepositoryNotFoundError, which is in the absent
+    tuple, so the gated clause has to come first or the warning never fires. Pinned
+    because reordering the handlers would silently lose it."""
+    assert issubclass(GatedRepoError, RepositoryNotFoundError), "premise of the ordering"
+    assert GatedRepoError not in saving_utils._HUB_ABSENT_ERRORS, (
+        "gated is handled by its own clause, ahead of the absent tuple"
+    )
+    _patch_ls(monkeypatch, GatedRepoError("403 gated repo", response = _response(403)))
+    with pytest.warns(UserWarning):
+        saving_utils.check_hf_model_exists("meta-llama/Llama-3.2-1B")
+
+
+def test_a_plain_absent_repo_does_not_warn_about_gating(monkeypatch):
+    """The complement: nothing about a 404 should mention accepting terms."""
+    _patch_ls(monkeypatch, RepositoryNotFoundError("404", response = _response(404)))
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        assert saving_utils.check_hf_model_exists("ns/nope") is False
+    assert [w for w in caught if "gated" in str(w.message)] == []
 
 
 # ---------------------------------------------------------------------------

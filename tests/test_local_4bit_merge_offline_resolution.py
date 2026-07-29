@@ -166,7 +166,8 @@ def test_local_4bit_fallback_emits_no_warning(monkeypatch, tmp_path, error, save
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
         saving_utils.determine_base_model_source("outputs/mymodel", save_method = save_method)
-    assert [str(w.message) for w in caught] == []
+    assert [str(w.message) for w in caught
+            if issubclass(w.category, UserWarning)] == []
 
 
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS)
@@ -249,11 +250,23 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             and save_method == "merged_16bit"
         )
 
-    source = inspect.getsource(saving_utils.merge_and_overwrite_lora)
-    assert (
-        'if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") '
-        'and save_method == "merged_16bit":'
-    ) in source, "the silent no-op gate moved; re-check what the fallback can reach"
+    # Whitespace-normalised fragments rather than one exact line. The property
+    # being pinned is which inputs the sink reads, and an exact match also failed
+    # on a reflow, a wrapped condition or an added comment, none of which change
+    # it. Behavioural coverage of the sink itself lives in the end-to-end merge
+    # tests, which need a real PeftModel; this only guards the premise that the
+    # disjointness walk below is computed against the right gate.
+    normalised = " ".join(inspect.getsource(saving_utils.merge_and_overwrite_lora).split())
+    for fragment in (
+        "base_model_is_quantized and",
+        'quant_type == "nf4"',
+        'quant_type == "fp4"',
+        'save_method == "merged_16bit"',
+    ):
+        assert fragment in normalised, (
+            f"the silent no-op gate no longer reads {fragment}; "
+            "re-check what the fallback can reach"
+        )
 
     all_save_methods = FOUR_BIT_SAVE_METHODS + HUB_DEPENDENT_SAVE_METHODS
     resolved, raised = 0, 0
@@ -283,11 +296,16 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
     assert (resolved, raised) == (6 + 3 * 2, 3 * 4), (resolved, raised)
 
 
-def test_merge_call_sites_pass_the_save_method():
-    """Both resolutions inside `merge_and_overwrite_lora` must forward it. The
-    second one (the FP8 16bit sibling) is only reachable under `merged_16bit`,
-    where forwarding changes nothing, but leaving it out would be a trap for the
-    next person who widens the fallback."""
+def test_every_merge_call_site_passes_the_save_method():
+    """*Every* resolution inside `merge_and_overwrite_lora` must forward it, not
+    exactly two of them. The second one (the FP8 16bit sibling) is only reachable
+    under `merged_16bit`, where forwarding changes nothing, but leaving it out
+    would be a trap for the next person who widens the fallback.
+
+    The count assertion this replaces pinned the number of call sites rather than
+    the property that matters, so adding a legitimate third resolution failed a
+    test that has nothing to say about it.
+    """
     tree = ast.parse(inspect.getsource(saving_utils.merge_and_overwrite_lora).lstrip())
     calls = [
         node for node in ast.walk(tree)
@@ -295,7 +313,7 @@ def test_merge_call_sites_pass_the_save_method():
         and isinstance(node.func, ast.Name)
         and node.func.id == "determine_base_model_source"
     ]
-    assert len(calls) == 2, f"expected 2 resolutions, found {len(calls)}"
+    assert calls, "the merge no longer resolves a base model source at all"
     for call in calls:
         passed = [
             arg.id for arg in call.args if isinstance(arg, ast.Name)

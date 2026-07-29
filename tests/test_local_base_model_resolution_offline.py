@@ -50,7 +50,6 @@ for everything that gets past them.
 
 import json
 import os
-import warnings
 
 import pytest
 import requests

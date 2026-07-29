@@ -2932,9 +2932,11 @@ def merge_and_overwrite_lora(
             # succeeded while creating no output directory at all, and the only
             # signal would be a UserWarning that scrolls past in a notebook.
             raise RuntimeError(
-                f"Unsloth: Model {model_name} not found locally or on Hugging Face, so the "
-                f"{save_method} merge cannot obtain the base weights. Nothing was written to "
-                f"`{save_directory}`."
+                f"Unsloth: Model {model_name} could not be read locally or on Hugging Face, "
+                f"so the {save_method} merge cannot obtain the base weights. Nothing was "
+                f"written to `{save_directory}`. If the repo exists, it is either gated (accept "
+                f"its terms or pass a token with access, and see the warning above) or the name "
+                f"is wrong."
             )
         model_name = final_model_name
 
@@ -4488,12 +4490,16 @@ pass
 # RevisionNotFoundError or HFValidationError. Every other failure (429, 5xx,
 # DNS, read timeout, OfflineModeIsEnabled) propagates out of `ls` unchanged,
 # which is exactly what lets us tell "absent" apart from "unreachable".
+#
+# GatedRepoError is deliberately NOT in here even though it also answers False.
+# It subclasses RepositoryNotFoundError, so it would be swallowed by this tuple;
+# it gets its own clause first, because a gated repo demonstrably exists and the
+# user needs to be told that rather than sent looking for a typo.
 _HUB_ABSENT_ERRORS = (
     FileNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
     EntryNotFoundError,
-    GatedRepoError,
 # Plus the invalid-repo-id errors: "this string cannot name a repo" is a
 # statement about the argument, never about connectivity, so it answers False
 # rather than raising. Both are ValueError subclasses, and naming the two
@@ -4560,6 +4566,20 @@ def check_hf_model_exists(model_name, token=None):
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
         return any(x["name"].endswith(".safetensors") for x in file_list)
+    except GatedRepoError as e:
+        # Must precede _HUB_ABSENT_ERRORS, which contains its base class
+        # RepositoryNotFoundError. False is deliberate and unchanged, so a local
+        # copy still wins and gated bases keep working exactly as they do today.
+        # But "absent" is not the reason, and the caller would otherwise be told
+        # the model was "not found locally or on Hugging Face" and go looking for
+        # a typo, so say the actionable thing where it is known.
+        warnings.warn(
+            f"Unsloth: `{model_name}` is gated on the Hugging Face Hub and the current "
+            f"token cannot read it ({type(e).__name__}: {e}). Accept the model terms on "
+            f"its Hub page, or pass a token that has access. Falling back to a local copy "
+            f"if there is one."
+        )
+        return False
     except _HUB_ABSENT_ERRORS:
         return False
     except NotImplementedError:
