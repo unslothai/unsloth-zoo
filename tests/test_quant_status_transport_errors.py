@@ -41,6 +41,8 @@ one call later, so it is classified the same way. Every test here monkeypatches
 the two Hub entry points, so nothing touches the network.
 """
 
+import os
+
 import huggingface_hub
 import pytest
 import requests
@@ -328,6 +330,29 @@ _REQUESTED = "Outputs/MyModel"
 _ON_DISK = ("outputs", "mymodel")
 
 
+def _require_a_case_sensitive_filesystem(tmp_path):
+    """State the precondition the shape above depends on, rather than assume it.
+
+    A case difference is the only thing that makes `os.path.exists(name)` miss
+    while `check_local_model_exists(name)` hits, because case insensitive matching
+    is the whole purpose of that helper. So there is no filesystem independent way
+    to write this shape, and on a case insensitive filesystem (macOS APFS, Windows
+    NTFS) `os.path.exists("Outputs/MyModel")` answers True, the local branch is
+    taken, and the Hub round trip these tests are named for never happens.
+
+    Left implicit, that turns them into tests that pass while exercising nothing.
+    Skipping says so out loud instead.
+    """
+    probe = tmp_path / "case_probe"
+    probe.mkdir(exist_ok = True)
+    if os.path.exists(str(tmp_path / "CASE_PROBE")):
+        pytest.skip(
+            "case insensitive filesystem: os.path.exists would resolve "
+            f"{_REQUESTED!r} locally and skip the Hub branch under test"
+        )
+    pass
+
+
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit"])
 def test_local_4bit_still_resolves_when_only_the_config_fetch_fails(
     monkeypatch, tmp_path, save_method,
@@ -339,6 +364,7 @@ def test_local_4bit_still_resolves_when_only_the_config_fetch_fails(
         tmp_path.joinpath(*_ON_DISK),
         quant_config = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"},
     )
+    _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _RateLimited())
@@ -357,6 +383,7 @@ def test_local_4bit_plus_16bit_merge_still_raises(monkeypatch, tmp_path):
         tmp_path.joinpath(*_ON_DISK),
         quant_config = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"},
     )
+    _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _RateLimited())
@@ -372,6 +399,7 @@ def test_local_fp8_resolves_for_a_16bit_merge(monkeypatch, tmp_path):
         tmp_path.joinpath(*_ON_DISK),
         quant_config = {"quant_method": "fp8"},
     )
+    _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _RateLimited())
@@ -385,6 +413,7 @@ def test_local_fp8_resolves_for_a_16bit_merge(monkeypatch, tmp_path):
 def test_no_local_copy_propagates(monkeypatch, tmp_path):
     """Nothing local can answer, so the outage is the whole story and must be
     what the caller sees, rather than a `(None, ...)` that writes no files."""
+    _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _RateLimited())
@@ -403,6 +432,7 @@ def test_an_exactly_named_local_directory_never_reaches_the_config_fetch(
         tmp_path.joinpath(*_ON_DISK),
         quant_config = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"},
     )
+    _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
 
