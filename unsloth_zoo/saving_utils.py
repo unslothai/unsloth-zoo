@@ -4779,23 +4779,26 @@ def check_model_quantization_status(model_name_or_path, token=None):
                 pass
     # HF repo
     else:
+        # The fetch and the parse are separate `try`s on purpose, because their
+        # failures mean opposite things and one exception class covers both.
+        # `json.JSONDecodeError` and `requests.exceptions.JSONDecodeError` are
+        # ValueError subclasses, so a single handler that forgives a malformed file
+        # also forgives a proxy mangling the API response mid-download, and that is
+        # the transport failure reported as "unquantized" that this function was
+        # narrowed to stop. Splitting them means the download is classified as a Hub
+        # operation and the parse as a local one.
+        from huggingface_hub import hf_hub_download
+        config_path = None
         try:
-            from huggingface_hub import hf_hub_download
             config_path = hf_hub_download(
                 repo_id = model_name_or_path,
                 filename = "config.json",
                 cache_dir = None,
                 token = token
             )
-            with open(config_path, 'r', encoding="utf-8") as f:
-                config = json.load(f)
         except _HUB_ABSENT_ERRORS:
             # No config.json in the repo, or no repo at all. Nothing there says
             # the weights are quantized, so `(False, None)` is the honest answer.
-            pass
-        except ValueError:
-            # A malformed body once the file is in hand. Same reasoning as the
-            # local branch: not transient, and the merge re-reads it.
             pass
         except Exception as e:
             raise _hub_unreachable_error(
@@ -4803,6 +4806,15 @@ def check_model_quantization_status(model_name_or_path, token=None):
                 action = f"reading the quantization config of `{model_name_or_path}`",
                 mistaken_for = "an unquantized model",
             ) from e
+
+        if config_path is not None:
+            try:
+                with open(config_path, 'r', encoding="utf-8") as f:
+                    config = json.load(f)
+            except (OSError, ValueError):
+                # The file is in hand and unreadable. Deterministic, same as the
+                # local branch: not the network's fault and not worth raising for.
+                pass
 
     # Detection keys off config.json["quantization_config"]. NVIDIA ModelOpt FP8 checkpoints
     # (e.g. *-Nemotron-*-FP8) instead carry their spec in a separate hf_quant_config.json

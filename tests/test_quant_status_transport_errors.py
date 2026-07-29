@@ -43,6 +43,7 @@ the two Hub entry points, so nothing touches the network.
 
 import huggingface_hub
 import pytest
+import requests
 from huggingface_hub.errors import (
     EntryNotFoundError,
     HfHubHTTPError,
@@ -187,8 +188,50 @@ _ABSENT_ERRORS = [
     pytest.param(lambda: _hub_error(EntryNotFoundError, "config.json not found"), id = "no-config-in-repo"),
     pytest.param(lambda: _hub_error(RepositoryNotFoundError, "404 repo not found"), id = "repo-absent"),
     pytest.param(lambda: FileNotFoundError("config.json"), id = "fsspec-file-not-found"),
-    pytest.param(lambda: ValueError("Expecting value: line 1 column 1"), id = "malformed-body"),
+    # A bare ValueError out of the *download* is deliberately NOT here. It was,
+    # on the assumption that a malformed body is deterministic, and that is what
+    # let a mangling proxy answer "unquantized". Whether an unreadable config is
+    # transient depends on which step failed, so the two steps get their own
+    # tests: test_a_mangled_proxy_response_on_the_download_raises and
+    # test_a_malformed_downloaded_config_does_not_raise.
 ]
+
+
+def test_a_mangled_proxy_response_on_the_download_raises(monkeypatch):
+    """The subtle half, and the one an earlier revision of this fix got wrong.
+
+    `json.JSONDecodeError` and `requests.exceptions.JSONDecodeError` are both
+    ValueError subclasses, so a single `except ValueError` that forgives a
+    malformed config.json ALSO forgives a captive portal or mangling middlebox
+    corrupting the API response mid-download. That is a transport failure being
+    reported as "this model is not quantized", which is the exact defect this
+    function was narrowed to stop, reintroduced one layer down.
+
+    The fetch and the parse are therefore classified separately: this must raise,
+    while `test_absent_or_malformed_config_still_reports_unquantized` below pins
+    that an unreadable file already in hand must not.
+    """
+    _patch_ls_present(monkeypatch)
+    _patch_config_fetch(
+        monkeypatch,
+        requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.check_model_quantization_status(_REPO)
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
+
+
+def test_a_malformed_downloaded_config_does_not_raise(monkeypatch, tmp_path):
+    """The complement: the download succeeded, the bytes on disk are junk. Nothing
+    transient about that, so it stays `(False, None)` like the local branch."""
+    blob = tmp_path / "config.json"
+    blob.write_text("{not json", encoding = "utf-8")
+    _patch_ls_present(monkeypatch)
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download",
+        lambda *args, **kwargs: str(blob), raising = True,
+    )
+    assert saving_utils.check_model_quantization_status(_REPO) == (False, None)
 
 
 @pytest.mark.parametrize("make_error", _ABSENT_ERRORS)
