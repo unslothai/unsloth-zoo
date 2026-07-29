@@ -999,3 +999,43 @@ def test_native_nested_adapter_is_not_guessed_on_export(tmp_path, base_dir):
     assert not getattr(model, "_unsloth_tree_prefix", "")
     with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring|not possible"):
         save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
+
+
+def _peft_task_type(name):
+    # A config built with peft's TaskType keeps the enum, while adapter JSON
+    # carries the bare string; both spellings must reach the same verdict.
+    from peft import TaskType
+    return getattr(TaskType, name)
+
+
+@pytest.mark.parametrize("cfg_extra, refused", [
+    ({"task_type": "CAUSAL_LM"}, False),
+    ({"task_type": "causal_lm"}, False),
+    ({}, False),
+    ({"task_type": "SEQ_CLS"}, True),
+    ({"task_type": "SEQ_2_SEQ_LM"}, True),
+    ({"task_type": _peft_task_type("CAUSAL_LM")}, False),
+])
+def test_import_refuses_non_causal_task(cfg_extra, refused):
+    # The backend serves causal LMs, so a differently-tasked adapter would
+    # bind its backbone factors and answer with vocabulary logits.
+    from unsloth_zoo.saving_utils import normalize_peft_adapter_config
+    cfg = {"peft_type": "LORA", "r": 4, "lora_alpha": 8,
+           "target_modules": ["q_proj"], **cfg_extra}
+    if refused:
+        with pytest.raises(ValueError, match="CAUSAL_LM"):
+            normalize_peft_adapter_config(cfg)
+    else:
+        normalize_peft_adapter_config(cfg)
+
+
+def test_import_accepts_a_live_peft_config():
+    # LoraConfig.to_dict() hands back peft's enum for peft_type, whose str() is
+    # "PeftType.LORA", so comparing it would refuse an ordinary causal adapter.
+    # The task_type enum spelling is covered by the case above.
+    import peft
+    from unsloth_zoo.saving_utils import normalize_peft_adapter_config
+    cfg = peft.LoraConfig(
+        task_type="CAUSAL_LM", r=4, lora_alpha=8, target_modules=["q_proj"],
+    ).to_dict()
+    normalize_peft_adapter_config(cfg)
