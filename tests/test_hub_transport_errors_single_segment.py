@@ -257,6 +257,52 @@ def test_a_single_segment_id_keeps_its_revision(name):
     assert saving_utils._is_hub_repo_id(name) is True
 
 
+@pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
+def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
+    """The argument the revision split rests on, which nothing else pins.
+
+    Splitting on `@` means a local directory named `outputs/my@model` is now offered
+    to the Hub as the repo id `outputs/my`. That sounds like it could turn a local
+    base into a Hub probe, so the question is whether it differs from an ordinary
+    one-slash directory name, and it does not: `outputs/mymodel` is already a valid
+    `namespace/name` shape, so it was already probed both before and after the
+    split. Asserted as an equivalence rather than as a fixed outcome, so it keeps
+    holding if the surrounding policy for local bases changes.
+
+    With every Hub entry point dead, both names must answer identically, which for a
+    local nf4 base means the 4bit merges resolve locally and the 16bit ones raise.
+    """
+    import huggingface_hub as _hub
+
+    def _local_nf4(directory):
+        directory.mkdir(parents = True, exist_ok = True)
+        (directory / "model.safetensors").write_bytes(b"")
+        (directory / "config.json").write_text(json.dumps({
+            "model_type": "llama",
+            "quantization_config": {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"},
+        }), encoding = "utf-8")
+
+    _patch_ls(monkeypatch, ConnectionError("Temporary failure in name resolution"))
+    def _dead_download(*args, **kwargs):
+        raise ConnectionError("Temporary failure in name resolution")
+    monkeypatch.setattr(_hub, "hf_hub_download", _dead_download, raising = True)
+
+    outcomes = []
+    for relative in ("outputs/mymodel", "outputs/my@model"):
+        root = tmp_path / relative.replace("/", "_").replace("@", "at")
+        _local_nf4(root / "outputs" / relative.split("/")[1])
+        monkeypatch.chdir(root)
+        try:
+            resolved = saving_utils.determine_base_model_source(relative, None, save_method)
+            outcomes.append(("resolved", resolved[2]))
+        except RuntimeError as e:
+            outcomes.append(("raised", "connectivity" in str(e) or "rate limiting" in str(e)))
+
+    assert outcomes[0] == outcomes[1], (
+        f"`outputs/my@model` diverged from `outputs/mymodel`: {outcomes}"
+    )
+
+
 @pytest.mark.parametrize("name", ["gpt2@main", "hf://gpt2@main"])
 def test_a_revisioned_single_segment_id_is_absent_not_unreachable(monkeypatch, name):
     """1.25.1 names the whole `gpt2@main` in the rejection, so the classifier has to
