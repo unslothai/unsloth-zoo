@@ -138,3 +138,36 @@ def test_build_kto_batches_requires_batch_size_two():
     assert len(batches) == 1
     for key in ("comp_ids", "comp_labels", "kl_ids", "kl_labels", "label"):
         assert key in batches[0]
+
+
+def test_kto_string_labels_parsed_not_truthy():
+    # KTO data from CSV stores the binary label as a STRING. Plain bool() is
+    # wrong: bool("false") and bool("0") are both True, so every undesirable row
+    # would silently flip to desirable. _build_kto_batches must parse the string.
+    from unsloth_zoo.mlx.trainer import (
+        _build_kto_batches, _kto_parse_label, MLXKTOConfig,
+    )
+
+    # The exact coercions bool() gets wrong:
+    assert _kto_parse_label("false") is False
+    assert _kto_parse_label("0") is False
+    assert _kto_parse_label("0.0") is False
+    assert _kto_parse_label("true") is True
+    assert _kto_parse_label("1") is True
+    assert _kto_parse_label(True) is True and _kto_parse_label(0) is False
+    with pytest.raises(ValueError):
+        _kto_parse_label("maybe")
+
+    class _DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+    # Two rows with string labels "false"/"0" -> both must be undesirable.
+    dataset = [{"prompt": "a", "completion": " b", "label": "false"},
+               {"prompt": "c", "completion": " d", "label": "0"}]
+    batches = _build_kto_batches(
+        dataset, _DummyTokenizer(), MLXKTOConfig(per_device_train_batch_size=2),
+    )
+    assert batches[0]["label"] == [False, False], batches[0]["label"]

@@ -8243,6 +8243,35 @@ def _kto_tokenize_row(tokenizer, prompt, completion, args):
     return p, c
 
 
+def _kto_parse_label(value):
+    """Coerce a KTO desirable/undesirable label to bool, parsing string forms.
+
+    KTO data often arrives from CSV, where the binary label is a STRING. Plain
+    ``bool()`` is wrong there: ``bool("false")`` and ``bool("0")`` are both True
+    (any non-empty string is truthy), so every undesirable row would silently
+    flip to desirable. Accept real bools/ints/floats as-is and parse the common
+    string spellings; reject anything ambiguous rather than guess.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "1", "1.0", "yes", "y", "desirable"):
+            return True
+        if s in ("false", "0", "0.0", "no", "n", "undesirable", ""):
+            return False
+        raise ValueError(
+            f"Unsloth: KTO label {value!r} is not a recognized boolean. Use "
+            "True/False (or 1/0, 'true'/'false', 'yes'/'no')."
+        )
+    raise ValueError(
+        f"Unsloth: KTO label must be bool, int, float or str; got "
+        f"{type(value).__name__}."
+    )
+
+
 def _build_kto_batches(dataset, tokenizer, args):
     """Build unpaired KTO batches with the mismatched-pair KL variant.
 
@@ -8279,7 +8308,7 @@ def _build_kto_batches(dataset, tokenizer, args):
         p, c = _kto_tokenize_row(tokenizer, ex["prompt"], ex["completion"], args)
         if len(c) == 0:
             continue  # nothing to score
-        rows.append((p, c, bool(ex["label"])))
+        rows.append((p, c, _kto_parse_label(ex["label"])))
 
     batches = []
     dropped = 0
