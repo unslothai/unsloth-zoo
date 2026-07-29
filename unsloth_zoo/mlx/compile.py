@@ -27,15 +27,17 @@ compile-ready only once explicitly verified.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from itertools import accumulate
+import ast
 import importlib
 import inspect
 import mlx.core as mx
 import numpy as np
 import pkgutil
 import re
+import textwrap
 from typing import Any, Callable, Iterable, Mapping
 
 
@@ -50,6 +52,9 @@ _PATCH_BINDINGS: set[tuple[str, str, str, str]] = set()
 # `_set_norm_output_cast_to_input_dtype` so the generic and Qwen3-VL
 # paths agree.
 _QWEN3_VISION_NORM_CAST_OUTPUT = True
+_QWEN3_VISUAL_STATE_KEY = "_unsloth_qwen3_visual_state"
+_QWEN3_VISUAL_POSITIONS_KEY = "_unsloth_qwen3_visual_positions"
+_QWEN3_VISUAL_WIDTH_KEY = "_unsloth_qwen3_visual_width"
 
 
 def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
@@ -1535,6 +1540,15 @@ def _arch_matches_prefixes(arch: str, prefixes: tuple[str, ...]) -> bool:
     return bool(prefixes) and arch.startswith(prefixes)
 
 
+_QWEN_LIKE_MERGE_ARCHES = frozenset(
+    {"qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"}
+)
+_MASKED_SCATTER_PATCH_ARCHES = frozenset(
+    {"gemma3", "gemma4", "idefics2", "idefics3"}
+)
+_IDEFICS_SHARED_PATCH_ARCHES = frozenset({"idefics2", "idefics3"})
+
+
 def _adapter_matches(
     adapter: CompilePatchAdapter,
     arch: str,
@@ -1879,30 +1893,6 @@ def _try_import_module(module_name: str):
         return None
 
 
-def _iter_trait_model_modules(
-    trait: str,
-    *,
-    include_arches: Iterable[str] = (),
-):
-    """Yield model modules for architectures that share a compile trait.
-
-    Trait discovery (over the standard `mlx_vlm.models.<arch>.<arch>` layout)
-    lets future architectures inherit a shared patch automatically.
-    """
-
-    candidate_arches = set(include_arches)
-    candidate_arches.update(
-        arch
-        for arch, report in build_compile_trait_reports().items()
-        if trait in report.pattern_traits
-    )
-    for arch in sorted(candidate_arches):
-        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
-        if module is None:
-            continue
-        yield arch, module
-
-
 def _install_safe_fused_sdpa_mask_patches():
     """Work around MLX SDPA NaN gradients on fully masked query rows.
 
@@ -2174,6 +2164,760 @@ def _attach_position_ids(features, position_ids):
     return features
 
 
+def _explicit_position_embedding_adapter(original, replacement):
+    """Use Zoo's explicit-position path only while training."""
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        if not getattr(self, "training", False) or kwargs.get("position_ids") is None:
+            return original(self, input_ids, pixel_values, **kwargs)
+        return replacement(self, input_ids, pixel_values, **kwargs)
+
+    return patched
+
+
+def _patch_explicit_position_embeddings(model_cls, replacement):
+    adapted = _explicit_position_embedding_adapter(model_cls.get_input_embeddings, replacement)
+    _patch_method(model_cls, "get_input_embeddings", adapted)
+
+
+def _qwen_kwargs_lookup(node, key):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "kwargs"
+        and node.func.attr == "get"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == key
+    )
+
+
+def _qwen_pixel_none_guard(node):
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "pixel_values"
+        and len(node.test.ops) == 1
+        and isinstance(node.test.ops[0], ast.Is)
+        and len(node.test.comparators) == 1
+        and isinstance(node.test.comparators[0], ast.Constant)
+        and node.test.comparators[0].value is None
+    )
+
+
+def _qwen_video_tensor_access(node):
+    if isinstance(node, (ast.Name, ast.arg)):
+        name = node.id if isinstance(node, ast.Name) else node.arg
+        return name == "pixel_values_videos"
+    if isinstance(node, ast.Call):
+        return (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "kwargs"
+            and bool(node.args)
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "pixel_values_videos"
+        )
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "kwargs"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "pixel_values_videos"
+        )
+    return False
+
+
+def _qwen_video_tensor_contract(source):
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (IndentationError, SyntaxError):
+        return None
+    function = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef)),
+        None,
+    )
+    if function is None:
+        return None
+    has_grid_lookup = False
+    pixel_none_guards = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if (
+                any(
+                    isinstance(target, ast.Name)
+                    and target.id == "video_grid_thw"
+                    for target in targets
+                )
+                and _qwen_kwargs_lookup(node.value, "video_grid_thw")
+            ):
+                has_grid_lookup = True
+        if _qwen_pixel_none_guard(node):
+            pixel_none_guards.append(node)
+    if not has_grid_lookup or not pixel_none_guards:
+        return None
+
+    video_accesses = [
+        node for node in ast.walk(tree) if _qwen_video_tensor_access(node)
+    ]
+    native_fallbacks = []
+    for guard in pixel_none_guards:
+        for statement in guard.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if (
+                any(
+                    isinstance(target, ast.Name)
+                    and target.id == "pixel_values"
+                    for target in targets
+                )
+                and _qwen_kwargs_lookup(statement.value, "pixel_values_videos")
+            ):
+                native_fallbacks.append(statement.value)
+    if native_fallbacks:
+        first_guard_body = pixel_none_guards[0].body
+        first_statement = first_guard_body[0] if first_guard_body else None
+        if (
+            len(native_fallbacks) == 1
+            and function.body
+            and function.body[0] is pixel_none_guards[0]
+            and isinstance(first_statement, (ast.Assign, ast.AnnAssign))
+            and first_statement.value is native_fallbacks[0]
+            and video_accesses == native_fallbacks
+        ):
+            return "fixed"
+        return None
+    if video_accesses:
+        return None
+    legacy_guards = [
+        guard
+        for guard in pixel_none_guards
+        if guard in function.body
+        and any(
+            isinstance(node, ast.Return)
+            for statement in guard.body
+            for node in ast.walk(statement)
+        )
+    ]
+    if len(legacy_guards) != 1:
+        return None
+    guard_index = function.body.index(legacy_guards[0])
+    prelude_names = []
+    for statement in function.body[:guard_index]:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            return None
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            return None
+        prelude_names.append(targets[0].id)
+    if tuple(prelude_names) == (
+        "image_grid_thw",
+        "video_grid_thw",
+        "mask",
+        "grid_thw",
+    ):
+        return "legacy"
+    return None
+
+
+def _qwen_video_signature_supported(original):
+    try:
+        parameters = inspect.signature(
+            original,
+            follow_wrapped=False,
+        ).parameters
+    except (TypeError, ValueError):
+        return False
+    keyword_kinds = {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return (
+        all(
+            parameters.get(name) is not None
+            and parameters[name].kind in keyword_kinds
+            for name in ("input_ids", "pixel_values")
+        )
+        and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+
+
+def _qwen_video_contract_matches(original, expected):
+    try:
+        source = inspect.getsource(original)
+    except (OSError, TypeError):
+        return False
+    return (
+        _qwen_video_signature_supported(original)
+        and _qwen_video_tensor_contract(source) == expected
+    )
+
+
+def _qwen_video_tensor_adapter(original):
+    """Route processor-owned video pixels into legacy Qwen embedding calls."""
+
+    if getattr(original, "_unsloth_qwen_video_tensor", False):
+        return original
+    if getattr(
+        original,
+        "_unsloth_qwen3_replaces_visual_inference",
+        False,
+    ):
+        return original
+    underlying = inspect.unwrap(original)
+    if (
+        not _qwen_video_signature_supported(original)
+        or not _qwen_video_contract_matches(underlying, "legacy")
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            video_pixels = kwargs.get("pixel_values_videos")
+            if video_pixels is not None:
+                pixel_values = video_pixels
+        return original(
+            self,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    patched._unsloth_qwen_video_tensor = True
+    return patched
+
+
+def _patch_qwen_video_tensor(model_cls):
+    original = model_cls.get_input_embeddings
+    adapted = _qwen_video_tensor_adapter(original)
+    if adapted is not original:
+        _patch_method(model_cls, "get_input_embeddings", adapted)
+
+
+_QWEN_VIDEO_TENSOR_OWNER_MODULES = (
+    "mlx_vlm.models.qwen2_vl.qwen2_vl",
+    "mlx_vlm.models.qwen2_5_vl.qwen2_5_vl",
+    "mlx_vlm.models.qwen3_5.qwen3_5",
+    "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe",
+)
+
+
+def _install_qwen_video_tensor_patches():
+    """Patch only Qwen owners with the legacy processor/model video split."""
+
+    for module_name in _QWEN_VIDEO_TENSOR_OWNER_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        model_cls = getattr(module, "Model", None)
+        if model_cls is None or not hasattr(model_cls, "get_input_embeddings"):
+            continue
+        _patch_qwen_video_tensor(model_cls)
+
+
+def _qwen3_visual_window(
+    visual_pos_masks,
+    visual_state,
+    visual_positions,
+    *,
+    mask_offsets,
+    position_widths=None,
+    window,
+):
+    """Restore flattened Qwen3 features for one compact-state window.
+
+    Compact positions follow the mask coordinate system in which they were
+    packed. A shorter live mask is a chunk sliced from that full coordinate
+    row; otherwise a whole-row mask starts at zero.
+    """
+
+    batch_size = int(visual_pos_masks.shape[0])
+    mask_offsets = tuple(int(offset) for offset in mask_offsets)
+    if position_widths is None:
+        position_widths = (int(visual_pos_masks.shape[-1]),) * batch_size
+    else:
+        position_widths = tuple(int(width) for width in position_widths)
+    if len(mask_offsets) == 1 and batch_size > 1:
+        mask_offsets *= batch_size
+    if len(position_widths) == 1 and batch_size > 1:
+        position_widths *= batch_size
+    if len(mask_offsets) != batch_size or len(position_widths) != batch_size:
+        raise ValueError("Qwen3 visual state does not match the cache batch")
+
+    window_masks = []
+    feature_slices = [[] for _ in range(visual_state.shape[2])]
+    for row, (mask_start, position_width) in enumerate(
+        zip(mask_offsets, position_widths)
+    ):
+        whole_row = visual_pos_masks.shape[-1] == window
+        if whole_row:
+            active_mask = visual_pos_masks[row]
+        else:
+            row_mask = visual_pos_masks[row]
+            active_mask = row_mask[mask_start : mask_start + window]
+            if active_mask.shape[0] < window:
+                active_mask = mx.concatenate(
+                    [
+                        active_mask,
+                        mx.zeros(
+                            (window - active_mask.shape[0],),
+                            dtype=row_mask.dtype,
+                        ),
+                    ]
+                )
+        window_masks.append(active_mask[None, :])
+
+        row_positions = visual_positions[row]
+        if whole_row and visual_pos_masks.shape[-1] >= position_width:
+            # why: the whole mask row is consumed, so the feature window spans
+            # the whole row too -- a non-zero cache offset here belongs to an
+            # earlier prompt, not to this mask.
+            feature_start, feature_stop = 0, int(visual_pos_masks.shape[-1])
+        else:
+            feature_start = max(0, mask_start)
+            feature_stop = max(0, feature_start + window)
+        feature_before = int(
+            ((row_positions >= 0) & (row_positions < feature_start)).sum().item()
+        )
+        feature_count = int(
+            (
+                (row_positions >= feature_start)
+                & (row_positions < feature_stop)
+            ).sum().item()
+        )
+        selected = visual_state[row][
+            feature_before : feature_before + feature_count
+        ]
+        for layer in range(visual_state.shape[2]):
+            feature_slices[layer].append(selected[:, layer, :])
+
+    return mx.concatenate(window_masks, axis=0), [
+        mx.concatenate(parts, axis=0)
+        for parts in feature_slices
+    ]
+
+
+def _qwen3_cache_offsets(cache, batch_size):
+    """Return unpadded and padded prompt progress for each cache row."""
+
+    if not cache or cache[0] is None:
+        zeros = (0,) * batch_size
+        return zeros, zeros
+    cache_entry = cache[0]
+
+    def row_values(value):
+        if hasattr(value, "ndim"):
+            if value.ndim > 0:
+                return tuple(int(item) for item in value.reshape((-1,)).tolist())
+            value = value.item()
+        return (int(value),) * batch_size
+
+    offsets = row_values(getattr(cache_entry, "offset", 0))
+    # why: some cache classes declare `left_padding` as None rather than omitting it.
+    left_padding = getattr(cache_entry, "left_padding", None)
+    left_padding = row_values(0 if left_padding is None else left_padding)
+    if len(offsets) != batch_size or len(left_padding) != batch_size:
+        return offsets, offsets
+    mask_offsets = tuple(
+        max(0, offset + padding)
+        for offset, padding in zip(offsets, left_padding)
+    )
+    return offsets, mask_offsets
+
+
+def _pack_qwen3_visual_state(visual_pos_masks, deepstack_visual_embeds):
+    """Pack flattened Qwen3 features by row without scaling to prompt length."""
+
+    if (
+        deepstack_visual_embeds is None
+        or isinstance(deepstack_visual_embeds, mx.array)
+    ):
+        return deepstack_visual_embeds, None
+    if not deepstack_visual_embeds:
+        return deepstack_visual_embeds, None
+
+    counts = [
+        int(visual_pos_masks[row].sum().item())
+        for row in range(visual_pos_masks.shape[0])
+    ]
+    max_count = max(counts, default=0)
+    positions = []
+    packed_rows = []
+    feature_start = 0
+    for row, count in enumerate(counts):
+        prompt_positions = mx.arange(
+            visual_pos_masks.shape[1],
+            dtype=mx.int32,
+        )
+        position_keys = mx.where(
+            visual_pos_masks[row],
+            prompt_positions,
+            visual_pos_masks.shape[1],
+        )
+        row_positions = prompt_positions[mx.argsort(position_keys)[:count]]
+        if count < max_count:
+            row_positions = mx.concatenate(
+                [
+                    row_positions,
+                    mx.full((max_count - count,), -1, dtype=mx.int32),
+                ]
+            )
+        positions.append(row_positions[None, :])
+
+        row_layers = []
+        for embeds in deepstack_visual_embeds:
+            row_embeds = embeds[feature_start : feature_start + count]
+            if count < max_count:
+                row_embeds = mx.concatenate(
+                    [
+                        row_embeds,
+                        mx.zeros(
+                            (max_count - count, embeds.shape[-1]),
+                            dtype=embeds.dtype,
+                        ),
+                    ],
+                    axis=0,
+                )
+            row_layers.append(row_embeds)
+        packed_rows.append(mx.stack(row_layers, axis=1)[None, ...])
+        feature_start += count
+
+    return (
+        mx.concatenate(packed_rows, axis=0),
+        mx.concatenate(positions, axis=0),
+    )
+
+
+def _attach_qwen3_visual_state(features, visual_state, visual_positions):
+    """Carry compact Qwen3 state through mlx-vlm's generic prompt kwargs."""
+
+    original_to_dict = features.to_dict
+
+    @wraps(original_to_dict)
+    def to_dict():
+        values = original_to_dict()
+        values[_QWEN3_VISUAL_STATE_KEY] = visual_state
+        values[_QWEN3_VISUAL_POSITIONS_KEY] = visual_positions
+        values[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+            (visual_positions.shape[0],),
+            int(features.visual_pos_masks.shape[-1]),
+            dtype=mx.int32,
+        )
+        return values
+
+    features.deepstack_visual_embeds = None
+    features.to_dict = to_dict
+    return features
+
+
+def _pad_qwen3_prompt_rows(prompt_kwargs_list):
+    """Equalize compact visual widths before generic batch concatenation."""
+
+    template = next(
+        (
+            kwargs
+            for kwargs in prompt_kwargs_list
+            if kwargs
+            and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is not None
+            and kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is not None
+            and kwargs.get("visual_pos_masks") is not None
+        ),
+        None,
+    )
+    if template is None:
+        return prompt_kwargs_list
+
+    # why: a row still on mlx-vlm's native deepstack keys owns real features
+    # that no compact state can stand in for, so synthesizing an empty one
+    # would replace them with zeros. Leave the batch exactly as it is.
+    if any(
+        kwargs
+        and kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None
+        and kwargs.get("deepstack_visual_embeds") is not None
+        for kwargs in prompt_kwargs_list
+    ):
+        return prompt_kwargs_list
+
+    feature_widths = []
+    for kwargs in prompt_kwargs_list:
+        if not kwargs:
+            continue
+        state = kwargs.get(_QWEN3_VISUAL_STATE_KEY)
+        if state is not None:
+            feature_widths.append(state.shape[1])
+        elif (
+            kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is None
+            and kwargs.get("visual_pos_masks") is not None
+        ):
+            feature_widths.extend(kwargs["visual_pos_masks"].sum(axis=1).tolist())
+    max_features = max(feature_widths, default=0)
+    if not max_features:
+        return prompt_kwargs_list
+
+    padded_rows = [dict(kwargs) if kwargs else kwargs for kwargs in prompt_kwargs_list]
+    for kwargs in padded_rows:
+        if not kwargs:
+            continue
+        if kwargs.get(_QWEN3_VISUAL_STATE_KEY) is None:
+            if kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY) is not None:
+                continue
+            inputs_embeds = kwargs.get("inputs_embeds")
+            if inputs_embeds is None:
+                continue
+            state = template[_QWEN3_VISUAL_STATE_KEY]
+            visual_mask = template["visual_pos_masks"]
+            if kwargs.get("visual_pos_masks") is None:
+                kwargs["visual_pos_masks"] = mx.zeros(
+                    inputs_embeds.shape[:2],
+                    dtype=visual_mask.dtype,
+                )
+            visual_mask = kwargs["visual_pos_masks"]
+            empty_layers = [
+                mx.zeros(
+                    (int(visual_mask.sum().item()), state.shape[-1]),
+                    dtype=state.dtype,
+                )
+                for _ in range(state.shape[2])
+            ]
+            state, positions = _pack_qwen3_visual_state(
+                visual_mask,
+                empty_layers,
+            )
+            kwargs[_QWEN3_VISUAL_STATE_KEY] = state
+            kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = positions
+        state = kwargs[_QWEN3_VISUAL_STATE_KEY]
+        positions = kwargs[_QWEN3_VISUAL_POSITIONS_KEY]
+        visual_mask = kwargs.get("visual_pos_masks")
+        if (
+            kwargs.get(_QWEN3_VISUAL_WIDTH_KEY) is None
+            and visual_mask is not None
+        ):
+            kwargs[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                (positions.shape[0],),
+                int(visual_mask.shape[-1]),
+                dtype=mx.int32,
+            )
+        pad = max_features - state.shape[1]
+        if pad <= 0:
+            continue
+        kwargs[_QWEN3_VISUAL_STATE_KEY] = mx.pad(
+            state,
+            [(0, 0), (0, pad), (0, 0), (0, 0)],
+        )
+        kwargs[_QWEN3_VISUAL_POSITIONS_KEY] = mx.pad(
+            positions,
+            [(0, 0), (0, pad)],
+            constant_values=-1,
+        )
+    return padded_rows
+
+
+def _qwen3_prompt_merge_adapter(original):
+    """Pad compact visual rows in mlx-vlm's cold prompt batching path."""
+
+    if getattr(original, "_unsloth_qwen3_prompt_merge", False):
+        return original
+
+    @wraps(original)
+    def patched(prompt_kwargs_list, input_ids):
+        prompt_rows = _pad_qwen3_prompt_rows(prompt_kwargs_list)
+        max_length = max((len(ids) for ids in input_ids), default=0)
+        shifted_rows = prompt_rows
+        for row, (kwargs, ids) in enumerate(zip(prompt_rows, input_ids)):
+            positions = (
+                kwargs.get(_QWEN3_VISUAL_POSITIONS_KEY)
+                if kwargs
+                else None
+            )
+            left_padding = max_length - len(ids)
+            if positions is None or left_padding <= 0:
+                continue
+            if shifted_rows is prompt_rows:
+                shifted_rows = list(prompt_rows)
+            shifted = dict(kwargs)
+            shifted[_QWEN3_VISUAL_POSITIONS_KEY] = mx.where(
+                positions >= 0,
+                positions + left_padding,
+                positions,
+            )
+            shifted[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                (positions.shape[0],),
+                max_length,
+                dtype=mx.int32,
+            )
+            shifted_rows[row] = shifted
+        return original(shifted_rows, input_ids)
+
+    patched._unsloth_qwen3_prompt_merge = True
+    return patched
+
+
+def _qwen3_mixed_prompt_batch_adapter(original):
+    """Pad compact visual rows in mlx-vlm's APC prompt batching path."""
+
+    if getattr(original, "_unsloth_qwen3_mixed_prompt_batch", False):
+        return original
+
+    @wraps(original)
+    def patched(self, sequences):
+        prompt_rows = [sequence[3] for sequence in sequences]
+        padded_rows = _pad_qwen3_prompt_rows(prompt_rows)
+        if padded_rows is not prompt_rows:
+            sequences = [
+                (*sequence[:3], kwargs, *sequence[4:])
+                for sequence, kwargs in zip(sequences, padded_rows)
+            ]
+        batch = original(self, sequences)
+        prompt_kwargs = getattr(batch, "_prompt_kwargs", None)
+        if prompt_kwargs is not None:
+            visual_mask = prompt_kwargs.get("visual_pos_masks")
+            position_widths = prompt_kwargs.get(_QWEN3_VISUAL_WIDTH_KEY)
+            if visual_mask is not None and position_widths is not None:
+                prompt_kwargs[_QWEN3_VISUAL_WIDTH_KEY] = mx.full(
+                    (int(visual_mask.shape[0]),),
+                    int(visual_mask.shape[-1]),
+                    dtype=position_widths.dtype,
+                )
+        return batch
+
+    patched._unsloth_qwen3_mixed_prompt_batch = True
+    return patched
+
+
+def _qwen3_callable_source(original):
+    try:
+        return inspect.getsource(original)
+    except (OSError, TypeError):
+        return ""
+
+
+def _qwen3_drops_deepstack_after_eval(original):
+    return "deepstack_visual_embeds = mx.eval(" in _qwen3_callable_source(original)
+
+
+def _qwen3_batch_embedding_adapter(
+    original,
+    replacement=None,
+    *,
+    replace_visual_inference=False,
+):
+    """Expose flattened Qwen3 deepstack state in a compact row-owned format."""
+
+    if getattr(original, "_unsloth_qwen3_batch_visual_state", False):
+        return original
+
+    @wraps(original)
+    def patched(self, input_ids=None, pixel_values=None, **kwargs):
+        training = getattr(self, "training", False)
+        use_replacement = replacement is not None and (
+            (
+                training
+                and kwargs.get("position_ids") is not None
+            )
+            or (
+                not training and replace_visual_inference
+                and (
+                    pixel_values is not None
+                    or kwargs.get("pixel_values_videos") is not None
+                )
+            )
+        )
+        embedding_call = replacement if use_replacement else original
+        features = embedding_call(self, input_ids, pixel_values, **kwargs)
+        if training:
+            return features
+        visual_pos_masks = getattr(features, "visual_pos_masks", None)
+        if visual_pos_masks is not None:
+            visual_state, visual_positions = _pack_qwen3_visual_state(
+                visual_pos_masks,
+                getattr(features, "deepstack_visual_embeds", None),
+            )
+            if visual_positions is not None:
+                features = _attach_qwen3_visual_state(
+                    features,
+                    visual_state,
+                    visual_positions,
+                )
+        return features
+
+    patched._unsloth_qwen3_batch_visual_state = True
+    patched._unsloth_qwen3_replaces_visual_inference = bool(
+        replacement is not None
+        and replace_visual_inference
+        and _qwen_video_contract_matches(replacement, "fixed")
+    )
+    return patched
+
+
+def _qwen3_visual_state_adapter(original):
+    """Align Qwen3 mask/deepstack side channels before the language call."""
+
+    if getattr(original, "_unsloth_qwen3_visual_state", False):
+        return original
+
+    @wraps(original)
+    def patched(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        **kwargs,
+    ):
+        if visual_pos_masks is not None:
+            compact_state = kwargs.pop(_QWEN3_VISUAL_STATE_KEY, None)
+            visual_positions = kwargs.pop(_QWEN3_VISUAL_POSITIONS_KEY, None)
+            position_widths = kwargs.pop(_QWEN3_VISUAL_WIDTH_KEY, None)
+            if compact_state is not None and visual_positions is not None:
+                _unpadded_offsets, mask_offsets = _qwen3_cache_offsets(
+                    cache,
+                    int(visual_pos_masks.shape[0]),
+                )
+                visual_pos_masks, deepstack_visual_embeds = _qwen3_visual_window(
+                    visual_pos_masks,
+                    compact_state,
+                    visual_positions,
+                    mask_offsets=mask_offsets,
+                    position_widths=position_widths,
+                    window=int(inputs.shape[1]),
+                )
+                kwargs.pop("n_to_process", None)
+
+        return original(
+            self,
+            inputs,
+            inputs_embeds=inputs_embeds,
+            mask=mask,
+            cache=cache,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            **kwargs,
+        )
+
+    patched._unsloth_qwen3_visual_state = True
+    return patched
+
+
 def _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds):
     """Compile-safe additive merge for sparse visual embeddings."""
 
@@ -2393,6 +3137,8 @@ def _install_qwen2_5_compile_patches():
         return hidden_states
 
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         explicit_position_ids = kwargs.get("position_ids", None)
@@ -2434,7 +3180,7 @@ def _install_qwen2_5_compile_patches():
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen2_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "get_window_index", patched_qwen2_get_window_index)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen2_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen2_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_qwen2_get_input_embeddings)
     _PATCHED_ARCHES.add("qwen2_5_vl")
 
 
@@ -2545,6 +3291,8 @@ def _install_qwen2_compile_patches():
         return self.merger(hidden_states)
 
     def patched_qwen2_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         explicit_position_ids = kwargs.get("position_ids", None)
@@ -2585,7 +3333,7 @@ def _install_qwen2_compile_patches():
     _patch_method(vision_module.Attention, "__call__", patched_qwen2_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen2_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen2_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen2_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_qwen2_get_input_embeddings)
     _PATCHED_ARCHES.add("qwen2_vl")
 
 
@@ -2606,6 +3354,35 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_module = None
         qwen3moe_vision_module = None
         qwen3moe_language_module = None
+
+    for generate_name in ("mlx_vlm.generate", "mlx_vlm.generate.ar"):
+        try:
+            generate_module = importlib.import_module(generate_name)
+        except Exception:
+            continue
+        prompt_merge = getattr(
+            generate_module,
+            "_merge_prefill_prompt_kwargs",
+            None,
+        )
+        if prompt_merge is not None:
+            setattr(
+                generate_module,
+                "_merge_prefill_prompt_kwargs",
+                _qwen3_prompt_merge_adapter(prompt_merge),
+            )
+        batch_generator = getattr(generate_module, "BatchGenerator", None)
+        mixed_prompt_batch = getattr(
+            batch_generator,
+            "_build_mixed_prompt_batch",
+            None,
+        )
+        if mixed_prompt_batch is not None:
+            _patch_method(
+                batch_generator,
+                "_build_mixed_prompt_batch",
+                _qwen3_mixed_prompt_batch_adapter(mixed_prompt_batch),
+            )
 
     def merge_qwen3(image_features, inputs_embeds, input_ids, image_token_index, video_token_index):
         import mlx.core as mx
@@ -2867,6 +3644,8 @@ def _install_qwen3_family_compile_patches():
         return _add_visual_embeds(hidden_states, visual_pos_masks, visual_embeds)
 
     def patched_qwen3_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -2915,6 +3694,8 @@ def _install_qwen3_family_compile_patches():
         return _attach_position_ids(features, position_ids)
 
     def patched_qwen35_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -2961,9 +3742,26 @@ def _install_qwen3_family_compile_patches():
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_qwen3_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
     _patch_method(vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
-    _patch_method(importlib.import_module("mlx_vlm.models.qwen3_vl.language").Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
-    _patch_method(module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
-    _patch_method(qwen35_module.Model, "get_input_embeddings", patched_qwen35_get_input_embeddings)
+    language_module = importlib.import_module("mlx_vlm.models.qwen3_vl.language")
+    _patch_method(language_module.Qwen3VLModel, "_deepstack_process", patched_qwen3_deepstack)
+    language_call = language_module.LanguageModel.__call__
+    _patch_method(
+        language_module.LanguageModel,
+        "__call__",
+        _qwen3_visual_state_adapter(language_call),
+    )
+    _patch_method(
+        module.Model,
+        "get_input_embeddings",
+        _qwen3_batch_embedding_adapter(
+            module.Model.get_input_embeddings,
+            patched_qwen3_get_input_embeddings,
+            replace_visual_inference=_qwen3_drops_deepstack_after_eval(
+                module.Model.get_input_embeddings
+            ),
+        ),
+    )
+    _patch_explicit_position_embeddings(qwen35_module.Model, patched_qwen35_get_input_embeddings)
     if qwen3moe_module is not None:
         qwen3moe_module.masked_scatter = _masked_scatter_no_numpy
         _patch_staticmethod(qwen3moe_module.Model, "merge_input_ids_with_image_features", merge_qwen3)
@@ -2973,7 +3771,23 @@ def _install_qwen3_family_compile_patches():
         _patch_method(qwen3moe_vision_module.VisionModel, "fast_pos_embed_interpolate", patched_qwen3_fast_pos_embed_interpolate)
         _patch_method(qwen3moe_vision_module.VisionModel, "__call__", patched_qwen3_vision_call)
         _patch_method(qwen3moe_language_module.Qwen3VLMoEModel, "_deepstack_process", patched_qwen3_deepstack)
-        _patch_method(qwen3moe_module.Model, "get_input_embeddings", patched_qwen3_get_input_embeddings)
+        moe_language_call = qwen3moe_language_module.LanguageModel.__call__
+        _patch_method(
+            qwen3moe_language_module.LanguageModel,
+            "__call__",
+            _qwen3_visual_state_adapter(moe_language_call),
+        )
+        _patch_method(
+            qwen3moe_module.Model,
+            "get_input_embeddings",
+            _qwen3_batch_embedding_adapter(
+                qwen3moe_module.Model.get_input_embeddings,
+                patched_qwen3_get_input_embeddings,
+                replace_visual_inference=_qwen3_drops_deepstack_after_eval(
+                    qwen3moe_module.Model.get_input_embeddings
+                ),
+            ),
+        )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
 
@@ -3087,6 +3901,8 @@ def _install_glm_ocr_compile_patches():
         return self.merger(hidden_states)
 
     def patched_glm_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
@@ -3132,8 +3948,21 @@ def _install_glm_ocr_compile_patches():
     _patch_method(vision_module.GlmOcrVisionAttention, "__call__", patched_glm_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_glm_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_glm_vision_call)
-    _patch_method(module.Model, "get_input_embeddings", patched_glm_get_input_embeddings)
+    _patch_explicit_position_embeddings(module.Model, patched_glm_get_input_embeddings)
     _PATCHED_ARCHES.add("glm_ocr")
+
+
+def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
+    """Whether PaddleOCR-VL exposes its newer batched vision contract."""
+
+    for class_name, method in (
+        ("VisionModel", "_forward_same_grid_batch"),
+        ("PaddleOCRVisionEmbeddings", "same_grid_batch"),
+        ("PaddleOCRProjector", "same_grid_batch"),
+    ):
+        if callable(getattr(getattr(vision_module, class_name, None), method, None)):
+            return True
+    return False
 
 
 def _install_paddleocr_vl_compile_patches():
@@ -3143,6 +3972,11 @@ def _install_paddleocr_vl_compile_patches():
         module = importlib.import_module("mlx_vlm.models.paddleocr_vl.paddleocr_vl")
         vision_module = importlib.import_module("mlx_vlm.models.paddleocr_vl.vision")
     except Exception:
+        return
+
+    if _paddleocr_vl_has_batched_vision(vision_module):
+        _VERIFIED_TRAINING_ARCHES.discard("paddleocr_vl")
+        _PATCHED_ARCHES.discard("paddleocr_vl")
         return
 
     InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
@@ -3342,12 +4176,19 @@ def _install_qwen_like_image_merge_patches():
     plumbing.
     """
 
-    for arch, module in _iter_trait_model_modules(
-        "qwen_like_image_merge",
-        include_arches=("qwen2_vl", "qwen2_5_vl", "glm_ocr", "paddleocr_vl"),
-    ):
-        if arch.startswith("qwen3"):
+    for arch in sorted(_QWEN_LIKE_MERGE_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
+        if arch == "paddleocr_vl":
+            vision_module = _try_import_module("mlx_vlm.models.paddleocr_vl.vision")
+            if (
+                vision_module is not None
+                and _paddleocr_vl_has_batched_vision(vision_module)
+            ):
+                _VERIFIED_TRAINING_ARCHES.discard(arch)
+                _PATCHED_ARCHES.discard(arch)
+                continue
         model_cls = getattr(module, "Model", None)
         if (
             model_cls is None
@@ -3440,8 +4281,48 @@ def _install_qwen3_get_input_embeddings_patch():
     _PATCHED_ARCHES.add("qwen3_vl")
 
 
+def _legacy_vlm_prefill_kwargs_adapter(original):
+    """Drop generator bookkeeping only for strict legacy language callables."""
+
+    if getattr(original, "_unsloth_legacy_prefill_kwargs", False):
+        return original
+    try:
+        parameters = inspect.signature(original, follow_wrapped=False).parameters
+    except (TypeError, ValueError):
+        return original
+    if (
+        "n_to_process" in parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    ):
+        return original
+
+    @wraps(original)
+    def patched(self, *args, **kwargs):
+        kwargs.pop("n_to_process", None)
+        return original(self, *args, **kwargs)
+
+    patched._unsloth_legacy_prefill_kwargs = True
+    return patched
+
+
+def _install_legacy_llava_prefill_patch():
+    language_module = _try_import_module("mlx_vlm.models.llava.language")
+    language_class = getattr(language_module, "LanguageModel", None)
+    if language_class is None:
+        return
+    original = language_class.__call__
+    adapted = _legacy_vlm_prefill_kwargs_adapter(original)
+    if adapted is not original:
+        _patch_method(language_class, "__call__", adapted)
+
+
 def _install_llama_pixtral_mistral_compile_patches():
     """Install compile-safe multimodal merge patches for llama-like families."""
+
+    _install_legacy_llava_prefill_patch()
 
     def merge_single_image_token_family(
         image_token_index, image_features, inputs_embeds, input_ids
@@ -3839,6 +4720,42 @@ def _install_mistral4_compile_patches():
     _PATCHED_ARCHES.add("mistral4")
 
 
+def _gemma3n_language_contract(method):
+    """Identify the installed Gemma3n cache and attention-mask contract."""
+
+    try:
+        source = inspect.getsource(method)
+    except (OSError, TypeError):
+        return None
+    if "cache[self.first_full_idx :]" in source and "int(c.offset)" in source:
+        return "legacy"
+    if (
+        "cache[self.first_full_idx]" in source
+        and "window_size=self.config.sliding_window" in source
+        and "raw_offset.max().item()" in source
+    ):
+        return "current"
+    return None
+
+
+def _gemma3n_cache_offset(cache):
+    """Absolute token progress for per-layer embedding slices, read from the
+    public ``offset``: a rotating cache's private ``_idx`` wraps, ``offset`` does not."""
+
+    raw_offset = next(
+        (
+            c.offset
+            for c in (cache or [])
+            if c is not None and hasattr(c, "offset")
+        ),
+        0,
+    )
+    if isinstance(raw_offset, mx.array):
+        raw_offset = raw_offset.max() if raw_offset.ndim else raw_offset
+        return int(raw_offset.item())
+    return int(raw_offset)
+
+
 def _install_gemma3n_compile_patches():
     """Install Gemma3n multiscale fusion and merge compatibility patches."""
 
@@ -3848,6 +4765,12 @@ def _install_gemma3n_compile_patches():
         language_module = importlib.import_module("mlx_vlm.models.gemma3n.language")
         kernels_module = importlib.import_module("mlx_vlm.models.kernels")
     except Exception:
+        return
+
+    language_contract = _gemma3n_language_contract(language_module.Gemma3Model.__call__)
+    if language_contract is None:
+        _VERIFIED_TRAINING_ARCHES.discard("gemma3n")
+        _PATCHED_ARCHES.discard("gemma3n")
         return
 
     def patched_merge_multimodal_and_text(
@@ -3927,14 +4850,17 @@ def _install_gemma3n_compile_patches():
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            cache_offset = next(
-                (
-                    int(c.offset)
-                    for c in (cache or [])
-                    if c is not None and hasattr(c, "offset")
-                ),
-                0,
-            )
+            if language_contract == "legacy":
+                cache_offset = next(
+                    (
+                        int(c.offset)
+                        for c in (cache or [])
+                        if c is not None and hasattr(c, "offset")
+                    ),
+                    0,
+                )
+            else:
+                cache_offset = _gemma3n_cache_offset(cache)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
@@ -3945,14 +4871,25 @@ def _install_gemma3n_compile_patches():
             cache = [None] * len(self.layers)
 
         if mask is None:
-            full_mask = language_module.create_attention_mask(
-                h,
-                cache[self.first_full_idx :],
-            )
-            sliding_window_mask = language_module.create_attention_mask(
-                h,
-                cache[self.first_sliding_idx :],
-            )
+            if language_contract == "legacy":
+                full_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_full_idx :],
+                )
+                sliding_window_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_sliding_idx :],
+                )
+            else:
+                full_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_full_idx],
+                )
+                sliding_window_mask = language_module.create_attention_mask(
+                    h,
+                    cache[self.first_sliding_idx],
+                    window_size=self.config.sliding_window,
+                )
         h0 = h
 
         target_magnitude = _safe_branch_magnitude(h0)
@@ -4363,10 +5300,10 @@ def _install_deepseek_ocr_compile_patches():
 def _install_masked_scatter_multimodal_patches():
     """Patch `masked_scatter` implementations that rely on host-side mutation."""
 
-    for arch, module in _iter_trait_model_modules(
-        "masked_scatter_multimodal",
-        include_arches=("gemma3", "idefics2", "idefics3"),
-    ):
+    for arch in sorted(_MASKED_SCATTER_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
+            continue
         if getattr(module, "masked_scatter", None) is None:
             continue
         setattr(module, "masked_scatter", _masked_scatter_no_numpy)
@@ -4377,7 +5314,6 @@ def _install_idefics_family_compile_patches():
     """Patch Idefics-family image filtering and multimodal merges for compile.
 
     Shared issue: Python-side padded-image filtering and placeholder merging.
-    Architectures with the same trait and standard layout inherit this patch.
     """
 
     def patched_prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
@@ -4447,11 +5383,9 @@ def _install_idefics_family_compile_patches():
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
-    for arch, module in _iter_trait_model_modules(
-        "padded_image_filtering",
-        include_arches=("idefics2", "idefics3"),
-    ):
-        if arch == "smolvlm":
+    for arch in sorted(_IDEFICS_SHARED_PATCH_ARCHES):
+        module = _try_import_module(f"mlx_vlm.models.{arch}.{arch}")
+        if module is None:
             continue
         model_cls = getattr(module, "Model", None)
         if model_cls is None:
@@ -5403,6 +6337,7 @@ def install_mlx_compile_patches():
         _apply_compile_patch_plan(_resolve_compile_patch_plan(bundle))
         _PATCHED_PATTERN_BUNDLES.add(bundle.name)
 
+    _install_qwen_video_tensor_patches()
     _PATCHES_INSTALLED = True
     _invalidate_qualification_cache()
     return build_compile_qualifications()
