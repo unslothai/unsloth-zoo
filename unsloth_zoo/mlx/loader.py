@@ -2349,11 +2349,13 @@ def _fix_gemma3_multimodal_image_feature_scale(model=None):
             final_embedding, image_mask_expanded, scaled_image_features,
         )
 
-        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
-        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
-        final_attention_mask_4d = mx.expand_dims(
-            attention_mask_expanded_1 * attention_mask_expanded_2,
-            1,
+        # Gemma3's layers use this verbatim, so it has to carry causality; an
+        # outer product of the padding mask does not. Same builder as the CCE
+        # path: causal, bidirectional inside each image block.
+        from .utils import _build_gemma_image_attention_mask
+        token_type_ids = (input_ids == image_token_index).astype(mx.int32)
+        final_attention_mask_4d = _build_gemma_image_attention_mask(
+            token_type_ids, attention_mask=attention_mask,
         )
         return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
 
