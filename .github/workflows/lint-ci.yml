@@ -3,7 +3,7 @@
 
 # Whole-repo Python source-lint gate. Adapted from unsloth's lint-ci.yml:
 # Python (compileall + narrow ruff) + YAML/JSON round-trip. Dropped vs unsloth:
-# shell lint (zoo has no committed *.sh), TypeScript/Rust (Studio/Tauri are unsloth-side).
+# shell lint (zoo has no committed *.sh), TypeScript/Rust (Unsloth/Tauri are unsloth-side).
 
 name: Lint CI
 

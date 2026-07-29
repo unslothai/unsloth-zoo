@@ -314,6 +314,17 @@ class _ConvAndRenameSanitizer:
         return out
 
 
+class _StripModelNamespaceSanitizer:
+    """HF -> MLX replay: strip the canonical top-level model namespace."""
+
+    @staticmethod
+    def sanitize(weights):
+        return {
+            name[len("model."):] if name.startswith("model.") else name: tensor
+            for name, tensor in weights.items()
+        }
+
+
 def _write_shard(path, tensors):
     from safetensors.torch import save_file
     save_file(tensors, str(path))
@@ -388,6 +399,58 @@ def test_prepare_export_rewrites_real_shards_and_index(monkeypatch, tmp_path):
     assert index_data["weight_map"] == {
         "language_model.layers.0.mlp.weight": "model-00002-of-00002.safetensors",
         "visual.patch_embed.weight": "model-00001-of-00002.safetensors",
+    }
+
+
+def test_prepare_export_restores_stripped_multimodal_namespaces_and_index(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.utils as mutils
+    monkeypatch.setattr(mutils, "mx", sys.modules["mlx.core"])
+    _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils)
+    monkeypatch.setattr(
+        mutils,
+        "_build_mlx_vlm_sanitize_pipelines",
+        lambda config, model=None: [[(_StripModelNamespaceSanitizer, None)]],
+    )
+
+    tensors = {
+        "audio_tower.layers.0.ffw.input_max": torch.tensor([1.0]),
+        "audio_tower.layers.0.ffw.input_min": torch.tensor([-1.0]),
+        "audio_tower.layers.0.ffw.output_max": torch.tensor([2.0]),
+        "audio_tower.layers.0.ffw.output_min": torch.tensor([-2.0]),
+        "vision_tower.encoder.layers.0.weight": torch.arange(6).reshape(2, 3),
+        "embed_audio.weight": torch.arange(8).reshape(2, 4),
+        "embed_vision.weight": torch.arange(10).reshape(2, 5),
+    }
+    unrelated_name = "multi_modal_projector.linear.weight"
+    unrelated_tensor = torch.arange(24).reshape(2, 3, 4)
+    shard_name = "model-00001-of-00001.safetensors"
+    weight_map = {name: shard_name for name in (*tensors, unrelated_name)}
+    out = _export_dir_with_shards(
+        tmp_path,
+        config={"model_type": "fake_vlm"},
+        shards={shard_name: {**tensors, unrelated_name: unrelated_tensor}},
+        index={"metadata": {"total_size": 123}, "weight_map": weight_map},
+    )
+
+    assert mutils._prepare_vlm_gguf_export_directory(out) == len(tensors)
+
+    shard = _read_shard(out / shard_name)
+    expected_names = {f"model.{name}" for name in tensors}
+    assert set(shard) == expected_names | {unrelated_name}
+    for old_name, original in tensors.items():
+        assert torch.equal(shard[f"model.{old_name}"], original)
+    assert torch.equal(shard[unrelated_name], unrelated_tensor)
+
+    index_data = json.loads(
+        (out / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )
+    assert index_data["metadata"] == {"total_size": 123}
+    assert index_data["weight_map"] == {
+        **{f"model.{name}": shard_name for name in tensors},
+        unrelated_name: shard_name,
     }
 
 

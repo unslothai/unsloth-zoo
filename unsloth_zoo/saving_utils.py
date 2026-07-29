@@ -67,7 +67,14 @@ This {model_type} model was trained 2x faster with [Unsloth](https://github.com/
 """
 
 import torch
-import bitsandbytes as bnb
+try:
+    import bitsandbytes as bnb
+    _BNB_LINEAR4BIT = (bnb.nn.Linear4bit,)
+except Exception:
+    # No bnb (e.g. gfx906, whose generic wheel has no kernels) -> no 4bit layers
+    # exist, so the isinstance check below is simply always False.
+    bnb = None
+    _BNB_LINEAR4BIT = ()
 try:
     from huggingface_hub import get_token
 except:
@@ -90,7 +97,7 @@ def find_skipped_quantized_modules(model):
     skipped_modules = []
     quantized_modules = []
     for name, module in model.named_modules():
-        if isinstance(module, bnb.nn.Linear4bit):
+        if isinstance(module, _BNB_LINEAR4BIT):
             if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
                 quantized_modules.append(name)
             else:
@@ -4803,7 +4810,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
             combined_score = calculate_combined_score(3.0, chunk_size)
 
             suitable_strategies.append({
-                'device_type': 'cuda',
+                'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
                 'device_id': gpu['device_id'],
                 'rows_per_chunk': chunk_size,
                 'available_memory': gpu['free'] * GPU_SAFETY_FACTOR,
@@ -4877,7 +4884,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     # Add GPU fallbacks
     for gpu in stats['gpus']:
         fallback_options.append({
-            'device_type': 'cuda',
+            'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
             'device_id': gpu['device_id'],
             'available': gpu['free'] * GPU_SAFETY_FACTOR,
             'total_available': gpu['free']

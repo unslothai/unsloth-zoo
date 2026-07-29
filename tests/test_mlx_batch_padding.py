@@ -60,21 +60,21 @@ def test_zoo_padding_matches_mlx_lm(max_len, expected):
     assert _zoo_padded_len(max_len) == _mlx_lm_padded_len(max_len)
 
 
-def test_source_padding_formula_includes_plus_one():
-    """Guard against a future refactor that drops the +1 again."""
-    import inspect
+def test_padding_formula_includes_plus_one():
+    """All width callers share _finite_text_pad_width; lock its +1 contract."""
     from unsloth_zoo.mlx import trainer
+    from unsloth_zoo.mlx.utils import _finite_text_pad_width as width
 
-    src = inspect.getsource(trainer)
-    # The exact line we care about. If someone rewrites the formula
-    # they must preserve the +1 contract or add a new test alongside.
-    needle = "1 + ((max_len + _PAD_MULTIPLE - 1) // _PAD_MULTIPLE) * _PAD_MULTIPLE"
-    assert needle in src, (
-        f"create_text_batches must use `{needle}` to match mlx-lm's "
-        "1 + pad_to*ceil(L/pad_to). Dropping the +1 leaves the input "
-        "one token shorter than mlx-lm after the autoregressive shift "
-        "and changes the convergence basin on small fixtures."
-    )
+    m = trainer._PAD_MULTIPLE
+    assert [
+        width(m, pad_to_multiple=m, max_seq_length=10_000),
+        width(m - 1, pad_to_multiple=m, max_seq_length=10_000),
+        width(m + 1, pad_to_multiple=m, max_seq_length=10_000),
+        width(m + 1, pad_to_multiple=m, max_seq_length=20),
+        width(0, pad_to_multiple=m, minimum_width=2, max_seq_length=64),
+        width(5, max_seq_length=64),
+        width(100, max_seq_length=64),
+    ] == [1 + m, 1 + m, 1 + 2 * m, 20, 2, 5, 64]
 
 
 def test_pad_multiple_constant_still_32():

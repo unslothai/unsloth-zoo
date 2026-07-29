@@ -2477,8 +2477,33 @@ def convert_to_gguf(
             }
         runs_to_do.append((args, final_output, "model"))
 
+    # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
+    # (app launched from a protected dir), so the final write failed with PermissionError
+    # [Errno 13] even though conversion succeeded. Only then redirect the bare name into
+    # input_folder; a writable CWD (Linux/Mac/Colab) is left unchanged.
+    def _dir_is_writable(d):
+        # mkstemp is exclusive: never truncates an existing file or follows a symlink.
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
+            os.close(fd)
+            os.remove(probe)
+            return True
+        except Exception:
+            return False
+    _cwd_writable = _dir_is_writable(os.getcwd())
+
     # Execute conversions
     for args, output_file, description in runs_to_do:
+        # Redirect only a bare filename under an unwritable CWD. Absolute paths and
+        # relative paths with a directory are the caller's choice; input_folder is probed
+        # too since it may be a read-only model source.
+        if (not _cwd_writable
+                and not os.path.isabs(output_file)
+                and os.path.dirname(output_file) == ""):
+            _dst = os.path.abspath(input_folder)
+            if _dir_is_writable(_dst):
+                output_file = os.path.join(_dst, output_file)
+                args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
