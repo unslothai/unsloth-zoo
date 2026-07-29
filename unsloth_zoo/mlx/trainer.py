@@ -8692,7 +8692,10 @@ class MLXKTOTrainer(MLXTrainer):
                 self._train_loss_history.append(train_loss)
                 self._kl_history.append(acc_kl)
                 self._global_step = step + 1
-                if args.logging_steps and (step % max(int(args.logging_steps), 1) == 0):
+                # Gate on the ONE-based step (step is a 0-based counter here), so
+                # logging_steps=N logs at steps N, 2N, ... like MLXTrainer -- not
+                # 1, N+1, ... (the old zero-based test).
+                if args.logging_steps and ((step + 1) % max(int(args.logging_steps), 1) == 0):
                     print(
                         f"Unsloth KTO: step {step + 1}/{total_steps} "
                         f"loss={train_loss:.4f} kl={acc_kl:.4f} "

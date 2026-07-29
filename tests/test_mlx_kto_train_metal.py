@@ -94,6 +94,23 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
 
 
 @metal_only
+def test_kto_logging_steps_uses_one_based_cadence(tmp_path, capsys):
+    # logging_steps must gate on the 1-based step: logging_steps=2 over 4 steps
+    # logs at steps 2 and 4, not the old zero-based 1 and 3.
+    import re
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    model, tok = _load_peft()
+    trainer = MLXKTOTrainer(
+        model=model, tokenizer=tok, train_dataset=_dataset(),
+        args=_config(output_dir=str(tmp_path), max_steps=4, logging_steps=2, warmup_steps=0),
+    )
+    trainer.train()
+    out = capsys.readouterr().out
+    logged = [int(m) for m in re.findall(r"Unsloth KTO: step (\d+)/", out)]
+    assert logged == [2, 4], f"expected logs at 1-based steps [2,4], got {logged}"
+
+
+@metal_only
 def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
     # 24 examples / batch 4 = 6 micro-batches. With max_steps unset, one epoch
     # is len(batches) // grad_accum optimizer steps: grad_accum=2 -> 3 steps,
