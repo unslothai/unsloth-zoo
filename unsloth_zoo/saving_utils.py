@@ -4516,6 +4516,37 @@ except ImportError:
 # a message that does not say what the guard says was not raised by the guard.
 _SINGLE_SEGMENT_REJECTION = re.compile(r"single[\s\-_]?segment|namespace/name", re.IGNORECASE)
 
+def _as_hub_addressed(model_name):
+    """The repo id part of a name, the way `HfFileSystem` itself addresses it.
+
+    Two forms are documented syntax rather than decoration, and both were passed
+    straight to `ls` before this file grew a prefilter, so both have to survive it:
+
+        hf://namespace/name     the URI scheme, stripped by `_strip_protocol`
+        namespace/name@rev      the revision suffix, split off by `resolve_path`
+
+    Verified on 1.25.1: `resolve_path("hf://openai-community/gpt2@main")` answers
+    repo_id `openai-community/gpt2` at revision `main`, and `resolve_path("hf://gpt2")`
+    raises the single segment rejection naming the *stripped* `gpt2`.
+
+    Everything that decides "is this a repo id" or "is this that rejection" has to
+    agree on this normalisation. Doing it in one place is the point: the first
+    version of this stripped the scheme in `_is_hub_repo_id` only, so
+    `_is_single_segment_id_rejection` counted the scheme's two slashes on
+    `hf://gpt2`, concluded the name was addressable, and reported 1.16+'s rejection
+    as a connectivity failure.
+    """
+    name = str(model_name)
+    if name.startswith("hf://"): name = name[len("hf://"):]
+    # Split a revision only when what precedes it is itself `namespace/name`, so
+    # an `@` inside an ordinary path is left alone.
+    if "@" in name:
+        repo_id = name.split("@", 1)[0]
+        if repo_id.count("/") == 1: name = repo_id
+    return name
+pass
+
+
 def _is_single_segment_id_rejection(model_name, e):
     """True only for "this version cannot address a single segment id".
 
@@ -4528,7 +4559,9 @@ def _is_single_segment_id_rejection(model_name, e):
     the silent no-op path this module exists to close.
     """
     if type(e) is not ValueError: return False        # a subclass is a transport failure
-    if str(model_name).count("/") != 0: return False  # namespace/name is addressable everywhere
+    # Count slashes the way `HfFileSystem` does, after normalisation: `hf://gpt2` is
+    # a single segment id wearing a scheme, and 1.16+ rejects it naming `gpt2`.
+    if _as_hub_addressed(model_name).count("/") != 0: return False
     return bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
 pass
 
@@ -4572,12 +4605,11 @@ def _is_hub_repo_id(model_name):
     huggingface_hub 0.x lists happily, so `check_hf_model_exists` still probes
     them and classifies the answer there.
     """
-    name = str(model_name)
-    # `hf://namespace/name` is the documented HfFileSystem URI form and `ls` accepts
-    # it, so the scheme is stripped before the path rules below rather than letting
-    # its two slashes read as a filesystem path. Before this file existed the URI
-    # went straight to `ls` and worked, so rejecting it would be a regression.
-    if name.startswith("hf://"): name = name[len("hf://"):]
+    # `hf://namespace/name` and `namespace/name@revision` are both documented
+    # HfFileSystem syntax that `ls` accepts, and both went straight to `ls` before
+    # this prefilter existed, so neither may read as a filesystem path here. See
+    # `_as_hub_addressed`, which is shared so the two callers cannot disagree.
+    name = _as_hub_addressed(model_name)
     # `ls` addresses at most `namespace/name`, so a deeper path
     # (`/home/me/base`, `models/base/checkpoint-500`) or a leading `.`, `/`, `~`
     # (`./base`, `/base`, `~/base`) is a filesystem path and nothing else.

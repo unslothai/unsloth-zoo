@@ -193,6 +193,52 @@ def test_single_segment_rejection_is_recognised_by_its_message(monkeypatch):
     assert saving_utils._is_single_segment_id_rejection("gpt2", ValueError(_REJECTION_MESSAGE))
 
 
+@pytest.mark.parametrize("name", ["hf://gpt2", "hf://bert-base-uncased"])
+def test_a_single_segment_id_wearing_the_uri_scheme_is_still_absent(monkeypatch, name):
+    """`hf://gpt2` is the same unaddressable id with a scheme on it.
+
+    `HfFileSystem` strips the protocol first, so 1.16+ raises the rejection naming
+    the *stripped* `gpt2`. Verified on 1.25.1. Counting slashes on the unstripped
+    string sees two, concludes `namespace/name`, and reports the rejection as a
+    connectivity failure, which also stops `determine_base_model_source` reaching
+    its local priorities. Caught by Codex on this branch.
+    """
+    _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
+    assert saving_utils.check_hf_model_exists(name) is False
+
+
+def test_the_uri_scheme_does_not_smuggle_a_transport_failure_past_the_check(monkeypatch):
+    """The other direction of the same normalisation: stripping the scheme must not
+    start swallowing bare ValueErrors that say nothing about an id rejection."""
+    _patch_ls(monkeypatch, ValueError("Connection reset by peer"))
+    with pytest.raises(RuntimeError):
+        saving_utils.check_hf_model_exists("hf://gpt2")
+
+
+@pytest.mark.parametrize("name", [
+    "openai-community/gpt2@main",
+    "hf://openai-community/gpt2@main",
+    "openai-community/gpt2@refs/pr/1",
+])
+def test_a_revision_suffix_is_still_addressed_as_a_repo(name):
+    """`namespace/name@revision` is documented HfFileSystem syntax.
+
+    `resolve_path` splits the revision off and resolves the repo; verified on
+    1.25.1, where `hf://openai-community/gpt2@main` answers repo_id
+    `openai-community/gpt2` at revision `main`. `validate_repo_id` rejects the `@`,
+    so a prefilter that consults it without splitting first calls an existing remote
+    model absent, and `refs/pr/1` additionally trips the depth rule. Before this
+    file grew a prefilter these went straight to `ls` and worked. Caught by Codex.
+    """
+    assert saving_utils._is_hub_repo_id(name) is True
+
+
+@pytest.mark.parametrize("name", ["./base@old", "/abs/base@old", "~/base@old", "a/b/c@old"])
+def test_a_revision_suffix_does_not_launder_a_filesystem_path(name):
+    """Splitting on `@` must not turn a path into a repo id."""
+    assert saving_utils._is_hub_repo_id(name) is False
+
+
 def test_rejection_message_on_a_namespaced_name_still_raises(monkeypatch):
     """Scoping stays: `namespace/name` is addressable on every supported
     version, so nothing about it is an id rejection."""
