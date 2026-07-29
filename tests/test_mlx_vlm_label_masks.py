@@ -1741,3 +1741,41 @@ def test_baseline_loss_fn_forwards_real_shared_kv_slots():
     assert caches[0].state == (keys, values)
 
 
+# --- gemma3n: the ids-path embedding scale a merge leaves off ---------------
+
+
+def _scale_probe(model_type, hidden_size=16):
+    """Middle position carries a merged feature; the others are plain tokens."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils
+
+    mx_ = _utils_mx()
+    # Every position shares one token id, so an id-based mask cannot tell the
+    # feature-carrying position from the plain ones -- only a difference can.
+    ids = mx_.array([[7, 7, 7]], dtype=mx_.int32)
+    raw = mx_.ones((1, 3, hidden_size), dtype=mx_.float32)
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=model_type, hidden_size=hidden_size)
+        def embed_tokens(self, _ids): return raw
+
+    merged = mx_.concatenate(
+        [raw[:, :1], mx_.full((1, 1, hidden_size), 9.0), raw[:, 2:]], axis=1)
+    out = utils._apply_vlm_embed_scale(
+        SimpleNamespace(language_model=SimpleNamespace(model=_Backbone())),
+        ids, merged)
+    return np.asarray(out)[0], hidden_size ** 0.5
+
+
+@pytest.mark.parametrize("model_type,scaled", [
+    ("gemma3n_text", True),
+    # gemma3_text is compensated for in `_run_hidden_stack`, the route it takes,
+    # so scaling it here would apply the factor twice.
+    ("qwen2_vl", False), ("gemma3_text", False), ("gemma4_text", False),
+])
+def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
+    out, scale = _scale_probe(model_type)
+    assert out[0][0] == pytest.approx(scale if scaled else 1.0)
+    assert out[2][0] == pytest.approx(scale if scaled else 1.0)
+    # Merged features already carry the scaled magnitude; rescaling inflates.
+    assert out[1][0] == pytest.approx(9.0)

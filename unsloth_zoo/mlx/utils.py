@@ -616,6 +616,43 @@ class _SharedKVSlot:
         return self.keys, self.values
 
 
+# Language models that scale token embeddings by sqrt(hidden_size) on the ids
+# path only, so every multimodal forward loses it. gemma3 is absent because
+# `_run_hidden_stack`, the route it takes, already compensates.
+_VLM_EMBED_SCALE_FAMILIES = frozenset({"gemma3n_text"})
+
+
+def _vlm_embed_scale(model):
+    """The embedding scale this family's LM applies only on the ids path."""
+    config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
+    if _config_get(config, "model_type") not in _VLM_EMBED_SCALE_FAMILIES:
+        return None
+    hidden_size = _config_get(config, "hidden_size")
+    return float(hidden_size) ** 0.5 if hidden_size else None
+
+
+def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
+    """Scale the token embeddings a multimodal merge left unscaled.
+
+    Only positions still holding a plain token embedding: merged features
+    already carry the scaled magnitude. Found by difference, not by token id --
+    gemma3n's closing audio delimiter carries a feature without being the audio
+    token, and an id-based mask would rescale it.
+    """
+    scale = _vlm_embed_scale(model)
+    if scale is None or input_ids is None:
+        return merged_embeds
+    backbone = getattr(_get_text_model(model), "model", None)
+    embed_tokens = getattr(backbone, "embed_tokens", None)
+    if embed_tokens is None:
+        return merged_embeds
+    raw = embed_tokens(input_ids).astype(merged_embeds.dtype)
+    untouched = mx.all(merged_embeds == raw, axis=-1, keepdims=True)
+    # In the embedding dtype, as the ids path does: an fp32 product rounded back
+    # lands on different bf16 values.
+    return mx.where(untouched, merged_embeds * scale, merged_embeds)
+
+
 def _shared_kv_slot_count(model):
     """How many cache slots this stack needs, or 0 when it shares no K/V.
 
@@ -2162,6 +2199,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
+    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
