@@ -190,6 +190,46 @@ def test_kto_tokenize_row_caps_completion_exceeding_max_length():
     assert len(p) == 0 and len(c) == 8  # prompt dropped, completion capped
 
 
+def test_kto_appends_eos_and_preserves_it_under_truncation():
+    from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
+
+    EOS = 99
+
+    class _Tok:  # one id per word, never emits EOS itself
+        eos_token_id = EOS
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1 + i for i in range(len(text.split()))]}
+
+    big = MLXKTOConfig(max_length=1024, max_completion_length=None, max_prompt_length=0)
+
+    # 1) EOS appended when the completion lacks it
+    _, c = _kto_tokenize_row(_Tok(), "q", "a b c", big)
+    assert c[-1] == EOS and c.count(EOS) == 1
+
+    # 2) no double EOS when the completion already ends in EOS
+    class _TokEndsEos(_Tok):
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": super().__call__(text)["input_ids"] + [EOS]}
+    _, c = _kto_tokenize_row(_TokEndsEos(), "q", "a b", big)
+    assert c[-1] == EOS and c.count(EOS) == 1
+
+    # 3) append_eos=False -> no EOS
+    no_eos = MLXKTOConfig(max_length=1024, max_completion_length=None,
+                          max_prompt_length=0, append_eos=False)
+    _, c = _kto_tokenize_row(_Tok(), "q", "a b c", no_eos)
+    assert EOS not in c
+
+    # 4) over-length vs max_completion_length: EOS survives the cap
+    cap = MLXKTOConfig(max_length=1024, max_completion_length=4, max_prompt_length=0)
+    _, c = _kto_tokenize_row(_Tok(), "q", " ".join(["w"] * 20), cap)
+    assert len(c) == 4 and c[-1] == EOS
+
+    # 5) over-length vs max_length: EOS survives
+    ml = MLXKTOConfig(max_length=4, max_completion_length=None, max_prompt_length=0)
+    p, c = _kto_tokenize_row(_Tok(), "q", " ".join(["w"] * 20), ml)
+    assert len(p) + len(c) <= 4 and c[-1] == EOS
+
+
 def test_kto_rejects_streaming_dataset():
     # KTO materializes the whole dataset to form KL batches, so streaming must
     # be rejected loudly rather than silently exhausting the source.

@@ -8231,23 +8231,43 @@ def _kto_tokenize_row(tokenizer, prompt, completion, args):
     length exceeds max_length, matching TRL's keep-completion policy."""
     p = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     c = tokenizer(completion, add_special_tokens=False)["input_ids"]
+    # Ensure the completion ends with EOS so the model learns to terminate
+    # (TRL's add_eos_token_if_needed); tokenizing with add_special_tokens=False
+    # never adds one. Gated on the inherited append_eos flag, guarded against a
+    # double EOS and a tokenizer with no eos_token.
+    _eos = getattr(tokenizer, "eos_token_id", None)
+    _want_eos = bool(getattr(args, "append_eos", True)) and _eos is not None
+    _has_eos = bool(c) and c[-1] == _eos
+    if _want_eos and not _has_eos:
+        c = list(c) + [_eos]
+        _has_eos = True
+
+    def _cap_completion(seq, limit):
+        # Truncate the completion to `limit`, PRESERVING a trailing EOS. This
+        # deviates from TRL (which truncates then appends, dropping the EOS when
+        # the completion is over-length): here the termination signal is kept by
+        # trimming to limit-1 and re-appending the EOS.
+        if limit <= 0:
+            return seq[:0]
+        if _want_eos and _has_eos and len(seq) > limit:
+            return seq[:limit - 1] + [_eos]
+        return seq[:limit]
+
     max_completion = args.max_completion_length
     if max_completion is not None and max_completion > 0:
-        c = c[:max_completion]
+        c = _cap_completion(c, max_completion)
     if args.max_prompt_length and args.max_prompt_length > 0:
         p = p[-args.max_prompt_length:]
     if args.max_length and args.max_length > 0 and len(p) + len(c) > args.max_length:
         # Keep the completion, trim the prompt from the left. If the completion
         # alone meets or exceeds max_length there is no room for the prompt AND
-        # the completion itself must be capped to max_length -- otherwise
-        # (with max_completion_length unset) the returned sequence would exceed
-        # max_length. Keep the leading completion tokens.
+        # the completion itself must be capped to max_length (EOS preserved).
         keep = args.max_length - len(c)
         if keep > 0:
             p = p[-keep:]
         else:
             p = []
-            c = c[:args.max_length]
+            c = _cap_completion(c, args.max_length)
     return p, c
 
 
