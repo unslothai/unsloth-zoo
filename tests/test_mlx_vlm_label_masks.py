@@ -1779,3 +1779,219 @@ def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
     assert out[2][0] == pytest.approx(scale if scaled else 1.0)
     # Merged features already carry the scaled magnitude; rescaling inflates.
     assert out[1][0] == pytest.approx(9.0)
+
+
+# --- paligemma: a prefix-LM mask, not a padding outer product ---------------
+
+
+def test_paligemma_mask_is_bidirectional_on_the_prefix_and_causal_on_the_suffix():
+    """PaliGemma's own mask is an outer product of the padding mask, so with
+    nothing padded the suffix being trained on reads the tokens after it."""
+    from unsloth_zoo.mlx.loader import (
+        _VLM_MODEL_FIXUPS, _fix_paligemma_multimodal_causal_mask,
+        _paligemma_prefix_lm_mask,
+    )
+
+    # Loading a VLM has to apply the correction, not just define it.
+    assert _fix_paligemma_multimodal_causal_mask in _VLM_MODEL_FIXUPS
+
+    mx_ = _utils_mx()
+    seq = 8
+    # 0 marks the prefix, 1 the suffix: the reverse of Gemma3's convention.
+    token_type_ids = mx_.array([[0, 0, 0, 0, 1, 1, 0, 0]], dtype=mx_.int32)
+    padding = mx_.array([[1, 1, 1, 1, 1, 1, 0, 0]], dtype=mx_.int32)
+    m = np.asarray(
+        _paligemma_prefix_lm_mask(token_type_ids, padding)
+    ).reshape(-1, seq, seq)[0].astype(bool)
+
+    q_idx, kv_idx = np.indices(m.shape)
+    real = np.asarray(padding)[0] == 1
+    prefix = (np.asarray(token_type_ids)[0] == 0) & real
+    both_real = real[q_idx] & real[kv_idx]
+    both_prefix = prefix[q_idx] & prefix[kv_idx]
+    ahead = q_idx < kv_idx
+    # The suffix is causal: outside the prefix nothing reads ahead. Left as an
+    # outer product every one of these is visible.
+    assert not m[ahead & ~both_prefix & both_real].any()
+    # The prefix stays bidirectional, which is what PaliGemma is trained for.
+    assert m[both_prefix].all()
+    # The past is always visible, so this is a mask and not all-zeros.
+    assert m[(q_idx >= kv_idx) & both_real].all()
+    # And the pads are excluded, which the outer product did do and this must too.
+    assert not m[~both_real].any()
+
+
+def test_paligemma_mask_is_left_alone_without_token_types():
+    """`Model.__call__` forwards no extra kwargs, so on the plain loss path the
+    token types never arrive and there is no prefix boundary to derive."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _paligemma_causal_mask_wrapper, _paligemma_replace_mask,
+    )
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+
+    untouched = _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=outer_product), None, padding)
+    assert untouched.attention_mask_4d is outer_product
+    # Nor when upstream built no mask at all, e.g. a text-only batch.
+    assert _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=None),
+        mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
+    # But it is replaced once the token types are there.
+    replaced = _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=outer_product),
+        mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
+    assert replaced.attention_mask_4d is not outer_product
+    assert not np.asarray(replaced.attention_mask_4d).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
+    """The wrapper is what actually reaches a loaded model, so it has to hand the
+    token types on rather than return upstream's mask untouched."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import _paligemma_causal_mask_wrapper
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    seen = {}
+
+    def original(_self, input_ids=None, pixel_values=None, mask=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(attention_mask_4d=outer_product)
+
+    wrapped = _paligemma_causal_mask_wrapper(original)
+    got = wrapped(object(), mx_.zeros((1, 4), dtype=mx_.int32), None,
+                  mx_.ones((1, 4), dtype=mx_.int32),
+                  token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
+    # Upstream still runs and still sees its kwargs.
+    assert "token_type_ids" in seen["kwargs"]
+    # And its all-visible mask does not survive: the suffix cannot read ahead.
+    assert got.attention_mask_4d is not outer_product
+    assert not np.asarray(got.attention_mask_4d).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
+    """Upstream's call embeds with a fixed three arguments, dropping the token
+    types, so without threading them the `use_cce=False` path keeps leaking."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _paligemma_call_wrapper, _paligemma_causal_mask_wrapper,
+        _paligemma_pending_token_types,
+    )
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    seen = {}
+
+    def upstream_embed(_self, input_ids=None, pixel_values=None, mask=None, **kw):
+        return SimpleNamespace(attention_mask_4d=outer_product)
+
+    class _Model:
+        get_input_embeddings = _paligemma_causal_mask_wrapper(upstream_embed)
+
+        def __call__(self, input_ids, pixel_values=None, mask=None, **kwargs):
+            # Upstream drops kwargs here, exactly as PaliGemma does.
+            seen["mask"] = self.get_input_embeddings(
+                input_ids, pixel_values, mask).attention_mask_4d
+            return seen["mask"]
+
+    _Model.__call__ = _paligemma_call_wrapper(_Model.__call__)
+    model = _Model()
+    model(mx_.zeros((1, 4), dtype=mx_.int32), None, padding,
+          token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
+
+    assert seen["mask"] is not outer_product
+    assert not np.asarray(seen["mask"]).reshape(4, 4)[2, 3]
+    # And nothing is left pending once the call returns.
+    assert _paligemma_pending_token_types() is None
+
+
+class _FakePaligemma:
+    """Upstream's shape: `__call__` embeds with a fixed three arguments, so the
+    token types it was given never reach the embedder on their own."""
+
+    outer_product = None          # set per test, so identity can be compared
+    seen = None
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None,
+                             **kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(attention_mask_4d=self.outer_product)
+
+    def __call__(self, input_ids, pixel_values=None, mask=None, **kwargs):
+        import threading
+        from unsloth_zoo.mlx.loader import _paligemma_pending_token_types
+        if self.seen is not None:
+            self.seen[threading.current_thread().name] = \
+                _paligemma_pending_token_types()
+        return self.get_input_embeddings(input_ids, pixel_values, mask)
+
+
+def test_paligemma_install_puts_both_wrappers_on_the_class():
+    """Removing either assignment leaves the matching production loss path
+    unfixed, so the install itself has to be checked, not just the wrappers."""
+    from unsloth_zoo.mlx.loader import _install_paligemma_causal_mask
+
+    mx_ = _utils_mx()
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    token_type_ids = mx_.array([[0, 0, 1, 1]], dtype=mx_.int32)
+
+    class _Model(_FakePaligemma):
+        outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+        seen = {}
+
+    assert _install_paligemma_causal_mask(_Model)
+    model, ids = _Model(), mx_.zeros((1, 4), dtype=mx_.int32)
+
+    # The plain path: the call wrapper has to carry the token types across.
+    plain = model(ids, None, padding, token_type_ids=token_type_ids)
+    assert not np.asarray(plain.attention_mask_4d).reshape(4, 4)[2, 3]
+    # The cross-entropy path: the embedder wrapper receives them itself.
+    direct = model.get_input_embeddings(
+        ids, None, padding, token_type_ids=token_type_ids).attention_mask_4d
+    assert not np.asarray(direct).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
+    """One model can serve several callers at once; an attribute on the model
+    would let one read another's batch."""
+    import threading
+    from unsloth_zoo.mlx.loader import (
+        _install_paligemma_causal_mask, _paligemma_pending_token_types,
+    )
+
+    mx_ = _utils_mx()
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    entered = threading.Barrier(2)
+
+    class _Model(_FakePaligemma):
+        outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+        seen = {}
+
+        def __call__(self, *args, **kwargs):
+            entered.wait(timeout=5)      # both callers inside their own call
+            return _FakePaligemma.__call__(self, *args, **kwargs)
+
+    assert _install_paligemma_causal_mask(_Model)
+    model = _Model()
+    marks = {"a": mx_.array([[0, 0, 1, 1]], dtype=mx_.int32),
+             "b": mx_.array([[0, 1, 1, 1]], dtype=mx_.int32)}
+    threads = [
+        threading.Thread(name=name, target=model,
+                         args=(mx_.zeros((1, 4), dtype=mx_.int32), None, padding),
+                         kwargs={"token_type_ids": mark})
+        for name, mark in marks.items()
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    # Each caller saw its own token types, not the other's.
+    for name, mark in marks.items():
+        assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
+    assert _paligemma_pending_token_types() is None

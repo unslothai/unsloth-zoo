@@ -2369,6 +2369,134 @@ def _fix_gemma3_multimodal_image_feature_scale(model=None):
     if model is not None:
         model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
     return True
+def _paligemma_prefix_lm_mask(token_type_ids, attention_mask):
+    """PaliGemma's prefix is bidirectional and only its suffix is causal.
+
+    Its processor marks the suffix with 1, the reverse of the convention the
+    builder reads, so the polarity is inverted before the group is formed.
+    """
+    from .utils import _build_gemma_image_attention_mask
+    prefix = (token_type_ids == 0).astype(token_type_ids.dtype)
+    return _build_gemma_image_attention_mask(prefix, attention_mask=attention_mask)
+
+
+def _paligemma_replace_mask(features, token_type_ids, attention_mask):
+    """Swap the outer-product mask for the prefix-LM one where the split is known.
+
+    Without token types there is no prefix boundary to derive, so upstream's mask
+    is left as it is rather than guessed at.
+    """
+    if token_type_ids is None or features.attention_mask_4d is None:
+        return features
+    features.attention_mask_4d = _paligemma_prefix_lm_mask(
+        token_type_ids, attention_mask,
+    )
+    return features
+
+
+# Where the call wrapper leaves the token types for the embedder wrapper. A
+# per-thread stack, not an attribute on the model: one model can serve several
+# callers at once, and an attribute would let them read each other's batch.
+_PALIGEMMA_TOKEN_TYPES = threading.local()
+
+
+def _paligemma_pending_token_types():
+    stack = getattr(_PALIGEMMA_TOKEN_TYPES, "stack", None)
+    return stack[-1] if stack else None
+
+
+def _paligemma_call_wrapper(original_call):
+    """Thread the token types through to the embedder.
+
+    Upstream's call embeds with a fixed three arguments, so the token types that
+    carry the prefix boundary never reach the mask on the plain loss path.
+    """
+
+    def __call__(self, *args, **kwargs):
+        stack = getattr(_PALIGEMMA_TOKEN_TYPES, "stack", None)
+        if stack is None:
+            stack = _PALIGEMMA_TOKEN_TYPES.stack = []
+        stack.append(kwargs.get("token_type_ids"))
+        try:
+            return original_call(self, *args, **kwargs)
+        finally:
+            stack.pop()
+
+    return __call__
+
+
+def _paligemma_causal_mask_wrapper(original):
+    """Wrap PaliGemma's embedder so its 4-D mask carries a causal suffix."""
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None,
+                             **kwargs):
+        features = original(self, input_ids, pixel_values, mask, **kwargs)
+        token_type_ids = kwargs.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = _paligemma_pending_token_types()
+        return _paligemma_replace_mask(features, token_type_ids, mask)
+
+    return get_input_embeddings
+
+
+def _install_paligemma_causal_mask(model_cls):
+    """Put both wrappers on a PaliGemma model class, or report why not."""
+    original_embed = getattr(model_cls, "get_input_embeddings", None)
+    original_call = getattr(model_cls, "__call__", None)
+    if not callable(original_embed) or not callable(original_call):
+        return False
+    model_cls.get_input_embeddings = _paligemma_causal_mask_wrapper(original_embed)
+    model_cls.__call__ = _paligemma_call_wrapper(original_call)
+    model_cls._unsloth_causal_mask_patched = True
+    return True
+
+
+def _fix_paligemma_multimodal_causal_mask(model=None):
+    """Give PaliGemma's prefix-LM mask a causal suffix.
+
+    Its 4-D mask is an outer product of the padding mask, so with nothing padded
+    every position sees every other and the suffix being trained on can read the
+    answer tokens after it. PaliGemma wants its prefix -- image plus prompt --
+    bidirectional and its suffix causal, which is what the reference builds from
+    `token_type_ids`, marking the suffix with 1 where Gemma3 marks the
+    bidirectional side.
+
+    Both loss paths are corrected: the cross-entropy path embeds directly and
+    already carries the token types, and the plain path goes through
+    `Model.__call__`, which the companion wrapper makes them survive.
+    """
+    try:
+        import mlx.core as mx
+        paligemma_module = importlib.import_module("mlx_vlm.models.paligemma.paligemma")
+    except Exception:
+        return False
+
+    model_cls = getattr(paligemma_module, "Model", None)
+    # A real class, not the simulation shim's stand-in object.
+    if not isinstance(model_cls, type):
+        return False
+    if getattr(model_cls, "_unsloth_causal_mask_patched", False):
+        return True
+    try:
+        return _install_paligemma_causal_mask(model_cls)
+    except Exception:
+        return False
+
+
+# Upstream corrections applied to every VLM as it loads, in order.
+_VLM_MODEL_FIXUPS = (
+    _fix_gemma4_kv_sharing,
+    _fix_gemma3_vision_post_layernorm_eps,
+    _fix_gemma3_vision_attention_fp32_sdpa,
+    _fix_gemma3_vision_encoder_fp32_layernorm,
+    _fix_gemma3_vision_post_layernorm_fp32,
+    _fix_gemma3_vision_mlp_fp32_activation,
+    _fix_gemma3_language_mlp_fp32_activation,
+    _fix_gemma3_multimodal_image_feature_scale,
+    _fix_paligemma_multimodal_causal_mask,
+)
+
+
 def _disable_fused_mrope(model):
     """Flip fused_apply off so MRoPE training uses the differentiable
     cos/sin fallback; the fused Metal kernel has no VJP."""
@@ -7320,16 +7448,7 @@ class FastMLXModel:
                 model._unsloth_text_only_vlm = True
             model._is_vlm_model = True
             model._processor = processor
-            for fixup in (
-                _fix_gemma4_kv_sharing,
-                _fix_gemma3_vision_post_layernorm_eps,
-                _fix_gemma3_vision_attention_fp32_sdpa,
-                _fix_gemma3_vision_encoder_fp32_layernorm,
-                _fix_gemma3_vision_post_layernorm_fp32,
-                _fix_gemma3_vision_mlp_fp32_activation,
-                _fix_gemma3_language_mlp_fp32_activation,
-                _fix_gemma3_multimodal_image_feature_scale,
-            ):
+            for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
 
             model._config = getattr(model, "_config", config_data)
