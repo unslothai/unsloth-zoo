@@ -415,3 +415,24 @@ def test_an_exactly_named_local_directory_never_reaches_the_config_fetch(
     )
     assert resolved[3] is True
     assert resolved[4] == "nf4"
+
+
+# ---------------------------------------------------------------------------
+# A disabled repo is a fact about the repo, not about the network.
+# ---------------------------------------------------------------------------
+
+def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch):
+    """`DisabledRepoError` is the one Hub 4xx that does NOT subclass
+    `RepositoryNotFoundError`, so without being named explicitly it reached the
+    catch-all and was announced as "a connectivity or rate limiting problem, not a
+    missing model". It is neither, and no amount of retrying changes it."""
+    from huggingface_hub.errors import DisabledRepoError, RepositoryNotFoundError
+    assert not issubclass(DisabledRepoError, RepositoryNotFoundError), (
+        "premise: this is why it needs naming rather than inheriting its way in"
+    )
+
+    def fake_ls(self, path, detail = True, **kwargs):
+        raise DisabledRepoError("403 disabled")
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+
+    assert saving_utils.check_hf_model_exists("ns/disabled") is False

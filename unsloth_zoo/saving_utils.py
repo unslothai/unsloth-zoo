@@ -4473,6 +4473,17 @@ except ImportError:
     _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
 try:
+    # A repo the Hub has disabled. Unlike every other 4xx in the absent set it does
+    # NOT subclass RepositoryNotFoundError, so without naming it explicitly it falls
+    # to the catch-all and is announced as "a connectivity or rate limiting problem,
+    # not a missing model". It is neither: the repo is unusable and no amount of
+    # retrying changes that. Guarded like HfUriError in case an older release lacks it.
+    from huggingface_hub.errors import DisabledRepoError
+    _HUB_DISABLED_REPO_ERRORS = (DisabledRepoError,)
+except ImportError:
+    _HUB_DISABLED_REPO_ERRORS = ()
+
+try:
     # "The network is disabled or unavailable and the file is not in the cache."
     # It subclasses EntryNotFoundError, so it has to be caught ahead of the absent
     # set rather than added to it. Imported defensively like HfUriError.
@@ -4539,7 +4550,7 @@ _HUB_ABSENT_ERRORS = (
 # rather than raising. Both are ValueError subclasses, and naming the two
 # specific types keeps a genuine transport failure that happens to surface as a
 # plain ValueError from being swallowed along with them.
-) + _HUB_INVALID_ID_ERRORS
+) + _HUB_INVALID_ID_ERRORS + _HUB_DISABLED_REPO_ERRORS
 
 def _is_hub_repo_id(model_name):
     """False for a string that is plainly a filesystem path, not a Hub repo id.
