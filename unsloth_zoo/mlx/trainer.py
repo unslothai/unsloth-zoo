@@ -8237,9 +8237,17 @@ def _kto_tokenize_row(tokenizer, prompt, completion, args):
     if args.max_prompt_length and args.max_prompt_length > 0:
         p = p[-args.max_prompt_length:]
     if args.max_length and args.max_length > 0 and len(p) + len(c) > args.max_length:
-        # Keep the whole completion; trim the prompt from the left.
-        keep = max(args.max_length - len(c), 0)
-        p = p[-keep:] if keep > 0 else []
+        # Keep the completion, trim the prompt from the left. If the completion
+        # alone meets or exceeds max_length there is no room for the prompt AND
+        # the completion itself must be capped to max_length -- otherwise
+        # (with max_completion_length unset) the returned sequence would exceed
+        # max_length. Keep the leading completion tokens.
+        keep = args.max_length - len(c)
+        if keep > 0:
+            p = p[-keep:]
+        else:
+            p = []
+            c = c[:args.max_length]
     return p, c
 
 

@@ -171,3 +171,20 @@ def test_kto_string_labels_parsed_not_truthy():
         dataset, _DummyTokenizer(), MLXKTOConfig(per_device_train_batch_size=2),
     )
     assert batches[0]["label"] == [False, False], batches[0]["label"]
+
+
+def test_kto_tokenize_row_caps_completion_exceeding_max_length():
+    # When max_completion_length is unset and a completion alone exceeds
+    # max_length, the old code set keep=0 (dropping the prompt) but left the
+    # whole completion, so the returned sequence exceeded max_length. The
+    # completion must be capped too.
+    from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
+
+    class _LenTokenizer:  # one token id per whitespace-split word
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": list(range(len(text.split())))}
+
+    args = MLXKTOConfig(max_length=8, max_completion_length=None, max_prompt_length=0)
+    p, c = _kto_tokenize_row(_LenTokenizer(), "a b c", " ".join(["w"] * 20), args)
+    assert len(p) + len(c) <= 8, (len(p), len(c))
+    assert len(p) == 0 and len(c) == 8  # prompt dropped, completion capped
