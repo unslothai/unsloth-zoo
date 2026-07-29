@@ -111,6 +111,32 @@ def test_kto_logging_steps_uses_one_based_cadence(tmp_path, capsys):
 
 
 @metal_only
+def test_kto_grad_accum_weights_microbatches_by_example_count(tmp_path):
+    # 6 rows, batch_size=4 -> micro-batches of sizes [4, 2]. With lr=0 nothing
+    # updates, so both are scored on the same initial model. A grad-accum window
+    # over both must report the EXAMPLE-weighted mean (4*L1+2*L2)/6, not the equal
+    # mean (L1+L2)/2 -- otherwise the trailing size-2 batch is over-weighted.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+    data = _dataset(6)
+
+    def _run(tmp, **over):
+        m, t = _load_peft()
+        cfg = _config(output_dir=str(tmp), per_device_train_batch_size=4,
+                      learning_rate=0.0, weight_decay=0.0, warmup_steps=0, **over)
+        tr = MLXKTOTrainer(model=m, tokenizer=t, train_dataset=data, args=cfg)
+        tr.train()
+        return tr._train_loss_history
+
+    L1, L2 = _run(tmp_path / "a", gradient_accumulation_steps=1, max_steps=2)
+    Lw = _run(tmp_path / "b", gradient_accumulation_steps=2, max_steps=1)[0]
+
+    example_weighted = (4 * L1 + 2 * L2) / 6
+    equal_weighted = (L1 + L2) / 2
+    assert abs(example_weighted - equal_weighted) > 1e-5, "test needs L1 != L2 to discriminate"
+    assert Lw == pytest.approx(example_weighted, abs=1e-4), (Lw, example_weighted, equal_weighted)
+
+
+@metal_only
 def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
     # 24 examples / batch 4 = 6 micro-batches. With max_steps unset, one epoch
     # is len(batches) // grad_accum optimizer steps: grad_accum=2 -> 3 steps,

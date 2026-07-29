@@ -8622,9 +8622,10 @@ class MLXKTOTrainer(MLXTrainer):
 
         step = 0
         micro = 0            # micro-batches accumulated in the current window
-        acc_grad = None      # running mean of the window's gradients
-        acc_loss = 0.0       # running mean of the window's losses
-        acc_kl = 0.0         # running mean of the window's KL diagnostics
+        acc_grad = None      # running SUM of example-weighted window gradients
+        acc_loss = 0.0       # running SUM of example-weighted window losses
+        acc_kl = 0.0         # running SUM of example-weighted KL diagnostics
+        acc_n = 0            # total examples (rows) accumulated in the window
         stop = False
         max_epochs = 1_000_000
         for _epoch in range(max_epochs):
@@ -8654,16 +8655,23 @@ class MLXKTOTrainer(MLXTrainer):
 
                 loss, grad = nn.value_and_grad(model, loss_fn)(model)
 
-                # Accumulate the mean gradient. Dividing each micro-batch by
-                # grad_accum before summing keeps the accumulator at update
-                # scale; sum(g_i / N) == mean(g_i).
-                contrib = tree_map(lambda g: g / grad_accum, grad)
+                # Example-count weighting. _kto_loss is a mean over the batch's
+                # rows, so a grad-accum window that mixes batches of different
+                # sizes (e.g. a full batch plus the trailing size-2 batch) must
+                # weight each micro-batch by its row count and normalize by the
+                # window total -- equal weighting would over-weight the smaller
+                # batch. This mirrors the pair/example-count accumulation Daniel
+                # adopted for ORPO/DPO/GRPO (the weight the loss averaged over is
+                # what makes accumulate-then-normalize match the single-batch mean).
+                n_i = len(labels)
+                contrib = tree_map(lambda g: g * n_i, grad)
                 if acc_grad is None:
                     acc_grad = contrib
                 else:
                     acc_grad = tree_map(lambda a, g: a + g, acc_grad, contrib)
-                acc_loss += float(loss) / grad_accum
-                acc_kl += float(kl_scalar) / grad_accum
+                acc_loss += float(loss) * n_i
+                acc_kl += float(kl_scalar) * n_i
+                acc_n += n_i
                 micro += 1
                 if micro < grad_accum:
                     # Materialize the running accumulator so the autograd graph
@@ -8671,7 +8679,10 @@ class MLXKTOTrainer(MLXTrainer):
                     mx.eval(acc_grad)
                     continue
 
-                grad = acc_grad
+                # Normalize the window by its total example count.
+                grad = tree_map(lambda g: g / acc_n, acc_grad)
+                mean_loss = acc_loss / acc_n
+                mean_kl = acc_kl / acc_n
                 # Install this step's scheduled LR before the decay helpers:
                 # _apply_manual_weight_decay reads optimizer.learning_rate, so
                 # setting the LR afterwards would decouple decay using the
@@ -8688,9 +8699,9 @@ class MLXKTOTrainer(MLXTrainer):
                 optimizer.update(model, grad)
                 mx.eval(model.parameters(), optimizer.state)
 
-                train_loss = acc_loss
+                train_loss = mean_loss
                 self._train_loss_history.append(train_loss)
-                self._kl_history.append(acc_kl)
+                self._kl_history.append(mean_kl)
                 self._global_step = step + 1
                 # Gate on the ONE-based step (step is a 0-based counter here), so
                 # logging_steps=N logs at steps N, 2N, ... like MLXTrainer -- not
@@ -8698,13 +8709,14 @@ class MLXKTOTrainer(MLXTrainer):
                 if args.logging_steps and ((step + 1) % max(int(args.logging_steps), 1) == 0):
                     print(
                         f"Unsloth KTO: step {step + 1}/{total_steps} "
-                        f"loss={train_loss:.4f} kl={acc_kl:.4f} "
+                        f"loss={train_loss:.4f} kl={mean_kl:.4f} "
                         f"(desirable={len(chosen_idx)} undesirable={len(rejected_idx)})"
                     )
                 step += 1
                 acc_grad = None
                 acc_loss = 0.0
                 acc_kl = 0.0
+                acc_n = 0
                 micro = 0
 
         # Honor the documented save_steps=0 contract (save at end of training),
