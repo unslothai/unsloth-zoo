@@ -1309,6 +1309,65 @@ def fix_gemma4_forced_float32_ple_dtype(source, module = None):
 pass
 
 
+def _unwrap_undecorated_method(func, owner_qualname):
+    """
+    Recover the real, undecorated method hidden behind a decorator that returns
+    a bare closure without `functools.wraps`.
+
+    `functools.wraps` copies `__qualname__` and sets `__wrapped__`, and both
+    `inspect.getsource` and `inspect.signature` already follow `__wrapped__`, so
+    well behaved decorators need no help here and are returned unchanged by the
+    `__qualname__` fast path below.
+
+    A decorator that does NOT use `functools.wraps` leaves a class attribute
+    whose source and signature belong to the wrapper, not to the method. One
+    such decorator is transformers' `@force_accelerate_hooks(...)` in
+    `transformers/integrations/accelerate.py`, applied to
+    `Qwen3_5GatedDeltaNet.forward`: it leaves behind
+    `force_accelerate_hooks.<locals>.decorator.<locals>.wrapped`, so
+    `inspect.getsource` returns the wrapper (which lives in another file and
+    closes over free variables that do not exist at module scope) and
+    `inspect.signature` returns `(self, *args, **kwargs)`. Generating a
+    standalone function from that emits `return wrapped(self, *args, **kwargs)`
+    under the real named signature, which is a `NameError` at the first forward.
+
+    Walk `__wrapped__` and then single function closure cells until we land on a
+    function that really belongs to `owner_qualname`. If no such function is
+    found, return `func` unchanged so nothing else changes behaviour.
+    """
+    prefix = owner_qualname + "."
+    if getattr(func, "__qualname__", "").startswith(prefix):
+        return func
+    seen = set()
+    current = func
+    for _ in range(10):
+        candidate = getattr(current, "__wrapped__", None)
+        if candidate is None:
+            cells = getattr(current, "__closure__", None)
+            if getattr(current, "__code__", None) is None or not cells:
+                break
+            inner = []
+            for cell in cells:
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if inspect.isfunction(value):
+                    inner.append(value)
+            # More than one candidate is ambiguous, so leave `func` alone.
+            if len(inner) != 1:
+                break
+            candidate = inner[0]
+        if not inspect.isfunction(candidate) or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        current = candidate
+        if getattr(current, "__qualname__", "").startswith(prefix):
+            return current
+    return func
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1332,7 +1391,11 @@ def create_standalone_class(
     # All Unsloth Zoo code licensed under LGPLv3
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
-    old_source = inspect.getsource(f.forward)
+    # A decorator that returns a bare closure (no `functools.wraps`) hides the
+    # real method behind the wrapper, so read the source and the signature off
+    # the undecorated function instead of off the class attribute.
+    real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
+    old_source = inspect.getsource(real_forward)
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
@@ -1465,7 +1528,7 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(f.forward).parameters
+    parameters = inspect.signature(real_forward).parameters
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's

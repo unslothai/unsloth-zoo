@@ -205,6 +205,37 @@ def test_trainer_config_smoke():
     assert ok
 
 
+# ---------------------------------------------------------------------------
+# 8. Warm-start contract: the documented from_pretrained behaviour must match
+#    the adapter-reload code. The reload restores the non-adapter tensors a
+#    save_trainable_adapters checkpoint recorded as trainable, so the docstring
+#    must describe that instead of promising an adapter-only trainable set.
+# ---------------------------------------------------------------------------
+
+def test_from_pretrained_documents_restored_non_adapter_trainables():
+    import inspect
+    import unsloth_zoo.mlx.loader as ml
+
+    source = inspect.getsource(ml.FastMLXModel.from_pretrained)
+    assert "_unfreeze_saved_mlx_non_adapter_parameters(" in source, (
+        "adapter reload no longer restores saved non-adapter trainables; "
+        "the from_pretrained docstring must be updated to match"
+    )
+    doc = inspect.getdoc(ml.FastMLXModel.from_pretrained) or ""
+    assert "save_trainable_adapters" in doc, (
+        "from_pretrained restores the non-adapter tensors held by a "
+        "save_trainable_adapters checkpoint, but its docstring never says so"
+    )
+    stale = [
+        phrase for phrase in ("are not re-enabled", "re-specify them")
+        if phrase in doc
+    ]
+    assert not stale, (
+        "from_pretrained docstring still claims saved non-adapter tensors stay "
+        f"frozen on reload: {stale}"
+    )
+
+
 def test_adam_optimizers_enable_bias_correction():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 

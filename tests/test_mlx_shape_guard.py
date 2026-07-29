@@ -174,6 +174,29 @@ def test_padding_budget_keeps_small_schedules_exact_without_padding():
     assert plan.report.budget_satisfied is True
 
 
+def test_padding_budget_exact_threshold_boundary_and_domain():
+    events = [_event(("vlm",), width) for width in range(10, 139)]
+    at_cap = build_text_shape_frontier(events[:128], compile_scope=FULL_STEP_SCOPE)
+    over_cap = build_text_shape_frontier(events, compile_scope=FULL_STEP_SCOPE)
+
+    ceiling = AUTOMATIC_TEXT_COMPILE_CEILING
+    exact = select_text_shape_padding_budget(
+        at_cap, exact_signature_threshold=ceiling,
+    ).report
+    bucketed = select_text_shape_padding_budget(
+        over_cap, exact_signature_threshold=ceiling,
+    ).report
+
+    assert (exact.action, exact.planned_signatures, exact.raw_signatures) == ("exact", 128, 128)
+    assert (bucketed.action, bucketed.raw_signatures) == ("bucket", 129)
+    # No bounded points exist below the default; the ceiling caps above.
+    for invalid in (31, AUTOMATIC_TEXT_COMPILE_CEILING + 1):
+        with pytest.raises(ValueError):
+            select_text_shape_padding_budget(
+                at_cap, exact_signature_threshold=invalid,
+            )
+
+
 def test_padding_budget_uses_bounded_plans_and_adapts_to_width_distribution():
     clustered = [_event(("text",), width) for width in range(100, 164)]
     irregular = [_event(("text",), 10 + width * width) for width in range(64)]
