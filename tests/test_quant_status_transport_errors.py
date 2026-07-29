@@ -431,8 +431,15 @@ def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch)
         "premise: this is why it needs naming rather than inheriting its way in"
     )
 
+    # Built through `_hub_error`, not `DisabledRepoError("...")`. It inherits
+    # HfHubHTTPError, whose `response` is keyword-only and required from hub 1.0, so
+    # the bare call raises TypeError there. That TypeError then reaches the
+    # catch-all and the test fails announcing a connectivity problem, which reads
+    # exactly like the bug under test rather than a broken fixture.
+    error = _hub_error(DisabledRepoError, "403 disabled")
+
     def fake_ls(self, path, detail = True, **kwargs):
-        raise DisabledRepoError("403 disabled")
+        raise error
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
 
     assert saving_utils.check_hf_model_exists("ns/disabled") is False
