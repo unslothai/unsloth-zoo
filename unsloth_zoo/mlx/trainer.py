@@ -8380,6 +8380,17 @@ class MLXKTOTrainer(MLXTrainer):
                 f"{type(self.args).__name__}). Use MLXKTOConfig for beta / "
                 "desirable_weight / undesirable_weight."
             )
+        # Only the standard KTO loss is implemented. The training path always
+        # calls _kto_loss and never reads args.loss_type, so any other value
+        # (e.g. TRL's 'apo_zero_unpaired') would be silently ignored and run
+        # plain KTO. Reject it rather than mistrain against the caller's request.
+        _loss_type = getattr(self.args, "loss_type", "kto")
+        if _loss_type != "kto":
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer only implements loss_type='kto' (got "
+                f"{_loss_type!r}). Other TRL KTO variants are not implemented on "
+                "the MLX KTO path. Set loss_type='kto'."
+            )
         self._is_vlm = False
         # Raw KTO rows: do NOT wrap in the SFT tokenized dataset view.
         self.train_dataset = train_dataset

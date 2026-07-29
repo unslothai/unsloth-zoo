@@ -212,3 +212,12 @@ def test_kto_rejects_streaming_dataset():
     with pytest.raises(NotImplementedError, match="streaming"):
         _build_kto_batches(_gen(), _DummyTokenizer(),
                            MLXKTOConfig(per_device_train_batch_size=2))
+
+
+def test_kto_rejects_non_kto_loss_type():
+    # loss_type is never read by the KTO loop; a non-'kto' value would silently
+    # run standard KTO. Reject it instead of ignoring the caller's request.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+    with pytest.raises(ValueError, match="loss_type='kto'"):
+        MLXKTOTrainer(object(), object(), [],
+                      args=MLXKTOConfig(loss_type="apo_zero_unpaired"))
