@@ -4571,12 +4571,16 @@ def _as_hub_addressed(model_name):
     as a connectivity failure.
     """
     name = str(model_name)
-    if name.startswith("hf://"): name = name[len("hf://"):]
-    # `models/namespace/name` is the typed form of the same model address, and where
-    # the installed version reads it that way its three segments must not read as a
-    # filesystem path. Gated on the parser rather than stripped outright, because on
-    # a version that does not map the prefix this would probe a different repo.
-    if name.startswith("models/") and _hub_addresses_typed_model_uris():
+    explicit_uri = name.startswith("hf://")
+    if explicit_uri: name = name[len("hf://"):]
+    # `models/namespace/name` is the typed form of the same model address, but only
+    # under an explicit `hf://`. Bare, it is ambiguous, and the far commoner reading
+    # is a local directory: `models/base/checkpoint-500` is what a Trainer writes.
+    # Stripping the prefix there turns that path into the plausible repo id
+    # `base/checkpoint-500` and sends a local base to the Hub, so the scheme is what
+    # distinguishes "I mean a URI" from "I mean a folder". Gated on the parser too,
+    # since a version that does not map the prefix would probe a different repo.
+    if explicit_uri and name.startswith("models/") and _hub_addresses_typed_model_uris():
         name = name[len("models/"):]
     # Split a revision only when what precedes it is addressable, so an `@` inside
     # an ordinary path is left alone. `gpt2@main` counts: the zero-slash branch of
@@ -4913,8 +4917,11 @@ def _load_quant_config_or_raise(config_path, model_name_or_path):
         raise RuntimeError(
             f"Unsloth: could not read the quantization config of "
             f"`{model_name_or_path}` ({type(e).__name__}: {e}). It exists but cannot "
-            f"be parsed, so whether the weights are quantized is unknown, and "
-            f"assuming they are not would merge 16bit over quantized weights."
+            f"be parsed, so whether the weights are quantized is unknown. Assuming "
+            f"they are not would merge 16bit over quantized weights, and for an "
+            f"mxfp4 base it would also pick the in place writer instead of the "
+            f"full rewrite, whatever save_method you asked for. Repair or remove "
+            f"config.json (or re-download the base) and retry."
         ) from e
 pass
 

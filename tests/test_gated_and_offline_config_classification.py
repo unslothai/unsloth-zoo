@@ -245,6 +245,43 @@ def test_offline_config_download_never_selects_hf_unquantized(monkeypatch, tmp_p
         saving_utils.determine_base_model_source(_REPO, None, "merged_16bit")
 
 
+@pytest.mark.parametrize("save_method", [
+    "merged_4bit", "forced_merged_4bit", "merged_16bit", None,
+])
+def test_an_unreadable_local_config_raises_for_every_save_method(
+    monkeypatch, tmp_path, save_method,
+):
+    """The strictness is not 16bit-only, and the reason is `_merge_and_overwrite_lora`.
+
+    It is tempting to exempt the 4bit merges: they fold the adapter into weights
+    already in memory, so an unreadable base config looks like it could not change
+    what they write. It can. The mxfp4 route is chosen by
+
+        base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
+
+    and `save_method != "mxfp4"` includes both 4bit merges, so guessing `unquantized`
+    for an mxfp4 base takes the in place writer instead of the full rewrite. That is
+    the same wrong-merge class this parse exists to prevent, reached by a different
+    save method, so all four raise and the message names both consequences.
+
+    `main` answered `local_unquantized` here for every save method, which is the
+    guess being removed. Codex proposed exempting the 4bit paths; declined for the
+    reason above, and the message now says what to repair.
+    """
+    directory = tmp_path / "base"
+    directory.mkdir()
+    (directory / "model.safetensors").write_bytes(b"")
+    (directory / "config.json").write_text("{ not json", encoding = "utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("base", None, save_method)
+
+    message = str(excinfo.value)
+    assert "could not read the quantization config" in message, message
+    assert "config.json" in message, "the raise has to name the thing to repair"
+
+
 def test_gated_config_download_warns_and_raises(monkeypatch):
     """A gated `config.json` is unread, not unquantized, and the user gets told why."""
     _patch_ls_present(monkeypatch)

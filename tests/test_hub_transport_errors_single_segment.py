@@ -258,12 +258,11 @@ def test_a_single_segment_id_keeps_its_revision(name):
 
 
 @pytest.mark.parametrize("name", [
-    "models/openai-community/gpt2",
     "hf://models/openai-community/gpt2",
-    "models/openai-community/gpt2@main",
+    "hf://models/openai-community/gpt2@main",
 ])
-def test_a_typed_model_uri_tracks_what_the_parser_does(name):
-    """`models/namespace/name` is the typed form of a model address.
+def test_an_explicit_typed_model_uri_tracks_what_the_parser_does(name):
+    """Under `hf://`, `models/namespace/name` is unambiguously the typed form.
 
     Whether it resolves is a property of the installed release, not of a version
     number, so this asserts the classification *equals the capability* rather than
@@ -279,6 +278,29 @@ def test_a_typed_model_uri_tracks_what_the_parser_does(name):
     """
     supported = saving_utils._hub_addresses_typed_model_uris()
     assert saving_utils._is_hub_repo_id(name) is supported
+
+
+@pytest.mark.parametrize("name", [
+    "models/base/checkpoint-500",
+    "models/outputs/final",
+    "models/openai-community/gpt2",
+])
+@pytest.mark.parametrize("capability", [False, True])
+def test_a_bare_models_prefix_stays_a_local_path(monkeypatch, name, capability):
+    """Without the scheme the same string is ambiguous, and the commoner reading wins.
+
+    `models/base/checkpoint-500` is what a Trainer writes. Stripping the prefix there
+    turns a local directory into the plausible repo id `base/checkpoint-500` and sends
+    a local base to the Hub, which is why the scheme is what distinguishes "I mean a
+    URI" from "I mean a folder". Asserted under both capability answers, because the
+    reading must not depend on the installed release: Codex found that it did, by
+    running the gate on 1.25.1 where `test_local_path_is_absent_not_unreachable
+    [three-segment-path]` then reached `HfFileSystem.ls`.
+    """
+    monkeypatch.setattr(
+        saving_utils, "_hub_addresses_typed_model_uris", lambda: capability,
+    )
+    assert saving_utils._is_hub_repo_id(name) is False
 
 
 @pytest.mark.parametrize("name", [
