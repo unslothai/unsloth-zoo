@@ -188,3 +188,27 @@ def test_kto_tokenize_row_caps_completion_exceeding_max_length():
     p, c = _kto_tokenize_row(_LenTokenizer(), "a b c", " ".join(["w"] * 20), args)
     assert len(p) + len(c) <= 8, (len(p), len(c))
     assert len(p) == 0 and len(c) == 8  # prompt dropped, completion capped
+
+
+def test_kto_rejects_streaming_dataset():
+    # KTO materializes the whole dataset to form KL batches, so streaming must
+    # be rejected loudly rather than silently exhausting the source.
+    from unsloth_zoo.mlx.trainer import _build_kto_batches, MLXKTOConfig
+
+    class _DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+    ds = [{"prompt": "a", "completion": " b", "label": True},
+          {"prompt": "c", "completion": " d", "label": False}]
+    with pytest.raises(NotImplementedError, match="streaming"):
+        _build_kto_batches(ds, _DummyTokenizer(),
+                           MLXKTOConfig(per_device_train_batch_size=2, streaming=True))
+
+    def _gen():  # a bare iterable-without-__len__ passed directly
+        yield from ds
+    with pytest.raises(NotImplementedError, match="streaming"):
+        _build_kto_batches(_gen(), _DummyTokenizer(),
+                           MLXKTOConfig(per_device_train_batch_size=2))

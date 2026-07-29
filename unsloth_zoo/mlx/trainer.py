@@ -8288,6 +8288,22 @@ def _build_kto_batches(dataset, tokenizer, args):
     +1 within the batch), and label (list[bool]). Rolling within the batch keeps
     the KL y' set equal to the reward y set for that batch (TRL _get_kl_dataset).
     """
+    # KTO needs the full row set materialized to form mismatched-pair KL batches
+    # (completions are rolled +1 within each batch), so a streaming/IterableDataset
+    # would be exhausted up front rather than yielding bounded batches. Reject it
+    # loudly instead of silently consuming it, mirroring the ORPO/DPO streaming
+    # guard. Detect both the config flag and a bare iterable-without-__len__
+    # (HF IterableDataset / generator) passed directly.
+    if getattr(args, "streaming", False) or (
+        hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__")
+    ):
+        raise NotImplementedError(
+            "Unsloth: MLXKTOTrainer does not support streaming datasets yet. "
+            "_build_kto_batches materializes the whole dataset to form the "
+            "mismatched-pair KL batches, so a streaming / IterableDataset is fully "
+            "consumed before training instead of yielding bounded batches. Use a "
+            "finite (map-style) dataset, or disable streaming."
+        )
     bs = int(args.per_device_train_batch_size)
     if bs < 2:
         raise ValueError(
