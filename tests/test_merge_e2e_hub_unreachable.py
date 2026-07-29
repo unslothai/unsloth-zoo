@@ -168,6 +168,55 @@ def test_a_genuinely_absent_base_also_raises(monkeypatch, tmp_path):
     assert not _looks_like_a_successful_export(out_dir)
 
 
+def test_a_4bit_base_for_a_16bit_merge_raises_rather_than_warning(tmp_path):
+    """The last silent no-op on this path, and it needed no Hub at all.
+
+    `merged_16bit` off an nf4/fp4 base cannot be done: the merge answered
+    `warnings.warn` plus `return None` and wrote nothing, which is exactly the
+    shape that cost a training run in the case this branch was opened for. The
+    recovery it names, `forced_merged_4bit`, was already right; only the
+    reporting was wrong.
+    """
+    _skip_if_missing()
+    peft_model, base_dir = _peft_model(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+
+    # Make the local base look nf4 to `check_model_quantization_status`.
+    import json
+    config_path = os.path.join(base_dir, "config.json")
+    with open(config_path, encoding = "utf-8") as f:
+        config = json.load(f)
+    config["quantization_config"] = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}
+    with open(config_path, "w", encoding = "utf-8") as f:
+        json.dump(config, f)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        merge_and_overwrite_lora(
+            get_model_name = lambda *a, **k: base_dir,
+            model = peft_model,
+            tokenizer = None,
+            save_directory = out_dir,
+            save_method = "merged_16bit",
+            push_to_hub = False,
+        )
+
+    message = str(excinfo.value)
+    assert "Nothing was written" in message, message
+    assert "forced_merged_4bit" in message, "the raise must still name the recovery"
+    assert not _looks_like_a_successful_export(out_dir)
+
+
+def test_an_hf_uri_is_still_addressed_as_a_repo(monkeypatch):
+    """`hf://namespace/name` is the documented HfFileSystem URI form and `ls`
+    accepts it. Its two slashes must not read as a filesystem path, or a name that
+    worked before this change stops reaching the Hub at all."""
+    assert saving_utils._is_hub_repo_id("hf://openai-community/gpt2") is True
+    assert saving_utils._is_hub_repo_id("openai-community/gpt2") is True
+    # Still a path, scheme or no scheme.
+    assert saving_utils._is_hub_repo_id("hf://a/b/c") is False
+    assert saving_utils._is_hub_repo_id("/abs/base") is False
+
+
 # ---------------------------------------------------------------------------
 # The complement: an unreachable Hub must not break a merge that never needed it.
 # ---------------------------------------------------------------------------

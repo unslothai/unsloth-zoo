@@ -221,17 +221,46 @@ def test_a_mangled_proxy_response_on_the_download_raises(monkeypatch):
     assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
 
 
-def test_a_malformed_downloaded_config_does_not_raise(monkeypatch, tmp_path):
-    """The complement: the download succeeded, the bytes on disk are junk. Nothing
-    transient about that, so it stays `(False, None)` like the local branch."""
+@pytest.mark.parametrize("body, label", [
+    pytest.param("{not json",                 "truncated",  id = "truncated-json"),
+    pytest.param("<html>proxy error</html>",  "proxy-page", id = "proxy-error-page"),
+])
+def test_a_config_that_cannot_be_parsed_raises(monkeypatch, tmp_path, body, label):
+    """The download succeeded and the bytes are not a config.
+
+    An earlier revision of this file asserted the opposite, that this should stay
+    `(False, None)` because nothing about a malformed file is transient. That reads
+    the wrong question. Transience is not what the caller uses the answer for: it
+    uses it to decide whether the base is quantized, and "I could not read the
+    config" is not evidence that the weights are full precision. Answering
+    `(False, None)` skips the nf4/fp4 guard and merges 16bit over quantized weights,
+    which is the same class of wrong answer as the rest of this file, just sourced
+    from the disk rather than the socket. A mangling proxy also reaches here by
+    serving an HTML error page as the file body.
+    """
     blob = tmp_path / "config.json"
-    blob.write_text("{not json", encoding = "utf-8")
+    blob.write_text(body, encoding = "utf-8")
     _patch_ls_present(monkeypatch)
     monkeypatch.setattr(
         huggingface_hub, "hf_hub_download",
         lambda *args, **kwargs: str(blob), raising = True,
     )
-    assert saving_utils.check_model_quantization_status(_REPO) == (False, None)
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.check_model_quantization_status(_REPO)
+    assert "cannot" in str(excinfo.value) or "could not" in str(excinfo.value)
+
+
+def test_an_offline_cache_miss_on_the_config_raises(monkeypatch):
+    """`LocalEntryNotFoundError` means "the network is unavailable and this file is
+    not cached". It subclasses `EntryNotFoundError`, which is in the absent set, so
+    without its own clause ahead of that tuple an offline run reports every remote
+    base as unquantized."""
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    assert issubclass(LocalEntryNotFoundError, EntryNotFoundError), "premise of the ordering"
+    _patch_ls_present(monkeypatch)
+    _patch_config_fetch(monkeypatch, LocalEntryNotFoundError("offline and not cached"))
+    with pytest.raises(RuntimeError):
+        saving_utils.check_model_quantization_status(_REPO)
 
 
 @pytest.mark.parametrize("make_error", _ABSENT_ERRORS)
@@ -260,14 +289,25 @@ def test_a_reachable_hub_still_detects_quantization(monkeypatch, tmp_path):
 # A malformed *local* config.json is not a transport failure and must not raise.
 # ---------------------------------------------------------------------------
 
-def test_malformed_local_config_does_not_raise(tmp_path):
-    """Narrowed from a bare `except:` so KeyboardInterrupt and SystemExit stop
-    being swallowed, but the observable answer for a broken local config is
-    unchanged: the merge reads the same file again and fails loudly there."""
+def test_malformed_local_config_raises(tmp_path):
+    """Same reasoning on the local branch, and the same code path: a config.json
+    that exists but cannot be parsed leaves the quantization of the base unknown,
+    and unknown must not be reported as "not quantized"."""
     directory = tmp_path / "base"
     directory.mkdir()
     (directory / "model.safetensors").write_bytes(b"")
     (directory / "config.json").write_text("{not json", encoding = "utf-8")
+    with pytest.raises(RuntimeError):
+        saving_utils.check_model_quantization_status(str(directory))
+
+
+def test_an_absent_local_config_still_reports_unquantized(tmp_path):
+    """Absent is genuinely different from unreadable and keeps its answer. Nothing
+    in an empty directory says the weights are quantized, and the parse is never
+    reached because the file does not exist."""
+    directory = tmp_path / "base"
+    directory.mkdir()
+    (directory / "model.safetensors").write_bytes(b"")
     assert saving_utils.check_model_quantization_status(str(directory)) == (False, None)
 
 

@@ -157,11 +157,30 @@ def test_absent_repo_still_returns_false(monkeypatch, error):
 # difference is the only actionable thing the user can act on.
 # ---------------------------------------------------------------------------
 
+def _ls_gated_the_way_fsspec_delivers_it(monkeypatch):
+    """What a gated repo ACTUALLY looks like coming out of `HfFileSystem.ls`.
+
+    Not a GatedRepoError. `_repo_and_revision_exist` catches
+    `RepositoryNotFoundError`, which GatedRepoError subclasses, stashes it, and
+    `_raise_file_not_found` re-raises it as `FileNotFoundError(msg) from err`. So
+    the gated case arrives as a plain FileNotFoundError with the real reason in
+    `__cause__`, and an `except GatedRepoError` handler would never fire outside a
+    test that injects the error directly into `ls`. Read off the installed
+    huggingface_hub source, not assumed.
+    """
+    def fake_ls(self, path, detail = True, **kwargs):
+        try:
+            raise GatedRepoError("403 gated repo", response = _response(403))
+        except GatedRepoError as err:
+            raise FileNotFoundError(f"{path} (repository not found)") from err
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+
+
 def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
     """It stays False on purpose, so a local copy still wins and gated bases keep
     working. But a gated repo demonstrably exists, and reporting it as missing
     sends the user looking for a typo they do not have."""
-    _patch_ls(monkeypatch, GatedRepoError("403 gated repo", response = _response(403)))
+    _ls_gated_the_way_fsspec_delivers_it(monkeypatch)
 
     with pytest.warns(UserWarning) as caught:
         assert saving_utils.check_hf_model_exists("meta-llama/Llama-3.2-1B") is False
@@ -172,17 +191,24 @@ def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
     assert "token" in message
 
 
-def test_gated_repo_is_not_swallowed_by_its_base_class(monkeypatch):
-    """GatedRepoError subclasses RepositoryNotFoundError, which is in the absent
-    tuple, so the gated clause has to come first or the warning never fires. Pinned
-    because reordering the handlers would silently lose it."""
-    assert issubclass(GatedRepoError, RepositoryNotFoundError), "premise of the ordering"
-    assert GatedRepoError not in saving_utils._HUB_ABSENT_ERRORS, (
-        "gated is handled by its own clause, ahead of the absent tuple"
+def test_gated_detection_survives_the_fsspec_conversion(monkeypatch):
+    """The premise of the helper, pinned so a refactor back to `except
+    GatedRepoError` cannot pass. Matching on the type alone is not enough here
+    because the type never reaches the handler."""
+    assert issubclass(GatedRepoError, RepositoryNotFoundError)
+    wrapped = None
+    try:
+        try:
+            raise GatedRepoError("403", response = _response(403))
+        except GatedRepoError as err:
+            raise FileNotFoundError("ns/x (repository not found)") from err
+    except FileNotFoundError as e:
+        wrapped = e
+    assert not isinstance(wrapped, GatedRepoError), "the type is gone by this point"
+    assert saving_utils._gated_repo_cause(wrapped) is not None, (
+        "the reason has to be recovered from __cause__"
     )
-    _patch_ls(monkeypatch, GatedRepoError("403 gated repo", response = _response(403)))
-    with pytest.warns(UserWarning):
-        saving_utils.check_hf_model_exists("meta-llama/Llama-3.2-1B")
+    assert saving_utils._gated_repo_cause(FileNotFoundError("plain 404")) is None
 
 
 def test_a_plain_absent_repo_does_not_warn_about_gating(monkeypatch):

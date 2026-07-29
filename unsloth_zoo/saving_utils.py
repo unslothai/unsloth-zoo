@@ -2932,8 +2932,16 @@ def merge_and_overwrite_lora(
         # the methods the fallback above answers for nf4/fp4, so a Hub outage can
         # never arrive here carrying a local 4bit copy.
         if base_model_is_quantized and (quant_type == "nf4" or quant_type == "fp4") and save_method == "merged_16bit":
-            warnings.warn("Base model should be a 16bits or mxfp4 base model for a 16bit model merge. Use `save_method=forced_merged_4bit` instead")
-            return None
+            # The last silent no-op on this path. It wrote nothing and said so only
+            # through a warning, which is the same thing that cost a training run
+            # below, so it gets the same treatment. The message is unchanged apart
+            # from saying plainly that nothing was written; the recovery it names
+            # was already the right one.
+            raise RuntimeError(
+                f"Unsloth: base model should be a 16bit or mxfp4 base model for a 16bit "
+                f"merge, but `{model_name}` is {quant_type}. Nothing was written to "
+                f"`{save_directory}`. Use `save_method=\"forced_merged_4bit\"` instead."
+            )
         if final_model_name is None:
             # Never return None here. `save_pretrained_merged` would look like it
             # succeeded while creating no output directory at all, and the only
@@ -3020,15 +3028,29 @@ def merge_and_overwrite_lora(
                 print(f"Copied tokenizer.model from local model directory")
         else:
             # Original HF repo logic
+            # The third Hub round trip on this path, after the existence probe and
+            # the quantization lookup, and it had the same bare `except:` they did.
+            # An unreachable Hub here was reported as "Could not determine original
+            # model ID", which is a statement about the name rather than the network
+            # and sends the user hunting a typo they do not have.
             try:
                 file_list = HfFileSystem(token = token).ls(model_name, detail = True)
-            except:
+            except _HUB_ABSENT_ERRORS:
+                # This repo really is not there, which is what the fallback to the
+                # original model id exists for.
                 original_model_id = get_original_model_id(model_name)
-                model_name = original_model_id
                 if original_model_id is None:
                     raise ValueError(f"Could not determine original model ID from {model_name}. "
                                     "If using a local model, ensure the path exists and contains safetensors files.")
+                # Assigned only after the check, so the message above names the
+                # input that failed instead of always saying "from None".
+                model_name = original_model_id
                 file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+            except Exception as e:
+                raise _hub_unreachable_error(
+                    model_name, e,
+                    action = f"listing the shards of `{model_name}`",
+                ) from e
 
             # Process HF file listing. Same soft filter as the local branch above:
             # drop consolidated.safetensors only when proper shards coexist.
@@ -4450,6 +4472,15 @@ try:
 except ImportError:
     _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
+try:
+    # "The network is disabled or unavailable and the file is not in the cache."
+    # It subclasses EntryNotFoundError, so it has to be caught ahead of the absent
+    # set rather than added to it. Imported defensively like HfUriError.
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    _HUB_DOWNLOAD_UNREACHABLE_ERRORS = (LocalEntryNotFoundError,)
+except ImportError:
+    _HUB_DOWNLOAD_UNREACHABLE_ERRORS = ()
+
 # Recent huggingface_hub dropped support for *addressing* a canonical single
 # segment id. `HfFileSystem.resolve_path` answers a plain
 #     ValueError("Repository id must be 'namespace/name', got 'gpt2'. ...")
@@ -4497,16 +4528,12 @@ pass
 # RevisionNotFoundError or HFValidationError. Every other failure (429, 5xx,
 # DNS, read timeout, OfflineModeIsEnabled) propagates out of `ls` unchanged,
 # which is exactly what lets us tell "absent" apart from "unreachable".
-#
-# GatedRepoError is deliberately NOT in here even though it also answers False.
-# It subclasses RepositoryNotFoundError, so it would be swallowed by this tuple;
-# it gets its own clause first, because a gated repo demonstrably exists and the
-# user needs to be told that rather than sent looking for a typo.
 _HUB_ABSENT_ERRORS = (
     FileNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
     EntryNotFoundError,
+    GatedRepoError,
 # Plus the invalid-repo-id errors: "this string cannot name a repo" is a
 # statement about the argument, never about connectivity, so it answers False
 # rather than raising. Both are ValueError subclasses, and naming the two
@@ -4535,6 +4562,11 @@ def _is_hub_repo_id(model_name):
     them and classifies the answer there.
     """
     name = str(model_name)
+    # `hf://namespace/name` is the documented HfFileSystem URI form and `ls` accepts
+    # it, so the scheme is stripped before the path rules below rather than letting
+    # its two slashes read as a filesystem path. Before this file existed the URI
+    # went straight to `ls` and worked, so rejecting it would be a regression.
+    if name.startswith("hf://"): name = name[len("hf://"):]
     # `ls` addresses at most `namespace/name`, so a deeper path
     # (`/home/me/base`, `models/base/checkpoint-500`) or a leading `.`, `/`, `~`
     # (`./base`, `/base`, `~/base`) is a filesystem path and nothing else.
@@ -4546,6 +4578,38 @@ def _is_hub_repo_id(model_name):
     except Exception:
         return False
     return True
+pass
+
+def _gated_repo_cause(e):
+    """The GatedRepoError behind `e`, whether that is `e` itself or a `__cause__`.
+
+    Matching on the exception type alone does not work here, and the reason is
+    worth stating because it is the kind of thing a mocked test hides.
+    `HfFileSystem.ls` never lets a GatedRepoError out: `_repo_and_revision_exist`
+    catches `RepositoryNotFoundError`, which GatedRepoError subclasses, stashes it,
+    and `_raise_file_not_found` then does
+
+        raise FileNotFoundError(msg) from err
+
+    so a gated repo arrives as a plain FileNotFoundError carrying the real reason in
+    `__cause__`. A handler keyed on `except GatedRepoError` therefore fires only
+    against a test that injects the error straight into `ls`, never in production.
+    """
+    seen = set()
+    while e is not None and id(e) not in seen:
+        if isinstance(e, GatedRepoError): return e
+        seen.add(id(e))
+        e = e.__cause__ or e.__context__
+    return None
+pass
+
+def _warn_gated_repo(model_name, e):
+    warnings.warn(
+        f"Unsloth: `{model_name}` is gated on the Hugging Face Hub and the current "
+        f"token cannot read it ({type(e).__name__}: {e}). Accept the model terms on "
+        f"its Hub page, or pass a token that has access. Falling back to a local copy "
+        f"if there is one."
+    )
 pass
 
 def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missing model"):
@@ -4573,21 +4637,14 @@ def check_hf_model_exists(model_name, token=None):
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
         return any(x["name"].endswith(".safetensors") for x in file_list)
-    except GatedRepoError as e:
-        # Must precede _HUB_ABSENT_ERRORS, which contains its base class
-        # RepositoryNotFoundError. False is deliberate and unchanged, so a local
-        # copy still wins and gated bases keep working exactly as they do today.
-        # But "absent" is not the reason, and the caller would otherwise be told
-        # the model was "not found locally or on Hugging Face" and go looking for
-        # a typo, so say the actionable thing where it is known.
-        warnings.warn(
-            f"Unsloth: `{model_name}` is gated on the Hugging Face Hub and the current "
-            f"token cannot read it ({type(e).__name__}: {e}). Accept the model terms on "
-            f"its Hub page, or pass a token that has access. Falling back to a local copy "
-            f"if there is one."
-        )
-        return False
-    except _HUB_ABSENT_ERRORS:
+    except _HUB_ABSENT_ERRORS as e:
+        # False is deliberate and unchanged, so a local copy still wins and gated
+        # bases keep working exactly as they do today. But "absent" is not always
+        # the reason, and the caller would otherwise be told the model was "not
+        # found locally or on Hugging Face" and go looking for a typo it does not
+        # have, so name the actionable cause where it is known.
+        gated = _gated_repo_cause(e)
+        if gated is not None: _warn_gated_repo(model_name, gated)
         return False
     except NotImplementedError:
         # "I will not list that" (a namespace or bucket listing, which is what
@@ -4750,6 +4807,31 @@ def _is_fp8_quant_config(quant_config):
     return False
 pass
 
+def _load_quant_config_or_raise(config_path, model_name_or_path):
+    """Parse a config.json that is already on disk, or say why not.
+
+    A config that exists but cannot be read is NOT evidence that the weights are
+    full precision, and that is the only thing the caller uses this answer for. A
+    proxy can hand back an HTML error page as the file body, and a truncated or
+    permission-denied file is equally unreadable, and in every one of those cases
+    returning `(False, None)` claims the base is unquantized, skips the nf4/fp4
+    guard in `merge_and_overwrite_lora` and merges 16bit over quantized weights.
+    An absent config.json is different and still answers `(False, None)`: nothing
+    there says the model is quantized, and the caller never reaches this function
+    for it.
+    """
+    try:
+        with open(config_path, 'r', encoding = "utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"Unsloth: could not read the quantization config of "
+            f"`{model_name_or_path}` ({type(e).__name__}: {e}). It exists but cannot "
+            f"be parsed, so whether the weights are quantized is unknown, and "
+            f"assuming they are not would merge 16bit over quantized weights."
+        ) from e
+pass
+
 def check_model_quantization_status(model_name_or_path, token=None):
     """Check if a model is quantized (works for both HF and local)
 
@@ -4767,16 +4849,7 @@ def check_model_quantization_status(model_name_or_path, token=None):
     if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
         config_path = os.path.join(model_name_or_path, "config.json")
         if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding = "utf-8") as f:
-                    config = json.load(f)
-            except (OSError, ValueError):
-                # Unreadable or malformed local config.json. Left as "no config"
-                # rather than raised: nothing about it is transient, the directory
-                # is the one the caller named, and the merge reads the same file
-                # again and fails loudly there. Narrowed from a bare `except:`
-                # only so KeyboardInterrupt and SystemExit stop being swallowed.
-                pass
+            config = _load_quant_config_or_raise(config_path, model_name_or_path)
     # HF repo
     else:
         # The fetch and the parse are separate `try`s on purpose, because their
@@ -4796,10 +4869,37 @@ def check_model_quantization_status(model_name_or_path, token=None):
                 cache_dir = None,
                 token = token
             )
-        except _HUB_ABSENT_ERRORS:
+        except _HUB_DOWNLOAD_UNREACHABLE_ERRORS as e:
+            # Must precede the absent set: LocalEntryNotFoundError subclasses
+            # EntryNotFoundError, so the tuple below would swallow it, and it means
+            # "the network is unavailable and this file is not cached", which is a
+            # fact about reachability and not about the model.
+            raise _hub_unreachable_error(
+                model_name_or_path, e,
+                action = f"reading the quantization config of `{model_name_or_path}`",
+                mistaken_for = "an unquantized model",
+            ) from e
+        except _HUB_ABSENT_ERRORS as e:
             # No config.json in the repo, or no repo at all. Nothing there says
             # the weights are quantized, so `(False, None)` is the honest answer.
-            pass
+            #
+            # Except when the reason is authorization. GatedRepoError subclasses
+            # RepositoryNotFoundError, so this tuple swallows it, and the Hub also
+            # chains it behind a generic error the same way `ls` does, so the type
+            # alone is not enough to see it. A config we were refused is unread, and
+            # answering "unquantized" for it hands `determine_base_model_source` a
+            # Priority 3 HF_unquantized for what may be an nf4 base, skipping the
+            # nf4/fp4 guard. Measured on the parent commit: ls succeeds, the config
+            # fetch raises GatedRepoError, and the result is
+            # ('ns/base-bnb-4bit', False, 'HF_unquantized', False, None).
+            gated = _gated_repo_cause(e)
+            if gated is not None:
+                _warn_gated_repo(model_name_or_path, gated)
+                raise _hub_unreachable_error(
+                    model_name_or_path, gated,
+                    action = f"reading the quantization config of `{model_name_or_path}`",
+                    mistaken_for = "an unquantized model",
+                ) from e
         except Exception as e:
             raise _hub_unreachable_error(
                 model_name_or_path, e,
@@ -4808,13 +4908,7 @@ def check_model_quantization_status(model_name_or_path, token=None):
             ) from e
 
         if config_path is not None:
-            try:
-                with open(config_path, 'r', encoding="utf-8") as f:
-                    config = json.load(f)
-            except (OSError, ValueError):
-                # The file is in hand and unreadable. Deterministic, same as the
-                # local branch: not the network's fault and not worth raising for.
-                pass
+            config = _load_quant_config_or_raise(config_path, model_name_or_path)
 
     # Detection keys off config.json["quantization_config"]. NVIDIA ModelOpt FP8 checkpoints
     # (e.g. *-Nemotron-*-FP8) instead carry their spec in a separate hf_quant_config.json
