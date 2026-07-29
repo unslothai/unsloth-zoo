@@ -526,6 +526,7 @@ from .utils import (
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
+    _is_base_tensor_inside_lora_module,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _is_vlm_model,
@@ -8378,6 +8379,34 @@ def _build_kto_batches(dataset, tokenizer, args):
     return batches
 
 
+def _kto_model_has_non_lora_trainable_params(model):
+    """True when the model has trainable tensors outside any LoRA module.
+
+    KTO's reference is the adapter-off (LoRA scale=0) forward of the SAME model,
+    so a trainable non-LoRA tensor (a directly-trained lm_head/embed_tokens, or a
+    trainable non-LoRA bias) moves during training and leaves the reference
+    carrying trained weights -- not the frozen initial policy.
+
+    Mirrors #832's utils.model_has_non_lora_trainable_params verbatim; kept local
+    here to avoid depending on that unmerged branch (consolidate onto the shared
+    helper once #832 lands on main).
+    """
+    trainable = dict(tree_flatten(model.trainable_parameters()))
+    if not trainable:
+        return False
+    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
+    lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
+    lora_module_prefixes = tuple(f"{name}." for name in lora_module_names if name)
+    has_root_lora_module = any(name == "" for name in lora_module_names)
+    return any(
+        key not in adapter_tensors
+        and not _is_base_tensor_inside_lora_module(
+            key, lora_module_prefixes, has_root_lora_module,
+        )
+        for key in trainable
+    )
+
+
 class MLXKTOTrainer(MLXTrainer):
     """MLX-native KTO trainer, mirroring TRL's KTOTrainer constructor API.
 
@@ -8468,6 +8497,24 @@ class MLXKTOTrainer(MLXTrainer):
                 "vision-language models yet (the VLM processor has no pad_token_id "
                 "and the model returns structured outputs, not raw logits). Use a "
                 "text model + tokenizer for KTO."
+            )
+
+        # The KTO reference is the adapter-off (LoRA scale=0) forward of the SAME
+        # model, so any trainable non-LoRA tensor (a directly-trained
+        # lm_head/embed_tokens, a non-LoRA bias) would move during training and
+        # leave the "reference" carrying trained weights -- corrupting the KTO
+        # signal. Unlike DPO/GRPO there is no reference_free escape in KTO: the
+        # adapter-off reference is structural, so this is a hard requirement, not
+        # a togglable option. (Mirrors #832's referenced-DPO/GRPO guard.)
+        if _kto_model_has_non_lora_trainable_params(model):
+            raise ValueError(
+                "Unsloth: MLXKTOTrainer requires ALL trainable parameters to be "
+                "LoRA adapters. A trainable non-LoRA tensor (e.g. a directly "
+                "trained lm_head/embed_tokens) would drift during training and "
+                "corrupt the adapter-off KTO reference. This is a structural limit "
+                "of KTO's reference (there is no reference_free mode), not a "
+                "togglable option -- train only LoRA adapters, e.g. via "
+                "FastMLXModel.get_peft_model(...) without unfreezing base weights."
             )
 
         # LoRA+ needs per-leaf gradient scaling (a higher LR on lora_b), which

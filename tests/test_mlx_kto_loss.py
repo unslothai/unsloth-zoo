@@ -298,3 +298,29 @@ def test_kto_rejects_gated_delta_and_vlm(monkeypatch):
         image_processor = object()
     with pytest.raises(NotImplementedError, match="vision-language"):
         _mk(_VLMTok()).train()
+
+
+def test_kto_rejects_non_lora_trainable_params(monkeypatch):
+    # KTO's reference is the adapter-off forward; trainable non-LoRA tensors would
+    # drift and corrupt it. train() rejects them (structural, no reference_free).
+    import unsloth_zoo.mlx.trainer as T
+    from unsloth_zoo.mlx.trainer import (
+        MLXKTOTrainer, MLXKTOConfig, _kto_model_has_non_lora_trainable_params,
+    )
+
+    # Predicate: a model with no trainable params has no non-LoRA trainables.
+    class _Empty:
+        def trainable_parameters(self):
+            return {}
+    assert _kto_model_has_non_lora_trainable_params(_Empty()) is False
+
+    # Guard: train() raises when the predicate reports non-LoRA trainables.
+    tr = MLXKTOTrainer.__new__(MLXKTOTrainer)
+    tr.args = MLXKTOConfig()
+    tr.model = object()
+    tr.tokenizer = object()
+    monkeypatch.setattr(T, "iter_mlx_lora_modules", lambda m: [("m", object())])
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: False)
+    monkeypatch.setattr(T, "_kto_model_has_non_lora_trainable_params", lambda m: True)
+    with pytest.raises(ValueError, match="structural limit"):
+        tr.train()
