@@ -50,11 +50,20 @@ is what a captive proxy or a mangling middlebox does:
 Both JSONDecodeError classes are `isinstance(..., ValueError)`, so on 0.36.2 a
 proxy failure on `gpt2` landed in the single segment branch and answered False.
 `determine_base_model_source` then fell through every priority, and the merge
-wrote nothing. Neither is `type(e) is ValueError`, which is the discriminator
-used: the version guard is the only thing that raises the bare class.
+wrote nothing. Neither is `type(e) is ValueError`, which is the first of the two
+discriminators used: only the guard raises the bare class.
+
+The second is the wording. The guard is NOT present on every 1.x release, so the
+bare class alone does not identify it: upstream `hf_file_system.py` has no such
+check at 0.36.2, 1.0.0, 1.5.0, 1.10.0 or 1.15.0 and grows one at 1.16.0. Across
+1.0 - 1.15 a slashless name still reaches the network, so a bare ValueError there
+can be a transport failure, and a `major >= 1` gate reported it as absent. The
+message is what tells the two apart, and it is byte identical at 1.16.0, 1.20.0,
+1.24.0 and 1.25.1.
 """
 
 import http.server
+import inspect
 import json
 import threading
 
@@ -70,9 +79,23 @@ try:
 except ImportError:      # huggingface_hub < 1.0 has no hf:// URI parser
     HfUriError = None
 
-# Decided here from the installed version rather than read off the module under
-# test, so these tests still collect against a build that predates the flag.
-_HUB_REFUSES_SINGLE_SEGMENT_IDS = int(str(huggingface_hub.__version__).split(".", 1)[0]) >= 1
+def _hub_has_single_segment_guard():
+    """Whether the installed resolver refuses a slashless id before sending a
+    request, feature detected rather than inferred from the version number.
+
+    The major number does not answer this: upstream `hf_file_system.py` has no
+    such guard at 0.36.2, 1.0.0, 1.5.0, 1.10.0 or 1.15.0 and grows one at 1.16.0.
+    Reading the installed resolver is exact, needs no network, and cannot drift
+    the way a hardcoded boundary already did.
+    """
+    try:
+        source = inspect.getsource(huggingface_hub.HfFileSystem.resolve_path)
+    except Exception:
+        return False
+    return 'path.count("/") == 0' in source and "Repository id must be" in source
+
+
+_HUB_HAS_SINGLE_SEGMENT_GUARD = _hub_has_single_segment_guard()
 
 
 # The exact text huggingface_hub 1.24.0 uses, so these tests describe the real
@@ -156,7 +179,7 @@ def test_determine_base_model_source_propagates_single_segment_transport_error(
 
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_single_segment_rejection_still_reports_absent(monkeypatch, name):
-    """huggingface_hub >= 1.0 cannot address these ids at all. That is a
+    """huggingface_hub >= 1.16 cannot address these ids at all. That is a
     statement about the argument, raised before a socket is opened, so it stays
     False and callers fall through to their local priorities."""
     message = _REJECTION_MESSAGE.replace("gpt2", name)
@@ -178,25 +201,46 @@ def test_rejection_message_on_a_namespaced_name_still_raises(monkeypatch):
         saving_utils.check_hf_model_exists("openai-community/gpt2")
 
 
-def test_production_version_gate_matches_the_installed_huggingface_hub():
-    """The gate is what makes the swallow provably safe on 1.x, so pin that it
-    tracks the installed release rather than a stale constant."""
-    assert saving_utils._HUB_REJECTS_SINGLE_SEGMENT_IDS is _HUB_REFUSES_SINGLE_SEGMENT_IDS
+def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
+    """The regression a version test cannot catch, on every supported release.
 
+    The guard carries its own wording, so recognising it by that wording is exact
+    wherever it exists. A bare ValueError that does NOT carry it was not raised by
+    the guard, which leaves a transport failure as the only thing it can be.
 
-def test_generic_valueerror_classification_matches_the_installed_version(monkeypatch):
-    """A bare ValueError with no recognisable message.
-
-    On a version that refuses single segment ids the network is never reached
-    for such a name, so the only thing that can raise it is the guard, and False
-    is right. On 0.x the network IS reached, so it must raise.
+    A `major >= 1` gate got this wrong for the entire 1.0 - 1.15 range, where no
+    guard exists and the network IS reached: such a ValueError came off a live
+    socket and was still answered False, so `determine_base_model_source` fell
+    through every priority and the merge wrote nothing. That is the exact defect
+    this file exists to pin, reached through a different door.
     """
     _patch_ls(monkeypatch, ValueError("boom"))
-    if _HUB_REFUSES_SINGLE_SEGMENT_IDS:
-        assert saving_utils.check_hf_model_exists("gpt2") is False
-    else:
-        with pytest.raises(RuntimeError):
-            saving_utils.check_hf_model_exists("gpt2")
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.check_hf_model_exists("gpt2")
+    message = str(excinfo.value)
+    assert "connectivity" in message or "rate limiting" in message
+
+
+def test_classification_never_consults_the_installed_version(monkeypatch):
+    """Both answers are decided by the message alone, whatever is installed.
+
+    Pinned by identity as well as by behaviour: the previous implementation asked
+    `huggingface_hub.__version__`, and the test that covered it recomputed the
+    same expression, so the two agreed with each other rather than with upstream
+    and the 1.0 - 1.15 hole stayed invisible.
+    """
+    _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
+    assert saving_utils.check_hf_model_exists("gpt2") is False
+
+    _patch_ls(monkeypatch, ValueError("Expecting value: line 1 column 1 (char 0)"))
+    with pytest.raises(RuntimeError):
+        saving_utils.check_hf_model_exists("gpt2")
+
+    assert not hasattr(saving_utils, "_HUB_REJECTS_SINGLE_SEGMENT_IDS"), (
+        "recognition is by the rejection wording, which upstream keeps byte "
+        "identical across 1.16.0 - 1.25.1, not by a version boundary that has "
+        "already moved once"
+    )
 
 
 @pytest.mark.skipif(HfUriError is None, reason = "huggingface_hub < 1.0 has no HfUriError")
@@ -276,7 +320,7 @@ def garbage_endpoint():
 
 
 @pytest.mark.skipif(
-    _HUB_REFUSES_SINGLE_SEGMENT_IDS,
+    _HUB_HAS_SINGLE_SEGMENT_GUARD,
     reason = "this huggingface_hub refuses single segment ids before it sends a request, "
              "so no transport failure can reach that branch on this version",
 )

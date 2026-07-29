@@ -4441,26 +4441,28 @@ try:
 except ImportError:
     _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
-# huggingface_hub >= 1.0 dropped support for *addressing* a canonical single
+# Recent huggingface_hub dropped support for *addressing* a canonical single
 # segment id. `HfFileSystem.resolve_path` answers a plain
 #     ValueError("Repository id must be 'namespace/name', got 'gpt2'. ...")
 # from a pure argument check placed before `parse_hf_uri` and before
 # `_repo_and_revision_exist`, so it is raised without any network I/O and can
-# never be a transport failure. 0.x has no such check and lists those ids
+# never be a transport failure. Releases without that check list those ids
 # happily, so there the network IS reached and the same catch would swallow a
-# genuine failure. Recording which of the two is installed is what lets the
-# swallow be scoped to the case where it is provably safe.
-def _hub_rejects_single_segment_ids():
-    try:
-        import huggingface_hub
-        return int(str(huggingface_hub.__version__).split(".", 1)[0]) >= 1
-    except Exception:
-        return False
-pass
-_HUB_REJECTS_SINGLE_SEGMENT_IDS = _hub_rejects_single_segment_ids()
-
-# The wording of that rejection, kept as a second, version independent signal
-# so a backport of the check to a 0.x line is still recognised.
+# genuine failure.
+#
+# The rejection is therefore recognised by its wording, not by the installed
+# version number. Measured against upstream `hf_file_system.py`, the guard is
+# absent at 0.36.2, 1.0.0, 1.5.0, 1.10.0 and 1.15.0 and first appears at 1.16.0,
+# so a `major >= 1` test is wrong for the whole 1.0 - 1.15 range: it swallows
+# every plain ValueError raised there, including one carried out of a live
+# socket, which reports a transport failure as a missing model and lands the
+# merge straight back on the silent no-op this module exists to close.
+#
+# The wording is the stable signal instead. It is byte identical at 1.16.0,
+# 1.20.0, 1.24.0 and 1.25.1, where this pattern matches it twice (on
+# `namespace/name` and on `Single-segment`), it needs no boundary that upstream
+# can move again, and unlike a version test it cannot produce a false positive:
+# a message that does not say what the guard says was not raised by the guard.
 _SINGLE_SEGMENT_REJECTION = re.compile(r"single[\s\-_]?segment|namespace/name", re.IGNORECASE)
 
 def _is_single_segment_id_rejection(model_name, e):
@@ -4476,7 +4478,7 @@ def _is_single_segment_id_rejection(model_name, e):
     """
     if type(e) is not ValueError: return False        # a subclass is a transport failure
     if str(model_name).count("/") != 0: return False  # namespace/name is addressable everywhere
-    return _HUB_REJECTS_SINGLE_SEGMENT_IDS or bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
+    return bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
 pass
 
 # Exceptions that genuinely mean "this repo is not there / not usable".
