@@ -8155,10 +8155,16 @@ def train_on_responses_only(
 # ============================================================================
 
 
-@dataclass
+@dataclass(init=False)
 class MLXKTOConfig(MLXTrainingConfig):
     """KTO configuration mirroring TRL's KTOConfig field names, on top of the
-    shared MLX training knobs (optimizer, schedule, clipping, save)."""
+    shared MLX training knobs (optimizer, schedule, clipping, save).
+
+    init=False (not a bare @dataclass) so the subclass inherits
+    MLXTrainingConfig.__init__ rather than a generated one that would bypass the
+    parent's setup (e.g. the warmup-steps-explicit initialization). Mirrors
+    #830's MLXORPOConfig/MLXDPOConfig. fields() still registers the KTO-specific
+    fields below, which the inherited __init__ reads via fields(type(self))."""
 
     beta: float = 0.1
     desirable_weight: float = 1.0

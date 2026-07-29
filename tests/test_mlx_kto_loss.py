@@ -324,3 +324,16 @@ def test_kto_rejects_non_lora_trainable_params(monkeypatch):
     monkeypatch.setattr(T, "_kto_model_has_non_lora_trainable_params", lambda m: True)
     with pytest.raises(ValueError, match="structural limit"):
         tr.train()
+
+
+def test_kto_config_inherits_parent_init_not_a_generated_one():
+    # Bare @dataclass regenerates __init__ and bypasses MLXTrainingConfig.__init__
+    # (dropping e.g. _unsloth_mlx_warmup_steps_explicit). @dataclass(init=False)
+    # inherits the parent init while keeping the KTO-specific fields.
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXTrainingConfig
+    assert MLXKTOConfig.__init__ is MLXTrainingConfig.__init__
+    c = MLXKTOConfig()
+    assert hasattr(c, "_unsloth_mlx_warmup_steps_explicit")  # parent init ran
+    assert c.beta == 0.1 and c.loss_type == "kto"  # KTO fields intact
+    c2 = MLXKTOConfig(beta=0.5, desirable_weight=2.0)
+    assert c2.beta == 0.5 and c2.desirable_weight == 2.0
