@@ -4516,6 +4516,40 @@ except ImportError:
 # a message that does not say what the guard says was not raised by the guard.
 _SINGLE_SEGMENT_REJECTION = re.compile(r"single[\s\-_]?segment|namespace/name", re.IGNORECASE)
 
+def _hub_addresses_typed_model_uris():
+    """Does the installed huggingface_hub read `models/namespace/name` as a model?
+
+    Asked of the parser `resolve_path` actually consults, never of a version number.
+    1.16+ routes through `parse_hf_uri`, which maps the optional `models/` type
+    prefix; 0.36.2 tests `REPO_TYPES_URL_PREFIXES.values()`, which holds only
+    `datasets/` and `spaces/`, so there `models/org/repo` resolves to nothing:
+
+        1.25.1   resolve_path("models/openai-community/gpt2") -> model openai-community/gpt2
+        0.36.2   resolve_path("models/openai-community/gpt2") -> FileNotFoundError
+
+    `REPO_TYPES_MAPPING` contains `models` on both, so it cannot tell them apart.
+    Stripping the prefix unconditionally would be worse than leaving it: on 0.36.2 it
+    would probe `org/repo` and answer True for an address that version cannot reach.
+
+    Only `models/` is worth asking about. `datasets/`, `spaces/` and `kernels/` all
+    resolve too, and are all rejected by the depth rule on purpose, because none of
+    them can be the base model of a LoRA merge.
+    """
+    try:
+        from huggingface_hub.utils._hf_uris import parse_hf_uri
+    except Exception:
+        try:
+            from huggingface_hub.hf_file_system import parse_hf_uri
+        except Exception:
+            return False
+    try:
+        parsed = parse_hf_uri("hf://models/namespace/name")
+    except Exception:
+        return False
+    return getattr(parsed, "type", None) == "model" and getattr(parsed, "id", None) == "namespace/name"
+pass
+
+
 def _as_hub_addressed(model_name):
     """The repo id part of a name, the way `HfFileSystem` itself addresses it.
 
@@ -4538,6 +4572,12 @@ def _as_hub_addressed(model_name):
     """
     name = str(model_name)
     if name.startswith("hf://"): name = name[len("hf://"):]
+    # `models/namespace/name` is the typed form of the same model address, and where
+    # the installed version reads it that way its three segments must not read as a
+    # filesystem path. Gated on the parser rather than stripped outright, because on
+    # a version that does not map the prefix this would probe a different repo.
+    if name.startswith("models/") and _hub_addresses_typed_model_uris():
+        name = name[len("models/"):]
     # Split a revision only when what precedes it is addressable, so an `@` inside
     # an ordinary path is left alone. `gpt2@main` counts: the zero-slash branch of
     # `resolve_path` splits `@` too, so a canonical single segment id carries a

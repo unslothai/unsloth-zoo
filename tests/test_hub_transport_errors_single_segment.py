@@ -257,6 +257,53 @@ def test_a_single_segment_id_keeps_its_revision(name):
     assert saving_utils._is_hub_repo_id(name) is True
 
 
+@pytest.mark.parametrize("name", [
+    "models/openai-community/gpt2",
+    "hf://models/openai-community/gpt2",
+    "models/openai-community/gpt2@main",
+])
+def test_a_typed_model_uri_tracks_what_the_parser_does(name):
+    """`models/namespace/name` is the typed form of a model address.
+
+    Whether it resolves is a property of the installed release, not of a version
+    number, so this asserts the classification *equals the capability* rather than
+    hardcoding either answer:
+
+        1.25.1   resolve_path("models/openai-community/gpt2") -> model openai-community/gpt2
+        0.36.2   resolve_path("models/openai-community/gpt2") -> FileNotFoundError
+
+    Stripping the prefix unconditionally would be worse than not stripping it, since
+    on 0.36.2 that probes `openai-community/gpt2` and would answer True for an
+    address that version cannot reach. Caught by Codex, twice: I rejected it the
+    first time from 0.36.2's prefix table, which is the wrong version to check.
+    """
+    supported = saving_utils._hub_addresses_typed_model_uris()
+    assert saving_utils._is_hub_repo_id(name) is supported
+
+
+@pytest.mark.parametrize("name", [
+    "/models/org/repo", "./models/org/repo", "~/models/org/repo", "models/a/b/c",
+])
+def test_the_typed_prefix_never_launders_a_path(monkeypatch, name):
+    """With the capability forced on, a path that merely begins with `models` stays a
+    path. `parse_hf_uri` itself would read `models/a/b/c` as repo `a/b` plus file `c`,
+    and `/abs/base` as repo `abs/base`, which is why this file does not delegate its
+    path rules to that parser."""
+    monkeypatch.setattr(saving_utils, "_hub_addresses_typed_model_uris", lambda: True)
+    assert saving_utils._is_hub_repo_id(name) is False
+
+
+@pytest.mark.parametrize("name", [
+    "datasets/stanfordnlp/imdb", "spaces/org/demo", "kernels/org/k",
+])
+def test_repo_types_that_cannot_be_a_base_model_stay_rejected(monkeypatch, name):
+    """These resolve too, and are rejected deliberately: a dataset, a Space and a
+    kernel are not the base model of a LoRA merge, so a Hub probe for one is a
+    round trip that can only answer a question nobody asked."""
+    monkeypatch.setattr(saving_utils, "_hub_addresses_typed_model_uris", lambda: True)
+    assert saving_utils._is_hub_repo_id(name) is False
+
+
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
 def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
     """The argument the revision split rests on, which nothing else pins.
