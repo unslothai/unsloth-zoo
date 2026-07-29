@@ -2446,6 +2446,280 @@ def test_qualified_families_carry_their_probed_requirements():
     mlx_utils._check_audio_transformers_floor("gemma3n")  # no floor recorded
 
 
+class _Gemma4Extractor:
+    """Gemma 4's mel framing and masking, in the two shapes mlx-vlm has shipped.
+
+    Both releases pad waveforms to the longest in the batch and on to a multiple
+    of 128 samples before framing. 0.5.0 added the reference's semicausal
+    left-pad and its mask rule -- a frame is valid only when its whole analysis
+    window is real audio -- where 0.4.4 subsamples a sample-level mask, which
+    keeps frames a padded batch filled with silence.
+
+    Frame counts and mask sums match the shipped extractors at every length
+    asserted below. Mel values, dithering, normalisation and the 480,000-sample
+    truncation are not reproduced; nothing here depends on them.
+    """
+    sampling_rate = 16000
+    frame_length, hop_length, pad_multiple = 320, 160, 128
+
+    def __init__(self, semicausal_pad, emit_mask=True):
+        self.semicausal_pad = semicausal_pad
+        self.emit_mask = emit_mask
+
+    def __call__(self, waveforms, sampling_rate=None, return_attention_mask=True):
+        lengths = [len(w) for w in waveforms]
+        target = max(lengths)
+        if target % self.pad_multiple:
+            target = (target // self.pad_multiple + 1) * self.pad_multiple
+        left = self.frame_length // 2 if self.semicausal_pad else 0
+        frames = (target + left - (self.frame_length + 1)) // self.hop_length + 1
+        out = {"input_features": np.zeros(
+            (len(waveforms), max(frames, 0), 128), np.float32)}
+        if self.emit_mask:
+            offsets = np.arange(max(frames, 0)) * self.hop_length
+            out["input_features_mask"] = np.stack([
+                (offsets + self.frame_length < length + left) if left
+                else (offsets < length)
+                for length in lengths
+            ])
+        return out
+
+
+class Gemma4Processor:  # named as mlx-vlm's, so the family resolves to gemma4
+    tokenizer = type("_AudioTok", (_FakeTokenizer,), {
+        "audio_token": "<|audio|>",
+        "_vocab": dict(_FakeTokenizer._vocab, **{"<|audio|>": 300})})()
+
+    def __init__(self, extractor):
+        self.feature_extractor = extractor
+
+    def _compute_audio_num_tokens(self, waveform, sampling_rate):
+        raise AssertionError("the shipped duration rule must not be reached")
+
+    def __call__(self, text=None, audio=None, **_kwargs):
+        extracted = self.feature_extractor(audio, sampling_rate=16000)
+        runs = [[101] + [300] * self._compute_audio_num_tokens(clip, 16000) + [11]
+                for clip in audio]
+        width = max(len(run) for run in runs)
+        return {
+            "input_ids": np.array(
+                [run + [0] * (width - len(run)) for run in runs], np.int32),
+            "attention_mask": np.array(
+                [[1] * len(run) + [0] * (width - len(run)) for run in runs],
+                np.int32),
+            "input_features": extracted["input_features"],
+            "input_features_mask": extracted["input_features_mask"],
+        }
+
+
+class _ForwardsTheHook(Gemma4Processor):
+    """Keeps its own attributes, but writes that one hook through to another.
+
+    The narrowest sharing there is: a probe watching any other attribute name
+    sees an independent copy.
+    """
+    def __setattr__(self, name, value):
+        origin = self.__dict__.get("_origin")
+        if origin is not None and name == "_compute_audio_num_tokens":
+            return setattr(origin, name, value)
+        return object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        origin = self.__dict__.get("_origin")
+        if origin is not None and name == "_compute_audio_num_tokens":
+            return delattr(origin, name)
+        return object.__delattr__(self, name)
+
+    def __copy__(self):
+        twin = type(self)(self.feature_extractor)
+        object.__setattr__(twin, "_origin", self)
+        return twin
+
+
+@pytest.mark.parametrize("samples,reference,floor_044,mask_blind", [
+    # 5.855 s: ceil(duration / 40 ms) says 147 and the reference agrees, but
+    # 0.4.4's extractor emits one frame fewer -- copying the reference formula
+    # would keep predicting a frame that extractor never produces.
+    (93680, 147, 146, 147),
+    # 2.245 s: both extractors emit 56; only the duration rule is over, at 57.
+    (35920, 56, 56, 56),
+    # Short enough that the reference's trailing frames are all padding, so a
+    # count taken from the frame total instead of the mask says two.
+    (769, 1, 1, 2),
+])
+def test_gemma4_audio_placeholders_track_the_installed_extractor(
+        samples, reference, floor_044, mask_blind):
+    """Counts must equal the positions the audio tower emits, per version."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    clip = np.zeros(samples, dtype=np.float32)
+    counts = []
+    for semicausal_pad in (True, False):
+        processor = Gemma4Processor(_Gemma4Extractor(semicausal_pad))
+        mlx_utils._repair_gemma4_audio_processor(processor)
+        counts.append(processor._compute_audio_num_tokens(clip, 16000))
+    assert counts == [reference, floor_044]
+
+    # What a count that ignored the mask would produce, so the cases above that
+    # differ from it show the mask is load-bearing.
+    frames = _Gemma4Extractor(True)([clip])["input_features"].shape[1]
+    assert mlx_utils._gemma4_audio_encoder_positions(
+        np.ones(frames, dtype=bool)) == mask_blind
+    # An extractor reporting no mask leaves the encoder without one too, so
+    # every frame counts -- the same number.
+    maskless = Gemma4Processor(_Gemma4Extractor(True, emit_mask=False))
+    mlx_utils._repair_gemma4_audio_processor(maskless)
+    assert maskless._compute_audio_num_tokens(clip, 16000) == mask_blind
+
+
+@pytest.mark.parametrize("order", [(93680, 35920), (35920, 93680)])
+@pytest.mark.parametrize("emit_mask", [True, False])
+def test_padded_audio_batch_masks_each_clip_to_its_own_audio(order, emit_mask):
+    """Batch padding must not hand a short clip frames that are silence."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    # The 0.4.4 mask rule this corrects, and an extractor reporting no mask at
+    # all: padding looks like real audio either way once a batch is padded.
+    extractor = _Gemma4Extractor(False, emit_mask=emit_mask)
+    processor = Gemma4Processor(extractor)
+    clips = [np.zeros(samples, np.float32) for samples in order]
+    solo = [223 if samples == 35920 else 584 for samples in order]
+
+    batched = dict(extractor(clips))
+    as_collated = batched.get("input_features_mask")
+    features = batched["input_features"]
+    if emit_mask:
+        # The short clip keeps two frames of pure padding, and how many it
+        # keeps depends on what it was batched against.
+        assert sorted(int(m.sum()) for m in as_collated) == [225, 584]
+
+    corrected = mlx_utils._audio_repaired_processor(processor)
+    repaired = mlx_utils._repair_audio_batch(batched, clips, corrected)
+    counts = [corrected._compute_audio_num_tokens(clip, 16000) for clip in clips]
+    mask = repaired["input_features_mask"]
+    # Exact, not just the count: the frames kept must be that clip's own, at
+    # its own offsets, or the encoder reads silence for real audio.
+    assert mask.shape == (2, 584) and mask.dtype == np.dtype(bool)
+    for row, keep in enumerate(solo):
+        assert mask[row][:keep].all() and not mask[row][keep:].any()
+    # Every row's surviving positions now match the run written for that clip,
+    # and the features those positions index are still there.
+    assert [mlx_utils._gemma4_audio_encoder_positions(row)
+            for row in mask] == counts
+    assert repaired["input_features"] is features
+
+    # Half a contract: on a processor whose count was left alone, so is the
+    # mask. A clip list that does not pair with the feature rows -- in either
+    # direction -- is left alone too, so the collation check reports that
+    # instead of a plausible-looking mask hiding it.
+    three = [*clips, np.zeros(74000, np.float32)]
+    left_alone = [
+        mlx_utils._repair_audio_batch(dict(extractor(clips)), clips, processor),
+        mlx_utils._repair_audio_batch(dict(extractor(clips)), three, corrected),
+        mlx_utils._repair_audio_batch(dict(extractor(three)), clips, corrected),
+    ]
+    for untouched, source in zip(left_alone, (clips, clips, three)):
+        expected = extractor(source).get("input_features_mask")
+        assert (untouched.get("input_features_mask") is None if not emit_mask
+                else untouched["input_features_mask"].tolist()
+                == expected.tolist())
+
+    # A mask that does not cover its features is not left to broadcast: no
+    # other check compares the two.
+    if emit_mask:
+        for batch_clips in (clips, clips[:1]):
+            ragged = dict(extractor(batch_clips))
+            ragged["input_features_mask"] = (
+                ragged["input_features_mask"][:, :1])
+            with pytest.raises(ValueError, match="paired with their clips"):
+                mlx_utils._repair_audio_batch(ragged, batch_clips, corrected)
+
+
+def test_collation_repairs_the_audio_batch_before_the_model_sees_it():
+    import pickle
+
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = Gemma4Processor(_Gemma4Extractor(False))
+    clips = [np.zeros(93680, np.float32), np.zeros(35920, np.float32)]
+    inputs = mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>", "<|audio|>"], [[], []], 1024,
+        all_audio=[[clips[0]], [clips[1]]],
+    )
+    assert [int(m.sum()) for m in inputs["input_features_mask"]] == [584, 223]
+    assert inputs["input_features"].shape[:2] == (2, 584)
+    # The shared processor is never touched: a corrected count on it would meet
+    # an uncorrected mask in anything else using it, concurrently or after.
+    assert "_compute_audio_num_tokens" not in vars(processor)
+    assert not mlx_utils._audio_count_corrected(processor)
+    pickle.loads(pickle.dumps(processor))
+
+
+def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
+    """The correction must not be observable through the shared processor."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
+    monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {
+        "gemma4": frozenset({mlx_utils._installed_mlx_vlm_version()}),
+        "fakegemmaaudio": frozenset({mlx_utils._installed_mlx_vlm_version()}),
+    })
+    processor = Gemma4Processor(_Gemma4Extractor(True))
+    assert mlx_utils._check_audio_family_gate(processor) == "gemma4"
+
+    corrected = mlx_utils._audio_repaired_processor(processor)
+    assert corrected is not processor and type(corrected) is type(processor)
+    assert corrected.feature_extractor is processor.feature_extractor
+    assert corrected._compute_audio_num_tokens(
+        np.zeros(35920, dtype=np.float32), 16000) == 56
+    # Built on the copy, not installed on the original and moved across.
+    assert corrected._compute_audio_num_tokens.args[0] is corrected
+
+    # Same family name, so the repair is reached, but not independently
+    # copyable -- correcting either would correct the caller's own processor.
+    # A copy that is the original, and one that keeps its own attributes but
+    # writes just that hook through -- the narrowest sharing there is.
+    for cls in (type("Gemma4Processor", (Gemma4Processor,),
+                     {"__copy__": lambda self: self}),
+                type("Gemma4Processor", (_ForwardsTheHook,), {})):
+        for own in (lambda clip, rate: 7, None):
+            shared = cls(_Gemma4Extractor(True))
+            if own is not None:
+                shared._compute_audio_num_tokens = own
+            with pytest.raises(NotImplementedError, match="independent object"):
+                mlx_utils._audio_repaired_processor(shared)
+            assert not mlx_utils._audio_count_corrected(shared)
+            # Refusing must leave the processor exactly as it was: whatever it
+            # had of its own, and nothing where it had been inheriting.
+            if own is not None:
+                assert shared._compute_audio_num_tokens is own
+            else:
+                assert "_compute_audio_num_tokens" not in vars(shared)
+    # The gate only decides support; nothing about the original changes, so a
+    # concurrent user of it cannot pick up half the correction.
+    assert "_compute_audio_num_tokens" not in vars(processor)
+    assert not mlx_utils._audio_count_corrected(processor)
+
+    other = _FakeGemmaAudioProcessor()
+    assert mlx_utils._check_audio_family_gate(other) == "fakegemmaaudio"
+    assert mlx_utils._audio_repaired_processor(other) is other
+
+
+def test_gemma4_repair_refuses_a_processor_it_cannot_correct():
+    """A renamed hook would silently restore the defect the gate says is fixed."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    renamed = type("_Renamed", (), {})()
+    renamed.feature_extractor = _Gemma4Extractor(True)
+    with pytest.raises(NotImplementedError, match="_compute_audio_num_tokens"):
+        mlx_utils._repair_gemma4_audio_processor(renamed)
+
+    no_extractor = Gemma4Processor(None)
+    mlx_utils._repair_gemma4_audio_processor(no_extractor)
+    with pytest.raises(NotImplementedError, match="audio feature extractor"):
+        no_extractor._compute_audio_num_tokens(np.zeros(16000, np.float32), 16000)
+
+
 def test_audio_merge_patch_is_held_and_restored_exactly():
     """Overlapping runs share the correction; the last one puts it back."""
     from unsloth_zoo.mlx.utils import (

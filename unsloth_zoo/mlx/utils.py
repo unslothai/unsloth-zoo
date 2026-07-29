@@ -51,7 +51,7 @@ import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache, wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path
 
 
@@ -5553,6 +5553,196 @@ def _check_audio_transformers_floor(family):
         )
 
 
+# Gemma 4's audio encoder subsamples time through two stride-2, kernel-3 conv
+# blocks (SubSampleConvProjection), each padding one frame on either side.
+_GEMMA4_AUDIO_SUBSAMPLE_BLOCKS = 2
+
+
+def _gemma4_audio_frame_mask(extractor, waveform, sampling_rate):
+    """The mel frames one clip fills, extracted on its own.
+
+    Alone is the only way to ask: mlx-vlm pads waveforms to the longest in the
+    batch before framing, and 0.4.4 derives the mask by subsampling a
+    sample-level one, so a shorter clip's valid count moves with whatever else
+    it is batched against.
+    """
+    features = extractor(
+        [np.asarray(waveform, dtype=np.float32)],
+        sampling_rate=sampling_rate,
+        return_attention_mask=True,
+    )
+    if "input_features_mask" in features:
+        return np.asarray(features["input_features_mask"])[0].astype(bool)
+    # An extractor that reports no mask leaves the encoder without one too, and
+    # Gemma 4 then treats every frame as real audio.
+    return np.ones(
+        int(np.asarray(features["input_features"]).shape[-2]), dtype=bool,
+    )
+
+
+def _gemma4_audio_encoder_positions(frames):
+    for _ in range(_GEMMA4_AUDIO_SUBSAMPLE_BLOCKS):
+        kept = (len(frames) + 2 - 3) // 2 + 1
+        frames = frames[::2][:kept]
+    return int(frames.sum())
+
+
+def _gemma4_audio_placeholder_count(processor, waveform, sampling_rate):
+    """How many audio placeholders one Gemma 4 clip needs.
+
+    Must equal the number of positions the audio tower emits, or the merge has
+    nothing to put behind the surplus placeholder. mlx-vlm's processor instead
+    counts ``ceil(duration / 40 ms)``: 40 ms is only the nominal frame period,
+    so the count runs one over whenever a duration lands near a frame boundary
+    (3 of 10 real LibriSpeech utterances).
+
+    The frames are read off the installed extractor rather than recomputed from
+    a copy of its framing arithmetic, because that arithmetic changed inside the
+    supported span -- mlx-vlm added the reference's semicausal left-pad in
+    0.5.0, and a formula assuming it predicts a frame 0.4.4 never produces. The
+    extractor's own truncation applies for the same reason: the count has to
+    follow the audio the tower is actually given.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    if extractor is None:
+        raise NotImplementedError(
+            f"Unsloth MLX: {type(processor).__name__} has no audio feature "
+            f"extractor, so the number of audio placeholders a clip needs "
+            f"cannot be determined."
+        )
+    return _gemma4_audio_encoder_positions(
+        _gemma4_audio_frame_mask(extractor, waveform, sampling_rate),
+    )
+
+
+def _trim_gemma4_audio_batch_mask(inputs, clips, processor):
+    """Mask each clip to the frames its own audio fills.
+
+    Batch padding otherwise leaves a shorter clip holding frames that are
+    entirely silence, which the encoder reports as valid positions and the model
+    trains on as speech. Restoring each clip's own mask also puts the valid
+    count back in step with the placeholder run written for it.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    features = inputs.get("input_features")
+    if extractor is None or features is None:
+        return inputs
+    mask = inputs.get("input_features_mask")
+    # An extractor that reports no mask leaves every padded frame looking real,
+    # so the batch needs one written for it rather than left out.
+    shape = np.asarray(features).shape[:2]
+    if mask is not None and np.asarray(mask).shape != shape:
+        # Nothing downstream compares these two, and a mask short of its
+        # features broadcasts over the rows it does not cover.
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} returned an audio mask "
+            f"of shape {tuple(np.asarray(mask).shape)} for features of shape "
+            f"{tuple(np.asarray(features).shape)}, so audio positions cannot "
+            f"be paired with their clips."
+        )
+    if shape[0] != len(clips):
+        # The feature-count check reports this; repairing part of the batch
+        # would hide it behind a plausible-looking mask.
+        return inputs
+    if len(clips) < 2:
+        # One clip is extracted the way it will be used, so nothing was padded
+        # against a neighbour and its mask already covers only its own audio.
+        return inputs
+    trimmed = np.zeros(shape, dtype=bool)
+    default_rate = _audio_extractor_sampling_rate(processor)
+    for row, clip in enumerate(clips[:shape[0]]):
+        waveform, rate = clip if isinstance(clip, tuple) else (clip, None)
+        solo = _gemma4_audio_frame_mask(
+            extractor, waveform,
+            rate or getattr(clip, "sampling_rate", None) or default_rate,
+        )
+        keep = min(len(solo), shape[1])
+        trimmed[row, :keep] = solo[:keep]
+    inputs["input_features_mask"] = (
+        trimmed if mask is None else trimmed.astype(np.asarray(mask).dtype)
+    )
+    return inputs
+
+
+def _repair_gemma4_audio_processor(processor):
+    if not callable(getattr(processor, "_compute_audio_num_tokens", None)):
+        raise NotImplementedError(
+            f"Unsloth MLX: {type(processor).__name__} does not expose "
+            f"_compute_audio_num_tokens, so its audio placeholder count cannot "
+            f"be matched to the model's audio encoder. This mlx-vlm release is "
+            f"not usable for Gemma 4 audio training."
+        )
+    # Bound on the instance, not the class: a class-level patch would follow the
+    # processor type into every other use of it in this process. Unlike
+    # __call__, this one is reached through the instance dict.
+    processor._compute_audio_num_tokens = partial(
+        _gemma4_audio_placeholder_count, processor,
+    )
+
+
+_AUDIO_PROCESSOR_REPAIRS = {"gemma4": _repair_gemma4_audio_processor}
+
+_AUDIO_BATCH_MASK_REPAIRS = {"gemma4": _trim_gemma4_audio_batch_mask}
+
+_AUDIO_NO_OWN_HOOK = object()
+
+
+def _audio_count_corrected(processor):
+    """Whether this processor is carrying the corrected placeholder count."""
+    hook = getattr(processor, "_compute_audio_num_tokens", None)
+    return (isinstance(hook, partial)
+            and hook.func is _gemma4_audio_placeholder_count)
+
+
+def _audio_repaired_processor(processor):
+    """A processor counting audio placeholders the way its encoder does.
+
+    A copy, because the correction has a second half -- the batch mask -- that
+    can only be applied where the collated batch is held. Correcting the shared
+    processor in place would hand the count alone to anything else using it,
+    including a concurrent collation's own model call, and a corrected count
+    meeting an uncorrected mask misaligns a batch that lined up before.
+    Components are shared by reference, so the copy costs a dict.
+    """
+    repair = _AUDIO_PROCESSOR_REPAIRS.get(
+        _audio_family_from_processor(processor),
+    )
+    if repair is None:
+        return processor
+    corrected = copy.copy(processor)
+    # Only an instance-level hook is ours to put back; pinning an inherited one
+    # would leave a copy of it shadowing the class's own.
+    state = getattr(processor, "__dict__", None) or {}
+    own_hook = state.get("_compute_audio_num_tokens", _AUDIO_NO_OWN_HOOK)
+    repair(corrected)
+    if _audio_count_corrected(processor):
+        # The copy shares state with the processor this run was handed, so the
+        # correction reached it too. Half of it -- the batch mask -- can only
+        # be applied to a batch collated here, and the count alone misaligns a
+        # batch that lined up before, so put back what was there and refuse.
+        if own_hook is _AUDIO_NO_OWN_HOOK:
+            del corrected._compute_audio_num_tokens
+        else:
+            corrected._compute_audio_num_tokens = own_hook
+        raise NotImplementedError(
+            f"Unsloth MLX: copying {type(processor).__name__} does not give an "
+            f"independent object, so its audio placeholder count cannot be "
+            f"corrected without changing the processor this run was handed."
+        )
+    return corrected
+
+
+def _repair_audio_batch(inputs, clips, processor):
+    repair = _AUDIO_BATCH_MASK_REPAIRS.get(
+        _audio_family_from_processor(processor),
+    )
+    # Only on the processor whose count was corrected: the two describe one
+    # contract, so applying either alone puts them back out of step.
+    if not clips or repair is None or not _audio_count_corrected(processor):
+        return inputs
+    return repair(inputs, clips, processor)
+
+
 def _check_audio_family_gate(processor):
     """Refuse audio rows for families/versions without a verified contract."""
     family = _audio_family_from_processor(processor)
@@ -6307,6 +6497,9 @@ def _processor_vlm_inputs(
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
         base_kwargs[audio_kwarg] = audio
+        # Everything below this line collates through the corrected copy; the
+        # caller's processor stays as mlx-vlm made it.
+        processor = _audio_repaired_processor(processor)
     if truncation:
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
@@ -6379,8 +6572,14 @@ def _processor_vlm_inputs(
 
     if audio_kwarg is None:
         return _run_layouts()
+
+    def _run_audio_layouts():
+        return _repair_audio_batch(
+            _run_layouts(), base_kwargs[audio_kwarg], processor,
+        )
+
     try:
-        return _run_layouts()
+        return _run_audio_layouts()
     except ValueError as exc:
         if "unpack" not in str(exc):
             raise
@@ -6392,7 +6591,7 @@ def _processor_vlm_inputs(
             for clip in audio
         ]
         try:
-            return _run_layouts()
+            return _run_audio_layouts()
         except Exception:
             # Guess was wrong: report what the processor first said.
             raise exc from None
