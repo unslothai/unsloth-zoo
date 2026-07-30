@@ -1626,6 +1626,22 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
     (TRL's maybe_apply_chat_template is a no-op on non-conversational rows).
     """
     if _is_conversational_messages(prompt):
+        # Flatten OpenAI-style content PARTS (content=[{"type":"text",...}]) to
+        # plain strings before templating, exactly as the SFT chat path does
+        # (_normalize_mlx_messages(..., is_vlm=False)). Without this the raw
+        # part-lists reach apply_chat_template and templates diverge: Qwen2.5 /
+        # SmolLM raise TypeError ("can only concatenate str (not \"list\") to
+        # str"), while Qwen3 SILENTLY renders every turn empty -- prompt+chosen
+        # and prompt+rejected come out byte-identical, so the ORPO odds-ratio
+        # term collapses to -logsigmoid(0) = log 2, a constant with zero
+        # gradient, and the run trains on empty assistant turns while appearing
+        # to converge. Normalizing here keeps ORPO/DPO byte-identical to the SFT
+        # path and TRL for the same row. String rows are returned unchanged by
+        # _normalize_mlx_messages, so the non-conversational path below is
+        # untouched.
+        prompt = _normalize_mlx_messages(prompt, is_vlm=False)
+        chosen = _normalize_mlx_messages(chosen, is_vlm=False)
+        rejected = _normalize_mlx_messages(rejected, is_vlm=False)
         last_role = prompt[-1].get("role")
         if last_role == "user":
             add_gen, cont = True, False
