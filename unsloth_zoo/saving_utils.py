@@ -5043,8 +5043,10 @@ pass
 # directory only to size the shards, so nothing on that path can reach the Hub.
 _MERGES_FROM_LOADED_WEIGHTS = ("merged_4bit", "forced_merged_4bit")
 
-# `model-00001-of-00005.safetensors`, and the same shape under any prefix.
-_SHARD_NAME = re.compile(r"^.+-(\d+)-of-(\d+)\.safetensors$")
+# `model-00001-of-00005.safetensors`, and the same shape under any prefix. The prefix is
+# captured because it identifies the set: two shards can declare the same total and belong
+# to different ones.
+_SHARD_NAME = re.compile(r"^(.+)-(\d+)-of-(\d+)\.safetensors$")
 
 def _local_snapshot_is_complete(local_path):
     """Does this directory hold every shard its own index names?
@@ -5078,15 +5080,19 @@ def _local_snapshot_is_complete(local_path):
         entries = os.listdir(local_path)
     except OSError:
         return False
-    seen_by_total = {}
+    seen_by_set = {}
     for entry in entries:
         match = _SHARD_NAME.match(entry)
         if match is None: continue
-        seen_by_total.setdefault(int(match.group(2)), set()).add(int(match.group(1)))
-    if not seen_by_total: return True                    # a single file snapshot
-    if len(seen_by_total) != 1: return False             # shards disagree on the total
-    total, seen = next(iter(seen_by_total.items()))
-    return seen == set(range(1, total + 1))
+        prefix, part, total = match.group(1), int(match.group(2)), int(match.group(3))
+        seen_by_set.setdefault((prefix, total), set()).add(part)
+    if not seen_by_set: return True                      # a single file snapshot
+    # Grouped by set, not by total: `model-00001-of-00002` plus a stale
+    # `backup-00002-of-00002` is one shard of each, not both shards of one.
+    return any(
+        seen == set(range(1, total + 1))
+        for (_prefix, total), seen in seen_by_set.items()
+    )
 pass
 
 def _local_base_completes_without_the_hub(quant_type, save_method, local_path):

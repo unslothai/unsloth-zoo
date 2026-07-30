@@ -303,6 +303,25 @@ def test_shards_that_disagree_on_the_total_are_not_complete(tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
+def test_shards_from_different_sets_do_not_complete_each_other(tmp_path):
+    """One shard of `model` and one stale shard of `backup` declare the same total and are
+    not the same set, so `model-00002-of-00002` is still missing."""
+    directory = str(tmp_path)
+    for shard in ("model-00001-of-00002.safetensors", "backup-00002-of-00002.safetensors"):
+        open(os.path.join(directory, shard), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+
+
+def test_one_complete_set_is_enough_beside_a_stray(tmp_path):
+    """The base is readable when any set is whole; a leftover from another is not a reason
+    to call the snapshot half downloaded."""
+    directory = str(tmp_path)
+    for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                  "backup-00001-of-00002.safetensors"):
+        open(os.path.join(directory, shard), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
 def test_an_unreadable_index_is_not_proof_of_completeness(tmp_path):
     """Unproven completeness answers False: the unreachable Hub is the honest failure."""
     directory = str(tmp_path)
