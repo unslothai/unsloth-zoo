@@ -1403,24 +1403,14 @@ def make_orpo_loss_fn(beta=0.1):
         logp = logp_tok.sum(axis=1) / mx.maximum(ntok_row, mx.array(1.0))
         B = batch.shape[0] // 2
         logp_c, logp_r = logp[:B], logp[B:]
-        # SFT term: TRL chosen_nll_loss. Pooled token-mean cross-entropy over the
-        # full prompt+response span (all non-pad chosen tokens), matching TRL's
-        # nn.CrossEntropyLoss default reduction. This is NOT the response-only,
-        # length-normalized logp used for the odds-ratio term below.
+        # TRL chosen_nll_loss: token-mean CE over the full prompt+response span,
+        # NOT the response-only logp the odds-ratio term uses.
         nll_mask = (steps < lengths[:, 1:]).astype(mx.float32)[:B]
         sft = (ce_tok[:B] * nll_mask).sum() / mx.maximum(nll_mask.sum(), mx.array(1.0))
-        # Odds-ratio term. log(p/(1-p)) per side; computed in float32 (see
-        # _orpo_odds_ratio_loss) so the 1-exp(logp) floor does not underflow in
-        # float16 and drive log(0) = -inf / NaN gradients. Cast back to the SFT
-        # (model) dtype so the combined loss dtype is unchanged.
         or_loss = _orpo_odds_ratio_loss(logp_c, logp_r)
         loss = sft + beta * or_loss.astype(sft.dtype)
-        # Return the PAIR count, not the response-token count. This is a
-        # preference loss reduced as a mean over pairs (the odds-ratio term),
-        # so the trainer's accumulate-then-normalize machinery must weight each
-        # microbatch by its pair count. Weighting by tokens would make
-        # long-completion microbatches dominate and break equivalence with a
-        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        # PAIR count, not token count: this is a mean over pairs, so accumulation
+        # must weight microbatches by pairs to stay equivalent to a single batch.
         return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
@@ -1486,12 +1476,8 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False,
             ref_r = mx.zeros(pol_r.shape)
         else:
             saved = [md.scale for md in _mods]
-            # Also silence NEFTune for the reference forward: the model stays in
-            # train() so the wrapped embedding would otherwise inject fresh random
-            # noise, making the "frozen" reference logps noisy and corrupting
-            # log(pi_policy / pi_ref). Disabling the noise flag (default True)
-            # yields a clean reference while the policy forward above keeps its
-            # NEFTune augmentation. Restored in finally alongside the LoRA scales.
+            # Silence NEFTune for the reference forward: the model stays in
+            # train(), so its noise would make the "frozen" reference logps noisy.
             neft_saved = [
                 getattr(m, "_neftune_noise_enabled", True) for m in _neftune
             ]
@@ -1511,11 +1497,7 @@ def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False,
 
         logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
         loss = -mx.mean(nn.log_sigmoid(logits))
-        # Return the PAIR count, not the response-token count. DPO is a mean
-        # over preference pairs, so the trainer must weight each microbatch by
-        # its pair count when accumulating; token weighting would let
-        # long-completion microbatches dominate and break equivalence with a
-        # single batch of the same pairs under gradient_accumulation_steps > 1.
+        # PAIR count, not token count (see make_orpo_loss_fn).
         return loss, mx.array(B, dtype=mx.int32)
     return loss_fn
 
@@ -1583,55 +1565,20 @@ def _is_conversational_messages(value):
 
 def _render_preference_example(tokenizer, prompt, chosen, rejected,
                                tools=None, chat_template_kwargs=None):
-    """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one
-    preference row, rendering conversational (message-list) rows through the
-    tokenizer chat template.
+    """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one row.
 
-    TRL's DPO/ORPO natively accept BOTH the standard (string) and the
-    conversational (message-list) preference formats: their dataset pipeline
-    runs maybe_apply_chat_template, which for a conversational row applies
-    apply_chat_template (trl/data_utils.py) to render the prompt, prompt+chosen
-    and prompt+rejected as strings (add_generation_prompt when the last prompt
-    role is 'user', continue_final_message when it is 'assistant'), and is a
-    no-op on string rows. Without this, string-concatenating message LISTS
-    (``prompt + chosen``) and calling encode_mlx_text on them raises -- encode
-    does ``text.startswith(bos_token)`` (lists have no ``.startswith``) and then
-    ``tokenizer.encode`` on a list of dicts -- so the very common conversational
-    preference datasets crash before any training. Mirror TRL and the SFT chat
-    render path here so both formats train; the downstream boundary split then
-    operates on the rendered strings exactly as it does for pre-rendered string
-    prompts. Plain string rows fall through unchanged (byte-identical to the
-    prior concat).
+    Mirrors TRL's maybe_apply_chat_template: conversational (message-list) rows
+    render through the chat template, plain string rows fall through unchanged.
+    Without this, concatenating message lists crashes in encode_mlx_text.
 
-    ``tools`` / ``chat_template_kwargs`` are the per-row function-calling schema
-    and extra template kwargs. TRL's apply_chat_template threads them into EVERY
-    render of a preference row (prompt, prompt+chosen, prompt+rejected --
-    trl/data_utils.py: tools=tools, **example.get("chat_template_kwargs", {})),
-    and this codebase's SFT conversational path threads the same per-row fields
-    (_tokenize_mlx_conversational_prompt_completion / the assistant-mask row:
-    tools=item.get("tools"), **item.get("chat_template_kwargs", {})). Dropping
-    them here would (a) render a tool/function-calling template WITHOUT its tool
-    schema (raising inside templates that reference ``tools``, or omitting the
-    tool block), and (b) ignore a per-row chat_template_kwargs knob (e.g. Qwen3
-    ``enable_thinking``), so ORPO/DPO would train on DIFFERENT text than the SFT
-    path and TRL for the identical row. Thread them into all three renders to
-    match. Only affects the conversational branch; plain string rows ignore them
-    (TRL's maybe_apply_chat_template is a no-op on non-conversational rows).
+    ``tools`` / ``chat_template_kwargs`` are per-row and thread into all three
+    renders, as TRL and the SFT path do; dropping them would train ORPO/DPO on
+    different text than SFT for the same row.
     """
     if _is_conversational_messages(prompt):
-        # Flatten OpenAI-style content PARTS (content=[{"type":"text",...}]) to
-        # plain strings before templating, exactly as the SFT chat path does
-        # (_normalize_mlx_messages(..., is_vlm=False)). Without this the raw
-        # part-lists reach apply_chat_template and templates diverge: Qwen2.5 /
-        # SmolLM raise TypeError ("can only concatenate str (not \"list\") to
-        # str"), while Qwen3 SILENTLY renders every turn empty -- prompt+chosen
-        # and prompt+rejected come out byte-identical, so the ORPO odds-ratio
-        # term collapses to -logsigmoid(0) = log 2, a constant with zero
-        # gradient, and the run trains on empty assistant turns while appearing
-        # to converge. Normalizing here keeps ORPO/DPO byte-identical to the SFT
-        # path and TRL for the same row. String rows are returned unchanged by
-        # _normalize_mlx_messages, so the non-conversational path below is
-        # untouched.
+        # Flatten OpenAI-style content parts like the SFT path. Raw part-lists
+        # make Qwen2.5/SmolLM raise TypeError and Qwen3 render every turn empty
+        # (chosen == rejected, so the odds-ratio term is a constant log 2).
         prompt = _normalize_mlx_messages(prompt, is_vlm=False)
         chosen = _normalize_mlx_messages(chosen, is_vlm=False)
         rejected = _normalize_mlx_messages(rejected, is_vlm=False)
@@ -1645,11 +1592,8 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
                 "Unsloth MLX preference: conversational chat prompt has invalid "
                 f"last-message role {last_role!r}; expected 'user' or 'assistant'."
             )
-        # Only inject tools / chat_template_kwargs when the row actually carries
-        # them, so rows WITHOUT these fields render byte-identically to before
-        # (and tokenizers whose apply_chat_template omits a tools= parameter keep
-        # working). A real HF tokenizer defaults tools=None, so this is equivalent
-        # to TRL's unconditional tools=tools for the no-tools case.
+        # Injected only when present, so rows without them render as before and
+        # tokenizers lacking a tools= parameter keep working.
         extra_kwargs = dict(chat_template_kwargs or {})
         if tools is not None:
             extra_kwargs["tools"] = tools
@@ -1667,53 +1611,32 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
             **extra_kwargs,
         )
         return prompt_str, prompt_chosen_str, prompt_rejected_str
-    # Standard string preference row (or a prompt already rendered to a chat
-    # string): concatenate, matching the prior behavior exactly. tools /
-    # chat_template_kwargs do not apply to non-conversational rows (TRL's
-    # maybe_apply_chat_template is a no-op on them).
+    # Plain string row: concatenate. tools / chat_template_kwargs do not apply.
     return prompt, prompt + chosen, prompt + rejected
 
 
 class PreferenceBatchList(list):
-    """The materialized preference batches, plus the length of ONE dataset pass.
+    """Eager preference batches carrying the length of ONE dataset pass.
 
-    ``create_preference_batches`` is eager: it returns fully built
-    ``(batch, lengths, None)`` tuples rather than a lazy
-    ``FiniteTextBatchPlan`` / ``FiniteVLMBatchPlan``. The trainer nevertheless
-    needs the one-pass micro-batch count to force HF's epoch-final optimizer
-    step -- ``_mlx_epoch_microbatches`` and ``_callback_batches_per_epoch`` both
-    read it as ``getattr(batches, "cycle_length", None)``, and a plain ``list``
-    cannot carry it. Without it those helpers fall back to None under
-    ``max_steps > 0``, so a ragged pass (e.g. 3 preference batches with
-    ``gradient_accumulation_steps=2``) never force-updates on its tail: batch 3
-    is accumulated together with the next pass's batch 1, changing the effective
-    gradient and moving the callback/save/eval epoch boundaries away from the
-    SFT finite-plan path.
-
-    Subclassing ``list`` keeps every existing consumer byte-identical -- the
-    trainer indexes and modulo-cycles this (``batches[i % len(batches)]``) and
-    its ``isinstance`` gates all test against the lazy plan types
-    (``_FINITE_BATCH_PLAN_TYPES`` / ``_EAGER_REFETCHABLE_PLAN_TYPES``), which a
-    list subclass deliberately does not join: these batches are already
-    materialized and must not be refetched.
+    The trainer reads that length as ``getattr(batches, "cycle_length", None)``
+    to force HF's epoch-final optimizer step; a plain list cannot carry it, so a
+    ragged pass never force-updates on its tail. Stays a ``list`` (and outside
+    the lazy-plan isinstance gates) so existing consumers are unchanged.
     """
 
     __slots__ = ("cycle_length",)
 
     def __init__(self, batches=(), *, cycle_length=None):
         super().__init__(batches)
-        # Micro-batches in ONE pass over the row set. Deliberately NOT clamped to
-        # len(self): a sub-one-pass run (num_batches below the pass length) has a
-        # boundary it never reaches, and the SFT/VLM plans count their pass the
-        # same way -- independently of the num_batches horizon.
+        # Not clamped to len(self): num_epochs makes the list several passes
+        # long and a num_batches horizon can truncate it below one, matching how
+        # the SFT/VLM plans count theirs.
         self.cycle_length = (
             None if cycle_length is None else max(1, int(cycle_length))
         )
 
     def __reduce__(self):
-        # __slots__ on a list subclass leaves no __dict__ for the default
-        # list reducer to restore, so spell the round-trip out (checkpoint /
-        # resume paths deep-copy prepared batches).
+        # __slots__ leaves no __dict__ for the default list reducer to restore.
         return (self.__class__, (list(self),), {"cycle_length": self.cycle_length})
 
     def __setstate__(self, state):
@@ -1728,45 +1651,26 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         append_eos=True, num_epochs=None):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
-    Each example contributes ``prompt + chosen`` and ``prompt + rejected``.
-    Pairs are grouped into batches of ``batch_size`` PAIRS, and every row in a
-    batch is padded to that batch's max length, rounded up to
-    ``pad_to_multiple`` (Apple-Silicon padding).
+    Each example contributes ``prompt + chosen`` and ``prompt + rejected``,
+    grouped into batches of ``batch_size`` PAIRS and padded to a multiple of
+    ``pad_to_multiple``.
 
-    ``dataset_order`` controls how pairs are ordered before batching (mirrors
-    the SFT/VLM builders so preference runs can match CUDA/TRL parity):
-      "default"       length-sort by ``max(len(chosen), len(rejected))`` — least
-                      padding / best throughput; the historical behavior.
-      "sequential"    keep dataset order — matches CUDA ``SequentialSampler``.
-      "torch_randperm" seeded permutation — matches CUDA ``RandomSampler``.
-    ``preserve_dataset_order=True`` forces "sequential" (Studio wiring).
-    ``seed`` seeds the "torch_randperm" order.
+    ``dataset_order`` (mirrors the SFT/VLM builders for CUDA/TRL parity):
+      "default"        length-sort — least padding; the historical behavior.
+      "sequential"     dataset order — CUDA ``SequentialSampler``.
+      "torch_randperm" seeded permutation — CUDA ``RandomSampler``.
+    ``preserve_dataset_order=True`` forces "sequential"; ``seed`` seeds
+    "torch_randperm". ``num_epochs`` (epoch-based runs, ``num_batches`` None)
+    materializes one reseeded permutation per epoch for "torch_randperm" so the
+    modulo-cycled loop sees a fresh order each epoch.
 
-    ``num_epochs`` is set by epoch-based runs (max_steps<=0, num_train_epochs>0)
-    that leave ``num_batches`` None. For "torch_randperm" it materializes one
-    reseeded (``base_seed + epoch``) permutation PER EPOCH so the trainer's
-    modulo-cycled loop (``batches[i % len]``) sees a fresh order each epoch --
-    matching the SFT ``create_ordered_batches`` per-epoch reseed and the CUDA
-    ``RandomSampler`` -- instead of replaying one permutation every epoch. Epoch
-    0 uses ``base_seed``, byte-identical to the single-pass order. "default"
-    (length-sort) and "sequential" need no expansion: both modulo-cycle one pass
-    exactly like their SFT counterparts (create_batches / SequentialSampler).
+    ``append_eos`` (default True, as TRL) appends EOS to each completion before
+    truncation, guarded against a double EOS; it lands inside the loss span and
+    is trained on. Over-long rows truncate PROMPT-FIRST (keeping the prompt end,
+    TRL's ``truncation_mode="keep_end"``) so the response survives with a
+    non-empty span.
 
-    ``append_eos`` (default True, matching TRL) appends the tokenizer's EOS id
-    to each chosen/rejected completion, guarded to avoid a double EOS (mirrors
-    TRL's ``add_eos_token_if_needed``). EOS is appended before truncation to
-    ``max_seq_length``. Because EOS lands after the prompt boundary it falls
-    inside the ``[response_start, seq_end)`` loss span, so it is trained on — as
-    in TRL.
-
-    Rows longer than ``max_seq_length`` are truncated PROMPT-FIRST (keeping the
-    END of the prompt, TRL's default ``truncation_mode="keep_end"``) so the
-    completion is preserved; a plain right-truncation would drop the response
-    tail on a long prompt and leave an empty ``[response_start, seq_end)`` span
-    with no preference signal. Both rows in a pair share the same truncated
-    prompt prefix, so they keep a single ``response_start``.
-
-    Returns a list of ``(batch, lengths, None)`` tuples:
+    Returns ``PreferenceBatchList`` of ``(batch, lengths, None)``:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
       lengths: (2B, 2) — per row [response_start, seq_end)
     """
@@ -1781,43 +1685,23 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     pad_id = eos_id if eos_id is not None else 0
 
     def _with_eos(ids):
-        # TRL appends EOS to the completion, avoiding a double EOS
-        # (add_eos_token_if_needed). Append before max_seq_length truncation,
-        # matching the SFT path's append-then-truncate contract.
         if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
             ids = ids + [eos_id]
         return ids
 
     def _truncate_preference_pair(p_ids, c_full, r_full):
-        # Fit the concatenated prompt+completion rows into max_seq_length while
-        # PRESERVING the completion, mirroring TRL's ORPO/DPO tokenize_row
-        # (truncate the prompt first, then the response only if still too long).
-        # A plain right-truncation (``ids[:max_seq_length]``) drops the response
-        # tail whenever the prompt is long, so a legitimate long-prompt row would
-        # collapse to prompt-only tokens and the [response_start, seq_end) span
-        # would be empty -> no ORPO/DPO preference signal for that pair.
-        #
-        # ``p_len`` is the shared prompt boundary: the longest prefix common to
-        # the standalone prompt and both concatenated prompt+completion rows. A
-        # plain min(len(...)) breaks when the tokenizer appends EOS during encode
-        # (add_eos_token=True): p_ids then ends with a prompt-only EOS absent at
-        # the prompt/completion seam, so min(len) lands one token past the true
-        # boundary and masks out the first completion token. The common prefix
-        # stops at that EOS-vs-first-completion divergence (and also at any
-        # merged boundary token), so it is correct with or without a prompt EOS.
+        # Truncate prompt-first so the response survives (TRL tokenize_row); a
+        # plain right-truncation would empty the loss span on long prompts.
+        # Common prefix, not min(len): a prompt-only EOS would otherwise put the
+        # boundary one token past the seam and mask the first completion token.
         p_len = _common_prefix_len(p_ids, c_full, r_full)
         resp_c = c_full[p_len:]
         resp_r = r_full[p_len:]
         longer_resp = max(len(resp_c), len(resp_r))
         if p_len + longer_resp <= max_seq_length:
-            # Whole pair already fits; both rows are unchanged. This is identical
-            # to the previous append-then-right-truncate result for such rows.
             return p_len, c_full[:max_seq_length], r_full[:max_seq_length]
-        # Reserve room for the (longer) response, then keep the END of the prompt
-        # (TRL's default truncation_mode="keep_end"). Both rows share the same
-        # prompt prefix, so they keep a single response_start. If the response
-        # alone exceeds the budget, the prompt is dropped and the response is
-        # right-truncated (still leaving a non-empty response span with signal).
+        # Reserve room for the longer response, keep the prompt END
+        # (truncation_mode="keep_end"); both rows keep one response_start.
         keep_prompt = max(0, max_seq_length - longer_resp)
         prompt_prefix = c_full[:p_len]  # == r_full[:p_len]
         prompt_kept = prompt_prefix[p_len - keep_prompt:]
@@ -1834,27 +1718,16 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 f"columns; got {sorted(ex.keys())}."
             )
         prompt = ex[prompt_key]
-        # Per-row function-calling schema / extra chat-template kwargs, threaded
-        # into the conversational render below exactly as the SFT path and TRL's
-        # apply_chat_template do (tools=item.get("tools"),
-        # **item.get("chat_template_kwargs", {})). No-op for plain string rows.
         _ex_tools = ex.get("tools") if isinstance(ex, Mapping) else None
         _ex_template_kwargs = (
             ex.get("chat_template_kwargs") if isinstance(ex, Mapping) else None
         )
-        # Conversational (message-list) prompt/chosen/rejected are rendered
-        # through the chat template first (TRL maybe_apply_chat_template parity);
-        # standard string rows pass through unchanged. This yields the prompt
-        # string and the two prompt+completion strings the encodes below expect.
         prompt, chosen_full_text, rejected_full_text = _render_preference_example(
             tokenizer, prompt, ex[chosen_key], ex[rejected_key],
             tools=_ex_tools, chat_template_kwargs=_ex_template_kwargs,
         )
-        # Use the shared text encoder (same as the SFT path) so a prompt that
-        # was already rendered with the chat template's leading BOS does not get
-        # a second BOS from encode()'s default add_special_tokens=True. Raw
-        # hf.encode here would train ORPO/DPO on duplicated special tokens and
-        # diverge from the rest of the MLX trainer for identical rendered text.
+        # encode_mlx_text, not raw hf.encode: a template-rendered prompt already
+        # carries a BOS and would otherwise get a second one.
         p_ids = encode_mlx_text(hf, prompt)
         c_full = _with_eos(encode_mlx_text(hf, chosen_full_text))
         r_full = _with_eos(encode_mlx_text(hf, rejected_full_text))
@@ -1868,34 +1741,12 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     # "torch_randperm" permutes the ROWS per pass below (RandomSampler parity),
     # so it is intentionally NOT pre-permuted here.
 
-    # Group rows into fixed-size batch chunks, then RESHUFFLE the pass order on
-    # every epoch and take the first num_batches, mirroring the text/SFT path
-    # (mlx_lm.iterate_batches with loop=True draws a fresh permutation per pass;
-    # see create_batches, loop=(num_batches is not None)) and the text
-    # create_ordered_batches (which reseeds its order per epoch). Two problems
-    # this fixes:
-    #   1) A single length-sorted pass puts the shortest pairs first, so a
-    #      step-limited (max_steps>0) run whose num_batches is SMALLER than one
-    #      pass would train ORPO/DPO only on the shortest prompts/completions and
-    #      silently ignore the rest.
-    #   2) When num_batches (= max_steps * grad_accum) spans MORE than one pass,
-    #      the trainer modulo-cycles the returned list (batches[batch_idx % len]).
-    #      Materializing a single fixed pass would then repeat the SAME order
-    #      every epoch, biasing small-dataset / long-max_steps runs toward one
-    #      deterministic pass order (whereas SFT, via iterate_batches loop=True,
-    #      reshuffles each epoch). Emitting a fresh order per pass up to
-    #      num_batches makes each cycled epoch distinct, matching the SFT/TRL
-    #      per-epoch reshuffle.
-    # The DEFAULT (length-sort) mode reshuffles the BATCH order from ONE seeded
-    # numpy RandomState so the DEFAULT path stays torch-free (MLX/Apple Silicon
-    # installs have no torch). The opt-in "torch_randperm" mode instead redraws a
-    # fresh seeded ROW permutation per pass (base_seed + epoch), exactly like the
-    # text path's create_ordered_batches, so a modulo-cycled multi-pass run does
-    # not replay the same "random" order every epoch (CUDA RandomSampler parity).
-    # Both keep a single sub-epoch selection byte-identical to the prior
-    # single-pass materialization: pass 0 uses base_seed (the first permutation),
-    # first num_batches. "sequential" carries the user's intended fixed order
-    # (SequentialSampler parity), so it is left single-pass.
+    # Reshuffle the pass order per epoch, mirroring the SFT path. Without it a
+    # sub-one-pass num_batches would train only the shortest pairs (length-sort),
+    # and a multi-pass run would replay one identical order every epoch.
+    # "default" reshuffles BATCH order via numpy so it stays torch-free;
+    # "torch_randperm" redraws a ROW permutation per pass; "sequential" is
+    # left single-pass. Pass 0 uses base_seed, so sub-epoch runs are unchanged.
     base_starts = list(range(0, len(rows), batch_size))
     if order_mode == "default" and num_batches is not None and base_starts:
         rng = np.random.RandomState(_normalize_seed(seed))
@@ -1918,15 +1769,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             epoch += 1
         chunks = chunks[:num_batches]
     elif order_mode == "torch_randperm" and num_epochs is not None and rows:
-        # Epoch-based run (num_batches is None): materialize num_epochs passes,
-        # each a freshly reseeded (base_seed + epoch) row permutation, so the
-        # trainer's modulo-cycled loop (batches[i % len]) draws a distinct order
-        # every epoch instead of replaying one permutation. Mirrors the
-        # step-based branch above and the SFT create_ordered_batches per-epoch
-        # reseed (CUDA RandomSampler parity). Epoch 0 uses base_seed, so it is
-        # byte-identical to the single-pass branch below -- only later epochs
-        # gain reshuffling. (default/sequential need no expansion: both
-        # modulo-cycle one pass exactly like their SFT counterparts.)
+        # Epoch-based run: one reseeded permutation per epoch, so the
+        # modulo-cycled loop draws a distinct order instead of replaying one.
         base_seed = _normalize_seed(seed)
         chunks = []
         for _epoch in range(max(1, int(num_epochs))):
@@ -1937,8 +1781,7 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                 for j in range(0, len(rows_epoch), batch_size)
             )
     elif order_mode == "torch_randperm":
-        # num_batches is None (or no rows): a single seeded permutation,
-        # identical to pass 0 (base_seed) of the multi-pass branch above.
+        # Single seeded permutation, identical to pass 0 above.
         order = _torch_randperm_order(len(rows), _normalize_seed(seed))
         rows_ordered = [rows[i] for i in order]
         chunks = [rows_ordered[s:s + batch_size] for s in base_starts]
@@ -1950,13 +1793,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
         if pad_to_multiple:
             Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
-            # Cap the rounded padded length back to max_seq_length. Rows were
-            # already truncated to max_seq_length, but rounding up to
-            # pad_to_multiple overshoots it when max_seq_length is not a multiple
-            # (e.g. max_seq_length=50, pad_to_multiple=64 -> 64), which would make
-            # the ORPO/DPO forwards process sequences past the configured limit
-            # and defeat memory / context-limit experiments. The text batching
-            # path caps the same way.
+            # Cap the round-up: max_seq_length need not be a multiple of
+            # pad_to_multiple, and overshooting it would forward past the limit.
             Lmax = min(Lmax, max_seq_length)
         chosen_rows, rejected_rows, lengths = [], [], []
         for pe, c, r in chunk:

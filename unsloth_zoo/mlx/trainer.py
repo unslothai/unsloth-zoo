@@ -899,16 +899,9 @@ def _mlx_disable_lora_dropout(model):
     count = 0
     for _, mod in iter_mlx_lora_modules(model):
         if getattr(mod, "dropout", None) is not None:
-            # Stash the configured dropout probability BEFORE swapping in the
-            # identity. Replacing mod.dropout with _mlx_identity makes the
-            # forward deterministic but ERASES the probability the save path
-            # (_extract_mlx_lora_parameters / save_model / _enrich_mlx_adapter_
-            # config) reads back off the live module -- so a checkpoint saved
-            # after ORPO/DPO would record dropout=0.0 in adapter_config.json and
-            # no longer match the trained LoRA config on reload. _read_mlx_lora_
-            # dropout prefers this stash. Guard with hasattr so a repeated
-            # disable (reused trainer) keeps the ORIGINAL value instead of
-            # re-reading 0.0 off the already-neutralized module.
+            # Stash the probability before the identity swap erases it: the save
+            # path reads it off the live module and would record dropout=0.0.
+            # hasattr-guarded so a reused trainer keeps the ORIGINAL value.
             if not hasattr(mod, "_unsloth_orig_lora_dropout"):
                 mod._unsloth_orig_lora_dropout = _get_mlx_dropout_probability(
                     mod.dropout
@@ -4000,10 +3993,8 @@ class MLXTrainer:
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
-            # NEFTune is a training-only augmentation. The DPO/ORPO reference
-            # forward (adapters off) runs with the model still in train(), so it
-            # flips this flag off to compute a CLEAN, noise-free reference (see
-            # make_dpo_loss_fn); the policy forward keeps it True and stays noisy.
+            # Flipped off by the DPO/ORPO reference forward for a clean,
+            # noise-free reference (see make_dpo_loss_fn).
             _neftune_noise_enabled = True
             def __call__(self, x):
                 out = _Base.__call__(self, x)
@@ -4622,21 +4613,16 @@ class MLXTrainer:
         else:
             if getattr(args, "loss_type", "sft") == "orpo":
                 _ob = getattr(args, "orpo_beta", 0.1)
-                # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
-                # forward (SFT + odds-ratio) runs under train() mode, so nonzero
-                # LoRA dropout would perturb the policy log-probs vs TRL. Disable
-                # it (no-op when lora_dropout=0).
+                # TRL's ORPOConfig defaults disable_dropout=True; dropout under
+                # train() would perturb the log-probs. No-op when dropout=0.
                 _mlx_disable_lora_dropout(model)
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
             elif getattr(args, "loss_type", "sft") == "dpo":
                 _db = getattr(args, "dpo_beta", 0.1)
                 _rf = bool(getattr(args, "reference_free", False))
-                # tree_flatten only recurses dict/list/tuple, so a bare
-                # nn.Module is a single leaf and never reaches nested LoRA
-                # layers. Walk the module tree instead so LoRALinear,
-                # LoRAEmbedding, LoRASwitchLinear and DoRA adapters are all
-                # collected for the reference (adapters-off) pass.
+                # Walk the module tree: tree_flatten treats a bare nn.Module as
+                # one leaf and would never reach nested LoRA layers.
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
                 if (_lora_mods and not _rf
                         and any(type(m).__name__.startswith("DoRA")
@@ -4651,19 +4637,12 @@ class MLXTrainer:
                         "plain LoRA adapter, or pass reference_free=True to train "
                         "without a reference."
                     )
-                # NEFTune (if installed by _install_neftune) noises the input
-                # embeddings while training; hand the wrapped module to the loss
-                # so the reference (adapters-off) forward can run it clean and the
-                # DPO reward is not corrupted by reference-side NEFTune noise.
+                # Handed to the loss so the reference forward can run it clean.
                 _neft = getattr(self, "_neftune_emb", None)
                 _neftune_mods = [_neft] if _neft is not None else []
-                # TRL's DPOConfig defaults disable_dropout=True. The DPO policy
-                # forward runs under train() mode, so nonzero LoRA dropout would
-                # perturb the policy log-probs (and, for referenced DPO, the
-                # policy and reference forwards would even see different masks)
-                # and bias the preference margin vs TRL. Disable it (no-op when
-                # lora_dropout=0); the reference forward is already clean via
-                # scale=0.
+                # TRL's DPOConfig defaults disable_dropout=True; dropout would
+                # bias the margin (policy and reference would see different
+                # masks). No-op when dropout=0; reference is clean via scale=0.
                 _mlx_disable_lora_dropout(model)
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods,
                                            reference_free=_rf,
@@ -7175,14 +7154,8 @@ class MLXTrainer:
     def _prepare_data(self, is_vlm, defer_vlm_checker=False):
         """Prepare training data. Returns (batches, batch_iter)."""
         args = self.args
-        # Reject unknown loss_type values before any batch construction. Only
-        # "sft" (default), "orpo", and "dpo" are implemented on MLX. The loss
-        # selection in _train_inner and the preference branch below BOTH fall
-        # through to the SFT/CCE path for anything else, so a misconfigured
-        # preference run -- a typo like "dppo", or a real TRL DPO loss_type that
-        # is not implemented here ("ipo", "sigmoid", "hinge", "kto", ...) -- would
-        # silently optimize a plain cross-entropy objective instead of failing.
-        # Fail fast so the wrong objective is never trained.
+        # Fail fast: every other path falls through to SFT/CCE, so a typo or an
+        # unimplemented TRL loss_type would silently train cross-entropy.
         _supported_loss_types = ("sft", "orpo", "dpo")
         _loss_type = getattr(args, "loss_type", "sft")
         if _loss_type not in _supported_loss_types:
@@ -7212,14 +7185,9 @@ class MLXTrainer:
             )
 
         if self._batches is not None:
-            # Prebuilt batches carrying SFT labels -- (input_ids, lengths, labels),
-            # e.g. from train_on_responses_only -- are NOT the concatenated
-            # [chosen; rejected] preference layout the ORPO/DPO loss requires. That
-            # loss ignores labels and reads B = batch.shape[0] // 2 as pairs, so it
-            # would silently pair unrelated rows and optimize the wrong objective,
-            # while also bypassing create_preference_batches' prompt/chosen/rejected
-            # column validation. Preference batches use labels=None, so reject only
-            # the labeled (SFT) prebuilt batches and leave preference ones untouched.
+            # Labeled prebuilt batches (train_on_responses_only) are not the
+            # [chosen; rejected] layout: the loss reads B = shape[0] // 2 and would
+            # pair unrelated rows. Preference batches use labels=None.
             if getattr(args, "loss_type", "sft") in ("orpo", "dpo") and any(
                 len(b) >= 3 and b[2] is not None for b in self._batches
             ):
@@ -7249,22 +7217,9 @@ class MLXTrainer:
                     f"{args.loss_type.upper()} is not yet supported for VLM models on MLX."
                 )
             if self.distributed_world_size > 1:
-                # Multi-GPU (MLX DDP) DPO/ORPO is not sharded. The SFT/VLM data
-                # path builds a global micro-batch and hands each rank its own
-                # slice (comm_group is threaded into create_batches /
-                # iterate_training_batches / create_vlm_batches), so the gradients
-                # _apply_update all-reduces cover the intended global batch.
-                # create_preference_batches takes no comm_group/rank argument:
-                # every rank would build the SAME sorted preference batches
-                # (identical seed, data, sort) and _apply_update would all-reduce
-                # duplicate gradients, so multi-GPU training would silently train
-                # on one rank's stream rather than the global shard (and, under a
-                # max_steps random-subset cap, on the same reduced subset on every
-                # rank). Correctly sharding the concatenated [chosen; rejected]
-                # builder (global-batch construction plus cross-rank tail padding
-                # so collectives stay aligned) cannot be validated on the
-                # single-process CI, so fail fast rather than mistrain. No-op at
-                # world_size == 1 (the common single-GPU case).
+                # create_preference_batches takes no comm_group, so every rank
+                # would build identical batches and all-reduce duplicate
+                # gradients. No-op at world_size == 1.
                 raise NotImplementedError(
                     "Unsloth MLX: distributed (multi-GPU) DPO/ORPO preference "
                     "training is not yet implemented "
@@ -7276,16 +7231,8 @@ class MLXTrainer:
                     "across ranks yourself before training."
                 )
             if args.streaming:
-                # create_preference_batches materializes the WHOLE dataset: it
-                # collects every prompt/chosen/rejected row before batching and
-                # only honors num_batches afterwards, so an iterable/streaming
-                # dataset is fully consumed up front. The SFT/VLM paths honor
-                # streaming by returning a bounded iterator
-                # (iterate_training_batches / iterate_vlm_training_batches) that
-                # yields only max_steps worth of batches; the preference path has
-                # no such iterator, so args.streaming=True on an unbounded
-                # IterableDataset would hang or OOM instead of stopping at
-                # max_steps. Fail fast rather than silently blow up.
+                # create_preference_batches materializes the whole dataset and
+                # has no bounded iterator, unlike the SFT/VLM paths.
                 raise NotImplementedError(
                     "Unsloth MLX: streaming DPO/ORPO preference training is not "
                     "yet implemented. create_preference_batches materializes the "
@@ -7299,18 +7246,9 @@ class MLXTrainer:
                 if getattr(args, "preserve_dataset_order", False)
                 else getattr(args, "dataset_order", "default")
             )
-            # Epoch-based preference runs (max_steps<=0, num_train_epochs>1) get
-            # num_batches=None, so without num_epochs create_preference_batches
-            # would materialize ONE torch_randperm pass and the modulo-cycled
-            # training loop (batches[i % len]) would replay that identical
-            # "random" order every epoch -- the same bias the step-based per-pass
-            # reshuffle fixed, and divergent from the SFT create_ordered_batches
-            # path that reseeds torch_randperm per epoch. Thread num_epochs so
-            # the reshuffle spans every epoch. Only torch_randperm needs it:
-            # "default" (length-sort) and "sequential" modulo-cycle one pass
-            # exactly like their SFT counterparts (create_batches /
-            # SequentialSampler), so their per-epoch order already matches SFT.
-            # Step-based runs (num_batches set) are unchanged.
+            # Epoch-based runs pass num_batches=None; without num_epochs the
+            # modulo-cycled loop would replay one permutation every epoch. Only
+            # torch_randperm needs it -- the other modes already match SFT.
             pref_num_epochs = (
                 int(args.num_train_epochs)
                 if (
