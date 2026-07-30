@@ -1214,13 +1214,9 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
 
 
 def test_preference_config_subclasses_record_explicit_warmup_steps():
-    # Regression: MLXORPOConfig / MLXDPOConfig were plain @dataclass subclasses,
-    # so Python generated a fresh __init__ that bypassed
-    # MLXTrainingConfig.__init__ and never set
-    # _unsloth_mlx_warmup_steps_explicit. An explicit warmup_steps equal to the
-    # default alongside a positive warmup_ratio was then treated as implicit,
-    # silently switching to the ratio schedule for these new trainers.
-    # @dataclass(init=False) keeps the shared base initializer.
+    # Regression: plain @dataclass subclasses generated an __init__ that
+    # bypassed MLXTrainingConfig.__init__, so an explicit warmup_steps equal to
+    # the default was read as implicit. init=False keeps the base initializer.
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer,
         MLXDPOConfig,
@@ -3704,11 +3700,8 @@ def _build_fast_tokenizer(eos="<eos>"):
 
 
 def test_preference_tokenizer_keeps_public_hf_fast_tokenizer_api():
-    # Regression: create_preference_batches used getattr(tok, "_tokenizer", tok),
-    # which unwraps a plain PreTrainedTokenizerFast to its low-level Rust
-    # tokenizers.Tokenizer (no eos_token_id; encode returns an Encoding), so
-    # ORPO/DPO batching crashed before training. _hf_encoding_tokenizer must
-    # only unwrap non-HF wrappers (mlx-lm's TokenizerWrapper).
+    # Regression: unwrapping _tokenizer turned a PreTrainedTokenizerFast into the
+    # Rust tokenizer (no eos_token_id). Only non-HF wrappers may be unwrapped.
     from unsloth_zoo.mlx.utils import _hf_encoding_tokenizer
 
     ptf = _build_fast_tokenizer()
@@ -3728,14 +3721,8 @@ def test_preference_tokenizer_keeps_public_hf_fast_tokenizer_api():
 
 
 def test_preference_batches_render_conversational_rows_through_chat_template():
-    # TRL DPO/ORPO accept conversational (message-list) preference rows and
-    # normalize them via maybe_apply_chat_template (trl/data_utils.py:
-    # apply_chat_template renders prompt / prompt+chosen / prompt+rejected as
-    # strings, add_generation_prompt when the last prompt role is 'user'). The
-    # MLX builder must render message-list prompt/chosen/rejected through the chat
-    # template before encoding; string-concatenating and encoding the raw lists
-    # would crash (a list has no .startswith, and encode rejects a list of dicts),
-    # so common conversational preference datasets would fail before training.
+    # TRL normalizes conversational rows via maybe_apply_chat_template; encoding
+    # raw message lists would crash (no .startswith, encode rejects dicts).
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _Tok:
@@ -3803,12 +3790,8 @@ def test_create_preference_batches_runs_with_plain_fast_tokenizer():
 
 
 def test_preference_tokenizer_avoids_double_bos_on_rendered_prompt():
-    # Regression: create_preference_batches tokenized prompt/chosen/rejected with
-    # raw hf.encode(...), whose default add_special_tokens=True prepends a BOS.
-    # For a prompt already rendered with the chat template's leading BOS this
-    # produced a SECOND BOS. The SFT path guards against this via encode_mlx_text
-    # (double-BOS guard), so ORPO/DPO must go through the same encoder to emit the
-    # same ids for identical rendered text.
+    # Regression: raw hf.encode added a second BOS to a template-rendered prompt.
+    # Must go through encode_mlx_text like the SFT path.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     BOS_ID = 100
@@ -3848,11 +3831,8 @@ def test_preference_tokenizer_avoids_double_bos_on_rendered_prompt():
 
 
 def test_preference_long_prompt_preserves_response_span():
-    # Regression: create_preference_batches right-truncated the concatenated
-    # prompt+completion to max_seq_length. For a prompt near/over max_seq_length
-    # that dropped the response tail, so [response_start, seq_end) was empty and
-    # ORPO/DPO got no preference signal for the pair. Truncation must preserve
-    # the response (truncate the prompt side, TRL keep_end).
+    # Regression: right-truncation dropped the response tail on long prompts,
+    # leaving an empty loss span. Truncate the prompt side (TRL keep_end).
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     EOS_ID = 500
@@ -3902,11 +3882,8 @@ def test_preference_long_prompt_preserves_response_span():
 
 
 def test_preference_padding_capped_at_max_seq_length():
-    # When max_seq_length is not a multiple of pad_to_multiple, rows are truncated
-    # to max_seq_length but rounding the batch pad length Lmax up to the multiple
-    # would overshoot the cap (e.g. a 50-token row rounds to 64), making ORPO/DPO
-    # forwards process sequences past the configured limit. Lmax must be capped
-    # back to max_seq_length, matching the text batching path.
+    # Rounding Lmax up to pad_to_multiple can overshoot max_seq_length (50 -> 64)
+    # and forward past the cap; it must be capped back.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _WordTokenizer:
@@ -3946,14 +3923,9 @@ def test_common_prefix_len_locates_prompt_boundary():
 
 
 def test_preference_boundary_excludes_prompt_only_eos():
-    # Regression: a tokenizer configured to append EOS during encode
-    # (add_special_tokens=True, e.g. a LLaMA tokenizer loaded with
-    # add_eos_token=True) makes the standalone prompt ids end with a prompt-only
-    # EOS that is not present at the prompt/completion seam of
-    # encode(prompt + completion). The old min(len) boundary then sat one token
-    # PAST the true boundary, so the ORPO/DPO loss mask dropped the first
-    # completion token (and for a one-token completion scored only EOS). The
-    # boundary must be the shared prompt prefix, excluding the prompt-only EOS.
+    # Regression: with add_eos_token=True the prompt ids end in a prompt-only EOS
+    # absent at the seam, so min(len) sat one token past the true boundary and
+    # masked the first completion token. Use the shared prompt prefix.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     EOS_ID = 999
@@ -4028,14 +4000,9 @@ def test_preference_boundary_common_prefix_is_noop_without_prompt_eos():
 
 
 def test_preference_torch_randperm_reshuffles_batches_each_epoch():
-    # Regression (EPOCH-PERMUTATIONS): epoch-based preference runs (max_steps<=0,
-    # num_train_epochs>1) call create_preference_batches with num_batches=None, so
-    # without num_epochs it materialized ONE torch_randperm pass and the training
-    # loop (batches[i % len]) replayed that identical order every epoch -- the same
-    # bias the step-based per-pass reshuffle addressed, and divergent from the SFT
-    # create_ordered_batches path that reseeds torch_randperm per epoch. Threading
-    # num_epochs must materialize a freshly reseeded (base_seed + epoch)
-    # permutation per epoch while keeping epoch 0 byte-identical to the single pass.
+    # Regression: epoch-based runs pass num_batches=None, so without num_epochs
+    # one permutation was replayed every epoch. Reseed per epoch (base_seed +
+    # epoch) while keeping epoch 0 byte-identical to the single pass.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _RowTokenizer:
@@ -4091,12 +4058,9 @@ def test_preference_torch_randperm_reshuffles_batches_each_epoch():
 
 
 def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypatch):
-    # Regression (EPOCH-PERMUTATIONS wiring): _prepare_data must thread
-    # num_epochs into create_preference_batches for epoch-based torch_randperm
-    # preference runs (max_steps<=0, num_train_epochs>0), and flag
-    # _prepared_batches_include_epochs so total_steps uses n_batches // grad_accum
-    # over the already-epoch-expanded list. Step-based and non-random orders stay
-    # single-pass (num_epochs=None).
+    # Regression: _prepare_data must thread num_epochs for epoch-based
+    # torch_randperm runs and flag _prepared_batches_include_epochs so
+    # total_steps divides the already-expanded list.
     from unsloth_zoo.mlx import trainer as mlx_trainer
 
     captured = {}
@@ -4154,12 +4118,8 @@ def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypat
 
 
 def test_dpo_reference_collects_nested_lora_modules():
-    # Regression: the DPO reference collected adapters with
-    #   tree_flatten(model, is_leaf=lambda x: isinstance(x, LoRALinear)),
-    # but tree_flatten only recurses dict/list/tuple, so a bare nn.Module is a
-    # single leaf and nested adapters are never reached -> _lora_mods empty ->
-    # make_dpo_loss_fn raises "model has none". iter_mlx_lora_modules walks the
-    # module tree instead.
+    # Regression: tree_flatten treats a bare nn.Module as one leaf, so nested
+    # adapters were never reached and _lora_mods came back empty.
     import mlx.nn as nn
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
@@ -4191,15 +4151,9 @@ def test_dpo_reference_collects_nested_lora_modules():
 
 
 def test_preference_disable_lora_dropout_neutralizes_adapter_dropout():
-    # Regression (DROPOUT-PREFERENCE): TRL's DPOConfig/ORPOConfig default
-    # disable_dropout=True and call disable_dropout_in_model
-    # (trl/trainer/dpo_trainer.py:378-381, orpo_trainer.py:302-303), so preference
-    # log-prob forwards are DETERMINISTIC. mlx-lm's LoRALinear applies
-    # self.dropout(x) before the low-rank matmul, and the MLX preference loss runs
-    # under model.train(); a nonzero lora_dropout (get_peft_model(..., lora_dropout=)
-    # is a reachable common setting) would make the POLICY log-probs stochastic and
-    # diverge from TRL. _mlx_disable_lora_dropout must replace every adapter's
-    # dropout with a deterministic identity (lora_dropout=0 stays a no-op).
+    # Regression: TRL defaults disable_dropout=True, so preference forwards are
+    # deterministic. LoRALinear applies dropout before the low-rank matmul and
+    # the loss runs under train(), so nonzero lora_dropout diverged from TRL.
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
     from unsloth_zoo.mlx.utils import _get_mlx_dropout_probability
@@ -4266,14 +4220,8 @@ def test_preference_setup_disables_dropout_for_orpo_and_dpo():
 
 
 def test_preference_disable_dropout_neutralizes_base_model_dropout():
-    # Regression (ALL-MODEL-DROPOUT): TRL's disable_dropout_in_model
-    # (trl/trainer/utils.py) zeroes EVERY nn.Dropout in the model tree, not just
-    # the adapters, so the DPO/ORPO log-prob forwards are deterministic under
-    # disable_dropout=True. _mlx_disable_lora_dropout neutralizes the LoRA adapter
-    # dropout AND must walk the whole module tree to neutralize any base-model
-    # dropout (e.g. residual/attention dropout) in place, matching TRL exactly.
-    # mlx-lm base transformers ship no dropout today, so for common models this is
-    # a safe no-op superset; the walk keeps it correct for one that does.
+    # Regression: TRL zeroes EVERY nn.Dropout, not just adapters, so the walk must
+    # cover base-model dropout too. A no-op superset on today's mlx-lm models.
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout
     from unsloth_zoo.mlx.utils import _get_mlx_dropout_probability
@@ -4313,16 +4261,9 @@ def test_preference_disable_dropout_neutralizes_base_model_dropout():
 
 
 def test_preference_disable_dropout_preserves_saved_lora_dropout_metadata():
-    # Regression (DROPOUT-METADATA): _mlx_disable_lora_dropout replaces each
-    # adapter's dropout with _mlx_identity to make the ORPO/DPO forward
-    # deterministic. That runs at setup, BEFORE save_model, and permanently
-    # mutates the live module -- so the save path (_extract_mlx_lora_parameters /
-    # save_model / _enrich_mlx_adapter_config), which reads lora_dropout back off
-    # the live module, would record dropout=0.0 in adapter_config.json for a run
-    # trained with nonzero lora_dropout, and the reloaded adapter would no longer
-    # match the original LoRA config. The disable must stash the configured
-    # probability first so the forward stays deterministic AND the saved metadata
-    # stays correct.
+    # Regression: the identity swap runs before save_model and mutates the live
+    # module, so the save path would record dropout=0.0 for a run trained with
+    # nonzero dropout. Stash the probability first.
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import _mlx_disable_lora_dropout, _mlx_identity
     from unsloth_zoo.mlx.utils import (
@@ -4428,10 +4369,8 @@ def _patch_per_token_ce(monkeypatch):
 
 
 def test_dpo_loss_returns_pair_count_not_token_count(monkeypatch):
-    # Regression: DPO is a mean over PAIRS, so the accumulate-then-normalize
-    # trainer must weight each microbatch by its pair count. Returning the
-    # response-token count made long-completion microbatches dominate and broke
-    # equivalence with a single batch under gradient_accumulation_steps > 1.
+    # Regression: DPO is a mean over PAIRS; returning the token count let
+    # long-completion microbatches dominate under grad accumulation.
     from unsloth_zoo.mlx.utils import make_dpo_loss_fn
 
     _patch_per_token_ce(monkeypatch)
@@ -4452,16 +4391,12 @@ def test_orpo_loss_returns_pair_count_not_token_count(monkeypatch):
 
 
 def test_orpo_nll_covers_full_prompt_and_response(monkeypatch):
-    # Regression (ORPO-NLL parity): TRL 0.25.1 computes the ORPO chosen_nll_loss
-    # over the FULL prompt+response for decoder-only models. concatenated_forward
-    # builds its NLL labels from concatenated_input_ids masked ONLY by the
-    # attention_mask (padding), NOT by the prompt/response boundary
-    # (orpo_trainer.py:780-785, comment: "orpo chosen nll loss is computed over the
-    # full prompt and response"). Only the odds-ratio logps use the prompt-masked
-    # concatenated_labels via get_batch_logps. So the MLX SFT/NLL term must span
-    # prompt+response (all non-pad chosen tokens); masking it to the response span
-    # would DIVERGE from TRL. Pin the full-span behavior so it cannot regress to a
-    # response-only mask.
+    # Regression: TRL computes the ORPO chosen_nll_loss over the FULL
+    # prompt+response, masked ONLY by attention_mask, not by the prompt/response
+    # boundary -- orpo_trainer.py:780-785: "orpo chosen nll loss is computed over
+    # the full prompt and response". Only the odds-ratio logps use the
+    # prompt-masked labels. Masking the SFT term to the response span would
+    # DIVERGE from TRL; pin the full span so it cannot regress.
     import mlx.core as mx
     import mlx.nn as nn
     from unsloth_zoo.mlx.utils import make_orpo_loss_fn
@@ -4496,15 +4431,9 @@ def test_orpo_nll_covers_full_prompt_and_response(monkeypatch):
 
 
 def test_preference_torch_randperm_reshuffles_across_passes():
-    # Regression (TORCH-RANDPERM-RESHUFFLE): dataset_order="torch_randperm" mirrors
-    # CUDA's RandomSampler, which reshuffles every epoch, and the text path
-    # create_ordered_batches reseeds its torch_randperm order per epoch
-    # (_torch_randperm_order(..., base_seed + epoch)). The preference path built a
-    # SINGLE seeded permutation; when num_batches spans more than one pass the
-    # trainer modulo-cycles the returned list (batches[batch_idx % len]) and
-    # replayed the SAME "random" order every epoch. It must instead redraw a fresh
-    # per-pass permutation up to num_batches -- like the default-order fix and the
-    # text path -- while keeping the first sub-epoch byte-identical.
+    # Regression: torch_randperm mirrors CUDA's RandomSampler, which reshuffles
+    # every epoch; a single permutation was replayed once num_batches spanned
+    # more than one pass. Redraw per pass, first sub-epoch unchanged.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _Tok:
@@ -4550,11 +4479,8 @@ def test_preference_torch_randperm_reshuffles_across_passes():
 
 
 def test_dpo_reference_guard_rejects_dora_adapters():
-    # DPO obtains the reference by zeroing the LoRA scale, but a DoRA layer still
-    # applies its trainable magnitude m/||W|| (initialized to ||W|| but drifting as
-    # m trains), so the reference would no longer be the frozen base and the DPO
-    # gradient would be wrong. The setup must reject DoRA for referenced (not
-    # reference_free) DPO before building the loss, gated so plain LoRA is untouched.
+    # Zeroing the LoRA scale still leaves DoRA's trainable magnitude applied, so
+    # the reference is not the frozen base. Reject DoRA for referenced DPO.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -4571,14 +4497,9 @@ def test_dpo_reference_guard_rejects_dora_adapters():
 
 
 def test_dpo_reference_disables_neftune_noise(monkeypatch):
-    # Regression: NEFTune adds fresh random noise to the input embeddings whenever
-    # the module is training, and the DPO loop keeps the model in train() for BOTH
-    # forwards. The reference (adapters-off) forward only zeroes the LoRA scales,
-    # so without an explicit disable it compared the policy against a SECOND noisy
-    # base-model pass -- the DPO reward then carried random NEFTune noise instead
-    # of the frozen reference logps (TRL computes the reference clean). The
-    # reference forward must silence the wrapped embedding, keep the policy
-    # forward noisy, and restore the flag afterwards.
+    # Regression: the DPO loop keeps train() for both forwards, so the reference
+    # compared against a SECOND noisy pass. It must silence the embedding, keep
+    # the policy noisy, and restore the flag.
     from unsloth_zoo.mlx.utils import make_dpo_loss_fn
 
     class _NeftuneEmbed:
@@ -4629,12 +4550,9 @@ def test_dpo_reference_disables_neftune_noise(monkeypatch):
 
 
 def test_neftune_noise_disable_flag_shared_across_reference_pass():
-    # The clean-reference contract spans two files: trainer.py's _NEFTuneEmbed
-    # must gate its noise on `_neftune_noise_enabled` (not `training` alone),
-    # _train_inner must hand the wrapped embedding to make_dpo_loss_fn via
-    # `neftune_mods`, and make_dpo_loss_fn must flip that flag off for the
-    # reference forward. Pin all three so a rename in one file cannot silently
-    # re-introduce reference-side NEFTune noise.
+    # The contract spans two files: _NEFTuneEmbed gates on _neftune_noise_enabled,
+    # _train_inner passes neftune_mods, and make_dpo_loss_fn flips the flag. Pin
+    # all three so a rename cannot re-introduce reference-side noise.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
     from unsloth_zoo.mlx.utils import make_dpo_loss_fn
@@ -4653,13 +4571,8 @@ def test_neftune_noise_disable_flag_shared_across_reference_pass():
 
 
 def test_preference_default_order_truncation_samples_across_lengths():
-    # Regression: create_preference_batches length-sorted rows (default order) then
-    # truncated to the first num_batches (= max_steps * grad_accum), so a
-    # step-limited ORPO/DPO run trained only on the SHORTEST pairs and silently
-    # ignored the rest of the dataset. The text/SFT path avoids this bias by
-    # shuffling batch order before truncating (mlx_lm.iterate_batches, via
-    # create_batches loop=(num_batches is not None)); the preference path must
-    # likewise sample across the length distribution.
+    # Regression: length-sort then truncate to num_batches trained only the
+    # SHORTEST pairs. Must sample across the length distribution.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _LenTokenizer:
@@ -4739,18 +4652,9 @@ class _RecordingChatTemplateTokenizer:
 
 
 def test_preference_conversational_render_threads_tools_and_template_kwargs():
-    # Regression (CHAT-TEMPLATE-KWARGS): _render_preference_example rendered
-    # conversational preference rows through apply_chat_template but DROPPED the
-    # per-row `tools` schema and `chat_template_kwargs`. TRL's apply_chat_template
-    # threads both into every render of a preference row (prompt, prompt+chosen,
-    # prompt+rejected -- trl/data_utils.py: tools=tools,
-    # **example.get("chat_template_kwargs", {})), and this codebase's SFT
-    # conversational path threads the same per-row fields
-    # (_tokenize_mlx_conversational_prompt_completion). Dropping them makes a
-    # tool/function-calling template render WITHOUT its tool block (or raise) and
-    # ignores a per-row template knob (e.g. Qwen3 enable_thinking), so ORPO/DPO
-    # trains on different text than SFT/TRL for the identical row. The builder
-    # must thread ex-level tools / chat_template_kwargs into all three renders.
+    # Regression: per-row `tools` / `chat_template_kwargs` were dropped, so a
+    # tool template rendered without its tool block and per-row knobs (Qwen3
+    # enable_thinking) were ignored. Thread both into all three renders.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     tools = [{"type": "function", "function": {"name": "get_weather"}}]
@@ -4790,13 +4694,8 @@ def test_preference_conversational_render_threads_tools_and_template_kwargs():
 
 
 def test_preference_step_run_reshuffles_batch_order_each_pass():
-    # Regression (EPOCH-LOOP-BATCHES): create_preference_batches built ONE
-    # length-sorted pass of `starts`; when num_batches (= max_steps * grad_accum)
-    # spans MORE than one pass, the trainer modulo-cycles that fixed list
-    # (batches[batch_idx % len(batches)]), repeating the SAME short->long order
-    # every epoch -- unlike the SFT path, which reshuffles per epoch via
-    # mlx_lm.iterate_batches(loop=True). The default-order builder must emit a
-    # fresh permutation per pass up to num_batches so each cycled epoch differs.
+    # Regression: one length-sorted pass was modulo-cycled, repeating the same
+    # short->long order every epoch. Emit a fresh permutation per pass.
     from unsloth_zoo.mlx.utils import create_preference_batches
 
     class _LenTokenizer:
@@ -4842,14 +4741,9 @@ def test_preference_step_run_reshuffles_batch_order_each_pass():
 
 
 def test_preference_loss_rejects_prebuilt_sft_labeled_batches():
-    # Regression: train_on_responses_only pre-populates trainer._batches with SFT
-    # (input_ids, lengths, labels) rows. _prepare_data returned those before the
-    # ORPO/DPO preference branch, so the preference loss -- which ignores labels and
-    # reads B = batch.shape[0] // 2 as pairs -- silently paired unrelated rows and
-    # optimized the wrong objective, also bypassing create_preference_batches'
-    # prompt/chosen/rejected column validation. _prepare_data must reject prebuilt
-    # SFT-labeled batches for orpo/dpo while still accepting preference-layout
-    # (labels=None) prebuilt batches.
+    # Regression: prebuilt SFT (input_ids, lengths, labels) batches reached the
+    # preference loss, which reads B = shape[0] // 2 and paired unrelated rows.
+    # Reject labeled prebuilt batches; preference ones use labels=None.
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -4901,14 +4795,8 @@ def _pin_distributed(trainer, world_size):
 
 
 def test_preference_distributed_ddp_fails_fast_instead_of_duplicating():
-    # Regression (DDP-SHARD): create_preference_batches takes no comm_group/rank
-    # argument, so under MLX DDP (world_size>1) every rank builds the SAME sorted
-    # preference batches and _apply_update all-reduces DUPLICATE gradients --
-    # effectively single-rank training on identical data (and, under a max_steps
-    # random-subset cap, the same reduced subset on every rank) with inflated
-    # pair/step logging. The SFT/VLM paths thread comm_group through and rank-slice,
-    # so multi-rank IS a real path here. Until the preference builder is sharded,
-    # _prepare_data must fail fast rather than silently mistrain.
+    # Regression: with no comm_group every rank builds identical batches and
+    # all-reduces duplicate gradients. Fail fast until the builder is sharded.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     for loss_type in ("orpo", "dpo"):
@@ -4921,13 +4809,9 @@ def test_preference_distributed_ddp_fails_fast_instead_of_duplicating():
 
 
 def test_preference_streaming_fails_fast_instead_of_materializing():
-    # Regression (STREAMING): args.streaming is honored on the SFT/VLM paths
-    # (they return a bounded iterator via iterate_training_batches /
-    # iterate_vlm_training_batches that stops at max_steps), but the ORPO/DPO
-    # branch always calls create_preference_batches, which consumes the ENTIRE
-    # dataset before honoring num_batches. On an unbounded IterableDataset that
-    # hangs or OOMs instead of taking max_steps, so _prepare_data must reject
-    # streaming for orpo/dpo rather than silently materialize the stream.
+    # Regression: the SFT/VLM paths return a bounded iterator, but
+    # create_preference_batches consumes the entire dataset, so an unbounded
+    # stream hangs or OOMs. Reject streaming for orpo/dpo.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     for loss_type in ("orpo", "dpo"):
@@ -4940,11 +4824,8 @@ def test_preference_streaming_fails_fast_instead_of_materializing():
 
 
 def test_unknown_loss_type_rejected_before_batching():
-    # Regression (UNKNOWN-LOSS-TYPE): only "sft"/"orpo"/"dpo" are implemented on
-    # MLX. Any other value falls through the loss selection AND the preference
-    # branch to the SFT/CCE path, so a misconfigured preference run (a typo, or a
-    # real TRL DPO loss like "ipo"/"sigmoid"/"hinge" not implemented here) would
-    # silently optimize plain cross-entropy. _prepare_data must fail fast.
+    # Regression: any other loss_type falls through to SFT/CCE, so a typo or an
+    # unimplemented TRL loss ("ipo"/"hinge") would silently train cross-entropy.
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     for bad in ("ipo", "sigmoid", "hinge", "kto", "dppo"):
