@@ -34,6 +34,7 @@ because it writes something wrong rather than nothing. Every test here monkeypat
 the two Hub entry points, so nothing touches the network.
 """
 
+import json
 import os
 
 import huggingface_hub
@@ -46,6 +47,7 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
 )
 
+from huggingface_hub.utils import validate_repo_id
 from unsloth_zoo import saving_utils
 
 
@@ -420,3 +422,48 @@ def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch)
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
 
     assert saving_utils.check_hf_model_exists("ns/disabled") is False
+
+
+# The Hub API takes a repo id and a revision, not every address `ls` accepts.
+
+@pytest.mark.parametrize("given, expected_repo, expected_revision", [
+    pytest.param("ns/name",           "ns/name", None,  id = "plain"),
+    pytest.param("hf://ns/name",      "ns/name", None,  id = "uri"),
+    pytest.param("ns/name@dev",       "ns/name", "dev", id = "revision"),
+    pytest.param("hf://ns/name@dev",  "ns/name", "dev", id = "uri-and-revision"),
+])
+def test_the_download_is_addressed_as_a_repo_and_a_revision(
+    monkeypatch, given, expected_repo, expected_revision,
+):
+    """`hf_hub_download` answers HFValidationError for `hf://ns/name` and `ns/name@dev`, and
+    this function's absent set reads that as "no quantization config", so an nf4 base came
+    back unquantized and the 16bit guard never fired. These are the addresses
+    `_is_hub_repo_id` accepts, so the download has to be given them in the form it takes."""
+    seen = {}
+
+    def fake_download(*args, **kwargs):
+        seen.update(kwargs)
+        # Built through the helper: `response` is required on 1.x for some of these classes.
+        raise _hub_error(EntryNotFoundError, "no config.json")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download, raising = True)
+
+    saving_utils.check_model_quantization_status(given)
+    assert seen.get("repo_id") == expected_repo
+    assert seen.get("revision") == expected_revision
+
+
+def test_a_quantized_base_behind_a_uri_is_not_reported_unquantized(monkeypatch, tmp_path):
+    """The consequence, end to end at this function: the address must not decide the answer."""
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"quantization_config": {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}}),
+        encoding = "utf-8",
+    )
+    def fake_download(*args, **kwargs):
+        # What the real one does with anything that is not a bare repo id.
+        validate_repo_id(kwargs["repo_id"])
+        return str(config)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download, raising = True)
+
+    for given in ("ns/name", "hf://ns/name", "ns/name@dev"):
+        assert saving_utils.check_model_quantization_status(given) == (True, "nf4"), given

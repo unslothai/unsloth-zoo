@@ -303,6 +303,43 @@ def test_shards_that_disagree_on_the_total_are_not_complete(tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
+def test_an_index_naming_one_shard_of_five_is_not_complete(monkeypatch, tmp_path):
+    """A stale or half rebuilt index can name a single shard whose own filename says four
+    more belong to it. Every file the index names exists, and the snapshot is still partial,
+    so the names it gives are checked as names too."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    _shard(directory, "model-00001-of-00005.safetensors")
+    _write_index(directory, ["model-00001-of-00005.safetensors"])
+
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+    _hub_raises(monkeypatch, ConnectionError("dns failure"))
+    with pytest.raises(RuntimeError):
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+
+
+def test_an_index_over_a_whole_set_is_complete(monkeypatch, tmp_path):
+    """The complement, so the name check cannot quietly refuse well formed snapshots."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for shard in shards: _shard(directory, shard)
+    _write_index(directory, shards)
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
+def test_an_index_may_carry_paths_rather_than_bare_names(tmp_path):
+    """`weight_map` values are compared as basenames, the way the merge's own stale shard
+    filter compares them."""
+    directory = str(tmp_path)
+    open(os.path.join(directory, "model-00001-of-00001.safetensors"), "wb").close()
+    with open(os.path.join(directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
+        json.dump({"weight_map": {"a.weight": "./model-00001-of-00001.safetensors"}}, f)
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
 def test_shards_from_different_sets_do_not_complete_each_other(tmp_path):
     """One shard of `model` and one stale shard of `backup` declare the same total and are
     not the same set, so `model-00002-of-00002` is still missing."""

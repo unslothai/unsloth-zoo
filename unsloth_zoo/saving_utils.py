@@ -4587,6 +4587,22 @@ def _as_hub_addressed(model_name):
 pass
 
 
+def _hub_repo_and_revision(model_name):
+    """`hf://models/org/name@dev` as the Hub API wants it: `("org/name", "dev")`.
+
+    Defers to `_as_hub_addressed` for the repo id, so whether an `@` is a revision or part
+    of a directory name is decided in one place. When that decision was "part of the name",
+    the `@` is still in the answer and there is no revision to report.
+    """
+    repo_id = _as_hub_addressed(model_name)
+    if "@" in repo_id:
+        return repo_id, None
+    name = str(model_name)
+    if name.startswith("hf://"): name = name[len("hf://"):]
+    revision = name.partition("@")[2] if "@" in name else ""
+    return repo_id, (revision or None)
+pass
+
 def _is_single_segment_id_rejection(model_name, e):
     """True only for "this version cannot address a single segment id".
 
@@ -4924,13 +4940,20 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
         # response mid-download. Split, the download is classified as a Hub operation
         # and the parse as a local one.
         from huggingface_hub import hf_hub_download
+        # `hf_hub_download` takes a repo id and a revision, not the addresses `ls` accepts:
+        # it answers HFValidationError for `hf://org/name`, `org/name@dev` and
+        # `hf://models/org/name`, which this function's absent set then reads as "no
+        # quantization config", so a quantized base came back unquantized. Split the name
+        # the same way `_is_hub_repo_id` decided it was a repo, so the two cannot disagree.
+        repo_id, revision = _hub_repo_and_revision(model_name_or_path)
         config_path = None
         try:
             config_path = hf_hub_download(
-                repo_id = model_name_or_path,
+                repo_id = repo_id,
                 filename = "config.json",
                 cache_dir = None,
-                token = token
+                token = token,
+                revision = revision,
             )
         except _HUB_DOWNLOAD_UNREACHABLE_ERRORS as e:
             # Must precede the absent set, which would swallow it via
@@ -5081,31 +5104,43 @@ def _local_snapshot_is_complete(local_path):
         try:
             with open(index_path, encoding = "utf-8") as f:
                 weight_map = json.load(f).get("weight_map", {})
-            shards = set(weight_map.values())
+            shards = {os.path.split(v)[-1] for v in weight_map.values()}
         except Exception:
             return False
         if not shards: return False
-        return all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards)
+        if not all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards):
+            return False
+        # An index can itself be stale or half rebuilt: one naming
+        # `model-00001-of-00005.safetensors` and nothing else is answered by the name, which
+        # says four more belong to that set. So the names it gives are checked as names too.
+        return _shard_sets_are_whole(shards)
 
     try:
         entries = os.listdir(local_path)
     except OSError:
         return False
+    # With no index the merge cannot filter, so what is in the directory is what it reads.
+    return _shard_sets_are_whole(entries)
+pass
+
+def _shard_sets_are_whole(names):
+    """Does every `-NNNNN-of-NNNNN` set among these names have all of its parts?
+
+    Grouped by set, not by total: `model-00001-of-00002` beside a stale
+    `backup-00002-of-00002` is one shard of each, not both shards of one.
+
+    Every set has to be whole, not just one of them. The merge enumerates every top-level
+    `.safetensors` in the directory (`saving_utils.py`, the local branch of
+    `merge_and_overwrite_lora`) and drops stale shards only against an index, so a leftover
+    partial set is read too, and mismatched shapes are the "Bad in-place call" that filter
+    exists for. Names with no shard numbering are the single file case.
+    """
     seen_by_set = {}
-    for entry in entries:
-        match = _SHARD_NAME.match(entry)
+    for name in names:
+        match = _SHARD_NAME.match(name)
         if match is None: continue
         prefix, part, total = match.group(1), int(match.group(2)), int(match.group(3))
         seen_by_set.setdefault((prefix, total), set()).add(part)
-    if not seen_by_set: return True                      # a single file snapshot
-    # Grouped by set, not by total: `model-00001-of-00002` plus a stale
-    # `backup-00002-of-00002` is one shard of each, not both shards of one.
-    #
-    # Every set has to be whole, not just one of them. The merge enumerates every
-    # top-level `.safetensors` in the directory (`[f for f in os.listdir(model_name) if
-    # f.endswith(".safetensors")]`) and filters stale shards only against an index, so
-    # with no index a leftover partial set is not something it can skip: it gets read,
-    # and mismatched shapes are the "Bad in-place call" the filter below exists for.
     return all(
         seen == set(range(1, total + 1))
         for (_prefix, total), seen in seen_by_set.items()
