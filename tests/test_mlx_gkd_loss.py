@@ -16,13 +16,9 @@
 
 """Numerics for the GKD divergence: does the student actually move to the teacher?
 
-Behaviour over steps, not construction. Every training assertion also reports a
-divergence-to-teacher number, because a loss can fall while the student drifts
-away from the target (reverse KL does exactly that to forward KL).
-
-Real MLX required, so this skips on Linux; the guard/config/preflight half runs
-under the torch shim in test_mlx_gkd_guards.py. Synthetic tensors only -- no
-weights, no network, no Dataset.map.
+Every training assertion also reports a divergence-to-teacher number, because a
+loss can fall while the student drifts away from the target (reverse KL does
+exactly that to forward KL). Real MLX required, so this skips on Linux.
 """
 
 import pytest
@@ -69,7 +65,6 @@ def _new_student():
 
 
 def _masked_divergence(student_logits, teacher_logits, labels, direction):
-    """KL to the teacher on supervised positions only."""
     student_lp = nn.log_softmax(student_logits, axis=-1)
     teacher_lp = nn.log_softmax(teacher_logits, axis=-1)
     if direction == "forward":       # KL(teacher || student)
@@ -98,7 +93,7 @@ def _train(student, teacher_logits, ids, labels, beta, steps=STEPS, chunk_size=D
 
 @pytest.mark.parametrize("beta,direction", [(0.0, "forward"), (0.5, "forward"), (1.0, "reverse")])
 def test_student_moves_toward_teacher(beta, direction):
-    """Loss falls AND the corresponding divergence to the teacher falls."""
+    """Loss falls AND the divergence to the teacher falls."""
     teacher_logits, labels, ids = _fixture()
     student = _new_student()
     before = _masked_divergence(student(ids), teacher_logits, labels, direction)
@@ -116,7 +111,7 @@ def test_student_moves_toward_teacher(beta, direction):
 
 
 def test_chunked_matches_unchunked_numerically():
-    """Chunking is the default, so it must be exactly the naive computation."""
+    """Chunking is the default, so it must match the naive computation."""
     teacher_logits, labels, ids = _fixture()
     student = _new_student()
     logits = student(ids)
@@ -131,7 +126,7 @@ def test_chunked_matches_unchunked_numerically():
 
 
 def test_chunked_and_unchunked_train_identically():
-    """Equal values are not enough -- the gradients must agree too."""
+    """Gradients must agree too, not just values."""
     teacher_logits, labels, ids = _fixture()
     naive = _train(_new_student(), teacher_logits, ids, labels, 0.5, chunk_size=0)
     chunked = _train(_new_student(), teacher_logits, ids, labels, 0.5, chunk_size=8)
@@ -182,7 +177,6 @@ def test_beta_endpoints_are_asymmetric():
 
 
 def test_loss_survives_mx_compile():
-    """MLXTrainer compiles the step with inputs=state, outputs=state."""
     teacher_logits, labels, ids = _fixture()
 
     def run(compiled):

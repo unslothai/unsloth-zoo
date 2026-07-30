@@ -16,15 +16,10 @@
 
 """GKD guards: tokenizer compatibility, config validation, memory preflight.
 
-Pure logic and arithmetic, so this runs under the torch shim on Linux CI instead
-of skipping. The numeric behaviour of the divergence lives in
-test_mlx_gkd_loss.py, which needs real MLX and runs on Apple Silicon.
-
-The preflight numbers below are the measured ones from a Qwen2.5-0.5B LoRA
-student with a Qwen2.5-3B teacher (vocab 151936, 2.881 GB resident) on a 16 GB
-machine. They matter because an oversized step does not raise a catchable OOM --
-it aborts with "[METAL] Command buffer execution failed: Impacting
-Interactivity" and wedges the GPU context.
+Pure logic, so this runs under the torch shim on Linux CI instead of skipping.
+The preflight numbers are measured on a Qwen2.5-0.5B student + Qwen2.5-3B teacher
+(vocab 151936, 2.881 GB resident) on a 16 GB machine: an oversized step aborts
+with "[METAL] Command buffer execution failed" and wedges the GPU context.
 """
 
 import pytest
@@ -47,7 +42,6 @@ def _distill():
 
 
 class FakeTokenizer:
-    """Encodes by a per-instance rule so probe agreement can be controlled."""
 
     def __init__(self, offset=0):
         self.offset = offset
@@ -69,11 +63,7 @@ def test_width_mismatch_is_rejected():
 
 
 def test_width_matches_but_ids_differ_is_rejected():
-    """The silent-misalignment case: same vocab size, different encodings.
-
-    A width-only check would let this through and train the student against
-    targets that do not correspond to its own tokens, with no error.
-    """
+    """Same vocab size, different encodings: a width-only check misses this."""
     d = _distill()
     with pytest.raises(ValueError, match="encode text differently"):
         d.assert_tokenizers_compatible(FakeTokenizer(0), FakeTokenizer(1), VOCAB, VOCAB)
@@ -105,28 +95,27 @@ def test_non_positive_temperature_rejected(temperature):
 
 
 def test_on_policy_lmbda_rejected_with_reason():
-    """Off-policy only: on-policy needs generation in the training loop, which
-    the MLX trainer does not have."""
+    """On-policy needs generation in the loop, which the MLX trainer lacks."""
     with pytest.raises(ValueError, match="generation inside the training loop"):
         _distill().validate_gkd_config(0.5, 1.0, 0.5)
 
 
 # --- memory preflight --------------------------------------------------------
 def test_preflight_allows_batch2_seq512():
-    """Measured 10.16 GB on a 16 GB machine -- must not be rejected."""
+    """Measured 10.16 GB on 16 GB: must not be rejected."""
     d = _distill()
     estimate = d.preflight_memory(2, 512, VOCAB, RESIDENT, SYSTEM_16GB, chunked=True)
     assert estimate < SYSTEM_16GB * d.MEMORY_SAFETY_FRACTION
 
 
 def test_preflight_rejects_batch4_seq512():
-    """Measured 17.16 GB -- over a 16 GB machine, wedges Metal if allowed."""
+    """Measured 17.16 GB: wedges Metal if allowed."""
     with pytest.raises(ValueError, match="does not fit in memory"):
         _distill().preflight_memory(4, 512, VOCAB, RESIDENT, SYSTEM_16GB, chunked=True)
 
 
 def test_preflight_rejects_batch2_seq1024_unchunked():
-    """Measured 17.39 GB unchunked -- the config that actually crashed."""
+    """Measured 17.39 GB unchunked: the config that crashed."""
     with pytest.raises(ValueError, match="does not fit in memory"):
         _distill().preflight_memory(2, 1024, VOCAB, RESIDENT, SYSTEM_16GB, chunked=False)
 
@@ -153,7 +142,7 @@ def test_chunked_is_cheaper_than_unchunked_in_the_estimate():
 
 
 def test_largest_tokens_that_fit_is_consistent_with_preflight():
-    """Whatever the message advertises as fitting must actually pass preflight."""
+    """What the message advertises as fitting must pass preflight."""
     d = _distill()
     budget = int(SYSTEM_16GB * d.MEMORY_SAFETY_FRACTION)
     max_tokens = d.largest_tokens_that_fit(VOCAB, RESIDENT, budget, chunked=True)
@@ -164,11 +153,7 @@ def test_largest_tokens_that_fit_is_consistent_with_preflight():
 
 
 def test_skip_override_bypasses_the_raise_and_warns():
-    """Refusing by default is right; refusing with no recourse is not.
-
-    The estimator reads total system memory and is deliberately conservative, so
-    a user who knows their configuration fits must be able to proceed -- loudly.
-    """
+    """The estimator is conservative, so an override must exist -- loudly."""
     d = _distill()
     with pytest.warns(UserWarning) as record:
         estimate = d.preflight_memory(
@@ -184,7 +169,7 @@ def test_skip_override_bypasses_the_raise_and_warns():
 
 
 def test_skip_override_does_not_warn_when_it_already_fits():
-    """No warning noise for a configuration that was never going to be refused."""
+    """No warning for a config that was never going to be refused."""
     import warnings
     d = _distill()
     with warnings.catch_warnings():

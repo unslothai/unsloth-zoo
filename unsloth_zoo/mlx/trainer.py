@@ -1152,18 +1152,14 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # Off-policy knowledge distillation (GKD). Setting teacher_model_name_or_path
-    # is what switches the loss; everything else is inert while it is None.
-    # Appended LAST for the same positional-index reason as the fields above, and
-    # listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix.
+    # GKD. teacher_model_name_or_path switches the loss; inert while None.
+    # Appended LAST for the positional-index reason as the fields above.
     teacher_model_name_or_path: str | None = None
     gkd_beta: float = 0.5          # 0 = forward KL (classic KD), 1 = reverse KL
     gkd_temperature: float = 1.0
     gkd_lmbda: float = 0.0         # non-zero selects on-policy KD: not supported
     gkd_chunk_size: int = 128      # sequence positions per loss chunk; 0 = unchunked
-    # Downgrade the memory preflight from a refusal to a warning. The estimator
-    # reads total system memory and is deliberately conservative, so it can
-    # reject a config that would have fit; this is the escape hatch.
+    # Escape hatch: the preflight is conservative and can reject a config that fits.
     gkd_skip_memory_preflight: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -4529,9 +4525,7 @@ class MLXTrainer:
         _vlm_ignore_token_ids = None
 
         if getattr(args, "teacher_model_name_or_path", None):
-            # Off-policy KD replaces the loss entirely, so branch before the
-            # CCE/baseline selection below. Implementation lives in distill.py;
-            # this hook stays one branch so it rebases cleanly.
+            # KD replaces the loss, so branch before the CCE/baseline selection.
             import psutil as _psutil
             from .distill import build_gkd_loss_fn, load_teacher, assert_tokenizers_compatible
             _teacher, _teacher_tok = load_teacher(args.teacher_model_name_or_path)
