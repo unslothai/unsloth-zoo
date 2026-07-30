@@ -361,14 +361,16 @@ def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
-def test_two_whole_sets_are_complete(tmp_path):
-    """Nothing partial is left for the merge to trip on, so this is not the half downloaded
-    case the check is about."""
+def test_two_whole_sets_are_ambiguous_rather_than_complete(tmp_path):
+    """Two complete sets are worse than one complete and one partial, because nothing fails.
+    Both carry the same tensor keys, the merge reads every top-level `.safetensors` and
+    regenerates the index from them, so each key ends up pointing at whichever file was
+    visited last and the export can quietly be the stale copy."""
     directory = str(tmp_path)
     for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
                   "backup-00001-of-00002.safetensors", "backup-00002-of-00002.safetensors"):
         open(os.path.join(directory, shard), "wb").close()
-    assert saving_utils._local_snapshot_is_complete(directory) is True
+    assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
 def test_an_unreadable_index_is_not_proof_of_completeness(tmp_path):

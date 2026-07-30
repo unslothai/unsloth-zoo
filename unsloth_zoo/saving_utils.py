@@ -5113,27 +5113,34 @@ def _local_snapshot_is_complete(local_path):
         # An index can itself be stale or half rebuilt: one naming
         # `model-00001-of-00005.safetensors` and nothing else is answered by the name, which
         # says four more belong to that set. So the names it gives are checked as names too.
-        return _shard_sets_are_whole(shards)
+        return _one_whole_shard_set(shards)
 
     try:
         entries = os.listdir(local_path)
     except OSError:
         return False
     # With no index the merge cannot filter, so what is in the directory is what it reads.
-    return _shard_sets_are_whole(entries)
+    return _one_whole_shard_set(entries)
 pass
 
-def _shard_sets_are_whole(names):
-    """Does every `-NNNNN-of-NNNNN` set among these names have all of its parts?
+def _one_whole_shard_set(names):
+    """Do these names describe exactly one `-NNNNN-of-NNNNN` set, with all of its parts?
 
-    Grouped by set, not by total: `model-00001-of-00002` beside a stale
+    Grouped by set rather than by total, since `model-00001-of-00002` beside a stale
     `backup-00002-of-00002` is one shard of each, not both shards of one.
 
-    Every set has to be whole, not just one of them. The merge enumerates every top-level
-    `.safetensors` in the directory (`saving_utils.py`, the local branch of
-    `merge_and_overwrite_lora`) and drops stale shards only against an index, so a leftover
-    partial set is read too, and mismatched shapes are the "Bad in-place call" that filter
-    exists for. Names with no shard numbering are the single file case.
+    One set, because the merge reads every top-level `.safetensors` in the directory (the
+    local branch of `merge_and_overwrite_lora`) and drops stale shards only against an
+    index. Without one it has no way to choose:
+
+      a partial second set is read too, and mismatched shapes are the "Bad in-place call"
+      that filter exists for;
+
+      a complete second set is worse, because it does not fail. Both sets carry the same
+      tensor keys, the regenerated index maps each key to whichever file was visited last,
+      and the export can quietly be the stale copy.
+
+    Names with no shard numbering are the single file case, which the caller has seen.
     """
     seen_by_set = {}
     for name in names:
@@ -5141,10 +5148,10 @@ def _shard_sets_are_whole(names):
         if match is None: continue
         prefix, part, total = match.group(1), int(match.group(2)), int(match.group(3))
         seen_by_set.setdefault((prefix, total), set()).add(part)
-    return all(
-        seen == set(range(1, total + 1))
-        for (_prefix, total), seen in seen_by_set.items()
-    )
+    if not seen_by_set: return True
+    if len(seen_by_set) != 1: return False
+    (_prefix, total), seen = next(iter(seen_by_set.items()))
+    return seen == set(range(1, total + 1))
 pass
 
 def _local_base_completes_without_the_hub(quant_type, save_method, local_path):
