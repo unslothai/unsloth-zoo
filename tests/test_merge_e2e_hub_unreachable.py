@@ -17,31 +17,20 @@
 """`merge_and_overwrite_lora` end to end: what happens when the Hub is down.
 
 The rest of this change is verified at the level of `check_hf_model_exists` and
-`determine_base_model_source`. This file goes through the merge itself with a real
-PeftModel, because the promise being made is about the merge:
+`determine_base_model_source`, which cannot tell whether anything was written. So this
+file drives the merge itself with a real PeftModel and asserts the two things a user
+experiences: an exception is raised, and no output directory is left behind that could
+be mistaken for a successful export.
 
-    "Never return None here. `save_pretrained_merged` would look like it
-     succeeded while creating no output directory at all, and the only signal
-     would be a UserWarning that scrolls past in a notebook."
-
-That promise had no behavioural coverage. It was pinned only by an
-`inspect.getsource` string match and an AST walk, neither of which can tell
-whether anything was actually written. So the two things asserted here are the two
-things a user experiences: an exception is raised, and no output directory is left
-behind that could be mistaken for a successful export.
-
-Uses the tiny synthetic models from `_merge_e2e_helpers`, so this is sub-second.
-`set_offline_cpu_env()` there already forbids the network; the Hub entry points are
-monkeypatched on top so a failure is deterministic rather than dependent on being
-genuinely offline.
+Uses the tiny synthetic models from `_merge_e2e_helpers`, so this is sub-second. Its
+`set_offline_cpu_env()` already forbids the network; the Hub entry points are
+monkeypatched on top so a failure is deterministic.
 
 The merge math is pinned to CPU. `set_offline_cpu_env()` sets `UNSLOTH_ALLOW_CPU`,
-which permits CPU rather than requiring it, so `_active_merge_device()` still
-prefers whatever accelerator is present: CUDA on a training box, MPS on a Mac. What
-is under test here is control flow, whether the merge raises and whether it writes,
-so the device is incidental, and leaving it to the host makes the result depend on
-hardware these assertions have no opinion about. macos-14 showed why: its
-virtualized MPS reports 7.93 GiB available and then refuses a 256 byte allocation.
+which permits CPU rather than requiring it, so `_active_merge_device()` would still
+prefer any accelerator present. Only control flow is under test here, so leaving the
+device to the host only adds a hardware dependency: macos-14's virtualized MPS reports
+7.93 GiB available and then refuses a 256 byte allocation.
 """
 
 from __future__ import annotations
@@ -61,10 +50,8 @@ FAMILY = "llama"
 @pytest.fixture(autouse = True)
 def _merge_on_the_cpu(monkeypatch):
     """Pin `_merge_lora`'s device, for the reason in the module docstring.
-
-    `_active_merge_device` is `lru_cache`d, so replacing the module attribute is
-    both what takes effect and what gets undone cleanly by monkeypatch.
-    """
+    `_active_merge_device` is `lru_cache`d, so replacing the module attribute is both
+    what takes effect and what monkeypatch undoes cleanly."""
     monkeypatch.setattr(saving_utils, "_active_merge_device", lambda: "cpu")
 
 
@@ -104,14 +91,11 @@ def _looks_like_a_successful_export(out_dir):
     return any(name.endswith(".safetensors") for name in os.listdir(out_dir))
 
 
-# ---------------------------------------------------------------------------
 # The regression this whole branch exists to remove.
-# ---------------------------------------------------------------------------
 
 def test_unreachable_hub_raises_and_writes_nothing(monkeypatch, tmp_path):
-    """The bug, end to end. A base that is only on the Hub, a Hub that is rate
-    limited, and a 16bit merge: the old code warned, returned None, and created no
-    output directory, so the export looked like it had worked."""
+    """The bug, end to end: a base only on the Hub, a rate limited Hub and a 16bit
+    merge. The old code warned, returned None and created no output directory."""
     _skip_if_missing()
     peft_model, _base_dir = _peft_model(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -137,8 +121,7 @@ def test_unreachable_hub_raises_and_writes_nothing(monkeypatch, tmp_path):
 
 
 def test_the_failure_is_not_reported_only_as_a_warning(monkeypatch, tmp_path):
-    """A warning is the signal that scrolls past in a notebook. Whatever else it
-    does, this path must not merely warn and hand back None."""
+    """This path must not merely warn and hand back None."""
     _skip_if_missing()
     peft_model, _base_dir = _peft_model(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -160,8 +143,8 @@ def test_the_failure_is_not_reported_only_as_a_warning(monkeypatch, tmp_path):
 
 
 def test_a_genuinely_absent_base_also_raises(monkeypatch, tmp_path):
-    """Not just transport. A name that resolves nowhere used to warn and return
-    None too, writing nothing, and the message now says what to check."""
+    """Not just transport: a name that resolves nowhere also used to warn, return None
+    and write nothing. The message now says what to check."""
     _skip_if_missing()
     peft_model, _base_dir = _peft_model(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -187,14 +170,9 @@ def test_a_genuinely_absent_base_also_raises(monkeypatch, tmp_path):
 
 
 def test_a_4bit_base_for_a_16bit_merge_raises_rather_than_warning(tmp_path):
-    """The last silent no-op on this path, and it needed no Hub at all.
-
-    `merged_16bit` off an nf4/fp4 base cannot be done: the merge answered
-    `warnings.warn` plus `return None` and wrote nothing, which is exactly the
-    shape that cost a training run in the case this branch was opened for. The
-    recovery it names, `forced_merged_4bit`, was already right; only the
-    reporting was wrong.
-    """
+    """The last silent no-op on this path, and it needed no Hub at all. `merged_16bit`
+    off an nf4/fp4 base cannot be done, and the merge warned and returned None. The
+    recovery it names, `forced_merged_4bit`, was already right."""
     _skip_if_missing()
     peft_model, base_dir = _peft_model(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -225,9 +203,8 @@ def test_a_4bit_base_for_a_16bit_merge_raises_rather_than_warning(tmp_path):
 
 
 def test_an_hf_uri_is_still_addressed_as_a_repo(monkeypatch):
-    """`hf://namespace/name` is the documented HfFileSystem URI form and `ls`
-    accepts it. Its two slashes must not read as a filesystem path, or a name that
-    worked before this change stops reaching the Hub at all."""
+    """`hf://namespace/name` is documented HfFileSystem syntax that `ls` accepts, so its
+    two slashes must not read as a filesystem path."""
     assert saving_utils._is_hub_repo_id("hf://openai-community/gpt2") is True
     assert saving_utils._is_hub_repo_id("openai-community/gpt2") is True
     # Still a path, scheme or no scheme.
@@ -235,15 +212,11 @@ def test_an_hf_uri_is_still_addressed_as_a_repo(monkeypatch):
     assert saving_utils._is_hub_repo_id("/abs/base") is False
 
 
-# ---------------------------------------------------------------------------
 # The complement: an unreachable Hub must not break a merge that never needed it.
-# ---------------------------------------------------------------------------
 
 def test_a_local_base_still_merges_with_the_hub_down(monkeypatch, tmp_path):
-    """The other half of the contract, and the one a regression would silently
-    take away. The base is on disk, so nothing about this merge is the Hub's to
-    decide, and it must complete and write real weights with every Hub entry
-    point failing."""
+    """The base is on disk, so nothing about this merge is the Hub's to decide: it must
+    complete and write real weights with every Hub entry point failing."""
     _skip_if_missing()
     peft_model, base_dir = _peft_model(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")

@@ -16,20 +16,16 @@
 
 """`check_hf_model_exists` must not report "absent" for a Hub it cannot reach.
 
-The function used to wrap its `HfFileSystem(...).ls(...)` in a bare `except:`
-returning False, which mapped a 429, a 5xx, a DNS or proxy failure, a read
-timeout and `HF_HUB_OFFLINE` all onto "this repo does not exist".
-`determine_base_model_source` then fell through every priority and returned
-`(None, ...)`, and `merge_and_overwrite_lora` answered a bare `warnings.warn`
-plus `return None`. `save_pretrained_merged` therefore returned None, created
-no output directory at all, and the only signal was a UserWarning that scrolls
-past in a notebook, so the user believed the 16bit export had succeeded.
+The bare `except: return False` around `HfFileSystem(...).ls(...)` mapped a 429, a
+5xx, a DNS or proxy failure, a read timeout and `HF_HUB_OFFLINE` onto "this repo does
+not exist". `determine_base_model_source` then returned `(None, ...)` and
+`merge_and_overwrite_lora` warned and returned None, so `save_pretrained_merged`
+created no output directory at all and only warned about it.
 
-Telling the two apart is possible because `HfFileSystem` already separates
-them: `hf_file_system._raise_file_not_found` (a plain FileNotFoundError) is
-reached only after `_repo_and_revision_exists` catches
-RepositoryNotFoundError / RevisionNotFoundError / HFValidationError, while
-every transport failure propagates out of `ls` untouched.
+`HfFileSystem` already separates the two: `_raise_file_not_found` (a plain
+FileNotFoundError) is reached only after `_repo_and_revision_exists` catches
+RepositoryNotFoundError / RevisionNotFoundError / HFValidationError, while every
+transport failure propagates out of `ls` untouched.
 """
 
 import warnings
@@ -57,8 +53,7 @@ def _response(status_code):
 
 
 def _patch_ls(monkeypatch, side_effect):
-    """Make HfFileSystem.ls raise (or return) whatever the test wants, so no
-    test in this file ever touches the network."""
+    """No test in this file touches the network."""
     def fake_ls(self, path, detail = True, **kwargs):
         if isinstance(side_effect, BaseException):
             raise side_effect
@@ -66,9 +61,7 @@ def _patch_ls(monkeypatch, side_effect):
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
 
 
-# ---------------------------------------------------------------------------
 # Unreachable Hub must raise, never answer False.
-# ---------------------------------------------------------------------------
 
 _TRANSPORT_ERRORS = [
     pytest.param(
@@ -97,16 +90,14 @@ def test_transport_failure_raises_instead_of_reporting_absent(monkeypatch, error
         saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct")
 
     message = str(excinfo.value)
-    # The message must name the real cause, not the model.
+    # Names the real cause, not the model.
     assert "connectivity" in message or "rate limiting" in message
     assert "unsloth/Llama-3.2-1B-Instruct" in message
-    # The original exception is preserved for debugging.
     assert excinfo.value.__cause__ is error
 
 
 def test_transport_failure_does_not_return_false(monkeypatch):
-    """Pinned separately and bluntly: the pre-fix behaviour was `return False`,
-    which is the single step that makes the whole export silently no-op."""
+    """`return False` here is the single step that makes the whole export no-op."""
     _patch_ls(monkeypatch, HfHubHTTPError("429", response = _response(429)))
 
     result = None
@@ -120,12 +111,10 @@ def test_transport_failure_does_not_return_false(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # A genuinely absent or inaccessible repo must still answer False.
-# ---------------------------------------------------------------------------
 
 _ABSENT_ERRORS = [
-    # What HfFileSystem.ls actually raises for a missing repo: fsspec converts
+    # What ls actually raises for a missing repo: fsspec converts
     # RepositoryNotFoundError into a plain FileNotFoundError.
     pytest.param(
         FileNotFoundError("unslothai/nope (repository not found)"), id = "fsspec-file-not-found",
@@ -152,21 +141,17 @@ def test_absent_repo_still_returns_false(monkeypatch, error):
         assert saving_utils.check_hf_model_exists("unslothai/definitely-not-a-real-repo") is False
 
 
-# ---------------------------------------------------------------------------
-# A gated repo answers False like an absent one, but it is not absent, and the
-# difference is the only actionable thing the user can act on.
-# ---------------------------------------------------------------------------
+# A gated repo answers False like an absent one, but it is not absent, and that
+# difference is the only actionable thing the user has.
 
 def _ls_gated_the_way_fsspec_delivers_it(monkeypatch):
     """What a gated repo ACTUALLY looks like coming out of `HfFileSystem.ls`.
 
-    Not a GatedRepoError. `_repo_and_revision_exist` catches
-    `RepositoryNotFoundError`, which GatedRepoError subclasses, stashes it, and
-    `_raise_file_not_found` re-raises it as `FileNotFoundError(msg) from err`. So
-    the gated case arrives as a plain FileNotFoundError with the real reason in
-    `__cause__`, and an `except GatedRepoError` handler would never fire outside a
-    test that injects the error directly into `ls`. Read off the installed
-    huggingface_hub source, not assumed.
+    Not a GatedRepoError: `_repo_and_revision_exist` catches
+    `RepositoryNotFoundError` (which GatedRepoError subclasses) and
+    `_raise_file_not_found` re-raises it as `FileNotFoundError(msg) from err`, so the
+    real reason is in `__cause__` and an `except GatedRepoError` handler would never
+    fire. Read off the installed huggingface_hub source, not assumed.
     """
     def fake_ls(self, path, detail = True, **kwargs):
         try:
@@ -177,9 +162,8 @@ def _ls_gated_the_way_fsspec_delivers_it(monkeypatch):
 
 
 def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
-    """It stays False on purpose, so a local copy still wins and gated bases keep
-    working. But a gated repo demonstrably exists, and reporting it as missing
-    sends the user looking for a typo they do not have."""
+    """False on purpose, so a local copy still wins, but a gated repo demonstrably
+    exists and reporting it missing sends the user hunting a typo they do not have."""
     _ls_gated_the_way_fsspec_delivers_it(monkeypatch)
 
     with pytest.warns(UserWarning) as caught:
@@ -192,9 +176,8 @@ def test_gated_repo_says_it_is_gated_rather_than_absent(monkeypatch):
 
 
 def test_gated_detection_survives_the_fsspec_conversion(monkeypatch):
-    """The premise of the helper, pinned so a refactor back to `except
-    GatedRepoError` cannot pass. Matching on the type alone is not enough here
-    because the type never reaches the handler."""
+    """Pinned so a refactor back to `except GatedRepoError` cannot pass: the type
+    never reaches the handler."""
     assert issubclass(GatedRepoError, RepositoryNotFoundError)
     wrapped = None
     try:
@@ -220,9 +203,7 @@ def test_a_plain_absent_repo_does_not_warn_about_gating(monkeypatch):
     assert [w for w in caught if "gated" in str(w.message)] == []
 
 
-# ---------------------------------------------------------------------------
 # The success paths are unchanged.
-# ---------------------------------------------------------------------------
 
 def test_repo_with_safetensors_returns_true(monkeypatch):
     _patch_ls(monkeypatch, [
@@ -241,8 +222,7 @@ def test_repo_without_safetensors_returns_false(monkeypatch):
 
 
 def test_no_warning_is_used_to_report_an_unreachable_hub(monkeypatch):
-    """A warning is not an acceptable channel for this: it does not stop the
-    caller from believing the export happened."""
+    """A warning does not stop the caller believing the export happened."""
     _patch_ls(monkeypatch, HfHubHTTPError("429", response = _response(429)))
 
     with warnings.catch_warnings(record = True) as caught:
@@ -253,9 +233,7 @@ def test_no_warning_is_used_to_report_an_unreachable_hub(monkeypatch):
     assert not [w for w in caught if "not found" in str(w.message)]
 
 
-# ---------------------------------------------------------------------------
 # The downstream consequence: no silent no-op merge.
-# ---------------------------------------------------------------------------
 
 def test_determine_base_model_source_propagates_the_transport_error(monkeypatch):
     """The path that produced `(None, ...)` and hence the silent no-op export."""

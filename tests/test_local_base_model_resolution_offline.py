@@ -16,11 +16,10 @@
 
 """A local base model must still resolve when the Hub is unreachable.
 
-Companion to `test_check_hf_model_exists_transport_errors.py`. That file pins
-"an unreachable Hub must never be reported as an absent model". This file pins
-the other half, which the first fix broke: `determine_base_model_source` probes
-the Hub *before* it looks on disk, and a local directory is not a Hub repo id,
-so making every non-absent error fatal made local base models unresolvable.
+The other half of `test_check_hf_model_exists_transport_errors.py`, which the first
+fix broke: `determine_base_model_source` probed the Hub *before* looking on disk, and
+a local directory is not a repo id, so making every non-absent error fatal made local
+base models unresolvable.
 
 What `HfFileSystem.ls` actually raises for a local path (measured, not guessed):
 
@@ -29,23 +28,19 @@ What `HfFileSystem.ls` actually raises for a local path (measured, not guessed):
     './base'      HfUriError          FileNotFoundError
     '/abs/base'   FileNotFoundError online, OfflineModeIsEnabled offline
 
-Only two of those six are in the absent set and the exception type is not
-stable across versions, so the obvious shapes are classified from the string
-instead: a leading `.`, `/` or `~`, or more than one `/`, is a filesystem path
-and is never offered to the Hub at all.
+Only two of those six are in the absent set and the type is not stable across
+versions, so the obvious shapes are classified from the string instead: a leading `.`,
+`/` or `~`, or more than one `/`, is never offered to the Hub at all.
 
-A single segment name is deliberately NOT rejected that way. `gpt2` and
-`bert-base-uncased` are canonical repos that 0.x lists happily (measured: 17
-entries with safetensors on 0.36.2), so they are still probed, and the plain
-`ValueError` that 1.x answers is treated as absent only for names with no `/`.
+A single segment name is deliberately NOT rejected that way: `gpt2` and
+`bert-base-uncased` are canonical repos 0.x lists happily (measured: 17 entries with
+safetensors on 0.36.2), so they are still probed, and 1.x's plain `ValueError` counts
+as absent only for names with no `/`.
 
-The string gate is necessary but not sufficient. `outputs/mymodel` is a
-perfectly valid repo id *and* a perfectly ordinary local directory, so no
-amount of string inspection can spare it. Hence the second half: resolve local
-first. Priorities 1 and 2 (local unquantized, local mxfp4) outrank every Hub
-answer, so returning them before the probe changes no result and makes local
-resolution genuinely network free, while an unreachable Hub still propagates
-for everything that gets past them.
+The string gate is necessary but not sufficient, because `outputs/mymodel` is a valid
+repo id *and* an ordinary local directory. Hence the second half: resolve local first.
+Priorities 1 and 2 outrank every Hub answer, so returning them before the probe
+changes no result while an unreachable Hub still propagates past them.
 """
 
 import json
@@ -67,13 +62,9 @@ except ImportError:      # huggingface_hub < 1.0 has no hf:// URI parser
     HfUriError = None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _make_local_model(directory, quantization_config = None):
-    """A minimal on-disk model: `check_local_model_exists` keys off a
-    `.safetensors` file, `check_model_quantization_status` off config.json."""
+    """`check_local_model_exists` keys off a `.safetensors` file,
+    `check_model_quantization_status` off config.json."""
     os.makedirs(directory, exist_ok = True)
     open(os.path.join(directory, "model.safetensors"), "wb").close()
     config = {"model_type": "llama"}
@@ -85,12 +76,8 @@ def _make_local_model(directory, quantization_config = None):
 
 
 def _forbid_hub(monkeypatch):
-    """Fail loudly if anything reaches for the Hub at all.
-
-    Stronger than returning an error: it pins that a local path is never even
-    offered to `HfFileSystem.ls`, which is what makes the resolution genuinely
-    network free rather than merely tolerant of a failure.
-    """
+    """Fail loudly if anything reaches for the Hub at all, which pins that resolution
+    is network free rather than merely tolerant of a failure."""
     def no_network(self, path, detail = True, **kwargs):
         raise AssertionError(
             f"HfFileSystem.ls({path!r}) was called; a local base model must "
@@ -118,10 +105,8 @@ _OFFLINE = OfflineModeIsEnabled(
 )
 
 
-# ---------------------------------------------------------------------------
 # 1. check_hf_model_exists: a string that cannot name a repo is absent, not
 #    unreachable, and must cost no network call.
-# ---------------------------------------------------------------------------
 
 _NOT_REPO_IDS = [
     pytest.param("./base", id = "dot-slash-relative-path"),
@@ -137,8 +122,8 @@ _NOT_REPO_IDS = [
 
 @pytest.mark.parametrize("model_name", _NOT_REPO_IDS)
 def test_local_path_is_absent_not_unreachable(monkeypatch, model_name):
-    """Before the fix these raised RuntimeError("could not reach the Hub"),
-    which is both wrong (nothing was unreachable) and fatal."""
+    """These raised RuntimeError("could not reach the Hub"), which is both wrong and
+    fatal."""
     _forbid_hub(monkeypatch)
     assert saving_utils.check_hf_model_exists(model_name) is False
 
@@ -146,17 +131,12 @@ def test_local_path_is_absent_not_unreachable(monkeypatch, model_name):
 @pytest.mark.parametrize("model_name", _NOT_REPO_IDS)
 @pytest.mark.parametrize("typed_uris", [False, True])
 def test_a_path_stays_a_path_on_either_huggingface_hub(monkeypatch, model_name, typed_uris):
-    """The same contract, asserted against both answers the Hub parser can give.
+    """The same contract under both answers the Hub parser can give.
 
-    These cells decide whether a string reaches the network at all, and one of the
-    inputs (`models/base/checkpoint-500`) is classified by logic that is gated on
-    whether the installed release maps the `models/` type prefix. A job only ever
-    installs one version, so running under whichever one that is leaves the other
-    branch untested: the version-gated strip landed green here and still broke this
-    file on 1.25.1, which Codex found by running it there.
-
-    Forcing both answers is cheap and removes the dependence on what the runner
-    resolved, which is the whole failure mode this branch is about.
+    `models/base/checkpoint-500` is classified by logic gated on whether the installed
+    release maps the `models/` type prefix, and a job installs only one version, so
+    running under whichever one that is leaves the other branch untested: a
+    version-gated strip landed green here and still broke this file on 1.25.1.
     """
     monkeypatch.setattr(
         saving_utils, "_hub_addresses_typed_model_uris", lambda: typed_uris,
@@ -168,11 +148,10 @@ def test_a_path_stays_a_path_on_either_huggingface_hub(monkeypatch, model_name, 
 def test_valid_repo_id_is_still_probed(monkeypatch):
     """The gate must not quietly stop checking the Hub for real repo ids.
 
-    Includes the single segment canonical ids, which huggingface_hub 0.x lists
-    happily (measured: `ls("gpt2")` returns 17 entries with safetensors on
-    0.36.2, and pyproject supports >= 0.34). Rejecting them from the string
-    would turn a working `gpt2` merge into "not found locally or on Hugging
-    Face" on every 0.3x install.
+    Includes the canonical single segment ids, which 0.x lists happily (measured:
+    `ls("gpt2")` returns 17 entries with safetensors on 0.36.2, and pyproject supports
+    >= 0.34). Rejecting them from the string would turn a working `gpt2` merge into
+    "not found locally or on Hugging Face" on every 0.3x install.
     """
     seen = []
     def fake_ls(self, path, detail = True, **kwargs):
@@ -181,8 +160,8 @@ def test_valid_repo_id_is_still_probed(monkeypatch):
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
 
     assert saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct") is True
-    # A two segment relative directory is indistinguishable from a repo id, so
-    # it must still be probed rather than assumed local.
+    # A two segment relative directory is indistinguishable from a repo id, so it must
+    # still be probed rather than assumed local.
     assert saving_utils.check_hf_model_exists("outputs/mymodel") is True
     assert saving_utils.check_hf_model_exists("gpt2") is True
     assert saving_utils.check_hf_model_exists("bert-base-uncased") is True
@@ -206,8 +185,8 @@ _SINGLE_SEGMENT_REJECTIONS = [
 
 @pytest.mark.parametrize("error", _SINGLE_SEGMENT_REJECTIONS)
 def test_single_segment_name_the_hub_will_not_list_is_absent(monkeypatch, error):
-    """`base` is probed (it could be a canonical id) but both refusals mean
-    "not a repo id I can list", never "the Hub is unreachable"."""
+    """`base` is probed (it could be a canonical id) but both refusals mean "not a repo
+    id I can list", never "the Hub is unreachable"."""
     _hub_raises(monkeypatch, error)
     assert saving_utils.check_hf_model_exists("base") is False
 
@@ -231,39 +210,29 @@ if HfUriError is not None:
 
 @pytest.mark.parametrize("error", _INVALID_REPO_ID_ERRORS)
 def test_invalid_repo_id_errors_are_classified_absent(monkeypatch, error):
-    """Backstop for a repo-id-shaped string the installed huggingface_hub still
-    rejects as malformed. "This is not a repo id" is a statement about the
-    argument, never about connectivity, so it answers False."""
+    """Backstop for a repo-id-shaped string the installed release still rejects as
+    malformed: that is about the argument, never about connectivity."""
     _hub_raises(monkeypatch, error)
     assert saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct") is False
 
 
 def test_a_plain_ValueError_from_the_transport_is_not_swallowed(monkeypatch):
-    """Deliberate: a bare `ValueError` is absent only for a single segment name.
-
-    hf_hub 1.x reports a single segment id as a *bare* `ValueError`, and it is
-    tempting to add `ValueError` to the absent set outright. That would also
-    swallow any transport failure surfacing as a ValueError and reopen the
-    silent-no-op bug, so the catch is scoped to names with no `/`, where the
-    only thing a ValueError can mean is "single segment ids are not supported".
-    A `namespace/name` repo keeps raising.
-    """
+    """A bare `ValueError` is absent only for a single segment name. Adding `ValueError`
+    to the absent set outright would also swallow a transport failure surfacing as one
+    and reopen the silent no-op, so the catch is scoped to names with no `/`."""
     _hub_raises(monkeypatch, ValueError("malformed chunked response from proxy"))
     with pytest.raises(RuntimeError):
         saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct")
 
 
 def test_transport_error_on_a_valid_repo_id_still_raises(monkeypatch):
-    """Guard rail for the gate above: widening the absent set must not let the
-    original silent-no-op bug back in."""
+    """Widening the absent set must not let the silent no-op back in."""
     _hub_raises(monkeypatch, _OFFLINE)
     with pytest.raises(RuntimeError):
         saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct")
 
 
-# ---------------------------------------------------------------------------
 # 2. determine_base_model_source: a local base model resolves with no network.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("shape", ["relative", "dot-slash", "absolute"])
 def test_local_base_model_resolves_without_network(monkeypatch, tmp_path, shape):
@@ -290,12 +259,10 @@ def test_local_base_model_resolves_without_network(monkeypatch, tmp_path, shape)
 def test_absolute_local_path_resolves_under_hf_hub_offline(monkeypatch, tmp_path):
     """The reported shape: absolute path plus HF_HUB_OFFLINE=1.
 
-    Both of the offline devices here are belt and braces, and deliberately so.
-    `HF_HUB_OFFLINE` is read into module constants at import time, so setting it
-    cannot make an already-imported huggingface_hub go offline, and the
-    `OfflineModeIsEnabled` fake is never reached because an absolute path is not
-    probed and priority 1 returns first. Both are present so the test keeps
-    failing if either of those two protections is removed.
+    Both offline devices are deliberate. `HF_HUB_OFFLINE` is read into module constants
+    at import time, so setting it cannot take an already-imported huggingface_hub
+    offline, and the `OfflineModeIsEnabled` fake is never reached because an absolute
+    path is not probed. Keeping both means removing either protection still fails.
     """
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.chdir(tmp_path)
@@ -311,11 +278,9 @@ def test_absolute_local_path_resolves_under_hf_hub_offline(monkeypatch, tmp_path
 
 
 def test_repo_id_shaped_local_dir_resolves_when_hub_is_unreachable(monkeypatch, tmp_path):
-    """`outputs/mymodel` is a valid repo id AND an ordinary local directory, so
-    no amount of string inspection can spare it from the Hub. Only resolving
-    local first saves it: priority 1 returns before the probe, and the injected
-    OfflineModeIsEnabled is never reached. This is the case that proves the
-    reordering is needed and that the string gate alone is not enough."""
+    """`outputs/mymodel` is a valid repo id AND an ordinary local directory, so no
+    string test can spare it from the Hub. Only resolving local first saves it, which is
+    what makes the reordering necessary and the string gate insufficient."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"))
     _hub_raises(monkeypatch, _OFFLINE)
@@ -331,8 +296,7 @@ def test_repo_id_shaped_local_dir_resolves_when_hub_is_unreachable(monkeypatch, 
 
 
 def test_local_mxfp4_also_outranks_the_hub_without_network(monkeypatch, tmp_path):
-    """Priority 2 outranks every Hub answer just as priority 1 does, so it must
-    not be made to depend on a reachable Hub either."""
+    """Priority 2 outranks every Hub answer just as priority 1 does."""
     monkeypatch.chdir(tmp_path)
     _make_local_model("base", quantization_config = {"quant_method": "mxfp4"})
     _forbid_hub(monkeypatch)
@@ -345,10 +309,8 @@ def test_local_mxfp4_also_outranks_the_hub_without_network(monkeypatch, tmp_path
     )
 
 
-# ---------------------------------------------------------------------------
-# 3. The original bug stays fixed: no local fallback plus an unreachable Hub
-#    must still be loud.
-# ---------------------------------------------------------------------------
+# 3. The original bug stays fixed: no local fallback plus an unreachable Hub must still
+#    be loud.
 
 _UNREACHABLE = [
     pytest.param(_OFFLINE, id = "hf-hub-offline"),
@@ -359,8 +321,7 @@ _UNREACHABLE = [
 
 @pytest.mark.parametrize("error", _UNREACHABLE)
 def test_unreachable_hub_with_no_local_copy_still_raises(monkeypatch, tmp_path, error):
-    """The regression PR 950 exists to prevent. Nothing on disk can answer, so
-    silence here is what silently exported an empty directory."""
+    """Nothing on disk can answer, so silence here is what exported nothing."""
     monkeypatch.chdir(tmp_path)     # genuinely empty: no local candidate at all
     _hub_raises(monkeypatch, error)
 
@@ -370,8 +331,8 @@ def test_unreachable_hub_with_no_local_copy_still_raises(monkeypatch, tmp_path, 
 
 
 def test_unreachable_hub_does_not_fall_through_to_nothing_found(monkeypatch, tmp_path):
-    """Bluntly pinned: the pre-950 behaviour returned `(None, ...)` here, and
-    the caller turned that into a no-op export plus a warning."""
+    """The old behaviour returned `(None, ...)` here, which the caller turned into a
+    no-op export plus a warning."""
     monkeypatch.chdir(tmp_path)
     _hub_raises(monkeypatch, _OFFLINE)
 
@@ -383,8 +344,8 @@ def test_unreachable_hub_does_not_fall_through_to_nothing_found(monkeypatch, tmp
 
 
 def test_absent_repo_with_no_local_copy_still_reports_nothing_found(monkeypatch, tmp_path):
-    """A genuinely missing repo is not an error here; it keeps the old answer
-    so the caller can raise its own message naming the model."""
+    """A genuinely missing repo keeps the old answer, so the caller can raise its own
+    message naming the model."""
     monkeypatch.chdir(tmp_path)
     _hub_raises(monkeypatch, RepositoryNotFoundError("404", response = _response(404)))
 
@@ -393,23 +354,18 @@ def test_absent_repo_with_no_local_copy_still_reports_nothing_found(monkeypatch,
     )
 
 
-# ---------------------------------------------------------------------------
-# 4. A local copy that only wins at priority 5 must NOT rescue an unreachable
-#    Hub, because the merge cannot use it for a 16bit export.
-# ---------------------------------------------------------------------------
+# 4. A local copy that only wins at priority 5 must NOT rescue an unreachable Hub,
+#    because the merge cannot use it for a 16bit export.
 
 def test_unreachable_hub_does_not_fall_back_to_a_priority_5_local_copy(
     monkeypatch, tmp_path,
 ):
-    """A bnb-4bit local copy is priority 5, below the Hub's priorities 3 and 4.
+    """A bnb-4bit local copy is priority 5, below the Hub's 3 and 4.
 
-    Quietly substituting it when the Hub is unreachable looks like graceful
-    degradation but is not: `merge_and_overwrite_lora` answers an nf4/fp4 base
-    for `merged_16bit` with `warnings.warn` plus `return None`, writing nothing
-    and creating no output directory. That is precisely the silent no-op this
-    branch removes, so the RuntimeError has to propagate instead. Priorities 1
-    and 2 are the ones that legitimately resolve without the Hub; they are
-    covered above and return before this line is ever reached.
+    Substituting it when the Hub is unreachable is not graceful degradation:
+    `merge_and_overwrite_lora` writes nothing for an nf4/fp4 base under
+    `merged_16bit`, which is the silent no-op itself, so the RuntimeError propagates.
+    Priorities 1 and 2 legitimately resolve without the Hub and are covered above.
     """
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("unsloth", "mymodel"), quantization_config = {
@@ -425,9 +381,9 @@ def test_unreachable_hub_does_not_fall_back_to_a_priority_5_local_copy(
 def test_a_non_repo_id_local_quantized_copy_still_resolves_at_priority_5(
     monkeypatch, tmp_path,
 ):
-    """The counterpart: a local path is never probed, so priority 5 is reached
-    with no Hub call at all and a `forced_merged_4bit` export still works
-    offline. Only a repo-id-shaped name can be blocked by an unreachable Hub."""
+    """A local path is never probed, so priority 5 is reached with no Hub call and a
+    `forced_merged_4bit` export still works offline. Only a repo-id-shaped name can be
+    blocked by an unreachable Hub."""
     monkeypatch.chdir(tmp_path)
     _make_local_model("base", quantization_config = {
         "load_in_4bit": True, "bnb_4bit_quant_type": "nf4",
@@ -444,8 +400,7 @@ def test_a_non_repo_id_local_quantized_copy_still_resolves_at_priority_5(
 
 
 def test_reachable_hub_still_outranks_a_quantized_local_copy(monkeypatch, tmp_path):
-    """The priority order itself is unchanged: the fallback above must trigger
-    only when the Hub actually failed, never as the new normal."""
+    """The priority order is unchanged: the fallback fires only when the Hub failed."""
     monkeypatch.chdir(tmp_path)
     _make_local_model("mymodel", quantization_config = {
         "load_in_4bit": True, "bnb_4bit_quant_type": "nf4",

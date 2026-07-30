@@ -16,42 +16,31 @@
 
 """Two classification holes left by narrowing the Hub round trips.
 
-Both are the same mistake the rest of this branch removes, in the two places the
-branch did not look, and both were found by driving the real code rather than
-reading it.
-
 1. The gated warning could not fire in production.
 
-`check_hf_model_exists` grew an `except GatedRepoError` clause so a locked out user
-is told to accept the licence instead of going to look for a typo. But
-`HfFileSystem.ls` never raises GatedRepoError. `_repo_and_revision_exist` catches
+`HfFileSystem.ls` never raises GatedRepoError: `_repo_and_revision_exist` catches
 RepositoryNotFoundError, which GatedRepoError subclasses, and
 `_raise_file_not_found` re-raises it as
-
-    raise FileNotFoundError(f"{path} (repository not found)") from err
-
-so the gated case arrives as a plain FileNotFoundError with the real reason in
-`__cause__`, and `_HUB_ABSENT_ERRORS` catches it first. Measured on 0.36.2 with
+`FileNotFoundError(f"{path} (repository not found)") from err`, so the real reason is
+in `__cause__` and `_HUB_ABSENT_ERRORS` catches it first. Measured on 0.36.2 with
 `HfApi.repo_info` raising GatedRepoError: `ls` raises
 `FileNotFoundError: ns/name (repository not found)`, `__cause__` is the
-GatedRepoError, and no warning was emitted. The clause only ever fired for a test
-that injected the error straight into `ls`, which is what the existing tests do.
+GatedRepoError, and no warning was emitted. The `except GatedRepoError` clause only
+ever fired for a test injecting the error straight into `ls`.
 
 2. An offline config fetch was still reported as an unquantized model.
 
 `LocalEntryNotFoundError` subclasses BOTH `EntryNotFoundError` and
-`FileNotFoundError`, so `_HUB_ABSENT_ERRORS` swallows it, and huggingface_hub
-defines it as "the network is disabled or unavailable and the file is not in the
-cache". It is what `hf_hub_download` raises under `HF_HUB_OFFLINE` with a cold
-cache and under a DNS or proxy outage. Swallowed, it answered `(False, None)` and
-`determine_base_model_source` returned `HF_unquantized` for an nf4 base, which
-skips the nf4/fp4 guard in `merge_and_overwrite_lora` and merges 16bit against
-quantized weights. A gated `config.json` reached the same place through
+`FileNotFoundError`, so `_HUB_ABSENT_ERRORS` swallowed it, yet it means "the network
+is disabled or unavailable and the file is not in the cache" and is what
+`hf_hub_download` raises under `HF_HUB_OFFLINE` with a cold cache or a DNS/proxy
+outage. Swallowed, it answered `(False, None)`, so `determine_base_model_source`
+returned `HF_unquantized` for an nf4 base, skipping the nf4/fp4 guard and merging
+16bit against quantized weights. A gated `config.json` arrived the same way via
 `RepositoryNotFoundError`.
 
-Nothing here touches the network: the Hub entry points are monkeypatched, and the
-one test that runs the real `HfFileSystem.ls` patches `HfApi.repo_info` underneath
-it so no socket is opened.
+Nothing here touches the network: the Hub entry points are monkeypatched, and the one
+test running the real `ls` patches `HfApi.repo_info` underneath it.
 """
 
 import json
@@ -80,16 +69,12 @@ _ON_DISK = ("outputs", "mymodel")
 
 
 def _require_a_case_sensitive_filesystem(tmp_path):
-    """Same precondition, same reason as in that sibling file, stated not assumed.
-
-    A case difference is the only thing that makes `os.path.exists(name)` miss
-    while `check_local_model_exists(name)` hits, so the shape cannot be written
-    filesystem independently. On macOS APFS and Windows NTFS `os.path.exists`
-    answers True for `Outputs/MyModel`, the local branch is taken, and the
-    resolved path comes back in the requested casing instead of the on-disk one.
-
-    macos-14 and windows-latest both fail here without this: macOS on the path
-    comparison, Windows on `resolved[1] is True`.
+    """Probed, not assumed, because the shape cannot be written filesystem
+    independently: a case difference is the only thing that makes
+    `os.path.exists(name)` miss while `check_local_model_exists(name)` hits. On macOS
+    APFS and Windows NTFS `os.path.exists("Outputs/MyModel")` is True, so the local
+    branch is taken and the path comes back in the requested casing. Without this,
+    macos-14 fails on the path comparison and windows-latest on `resolved[1] is True`.
     """
     probe = tmp_path / "case_probe"
     probe.mkdir(exist_ok = True)
@@ -113,8 +98,8 @@ class _StubResponse:
 
 
 def _hub_error(cls, message):
-    """Build the error by signature, not by version: `response` is keyword-only
-    and required from 1.0 for the HTTP-backed classes and absent on 0.x."""
+    """By signature, not by version: `response` is keyword-only and required from 1.0
+    for the HTTP-backed classes, and absent on 0.x."""
     try:
         return cls(message)
     except TypeError:
@@ -126,8 +111,8 @@ def _gated():
 
 
 def _local_entry_not_found():
-    """What `hf_hub_download` raises when it cannot reach the Hub and the file is
-    not cached. Skips rather than fails if a release ever drops the class."""
+    """What `hf_hub_download` raises when it cannot reach the Hub and the file is not
+    cached. Skips rather than fails if a release ever drops the class."""
     errors = pytest.importorskip("huggingface_hub.errors")
     cls = getattr(errors, "LocalEntryNotFoundError", None)
     if cls is None:
@@ -140,7 +125,7 @@ def _local_entry_not_found():
 
 
 def _patch_ls_present(monkeypatch):
-    """The existence probe succeeds. Everything here is about the round trip after."""
+    """The existence probe succeeds; everything here is about the round trip after."""
     def fake_ls(self, path, detail = True, **kwargs):
         return [{"name": f"{path}/model.safetensors"}]
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
@@ -153,8 +138,7 @@ def _patch_config_fetch(monkeypatch, side_effect):
 
 
 def _patch_repo_info(monkeypatch, side_effect):
-    """Fail underneath the *real* `HfFileSystem.ls`, so the conversion that
-    `hf_file_system` performs is the thing under test rather than a stand-in."""
+    """Fail underneath the *real* `ls`, so its own error conversion is under test."""
     def fake_repo_info(self, *args, **kwargs):
         raise side_effect
     monkeypatch.setattr(huggingface_hub.HfApi, "repo_info", fake_repo_info, raising = True)
@@ -174,9 +158,7 @@ def _gated_warnings(messages):
     return [m for m in messages if "gated on the Hugging Face Hub" in m]
 
 
-# ---------------------------------------------------------------------------
 # 1. The gated message has to survive the Hub's own error conversion.
-# ---------------------------------------------------------------------------
 
 def test_gated_repo_warns_through_the_real_hf_file_system(monkeypatch):
     """The production shape: real `ls`, gated `repo_info` underneath it."""
@@ -186,7 +168,7 @@ def test_gated_repo_warns_through_the_real_hf_file_system(monkeypatch):
         result = saving_utils.check_hf_model_exists("meta-llama/Llama-3.2-1B")
     messages = [str(w.message) for w in caught]
 
-    # False is deliberate and unchanged: a local copy must still win.
+    # False is unchanged: a local copy must still win.
     assert result is False
     assert _gated_warnings(messages), (
         f"a gated repo produced no gated warning; `ls` converts GatedRepoError to "
@@ -195,7 +177,7 @@ def test_gated_repo_warns_through_the_real_hf_file_system(monkeypatch):
 
 
 def test_the_real_ls_really_does_hide_the_gated_error(monkeypatch):
-    """Pins the upstream behaviour the fix depends on, so a change is visible here
+    """Pins the upstream behaviour the fix depends on, so a change shows up here
     rather than as a silently dead clause."""
     _patch_repo_info(monkeypatch, _gated())
     with pytest.raises(FileNotFoundError) as excinfo:
@@ -223,9 +205,7 @@ def test_a_genuinely_absent_repo_does_not_claim_to_be_gated(monkeypatch):
     assert not _gated_warnings([str(w.message) for w in caught])
 
 
-# ---------------------------------------------------------------------------
 # 2. An unreadable config is never an unquantized model.
-# ---------------------------------------------------------------------------
 
 def test_offline_config_download_raises_instead_of_reporting_unquantized(monkeypatch):
     _patch_ls_present(monkeypatch)
@@ -236,8 +216,8 @@ def test_offline_config_download_raises_instead_of_reporting_unquantized(monkeyp
 
 
 def test_offline_config_download_never_selects_hf_unquantized(monkeypatch, tmp_path):
-    """The consequence that matters: HF_unquantized for an nf4 base skips the
-    nf4/fp4 guard and merges 16bit against quantized weights."""
+    """HF_unquantized for an nf4 base skips the nf4/fp4 guard and merges 16bit against
+    quantized weights."""
     monkeypatch.chdir(tmp_path)
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _local_entry_not_found())
@@ -251,22 +231,15 @@ def test_offline_config_download_never_selects_hf_unquantized(monkeypatch, tmp_p
 def test_an_unreadable_local_config_raises_for_every_save_method(
     monkeypatch, tmp_path, save_method,
 ):
-    """The strictness is not 16bit-only, and the reason is `_merge_and_overwrite_lora`.
-
-    It is tempting to exempt the 4bit merges: they fold the adapter into weights
-    already in memory, so an unreadable base config looks like it could not change
-    what they write. It can. The mxfp4 route is chosen by
+    """The strictness is not 16bit-only, because an unreadable base config can change
+    what the 4bit merges write too. `_merge_and_overwrite_lora` picks the mxfp4 route by
 
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
 
     and `save_method != "mxfp4"` includes both 4bit merges, so guessing `unquantized`
-    for an mxfp4 base takes the in place writer instead of the full rewrite. That is
-    the same wrong-merge class this parse exists to prevent, reached by a different
-    save method, so all four raise and the message names both consequences.
-
-    `main` answered `local_unquantized` here for every save method, which is the
-    guess being removed. Codex proposed exempting the 4bit paths; declined for the
-    reason above, and the message now says what to repair.
+    for an mxfp4 base takes the in place writer instead of the full rewrite: the same
+    wrong-merge class, reached by a different save method. `main` answered
+    `local_unquantized` here for every save method, which is the guess being removed.
     """
     directory = tmp_path / "base"
     directory.mkdir()
@@ -306,9 +279,7 @@ def test_a_config_error_chained_behind_a_generic_one_is_still_gated(monkeypatch)
     assert _gated_warnings([str(w.message) for w in caught])
 
 
-# ---------------------------------------------------------------------------
 # Controls: the absent cases must not start raising.
-# ---------------------------------------------------------------------------
 
 def test_a_repo_without_a_config_json_still_reports_unquantized(monkeypatch):
     """`EntryNotFoundError` is a fact about the repo, not about the network."""
@@ -341,8 +312,8 @@ def test_a_reachable_hub_still_detects_quantization(monkeypatch, tmp_path):
 def test_a_local_4bit_copy_still_merges_when_the_config_fetch_is_offline(
     monkeypatch, tmp_path, save_method,
 ):
-    """The new raise must still reach the local fallback, exactly as a 429 does.
-    Both 4bit merges fold LoRA into weights already in memory."""
+    """The new raise must reach the local fallback like a 429 does; both 4bit merges
+    fold LoRA into weights already in memory."""
     _require_a_case_sensitive_filesystem(tmp_path)
     directory = _make_local_model(tmp_path.joinpath(*_ON_DISK), quant_config = _NF4)
     monkeypatch.chdir(tmp_path)
@@ -358,8 +329,8 @@ def test_a_local_4bit_copy_still_merges_when_the_config_fetch_is_offline(
 def test_an_exactly_named_local_directory_never_reaches_the_config_fetch(
     monkeypatch, tmp_path,
 ):
-    """Control on the branch itself: when the requested name IS the directory,
-    `check_model_quantization_status` reads it off disk and opens no socket."""
+    """When the requested name IS the directory, the config is read off disk and no
+    socket is opened."""
     directory = _make_local_model(tmp_path / "mymodel", quant_config = _NF4)
     _patch_ls_present(monkeypatch)
 

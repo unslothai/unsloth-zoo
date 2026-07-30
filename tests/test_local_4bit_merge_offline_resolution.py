@@ -16,35 +16,29 @@
 
 """A 4bit merge of a local 4bit base must not depend on the Hub being up.
 
-Companion to `test_local_fp8_base_offline_resolution.py`. That file freed the
-FP8 case; this one frees the case FP8 could not speak for.
-
 `merged_4bit` and `forced_merged_4bit` hand the live PeftModel to
-`merge_and_unload()` and write the result out. They never read base weights from
-anywhere: `determine_base_model_source` only supplies a directory to size the
-shards from. So for a repo-id shaped local nf4 directory such as
-`outputs/mymodel`, which is simultaneously a valid repo id and an ordinary
-directory and therefore cannot be spared the Hub probe by any string test, a Hub
-outage used to abort a merge that needed nothing from the Hub.
+`merge_and_unload()` and write the result out, never reading base weights from
+anywhere: `determine_base_model_source` only supplies a directory to size the shards
+from. So for a local nf4 directory such as `outputs/mymodel`, which is both a valid
+repo id and an ordinary directory and so cannot be spared the probe by any string
+test, a Hub outage used to abort a merge that needed nothing from the Hub.
 
-Measured end to end on huggingface_hub 1.24.0 / transformers 5.14.1, with a real
-bitsandbytes nf4 base in `outputs/mymodel`, `HfFileSystem.ls` raising
-ConnectionError and `hf_hub_download` raising too:
+Measured end to end on huggingface_hub 1.24.0 / transformers 5.14.1 with a real
+bitsandbytes nf4 base in `outputs/mymodel` and both `ls` and `hf_hub_download`
+raising ConnectionError:
 
     before the Hub-outage fix   Detected local model directory -> Merging finished
     with the fix, no save_method RuntimeError, nothing written, merge never ran
     with the fix, merged_4bit    Detected local model directory -> Merging finished
 
-Exactly one Hub call is attempted across that whole run, the probe inside
-`determine_base_model_source` itself, which is what says the rest of the path is
-offline already.
+Exactly one Hub call is attempted across that run, the probe inside
+`determine_base_model_source`, which is what says the rest of the path is already
+offline.
 
-nf4/fp4 under `merged_16bit` keeps raising, and that is the point of passing the
-save method rather than simply widening the fallback. There the merge answers
-`warnings.warn` plus `return None` and writes nothing, so falling back would
-trade a loud failure for exactly the silent no-op this whole change exists to
-remove. `test_the_fallback_can_never_reach_the_silent_no_op` pins that the
-fallback and that sink are disjoint by construction.
+nf4/fp4 under `merged_16bit` keeps raising, which is why the save method is passed
+rather than the fallback simply widened: there the merge writes nothing, so falling
+back would trade a loud failure for the silent no-op.
+`test_the_fallback_can_never_reach_the_silent_no_op` pins that disjointness.
 """
 
 import ast
@@ -60,10 +54,6 @@ from huggingface_hub.errors import OfflineModeIsEnabled
 from unsloth_zoo import saving_utils
 
 
-# ---------------------------------------------------------------------------
-# Helpers (same idiom as test_local_fp8_base_offline_resolution.py)
-# ---------------------------------------------------------------------------
-
 NF4_CONFIG        = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}
 FP4_CONFIG        = {"load_in_4bit": True, "bnb_4bit_quant_type": "fp4"}
 BNB_CONFIG        = {"load_in_4bit": True}
@@ -73,9 +63,9 @@ MXFP4_CONFIG      = {"quant_method": "mxfp4"}
 # The two save methods that fold LoRA into the weights already in memory.
 FOUR_BIT_SAVE_METHODS = ["merged_4bit", "forced_merged_4bit"]
 
-# Everything else keeps propagating an unreachable Hub. None is the default and
-# stands for every caller that does not know the save method, such as unsloth's
-# `_prewarm_base_model_hub_cache`.
+# Everything else keeps propagating an unreachable Hub. None is the default, standing
+# for callers that do not know the save method (unsloth's
+# `_prewarm_base_model_hub_cache`).
 HUB_DEPENDENT_SAVE_METHODS = ["merged_16bit", "mxfp4", "lora", None]
 
 
@@ -128,9 +118,7 @@ def _same_path(a, b):
     return os.path.realpath(str(a)) == os.path.realpath(str(b))
 
 
-# ---------------------------------------------------------------------------
 # The regression: a repo-id shaped local 4bit directory, Hub down, 4bit merge.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS)
@@ -139,7 +127,7 @@ def test_local_4bit_resolves_when_the_hub_is_unreachable(
     monkeypatch, tmp_path, error, save_method, quant_config, label,
 ):
     """The 4bit merge reads no base weights, so nothing about it is the Hub's to
-    decide. This is the answer priority 5 gives, unchanged."""
+    decide. This is priority 5's answer, unchanged."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), quant_config)
     _hub_raises(monkeypatch, error)
@@ -157,8 +145,7 @@ def test_local_4bit_resolves_when_the_hub_is_unreachable(
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS)
 def test_local_4bit_fallback_emits_no_warning(monkeypatch, tmp_path, error, save_method):
-    """A resolution that succeeds is not something to warn about, and a warning
-    is exactly the signal that scrolls past unnoticed."""
+    """A resolution that succeeds is not something to warn about."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
     _hub_raises(monkeypatch, error)
@@ -172,9 +159,8 @@ def test_local_4bit_fallback_emits_no_warning(monkeypatch, tmp_path, error, save
 
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS)
 def test_local_4bit_resolves_positionally_too(monkeypatch, tmp_path, save_method):
-    """`merge_and_overwrite_lora` passes the save method positionally, after the
-    token. Pin that order so the call sites cannot drift into passing it as the
-    token."""
+    """`merge_and_overwrite_lora` passes the save method positionally after the token,
+    so pin that order against a call site drifting into passing it as the token."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
     _hub_raises(monkeypatch, requests.exceptions.ConnectionError("dns failure"))
@@ -187,10 +173,8 @@ def test_local_4bit_resolves_positionally_too(monkeypatch, tmp_path, save_method
     assert quant_type == "nf4"
 
 
-# ---------------------------------------------------------------------------
-# Everything the merge cannot complete offline must keep raising. Nothing that
-# used to raise may now answer None, and nothing may now reach the silent no-op.
-# ---------------------------------------------------------------------------
+# Everything the merge cannot complete offline must keep raising. Nothing that used to
+# raise may now answer None, and nothing may now reach the silent no-op.
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("save_method", HUB_DEPENDENT_SAVE_METHODS)
@@ -198,10 +182,9 @@ def test_local_4bit_resolves_positionally_too(monkeypatch, tmp_path, save_method
 def test_local_4bit_still_raises_for_every_other_save_method(
     monkeypatch, tmp_path, error, save_method, quant_config, label,
 ):
-    """`merged_16bit` on an nf4/fp4 base answers `warnings.warn` plus
-    `return None` and writes nothing. Falling back there would swap a loud
-    failure for that silent no-op, so it keeps raising, and so does every save
-    method whose weights the Hub really does supply."""
+    """`merged_16bit` on an nf4/fp4 base writes nothing, so falling back would swap a
+    loud failure for that silent no-op. Same for every save method whose weights the
+    Hub really does supply."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), quant_config)
     _hub_raises(monkeypatch, error)
@@ -213,9 +196,8 @@ def test_local_4bit_still_raises_for_every_other_save_method(
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_default_call_is_unchanged(monkeypatch, tmp_path, error):
-    """Two positional arguments is what every caller outside this module uses,
-    including unsloth's `_prewarm_base_model_hub_cache`. It must behave exactly
-    as it did before the save method existed."""
+    """Two positional arguments is what every caller outside this module uses, and it
+    must behave as it did before the save method existed."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
     _hub_raises(monkeypatch, error)
@@ -227,9 +209,8 @@ def test_default_call_is_unchanged(monkeypatch, tmp_path, error):
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS + HUB_DEPENDENT_SAVE_METHODS)
 def test_no_local_copy_still_raises(monkeypatch, tmp_path, error, save_method):
-    """The fallback hands back a directory that exists. With nothing on disk
-    there is nothing to hand back, and "I could not tell" must not become
-    "absent" for any save method."""
+    """The fallback hands back a directory that exists. With nothing on disk, "I could
+    not tell" must not become "absent" for any save method."""
     monkeypatch.chdir(tmp_path)
     _hub_raises(monkeypatch, error)
     with pytest.raises(RuntimeError):
@@ -239,9 +220,8 @@ def test_no_local_copy_still_raises(monkeypatch, tmp_path, error, save_method):
 
 
 def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
-    """The sink in `merge_and_overwrite_lora` is gated on `merged_16bit`, and the
-    save method the fallback fires for is the same variable the sink reads. Walk
-    the whole product and check the two are disjoint rather than assuming it."""
+    """The sink in `merge_and_overwrite_lora` reads the same save method variable the
+    fallback fires on, so walk the whole product and check the two are disjoint."""
     # Mirrors the gate in merge_and_overwrite_lora; pinned against the source below.
     def hits_the_silent_no_op(base_model_is_quantized, quant_type, save_method):
         return (
@@ -250,12 +230,10 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             and save_method == "merged_16bit"
         )
 
-    # Whitespace-normalised fragments rather than one exact line. The property
-    # being pinned is which inputs the sink reads, and an exact match also failed
-    # on a reflow, a wrapped condition or an added comment, none of which change
-    # it. Behavioural coverage of the sink itself lives in the end-to-end merge
-    # tests, which need a real PeftModel; this only guards the premise that the
-    # disjointness walk below is computed against the right gate.
+    # Whitespace-normalised fragments, not one exact line: the property pinned is which
+    # inputs the sink reads, and an exact match also failed on a reflow. This only
+    # guards that the walk below is computed against the right gate; the sink's own
+    # behaviour is covered by the end-to-end merge tests.
     normalised = " ".join(inspect.getsource(saving_utils.merge_and_overwrite_lora).split())
     for fragment in (
         "base_model_is_quantized and",
@@ -291,21 +269,16 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             assert not hits_the_silent_no_op(is_quantized, quant_type, save_method), (
                 f"{label} + {save_method} fell back into the silent no-op"
             )
-    # 4 quant types x 6 save methods; fp8 resolves for all 6, the three 4bit
-    # types resolve for the two 4bit save methods only.
+    # 4 quant types x 6 save methods: fp8 resolves for all 6, the three 4bit types for
+    # the two 4bit save methods only.
     assert (resolved, raised) == (6 + 3 * 2, 3 * 4), (resolved, raised)
 
 
 def test_every_merge_call_site_passes_the_save_method():
-    """*Every* resolution inside `merge_and_overwrite_lora` must forward it, not
-    exactly two of them. The second one (the FP8 16bit sibling) is only reachable
-    under `merged_16bit`, where forwarding changes nothing, but leaving it out
-    would be a trap for the next person who widens the fallback.
-
-    The count assertion this replaces pinned the number of call sites rather than
-    the property that matters, so adding a legitimate third resolution failed a
-    test that has nothing to say about it.
-    """
+    """*Every* resolution must forward it, not exactly two of them. Forwarding changes
+    nothing for the FP8 16bit sibling, reachable only under `merged_16bit`, but omitting
+    it would trap whoever next widens the fallback. Asserted as a property, since a
+    count assertion would fail on a legitimate third resolution."""
     tree = ast.parse(inspect.getsource(saving_utils.merge_and_overwrite_lora).lstrip())
     calls = [
         node for node in ast.walk(tree)
@@ -323,16 +296,14 @@ def test_every_merge_call_site_passes_the_save_method():
         assert "save_method" in passed, ast.dump(call)
 
 
-# ---------------------------------------------------------------------------
 # A reachable Hub stays authoritative: nothing that resolved before changed.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS)
 def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
     monkeypatch, tmp_path, save_method,
 ):
-    """The fallback lives on the exception path only. With the Hub up, the 16bit
-    repo still wins at priority 3 for a 4bit merge exactly as it does today."""
+    """The fallback lives on the exception path only, so with the Hub up the 16bit repo
+    still wins at priority 3 for a 4bit merge."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
 
@@ -341,8 +312,8 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
     monkeypatch.setattr(
         saving_utils, "check_model_quantization_status",
-        # The local copy is consulted by its resolved absolute path, the Hub by
-        # the name as given, which is what tells the two calls apart here.
+        # The local copy is consulted by resolved absolute path, the Hub by the name as
+        # given, which is what tells the two calls apart.
         lambda name, token = None: (True, "nf4") if os.path.isabs(str(name)) else (False, None),
     )
 
@@ -358,8 +329,8 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
 def test_reachable_hub_absent_repo_still_falls_to_the_local_4bit_copy(
     monkeypatch, tmp_path, save_method,
 ):
-    """A genuinely absent repo was always priority 5, for every save method. The
-    new fallback must not have narrowed that."""
+    """A genuinely absent repo was always priority 5 for every save method, and the new
+    fallback must not have narrowed that."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
     # fsspec converts RepositoryNotFoundError into a plain FileNotFoundError.
@@ -379,8 +350,7 @@ def test_reachable_hub_absent_repo_still_falls_to_the_local_4bit_copy(
 def test_local_fp8_fallback_survives_for_every_save_method(
     monkeypatch, tmp_path, error, save_method,
 ):
-    """The FP8 fallback was unconditional on the save method before this change
-    and stays unconditional after it."""
+    """The FP8 fallback was unconditional on the save method and stays so."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _hub_raises(monkeypatch, error)
@@ -402,8 +372,8 @@ def test_local_fp8_fallback_survives_for_every_save_method(
 def test_priorities_1_and_2_still_never_probe_the_hub(
     monkeypatch, tmp_path, save_method, quant_config, source_info,
 ):
-    """These outrank every Hub answer and are resolved before the probe, so the
-    save method must not have introduced a reason to consult it."""
+    """These outrank every Hub answer and resolve before the probe, so the save method
+    must not have introduced a reason to consult it."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), quant_config)
     _forbid_hub(monkeypatch)
