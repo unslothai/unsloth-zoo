@@ -1681,6 +1681,52 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
     return prompt, prompt + chosen, prompt + rejected
 
 
+class PreferenceBatchList(list):
+    """The materialized preference batches, plus the length of ONE dataset pass.
+
+    ``create_preference_batches`` is eager: it returns fully built
+    ``(batch, lengths, None)`` tuples rather than a lazy
+    ``FiniteTextBatchPlan`` / ``FiniteVLMBatchPlan``. The trainer nevertheless
+    needs the one-pass micro-batch count to force HF's epoch-final optimizer
+    step -- ``_mlx_epoch_microbatches`` and ``_callback_batches_per_epoch`` both
+    read it as ``getattr(batches, "cycle_length", None)``, and a plain ``list``
+    cannot carry it. Without it those helpers fall back to None under
+    ``max_steps > 0``, so a ragged pass (e.g. 3 preference batches with
+    ``gradient_accumulation_steps=2``) never force-updates on its tail: batch 3
+    is accumulated together with the next pass's batch 1, changing the effective
+    gradient and moving the callback/save/eval epoch boundaries away from the
+    SFT finite-plan path.
+
+    Subclassing ``list`` keeps every existing consumer byte-identical -- the
+    trainer indexes and modulo-cycles this (``batches[i % len(batches)]``) and
+    its ``isinstance`` gates all test against the lazy plan types
+    (``_FINITE_BATCH_PLAN_TYPES`` / ``_EAGER_REFETCHABLE_PLAN_TYPES``), which a
+    list subclass deliberately does not join: these batches are already
+    materialized and must not be refetched.
+    """
+
+    __slots__ = ("cycle_length",)
+
+    def __init__(self, batches=(), *, cycle_length=None):
+        super().__init__(batches)
+        # Micro-batches in ONE pass over the row set. Deliberately NOT clamped to
+        # len(self): a sub-one-pass run (num_batches below the pass length) has a
+        # boundary it never reaches, and the SFT/VLM plans count their pass the
+        # same way -- independently of the num_batches horizon.
+        self.cycle_length = (
+            None if cycle_length is None else max(1, int(cycle_length))
+        )
+
+    def __reduce__(self):
+        # __slots__ on a list subclass leaves no __dict__ for the default
+        # list reducer to restore, so spell the round-trip out (checkpoint /
+        # resume paths deep-copy prepared batches).
+        return (self.__class__, (list(self),), {"cycle_length": self.cycle_length})
+
+    def __setstate__(self, state):
+        self.cycle_length = state.get("cycle_length")
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
@@ -1932,7 +1978,13 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is not None and len(out) >= num_batches:
             break
     mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
-    return out
+    # len(base_starts) == ceil(len(rows) / batch_size) is the one-pass count in
+    # EVERY ordering branch above: "default"/"torch_randperm" with num_batches
+    # cycle base_starts (or reseeded row permutations of the same length), the
+    # num_epochs branch concatenates that many whole passes, and
+    # "sequential"/single-pass use base_starts directly. len(out) is therefore
+    # not the pass length once num_epochs expands or num_batches truncates.
+    return PreferenceBatchList(out, cycle_length=len(base_starts) or None)
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
