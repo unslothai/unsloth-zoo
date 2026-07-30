@@ -16,12 +16,9 @@
 
 """8-bit first-moment optimizer state for MLX.
 
-These assert BEHAVIOUR over steps, not construction: a quantized moment that is
-built correctly but trains wrongly is the failure mode that matters.
-
-CPU/Metal, synthetic models only -- no weights, no network, no ``Dataset.map``
-(so the spawn-vs-fork start-method matrix that applies to dataset code is not
-relevant here; nothing in this path is handed to a worker process).
+Behaviour over steps, not construction. Real MLX required, so this skips on Linux;
+the routing half runs under the torch shim. No ``Dataset.map`` here, so the
+spawn-vs-fork matrix does not apply.
 """
 
 import tempfile
@@ -48,7 +45,6 @@ STEPS = 8
 
 
 def _build_model(width=256):
-    """Deterministic 2-layer MLP whose weights ARE quantization-eligible."""
     mx.random.seed(0)
     model = nn.Sequential(nn.Linear(width, width), nn.ReLU(), nn.Linear(width, width))
     mx.eval(model.parameters())
@@ -56,12 +52,7 @@ def _build_model(width=256):
 
 
 def _build_ineligible_model():
-    """Every trainable parameter is ineligible for mx.quantize.
-
-    Linear(96, 100) has last dim 100, which is not a multiple of 64; biases are
-    1-D. Nothing here can be quantized, so the optimizer must fall back to fp32
-    moments throughout and still train.
-    """
+    """Nothing here is quantization-eligible: 100 is not a multiple of 64."""
     mx.random.seed(0)
     model = nn.Sequential(nn.Linear(96, 100), nn.ReLU(), nn.Linear(100, 100))
     mx.eval(model.parameters())
@@ -98,13 +89,8 @@ def _train(optimizer, model, x, y, steps=STEPS, compiled=False):
 
 
 def _state_bytes(state):
-    """Sum every array in the state tree.
-
-    Default traversal only: a quantized moment is a tuple/list of arrays, which
-    tree_flatten descends into as ``<param>.m.0/.1/.2`` -- the same flattening
-    save_optimizer_state relies on. Marking tuple/list as a leaf here would stop
-    the walk at the top-level ``layers`` list and count almost nothing.
-    """
+    """Sum every array in the state tree. Default traversal only: marking
+    tuple/list as a leaf would stop at the top-level ``layers`` list."""
     return sum(v.nbytes for _, v in tree_flatten(state) if isinstance(v, mx.array))
 
 
@@ -187,7 +173,7 @@ def test_quantized_state_saves_reloads_and_resumes_identically():
 
 # 5 ------------------------------------------------------------------------
 def test_second_moment_is_never_quantized():
-    """Guard: quantizing v diverges to NaN, so it must not be silently enabled."""
+    """Quantizing v diverges to NaN; it must not be silently enabled."""
     x, y = _batch()
     opt = QuantizedMomentAdam(1e-3, bias_correction=True)
     _train(opt, _build_model(), x, y, steps=2)
@@ -219,7 +205,7 @@ def test_compiled_and_uncompiled_agree():
 
 # 7 ------------------------------------------------------------------------
 def test_model_with_no_quantizable_parameters_still_trains():
-    """Most likely real-world break: nothing is eligible, so every moment is fp32."""
+    """Nothing eligible -> every moment fp32, must still train."""
     model = _build_ineligible_model()
     opt = QuantizedMomentAdam(1e-3, bias_correction=True)
 
@@ -242,12 +228,7 @@ def test_model_with_no_quantizable_parameters_still_trains():
 # 8 ------------------------------------------------------------------------
 @pytest.mark.parametrize("bits", [2, 4, 16, 32])
 def test_bit_widths_other_than_8_are_rejected(bits):
-    """Don't ship an unexercised knob: narrower widths are refused, not offered.
-
-    Optimizer moments are demonstrably quantization-sensitive -- affine 8-bit
-    quantization of the SECOND moment already diverges to NaN -- so a width with
-    no convergence evidence must not be silently accepted.
-    """
+    """Narrower widths are refused, not offered untested."""
     with pytest.raises(ValueError, match=r"supports bits=8 only"):
         QuantizedMomentAdam(1e-3, bits=bits)
     with pytest.raises(ValueError, match=r"supports bits=8 only"):
@@ -257,7 +238,7 @@ def test_bit_widths_other_than_8_are_rejected(bits):
 # 9 ------------------------------------------------------------------------
 @pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
 def test_every_supported_group_size_trains(group_size):
-    """Each advertised group size is exercised, not just the default."""
+
     x, y = _batch()
     opt = QuantizedMomentAdam(1e-3, bias_correction=True, group_size=group_size)
     losses = _train(opt, _build_model(), x, y)
@@ -276,7 +257,7 @@ def test_unsupported_group_size_is_rejected(group_size):
 
 # 10 -----------------------------------------------------------------------
 def test_adamw_variant_also_quantizes():
-    """The AdamW subclass inherits decoupled decay from the stock implementation."""
+
     x, y = _batch()
     opt = QuantizedMomentAdamW(1e-3, weight_decay=0.0, bias_correction=True)
     losses = _train(opt, _build_model(), x, y)

@@ -55,8 +55,7 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = (
     "adafactor", "adamw", "adam", "sgd", "muon", "lion",
-    # 8-bit variants quantize the optimizer's FIRST moment only; see
-    # unsloth_zoo/mlx/optimizers_quantized.py for why the second moment cannot be.
+    # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
     "adamw_8bit", "adam_8bit",
 )
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
@@ -747,11 +746,8 @@ def _normalize_mlx_optimizer_name(name):
         name = name.value
     opt_name = str(name or "adamw").strip().lower()
     opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
-    # "adamw_8bit" / "adam_8bit" are NOT collapsed: they route to a real 8-bit
-    # first-moment optimizer. "paged_*" and "*_bnb_*" stay collapsed on purpose --
-    # "paged" promises CPU offload and "bnb" names a library MLX does not use, so
-    # routing them to this implementation would substitute a different wrong
-    # answer for the current one.
+    # "*_8bit" route to a real 8-bit optimizer. "paged_*" / "*_bnb_*" stay
+    # collapsed: they promise CPU offload / a library MLX does not use.
     if opt_name in (
         "paged_adamw_8bit",
         "adamw_bnb_8bit",
@@ -3349,9 +3345,7 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name in ("adamw_8bit", "adam_8bit"):
-            # 8-bit FIRST moment only. Print rather than route silently: the old
-            # behaviour rewrote adamw_8bit to fp32 adamw with no message, and a
-            # quieter surprise would be no improvement.
+            # Print rather than route silently: the old path was a quiet rewrite.
             from .optimizers_quantized import (
                 QuantizedMomentAdam,
                 QuantizedMomentAdamW,

@@ -16,46 +16,34 @@
 
 """8-bit optimizer state for MLX: quantized Adam/AdamW FIRST moment.
 
-Adam keeps two fp32 buffers per parameter (``m``, ``v``), so optimizer state is
-2x the trainable-parameter bytes. Storing ``m`` as 8-bit packed arrays cuts that
-materially at no measurable cost to the loss curve.
+Adam holds two fp32 buffers per parameter, so state is 2x the trainable bytes.
+Packing ``m`` to 8 bits cuts that at no measurable cost: final loss 0.08318 vs an
+fp32 baseline of 0.08317 on the same seed.
 
-ONLY the first moment is quantized. The second moment stays fp32, deliberately:
-``v`` is a running mean of SQUARED gradients, so its values span many orders of
-magnitude and sit near zero early in training. MLX's ``mx.quantize`` is an affine
-per-group scheme, and the reconstruction error near zero is large relative to the
-value; ``sqrt(v)`` then lands in the update denominator and the step explodes.
-Measured on a 2-layer MLP, quantizing ``v`` diverges within three steps:
+``v`` is deliberately NOT quantized. It is a running mean of squared gradients, so
+it spans orders of magnitude and sits near zero early; MLX's affine ``mx.quantize``
+reconstructs poorly there, ``sqrt(v)`` lands in the denominator, and the step
+explodes - measured, for both int8 m+v and fp32 m + int8 v:
 
     1.0590 -> 0.8627 -> 19.3755 -> 10.2466 -> nan
 
-both for int8 m + int8 v and for fp32 m + int8 v. Quantizing ``m`` alone is
-stable: final loss 0.08318 against an fp32 baseline of 0.08317 on the same seed.
-Making ``v`` quantizable needs a dynamic/exponential mapping with stochastic
-rounding (what bitsandbytes implements); MLX exposes no such primitive, so this
-module does not pretend to offer it.
+That needs bitsandbytes-style dynamic quantization, which MLX does not expose.
 
-Two MLX-specific constraints are load-bearing here. Do not "simplify" them away:
+Two constraints are load-bearing; do not "simplify" them away:
 
-1. Optimizer state must contain ONLY ``mx.array`` leaves. ``Optimizer.state`` is
-   walked by ``tree_flatten`` (for checkpointing) and by ``mx.compile``'s
-   inputs/outputs. A plain Python ``bool`` stored alongside the moments raises
-   ``TypeError: object of type 'bool' has no len()``. Whether a moment is
-   quantized is therefore inferred from its VALUE, never from a stored flag.
+1. Optimizer state must hold ONLY ``mx.array`` leaves - it is walked by
+   ``tree_flatten`` (checkpointing) and ``mx.compile``. A Python ``bool`` beside
+   the moments raises ``TypeError: object of type 'bool' has no len()``, so
+   whether a moment is quantized is inferred from its value, never a stored flag.
 
-2. A quantized moment is the 3-tuple ``mx.quantize`` returns, but
-   ``mlx.utils.tree_map`` (used by ``Optimizer.apply_gradients``) and
-   ``tree_unflatten`` (used when reloading a checkpoint) rebuild containers, so
-   the triple comes back as a LIST. Checking ``isinstance(m, tuple)`` alone
-   silently misses the reloaded case and fails with
-   ``TypeError: can't multiply sequence by non-int of type 'float'``. Always test
+2. ``tree_map`` and ``tree_unflatten`` rebuild the quantized 3-tuple as a LIST, so
+   ``isinstance(m, tuple)`` alone misses the reloaded case and fails with
+   ``TypeError: can't multiply sequence by non-int of type 'float'``. Test
    ``(tuple, list)``.
 
-Verified against ``mx.compile`` with ``inputs=state, outputs=state`` (how
-MLXTrainer compiles its step): compiled and uncompiled runs are bit-identical.
-The quantized triple flattens to ``<param>.m.0/.1/.2``, all arrays, so
-``save_optimizer_state`` / ``load_optimizer_state`` round-trip it unchanged and a
-resumed step reproduces the continuous one exactly.
+Compiled and uncompiled runs are bit-identical under ``inputs=state,
+outputs=state``. The triple flattens to ``<param>.m.0/.1/.2``, so
+save/load_optimizer_state round-trip it and a resumed step reproduces exactly.
 """
 
 import mlx.core as mx
@@ -76,23 +64,15 @@ SUPPORTED_GROUP_SIZES = (32, 64, 128)
 
 
 class _QuantizedFirstMomentMixin:
-    """Store ``state["m"]`` 8-bit packed; delegate the update math to the parent.
-
-    ``apply_single`` dequantizes into the state, calls the parent (so bias
-    correction and AdamW's decoupled decay stay byte-for-byte the stock
-    implementation), then requantizes what the parent wrote back.
-    """
+    """Store ``state["m"]`` 8-bit packed; delegate the update math to the parent,
+    so bias correction and AdamW's decoupled decay stay the stock implementation."""
 
     def _init_quantization(self, group_size, bits):
-        # Plain instance attributes, NOT optimizer state: state holds arrays only
-        # (see the module docstring). self.betas / self.eps are stored the same way.
+        # Instance attributes, NOT optimizer state (which holds arrays only).
         bits = int(bits)
         if bits != DEFAULT_BITS:
-            # Rejected rather than offered untested. Optimizer state here is
-            # demonstrably quantization-sensitive, not theoretically so: affine
-            # 8-bit quantization of the SECOND moment already diverges to NaN
-            # (1.0590 -> 0.8627 -> 19.3755 -> nan). A narrower width for the first
-            # moment needs its own convergence evidence before it ships.
+            # Rejected rather than offered untested: this state is demonstrably
+            # quantization-sensitive (see the second-moment NaN trace above).
             raise ValueError(
                 f"Unsloth: quantized optimizer state supports bits={DEFAULT_BITS} "
                 f"only, got bits={bits}. Optimizer moments are quantization-"
@@ -109,12 +89,8 @@ class _QuantizedFirstMomentMixin:
         self.bits = bits
 
     def is_quantizable(self, parameter):
-        """``mx.quantize`` needs a 2-D array whose last dim divides group_size.
-
-        Everything else (biases, norms, embeddings with an odd width) keeps an
-        fp32 moment, so a model with no eligible parameter still trains -- it
-        just saves nothing.
-        """
+        """``mx.quantize`` needs 2-D with last dim divisible by group_size.
+        Everything else keeps an fp32 moment and still trains, saving nothing."""
         return parameter.ndim == 2 and parameter.shape[-1] % self.group_size == 0
 
     def init_single(self, parameter, state):
@@ -185,13 +161,8 @@ class QuantizedMomentAdamW(_QuantizedFirstMomentMixin, optim.AdamW):
 
 
 def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE):
-    """One-line description of what an 8-bit optimizer request actually gets.
-
-    The historical behaviour was to rewrite ``adamw_8bit`` to plain ``adamw``
-    with no message, so users asking for 8-bit silently got fp32 state. Replacing
-    that with a quieter surprise would be no better, so state the shape of the
-    saving explicitly.
-    """
+    """What an 8-bit request actually gets. The old behaviour rewrote
+    ``adamw_8bit`` to ``adamw`` silently; a quieter surprise would be no better."""
     return (
         f"Unsloth: {optimizer_name} on MLX quantizes the optimizer's FIRST moment "
         f"to 8-bit (group_size={group_size}); the second moment stays float32 "

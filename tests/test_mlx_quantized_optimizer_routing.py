@@ -16,11 +16,9 @@
 
 """Which optimizer names route to the 8-bit path, and what the user is told.
 
-Pure name/string logic, so it runs under the torch shim on Linux CI rather than
-skipping. The numeric behaviour of the quantized moment lives in
-test_mlx_quantized_optimizer_state.py, which needs real MLX and therefore only
-executes on Apple Silicon -- keeping the routing contract here means the gate
-still has something that actually runs.
+Pure name logic, so this runs under the torch shim on Linux CI instead of skipping.
+The numerics live in test_mlx_quantized_optimizer_state.py (real MLX only), so
+keeping the routing contract here means the gate still executes something.
 """
 
 import pytest
@@ -39,8 +37,7 @@ def _normalize(name):
 
 @pytest.mark.parametrize("name", ["adamw_8bit", "adam_8bit"])
 def test_8bit_names_reach_the_quantized_path(name):
-    """The regression: these were rewritten to plain fp32 adamw with no message,
-    so asking for an 8-bit optimizer silently got full-precision state."""
+    """These were rewritten to fp32 adamw with no message."""
     assert _normalize(name) == name, (
         f"{name} was collapsed to {_normalize(name)!r}; the 8-bit request is being "
         "silently downgraded to full-precision optimizer state"
@@ -55,9 +52,7 @@ def test_8bit_names_reach_the_quantized_path(name):
     "adamw_hf",
 ])
 def test_paged_and_bnb_names_still_collapse(name):
-    """Deliberate limit: "paged" promises CPU offload and "bnb" names a library
-    MLX does not use, so routing them here would swap one wrong answer for
-    another. They keep their existing behaviour."""
+    """Deliberate limit: "paged" promises CPU offload, "bnb" a library MLX lacks."""
     assert _normalize(name) == "adamw"
 
 
@@ -78,8 +73,7 @@ def test_8bit_names_are_advertised_as_supported():
 
 
 def test_description_states_what_is_and_is_not_quantized():
-    """The old behaviour was a silent rewrite; a quieter surprise is no better,
-    so the message must name the actual shape of the saving."""
+    """The message must name the actual shape of the saving."""
     from unsloth_zoo.mlx.optimizers_quantized import describe_quantized_optimizer
     message = describe_quantized_optimizer("adamw_8bit")
 
