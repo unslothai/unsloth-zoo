@@ -1133,7 +1133,13 @@ def create_new_function(
 
     pass
 
-    if overwrite or not os.path.isfile(function_location):
+    # distributed_function() is collective, so every rank has to reach it. Deciding
+    # locally lets a rank that arrives after rank 0 has written the file skip the
+    # collective, which desynchronises the group and hangs it. Rank 0 decides and
+    # broadcasts instead.
+    if distributed_function(
+        1, lambda: overwrite or not os.path.isfile(function_location)
+    ):
         try:
             distributed_function(1, write_file, function_location, write_new_source)
         except Exception as error:
