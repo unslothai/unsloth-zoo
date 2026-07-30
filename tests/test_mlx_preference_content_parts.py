@@ -16,31 +16,12 @@
 
 """Regression tests: preference rows carrying OpenAI-style content PARTS.
 
-A conversational ORPO/DPO row may carry ``content`` as a list of parts
-(``[{"type": "text", "text": "..."}]``) rather than a plain string -- the
-OpenAI chat shape that many public preference datasets use. The SFT chat path
-flattens those parts via ``_normalize_mlx_messages(..., is_vlm=False)`` before
-templating; ``_render_preference_example`` did not, so the raw part-lists
-reached ``apply_chat_template`` and real templates diverged in two ways:
-
-  1. CONCAT templates (Qwen2.5, SmolLM-Instruct) build the turn with
-     ``'<|im_start|>' + message.role + '\\n' + message.content``. Concatenating
-     a list onto a str raises ``TypeError: can only concatenate str (not
-     "list") to str`` -- a loud crash before any training.
-
-  2. STRING-GUARD templates (Qwen3) wrap the body in
-     ``{%- if message.content is string %}`` and leave the rendered content at
-     its empty default otherwise. A part-list row therefore renders every turn
-     EMPTY, silently: prompt+chosen and prompt+rejected come out byte-identical,
-     the ORPO odds-ratio term collapses to ``-logsigmoid(0) = log 2`` -- a
-     constant with zero gradient -- and the run trains on empty assistant turns
-     while its loss curve still looks plausible.
-
-The stub templates below reproduce those two real behaviors exactly; the
-mechanism was read off the shipped Qwen2.5 / Qwen3 Jinja templates and the
-outcomes were confirmed against the real tokenizers (see
-``test_real_tokenizers_render_content_parts``, which runs whenever those
-tokenizers are available locally).
+``_render_preference_example`` did not flatten list-valued ``content`` the way
+the SFT path does, and real templates diverged: CONCAT templates (Qwen2.5,
+SmolLM) raise ``TypeError`` on ``str + list``, while STRING-GUARD templates
+(Qwen3) render every turn EMPTY -- chosen and rejected come out identical, so
+the odds-ratio term is a constant log 2 with zero gradient and the run silently
+trains on nothing. The stubs below reproduce both behaviors.
 """
 
 from __future__ import annotations
@@ -98,7 +79,6 @@ class _ConcatTokenizer:
                             **kwargs):
         out = ""
         for message in messages:
-            # Mirrors `{{- '<|im_start|>' + message.role + '\n' + message.content ... }}`
             out += "<|im_start|>" + message["role"] + "\n" + message["content"] + "<|im_end|>\n"
         if add_generation_prompt:
             out += "<|im_start|>assistant\n"
@@ -128,10 +108,7 @@ def _identity_normalize(messages, **kwargs):
     return messages
 
 
-# --------------------------------------------------------------------------
-# 1. Document the bug: without normalization each template family misbehaves.
-# --------------------------------------------------------------------------
-
+# 1. Document the bug: without normalization each family misbehaves.
 def test_prefix_concat_template_raises_on_content_parts(monkeypatch):
     from unsloth_zoo.mlx import utils as U
 
@@ -153,10 +130,7 @@ def test_prefix_string_guard_template_silently_empties_turns(monkeypatch):
     assert chosen_str == rejected_str
 
 
-# --------------------------------------------------------------------------
-# 2. The fix: both template families render content, chosen != rejected.
-# --------------------------------------------------------------------------
-
+# 2. The fix: both families render content, chosen != rejected.
 @pytest.mark.parametrize("tokenizer", [_ConcatTokenizer(), _StringGuardTokenizer()],
                          ids=["concat", "string_guard"])
 def test_content_parts_render_like_plain_strings(tokenizer):
@@ -186,10 +160,7 @@ def test_plain_string_rows_are_unchanged():
     ) == ("Q: ", "Q: A4", "Q: A5")
 
 
-# --------------------------------------------------------------------------
-# 3. The consequence: the ORPO odds-ratio term regains a gradient.
-# --------------------------------------------------------------------------
-
+# 3. The consequence: the odds-ratio term regains a gradient.
 def test_identical_renders_make_odds_ratio_a_constant():
     """Pin WHY the silent case is harmful: equal logps => L_OR == log 2 exactly."""
     import mlx.core as mx
@@ -217,10 +188,7 @@ def test_fixed_render_gives_distinct_preference_sequences():
     assert abs(or_loss - math.log(2.0)) > 1e-3
 
 
-# --------------------------------------------------------------------------
 # 4. Same assertions against the real shipped templates, when available.
-# --------------------------------------------------------------------------
-
 REAL_TOKENIZERS = [
     "Qwen/Qwen3-0.6B",                        # string-guard: silently dropped
     "Qwen/Qwen2.5-0.5B-Instruct",             # concat: raised TypeError
@@ -234,7 +202,7 @@ def test_real_tokenizers_render_content_parts(model_id):
     pytest.importorskip("jinja2")
     try:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
-    except Exception as exc:  # not cached / no network -- not a failure signal
+    except Exception as exc:  # not cached / no network
         pytest.skip(f"{model_id} unavailable: {exc}")
     if not getattr(tokenizer, "chat_template", None):
         pytest.skip(f"{model_id} has no chat template")

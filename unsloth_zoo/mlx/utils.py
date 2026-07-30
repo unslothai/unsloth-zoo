@@ -1350,16 +1350,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     return loss_fn
 
 
-# ============================================================================
-# ORPO (Odds Ratio Preference Optimization) — text models.
-# Mirrors TRL/CUDA's concatenated-forward: chosen and rejected are stacked into
-# one batch (chosen block then rejected block) and run through a single forward,
-# then split. Loss follows the ORPO paper: L = L_SFT + beta * L_OR, where
-# L_OR = -log(sigmoid(log_odds_chosen - log_odds_rejected)) and the odds use the
-# full p/(1-p) form (not a simplified log-prob ratio). Built on this module's
-# own length-mask convention (see make_baseline_loss_fn), not ported from TRL
-# (no TRL on MLX) or copied from third-party MLX projects.
-# ============================================================================
+# ORPO (Odds Ratio Preference Optimization) — text models. Mirrors TRL's
+# concatenated forward (chosen block then rejected block, one pass, then split).
+# L = L_SFT + beta * L_OR with the full p/(1-p) odds form per the ORPO paper.
 def _orpo_odds_ratio_loss(logp_c, logp_r):
     """ORPO odds-ratio term L_OR, computed in float32 for numerical stability.
 
@@ -1978,12 +1971,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is not None and len(out) >= num_batches:
             break
     mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
-    # len(base_starts) == ceil(len(rows) / batch_size) is the one-pass count in
-    # EVERY ordering branch above: "default"/"torch_randperm" with num_batches
-    # cycle base_starts (or reseeded row permutations of the same length), the
-    # num_epochs branch concatenates that many whole passes, and
-    # "sequential"/single-pass use base_starts directly. len(out) is therefore
-    # not the pass length once num_epochs expands or num_batches truncates.
+    # len(base_starts) is the one-pass count in every ordering branch above;
+    # len(out) is not, once num_epochs expands or num_batches truncates.
     return PreferenceBatchList(out, cycle_length=len(base_starts) or None)
 
 

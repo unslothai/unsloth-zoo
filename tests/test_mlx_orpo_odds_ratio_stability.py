@@ -16,12 +16,9 @@
 
 """Regression test for ORPO odds-ratio numerical stability in float16.
 
-The odds-ratio term uses log(1 - p) = log(-expm1(logp)) with a 1e-12 floor.
-In float16 that floor underflows to 0.0, so a perfectly-predicted response row
-(logp -> 0, e.g. an empty response span) makes mx.log(0.0) = -inf and yields
-NaN gradients. The fix computes the term in float32 (mirroring TRL's
-ORPOTrainer.odds_ratio_loss upcast). This test pins that a float16 logp row
-with an exact 0.0 stays finite.
+The 1e-12 floor in log(1 - p) underflows to 0.0 in float16, so a
+perfectly-predicted row (logp -> 0) gives log(0) = -inf and NaN gradients.
+The term is computed in float32 instead, mirroring TRL's upcast.
 """
 
 from __future__ import annotations

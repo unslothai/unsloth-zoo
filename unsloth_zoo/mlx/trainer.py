@@ -5495,10 +5495,8 @@ class MLXTrainer:
             nonlocal eval_batches
             if eval_batches is not None or self.eval_dataset is None:
                 return eval_batches
-            # Preference losses (ORPO/DPO) have no eval path yet: never
-            # materialize eval batches, so neither the static cadence nor a
-            # callback request can run eval on SFT-shaped batches (which the
-            # preference loss would mis-split into [chosen; rejected] pairs).
+            # ORPO/DPO have no eval path: SFT-shaped eval batches would be
+            # mis-split into [chosen; rejected] pairs.
             if getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
                 return eval_batches
             eval_batch_size = (

@@ -16,23 +16,11 @@
 
 """Regression tests: preference batches must expose their one-pass length.
 
-``create_preference_batches`` is eager, so it returns materialized batches
-rather than a lazy ``FiniteTextBatchPlan``. The trainer still needs the
-micro-batch count of ONE dataset pass to force HF's epoch-final optimizer step:
-``_mlx_epoch_microbatches`` and ``_callback_batches_per_epoch`` both read it as
-``getattr(batches, "cycle_length", None)``.
-
-Returning a bare ``list`` left that None under ``max_steps > 0``, so a ragged
-pass never force-updated on its tail -- 3 preference batches with
-``gradient_accumulation_steps=2`` should update on batch 2 and then apply the
-epoch tail (batch 3) by itself, but instead accumulated batch 3 together with
-the next pass's batch 1. That changes the effective gradient and moves the
-callback/save/eval epoch boundaries off the SFT finite-plan path.
-
-``PreferenceBatchList`` carries the count. The pass length is deliberately NOT
-clamped to ``len(batches)``: ``num_epochs`` expansion makes the returned list
-several passes long, and a ``num_batches`` horizon can truncate it below one
-pass -- the same convention the SFT/VLM plans use.
+The trainer reads it as ``getattr(batches, "cycle_length", None)`` to force
+HF's epoch-final optimizer step. A bare ``list`` left that None under
+``max_steps > 0``, so a ragged pass folded its tail into the next pass instead
+of updating on it. The count is NOT clamped to ``len(batches)``: num_epochs
+makes the list several passes long and num_batches can truncate it below one.
 """
 
 from __future__ import annotations
@@ -74,7 +62,7 @@ def _install_shim():
 
 
 class _StubTokenizer:
-    """Minimal encoder: char codes, so prompt ids prefix prompt+completion ids."""
+    """Char codes, so prompt ids prefix prompt+completion ids."""
 
     eos_token_id = 7
     bos_token = None
@@ -106,10 +94,7 @@ def _args(max_steps=0, num_train_epochs=1.0):
     )
 
 
-# --------------------------------------------------------------------------
 # 1. The count itself.
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("n_pairs,batch_size", [(6, 2), (5, 2), (3, 2), (1, 4), (7, 3)])
 def test_cycle_length_is_one_pass(n_pairs, batch_size):
     batches = _build(n_pairs, batch_size)
@@ -138,10 +123,7 @@ def test_empty_dataset_reports_no_cycle():
     assert batches.cycle_length is None
 
 
-# --------------------------------------------------------------------------
-# 2. What the trainer does with it -- codex's ragged-tail scenario.
-# --------------------------------------------------------------------------
-
+# 2. What the trainer does with it -- the ragged-tail scenario.
 def test_bare_list_reports_no_epoch_boundary():
     """Document the bug: a plain list gives the helper nothing to work with."""
     from unsloth_zoo.mlx.trainer import _mlx_epoch_microbatches
@@ -166,10 +148,7 @@ def test_epoch_based_run_still_reports_a_boundary():
     assert _mlx_epoch_microbatches(_args(num_train_epochs=1.0), batches) == 3
 
 
-# --------------------------------------------------------------------------
 # 3. The container must stay a drop-in list.
-# --------------------------------------------------------------------------
-
 def test_behaves_like_the_list_it_replaces():
     batches = _build(6, 2)
     assert isinstance(batches, list)
