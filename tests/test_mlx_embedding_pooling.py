@@ -16,21 +16,13 @@
 
 """Pooling correctness and contrastive-loss behaviour on MLX.
 
-Two things are asserted that a weaker suite would miss.
+The padding fixture pads with junk at 100x so a mask-ignoring mean differs by ~26;
+that difference is asserted directly, so the invariance tests cannot pass against a
+broken implementation.
 
-Padding invariance: a pool that averages over padding produces no error, only
-worse embeddings. The fixture pads with junk at 100x scale so a mask-ignoring
-mean differs by ~26 -- that difference is asserted directly, so the test cannot
-pass against a broken implementation.
-
-Separation, not loss: a falling loss does not show the objective is doing what it
-claims. Each loss also asserts that positive/negative similarity SEPARATION rises.
-Note the synthetic encoder starts collapsed (all pairs ~0.995 cosine), so
-"positive similarity rises" is unreachable from that ceiling and would be the
-wrong assertion; separation is the metric that discriminates.
-
-Real MLX required, so this skips on Linux; the shim-runnable half is in
-test_mlx_embedding_guards.py. Synthetic tensors only -- no weights, no network.
+Each loss asserts that positive/negative SEPARATION rises, not just that the loss
+falls. The synthetic encoder starts collapsed (all pairs ~0.995 cosine), so
+"positive similarity rises" would be unreachable and the wrong assertion.
 """
 
 import pytest
@@ -62,7 +54,6 @@ STEPS = 8
 
 # --- pooling ---------------------------------------------------------------
 def _padded_fixture():
-    """Same content twice: once unpadded, once padded with extreme junk."""
     mx.random.seed(0)
     rows, length, width, pad = 3, 8, 5, 4
     hidden = mx.random.normal((rows, length, width))
@@ -90,10 +81,10 @@ def test_pooling_is_invariant_to_padding(mode):
 
 
 def test_mask_ignoring_mean_is_measurably_wrong():
-    """Discriminating counterexample: the fixture must be able to fail."""
+    """The fixture must be able to fail."""
     _, _, hidden_padded, mask_padded = _padded_fixture()
 
-    naive = hidden_padded.mean(axis=1)                       # ignores the mask
+    naive = hidden_padded.mean(axis=1)  # ignores the mask
     correct = pool(hidden_padded, mask_padded, "mean")
     difference = float(mx.abs(naive - correct).max())
 
@@ -110,13 +101,13 @@ def test_ragged_batch_mean_matches_hand_computation():
     mask = (mx.arange(8)[None, :] < lengths[:, None]).astype(mx.float32)
 
     pooled = pool(hidden, mask, "mean")
-    manual = hidden[1, :5, :].mean(axis=0)                   # row 1 has 5 real tokens
+    manual = hidden[1, :5, :].mean(axis=0)  # row 1 has 5 real tokens
 
     assert float(mx.abs(pooled[1] - manual).max()) < 1e-5
 
 
 def test_ragged_batch_lasttoken_uses_last_real_token():
-    """Row 1 has 5 real tokens, so lasttoken must return position 4, not 7."""
+    """Row 1 has 5 real tokens: position 4, not 7."""
     mx.random.seed(0)
     hidden = mx.random.normal((3, 8, 5))
     lengths = mx.array([8, 5, 2])
@@ -211,7 +202,7 @@ def _cosent_groups(encoder):
 
 
 def test_cosent_raises_similar_and_lowers_dissimilar():
-    """The cleanest evidence available: the two labelled groups move apart."""
+    """The two labelled groups move apart."""
     encoder = _new_encoder()
     similar_before, dissimilar_before = _cosent_groups(encoder)
 
@@ -250,7 +241,7 @@ def test_triplet_separates_positive_from_explicit_negative():
 
 
 def test_identical_inputs_give_no_separation():
-    """Sanity floor: anchors distilled against themselves cannot separate."""
+    """Self-similarity is 1."""
     encoder = _new_encoder()
     anchors, _, _, mask = _loss_fixture()
     embedded = l2_normalize(encoder(anchors, mask))
@@ -263,7 +254,7 @@ ST_REPO = "Qwen/Qwen3-Embedding-0.6B"
 
 
 def _cached_st_checkpoint():
-    """Resolve the cached repo WITHOUT downloading. Skips if it is not present."""
+    """Resolve the cached repo WITHOUT downloading."""
     huggingface_hub = pytest.importorskip("huggingface_hub")
     try:
         path = huggingface_hub.snapshot_download(ST_REPO, local_files_only=True)
@@ -277,8 +268,7 @@ def _cached_st_checkpoint():
 
 
 def test_real_st_checkpoint_needs_the_remap_and_loads_after_it():
-    """End to end on Qwen3-Embedding-0.6B: without the shim mlx_lm reports
-    'Received 310 parameters not in model'; with it the weights load and match."""
+    """Without the shim mlx_lm reports 'Received 310 parameters not in model'."""
     import json
     import os
 
@@ -291,14 +281,13 @@ def test_real_st_checkpoint_needs_the_remap_and_loads_after_it():
     path, weights_path = _cached_st_checkpoint()
     weights = mx.load(weights_path)
 
-    # The checkpoint really is in sentence-transformers layout.
     assert is_sentence_transformers_layout(weights.keys())
     assert not any(k.startswith("model.") for k in weights)
 
     config = json.load(open(os.path.join(path, "config.json")))
     model = qwen3.Model(qwen3.ModelArgs.from_dict(config))
     expected = {name for name, _ in tree_flatten(model.parameters())}
-    # Same count, zero overlap: exactly the prefix problem, not a real mismatch.
+    # same count, zero overlap: the prefix problem, not a real mismatch
     assert len(weights) == len(expected)
     assert not (set(weights) & expected)
 
@@ -318,7 +307,7 @@ def test_real_st_checkpoint_needs_the_remap_and_loads_after_it():
 
 
 def test_real_st_checkpoint_declares_lasttoken_pooling():
-    """Reading 1_Pooling is not optional: this model is not mean-pooled."""
+    """This model is not mean-pooled."""
     import json
     import os
 

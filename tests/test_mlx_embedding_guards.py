@@ -16,14 +16,10 @@
 
 """Sentence-transformers layout shim, pooling-mode detection, batch advisory.
 
-Pure dict/string/arithmetic logic, so this runs under the torch shim on Linux CI
-rather than skipping. The numeric behaviour lives in
-test_mlx_embedding_pooling.py, which needs real MLX.
-
-The layout shim matters because Qwen/Qwen3-Embedding-0.6B -- the obvious model for
-this feature -- does not load without it: sentence-transformers stores the inner
-transformer at the repo root, so all 310 keys arrive without the ``model.`` prefix
-mlx_lm expects and loading fails with "Received 310 parameters not in model".
+Pure logic, so this runs under the torch shim on Linux CI rather than skipping.
+The shim matters because Qwen3-Embedding-0.6B does not load without it: all 310
+keys arrive without the ``model.`` prefix and loading fails with
+"Received 310 parameters not in model".
 """
 
 import pytest
@@ -42,8 +38,7 @@ def _embedding():
 
 # --- pooling-mode detection --------------------------------------------------
 def test_pooling_map_matches_cuda_exactly():
-    """Same map as unsloth/models/sentence_transformer.py:587-599, so a checkpoint
-    resolves to the same mode on both backends."""
+    """Same map as sentence_transformer.py:587-599."""
     expected = {
         "pooling_mode_cls_token": "cls",
         "pooling_mode_mean_tokens": "mean",
@@ -56,7 +51,7 @@ def test_pooling_map_matches_cuda_exactly():
 
 
 def test_qwen3_embedding_resolves_to_lasttoken():
-    """Its real 1_Pooling/config.json. Defaulting to mean would pool the wrong thing."""
+    """Its real 1_Pooling/config.json; defaulting to mean would be wrong."""
     config = {
         "word_embedding_dimension": 1024,
         "pooling_mode_cls_token": False,
@@ -114,7 +109,6 @@ def test_remap_restores_the_model_prefix():
 
 
 def test_remap_preserves_values_identically():
-    """Values must pass through untouched -- only keys change."""
     e = _embedding()
     original = {k: f"tensor-{i}" for i, k in enumerate(ST_KEYS)}
     remapped = e.remap_sentence_transformer_weights(original)
@@ -147,7 +141,7 @@ def test_remap_does_not_double_prefix():
 
 # --- batch-size advisory -----------------------------------------------------
 def test_estimate_reproduces_the_measured_points():
-    """Fitted on measured Qwen3-0.6B steps: 4->4.76, 8->7.92, 16->14.24 GB."""
+    """Measured: 4->4.76, 8->7.92, 16->14.24 GB."""
     e = _embedding()
     for batch, measured in ((4, 4.76), (8, 7.92), (16, 14.24)):
         assert abs(e.estimate_peak_gb(batch) - measured) < 0.6, (
@@ -156,7 +150,7 @@ def test_estimate_reproduces_the_measured_points():
 
 
 def test_estimate_extrapolates_to_the_measured_batch32_point():
-    """Measured once at 26.46 GB (via swap) on a 16 GB machine."""
+    """Measured once at 26.46 GB via swap."""
     assert abs(_embedding().estimate_peak_gb(32) - 26.46) < 1.0
 
 
@@ -176,8 +170,7 @@ def test_recommendation_grows_with_ram_and_shrinks_with_seq_len():
 
 
 def test_small_machines_get_a_warning_not_an_exception():
-    """Advisory only: oversubscription here degrades into swap, not breakage, so a
-    hard refusal would be wrong."""
+    """Advisory: oversubscription degrades into swap, not breakage."""
     e = _embedding()
     batch, warning = e.recommend_batch_size(8)
     assert batch >= 1
