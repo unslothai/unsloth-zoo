@@ -109,6 +109,8 @@ jobs:
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
+            tests/test_mlx_preference_content_parts.py \
+            tests/test_mlx_preference_cycle_length.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
