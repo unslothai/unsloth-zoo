@@ -4895,8 +4895,13 @@ def _load_quant_config_or_raise(config_path, model_name_or_path):
         ) from e
 pass
 
-def check_model_quantization_status(model_name_or_path, token=None):
+def check_model_quantization_status(model_name_or_path, token=None, local_ok=True):
     """Check if a model is quantized (works for both HF and local)
+
+    `local_ok = False` asks the Hub about a name that also exists on disk. The caller
+    needs it when the local copy has already been rejected: a name can be both a
+    directory and a repo id, and re-reading the directory would answer with the copy
+    the caller could not use.
 
     Failing to READ the config is not the same as "not quantized". The bare `except:`
     this replaces answered `(False, None)` for a 429 or 5xx on the config fetch, so an
@@ -4906,7 +4911,7 @@ def check_model_quantization_status(model_name_or_path, token=None):
     """
     config = None
     # Local path
-    if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
+    if local_ok and os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
         config_path = os.path.join(model_name_or_path, "config.json")
         if os.path.exists(config_path):
             config = _load_quant_config_or_raise(config_path, model_name_or_path)
@@ -5010,6 +5015,7 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
     base = _strip_fp8_suffix(model_name)
     if not base:
         return None
+    local_rejected = False
     try:
         local = check_local_model_exists(base)
         if local and not check_model_quantization_status(local)[0]:
@@ -5018,11 +5024,16 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         # An unusable local candidate says nothing about the Hub. Its config.json cannot
         # be read, so it cannot be classified as the 16bit sibling, but the Hub may still
         # hold one: skip it and keep looking rather than answering "no sibling".
-        pass
+        local_rejected = True
     except Exception:
         return None
     try:
-        if check_hf_model_exists(base, token) and not check_model_quantization_status(base, token)[0]:
+        # `local_ok` only when it has to be: passing it always would break any caller that
+        # replaced this function with a two argument stand-in.
+        _ask_the_hub = {"local_ok": False} if local_rejected else {}
+        if check_hf_model_exists(base, token) and not check_model_quantization_status(
+            base, token, **_ask_the_hub,
+        )[0]:
             return base
     except RuntimeError as e:
         # An unreachable Hub is not "there is no 16bit sibling". None is still right,
@@ -5089,7 +5100,13 @@ def _local_snapshot_is_complete(local_path):
     if not seen_by_set: return True                      # a single file snapshot
     # Grouped by set, not by total: `model-00001-of-00002` plus a stale
     # `backup-00002-of-00002` is one shard of each, not both shards of one.
-    return any(
+    #
+    # Every set has to be whole, not just one of them. The merge enumerates every
+    # top-level `.safetensors` in the directory (`[f for f in os.listdir(model_name) if
+    # f.endswith(".safetensors")]`) and filters stale shards only against an index, so
+    # with no index a leftover partial set is not something it can skip: it gets read,
+    # and mismatched shapes are the "Bad in-place call" the filter below exists for.
+    return all(
         seen == set(range(1, total + 1))
         for (_prefix, total), seen in seen_by_set.items()
     )
@@ -5136,8 +5153,17 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     local_path = check_local_model_exists(model_name)
 
     local_is_quantized, local_quant_type = None, None
+    local_config_error = None
     if local_path:
-        local_is_quantized, local_quant_type = check_model_quantization_status(local_path)
+        try:
+            local_is_quantized, local_quant_type = check_model_quantization_status(local_path)
+        except RuntimeError as e:
+            # An unreadable config.json means this copy cannot be classified, which is not
+            # an answer about the Hub: the same name may resolve there to a base that can
+            # be read. Drop the candidate, keep the reason, and raise it at priority 6 if
+            # nothing else answers, where "not found" would be false.
+            local_config_error = e
+            local_path = None
 
     # Priority 1: Local unquantized
     if local_path and not local_is_quantized:
@@ -5165,7 +5191,14 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     try:
         hf_exists = check_hf_model_exists(model_name, token)
         if hf_exists:
-            hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
+            # A rejected local copy must not answer for the Hub: this name can be both a
+            # directory and a repo id, and the directory is the thing that could not be
+            # read. The keyword is passed only then, so the ordinary call stays two
+            # arguments wide for anyone who has stubbed this function.
+            _ask_the_hub = {"local_ok": False} if local_config_error is not None else {}
+            hf_is_quantized, hf_quant_type = check_model_quantization_status(
+                model_name, token, **_ask_the_hub,
+            )
     except RuntimeError:
         if local_path and local_is_quantized and \
             _local_base_completes_without_the_hub(local_quant_type, save_method, local_path):
@@ -5185,6 +5218,11 @@ def determine_base_model_source(model_name, token=None, save_method=None):
         return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
 
     # Priority 6: Nothing suitable found
+    if local_config_error is not None:
+        # There is a local copy and it cannot be read. Answering "nothing found", which the
+        # callers report as "not found locally or on Hugging Face", would send the user
+        # looking for the wrong thing.
+        raise local_config_error
     return (None, False, "", False, None)
 pass
 

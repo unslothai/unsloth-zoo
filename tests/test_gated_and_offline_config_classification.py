@@ -341,3 +341,81 @@ def test_an_exactly_named_local_directory_never_reaches_the_config_fetch(
     is_quantized, config = saving_utils.check_model_quantization_status(str(directory))
     assert is_quantized is True
     assert config is not None
+
+
+# An unreadable local config is not an answer about the Hub.
+
+def test_a_healthy_hub_base_is_used_when_the_local_config_cannot_be_read(monkeypatch, tmp_path):
+    """The local copy cannot be classified, so it cannot be chosen, and that says nothing
+    about the Hub: the same name resolves there to a base that can be read. Before this
+    branch the unreadable config was guessed unquantized and the broken directory was
+    merged from; raising instead would refuse a request the Hub could satisfy."""
+    _require_a_case_sensitive_filesystem(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    directory = os.path.join("outputs", "mymodel")
+    os.makedirs(directory, exist_ok = True)
+    open(os.path.join(directory, "model.safetensors"), "wb").close()
+    with open(os.path.join(directory, "config.json"), "w", encoding = "utf-8") as f:
+        f.write("{ truncated mid write")
+
+    def fake_ls(self, path, detail = True, **kwargs):
+        return [{"name": f"{path}/model.safetensors"}]
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+    # The Hub serves a readable config for the same name. Stubbed at the download, not at
+    # `check_model_quantization_status`, so the real function runs on both sides: the
+    # directory reaches the real parser and the real raise, which is the subject here.
+    good_config = tmp_path / "hub-config.json"
+    good_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
+    import huggingface_hub
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download",
+        lambda *args, **kwargs: str(good_config), raising = True,
+    )
+
+    name, is_local, source, is_quantized, quant_type = \
+        saving_utils.determine_base_model_source("outputs/mymodel")
+    assert name == "outputs/mymodel"
+    assert is_local is False
+    assert source == "HF_unquantized"
+
+
+def test_the_local_parse_error_is_what_surfaces_when_the_hub_has_nothing(monkeypatch, tmp_path):
+    """Nothing else answered, so the actionable fact is the local one. "Not found locally or
+    on Hugging Face" would be false: it is right there and unreadable."""
+    _require_a_case_sensitive_filesystem(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    directory = os.path.join("outputs", "mymodel")
+    os.makedirs(directory, exist_ok = True)
+    open(os.path.join(directory, "model.safetensors"), "wb").close()
+    with open(os.path.join(directory, "config.json"), "w", encoding = "utf-8") as f:
+        f.write("{ truncated mid write")
+
+    def absent(self, path, detail = True, **kwargs):
+        raise FileNotFoundError(f"{path} (repository not found)")
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", absent, raising = True)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel")
+    message = str(excinfo.value)
+    assert "config.json" in message, message
+    assert "not found locally or on Hugging Face" not in message
+
+
+def test_an_unreachable_hub_still_wins_over_an_unreadable_local_config(monkeypatch, tmp_path):
+    """Two things went wrong and only one is retryable. The transport failure is the one
+    that stopped the resolution, so it stays the one reported."""
+    _require_a_case_sensitive_filesystem(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    directory = os.path.join("outputs", "mymodel")
+    os.makedirs(directory, exist_ok = True)
+    open(os.path.join(directory, "model.safetensors"), "wb").close()
+    with open(os.path.join(directory, "config.json"), "w", encoding = "utf-8") as f:
+        f.write("{ truncated mid write")
+
+    def unreachable(self, path, detail = True, **kwargs):
+        raise ConnectionError("Temporary failure in name resolution")
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", unreachable, raising = True)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)

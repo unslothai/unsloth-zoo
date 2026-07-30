@@ -312,12 +312,24 @@ def test_shards_from_different_sets_do_not_complete_each_other(tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
-def test_one_complete_set_is_enough_beside_a_stray(tmp_path):
-    """The base is readable when any set is whole; a leftover from another is not a reason
-    to call the snapshot half downloaded."""
+def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
+    """One whole `model` set is not enough while a partial `backup` set sits next to it. The
+    merge takes every top-level `.safetensors` in the directory and filters stale shards only
+    against an index, so with no index the leftover is read too, and mismatched shapes are
+    the "Bad in-place call" that filter exists for."""
     directory = str(tmp_path)
     for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
                   "backup-00001-of-00002.safetensors"):
+        open(os.path.join(directory, shard), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+
+
+def test_two_whole_sets_are_complete(tmp_path):
+    """Nothing partial is left for the merge to trip on, so this is not the half downloaded
+    case the check is about."""
+    directory = str(tmp_path)
+    for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                  "backup-00001-of-00002.safetensors", "backup-00002-of-00002.safetensors"):
         open(os.path.join(directory, shard), "wb").close()
     assert saving_utils._local_snapshot_is_complete(directory) is True
 
@@ -486,11 +498,22 @@ def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_confi
     def fake_ls(self, path, detail = True, **kwargs):
         return [{"name": f"{path}/model.safetensors"}]
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
-    # Only the Hub is asked about the name as given; the local copy is asked by path.
+    # Stubbed at the download so the real classifier runs on both sides: the directory
+    # reaches the real parser and raises, the Hub serves a readable config for the same
+    # name. Without the local skip, the broken directory answers for the Hub too.
+    good_config = tmp_path / "hub-config.json"
+    good_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
+    import huggingface_hub
     monkeypatch.setattr(
-        saving_utils, "check_model_quantization_status",
-        lambda name, token = None: (False, None) if not os.path.isabs(str(name))
-        else (_ for _ in ()).throw(RuntimeError("config.json is unreadable")),
+        huggingface_hub, "hf_hub_download",
+        lambda *args, **kwargs: str(good_config), raising = True,
     )
 
-    assert saving_utils._resolve_fp8_16bit_sibling("unsloth/GLM-Air-FP8") == "unsloth/GLM-Air"
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        sibling = saving_utils._resolve_fp8_16bit_sibling("unsloth/GLM-Air-FP8")
+    assert sibling == "unsloth/GLM-Air"
+    assert [str(w.message) for w in caught
+            if "could not check the Hugging Face Hub" in str(w.message)] == [], (
+        "a local config problem must not be reported as an unreachable Hub"
+    )
