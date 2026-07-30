@@ -1995,3 +1995,106 @@ def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
     for name, mark in marks.items():
         assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
     assert _paligemma_pending_token_types() is None
+
+
+# --- gemma3n: AltUp correction at batch sizes above one ---------------------
+
+
+def _broken_altup(mx_, hidden=4, inputs=3):
+    """A stand-in shaped like the AltUp whose correction assumes a batch of one."""
+    from types import SimpleNamespace
+
+    class _Coefs:  # callable like the real nn.Linear, with a weight to clip
+        weight = mx_.zeros((inputs, hidden), dtype=mx_.float32)
+
+        def __call__(self, modalities):
+            return mx_.zeros((*modalities.shape[:-1], inputs), dtype=mx_.float32)
+
+    class _Altup:
+        config = SimpleNamespace(hidden_size=hidden, altup_num_inputs=inputs,
+                                 altup_coef_clip=None, altup_active_idx=0)
+        correction_coefs = _Coefs()
+
+        def compute_router_modalities(self, x):
+            return x
+
+        def correct(self, predictions, activated):
+            all_coefs = mx_.ones((*activated.shape[:-1], inputs), dtype=mx_.float32)
+            innovation = activated - predictions[self.config.altup_active_idx]
+            # The batch axis is treated as though it were last.
+            all_coefs = all_coefs.transpose(2, 1, 0)
+            corrected = innovation[None] * all_coefs[:, None]
+            corrected += predictions
+            return corrected.astype(activated.dtype)
+
+    return _Altup
+
+
+def test_gemma3n_altup_correction_survives_a_batch_larger_than_one():
+    """Upstream transposes its coefficients as though the batch axis were last,
+    which only broadcasts when the batch is one."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _VLM_MODEL_FIXUPS, _altup_correct_handles_batch, _fix_gemma3n_altup_batch,
+    )
+
+    assert _fix_gemma3n_altup_batch in _VLM_MODEL_FIXUPS
+
+    mx_ = _utils_mx()
+    # Distinct batch and sequence, or transposing the two would look the same.
+    hidden, inputs, seq, rows = 4, 3, 5, 2
+    cls = _broken_altup(mx_, hidden, inputs)
+    altup = cls()
+    assert not _altup_correct_handles_batch(altup), "fixture should start broken"
+
+    upstream_correct = cls.correct
+    model = SimpleNamespace(language_model=SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
+    assert _fix_gemma3n_altup_batch(model)
+    assert _altup_correct_handles_batch(altup)
+
+    # Rows are independent, so a batch must equal the rows corrected separately.
+    rng = np.random.default_rng(0)
+    activated = mx_.array(
+        rng.normal(size=(rows, seq, hidden)).astype(np.float32))
+    # Non-zero, or subtracting the active prediction would not be observable.
+    predictions = mx_.array(
+        rng.normal(size=(inputs, rows, seq, hidden)).astype(np.float32))
+    both = np.asarray(altup.correct(predictions, activated))
+    assert both.shape == (inputs, rows, seq, hidden)
+    for row in range(rows):
+        one = np.asarray(altup.correct(
+            predictions[:, row:row + 1], activated[row:row + 1]))
+        assert np.allclose(both[:, row:row + 1], one, atol=1e-5), \
+            f"row {row} differs when corrected in a batch"
+
+    # The formula stays upstream's. At a batch of one, where upstream is
+    # already right, the replacement has to reproduce it exactly.
+    one_act, one_pred = activated[:1], predictions[:, :1]
+    assert np.allclose(np.asarray(altup.correct(one_pred, one_act)),
+                       np.asarray(upstream_correct(altup, one_pred, one_act)),
+                       atol=1e-6), "the replacement changed the correction itself"
+
+
+def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
+    """Upstream repaired this in 0.5.0, so the backport must leave it alone."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _altup_correct_handles_batch, _fix_gemma3n_altup_batch,
+    )
+
+    mx_ = _utils_mx()
+    cls = _broken_altup(mx_)
+
+    def fixed(self, predictions, activated):
+        all_coefs = (self.correction_coefs(activated) + 1.0)
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        return (activated - predictions[0])[None] * all_coefs + predictions
+
+    cls.correct = fixed
+    altup = cls()
+    assert _altup_correct_handles_batch(altup)
+    model = SimpleNamespace(language_model=SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
+    assert not _fix_gemma3n_altup_batch(model)
+    assert cls.correct is fixed, "an already-correct release must be left alone"

@@ -2369,6 +2369,69 @@ def _fix_gemma3_multimodal_image_feature_scale(model=None):
     if model is not None:
         model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
     return True
+def _altup_correct_handles_batch(altup):
+    """True when this AltUp already corrects a batch larger than one."""
+    import mlx.core as mx
+    hidden = getattr(getattr(altup, "config", None), "hidden_size", None)
+    inputs = getattr(getattr(altup, "config", None), "altup_num_inputs", None)
+    if not hidden or not inputs:
+        return True  # cannot tell, so leave it alone
+    activated = mx.zeros((2, 1, int(hidden)), dtype=mx.float32)
+    predictions = mx.zeros((int(inputs), 2, 1, int(hidden)), dtype=mx.float32)
+    try:
+        mx.eval(altup.correct(predictions, activated))
+    except Exception:
+        return False
+    return True
+
+
+def _fix_gemma3n_altup_batch(model=None):
+    """Correct Gemma 3n's AltUp coefficients for batches larger than one.
+
+    The correction transposes its coefficients as though the batch axis were
+    last, which only broadcasts when the batch is one; anything larger fails
+    outright. Upstream repaired this in mlx-vlm 0.5.0, so this only ever runs
+    against older releases, whose source no longer changes.
+    """
+    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
+                     "layers", None)
+    altup = getattr(layers[0], "altup", None) if layers else None
+    if altup is None:
+        return False
+    model_cls = type(altup)
+    if getattr(model_cls, "_unsloth_altup_batch_patched", False):
+        return True
+    if _altup_correct_handles_batch(altup):
+        return False
+
+    import mlx.core as mx
+
+    def correct(self, predictions, activated):
+        modalities = self.compute_router_modalities(activated)
+        self.correction_coefs.weight = self.correction_coefs.weight.astype(mx.float32)
+        if self.config.altup_coef_clip is not None:
+            self.correction_coefs.weight = mx.clip(
+                self.correction_coefs.weight,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip,
+            )
+        all_coefs = self.correction_coefs(modalities) + 1.0
+        innovation = activated - predictions[self.config.altup_active_idx]
+        # Coefficients are (batch, sequence, input); the correction needs them
+        # as (input, batch, sequence, 1) so they broadcast over the hidden axis.
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        corrected = innovation[None] * all_coefs
+        corrected += predictions
+        return corrected.astype(activated.dtype)
+
+    try:
+        model_cls.correct = correct
+        model_cls._unsloth_altup_batch_patched = True
+    except Exception:
+        return False
+    return True
+
+
 def _paligemma_prefix_lm_mask(token_type_ids, attention_mask):
     """PaliGemma's prefix is bidirectional and only its suffix is causal.
 
@@ -2494,6 +2557,7 @@ _VLM_MODEL_FIXUPS = (
     _fix_gemma3_language_mlp_fp32_activation,
     _fix_gemma3_multimodal_image_feature_scale,
     _fix_paligemma_multimodal_causal_mask,
+    _fix_gemma3n_altup_batch,
 )
 
 
