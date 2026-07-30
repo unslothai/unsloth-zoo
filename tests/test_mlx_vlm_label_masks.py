@@ -2790,3 +2790,42 @@ def test_patched_audio_merge_places_each_row_own_features():
         assert out.dtype == mx_.bfloat16
     finally:
         remove_audio_merge_patch(model)
+
+
+def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
+    """Phi-4-multimodal's config.json declares neither token index.
+
+    Training threads the checkpoint mapping rather than the model's config
+    object, so both arrive absent and the compile preparation cannot read them
+    directly. mlx-vlm carries them as dataclass defaults.
+    """
+    from unsloth_zoo.mlx.utils import _phi4mm_token_ids
+
+    config_cls = pytest.importorskip("mlx_vlm.models.phi4mm.config").ModelConfig
+    fields = config_cls.__dataclass_fields__
+    expected = (int(fields["image_token_index"].default),
+                int(fields["audio_token_index"].default))
+
+    # The real checkpoint's shape: model_type present, neither index declared.
+    assert _phi4mm_token_ids({"model_type": "phi4mm"}) == expected
+    # A config that does declare them wins over the defaults.
+    assert _phi4mm_token_ids(
+        {"image_token_index": -7, "audio_token_index": 11}
+    ) == (-7, 11)
+    # One present, one absent: only the missing side falls back.
+    assert _phi4mm_token_ids({"image_token_index": -7}) == (-7, expected[1])
+
+
+def test_compile_preparation_survives_a_phi4mm_config_without_token_indices():
+    """The regression this guards is in the compile-preparation branch, not the
+    helper: training threads the checkpoint mapping, which declares neither
+    index, and `int(None)` raised there before the first step."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    pytest.importorskip("mlx_vlm.models.phi4mm.config")
+    batch = {
+        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
+    }
+    # The real checkpoint's config.json shape: model_type only.
+    _prepare_vlm_batch_for_compile(batch, {"model_type": "phi4mm"})

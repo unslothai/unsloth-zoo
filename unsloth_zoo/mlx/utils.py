@@ -2318,6 +2318,27 @@ def _config_to_mapping(config):
     }
 
 
+def _phi4mm_token_ids(config):
+    """Phi-4-multimodal's image and audio token ids.
+
+    Its checkpoint config.json declares neither; mlx-vlm supplies both as
+    dataclass defaults. Training threads the checkpoint mapping rather than the
+    model's config object, so read the defaults off the dataclass instead of
+    restating them here.
+    """
+    image_id = _config_get(config, "image_token_index")
+    audio_id = _config_get(config, "audio_token_index")
+    if image_id is None or audio_id is None:
+        from mlx_vlm.models.phi4mm.config import ModelConfig as _Phi4MMConfig
+
+        fields = _Phi4MMConfig.__dataclass_fields__
+        if image_id is None:
+            image_id = fields["image_token_index"].default
+        if audio_id is None:
+            audio_id = fields["audio_token_index"].default
+    return int(image_id), int(audio_id)
+
+
 def _normalize_grid_thw(grid_thw):
     if grid_thw is None:
         return None
@@ -3116,8 +3137,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         pixel_attention_mask = batch_dict.get("pixel_attention_mask")
         if input_ids is not None:
             input_ids_np = np.asarray(input_ids)
-            image_token_id = int(_config_get(config, "image_token_index"))
-            audio_token_id = int(_config_get(config, "audio_token_index"))
+            image_token_id, audio_token_id = _phi4mm_token_ids(config)
             batch_dict["image_token_positions"] = tuple(
                 tuple(
                     int(pos)
@@ -3153,8 +3173,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
             replacements = []
             image_idx = 0
             audio_idx = 0
-            image_token_id = int(_config_get(config, "image_token_index"))
-            audio_token_id = int(_config_get(config, "audio_token_index"))
+            image_token_id, audio_token_id = _phi4mm_token_ids(config)
             for batch_idx, row in enumerate(input_ids_np):
                 batch_replacements = []
                 for pos in image_positions[batch_idx]:
