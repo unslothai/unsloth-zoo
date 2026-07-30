@@ -342,6 +342,49 @@ def test_repo_types_that_cannot_be_a_base_model_stay_rejected(monkeypatch, name)
     assert saving_utils._is_hub_repo_id(name) is False
 
 
+# A root URI addresses the repository itself.
+
+@pytest.mark.parametrize("given, expected", [
+    pytest.param("hf://openai-community/gpt2/",  "openai-community/gpt2", id = "root-uri"),
+    pytest.param("hf://openai-community/gpt2//", "openai-community/gpt2", id = "doubled"),
+    pytest.param("hf://gpt2/",                   "gpt2",                  id = "single-segment"),
+])
+def test_a_trailing_slash_on_an_hf_uri_is_not_depth(given, expected):
+    """`resolve_path` normalizes `hf://org/repo/` to repo id `org/repo` with an empty path
+    in repo, so `ls` addresses the repository and the slash must not read as another
+    segment. Measured on 0.36.2: the error for a missing `hf://org/repo/` names `org/repo`."""
+    assert saving_utils._as_hub_addressed(given) == expected
+    assert saving_utils._is_hub_repo_id(given) is True
+
+
+@pytest.mark.parametrize("given", [
+    "outputs/mymodel/",
+    "./outputs/mymodel/",
+    "outputs/nested/mymodel/",
+])
+def test_a_trailing_slash_without_the_scheme_still_reads_as_a_directory(given):
+    """Only an explicit `hf://` makes the slash a Hub root. Bare, a trailing slash is how a
+    directory is written, and stripping it would turn `outputs/mymodel/` into a repo id and
+    send a local base to the Hub."""
+    assert saving_utils._is_hub_repo_id(given) is False
+
+
+def test_a_root_uri_is_probed_rather_than_reported_absent(monkeypatch):
+    """The regression the depth test could cause: an existing repo answered absent because
+    of a trailing slash, with no Hub round trip to disagree."""
+    seen = []
+
+    def fake_ls(self, path, detail = True, **kwargs):
+        seen.append(path)
+        return [{"name": f"{path}/model.safetensors"}]
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+
+    assert saving_utils.check_hf_model_exists("hf://openai-community/gpt2/") is True
+    assert seen == ["hf://openai-community/gpt2/"], (
+        "the name must reach `ls` unedited: `_as_hub_addressed` decides shape, not the argument"
+    )
+
+
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
 def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
     """The argument the revision split rests on, which nothing else pins.

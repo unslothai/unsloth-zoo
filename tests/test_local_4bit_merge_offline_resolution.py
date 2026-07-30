@@ -269,9 +269,10 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             assert not hits_the_silent_no_op(is_quantized, quant_type, save_method), (
                 f"{label} + {save_method} fell back into the silent no-op"
             )
-    # 4 quant types x 6 save methods: fp8 resolves for all 6, the three 4bit types for
-    # the two 4bit save methods only.
-    assert (resolved, raised) == (6 + 3 * 2, 3 * 4), (resolved, raised)
+    # 4 quant types x 6 save methods. fp8 resolves for the two 4bit merges and for
+    # `merged_16bit`, the one save method that applies its companion scales; the three
+    # 4bit types resolve for the two 4bit save methods only.
+    assert (resolved, raised) == (3 + 3 * 2, 3 + 3 * 4), (resolved, raised)
 
 
 def test_every_merge_call_site_passes_the_save_method():
@@ -346,11 +347,13 @@ def test_reachable_hub_absent_repo_still_falls_to_the_local_4bit_copy(
 
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
-@pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS + HUB_DEPENDENT_SAVE_METHODS)
-def test_local_fp8_fallback_survives_for_every_save_method(
+@pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS + ["merged_16bit"])
+def test_local_fp8_serves_the_save_methods_that_can_read_it(
     monkeypatch, tmp_path, error, save_method,
 ):
-    """The FP8 fallback was unconditional on the save method and stays so."""
+    """The 4bit merges take the weights from memory, and `merged_16bit` dequantizes the
+    stored ones through `_merge_and_overwrite_lora_fp8`. Both can finish from the local
+    copy, so an unreachable Hub must not stop them."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _hub_raises(monkeypatch, error)
@@ -362,6 +365,21 @@ def test_local_fp8_fallback_survives_for_every_save_method(
     assert source == "local_fp8"
     assert is_quantized is True
     assert quant_type == "fp8"
+
+
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+@pytest.mark.parametrize("save_method", [m for m in HUB_DEPENDENT_SAVE_METHODS if m != "merged_16bit"])
+def test_local_fp8_does_not_serve_the_rest(monkeypatch, tmp_path, error, save_method):
+    """Only `merged_16bit` applies the companion scales. The other save methods reach the
+    in place writer, which reads the stored tensor raw and writes it back at its FP8 dtype,
+    so a fallback there would fold the delta into scaled space and export a wrong base."""
+    monkeypatch.chdir(tmp_path)
+    _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    _hub_raises(monkeypatch, error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = save_method)
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS + HUB_DEPENDENT_SAVE_METHODS)

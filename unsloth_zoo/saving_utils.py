@@ -4564,6 +4564,11 @@ def _as_hub_addressed(model_name):
     name = str(model_name)
     explicit_uri = name.startswith("hf://")
     if explicit_uri: name = name[len("hf://"):]
+    # A root URI names the repo itself: `resolve_path("hf://org/repo/")` answers repo_id
+    # `org/repo` with an empty path in repo, so the trailing slash must not count toward
+    # the depth test below. Only under an explicit `hf://`, since a bare `outputs/model/`
+    # is how a directory is written and stripping there would send it to the Hub.
+    if explicit_uri: name = name.rstrip("/")
     # `models/` is a type prefix only under an explicit `hf://`. Bare, the commoner
     # reading is a local directory (`models/base/checkpoint-500` is what a Trainer
     # writes), and stripping it there would turn that path into the plausible repo id
@@ -5033,24 +5038,54 @@ pass
 # directory only to size the shards, so nothing on that path can reach the Hub.
 _MERGES_FROM_LOADED_WEIGHTS = ("merged_4bit", "forced_merged_4bit")
 
-def _local_base_completes_without_the_hub(quant_type, save_method):
+def _local_snapshot_is_complete(local_path):
+    """Does this directory hold every shard its own index names?
+
+    `check_local_model_exists` answers on the first `.safetensors` it sees, which is the
+    right test for "is there a local copy" and the wrong one for "can the merge read the
+    whole base from it". A snapshot interrupted mid download keeps its index and some of
+    its shards, and a merge that reads only what is present rebuilds the index from
+    those shards, so the export looks finished and is missing layers.
+
+    No index means a single file snapshot, and the caller already saw that file.
+    An index that cannot be read answers False: completeness is unproven, and the
+    unreachable Hub is then the more honest failure.
+    """
+    index_path = os.path.join(local_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path): return True
+    try:
+        with open(index_path, encoding = "utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+        shards = set(weight_map.values())
+    except Exception:
+        return False
+    if not shards: return False
+    return all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards)
+pass
+
+def _local_base_completes_without_the_hub(quant_type, save_method, local_path):
     """Is a local quantized copy enough to finish `save_method` with no network?
 
     True lets `determine_base_model_source` hand back the local copy instead of
-    propagating an unreachable Hub, so the two grounds are exact rather than "local is
+    propagating an unreachable Hub, so each ground is exact rather than "local is
     probably fine":
 
-    FP8, any save method. `merge_and_overwrite_lora` dequantizes an FP8 base for
-    `merged_16bit` (`_merge_and_overwrite_lora_fp8`) and otherwise keeps the quant
-    config, so the local weights already suffice.
+    The 4bit merges, at any quantization. They hand the live model to
+    `merge_and_unload()` and never read base weights, so nothing on disk can be missing.
 
-    Any quantization, for the 4bit merges. They never read base weights at all.
+    FP8 under `merged_16bit`, if the snapshot is whole. That is the one save method whose
+    FP8 path (`_merge_and_overwrite_lora_fp8`) reads and dequantizes the stored weights,
+    which is both why the local copy suffices and why every shard has to be there.
 
-    Everything else keeps raising, notably nf4/fp4 under `merged_16bit`, where the
-    merge writes nothing: falling back there would restore the silent no-op.
+    Everything else keeps raising. Two cases make that concrete: nf4/fp4 under
+    `merged_16bit`, where the merge writes nothing, and FP8 under any other save method,
+    where the in place writer takes `file.get_tensor(key)` raw and writes it back at the
+    stored dtype, folding the delta into FP8 without its companion scale.
     """
-    if quant_type == "fp8": return True
-    return save_method in _MERGES_FROM_LOADED_WEIGHTS
+    if save_method in _MERGES_FROM_LOADED_WEIGHTS: return True
+    if quant_type == "fp8" and save_method == "merged_16bit":
+        return _local_snapshot_is_complete(local_path)
+    return False
 pass
 
 def determine_base_model_source(model_name, token=None, save_method=None):
@@ -5101,7 +5136,7 @@ def determine_base_model_source(model_name, token=None, save_method=None):
             hf_is_quantized, hf_quant_type = check_model_quantization_status(model_name, token)
     except RuntimeError:
         if local_path and local_is_quantized and \
-            _local_base_completes_without_the_hub(local_quant_type, save_method):
+            _local_base_completes_without_the_hub(local_quant_type, save_method, local_path):
             return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
         raise
 

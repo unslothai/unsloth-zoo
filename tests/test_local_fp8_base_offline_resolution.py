@@ -111,7 +111,7 @@ def test_local_fp8_resolves_when_the_hub_is_unreachable(monkeypatch, tmp_path, e
     _hub_raises(monkeypatch, error)
 
     name, is_local, source, is_quantized, quant_type = \
-        saving_utils.determine_base_model_source("outputs/mymodel")
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
 
     assert _same_path(name, tmp_path / "outputs" / "mymodel")
     assert is_local is True
@@ -128,7 +128,9 @@ def test_local_fp8_fallback_never_lands_on_the_silent_no_op(monkeypatch, tmp_pat
     _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _hub_raises(monkeypatch, error)
 
-    _, _, _, is_quantized, quant_type = saving_utils.determine_base_model_source("outputs/mymodel")
+    _, _, _, is_quantized, quant_type = saving_utils.determine_base_model_source(
+        "outputs/mymodel", save_method = "merged_16bit",
+    )
     assert is_quantized is True
     assert quant_type not in ("nf4", "fp4", "bitsandbytes")
 
@@ -142,7 +144,7 @@ def test_local_fp8_fallback_emits_no_warning(monkeypatch, tmp_path, error):
 
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
-        saving_utils.determine_base_model_source("outputs/mymodel")
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
     assert [str(w.message) for w in caught
             if issubclass(w.category, UserWarning)] == []
 
@@ -166,6 +168,123 @@ def test_local_4bit_still_raises_when_the_hub_is_unreachable(
     with pytest.raises(RuntimeError) as excinfo:
         saving_utils.determine_base_model_source("outputs/mymodel")
     assert "connectivity" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+@pytest.mark.parametrize("save_method", [
+    pytest.param(None,            id = "unknown"),
+    pytest.param("mxfp4",         id = "mxfp4"),
+    pytest.param("merged_16bit_forced", id = "merged_16bit_forced"),
+])
+def test_local_fp8_only_falls_back_for_the_16bit_merge(
+    monkeypatch, tmp_path, error, save_method,
+):
+    """FP8 is dequantized only on the `merged_16bit` path. Every other save method reaches
+    the in place writer, which takes the stored tensor with `file.get_tensor(key)` and
+    writes it back at its FP8 dtype, so the delta lands in scaled space without the
+    companion scale. Falling back there would turn an outage into a wrong export, which is
+    worse than the no-op this branch removes, so it keeps raising."""
+    monkeypatch.chdir(tmp_path)
+    _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    _hub_raises(monkeypatch, error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = save_method)
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit"])
+def test_the_4bit_merges_still_fall_back_at_any_quantization(monkeypatch, tmp_path, save_method):
+    """The complement of the narrowing: these read no base weights at all, so nothing on
+    disk can be missing and FP8 is not special to them."""
+    monkeypatch.chdir(tmp_path)
+    _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
+    _hub_raises(monkeypatch, ConnectionError("dns failure"))
+
+    _, is_local, source, _, quant_type = saving_utils.determine_base_model_source(
+        "outputs/mymodel", save_method = save_method,
+    )
+    assert is_local is True
+    assert source == "local_nf4"
+
+
+# A half downloaded snapshot is not a base the merge can read.
+
+def _shard(directory, name):
+    open(os.path.join(directory, name), "wb").close()
+
+
+def _write_index(directory, shards):
+    index = {"weight_map": {f"layer{i}.weight": shard for i, shard in enumerate(shards)}}
+    with open(os.path.join(directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
+        json.dump(index, f)
+
+
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+def test_a_partial_fp8_snapshot_does_not_satisfy_the_fallback(monkeypatch, tmp_path, error):
+    """`check_local_model_exists` answers on the first `.safetensors`, so an interrupted
+    download passes it. The merge would then rebuild the index from the shards present and
+    write a base missing layers, reported as a success."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    _shard(directory, "model-00001-of-00002.safetensors")
+    _write_index(directory, ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
+    _hub_raises(monkeypatch, error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
+
+
+def test_a_whole_sharded_fp8_snapshot_still_satisfies_the_fallback(monkeypatch, tmp_path):
+    """The narrowing must cost nothing when every shard is there."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for shard in shards: _shard(directory, shard)
+    _write_index(directory, shards)
+    _hub_raises(monkeypatch, ConnectionError("dns failure"))
+
+    _, is_local, source, _, quant_type = saving_utils.determine_base_model_source(
+        "outputs/mymodel", save_method = "merged_16bit",
+    )
+    assert is_local is True
+    assert source == "local_fp8"
+    assert quant_type == "fp8"
+
+
+def test_an_unsharded_fp8_snapshot_needs_no_index(monkeypatch, tmp_path):
+    """No index means one file, which the caller has already seen."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
+def test_an_unreadable_index_is_not_proof_of_completeness(tmp_path):
+    """Unproven completeness answers False: the unreachable Hub is the honest failure."""
+    directory = str(tmp_path)
+    with open(os.path.join(directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
+        f.write("{not json")
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+
+
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+def test_a_partial_snapshot_still_serves_the_4bit_merges(monkeypatch, tmp_path, error):
+    """Completeness is required only where base weights are read. The 4bit merges take
+    them from memory, so a missing shard is not their problem and refusing there would
+    withdraw a fallback that works."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), NF4_CONFIG)
+    _write_index(directory, ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"])
+    _hub_raises(monkeypatch, error)
+
+    _, is_local, source, _, _ = saving_utils.determine_base_model_source(
+        "outputs/mymodel", save_method = "merged_4bit",
+    )
+    assert is_local is True
+    assert source == "local_nf4"
 
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
