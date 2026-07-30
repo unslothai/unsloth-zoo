@@ -6469,6 +6469,8 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
+                if _stream_policy is not None:
+                    _stream_policy.armed = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
                 state = [model.state, optimizer.state, mx.random.state]
@@ -6749,6 +6751,9 @@ class MLXTrainer:
                     _use_compile = False
                     _compile_scope = "fallback_eager"
                     _compile_fallback_reason = "stream_signature_cap"
+                    # Nothing compiled will consume a grid width again, so the
+                    # eager tail should not keep paying to pad onto one.
+                    _stream_policy.armed = False
                     state = [model.state, optimizer.state, mx.random.state]
 
             _step_fn_for_batch = step_fn
@@ -6836,6 +6841,8 @@ class MLXTrainer:
                         _use_compile = False
                         _compile_scope = "fallback_eager"
                         _compile_fallback_reason = "runtime_error"
+                        if _stream_policy is not None:
+                            _stream_policy.armed = False
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         if rng_state_before is not None:

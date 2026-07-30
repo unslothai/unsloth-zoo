@@ -8186,6 +8186,10 @@ def test_stream_width_policy_and_registry_contracts():
         "stream_exact", False, 2)
     # One signature past the allowance the same object widens.
     assert gated(55) == 65 and gated.gate_released
+    # A permanent eager fallback disarms it; nothing compiled consumes a grid
+    # width again, so the tail must not keep padding onto one.
+    gated.armed = False
+    assert gated(55) is None
     assert rep().action == "stream_grid"
 
     registry = _StreamSignatureRegistry(1)
