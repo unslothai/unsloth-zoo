@@ -103,7 +103,11 @@ jobs:
         # + cache-completeness gate (CPU-pure; collect-only would let it
         # regress silently). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). Executing them here keeps fixture/source drift visible.
+        # no weights). test_mlx_gkd_guards pins the tokenizer-compatibility,
+        # config and memory-preflight contracts for distillation; it runs under
+        # the torch shim so it EXECUTES here rather than skipping (the numeric
+        # half needs real MLX and runs on the Apple Silicon job). Executing them
+        # here keeps fixture/source drift visible.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -112,6 +116,7 @@ jobs:
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
+            tests/test_mlx_gkd_guards.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
