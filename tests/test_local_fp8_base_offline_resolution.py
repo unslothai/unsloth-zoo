@@ -262,6 +262,47 @@ def test_an_unsharded_fp8_snapshot_needs_no_index(monkeypatch, tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is True
 
 
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+def test_a_shard_name_declares_the_total_even_with_no_index(monkeypatch, tmp_path, error):
+    """The index is not the only thing that knows: `model-00001-of-00002.safetensors` says
+    one more should be here, and a download interrupted before the index arrived is exactly
+    the case an index check cannot see."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    _shard(directory, "model-00001-of-00002.safetensors")
+    _hub_raises(monkeypatch, error)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
+
+
+def test_every_shard_present_needs_no_index(monkeypatch, tmp_path):
+    """The complement: the naming is satisfied, so the missing index is not itself a
+    reason to refuse."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
+        _shard(directory, shard)
+    _hub_raises(monkeypatch, ConnectionError("dns failure"))
+
+    _, is_local, source, _, _ = saving_utils.determine_base_model_source(
+        "outputs/mymodel", save_method = "merged_16bit",
+    )
+    assert is_local is True
+    assert source == "local_fp8"
+
+
+def test_shards_that_disagree_on_the_total_are_not_complete(tmp_path):
+    """Two totals cannot both be right, and neither can be checked against the other."""
+    directory = str(tmp_path)
+    for shard in ("model-00001-of-00002.safetensors", "model-00001-of-00005.safetensors"):
+        open(os.path.join(directory, shard), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+
+
 def test_an_unreadable_index_is_not_proof_of_completeness(tmp_path):
     """Unproven completeness answers False: the unreachable Hub is the honest failure."""
     directory = str(tmp_path)
@@ -406,3 +447,31 @@ def test_sibling_lookup_stays_silent_for_a_genuinely_absent_sibling(monkeypatch,
         assert saving_utils._resolve_fp8_16bit_sibling("outputs/GLM-5.2-FP8") is None
     assert [str(w.message) for w in caught
             if issubclass(w.category, UserWarning)] == []
+
+
+def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_config(
+    monkeypatch, tmp_path,
+):
+    """A local candidate whose config.json cannot be read cannot be classified, and that is
+    not an answer about the Hub. Giving up there would dequantize the FP8 weights while a
+    full precision sibling sat on the Hub, so the local candidate is skipped and the lookup
+    continues."""
+    monkeypatch.chdir(tmp_path)
+    # `unsloth/GLM-Air-FP8` strips to `unsloth/GLM-Air`, which also exists locally, broken.
+    local_sibling = os.path.join("unsloth", "GLM-Air")
+    os.makedirs(local_sibling, exist_ok = True)
+    open(os.path.join(local_sibling, "model.safetensors"), "wb").close()
+    with open(os.path.join(local_sibling, "config.json"), "w", encoding = "utf-8") as f:
+        f.write("{ this is not json")
+
+    def fake_ls(self, path, detail = True, **kwargs):
+        return [{"name": f"{path}/model.safetensors"}]
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+    # Only the Hub is asked about the name as given; the local copy is asked by path.
+    monkeypatch.setattr(
+        saving_utils, "check_model_quantization_status",
+        lambda name, token = None: (False, None) if not os.path.isabs(str(name))
+        else (_ for _ in ()).throw(RuntimeError("config.json is unreadable")),
+    )
+
+    assert saving_utils._resolve_fp8_16bit_sibling("unsloth/GLM-Air-FP8") == "unsloth/GLM-Air"

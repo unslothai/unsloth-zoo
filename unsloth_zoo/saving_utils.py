@@ -5014,6 +5014,11 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         local = check_local_model_exists(base)
         if local and not check_model_quantization_status(local)[0]:
             return local
+    except RuntimeError:
+        # An unusable local candidate says nothing about the Hub. Its config.json cannot
+        # be read, so it cannot be classified as the 16bit sibling, but the Hub may still
+        # hold one: skip it and keep looking rather than answering "no sibling".
+        pass
     except Exception:
         return None
     try:
@@ -5038,6 +5043,9 @@ pass
 # directory only to size the shards, so nothing on that path can reach the Hub.
 _MERGES_FROM_LOADED_WEIGHTS = ("merged_4bit", "forced_merged_4bit")
 
+# `model-00001-of-00005.safetensors`, and the same shape under any prefix.
+_SHARD_NAME = re.compile(r"^.+-(\d+)-of-(\d+)\.safetensors$")
+
 def _local_snapshot_is_complete(local_path):
     """Does this directory hold every shard its own index names?
 
@@ -5047,20 +5055,38 @@ def _local_snapshot_is_complete(local_path):
     its shards, and a merge that reads only what is present rebuilds the index from
     those shards, so the export looks finished and is missing layers.
 
-    No index means a single file snapshot, and the caller already saw that file.
+    Without an index the shard names answer instead: `model-00001-of-00005.safetensors`
+    says four more should be here, so an interrupted download is caught even when the
+    index was not the part that arrived. No shard naming at all means a single file
+    snapshot, and the caller already saw that file.
+
     An index that cannot be read answers False: completeness is unproven, and the
     unreachable Hub is then the more honest failure.
     """
     index_path = os.path.join(local_path, "model.safetensors.index.json")
-    if not os.path.isfile(index_path): return True
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path, encoding = "utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            shards = set(weight_map.values())
+        except Exception:
+            return False
+        if not shards: return False
+        return all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards)
+
     try:
-        with open(index_path, encoding = "utf-8") as f:
-            weight_map = json.load(f).get("weight_map", {})
-        shards = set(weight_map.values())
-    except Exception:
+        entries = os.listdir(local_path)
+    except OSError:
         return False
-    if not shards: return False
-    return all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards)
+    seen_by_total = {}
+    for entry in entries:
+        match = _SHARD_NAME.match(entry)
+        if match is None: continue
+        seen_by_total.setdefault(int(match.group(2)), set()).add(int(match.group(1)))
+    if not seen_by_total: return True                    # a single file snapshot
+    if len(seen_by_total) != 1: return False             # shards disagree on the total
+    total, seen = next(iter(seen_by_total.items()))
+    return seen == set(range(1, total + 1))
 pass
 
 def _local_base_completes_without_the_hub(quant_type, save_method, local_path):
