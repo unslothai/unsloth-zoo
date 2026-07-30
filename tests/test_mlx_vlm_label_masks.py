@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 from pathlib import Path
@@ -2382,6 +2384,38 @@ def test_prompt_completion_audio_rides_the_prompt_half(monkeypatch):
                                return_prompt_completion=True)
 
 
+def test_prompt_completion_refuses_audio_stated_as_spans(monkeypatch):
+    """A span is an absolute coordinate into the half it was measured on, and
+    the combine joins the halves before flushing and truncating the result.
+    Letting it through would place the clip's audio on whatever landed there."""
+    class _Spans(_FakeGemmaAudioProcessor):
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            out = super().__call__(text, audio, max_length, **kwargs)
+            out["audio_bounds"] = [
+                np.array([[1, 4]] * v.count("<audio>"), np.int32) for v in text
+            ]
+            return out
+
+    processor = _Spans()
+    _qualify(monkeypatch, processor=processor)
+    with pytest.raises(NotImplementedError,
+                       match="spans, which prompt/completion collation can move"):
+        _finalized_collate([_PC_AUDIO_ROW], processor, 16, None,
+                           return_prompt_completion=True)
+    # Only audio rows are refused; the format itself still works for this family.
+    text_only = {"prompt": [{"role": "user", "content": "q"}],
+                 "completion": [{"role": "assistant", "content": "a"}]}
+    _finalized_collate([text_only], processor, 16, None,
+                       return_prompt_completion=True)
+    _finalized_collate([text_only, text_only], processor, 16, None,
+                       return_prompt_completion=True)
+    # The audio is on the later row: a first-row check would let this through.
+    with pytest.raises(NotImplementedError,
+                       match="spans, which prompt/completion collation can move"):
+        _finalized_collate([text_only, _PC_AUDIO_ROW], processor, 16, None,
+                           return_prompt_completion=True)
+
+
 def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
     """Production must build the pc_audio carrier and honor it at finalize."""
     import mlx.core as current_mx
@@ -2436,6 +2470,7 @@ def test_qualified_families_carry_their_probed_requirements():
         "gemma3n": frozenset({"0.4.4"}),
         "gemma4": frozenset({"0.4.4"}),
         "phi4mm": frozenset({"0.4.4"}),
+        "minicpmo": frozenset({"0.4.4"}),
     }
     # Gemma 4 was probed only on a newer transformers; this env pins an older.
     gemma4_like = type("Proc", (), {})
@@ -2812,20 +2847,549 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     assert _phi4mm_token_ids(
         {"image_token_index": -7, "audio_token_index": 11}
     ) == (-7, 11)
-    # One present, one absent: only the missing side falls back.
+    # One present, one absent: only the missing side falls back, either way
+    # round, so neither explicit value can be overwritten by the other's gap.
     assert _phi4mm_token_ids({"image_token_index": -7}) == (-7, expected[1])
+    assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
 
 
-def test_compile_preparation_survives_a_phi4mm_config_without_token_indices():
+def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     """The regression this guards is in the compile-preparation branch, not the
     helper: training threads the checkpoint mapping, which declares neither
-    index, and `int(None)` raised there before the first step."""
+    index, and `int(None)` raised there before the first step. Surviving the
+    call is not enough -- the positions have to come out where the real marker
+    ids sit, so resolving the wrong ids or swapping them is caught too."""
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
-    pytest.importorskip("mlx_vlm.models.phi4mm.config")
-    batch = {
-        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
-        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
-    }
+    config_cls = pytest.importorskip("mlx_vlm.models.phi4mm.config").ModelConfig
+    fields = config_cls.__dataclass_fields__
+    image_id = int(fields["image_token_index"].default)
+    audio_id = int(fields["audio_token_index"].default)
+
+    def _prepared(config, ids):
+        return _prepare_vlm_batch_for_compile({
+            "input_ids": mx.array([ids], dtype=mx.int32),
+            "attention_mask": mx.array([[1] * len(ids)], dtype=mx.int32),
+        }, config)
+
     # The real checkpoint's config.json shape: model_type only.
-    _prepare_vlm_batch_for_compile(batch, {"model_type": "phi4mm"})
+    prepared = _prepared({"model_type": "phi4mm"}, [7, image_id, 8, audio_id, 9])
+    assert prepared["image_token_positions"] == ((1,),)
+    assert prepared["audio_token_spans"] == (((3, 4),),)
+    # The markers are also resolved a second time, to rewrite the ids: a pair
+    # corrupted only there would leave the metadata above intact.
+    assert np.asarray(prepared["input_ids"]).tolist() == [
+        [7, image_id, 8, audio_id, 9]
+    ]
+    # An explicit config wins at the call site too, not only in the helper, and
+    # at both resolutions: the rewrite ignoring it would restore the defaults.
+    declared = _prepared({"model_type": "phi4mm", "image_token_index": 7,
+                          "audio_token_index": 9}, [7, image_id, 8, audio_id, 9])
+    assert declared["image_token_positions"] == ((0,),)
+    assert declared["audio_token_spans"] == (((4, 5),),)
+    assert np.asarray(declared["input_ids"]).tolist() == [
+        [7, image_id, 8, audio_id, 9]
+    ]
+
+# --- audio alignment from stated spans, for families whose run carries no id ---
+
+
+def _bounds_inputs(bounds, width=8, rows=1, features=1):
+    """A processor output shaped like MiniCPM-o's: spans, not identifiable runs.
+
+    The ids are one repeated token, which is what a placeholder run looks like;
+    tests that need a span landing on ordinary text overwrite them.
+    """
+    return {
+        "input_ids": np.zeros((rows, width), dtype=np.int32),
+        "attention_mask": np.ones((rows, width), dtype=np.int32),
+        "audio_bounds": bounds,
+        "audio_features": np.zeros((features, 80, 4), dtype=np.float32),
+    }
+
+
+def test_the_delimiters_around_an_audio_run_are_not_targets():
+    """A stated span covers the run's interior only, so the delimiters the
+    processor generated around it would otherwise stay supervised -- and they
+    are generated the same way the run is."""
+    from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
+
+    class _Delimited(_FakeProcessor):
+        tokenizer = type("_Tok", (_FakeTokenizer,), {
+            "audio_start_id": 151697, "audio_end_id": 151699})()
+
+    assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
+
+
+def test_audio_bounds_are_read_per_row():
+    from unsloth_zoo.mlx.utils import _audio_bounds_per_row
+
+    assert _audio_bounds_per_row({"input_ids": np.zeros((1, 4))}) is None
+    assert _audio_bounds_per_row(_bounds_inputs([[[1, 5]], [[2, 3], [4, 6]]])) == [
+        [(1, 5)], [(2, 3), (4, 6)]
+    ]
+
+
+@pytest.mark.parametrize("bounds, counts, message", [
+    ([[[1, 5]]], [2], "none may be dropped by truncation"),   # a clip lost its run
+    ([[[1, 3], [4, 6]]], [1], "no extra may be added"),       # one clip, two spans
+    ([[[3, 3]]], [1], "does not run forwards"),          # a run with no positions
+    ([[[5, 3]]], [1], "does not run forwards"),          # ends before it starts
+    ([[[1, 99]]], [1], "outside its 8 position"),        # truncation cut the run
+    # A negative start slices empty, which reads as "every position attended".
+    ([[[-1, 3]]], [1], "outside its 8 position"),
+    # The mismatch is on row 1: a check reading only the first row misses it.
+    ([[[1, 3]], [[1, 3]]], [1, 2], "row 1 carries 2 audio clip"),
+])
+def test_audio_bounds_reject_a_batch_that_cannot_be_aligned(bounds, counts, message):
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    with pytest.raises(ValueError, match=message):
+        _assert_audio_runs_intact(
+            _bounds_inputs(bounds, rows=len(counts), features=sum(counts)),
+            counts, _FakeProcessor(), 8,
+        )
+
+
+def test_the_projection_after_the_audio_tower_is_frozen_too():
+    """Freezing the encoder alone leaves the layer that projects its output into
+    the language model trainable, which a full fine-tune would pull into the
+    optimizer. Families name that layer differently."""
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    class _Module:
+        def __init__(self):
+            self.frozen = False
+
+        def freeze(self, recurse=False):
+            self.frozen = True
+
+    class _MiniCPMOish:
+        def __init__(self):
+            self.audio_tower = _Module()
+            self.audio_projection_layer = _Module()
+
+    model = _MiniCPMOish()
+    assert set(freeze_audio_modules(model)) == {
+        "audio_tower", "audio_projection_layer",
+    }
+    assert model.audio_tower.frozen and model.audio_projection_layer.frozen
+
+
+def test_stated_spans_refuse_the_left_padding_repair():
+    """The repair moves each row's tokens forward but re-derives nothing, so a
+    stated span would keep naming its pre-repair position and land the clip's
+    audio on whatever moved there. Both ends of a stale span can still be
+    attended, so no later check would catch it."""
+    from unsloth_zoo.mlx.utils import _right_pad_vlm_rows
+
+    left_padded = _bounds_inputs([[[4, 6]]], width=8)
+    left_padded["attention_mask"] = np.array([[0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
+        _right_pad_vlm_rows(left_padded, _FakeProcessor())
+
+    # Interior padding moves tokens just as leading padding does, so the refusal
+    # covers it and must not describe the layout as merely left-padded.
+    interior = _bounds_inputs([[[5, 7]]], width=8)
+    interior["attention_mask"] = np.array([[1, 1, 0, 0, 1, 1, 1, 1]], np.int32)
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
+        _right_pad_vlm_rows(interior, _FakeProcessor())
+
+    # Already content-first: the repair is a no-op and must not refuse.
+    right_padded = _bounds_inputs([[[1, 3]]], width=8)
+    right_padded["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0]], np.int32)
+    _right_pad_vlm_rows(right_padded, _FakeProcessor())
+
+    # These processors report the field on every batch, empty when there is no
+    # audio, so keying the refusal on the field would strand text-only rows.
+    no_audio = _bounds_inputs([[], []], width=8, rows=2, features=0)
+    no_audio["attention_mask"] = np.array([[0, 0, 1, 1, 1, 1, 1, 1],
+                                           [0, 1, 1, 1, 1, 1, 1, 1]], np.int32)
+    repaired = _right_pad_vlm_rows(no_audio, _FakeProcessor())
+    assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
+
+    # Only the text-only row moves. The audio row keeps its layout, so its spans
+    # keep naming the same tokens and the batch is repairable.
+    neighbour_moves = _bounds_inputs([[[1, 3]], []], width=8, rows=2)
+    neighbour_moves["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0],
+                                                  [0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
+    repaired = _right_pad_vlm_rows(neighbour_moves, _FakeProcessor())
+    assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
+
+    # The moving span-bearing row is not row 0, so checking only the first row's
+    # spans would repair this batch and strand row 1's coordinates.
+    later_row = _bounds_inputs([[[1, 3]], [[4, 6]]], width=8, rows=2, features=2)
+    later_row["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 0, 0],
+                                            [0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
+    with pytest.raises(ValueError, match=r"row\(s\) \[1\] content-first"):
+        _right_pad_vlm_rows(later_row, _FakeProcessor())
+
+
+def test_spans_that_do_not_name_a_placeholder_run_are_refused():
+    """These processors pair the n-th opening delimiter with the n-th closing
+    one, so a delimiter the rendered text carries itself shifts every later pair
+    onto ordinary tokens. The shifted span still counts, fits and attends: only
+    the tokens it names show it is wrong."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    shifted = _bounds_inputs([[[1, 4]]], width=8)
+    # start delimiter, prefix, start delimiter, placeholder, end delimiter, ...
+    shifted["input_ids"] = np.array([[9, 5, 9, 0, 8, 6, 6, 6]], dtype=np.int32)
+    with pytest.raises(ValueError, match="does not name a placeholder run"):
+        _assert_audio_runs_intact(shifted, [1], _FakeProcessor(), 8)
+
+    # Two rows whose runs disagree: one of them is not the placeholder token.
+    mixed = _bounds_inputs([[[1, 3]], [[1, 3]]], width=8, rows=2, features=2)
+    mixed["input_ids"] = np.array([[9, 0, 0, 8, 6, 6, 6, 6],
+                                   [9, 4, 4, 8, 6, 6, 6, 6]], dtype=np.int32)
+    with pytest.raises(ValueError, match="does not name a placeholder run"):
+        _assert_audio_runs_intact(mixed, [1, 1], _FakeProcessor(), 8)
+
+    # Two spans in one row, the second naming a different repeated token: a
+    # check comparing only each row's first span would accept this.
+    within_row = _bounds_inputs([[[1, 3], [4, 6]]], width=8, features=2)
+    within_row["input_ids"] = np.array([[9, 0, 0, 9, 4, 4, 8, 6]], dtype=np.int32)
+    with pytest.raises(ValueError, match="does not name a placeholder run"):
+        _assert_audio_runs_intact(within_row, [2], _FakeProcessor(), 8)
+
+    # And the batch this is all protecting: two rows, two clips, one marker.
+    valid = _bounds_inputs([[[1, 3]], [[1, 3], [4, 6]]], width=8, rows=2,
+                           features=3)
+    valid["input_ids"] = np.array([[9, 0, 0, 8, 6, 6, 6, 6],
+                                   [9, 0, 0, 9, 0, 0, 8, 6]], dtype=np.int32)
+    _assert_audio_runs_intact(valid, [1, 2], _FakeProcessor(), 8)
+
+
+def test_clips_the_extractor_would_truncate_are_refused():
+    """A clip past the extractor's window asks for positions whose audio the
+    model never receives. Sizing the run from the waveform also leaves it a
+    position or two above the embeddings on ordinary clips, which is upstream's
+    own rounding with the whole clip present -- that must still be accepted, or
+    every real batch is refused."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    class _Windowed(_FakeProcessor):
+        audio_processor = type("_Ex", (), {"n_samples": 16, "sampling_rate": 16})()
+
+    inputs = _bounds_inputs([[], [[1, 3]]], width=8, rows=2)
+    with pytest.raises(ValueError, match="row 1 carries a 17-sample audio clip"):
+        _assert_audio_runs_intact(inputs, [0, 1], _Windowed(), 8,
+                                  clips=[[], [np.zeros(17, np.float32)]])
+
+    # The second clip is the long one: checking only the first would miss it.
+    two_clips = _bounds_inputs([[], [[1, 3], [4, 6]]], width=8, rows=2, features=2)
+    with pytest.raises(ValueError, match="row 1 carries a 17-sample audio clip"):
+        _assert_audio_runs_intact(
+            two_clips, [0, 2], _Windowed(), 8,
+            clips=[[], [np.zeros(16, np.float32), np.zeros(17, np.float32)]],
+        )
+
+    _assert_audio_runs_intact(inputs, [0, 1], _Windowed(), 8,
+                              clips=[[], [np.zeros(16, np.float32)]])
+
+
+def test_text_carrying_the_audio_delimiters_itself_is_refused(monkeypatch):
+    """The processor pairs opening delimiters with closing ones across the whole
+    row, so one the text brought itself shifts the pairing, and truncation can
+    drop the generated span and leave the foreign one standing in for it at any
+    length -- including exactly the right one. Nothing downstream separates
+    them, so the text is refused before the processor expands it."""
+    class _Delimited(_FakeGemmaAudioProcessor):
+        tokenizer = type("_Tok", (_FakeGemmaAudioProcessor.tokenizer.__class__,), {
+            "audio_start_id": 301, "audio_end_id": 302,
+            "convert_ids_to_tokens": staticmethod(
+                lambda i: {301: "<|audio_start|>", 302: "<|audio_end|>"}.get(i)),
+        })()
+
+    processor = _Delimited()
+    _qualify(monkeypatch, processor=processor)
+    # Either delimiter alone is enough to shift the pairing, so each is refused
+    # on its own, not only a well-formed pair.
+    for text, named in (("<|audio_start|>x<|audio_end|> hi", "<|audio_start|>"),
+                        ("<|audio_start|> hi", "<|audio_start|>"),
+                        ("<|audio_end|> hi", "<|audio_end|>")):
+        row = _audio_row(_CLIP)
+        row["messages"][0]["content"][1]["text"] = text
+        with pytest.raises(ValueError, match=f"already contains {re.escape(named)}"):
+            _finalized_collate([row], processor, 16, None)
+
+    # The delimiter is on the second audio row: a check reading only the first
+    # would let it through and shift that row's spans.
+    later = _audio_row(_CLIP)
+    later["messages"][0]["content"][1]["text"] = "<|audio_start|> hi"
+    with pytest.raises(ValueError, match="row 1 already contains"):
+        _finalized_collate([_audio_row(_CLIP), later], processor, 16, None)
+
+    # The pairing is per row, so a row with no clip has none to disturb: a
+    # text-only sibling may say whatever it likes beside an audio row.
+    sibling = _audio_row(None, text="<|audio_start|> plain")
+    _finalized_collate([_audio_row(_CLIP), sibling], processor, 16, None)
+
+
+def test_ragged_image_metadata_survives_an_audio_batch():
+    """An audio row may carry images too, and those rows were refused before
+    this family was qualified. Their per-row image coordinates are ragged for
+    the same reason the audio spans are, and the model indexes both by row."""
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    batch = _to_mx_vlm_batch({
+        "input_ids": np.zeros((2, 8), dtype=np.int32),
+        "audio_bounds": [np.zeros((0, 2), np.int32), np.array([[1, 3]])],
+        "image_bound": [np.array([[1, 3], [4, 6]]), np.array([[2, 5]])],
+        "tgt_sizes": [np.array([[4, 4], [4, 4]]), np.array([[8, 8]])],
+    })
+    assert [np.asarray(r).tolist() for r in batch["image_bound"]] == [
+        [[1, 3], [4, 6]], [[2, 5]]
+    ]
+    assert [np.asarray(r).tolist() for r in batch["tgt_sizes"]] == [
+        [[4, 4], [4, 4]], [[8, 8]]
+    ]
+
+
+def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
+    """The check can only see clips the collation passes it, so dropping that
+    wiring would leave it live but blind."""
+    class _Spans(_FakeGemmaAudioProcessor):
+        audio_processor = type("_Ex", (), {"n_samples": 4, "sampling_rate": 16})()
+
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            out = super().__call__(text, audio, max_length, **kwargs)
+            out["audio_bounds"] = [
+                np.array([[2, 5]] * v.count("<audio>"), np.int32) for v in text
+            ]
+            return out
+
+    processor = _Spans()
+    _qualify(monkeypatch, processor=processor)
+    with pytest.raises(ValueError, match="audio clip"):
+        _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+
+
+def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
+    """Reading rows and width off shape[0] and shape[1] would take a 3-D batch
+    for an 8-wide one and pass it on with its extra axis intact."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    inputs = _bounds_inputs([[[1, 3]]], width=8)
+    inputs["input_ids"] = np.zeros((1, 8, 1), dtype=np.int32)
+    inputs.pop("attention_mask")
+    with pytest.raises(ValueError, match="cannot verify audio alignment"):
+        _assert_audio_runs_intact(inputs, [1], _FakeProcessor(), 8)
+
+
+def test_audio_clips_are_grouped_per_row_when_the_processor_assigns_them():
+    """A flat list leaves the row assignment to a marker count over the rendered
+    text, which a chat template need not emit; every clip then lands on row 0.
+    Grouping per row states the assignment instead of leaving it inferable."""
+    from unsloth_zoo.mlx.utils import _format_vlm_audio_for_processor
+
+    class _MiniCPMOProcessor(_FakeProcessor):  # matched by class name, as images are
+        pass
+
+    # A row with two clips: keeping only the first would drop one, and the span
+    # count would then disagree with what the row carries.
+    clips = [[], ["one", "two"]]
+    assert _format_vlm_audio_for_processor(clips, _MiniCPMOProcessor()) == [
+        [], ["one", "two"]
+    ]
+    assert _format_vlm_audio_for_processor(clips, _FakeProcessor()) == ["one", "two"]
+    assert _format_vlm_audio_for_processor([[], []], _MiniCPMOProcessor()) is None
+
+
+def test_collation_hands_the_processor_the_grouping_it_assigns_by(monkeypatch):
+    """Whatever the helper decides is worth nothing if collation calls it without
+    the processor: the payload silently reverts to flat and rows are guessed."""
+    seen = {}
+
+    class _MiniCPMOish(_FakeGemmaAudioProcessor):
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            seen["audio"] = audio
+            flat = [clip for row in audio for clip in row] if audio else audio
+            return super().__call__(text, flat, max_length, **kwargs)
+
+    processor = _MiniCPMOish()
+    _qualify(monkeypatch, processor=processor)
+    audio_row = dict(_audio_row(None, placeholder_only=True), audio=_CLIP)
+    _finalized_collate([_audio_row(None, text="plain"), audio_row], processor, 16, None)
+    assert [len(row) for row in seen["audio"]] == [0, 1]
+
+
+def test_stated_spans_are_checked_instead_of_soft_token_runs():
+    """The run interior need not be an audio-specific token, so counting runs
+    would find none. A batch whose spans line up must still pass, and one whose
+    spans have no payload behind them must not: the placeholders would occupy
+    the sequence with nothing to merge into them."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    _assert_audio_runs_intact(_bounds_inputs([[[1, 5]]]), [1], _FakeProcessor(), 8)
+
+    without_payload = _bounds_inputs([[[1, 5]]])
+    without_payload.pop("audio_features")
+    with pytest.raises(ValueError, match="audio"):
+        _assert_audio_runs_intact(without_payload, [1], _FakeProcessor(), 8)
+
+    # Present is not enough: the payload has to carry one entry per span, no
+    # more and no fewer, or a clip's placeholders would be filled from another
+    # clip's features.
+    for features in (1, 3):
+        with pytest.raises(ValueError, match="audio"):
+            _assert_audio_runs_intact(
+                _bounds_inputs([[[1, 3], [4, 6]]], features=features), [2],
+                _FakeProcessor(), 8,
+            )
+    _assert_audio_runs_intact(
+        _bounds_inputs([[[1, 3], [4, 6]]], features=2), [2], _FakeProcessor(), 8,
+    )
+
+
+def test_audio_span_positions_are_excluded_from_the_loss():
+    """Placeholder positions are inputs, never text to predict, and they cannot
+    be masked by token id when the marker is the unknown token. Each row is
+    masked by its own spans: reusing row 0's would silently supervise one row's
+    audio while masking another's text."""
+    from unsloth_zoo.mlx.utils import _stage_vlm_label_mask_np
+
+    inputs = _bounds_inputs([[[2, 5]], [], [[0, 1], [6, 8]]], width=8, rows=3)
+    mask = _stage_vlm_label_mask_np(inputs)
+    assert mask[0].tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
+    assert mask[1].tolist() == [0] * 8
+    assert mask[2].tolist() == [1, 0, 0, 0, 0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("bounds, expected", [
+    # Rows holding different clip counts: stacking raises, and keeping only the
+    # first row would tell every later row it has no audio while its
+    # placeholders still occupy the sequence.
+    ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])], [[[1, 3]], [[1, 3], [4, 7]]]),
+    # A row without audio beside one with it: the empty row must stay empty and
+    # stay a row, or the audio row's index moves.
+    ([np.zeros((0, 2), np.int32), np.array([[1, 3]])], [[], [[1, 3]]]),
+])
+def test_ragged_audio_bounds_survive_conversion_to_mlx(bounds, expected):
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    batch = _to_mx_vlm_batch({
+        "input_ids": np.zeros((2, 8), dtype=np.int32),
+        "audio_bounds": bounds,
+        # Nested ints, the shape MiniCPM-o reports: no array to stack, so this
+        # rides the ordinary passthrough and needs no per-row handling.
+        "audio_feature_lens": [[9], [9, 4]],
+    })
+    assert [np.asarray(r).tolist() for r in batch["audio_bounds"]] == expected
+    assert batch["audio_feature_lens"] == [[9], [9, 4]]
+
+
+def test_audio_spans_are_masked_on_the_deferred_label_path_too():
+    """Processor output the host staging cannot claim decides its labels at
+    finalize instead, and that decision has to exclude the spans as well. The
+    response-mask path arrives here with labels already chosen, so masking only
+    while deriving them would supervise audio under train_on_responses_only."""
+    import mlx.core as current_mx
+    if current_mx is not mx:
+        pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
+    from unsloth_zoo.mlx.utils import _apply_vlm_label_masks
+
+    batch = {
+        "input_ids": mx.array([[5, 6, 7, 8, 9, 10]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1, 1, 1, 1]], dtype=mx.int32),
+        "audio_bounds": [mx.array([[2, 5]], dtype=mx.int32)],
+    }
+    derived = np.asarray(_apply_vlm_label_masks(batch)).tolist()
+    assert derived == [[5, 6, -100, -100, -100, 10]]
+
+    supplied = mx.array([[-100, -100, 7, 8, 9, 10]], dtype=mx.int32)
+    responses_only = np.asarray(_apply_vlm_label_masks(batch, supplied)).tolist()
+    assert responses_only == [[-100, -100, -100, -100, -100, 10]]
+
+    # Each row by its own spans: broadcasting row 0's would supervise row 1's
+    # audio positions and mask text it should be learning.
+    rows = {
+        "input_ids": mx.array([[5, 6, 7, 8, 9, 10]] * 2, dtype=mx.int32),
+        "attention_mask": mx.array([[1] * 6] * 2, dtype=mx.int32),
+        "audio_bounds": [mx.array([[0, 2]], dtype=mx.int32),
+                         mx.array([[4, 6]], dtype=mx.int32)],
+    }
+    assert np.asarray(_apply_vlm_label_masks(rows)).tolist() == [
+        [-100, -100, 7, 8, 9, 10], [5, 6, 7, 8, -100, -100],
+    ]
+
+
+def test_an_empty_audio_payload_is_not_audio():
+    """MiniCPM-o hands a text-only batch audio_features shaped (0, 80, 0).
+    Calling that audio would route the run eagerly and abort a strict one."""
+    from unsloth_zoo.mlx.utils import _vlm_batch_carries_audio
+
+    assert not _vlm_batch_carries_audio({"audio_features": np.zeros((0, 80, 0), np.float32)})
+    assert _vlm_batch_carries_audio({"audio_features": np.zeros((1, 80, 4), np.float32)})
+    # A payload can arrive as a plain sequence too, and an empty one is no more
+    # audio than an empty array is.
+    assert not _vlm_batch_carries_audio({"input_audio_embeds": []})
+    assert _vlm_batch_carries_audio({"input_audio_embeds": [object()]})
+
+
+def test_audio_spans_are_checked_against_attended_positions():
+    """A span covering padding is not placed on the tokens the model attends.
+    Rows reach here content-first, so the check is per row over the positions
+    the span names."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    # Row 1's span starts on content and runs off the end of it. Row 0 attends
+    # everything, so a check reading row 0's mask sees nothing wrong, and one
+    # reading only the span's first position sees nothing wrong either.
+    straddling = _bounds_inputs([[[1, 3]], [[3, 6]]], width=8, rows=2, features=2)
+    straddling["attention_mask"] = np.array([[1, 1, 1, 1, 1, 1, 1, 1],
+                                             [1, 1, 1, 1, 0, 0, 0, 0]], np.int32)
+    with pytest.raises(ValueError, match="row 1 .* covering padding"):
+        _assert_audio_runs_intact(straddling, [1, 1], _FakeProcessor(), 8)
+
+
+def test_audio_bounds_require_a_row_per_tokenized_row():
+    """Bounds are indexed per row by the model, so a count that disagrees with
+    the tokenized rows would silently leave a row's audio unplaced. All three
+    counts have to agree, in both directions."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    # Dataset rows and tokenized rows agree; only the bounds disagree, so a
+    # check comparing just those two would pass this batch.
+    inputs = _bounds_inputs([[[1, 3]]], width=8, rows=2, features=2)
+    with pytest.raises(ValueError, match="tokenized row"):
+        _assert_audio_runs_intact(inputs, [1, 1], _FakeProcessor(), 8)
+
+    # Bounds and dataset rows agree; the tokenized rows do not.
+    fewer_ids = _bounds_inputs([[[1, 3]], [[1, 3]]], width=8, rows=1, features=2)
+    with pytest.raises(ValueError, match="tokenized row"):
+        _assert_audio_runs_intact(fewer_ids, [1, 1], _FakeProcessor(), 8)
+
+    # And the other direction: more bounds rows than the batch has.
+    extra_bounds = _bounds_inputs([[[1, 3]], [[1, 3]], [[1, 3]]], width=8,
+                                  rows=2, features=2)
+    with pytest.raises(ValueError, match="tokenized row"):
+        _assert_audio_runs_intact(extra_bounds, [1, 1], _FakeProcessor(), 8)
+
+    # Bounds and tokenized rows agree; only the dataset rows do not, so a check
+    # comparing just those two would accept this.
+    extra_counts = _bounds_inputs([[[1, 3]], [[1, 3]]], width=8, rows=2, features=2)
+    with pytest.raises(ValueError, match="dataset row"):
+        _assert_audio_runs_intact(extra_counts, [1, 1, 1], _FakeProcessor(), 8)
+
+
+def test_overlong_rows_are_refused_by_what_the_model_attends():
+    """The run path caps each row's attended tokens. Capping the padded width
+    instead would refuse a batch it accepts, since padding is not the row's own
+    length."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact
+
+    padded = _bounds_inputs([[[1, 3]]], width=12)
+    padded["attention_mask"] = np.array([[1] * 6 + [0] * 6], dtype=np.int32)
+    _assert_audio_runs_intact(padded, [1], _FakeProcessor(), 8)
+
+    with pytest.raises(ValueError, match="row 0 is 12 tokens"):
+        _assert_audio_runs_intact(_bounds_inputs([[[1, 3]]], width=12), [1],
+                                  _FakeProcessor(), 8)
+
+    # Row 1 is the one over the cap: reading row 0's mask every time would
+    # accept it, since row 0 stays under.
+    later_row = _bounds_inputs([[[1, 3]], [[1, 3]]], width=12, rows=2, features=2)
+    later_row["attention_mask"] = np.array([[1] * 6 + [0] * 6, [1] * 12], np.int32)
+    with pytest.raises(ValueError, match="row 1 is 12 tokens"):
+        _assert_audio_runs_intact(later_row, [1, 1], _FakeProcessor(), 8)
