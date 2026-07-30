@@ -65,6 +65,7 @@ message is what tells the two apart, and it is byte identical at 1.16.0, 1.20.0,
 import http.server
 import inspect
 import json
+import sys
 import threading
 
 import huggingface_hub
@@ -301,6 +302,61 @@ def test_a_bare_models_prefix_stays_a_local_path(monkeypatch, name, capability):
         saving_utils, "_hub_addresses_typed_model_uris", lambda: capability,
     )
     assert saving_utils._is_hub_repo_id(name) is False
+
+
+def test_the_capability_probe_asks_about_the_resolver_not_just_the_parser(monkeypatch):
+    """`parse_hf_uri` mapping the prefix does not mean `resolve_path` reaches it.
+
+    Measured against a repo that exists, `resolve_path("models/openai-community/
+    gpt2")` fails on 0.34.6, 0.36.2 and 1.15.0 and succeeds on 1.16.0, 1.20.0 and
+    1.25.1. `parse_hf_uri` exists from 1.15, so a probe that asks only the parser
+    claims support on 1.15 that the resolver does not have. Both questions are
+    required, and this pins that: with the parser mapping the prefix but the resolver
+    not delegating to it, the answer must be False.
+    """
+    if "models/" in tuple(getattr(huggingface_hub.constants,
+                                  "REPO_TYPES_URL_PREFIXES", {}).values()):
+        pytest.skip("this release advertises models/ in the prefix table")
+
+    # A parser that maps the prefix is injected on every version, so this cell has
+    # the same discriminating power whether or not the installed release ships one.
+    # Asserting against the real `parse_hf_uri` would make the test vacuous on 0.x,
+    # where it is absent, which is how the parser-only probe passed review here.
+    import types
+    stub = types.ModuleType("huggingface_hub.utils._hf_uris")
+
+    class _Uri:
+        type = "model"
+        id = "namespace/name"
+        revision = None
+        path_in_repo = ""
+
+    stub.parse_hf_uri = lambda uri, endpoint = None: _Uri()
+    monkeypatch.setitem(sys.modules, "huggingface_hub.utils._hf_uris", stub)
+
+    def resolver_without_the_parser(self, path, revision = None):
+        # References no URI parser, which is the 1.15 and 0.x shape.
+        raise AssertionError("never called")
+
+    monkeypatch.setattr(
+        saving_utils.HfFileSystem, "resolve_path", resolver_without_the_parser,
+        raising = True,
+    )
+    assert saving_utils._hub_addresses_typed_model_uris() is False, (
+        "a parser that maps the prefix does not mean the resolver reaches it"
+    )
+
+    def resolver_with_the_parser(self, path, revision = None):
+        # The probe reads the code object, so the name has to be referenced for
+        # real; a mention in a comment must not count, and once did.
+        parse_hf_uri  # noqa: F821
+        raise AssertionError("never called")
+
+    monkeypatch.setattr(
+        saving_utils.HfFileSystem, "resolve_path", resolver_with_the_parser,
+        raising = True,
+    )
+    assert saving_utils._hub_addresses_typed_model_uris() is True
 
 
 @pytest.mark.parametrize("name", [

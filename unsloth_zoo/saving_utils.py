@@ -4528,21 +4528,41 @@ def _hub_addresses_typed_model_uris():
         0.36.2   resolve_path("models/openai-community/gpt2") -> FileNotFoundError
 
     `REPO_TYPES_MAPPING` contains `models` on both, so it cannot tell them apart.
-    Stripping the prefix unconditionally would be worse than leaving it: on 0.36.2 it
-    would probe `org/repo` and answer True for an address that version cannot reach.
+
+    Asking `parse_hf_uri` alone is not enough either, and this is measured rather
+    than argued: that function exists from 1.15, but `resolve_path` did not start
+    delegating to it until 1.16, so on 1.15 it maps the prefix while the resolver
+    still does not. Against a repo that exists, `resolve_path("models/openai-
+    community/gpt2")` fails on 0.34.6, 0.36.2 and 1.15.0 and succeeds on 1.16.0,
+    1.20.0 and 1.25.1, and only the two questions below track that exactly.
 
     Only `models/` is worth asking about. `datasets/`, `spaces/` and `kernels/` all
     resolve too, and are all rejected by the depth rule on purpose, because none of
     them can be the base model of a LoRA merge.
     """
+    # The prefix table, for the releases whose resolve_path consults it.
     try:
-        from huggingface_hub.utils._hf_uris import parse_hf_uri
+        from huggingface_hub import constants
+        if "models/" in tuple(constants.REPO_TYPES_URL_PREFIXES.values()):
+            return True
     except Exception:
-        try:
-            from huggingface_hub.hf_file_system import parse_hf_uri
-        except Exception:
-            return False
+        pass
+    # Otherwise the prefix is mapped only where resolve_path delegates to the URI
+    # parser. Both halves are required: the parser having the capability says
+    # nothing about whether the resolver reaches it.
+    #
+    # Asked of the code object rather than of the source text. A source match reads
+    # comments as code, which is not a hypothetical: the first version of the test
+    # for this function stubbed a resolver whose comment said `parse_hf_uri`, and the
+    # probe duly reported the capability. Names the bytecode references cannot lie
+    # that way, and `getsource` also fails outright where source is unavailable.
     try:
+        code = HfFileSystem.resolve_path.__code__
+        referenced = set(code.co_names)
+        for const in code.co_consts:            # nested helpers, e.g. the revision aligner
+            if hasattr(const, "co_names"): referenced |= set(const.co_names)
+        if "parse_hf_uri" not in referenced: return False
+        from huggingface_hub.utils._hf_uris import parse_hf_uri
         parsed = parse_hf_uri("hf://models/namespace/name")
     except Exception:
         return False
