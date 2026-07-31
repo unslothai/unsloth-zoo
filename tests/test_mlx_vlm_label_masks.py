@@ -2338,9 +2338,44 @@ def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
 def test_placeholders_without_features_are_rejected(monkeypatch):
     _qualify(monkeypatch)
     # Pre-rendered text can keep the placeholder after the clip is gone.
-    with pytest.raises(ValueError, match="returned no audio features"):
+    with pytest.raises(ValueError) as caught:
         _finalized_collate([{"raw": "x"}], _FakeGemmaAudioProcessor(), 16, None,
                            formatting_func=lambda _: {"text": "<audio>hi"})
+    message = str(caught.value)
+    assert "returned no audio features" in message
+    # This processor is fine and never saw a clip, so the message has to reach
+    # that cause and introduce the checkpoint as an example. Prose cannot be
+    # checked for every way of blaming it; what is pinned is that the hedge
+    # still introduces the checkpoint clause.
+    assert "never received" in message
+    assert "for instance the checkpoint" in message
+
+
+def test_a_checkpoint_that_drops_its_audio_is_named_as_the_cause(monkeypatch):
+    """An export whose preprocessor configuration omits its audio half accepts
+    the audio argument and skips the audio, so this is where the user learns
+    their checkpoint is the problem rather than their dataset."""
+    class _Drops(_FakeGemmaAudioProcessor):
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            out = super().__call__(text, audio, max_length, **kwargs)
+            out.pop("input_features", None)
+            out.pop("input_features_mask", None)
+            return out
+
+    processor = _Drops()
+    _qualify(monkeypatch, processor=processor)
+    audio_row = dict(_audio_row(None, placeholder_only=True), audio=_CLIP)
+    with pytest.raises(ValueError) as caught:
+        _finalized_collate([audio_row], processor, 16, None)
+    message = str(caught.value)
+    assert "preprocessor configuration" in message
+    assert "audio feature extractor" in message
+    # Actionable, not just diagnostic.
+    assert "train on the text and image parts" in message
+    # One message serves both callers, and the other one has a healthy
+    # processor, so the checkpoint stays introduced as an example.
+    assert "for instance the checkpoint" in message
+    assert "never received" in message
 
 
 def test_audio_placeholders_masked_and_mixed_batches_collate(monkeypatch):
@@ -3411,3 +3446,234 @@ def test_overlong_rows_are_refused_by_what_the_model_attends():
     later_row["attention_mask"] = np.array([[1] * 6 + [0] * 6, [1] * 12], np.int32)
     with pytest.raises(ValueError, match="row 1 is 12 tokens"):
         _assert_audio_runs_intact(later_row, [1, 1], _FakeProcessor(), 8)
+
+
+# --- can this checkpoint take audio at all: behaviour, not configuration ---
+
+
+class _ProbeProcessor:
+    """A processor that reads its audio, as a capable checkpoint's does."""
+
+    def __init__(self, needs_text=None):
+        self.needs_text = needs_text
+        self.calls = 0
+
+    @staticmethod
+    def _samples(audio):
+        clip = audio[0][0] if isinstance(audio[0], (list, tuple)) else audio[0]
+        return np.asarray(clip, dtype=np.float32)
+
+    def __call__(self, text, audio=None, **kwargs):
+        self.calls += 1
+        if self.needs_text is not None and text[0] != self.needs_text:
+            raise ValueError("this processor wants its own marker")
+        return {"input_ids": np.zeros((1, 8), np.int32),
+                "audio_features": self._samples(audio)[:16].copy()}
+
+
+class _AudioModel:
+    def __init__(self, names=("language_model", "audio_tower")):
+        self._names = names
+
+    def named_modules(self):
+        return [(name, None) for name in self._names]
+
+
+def test_a_checkpoint_that_drops_its_audio_is_not_capable():
+    """The motivating defect: the export omits the audio half of its
+    preprocessor configuration, so the processor takes the argument and skips
+    the audio. Nothing raises and every field is well formed, so only the
+    content differential separates it from a working checkpoint."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _Drops(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls += 1
+            return {"input_ids": np.zeros((1, 8), np.int32)}
+
+    verdict = audio_input_capability(_AudioModel(), _Drops())
+    assert verdict.capable is False and verdict.processor_ok is False
+    assert "no audio-dependent output" in verdict.reason
+    # The model half is not what refused it; the audio modules are present.
+    assert verdict.model_ok is True
+
+
+def test_output_that_follows_only_the_clip_length_is_not_capable():
+    """Both tones are the same duration, so a processor sizing its output from
+    the length alone produces identical outputs and cannot be told from one
+    that ignored the audio."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _LengthOnly(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls += 1
+            return {"input_ids": np.zeros((1, len(self._samples(audio))), np.int32)}
+
+    assert audio_input_capability(_AudioModel(), _LengthOnly()).capable is False
+
+
+def test_a_processor_that_cannot_repeat_itself_is_not_capable():
+    """The same tone twice must agree. A processor alternating between outputs
+    would otherwise show a difference that says nothing about the audio."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _Alternates(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls += 1
+            # A period that also makes the two tones' outputs differ, so only
+            # the same-tone agreement check can refuse this.
+            return {"input_ids": np.full((1, 8), self.calls % 3, np.int32)}
+
+    assert audio_input_capability(_AudioModel(), _Alternates()).capable is False
+
+
+def test_keying_on_the_buffer_instead_of_its_samples_is_not_capable():
+    """Every call gets a freshly built buffer, so a processor keying on object
+    identity sees four distinct clips -- the discarded warm-up and the three
+    measured calls -- and cannot repeat itself. Reusing one buffer per tone in
+    the probe would let this shape pass."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _KeysOnIdentity(_ProbeProcessor):
+        def __init__(self):
+            super().__init__()
+            self.seen = {}
+
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls += 1
+            clip = audio[0][0] if isinstance(audio[0], (list, tuple)) else audio[0]
+            index = self.seen.setdefault(id(clip), len(self.seen))
+            return {"input_ids": np.full((1, 8), index, np.int32)}
+
+    assert audio_input_capability(_AudioModel(), _KeysOnIdentity()).capable is False
+
+
+def test_a_processor_that_warms_up_on_its_first_call_is_still_capable():
+    """One discarded call absorbs one-time state, so a real processor that
+    differs only on its first call is not mistaken for an unrepeatable one."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _Warms(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            if self.calls == 0:
+                self.calls += 1
+                return {"input_ids": np.full((1, 8), 99, np.int32)}
+            return super().__call__(text, audio, **kwargs)
+
+    assert audio_input_capability(_AudioModel(), _Warms()).capable is True
+
+
+def test_a_caller_supplied_text_answers_for_a_processor_that_needs_a_marker():
+    """Which marker a processor needs is prompt-rendering knowledge, so the
+    caller supplies candidates. A lone string is one candidate, not a sequence
+    of characters -- the form the Studio consumer passes."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    processor = _ProbeProcessor(needs_text="<|audio|> transcribe")
+    assert audio_input_capability(_AudioModel(), processor).capable is False
+    verdict = audio_input_capability(
+        _AudioModel(), _ProbeProcessor(needs_text="<|audio|> transcribe"),
+        texts="<|audio|> transcribe",
+    )
+    assert verdict.capable is True
+
+
+def test_a_processor_that_raises_answers_not_capable_without_escaping():
+    """Totality: this runs at model-load time and may never fail a load."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _Raises(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            raise RuntimeError("no audio machinery here")
+
+    verdict = audio_input_capability(_AudioModel(), _Raises())
+    assert verdict.capable is False and "raised" in verdict.reason
+
+    # A model that raises escapes the probe's own guards, so only the outer
+    # one keeps this total.
+    class _BrokenModel:
+        def named_modules(self):
+            raise RuntimeError("this model cannot be walked")
+
+    broken = audio_input_capability(_BrokenModel(), _ProbeProcessor())
+    assert broken.capable is False and "could not run" in broken.reason
+
+
+def test_audio_modules_are_found_wherever_the_family_nests_them():
+    """The families spell it five ways, so the walk keys on the name. The
+    nested path is a layout a fixed attribute list would miss -- not a claim
+    about where any one family puts it; Phi-4's pair sits at the top level."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    for names in (("audio_tower", "embed_audio"),
+                  ("audio_tower", "audio_projection_layer"),
+                  ("embed_tokens_extend.audio_embed.audio_encoder",)):
+        verdict = audio_input_capability(_AudioModel(names), _ProbeProcessor())
+        assert verdict.model_ok is True and verdict.capable is True, names
+    absent = audio_input_capability(
+        _AudioModel(("language_model", "vision_tower")), _ProbeProcessor())
+    assert absent.model_ok is False and absent.capable is False
+
+
+def test_without_a_model_the_check_can_refute_but_never_affirm():
+    """A processor-only call still answers for an unloadable export, and says
+    plainly that it did not look at a model."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    verdict = audio_input_capability(None, _ProbeProcessor())
+    assert verdict.capable is False
+    assert verdict.processor_ok is True and verdict.model_ok is None
+
+
+def test_mlx_array_outputs_are_fingerprinted_by_their_own_values():
+    """Real processors return MLX arrays, and exact integer outputs must not be
+    collapsed by a lossy cast on the way to comparison."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _MXOut(_ProbeProcessor):
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls += 1
+            # Two values a float32 round-trip cannot tell apart.
+            value = 16777216 + int(abs(self._samples(audio)[1]) > 0.05)
+            return {"input_ids": mx.array([[value]], dtype=mx.int32)}
+
+    assert audio_input_capability(_AudioModel(), _MXOut()).capable is True
+
+
+def test_a_later_candidate_text_still_answers():
+    """The contract takes a sequence, so a processor whose marker appears only
+    in a later candidate must still be found capable."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    processor = _ProbeProcessor(needs_text="second <|audio|>")
+    verdict = audio_input_capability(
+        _AudioModel(), processor, texts=["first", "second <|audio|>"],
+    )
+    assert verdict.capable is True
+
+
+def test_a_processor_taking_only_audios_is_called_with_that_keyword():
+    """Families disagree on the keyword; resolving it wrongly would refuse a
+    capable checkpoint for a reason that has nothing to do with its audio."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _AudiosOnly(_ProbeProcessor):
+        def __call__(self, text, audios=None, **kwargs):
+            self.calls += 1
+            return {"input_ids": np.zeros((1, 8), np.int32),
+                    "audio_features": self._samples(audios)[:16].copy()}
+
+    assert audio_input_capability(_AudioModel(), _AudiosOnly()).capable is True
+
+
+def test_even_a_base_exception_cannot_escape_the_capability_check():
+    """It runs at model-load time, so nothing it touches may abort a load --
+    including the interrupt-shaped exceptions a narrower guard would let past."""
+    from unsloth_zoo.mlx.utils import audio_input_capability
+
+    class _Interrupts:
+        def named_modules(self):
+            raise KeyboardInterrupt("interrupted mid-walk")
+
+    verdict = audio_input_capability(_Interrupts(), _ProbeProcessor())
+    assert verdict.capable is False and "could not run" in verdict.reason

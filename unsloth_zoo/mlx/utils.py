@@ -53,6 +53,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache, partial, wraps
 from pathlib import Path
+from typing import NamedTuple
 
 
 from .cce import _get_runtime_cce
@@ -5682,7 +5683,7 @@ def _trim_gemma4_audio_batch_mask(inputs, clips, processor):
         # against a neighbour and its mask already covers only its own audio.
         return inputs
     trimmed = np.zeros(shape, dtype=bool)
-    default_rate = _audio_extractor_sampling_rate(processor)
+    default_rate = audio_extractor_sampling_rate(processor)
     for row, clip in enumerate(clips[:shape[0]]):
         waveform, rate = clip if isinstance(clip, tuple) else (clip, None)
         solo = _gemma4_audio_frame_mask(
@@ -5808,7 +5809,7 @@ def _check_audio_family_gate(processor):
     )
 
 
-def _audio_extractor_sampling_rate(processor):
+def audio_extractor_sampling_rate(processor):
     """The sampling rate this processor's audio feature extractor expects."""
     for holder in (
         getattr(processor, "feature_extractor", None),
@@ -5823,6 +5824,184 @@ def _audio_extractor_sampling_rate(processor):
             except (TypeError, ValueError):
                 continue
     return None
+
+
+class AudioInputCapability(NamedTuple):
+    """Whether a loaded checkpoint can take audio input.
+
+    ``processor_ok`` and ``model_ok`` are the two halves, each ``True``,
+    ``False``, or ``None`` when it was not evaluated. ``capable`` requires both
+    to be ``True``, so a call without a model can refute a checkpoint but never
+    affirm one. ``reason`` names what was observed.
+    """
+
+    capable: bool
+    reason: str
+    processor_ok: "bool | None"
+    model_ok: "bool | None"
+
+
+# Two pitches two octaves apart, long enough for any pinned extractor's
+# framing and short enough that four calls cost a moment.
+_AUDIO_PROBE_TONES = (440.0, 1760.0)
+_AUDIO_PROBE_SECONDS = 0.2
+_AUDIO_PROBE_RATE = 16000
+# Marker-free by contract: which marker a processor needs is prompt-rendering
+# knowledge, so callers supply their own candidates through `texts`.
+_AUDIO_PROBE_TEXT = "Describe the audio."
+
+
+def _audio_probe_tone(rate, hertz):
+    """A fresh mono tone. Fresh matters: a processor keying on buffer identity
+    rather than sample values must not see the same object twice."""
+    count = max(int(rate * _AUDIO_PROBE_SECONDS), 1)
+    time = np.arange(count, dtype=np.float32) / float(rate)
+    return (0.25 * np.sin(2.0 * np.pi * hertz * time)).astype(np.float32)
+
+
+def _audio_probe_fingerprint(value):
+    """A content fingerprint of a processor's output.
+
+    Arrays enter by their bytes, so a field that echoes the call rather than the
+    audio compares equal and cannot be mistaken for evidence.
+    """
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _audio_probe_fingerprint(value[key]))
+            for key in sorted(value, key=str)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_audio_probe_fingerprint(item) for item in value)
+    if type(value) is _MX_ARRAY_TYPE:
+        try:
+            value = np.asarray(value)
+        except Exception:
+            # Only the dtypes numpy has no equivalent for, where float32 is
+            # lossless. Casting everything would collapse large exact integers.
+            value = np.asarray(value.astype(mx.float32))
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            return ("object_array", value.shape, repr(value.tolist()))
+        return ("array", value.shape, str(value.dtype), value.tobytes())
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return _audio_probe_fingerprint(np.asarray(value.detach().cpu()))
+    return ("scalar", repr(value))
+
+
+def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
+    """One real processor call on a freshly built tone."""
+    clip = _AudioClip(_audio_probe_tone(rate, hertz), rate)
+    # Held for the probe's lifetime so no later buffer can reuse its address.
+    held.append(clip)
+    payload = _format_vlm_audio_for_processor([[clip]], processor=processor)
+    return processor(text=[text], **{kwarg: payload})
+
+
+def _audio_probe_processor(processor, texts):
+    """Whether audio content demonstrably reaches this processor's output.
+
+    Per candidate text: a discarded warm-up call absorbs one-time state, then
+    the same tone twice -- which must agree, or the processor cannot repeat
+    itself and its outputs carry no evidence -- then a second tone, which must
+    differ. Both tones share duration, dtype and construction, so sample values
+    are the only input property that separates them: a processor that sizes its
+    output from the clip length, echoes the call, or drops the audio entirely
+    produces identical outputs and is refused.
+    """
+    try:
+        kwarg = _vlm_processor_audio_kwarg(processor)
+    except Exception:
+        return False, "the processor accepts no audio argument"
+    rate = audio_extractor_sampling_rate(processor) or _AUDIO_PROBE_RATE
+    held = []
+    raised = None
+    for text in texts:
+        try:
+            _audio_probe_once(processor, text, kwarg, rate,
+                              _AUDIO_PROBE_TONES[0], held)
+        except Exception:
+            pass  # a warm-up is discarded on any outcome, by design
+        try:
+            first = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[0], held))
+            again = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[0], held))
+            other = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[1], held))
+        except Exception as exc:
+            raised = exc
+            continue
+        if first != again:
+            raised = None
+            continue  # not repeatable: its outputs prove nothing either way
+        if first != other:
+            return True, "audio content changed the processor output"
+    if raised is not None:
+        return False, f"the processor raised on audio ({type(raised).__name__})"
+    return False, (
+        "the processor accepted audio and produced no audio-dependent output"
+    )
+
+
+def _model_carries_audio_modules(model):
+    """Whether the loaded model has audio machinery, by name.
+
+    A name walk rather than a fixed attribute list: the pinned families spell it
+    ``audio_tower``, ``embed_audio``, ``audio_projection_layer``,
+    ``audio_encoder`` and ``audio_projection``, and Phi-4 nests its pair under
+    an intermediate submodule.
+    """
+    walk = getattr(model, "named_modules", None)
+    if walk is None:
+        return False
+    for entry in walk():
+        name = entry[0] if isinstance(entry, tuple) else entry
+        if "audio" in str(name).lower():
+            return True
+    return False
+
+
+def audio_input_capability(model, processor, texts=None):
+    """Whether this loaded checkpoint can take audio input.
+
+    Answered from observed behaviour, per checkpoint: audio content has to
+    change what the processor returns, and the model has to carry audio
+    modules. Two exports of one family can therefore disagree -- a processor
+    whose checkpoint omits the audio half of its preprocessor configuration
+    accepts the argument, drops the audio, and is refused here.
+
+    ``texts`` supplies candidate prompts, as one string or a sequence; a
+    processor that needs a marker only its own template emits will not answer
+    positively without one, and which marker that is belongs to whoever renders
+    prompts, not here. The built-in candidate carries none.
+
+    Never raises: anything unevaluable answers not capable, so this cannot fail
+    a model load. A positive says audio reaches the processor's output and the
+    model has somewhere to put it -- not that features merge correctly, which
+    the per-batch checks continue to guard.
+    """
+    processor_ok = model_ok = None
+    try:
+        if isinstance(texts, str):
+            texts = [texts]
+        candidates = [*(texts or ()), _AUDIO_PROBE_TEXT]
+        processor_ok, reason = _audio_probe_processor(processor, candidates)
+        if model is None:
+            return AudioInputCapability(False, reason, processor_ok, None)
+        model_ok = _model_carries_audio_modules(model)
+        if not model_ok:
+            reason = "the model carries no audio modules"
+        return AudioInputCapability(
+            bool(processor_ok and model_ok), reason, processor_ok, model_ok,
+        )
+    except BaseException as exc:  # totality: a load must never fail on this
+        return AudioInputCapability(
+            False, f"the capability check could not run ({type(exc).__name__})",
+            processor_ok, model_ok,
+        )
 
 
 class _AudioClip(np.ndarray):
@@ -6037,7 +6216,7 @@ def _extract_vlm_audio(item, messages, processor):
         return []
 
     _check_audio_family_gate(processor)
-    expected_rate = _audio_extractor_sampling_rate(processor)
+    expected_rate = audio_extractor_sampling_rate(processor)
     return [_normalize_audio_clip(clip, expected_rate) for clip in clips]
 
 
@@ -6078,8 +6257,12 @@ def _assert_audio_features_present(inputs, expected, processor):
         return
     raise ValueError(
         f"Unsloth MLX: {type(processor).__name__} returned no audio features "
-        f"for a batch containing audio, so the placeholders would have nothing "
-        f"behind them. Check that this processor has an audio feature extractor."
+        f"for a batch whose text carries audio placeholders, so those "
+        f"placeholders have nothing behind them. The cause is upstream of this "
+        f"check -- for instance the checkpoint ships no audio feature extractor "
+        f"(look for an audio section in its preprocessor configuration), or a "
+        f"placeholder was rendered for a clip the processor never received. "
+        f"Otherwise train on the text and image parts of this dataset."
     )
 
 
@@ -6294,7 +6477,7 @@ def _assert_audio_clips_fit_the_extractor(clips, processor):
     window = _extractor_window_samples(processor)
     if not window or not clips:
         return
-    rate = _audio_extractor_sampling_rate(processor)
+    rate = audio_extractor_sampling_rate(processor)
     for index, row in enumerate(clips):
         for clip in row or ():
             length = int(np.asarray(clip).shape[0])
@@ -6885,7 +7068,7 @@ def _processor_vlm_inputs(
             raise
         # Some take (samples, rate) pairs, which surfaces as an unpacking
         # error. The rate rides on the clip: such processors expose none.
-        default_rate = _audio_extractor_sampling_rate(processor)
+        default_rate = audio_extractor_sampling_rate(processor)
         base_kwargs[audio_kwarg] = [
             (np.asarray(clip), getattr(clip, "sampling_rate", None) or default_rate)
             for clip in audio
