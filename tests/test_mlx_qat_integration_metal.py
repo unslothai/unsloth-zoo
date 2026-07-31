@@ -182,6 +182,41 @@ def test_qat_runs_through_mlx_trainer():
     assert mlx_qat_module_count(model) == patched
 
 
+def test_full_finetuning_request_is_not_silently_dropped():
+    """Every guard must be reachable through the public entry point.
+
+    get_peft_model returns at its full_finetuning branch before the QAT hook,
+    so a guard that only lived inside apply_mlx_qat was unreachable here and
+    the request was silently ignored -- the model trained with no QAT at all
+    and nothing said so.
+    """
+    from unsloth_zoo.mlx.qat import mlx_qat_module_count
+
+    model, _ = FastMLXModel.from_pretrained(
+        "Qwen/Qwen2.5-0.5B-Instruct", max_seq_length=64, full_finetuning=True)
+    with pytest.raises(NotImplementedError, match="full_finetuning"):
+        FastMLXModel.get_peft_model(
+            model, r=8, lora_alpha=16, qat_scheme="auto")
+    assert mlx_qat_module_count(model) == 0
+
+
+def test_rejected_request_leaves_the_model_unmutated():
+    """A refused QAT request must not install LoRA first and raise after."""
+    from mlx_lm.tuner.lora import LoRALinear
+
+    model, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
+    with pytest.raises(NotImplementedError, match="lora_dropout=0"):
+        FastMLXModel.get_peft_model(
+            model, r=8, lora_alpha=16, lora_dropout=0.1,
+            qat_scheme="auto", use_gradient_checkpointing=False,
+        )
+    installed = sum(
+        1 for _, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    )
+    assert installed == 0, f"{installed} LoRA layers left behind after refusal"
+
+
 def test_vlm_is_gated_off():
     """VLMs are refused for now: the merge path is unvalidated, not broken.
 

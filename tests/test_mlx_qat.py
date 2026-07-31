@@ -299,6 +299,24 @@ def test_full_finetuning_is_rejected():
         apply_mlx_qat(holder, "auto")
 
 
+def test_non_affine_quantized_base_is_rejected():
+    """mxfp4/nvfp4/mxfp8 bases must be refused, not crash inside the forward.
+
+    ``mx.quantize`` returns only ``(packed, scales)`` for those modes -- no
+    biases -- so the affine three-value unpack in the QAT forward would raise
+    a bare unpacking error partway through training.
+    """
+    base = nn.Linear(DIMS, DIMS, bias=False)
+    quantized = nn.QuantizedLinear.from_linear(
+        base, group_size=32, bits=4, mode="mxfp4")
+    assert quantized.mode == "mxfp4"
+    assert quantized.biases is None, "mxfp4 unexpectedly produced biases"
+
+    layer = LoRALinear.from_base(quantized, r=8, scale=2.0)
+    with pytest.raises(NotImplementedError, match="mxfp4"):
+        apply_mlx_qat(_Holder(layer), "auto")
+
+
 def test_dora_is_rejected():
     dora = pytest.importorskip("mlx_lm.tuner.dora")
     base = nn.QuantizedLinear.from_linear(

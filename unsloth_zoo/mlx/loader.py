@@ -7530,6 +7530,16 @@ class FastMLXModel:
                 "Unsloth: loftq_config is not supported for MLX LoRA yet."
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
+        if qat_scheme is not None and qat_scheme is not False:
+            # Validate before the full_finetuning early return below and before
+            # any LoRA is installed. full_finetuning returns from this function
+            # without ever reaching the apply hook, so a guard that only lived
+            # there would let the request be dropped silently; the other
+            # rejections would raise only after the model had been mutated.
+            from .qat import validate_mlx_qat_request
+            validate_mlx_qat_request(
+                model, qat_scheme, lora_dropout=lora_dropout,
+            )
         if bias not in (None, False, "none"):
             print(
                 "Unsloth: bias is not supported for MLX LoRA yet - "

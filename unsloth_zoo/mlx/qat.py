@@ -45,6 +45,7 @@ from __future__ import annotations
 __all__ = (
     "SUPPORTED_MLX_QAT_SCHEMES",
     "TORCHAO_ONLY_QAT_SCHEMES",
+    "validate_mlx_qat_request",
     "apply_mlx_qat",
     "remove_mlx_qat",
     "mlx_qat_module_count",
@@ -207,17 +208,16 @@ def _preview(names, limit=3):
     return shown
 
 
-def apply_mlx_qat(model, qat_scheme="auto"):
-    """Fake-quantize the merged LoRA weight during training.
+def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None):
+    """Reject an unsupportable QAT request *before* anything is mutated.
 
-    Args:
-        model: an MLX model that already has LoRA layers attached.
-        qat_scheme: ``"auto"``/``True`` to inherit the base model's own
-            quantization, or ``"int4"`` / ``"int8"`` to additionally assert the
-            base was quantized to that width.
+    Everything checkable without adapters lives here so ``get_peft_model`` can
+    call it up front: otherwise a rejected request either raises after LoRA has
+    already been installed and trainability changed, or -- for
+    ``full_finetuning=True``, which returns before adapters are ever created --
+    is silently ignored.
 
-    Returns:
-        The number of LoRA modules placed under QAT.
+    Returns the requested bit width (``None`` means "inherit the base").
     """
     requested_bits = _resolve_qat_bits(qat_scheme)
 
@@ -242,6 +242,32 @@ def apply_mlx_qat(model, qat_scheme="auto"):
             "against save_method='merged_4bit'. Use a text-only model, or "
             "train the VLM without qat_scheme."
         )
+
+    if lora_dropout is not None and float(lora_dropout) > 0.0:
+        raise NotImplementedError(
+            "Unsloth: qat_scheme requires lora_dropout=0 on MLX. QAT folds the "
+            "adapter into the weight to match fuse(), which leaves no separate "
+            f"LoRA activation path for dropout to act on (got {lora_dropout})."
+        )
+
+    return requested_bits
+
+
+def apply_mlx_qat(model, qat_scheme="auto"):
+    """Fake-quantize the merged LoRA weight during training.
+
+    Args:
+        model: an MLX model that already has LoRA layers attached.
+        qat_scheme: ``"auto"``/``True`` to inherit the base model's own
+            quantization, or ``"int4"`` / ``"int8"`` to additionally assert the
+            base was quantized to that width.
+
+    Returns:
+        The number of LoRA modules placed under QAT.
+    """
+    # Re-run the pre-mutation checks: apply_mlx_qat is public and may be called
+    # directly, not only through get_peft_model.
+    requested_bits = validate_mlx_qat_request(model, qat_scheme)
 
     patchable, dora, switch, unquantized = _qat_targets(model)
 
@@ -283,6 +309,17 @@ def apply_mlx_qat(model, qat_scheme="auto"):
             f"LoRA layers, found {sorted(grids)}."
         )
     group_size, bits, mode = next(iter(grids))
+
+    # Only the affine grid round-trips through the three-value
+    # quantize/dequantize used below: mx.quantize returns just (packed, scales)
+    # for mxfp4/nvfp4/mxfp8, and those grids need different fake-quant maths
+    # anyway. Reject explicitly rather than unpack-crash inside the forward.
+    if mode not in (None, "affine"):
+        raise NotImplementedError(
+            f"Unsloth: qat_scheme is not supported for {mode!r}-quantized "
+            "bases on MLX yet — only the affine grid is implemented. Load the "
+            "model with load_in_4bit=True (affine) to use QAT."
+        )
 
     if requested_bits is not None and requested_bits != bits:
         raise ValueError(
