@@ -3015,6 +3015,70 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
+def test_an_untyped_audio_part_is_typed_whichever_alias_it_uses(monkeypatch):
+    """An untyped part is typed from its key, and a part the inference misses
+    reaches neither the family gate nor the extractor."""
+    from unsloth_zoo.mlx.utils import (
+        _extract_vlm_audio, _normalize_vlm_messages, _raw_row_has_audio,
+    )
+
+    processor = _FakeGemmaAudioProcessor()
+    _qualify(monkeypatch, processor=processor)
+    # A ramp rather than the shared constant clip, so a clip substituted for
+    # the caller's cannot coincide with it.
+    ramp = {"array": np.linspace(-0.5, 0.5, 16, dtype=np.float32),
+            "sampling_rate": 16000}
+    for alias in ("audio", "audio_url", "input_audio"):
+        row = {"messages": [{"role": "user", "content": [
+            {alias: ramp}, {"type": "text", "text": "hi"}]}]}
+        messages = _normalize_vlm_messages(row["messages"])
+        part = messages[0]["content"][0]
+        # "audio", not the alias: Gemma's templates render a placeholder for
+        # that spelling alone.
+        assert part["type"] == "audio", alias
+        assert _raw_row_has_audio(row) is True, alias
+        # ...and the caller's own clip reaches the extractor, which reads the
+        # payload from the key the caller used.
+        clips = _extract_vlm_audio(row, messages, processor)
+        assert len(clips) == 1, alias
+        assert np.array_equal(np.asarray(clips[0]), ramp["array"]), alias
+
+
+def test_a_fixed_budget_row_cannot_hide_a_short_run_behind_a_long_one():
+    """Runs of the wrong lengths still total correctly and still start once per
+    clip, so the total cannot stand in for the individual runs: a clip then
+    spills into the next run and pairs audio with the wrong positions."""
+    from unsloth_zoo.mlx.utils import _assert_audio_runs_intact_ids
+
+    # Budget 3, three clips: runs of 3, 2 and 4 total 9 and begin three times,
+    # which the total check and the run-count check both accept. The aligned
+    # row comes first, so a check that reads only row 0 cannot pass.
+    ids = np.array([[1, 7, 7, 7, 1, 7, 7, 7, 1, 7, 7, 7, 1],
+                    [1, 7, 7, 7, 1, 7, 7, 1, 7, 7, 7, 7, 1]])
+    with pytest.raises(ValueError,
+                       match=r"row 1 .*run\(s\) of length \[3, 2, 4\]"):
+        _assert_audio_runs_intact_ids(
+            ids, np.ones_like(ids), [3, 3], [7], None, budget=3)
+
+    # One wrong run in each position in turn, so an implementation that skips
+    # any single position accepts the row whose only bad run sits there. The
+    # fourth case keeps both bad runs past a three-run prefix, which a check
+    # reading only the first few runs would clear, and the last is uniformly
+    # wrong, which a check comparing the runs to each other would clear.
+    for lengths in ([2, 3, 3], [3, 2, 3], [3, 3, 2], [3, 3, 3, 2, 4], [4, 4]):
+        row = [1]
+        for length in lengths:
+            row += [7] * length + [1]
+        row = np.array([row])
+        with pytest.raises(ValueError,
+                           match=re.escape(f"length {lengths}")):
+            _assert_audio_runs_intact_ids(
+                row, np.ones_like(row), [len(lengths)], [7], None, budget=3)
+
+    assert _assert_audio_runs_intact_ids(
+        ids[:1], np.ones_like(ids[:1]), [3], [7], None, budget=3) == 3
+
+
 def test_audio_bounds_are_read_per_row():
     from unsloth_zoo.mlx.utils import _audio_bounds_per_row
 

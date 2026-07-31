@@ -3796,7 +3796,12 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "text"
                             elif "image" in clean:
                                 clean["type"] = "image"
-                            elif "audio" in clean:
+                            elif any(alias in clean for alias in _AUDIO_PART_TYPES):
+                                # Every spelling an audio part accepts, typed
+                                # as "audio": an untyped alias otherwise
+                                # reaches neither the family gate nor the
+                                # extractor, and Gemma's templates render a
+                                # placeholder for "audio" alone.
                                 clean["type"] = "audio"
                         parts.append(clean)
                 msg["content"] = parts
@@ -6510,9 +6515,9 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     ``max_seq_length`` (some processors divert the truncation arguments to their
     audio feature extractor and leave the text over the cap).
 
-    A run that was *shortened* rather than dropped cannot be detected here: that
-    needs the family's post-subsampling token budget, which only the model-side
-    merge knows, so the merge is where the exact count is checked.
+    A run that was *shortened* rather than dropped needs the family's
+    post-subsampling token budget. Families that state a fixed count per clip
+    before the model runs have each of their runs checked against it here.
 
     Processors that state their spans take a different route, since their run
     carries no identifying token. Those rows are held to the conditions in
@@ -6598,19 +6603,23 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
             else np.ones(row.shape, dtype=bool)
         )
         is_soft = np.isin(row, soft_array) & valid
-        starts = int(np.sum(is_soft & ~np.concatenate(([False], is_soft[:-1]))))
+        begins = is_soft & ~np.concatenate(([False], is_soft[:-1]))
+        starts = int(begins.sum())
         total_runs += starts
         if expected_clips and budget:
-            # Fixed-budget families merge exactly `budget` per clip, so this is
-            # what catches a run shortened rather than dropped.
-            placeholders = int(is_soft.sum())
-            if placeholders != budget * expected_clips:
+            # Fixed-budget families merge exactly `budget` per clip, so every
+            # run must be that long. Checking the total instead lets a short
+            # run hide behind a long one and pairs a clip with the wrong
+            # positions.
+            ends = is_soft & ~np.concatenate((is_soft[1:], [False]))
+            lengths = (np.flatnonzero(ends) - np.flatnonzero(begins) + 1).tolist()
+            if any(int(length) != budget for length in lengths):
                 raise ValueError(
-                    f"Unsloth MLX: row {index} has {placeholders} audio "
-                    f"placeholder tokens but this model merges {budget} per "
-                    f"clip and the row carries {expected_clips} clip(s). The "
-                    f"row cannot be aligned; shorten it or raise "
-                    f"max_seq_length."
+                    f"Unsloth MLX: row {index} has audio placeholder run(s) of "
+                    f"length {[int(length) for length in lengths]} but this "
+                    f"model merges {budget} per clip, so its audio cannot be "
+                    f"aligned. Check whether the row was truncated, or whether "
+                    f"its rendered text carries placeholder tokens of its own."
                 )
         if expected_clips and starts != expected_clips:
             raise ValueError(
