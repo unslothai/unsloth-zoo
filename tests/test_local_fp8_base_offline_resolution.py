@@ -361,6 +361,56 @@ def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
     assert saving_utils._local_snapshot_is_complete(directory) is False
 
 
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+def test_an_unnumbered_stale_copy_is_ambiguous_too(monkeypatch, tmp_path, error):
+    """Numbering is not the only way two snapshots share a directory. `model.safetensors`
+    beside a stale `backup.safetensors` is read in full, and the regenerated index maps each
+    key to whichever file was visited last, so the export can quietly be the wrong copy."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    _shard(directory, "backup.safetensors")
+    _hub_raises(monkeypatch, error)
+
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+    with pytest.raises(RuntimeError):
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+
+
+def test_an_unnumbered_extra_beside_a_whole_set_is_ambiguous(tmp_path):
+    """The same, in the shape the numbered rules alone did not see."""
+    directory = str(tmp_path)
+    for name in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                 "backup.safetensors"):
+        open(os.path.join(directory, name), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+
+
+def test_a_consolidated_duplicate_beside_its_shards_is_still_one_snapshot(tmp_path):
+    """Mistral-7B-v0.3, Codestral, Nemo and Small ship a `consolidated.safetensors` that
+    duplicates their shards, and the merge drops it when proper shards coexist. Counting
+    files without mirroring that rule would call those repos incomplete."""
+    directory = str(tmp_path)
+    for name in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                 "consolidated.safetensors"):
+        open(os.path.join(directory, name), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
+def test_a_lone_consolidated_file_is_one_snapshot(tmp_path):
+    """The merge keeps it when it is the only file, so this is a base it can read."""
+    directory = str(tmp_path)
+    open(os.path.join(directory, "consolidated.safetensors"), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
+def test_files_that_are_not_safetensors_are_not_extras(tmp_path):
+    """config.json and the tokenizer are not weights and the merge never reads them as such."""
+    directory = str(tmp_path)
+    for name in ("model.safetensors", "config.json", "tokenizer.json"):
+        open(os.path.join(directory, name), "wb").close()
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
 def test_two_whole_sets_are_ambiguous_rather_than_complete(tmp_path):
     """Two complete sets are worse than one complete and one partial, because nothing fails.
     Both carry the same tensor keys, the merge reads every top-level `.safetensors` and

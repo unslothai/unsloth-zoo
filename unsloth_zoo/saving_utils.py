@@ -5082,6 +5082,9 @@ _MERGES_FROM_LOADED_WEIGHTS = ("merged_4bit", "forced_merged_4bit")
 # to different ones.
 _SHARD_NAME = re.compile(r"^(.+)-(\d+)-of-(\d+)\.safetensors$")
 
+# The one duplicate the merge drops by name rather than by index.
+_CONSOLIDATED = "consolidated.safetensors"
+
 def _local_snapshot_is_complete(local_path):
     """Does this directory hold every shard its own index names?
 
@@ -5119,8 +5122,46 @@ def _local_snapshot_is_complete(local_path):
         entries = os.listdir(local_path)
     except OSError:
         return False
-    # With no index the merge cannot filter, so what is in the directory is what it reads.
-    return _one_whole_shard_set(entries)
+    # With no index the merge has nothing to filter against, so what it reads is every
+    # top-level `.safetensors` less the one exception it makes for itself. Ask that same
+    # question rather than a second one: the files it would read have to be one snapshot.
+    return _one_snapshot_on_disk(_safetensors_the_merge_would_read(entries))
+pass
+
+def _safetensors_the_merge_would_read(entries):
+    """The `.safetensors` the local branch of `merge_and_overwrite_lora` would enumerate.
+
+    It lists them all and drops `consolidated.safetensors` when proper shards coexist,
+    because Mistral-7B-v0.3, Codestral, Nemo and Small ship one that duplicates their
+    shards. Mirrored here so a directory of that shape is not called incomplete, and so
+    this answer cannot drift from what is actually read.
+    """
+    files = [entry for entry in entries if entry.endswith(".safetensors")]
+    if any(name != _CONSOLIDATED for name in files):
+        files = [name for name in files if name != _CONSOLIDATED]
+    return files
+
+def _one_snapshot_on_disk(files):
+    """Do these files make exactly one snapshot: one whole numbered set, or one file?
+
+    Numbering is not the only way two snapshots can share a directory. `model.safetensors`
+    beside a stale `backup.safetensors`, or either beside a whole numbered set, is read in
+    full by the merge, and the index it regenerates maps each tensor key to whichever file
+    was visited last, so the export can quietly be the wrong copy. Nothing fails, which is
+    what makes it worth refusing.
+    """
+    if not files: return False
+    if not _one_whole_shard_set(files): return False
+    total = _shard_set_total(files)
+    # No numbered set: exactly one file. A numbered set: nothing beside it.
+    return len(files) == (total if total is not None else 1)
+
+def _shard_set_total(names):
+    """The declared total of the single shard set among `names`, or None if unnumbered."""
+    for name in names:
+        match = _SHARD_NAME.match(name)
+        if match is not None: return int(match.group(3))
+    return None
 pass
 
 def _one_whole_shard_set(names):
