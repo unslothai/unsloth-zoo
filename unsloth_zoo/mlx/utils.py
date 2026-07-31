@@ -5908,18 +5908,13 @@ def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
     # Held for the probe's lifetime so no later buffer can reuse its address.
     held.append(clip)
     payload = _format_vlm_audio_for_processor([[clip]], processor=processor)
-    try:
-        return processor(text=[text], **{kwarg: payload})
-    except ValueError as exc:
-        if "unpack" not in str(exc):
-            raise
-        # Same contract collation handles: a processor that wants
-        # (samples, rate) pairs rejects a bare waveform by failing to unpack
-        # it. Answering "not capable" here would report a working checkpoint
-        # as unusable.
-        return processor(
-            text=[text],
-            **{kwarg: _audio_payload_as_pairs([clip], processor)})
+    # Answering "not capable" from a payload-shape refusal would report a
+    # working checkpoint as unusable.
+    return _call_pairing_audio_on_refusal(
+        lambda call_kwargs: processor(**call_kwargs),
+        {"text": [text], kwarg: payload}, kwarg,
+        lambda clips: _audio_payload_as_pairs([clip], processor),
+    )
 
 
 def _audio_probe_processor(processor, texts):
@@ -6664,6 +6659,44 @@ def _vlm_processor_prefers_nested_audio(processor):
     return any(name in marker for name in ("minicpmo",))
 
 
+def _call_pairing_audio_on_refusal(invoke, kwargs, audio_kwarg, to_pairs):
+    """Call a processor, retrying once as ``(samples, rate)`` pairs.
+
+    Some processors take their audio as pairs and refuse a bare waveform by
+    failing to unpack it. The shape is not discoverable in advance, so it is
+    corrected from the refusal. A processor that refuses the corrected payload
+    too reports its own first refusal rather than the second one; a failure
+    while building the pairs is raised as itself, since it says nothing about
+    what the processor wanted.
+    """
+    try:
+        return invoke(kwargs)
+    except ValueError as error:
+        clips = kwargs.get(audio_kwarg)
+        if not clips or "unpack" not in str(error):
+            raise
+        retried = dict(kwargs)
+        retried[audio_kwarg] = to_pairs(clips)
+        try:
+            return invoke(retried)
+        except Exception:
+            raise error from None
+
+
+def _mlx_vlm_audio_rate(processor):
+    """The rate mlx-vlm assumes this processor's audio is at.
+
+    It resamples a decoded file to ``feature_extractor.sampling_rate`` and
+    falls back to 16 kHz; an array it forwards untouched, so this is the rate
+    the samples are expected to be at rather than one it enforced. Reading the
+    rate from anywhere else risks labelling them with a rate the rest of
+    mlx-vlm never assumed. An extractor that states ``None`` takes the same
+    fallback, since a pair has to carry a number.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    return getattr(extractor, "sampling_rate", None) or 16000
+
+
 def _audio_payload_as_pairs(clips, processor):
     """The ``(samples, rate)`` form processors that reject bare waveforms want.
 
@@ -6944,7 +6977,8 @@ def _vlm_processor_requests_mm_token_type_ids(processor):
 
 
 def _mlx_vlm_process_inputs_adapter(original):
-    """Apply the exact PyTorch-only retry to mlx-vlm's processor boundary."""
+    """Negotiate mlx-vlm's processor boundary: the Transformers PyTorch-only
+    output contract, and processors that take audio as (samples, rate) pairs."""
 
     if getattr(original, "_unsloth_pytorch_processor_output", False):
         return original
@@ -6970,7 +7004,18 @@ def _mlx_vlm_process_inputs_adapter(original):
             return_tensors=return_tensors,
             **kwargs,
         )
-        return _call_vlm_processor(original, (processor, prompts), call_kwargs)
+        # mlx-vlm sends bare waveforms and refuses tuples, so a processor
+        # wanting pairs cannot be reached from the caller at all. The rate it
+        # assumes is read only when reshaping, since reaching for it on every
+        # request would touch attributes a non-audio processor need not have.
+        def _as_pairs(clips):
+            rate = _mlx_vlm_audio_rate(processor)
+            return [(np.asarray(clip), rate) for clip in clips]
+
+        return _call_pairing_audio_on_refusal(
+            lambda kw: _call_vlm_processor(original, (processor, prompts), kw),
+            call_kwargs, "audio", _as_pairs,
+        )
 
     patched._unsloth_pytorch_processor_output = True
     return patched
@@ -7098,19 +7143,14 @@ def _processor_vlm_inputs(
             _run_layouts(), base_kwargs[audio_kwarg], processor,
         )
 
-    try:
+    def _invoke(kwargs):
+        base_kwargs[audio_kwarg] = kwargs[audio_kwarg]
         return _run_audio_layouts()
-    except ValueError as exc:
-        if "unpack" not in str(exc):
-            raise
-        # Some take (samples, rate) pairs, which surfaces as an unpacking
-        # error.
-        base_kwargs[audio_kwarg] = _audio_payload_as_pairs(audio, processor)
-        try:
-            return _run_audio_layouts()
-        except Exception:
-            # Guess was wrong: report what the processor first said.
-            raise exc from None
+
+    return _call_pairing_audio_on_refusal(
+        _invoke, {audio_kwarg: audio}, audio_kwarg,
+        lambda clips: _audio_payload_as_pairs(clips, processor),
+    )
 
 
 def _as_numpy_vlm_field(inputs, key):

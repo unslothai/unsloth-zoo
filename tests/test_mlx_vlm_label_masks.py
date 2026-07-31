@@ -3624,6 +3624,125 @@ class _AudioModel:
         return [(name, None) for name in self._names]
 
 
+def test_the_mlx_vlm_boundary_reshapes_audio_a_processor_cannot_unpack():
+    """Inference reaches the processor through mlx-vlm, which decodes audio to
+    bare waveforms and refuses tuples, so a processor wanting (samples, rate)
+    pairs is unreachable from the caller and has to be met at this boundary."""
+    from unsloth_zoo.mlx.utils import _mlx_vlm_process_inputs_adapter
+
+    class _Processor:
+        # A rate mlx-vlm never consults, to catch a pairing that resolves the
+        # rate for itself instead of using the one the samples are actually at.
+        sampling_rate = 22050
+
+    def pairs_only(processor, prompts, images=None, audio=None, **kwargs):
+        calls.append(audio)
+        if any(not isinstance(entry, tuple) for entry in audio or ()):
+            raise ValueError("too many values to unpack (expected 2)")
+        return {"input_audio_embeds": audio}
+
+    calls = []
+    patched = _mlx_vlm_process_inputs_adapter(pairs_only)
+    clip = np.zeros(4, dtype=np.float32)
+    out = patched(_Processor(), ["hi"], audio=[clip])
+    # mlx-vlm resamples a decoded file to feature_extractor.sampling_rate and
+    # falls back to 16 kHz, so that is the rate it assumes these are at.
+    assert [(int(np.asarray(s).size), r)
+            for s, r in out["input_audio_embeds"]] == [(4, 16000)]
+    assert len(calls) == 2, "the pair shape is a retry, not the first guess"
+
+    # ...and when mlx-vlm has a rate of its own, that one is used.
+    class _Resampled(_Processor):
+        feature_extractor = type("_FE", (), {"sampling_rate": 24000})()
+
+    calls = []
+    out = _mlx_vlm_process_inputs_adapter(pairs_only)(
+        _Resampled(), ["hi"], audio=[clip])
+    assert [r for _s, r in out["input_audio_embeds"]] == [24000]
+
+    # A request carrying no audio must not reach for audio attributes at all:
+    # processors expose some of them through properties that warn or raise.
+    class _Hostile:
+        @property
+        def feature_extractor(self):
+            raise AssertionError("a non-audio request asked for the audio rate")
+
+    def text_only(processor, prompts, images=None, audio=None, **kwargs):
+        return {"input_ids": prompts}
+
+    assert _mlx_vlm_process_inputs_adapter(text_only)(
+        _Hostile(), ["hi"])["input_ids"] == ["hi"]
+
+    # Only a ValueError is a payload-shape refusal: another type carrying the
+    # same word is the processor's own failure and is raised on the first call.
+    seen = []
+
+    def wrong_type(processor, prompts, images=None, audio=None, **kwargs):
+        seen.append(audio)
+        raise RuntimeError("cannot unpack, but not as a ValueError")
+
+    with pytest.raises(RuntimeError, match="not as a ValueError"):
+        _mlx_vlm_process_inputs_adapter(wrong_type)(
+            _Processor(), ["hi"], audio=[clip])
+    assert len(seen) == 1
+
+    # Neither guard may be dropped: a refusal that is not about unpacking, and
+    # an unpacking refusal with no audio to reshape, are both raised on the
+    # first call rather than provoking a second in another shape.
+    for label, message, audio in (("not an unpacking refusal", "some other complaint", [clip]),
+                                  ("nothing to reshape", "too many values to unpack", [])):
+        seen = []
+
+        def refuses(processor, prompts, images=None, audio=None,
+                    _message=message, _seen=seen, **kwargs):
+            _seen.append(audio)
+            raise ValueError(_message)
+
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _mlx_vlm_process_inputs_adapter(refuses)(
+                _Processor(), ["hi"], audio=audio)
+        assert len(seen) == 1, label
+
+    # Only the retried call is answered with the first refusal. A failure
+    # while building the pairs says nothing about what the processor wanted,
+    # so it is raised as itself.
+    from unsloth_zoo.mlx.utils import _call_pairing_audio_on_refusal
+
+    def always_refuses(call_kwargs):
+        raise ValueError("too many values to unpack (expected 2)")
+
+    def cannot_pair(_clips):
+        raise RuntimeError("building the pairs failed on its own terms")
+
+    with pytest.raises(RuntimeError, match="on its own terms"):
+        _call_pairing_audio_on_refusal(
+            always_refuses, {"audio": [clip]}, "audio", cannot_pair)
+
+    # Everything else the caller passed survives the retry, or a mixed
+    # image-and-audio request would silently lose its image.
+    retries = []
+
+    def records(processor, prompts, images=None, audio=None, **kwargs):
+        retries.append({"images": images, "prompts": prompts, **kwargs})
+        if any(not isinstance(entry, tuple) for entry in audio or ()):
+            raise ValueError("too many values to unpack (expected 2)")
+        return {"ok": True}
+
+    _mlx_vlm_process_inputs_adapter(records)(
+        _Processor(), ["hi"], images=["an image"], audio=[clip],
+        padding_side="right")
+    assert len(retries) == 2 and retries[0] == retries[1], retries
+
+    def still_broken(processor, prompts, images=None, audio=None, **kwargs):
+        if any(isinstance(entry, tuple) for entry in audio or ()):
+            raise RuntimeError("the retry's error, which must not surface")
+        raise ValueError("too many values to unpack (expected 2)")
+
+    with pytest.raises(ValueError, match="too many values"):
+        _mlx_vlm_process_inputs_adapter(still_broken)(
+            _Processor(), ["hi"], audio=[clip])
+
+
 def test_a_pair_taking_processor_is_not_reported_unusable():
     """Some processors take ``(samples, rate)`` pairs and reject a bare
     waveform by failing to unpack it. Reading that first refusal as the answer
@@ -3651,21 +3770,6 @@ def test_a_pair_taking_processor_is_not_reported_unusable():
     # The whole waveform arrives, with the rate it was built at alongside it.
     whole = len(_audio_probe_tone(_AUDIO_PROBE_RATE, _AUDIO_PROBE_TONES[0]))
     assert processor.seen and set(processor.seen) == {(whole, _AUDIO_PROBE_RATE)}
-
-    # An unrelated refusal is not a payload-shape complaint, so it is reported
-    # rather than retried in another shape.
-    class _Broken(_ProbeProcessor):
-        def __init__(self):
-            super().__init__()
-            self.saw_pairs = False
-
-        def __call__(self, text, audio=None, **kwargs):
-            self.saw_pairs |= any(isinstance(entry, tuple) for entry in audio or ())
-            raise ValueError("this processor is broken")
-
-    broken = _Broken()
-    assert audio_input_capability(_AudioModel(), broken).capable is False
-    assert broken.saw_pairs is False
 
     # A clip that carries no rate of its own -- what a dataset column yields --
     # takes the rate the processor's extractor expects, which Phi-4 keeps on a
