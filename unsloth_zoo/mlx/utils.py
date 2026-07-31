@@ -1648,7 +1648,7 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         rejected_key="rejected", pad_to_multiple=32,
                         num_batches=None, dataset_order="default",
                         preserve_dataset_order=False, seed=None,
-                        append_eos=True, num_epochs=None):
+                        append_eos=True, num_epochs=None, grad_accum=None):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``,
@@ -1771,15 +1771,28 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     elif order_mode == "torch_randperm" and num_epochs is not None and rows:
         # Epoch-based run: one reseeded permutation per epoch, so the
         # modulo-cycled loop draws a distinct order instead of replaying one.
+        # num_train_epochs is a float, so build to the same step budget the SFT
+        # ordered path uses (_create_ordered_text_plan): whole passes plus the
+        # accumulation windows of a partial one. int() instead collapsed 1.5 and
+        # 0.5 onto a single pass. Whole counts are unchanged.
         base_seed = _normalize_seed(seed)
+        cycle = len(base_starts)
+        accum = max(1, int(grad_accum or 1))
+        per_epoch = max(1, math.ceil(cycle / accum))
+        budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+        whole, rem = divmod(budget, per_epoch)
+        target_batches = whole * cycle + rem * accum
         chunks = []
-        for _epoch in range(max(1, int(num_epochs))):
+        _epoch = 0
+        while len(chunks) < target_batches:
             order = _torch_randperm_order(len(rows), base_seed + _epoch)
             rows_epoch = [rows[i] for i in order]
             chunks.extend(
                 rows_epoch[j:j + batch_size]
                 for j in range(0, len(rows_epoch), batch_size)
             )
+            _epoch += 1
+        chunks = chunks[:target_batches]
     elif order_mode == "torch_randperm":
         # Single seeded permutation, identical to pass 0 above.
         order = _torch_randperm_order(len(rows), _normalize_seed(seed))

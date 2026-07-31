@@ -7304,7 +7304,7 @@ class MLXTrainer:
             # modulo-cycled loop would replay one permutation every epoch. Only
             # torch_randperm needs it -- the other modes already match SFT.
             pref_num_epochs = (
-                int(args.num_train_epochs)
+                float(args.num_train_epochs)
                 if (
                     args.max_steps <= 0
                     and getattr(args, "num_train_epochs", -1) > 0
@@ -7322,6 +7322,7 @@ class MLXTrainer:
                 seed=getattr(args, "seed", None),
                 append_eos=bool(getattr(args, "append_eos", True)),
                 num_epochs=pref_num_epochs,
+                grad_accum=args.gradient_accumulation_steps,
             )
             # When num_epochs was materialized the returned list already spans
             # every epoch, so total_steps must use n_batches // grad_accum (not
