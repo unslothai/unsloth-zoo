@@ -5908,7 +5908,18 @@ def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
     # Held for the probe's lifetime so no later buffer can reuse its address.
     held.append(clip)
     payload = _format_vlm_audio_for_processor([[clip]], processor=processor)
-    return processor(text=[text], **{kwarg: payload})
+    try:
+        return processor(text=[text], **{kwarg: payload})
+    except ValueError as exc:
+        if "unpack" not in str(exc):
+            raise
+        # Same contract collation handles: a processor that wants
+        # (samples, rate) pairs rejects a bare waveform by failing to unpack
+        # it. Answering "not capable" here would report a working checkpoint
+        # as unusable.
+        return processor(
+            text=[text],
+            **{kwarg: _audio_payload_as_pairs([clip], processor)})
 
 
 def _audio_probe_processor(processor, texts):
@@ -6653,6 +6664,18 @@ def _vlm_processor_prefers_nested_audio(processor):
     return any(name in marker for name in ("minicpmo",))
 
 
+def _audio_payload_as_pairs(clips, processor):
+    """The ``(samples, rate)`` form processors that reject bare waveforms want.
+
+    A clip carries the rate it was decoded at; the processor's own extractor
+    rate stands in for anything that does not.
+    """
+    default_rate = audio_extractor_sampling_rate(processor)
+    return [(np.asarray(clip),
+             getattr(clip, "sampling_rate", None) or default_rate)
+            for clip in clips]
+
+
 def _format_vlm_audio_for_processor(all_audio, processor=None):
     """Group per-row clips the way this processor assigns them to rows."""
     if not all_audio or not any(all_audio):
@@ -7081,12 +7104,8 @@ def _processor_vlm_inputs(
         if "unpack" not in str(exc):
             raise
         # Some take (samples, rate) pairs, which surfaces as an unpacking
-        # error. The rate rides on the clip: such processors expose none.
-        default_rate = audio_extractor_sampling_rate(processor)
-        base_kwargs[audio_kwarg] = [
-            (np.asarray(clip), getattr(clip, "sampling_rate", None) or default_rate)
-            for clip in audio
-        ]
+        # error.
+        base_kwargs[audio_kwarg] = _audio_payload_as_pairs(audio, processor)
         try:
             return _run_audio_layouts()
         except Exception:

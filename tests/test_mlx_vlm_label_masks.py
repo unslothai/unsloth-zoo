@@ -3624,6 +3624,59 @@ class _AudioModel:
         return [(name, None) for name in self._names]
 
 
+def test_a_pair_taking_processor_is_not_reported_unusable():
+    """Some processors take ``(samples, rate)`` pairs and reject a bare
+    waveform by failing to unpack it. Reading that first refusal as the answer
+    reports a working checkpoint as unusable, which is what Phi-4's
+    remote-code processor did."""
+    from unsloth_zoo.mlx.utils import (
+        _AUDIO_PROBE_RATE, _AUDIO_PROBE_TONES, _audio_payload_as_pairs,
+        _audio_probe_tone, audio_input_capability,
+    )
+
+    class _PairsOnly(_ProbeProcessor):
+        def __init__(self):
+            super().__init__()
+            self.seen = []
+
+        def __call__(self, text, audio=None, **kwargs):
+            for entry in audio or ():
+                samples, rate = entry  # a bare waveform raises here
+                self.seen.append((len(samples), rate))
+            return super().__call__(text, audio=audio, **kwargs)
+
+    processor = _PairsOnly()
+    verdict = audio_input_capability(_AudioModel(), processor)
+    assert verdict.capable is True and verdict.processor_ok is True
+    # The whole waveform arrives, with the rate it was built at alongside it.
+    whole = len(_audio_probe_tone(_AUDIO_PROBE_RATE, _AUDIO_PROBE_TONES[0]))
+    assert processor.seen and set(processor.seen) == {(whole, _AUDIO_PROBE_RATE)}
+
+    # An unrelated refusal is not a payload-shape complaint, so it is reported
+    # rather than retried in another shape.
+    class _Broken(_ProbeProcessor):
+        def __init__(self):
+            super().__init__()
+            self.saw_pairs = False
+
+        def __call__(self, text, audio=None, **kwargs):
+            self.saw_pairs |= any(isinstance(entry, tuple) for entry in audio or ())
+            raise ValueError("this processor is broken")
+
+    broken = _Broken()
+    assert audio_input_capability(_AudioModel(), broken).capable is False
+    assert broken.saw_pairs is False
+
+    # A clip that carries no rate of its own -- what a dataset column yields --
+    # takes the rate the processor's extractor expects, which Phi-4 keeps on a
+    # separately named audio extractor rather than on the processor itself.
+    rated = type("_Rated", (_ProbeProcessor,), {
+        "audio_processor": type("_Extractor", (), {"sampling_rate": 22050})(),
+    })()
+    bare = np.zeros(4, dtype=np.float32)
+    assert _audio_payload_as_pairs([bare], rated)[0][1] == 22050
+
+
 def test_a_checkpoint_that_drops_its_audio_is_not_capable():
     """The motivating defect: the export omits the audio half of its
     preprocessor configuration, so the processor takes the argument and skips
