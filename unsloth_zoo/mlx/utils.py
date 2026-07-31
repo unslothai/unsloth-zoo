@@ -11713,7 +11713,75 @@ def _fuse_mlx_module(module, dequantize):
         return fuse(dequantize=dequantize)
     return fuse()
 
-def save_merged_model(model, tokenizer, path, dequantize=False):
+def _model_has_quantized_module(model):
+    """True when any module carries MLX quantized weights."""
+    import mlx.nn as nn
+
+    quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        quantized_types.append(QuantizedSwitchLinear)
+    except Exception:
+        pass
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+    return any(
+        isinstance(module, quantized_types)
+        for _, module in model.named_modules()
+    )
+
+
+# Matches the loader's runtime-quantization defaults so a save-quantized model
+# and a load-quantized one land on the same grid.
+_MERGED_SAVE_QUANT_BITS = 4
+_MERGED_SAVE_QUANT_GROUP_SIZE = 64
+_MERGED_SAVE_QUANT_MODE = "affine"
+
+
+def _quantize_merged_model_for_save(model):
+    """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
+
+    ``LoRALinear.fuse(dequantize=False)`` only requantizes when the base was
+    already quantized, so on a model loaded with ``load_in_16bit=True`` or
+    ``full_finetuning=True`` the 4-bit request used to be silently ignored and
+    a full-precision checkpoint was written instead.
+
+    Quantization goes through the loader's own predicate rather than a bare
+    ``nn.quantize``: the loader skips embeddings and the ``lm_head`` /
+    ``embed_tokens`` fragments, and an artifact that quantized those would not
+    match a model quantized at load time.
+    """
+    from mlx_lm.utils import quantize_model
+    from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
+
+    spec = _MLXQuantizationSpec(
+        enabled=True,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        source="merged_4bit_save",
+    )
+    predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
+    config = _get_model_config(model) or {}
+    model, updated_config = quantize_model(
+        model,
+        config,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        quant_predicate=predicate,
+    )
+    model._config = updated_config
+    print(
+        f"Unsloth: quantizing the merged model to "
+        f"{_MERGED_SAVE_QUANT_BITS}-bit "
+        f"(group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}, "
+        f"mode={_MERGED_SAVE_QUANT_MODE!r}) for save_method='merged_4bit'."
+    )
+    return model
+
+
+def save_merged_model(model, tokenizer, path, dequantize=False,
+                      quantize_unquantized=False):
     """Fuse LoRA weights and save the full merged model.
 
     Produces an HF-compatible directory with sharded safetensors,
@@ -11726,8 +11794,13 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         path: Directory to save merged model.
         dequantize: If True, dequantize quantized layers when fusing
             (saves as fp16/bf16 — needed for GGUF). If False, keep the
-            base quantization (smaller checkpoint, only meaningful when
-            the base was quantized).
+            base quantization.
+        quantize_unquantized: If True and nothing in the model is quantized,
+            quantize the merged weights before writing. Only the explicit
+            ``save_method='merged_4bit'`` request sets this. It is deliberately
+            NOT inferred from ``dequantize=False``, because that is also the
+            default for ``push_to_hub_merged``, which must keep saving at the
+            model's existing precision.
     """
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
@@ -11750,6 +11823,18 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         cfg = getattr(model, "_config", None)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+    elif quantize_unquantized and not _model_has_quantized_module(model):
+        # 4-bit was requested but nothing in the model is quantized, so the
+        # fuse above had nothing to requantize. Either quantize now or say so;
+        # never write a full-precision checkpoint in silence.
+        if _is_vlm_model(model) or _has_vision_config(_get_model_config(model)):
+            print(
+                "Unsloth: save_method='merged_4bit' on an unquantized VLM is "
+                "not supported yet — saving at full precision instead. Load "
+                "the VLM quantized (the default) to get a 4-bit merge."
+            )
+        else:
+            model = _quantize_merged_model_for_save(model)
 
     de_lora_model = model
 
@@ -12063,6 +12148,7 @@ def save_pretrained_merged(
         save_merged_model(
             model, tokenizer, save_directory,
             dequantize=(method == "merged_16bit"),
+            quantize_unquantized=(method == "merged_4bit"),
         )
 
     if push_to_hub:

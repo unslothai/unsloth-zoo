@@ -582,8 +582,9 @@ def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, mo
         collect_calls.append(model)
         return {}
 
-    def _stub_save_merged(model, tokenizer, path, dequantize=False):
-        merged_calls.append((path, dequantize))
+    def _stub_save_merged(model, tokenizer, path, dequantize=False,
+                          quantize_unquantized=False):
+        merged_calls.append((path, dequantize, quantize_unquantized))
 
     monkeypatch.setattr(mlx_utils, "collect_mlx_lora_adapter_tensors", _spy_collect)
     monkeypatch.setattr(mlx_utils, "save_merged_model", _stub_save_merged)
@@ -605,6 +606,10 @@ def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, mo
     assert len(merged_calls) == 2
     assert merged_calls[0][1] is True   # merged_16bit dequantizes
     assert merged_calls[1][1] is False  # merged_4bit keeps quantization
+    # Only merged_4bit opts into quantizing an unquantized merge; the flag is
+    # not inferred from dequantize=False, which push_to_hub_merged also uses.
+    assert merged_calls[0][2] is False
+    assert merged_calls[1][2] is True
 
 
 def test_save_trainable_adapters_raises_when_no_trainable_params(tmp_path):

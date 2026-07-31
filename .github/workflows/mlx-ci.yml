@@ -99,3 +99,14 @@ jobs:
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
         run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
+      - name: tests/test_mlx_quantized_merge_save.py
+        # Quantized-state detection across every MLX grid, which decides
+        # whether merged_4bit needs to quantize the merged weights.
+        run: python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+
+      - name: tests/test_mlx_quantized_merge_save_metal.py
+        # merged_4bit really produces 4-bit from a 16-bit / full-finetuned
+        # model, plus the paths that must not change (already-quantized base,
+        # merged_16bit, push_to_hub_merged).
+        run: python -m pytest tests/test_mlx_quantized_merge_save_metal.py -v -rs
