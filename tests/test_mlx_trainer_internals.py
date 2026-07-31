@@ -3017,6 +3017,9 @@ def _hf_update_steps_per_epoch(n_microbatches, grad_accum):
 @pytest.mark.parametrize("n_prompts,grad_accum,epochs", [
     (3, 2, 1), (4, 2, 1), (5, 2, 1), (3, 1, 1),
     (5, 3, 1), (3, 2, 2), (2, 4, 1), (4, 3, 1),
+    # Degenerate shapes: a single prompt, an accumulation window wider than the
+    # whole epoch, and a fractional epoch below one pass.
+    (1, 1, 1), (2, 8, 1), (1, 4, 2), (4, 2, 0.5), (3, 2, 1.5),
 ])
 def test_grpo_epoch_budget_ceils_a_ragged_prompt_tail(
     n_prompts, grad_accum, epochs,
@@ -3042,6 +3045,31 @@ def test_grpo_epoch_budget_ceils_a_ragged_prompt_tail(
     assert trainer._grpo_epoch_total_steps == expected
     # One rank-local pass, so the loop can force the epoch-final update.
     assert trainer._grpo_epoch_microbatches == n_prompts
+
+
+def test_grpo_epoch_budget_matches_hf_across_a_dense_grid():
+    # The budget formula is the one thing every other assertion rests on, and it
+    # must track transformers, not our own reading of it. Both governing lines --
+    # set_initial_training_values' num_update_steps_per_epoch and the
+    # do_sync_step that motivates the ceil -- are byte-identical in transformers
+    # 4.57.3, 4.57.6, 5.3.0, 5.5.0, 5.10.2 and 5.12.1, so replaying the formula
+    # here pins us to all of them at once rather than to the pinned dev version.
+    import math
+
+    from unsloth_zoo.mlx.trainer import _mlx_steps_per_epoch
+
+    for n_prompts in range(1, 13):
+        for grad_accum in range(1, 6):
+            for epochs in (1, 2, 3, 0.5, 1.5, 2.5):
+                expected = math.ceil(
+                    epochs * _hf_update_steps_per_epoch(n_prompts, grad_accum)
+                )
+                got = max(1, math.ceil(
+                    float(epochs)
+                    * _mlx_steps_per_epoch(n_prompts, grad_accum)
+                ))
+                assert got == expected, (n_prompts, grad_accum, epochs,
+                                         got, expected)
 
 
 def test_grpo_epoch_length_is_exposed_to_the_loop_under_max_steps_too():
