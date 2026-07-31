@@ -7530,10 +7530,6 @@ class FastMLXModel:
                 "Unsloth: loftq_config is not supported for MLX LoRA yet."
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
-        if qat_scheme is not None:
-            raise NotImplementedError(
-                "Unsloth: qat_scheme is not supported for MLX LoRA yet."
-            )
         if bias not in (None, False, "none"):
             print(
                 "Unsloth: bias is not supported for MLX LoRA yet - "
@@ -7812,6 +7808,14 @@ class FastMLXModel:
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
+
+        # QAT after the adapters exist, matching the CUDA ordering (QAT is
+        # applied after _get_peft_model there too). It fake-quantizes the
+        # merged weight so training sees the grid that merged_4bit's fuse()
+        # will write.
+        if qat_scheme is not None and qat_scheme is not False:
+            from .qat import apply_mlx_qat
+            apply_mlx_qat(model, qat_scheme)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):
