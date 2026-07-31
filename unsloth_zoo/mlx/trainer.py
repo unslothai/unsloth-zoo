@@ -1243,6 +1243,13 @@ class MLXTrainingConfig:
             "compile_max_variants",
             "label_smoothing_factor",
             "report_grad_norm",
+            # Preference fields, added with ORPO/DPO. A config dumped before they
+            # existed omits them, which would fail copied_all_fields and let a
+            # copied default warmup_steps override a non-default warmup_ratio.
+            "orpo_beta",
+            "dpo_beta",
+            "reference_free",
+            "append_eos",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
