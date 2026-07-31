@@ -8000,8 +8000,15 @@ _AUDIO_MERGE_PATCH_FAMILIES = frozenset({"gemma4"})
 
 
 def audio_merge_patch_needed(config):
-    """Whether this model family's audio merge must be corrected for training."""
-    return _config_get(config, "model_type") in _AUDIO_MERGE_PATCH_FAMILIES
+    """Whether this model family's audio merge must be corrected for training.
+
+    Matched case-insensitively because mlx-vlm lowercases ``model_type`` before
+    selecting the module: a checkpoint spelling it differently loads the same
+    family and passes the audio gate, so an exact match here would skip the
+    correction for a model that needs it.
+    """
+    model_type = _config_get(config, "model_type")
+    return str(model_type).lower() in _AUDIO_MERGE_PATCH_FAMILIES
 
 
 def _compact_audio_features(embeddings, padding_mask, placeholders_per_row):

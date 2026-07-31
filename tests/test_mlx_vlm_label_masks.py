@@ -2755,6 +2755,24 @@ def test_gemma4_repair_refuses_a_processor_it_cannot_correct():
         no_extractor._compute_audio_num_tokens(np.zeros(16000, np.float32), 16000)
 
 
+def test_the_merge_correction_follows_the_family_not_its_spelling():
+    """mlx-vlm lowercases model_type before selecting the module, so a
+    differently spelled checkpoint loads the same family and passes the audio
+    gate. Matching it exactly here would skip the correction for a model whose
+    merge needs it, and the misalignment that follows is silent."""
+    from unsloth_zoo.mlx.utils import audio_merge_patch_needed
+
+    # Every casing, not a sample of them: a listed few can be satisfied by
+    # matching those strings, which is the defect this guards against.
+    import itertools
+    for chars in itertools.product(*({c.lower(), c.upper()} for c in "gemma4")):
+        spelling = "".join(chars)
+        assert audio_merge_patch_needed({"model_type": spelling}), spelling
+    # Families whose merge is already per row must still be left alone.
+    for other in ("gemma3n", "phi4mm", "minicpmo", None):
+        assert not audio_merge_patch_needed({"model_type": other}), other
+
+
 def test_audio_merge_patch_is_held_and_restored_exactly():
     """Overlapping runs share the correction; the last one puts it back."""
     from unsloth_zoo.mlx.utils import (
