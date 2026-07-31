@@ -3204,6 +3204,87 @@ def test_epoch_flush_window_applies_an_exact_weighted_mean(monkeypatch):
     assert expected_first != pytest.approx(1.5, abs=1e-9)
 
 
+def test_eager_plan_cycling_past_one_pass_flushes_on_every_boundary(monkeypatch):
+    # Exposing cycle_length on an EAGER list plan (the preference path) makes the
+    # forced update fire at it % cycle_length for the whole run, not just once.
+    # If cycle_length ever disagreed with where batches[it % len(batches)]
+    # actually wraps, every boundary after the first would land on the wrong
+    # micro-batch. Drive a plan that cycles several times and compare against
+    # HF's inner loop, whose do_sync_step fires on (step+1) == steps_in_epoch of
+    # EVERY pass.
+    import tempfile
+    import types
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    def hf_reference(n_per_pass, grad_accum, max_steps):
+        gs = micro = 0
+        while True:
+            for step in range(n_per_pass):
+                micro += 1
+                if ((step + 1) % grad_accum == 0
+                        or (step + 1) == n_per_pass):
+                    gs += 1
+                    if gs >= max_steps:
+                        return gs, micro
+
+    class Spy:
+        def __init__(self):
+            self.micro = 0
+            self.updates = []
+
+        def on_substep_end(self, args, state, control, **kwargs):
+            self.micro += 1
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            self.micro += 1
+            self.updates.append(self.micro)
+            return control
+
+    def make_batch(seed):
+        return (
+            mx.array([[seed + 1] * 6], dtype=mx.int32),
+            mx.array([[0, 5]], dtype=mx.int32),
+            None,
+        )
+
+    class Plan(list):
+        cycle_length = 3          # one pass, as create_preference_batches reports
+
+    spy = Spy()
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(3)],
+        args=MLXTrainingConfig(
+            max_steps=5, gradient_accumulation_steps=2, logging_steps=10 ** 6,
+            warmup_steps=0, learning_rate=1e-4, use_cce=False, compile=False,
+            gradient_checkpointing=False, cast_norm_output_to_input_dtype=False,
+            max_grad_norm=0.0, max_grad_leaf_norm=0.0,
+            disable_memory_limits=True, output_dir=tempfile.mkdtemp(),
+        ),
+        callbacks=[spy],
+    )
+    trainer._prepare_data = lambda _is_vlm: (
+        Plan([make_batch(i) for i in range(3)]), None,
+    )
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+
+    exp_steps, exp_micro = hf_reference(3, 2, 5)
+    assert trainer._global_step == exp_steps == 5
+    assert spy.micro == exp_micro == 8
+    # Window closes at 2, pass ends at 3; window at 5, pass ends at 6; window
+    # at 8. The flat model would have given 2, 4, 6, 8, 10.
+    assert spy.updates == [2, 3, 5, 6, 8], spy.updates
+
+
 def test_grpo_epoch_skip_repositions_instead_of_replaying_rollouts():
     # Publishing a GRPO epoch length makes _honor_epoch_stop_skip reachable for
     # GRPO for the first time. Its base hook DRAINS the producer, which for an
