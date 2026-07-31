@@ -101,7 +101,9 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). Executing them here keeps fixture/source drift visible.
+        # regress silently). test_train_on_responses_list_labels pins the
+        # tensor-vs-list labels contract for response masking (stub tokenizer,
+        # no weights). Executing them here keeps fixture/source drift visible.
         #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
@@ -117,6 +119,7 @@ jobs:
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
+            tests/test_train_on_responses_list_labels.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
             tests/test_quant_status_transport_errors.py \
