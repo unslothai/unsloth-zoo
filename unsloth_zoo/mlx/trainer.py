@@ -7737,14 +7737,16 @@ class MLXORPOTrainer(MLXTrainer):
     the class is authoritative regardless of the config passed."""
     def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
                  dataset_text_field=None, max_seq_length=None, packing=None,
-                 data_collator=None, args=None, formatting_func=None, processor=None):
+                 data_collator=None, args=None, formatting_func=None,
+                 processor=None, callbacks=None):
         if args is None:
             args = MLXORPOConfig()
         elif getattr(args, "loss_type", "sft") != "orpo":
             args.loss_type = "orpo"
         super().__init__(model, tokenizer, train_dataset, eval_dataset,
                          dataset_text_field, max_seq_length, packing,
-                         data_collator, args, formatting_func, processor)
+                         data_collator, args, formatting_func, processor,
+                         callbacks)
 
 
 class MLXDPOTrainer(MLXTrainer):
@@ -7752,14 +7754,16 @@ class MLXDPOTrainer(MLXTrainer):
     the class is authoritative regardless of the config passed."""
     def __init__(self, model, tokenizer, train_dataset, eval_dataset=None,
                  dataset_text_field=None, max_seq_length=None, packing=None,
-                 data_collator=None, args=None, formatting_func=None, processor=None):
+                 data_collator=None, args=None, formatting_func=None,
+                 processor=None, callbacks=None):
         if args is None:
             args = MLXDPOConfig()
         elif getattr(args, "loss_type", "sft") != "dpo":
             args.loss_type = "dpo"
         super().__init__(model, tokenizer, train_dataset, eval_dataset,
                          dataset_text_field, max_seq_length, packing,
-                         data_collator, args, formatting_func, processor)
+                         data_collator, args, formatting_func, processor,
+                         callbacks)
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
