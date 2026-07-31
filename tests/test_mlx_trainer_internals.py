@@ -3269,6 +3269,69 @@ def test_grpo_kl_probe_honours_a_disabled_logging_interval():
     assert _resolve_interval_steps(1, 4) == 1
 
 
+@pytest.mark.parametrize("logging_steps,first_step,expected_probe_steps", [
+    # Disabled interval: only the always-logged final step.
+    (0, False, [4]),
+    # logging_first_step bypasses the strategy gate entirely
+    # (_request_non_interval_actions), so step 1 logs even at logging_steps=0
+    # and must carry a KL like every other trainer-raised log.
+    (0, True, [1, 4]),
+    (2, False, [2, 4]),
+    (2, True, [1, 2, 4]),
+    (1, False, [1, 2, 3, 4]),
+])
+def test_grpo_kl_probe_fires_exactly_on_logged_steps(
+    monkeypatch, logging_steps, first_step, expected_probe_steps,
+):
+    # The probe must line up with the steps the trainer actually logs: no probe
+    # on unlogged steps (wasted eager forwards), and no logged step left without
+    # a KL. Driving the real loop with a recording _grpo_mean_kl pins both
+    # directions at once. logging_steps=0 previously raised ZeroDivisionError
+    # here before any of this could be observed.
+    import tempfile
+    import types
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+
+    probed_at = []
+
+    def make_batch(seed):
+        ids = mx.array([[seed + 1] * 6], dtype=mx.int32)
+        lengths = mx.array([[0, 5]], dtype=mx.int32)
+        return (ids, lengths, None)
+
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(4)],
+        args=MLXTrainingConfig(
+            max_steps=4, gradient_accumulation_steps=1,
+            logging_steps=logging_steps, warmup_steps=0, learning_rate=1e-4,
+            use_cce=False, compile=False, gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False, max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0, disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        ),
+    )
+    trainer._prepare_data = lambda _is_vlm: ([make_batch(i) for i in range(4)], None)
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+    # Presence of this attribute is what arms the probe for a GRPO run.
+    trainer._grpo_mean_kl = lambda _batch, _lengths: (
+        probed_at.append(trainer._global_step + 1) or 0.25
+    )
+    trainer.args.logging_first_step = first_step
+    trainer.train()
+
+    assert probed_at == expected_probe_steps, (probed_at, expected_probe_steps)
+    # Every probe landed on a step that produced a log, and none was wasted.
+    assert len(trainer._train_loss_history) == len(expected_probe_steps)
+
+
 def test_grpo_kl_probe_step_index_survives_an_epoch_flush():
     # The probe indexed the step as `it // grad_accum`, which is only the step
     # number under a flat accumulation model. Now that an epoch's ragged tail

@@ -6814,9 +6814,18 @@ class MLXTrainer:
                 _kl_logging_steps = int(
                     getattr(self.state, "logging_steps", 0) or 0
                 )
+                # logging_first_step is deliberately NOT gated on the strategy
+                # (_request_non_interval_actions: HF raises the first-step log
+                # before it tests the strategy), so it fires even at
+                # logging_steps=0. It is a function of the step number, not of a
+                # callback flag, so it is knowable here -- unlike a should_log
+                # a user callback raises in on_step_end, which is decided after
+                # this point and therefore cannot carry a KL.
                 if ((_kl_logging_steps > 0
                         and _prospective_step % _kl_logging_steps == 0)
-                        or _prospective_step == total_steps):
+                        or _prospective_step == total_steps
+                        or (_prospective_step == 1
+                            and getattr(args, "logging_first_step", False))):
                     self._pending_grpo_kl = self._grpo_mean_kl(
                         batch_data[0], batch_data[1])
 
