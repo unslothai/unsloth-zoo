@@ -1065,6 +1065,13 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    # Added with ORPO/DPO. Kept an exact suffix of MLXTrainingConfig's field
+    # order, so a config dumped before preference tuning existed still counts as
+    # a wholesale copy for warmup semantics.
+    "loss_type",
+    "orpo_beta",
+    "dpo_beta",
+    "reference_free",
 )
 
 
@@ -1116,10 +1123,6 @@ class MLXTrainingConfig:
 
     # Eval
     eval_steps: int = 0  # 0 = disabled
-    loss_type: str = "sft"  # "sft" or "orpo"
-    orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
-    dpo_beta: float = 0.1  # DPO beta (TRL default)
-    reference_free: bool = False  # DPO: drop the reference term if True
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
@@ -1198,6 +1201,16 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
+    # Preference (ORPO/DPO) fields, appended for the same reason as the block
+    # above: declared LAST so the 67 fields that predate them keep the positional
+    # slots they have upstream. Also listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS,
+    # which keeps that tuple an exact suffix of the field order and makes a
+    # pre-preference config dump a recognized wholesale copy.
+    loss_type: str = "sft"  # "sft", "orpo" or "dpo"
+    orpo_beta: float = 0.1  # ORPO odds-ratio weight (TRL default)
+    dpo_beta: float = 0.1  # DPO beta (TRL default)
+    reference_free: bool = False  # DPO: drop the reference term if True
+
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
         if len(args) > len(config_fields):
@@ -1243,13 +1256,6 @@ class MLXTrainingConfig:
             "compile_max_variants",
             "label_smoothing_factor",
             "report_grad_norm",
-            # Preference fields, added with ORPO/DPO. A config dumped before they
-            # existed omits them, which would fail copied_all_fields and let a
-            # copied default warmup_steps override a non-default warmup_ratio.
-            "orpo_beta",
-            "dpo_beta",
-            "reference_free",
-            "append_eos",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
