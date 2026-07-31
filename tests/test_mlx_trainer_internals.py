@@ -3103,6 +3103,107 @@ def test_grpo_callback_epoch_total_matches_hf_under_max_steps():
     assert inst._callback_num_train_epochs(4, None) == expected
 
 
+def test_epoch_flush_window_applies_an_exact_weighted_mean(monkeypatch):
+    # The three fixes are all about "changing the effective gradient", and each
+    # of them creates an accumulation window of length 1 where the flat model
+    # had grad_accum. Verifying that an update HAPPENS on the epoch tail is not
+    # enough: the value applied there must be the weighted mean over exactly
+    # that window's micro-batches (the standing rule -- weight by whatever count
+    # the loss averaged over), with no residual 1/grad_accum factor.
+    #
+    # Drives the real loop with SYNTHETIC per-micro-batch gradients (leaf k for
+    # the k-th micro-batch) and captures what reaches optimizer.update. With 3
+    # micro-batches at grad_accum=2 the windows are [1,2] and [3]:
+    #   step 1 -> (1*w1 + 2*w2) / (w1 + w2)
+    #   step 2 -> (3*w3) / w3 == 3.0      <- the tail, applied ALONE
+    import tempfile
+    import types
+
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_map
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    weights = []          # supervised-token count per micro-batch
+    applied = []          # one grad leaf per optimizer update
+    call = {"k": 0}
+
+    def value_and_grad_synthetic(model, fn):
+        def wrapped(*args):
+            loss, toks = fn(*args)
+            mx.eval(toks)                     # outside any transform here
+            weights.append(float(toks))
+            call["k"] += 1
+            k = float(call["k"])
+            grad = tree_map(
+                lambda p: mx.ones_like(p).astype(mx.float32) * k,
+                model.trainable_parameters(),
+            )
+            return (loss, toks), grad
+        return wrapped
+
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_synthetic)
+
+    def recording_optimizer(_total_steps):
+        def update(_model, grad):
+            leaf = tree_flatten(grad)[0][1]
+            mx.eval(leaf)
+            applied.append(round(float(leaf.reshape(-1)[0]), 6))
+
+        return types.SimpleNamespace(
+            learning_rate=mx.array(1e-5), state={}, update=update,
+        )
+
+    # Three micro-batches with DIFFERENT supervised-token counts, so a plain
+    # unweighted mean and the token-weighted mean give different answers and the
+    # assertion cannot pass by coincidence.
+    batches = [
+        (mx.array([[1] * 6], dtype=mx.int32), mx.array([[0, 3]], dtype=mx.int32), None),
+        (mx.array([[1] * 6], dtype=mx.int32), mx.array([[0, 6]], dtype=mx.int32), None),
+        (mx.array([[1] * 6], dtype=mx.int32), mx.array([[0, 4]], dtype=mx.int32), None),
+    ]
+
+    class Plan(list):
+        cycle_length = 3
+
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"text": f"row {i}"} for i in range(3)],
+        args=MLXTrainingConfig(
+            max_steps=-1, num_train_epochs=1, gradient_accumulation_steps=2,
+            logging_steps=10 ** 6, warmup_steps=0, learning_rate=1e-4,
+            use_cce=False, compile=False, gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False, max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0, disable_memory_limits=True,
+            output_dir=tempfile.mkdtemp(),
+        ),
+    )
+    trainer._prepare_data = lambda _is_vlm: (Plan(batches), None)
+    trainer._build_optimizer = recording_optimizer
+    trainer.save_model = lambda *_a, **_kw: None
+    trainer.train()
+
+    # HF's ceil: 3 micro-batches at grad_accum=2 costs 2 optimizer steps.
+    assert len(applied) == 2, applied
+    assert len(weights) == 3, weights
+    w1, w2, w3 = weights
+    expected_first = round((1.0 * w1 + 2.0 * w2) / (w1 + w2), 6)
+    expected_tail = round((3.0 * w3) / w3, 6)
+    assert applied[0] == pytest.approx(expected_first, abs=1e-5), (
+        applied, weights,
+    )
+    # The tail window is ONE micro-batch: its own gradient, undiluted.
+    assert applied[1] == pytest.approx(expected_tail, abs=1e-5) == 3.0, (
+        applied, weights,
+    )
+    # Guard the guard: an unweighted mean would give 1.5 for the first window,
+    # so the weights must genuinely differ.
+    assert w1 != w2, weights
+    assert expected_first != pytest.approx(1.5, abs=1e-9)
+
+
 def test_grpo_epoch_skip_repositions_instead_of_replaying_rollouts():
     # Publishing a GRPO epoch length makes _honor_epoch_stop_skip reachable for
     # GRPO for the first time. Its base hook DRAINS the producer, which for an
