@@ -3791,18 +3791,19 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        # Gemma 3n's template renders a placeholder for
+                        # "audio" alone, so a part left under an alias carries
+                        # a clip with nothing behind it, and an untyped one
+                        # reaches neither the family gate nor the extractor.
                         if "type" not in clean:
                             if "text" in clean:
                                 clean["type"] = "text"
                             elif "image" in clean:
                                 clean["type"] = "image"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
-                                # Every spelling an audio part accepts, typed
-                                # as "audio": an untyped alias otherwise
-                                # reaches neither the family gate nor the
-                                # extractor, and Gemma's templates render a
-                                # placeholder for "audio" alone.
                                 clean["type"] = "audio"
+                        elif clean["type"] in _AUDIO_PART_TYPES:
+                            clean["type"] = "audio"
                         parts.append(clean)
                 msg["content"] = parts
             else:

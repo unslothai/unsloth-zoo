@@ -3015,9 +3015,11 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
-def test_an_untyped_audio_part_is_typed_whichever_alias_it_uses(monkeypatch):
-    """An untyped part is typed from its key, and a part the inference misses
-    reaches neither the family gate nor the extractor."""
+def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
+    """Every audio spelling ends up typed "audio", whether the caller wrote the
+    type out or left it off. An untyped alias otherwise reaches neither the
+    family gate nor the extractor, and one left under an explicit alias reaches
+    both but renders no placeholder."""
     from unsloth_zoo.mlx.utils import (
         _extract_vlm_audio, _normalize_vlm_messages, _raw_row_has_audio,
     )
@@ -3028,20 +3030,59 @@ def test_an_untyped_audio_part_is_typed_whichever_alias_it_uses(monkeypatch):
     # the caller's cannot coincide with it.
     ramp = {"array": np.linspace(-0.5, 0.5, 16, dtype=np.float32),
             "sampling_rate": 16000}
+    text = {"type": "text", "text": "hi"}
     for alias in ("audio", "audio_url", "input_audio"):
-        row = {"messages": [{"role": "user", "content": [
-            {alias: ramp}, {"type": "text", "text": "hi"}]}]}
-        messages = _normalize_vlm_messages(row["messages"])
-        part = messages[0]["content"][0]
-        # "audio", not the alias: Gemma's templates render a placeholder for
-        # that spelling alone.
-        assert part["type"] == "audio", alias
-        assert _raw_row_has_audio(row) is True, alias
-        # ...and the caller's own clip reaches the extractor, which reads the
-        # payload from the key the caller used.
-        clips = _extract_vlm_audio(row, messages, processor)
-        assert len(clips) == 1, alias
-        assert np.array_equal(np.asarray(clips[0]), ramp["array"]), alias
+        for part in ({alias: ramp}, {"type": alias, alias: ramp}):
+            # The clip takes the first, an interior and the last position on
+            # both axes -- content entry within a message, and message within
+            # the conversation -- past index 1 on each, and one layout carries
+            # two clips, once across messages and once within one. An
+            # implementation that reaches only some positions, ties the two
+            # indices together, or stops after the first clip in a message or
+            # in the row, fails one of these.
+            for content in ([[dict(part), text]],
+                            [[text, dict(part)]],
+                            [[text, dict(part), text]],
+                            [[text, text, dict(part)]],
+                            [[dict(part), text], [text]],
+                            [[text], [text, dict(part)]],
+                            [[text], [dict(part), text], [text]],
+                            [[text], [text], [text, dict(part)]],
+                            [[dict(part), text], [text, dict(part)]],
+                            [[dict(part), text, dict(part)]]):
+                row = {"messages": [{"role": "user", "content": entries}
+                                    for entries in content]}
+                messages = _normalize_vlm_messages(row["messages"])
+                # Normalization retypes in place: the conversation keeps its
+                # shape and every clip keeps the coordinates it was given, so
+                # a pass that relocated or dropped one would not survive here.
+                at = [(index, position)
+                      for index, entries in enumerate(content)
+                      for position, entry in enumerate(entries) if alias in entry]
+                assert [len(message["content"]) for message in messages] == \
+                    [len(entries) for entries in content], (part, content)
+                assert [(index, position)
+                        for index, message in enumerate(messages)
+                        for position, entry in enumerate(message["content"])
+                        if alias in entry] == at, (part, content)
+                for index, position in at:
+                    # "audio", not the alias: Gemma 3n's template renders a
+                    # placeholder for that spelling alone.
+                    assert messages[index]["content"][position]["type"] == \
+                        "audio", (part, content)
+                assert _raw_row_has_audio(row) is True, (part, content)
+                # ...and the caller's own clips reach the extractor, which
+                # reads the payload from the key the caller used.
+                clips = _extract_vlm_audio(row, messages, processor)
+                assert len(clips) == len(at), (part, content)
+                for clip in clips:
+                    assert np.array_equal(
+                        np.asarray(clip), ramp["array"]), (part, content)
+
+    # A type outside the audio spellings is never rewritten.
+    kept = _normalize_vlm_messages(
+        [{"role": "user", "content": [{"type": "video", "video": "v.mp4"}]}])
+    assert kept[0]["content"][0]["type"] == "video"
 
 
 def test_a_fixed_budget_row_cannot_hide_a_short_run_behind_a_long_one():
