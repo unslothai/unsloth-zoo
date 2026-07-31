@@ -101,7 +101,12 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). Executing them here keeps fixture/source drift visible.
+        # regress silently). test_train_on_responses_list_labels pins the
+        # tensor-vs-list labels contract for response masking (stub tokenizer,
+        # no weights). The two preference files pin the ORPO/DPO content-part
+        # and epoch-boundary contracts (torch shim, no weights); they were
+        # collected but executed by no job before this.
+        # Executing them here keeps fixture/source drift visible.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -109,6 +114,7 @@ jobs:
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
+            tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference_content_parts.py \
             tests/test_mlx_preference_cycle_length.py \
             -v
