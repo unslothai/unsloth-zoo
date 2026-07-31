@@ -4714,6 +4714,15 @@ class MLXTrainer:
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
         )
         _vlm_ignore_token_ids = None
+        # Deferred until data setup has validated (see the apply site below).
+        # _mlx_disable_lora_dropout MUTATES the live model -- it swaps adapter
+        # dropout for an identity and zeroes every standalone nn.Dropout -- and
+        # only the probability is stashed, so the original modules cannot be put
+        # back. Doing it here, before _prepare_data's fail-fast checks (streaming,
+        # prebuilt SFT batches, missing preference columns, ...), left a caller
+        # who catches the error holding a model with dropout permanently off, so
+        # a subsequent SFT run on the same model would silently train without it.
+        _disable_preference_dropout = False
 
         if is_vlm:
             processor = self._resolve_vlm_processor()
@@ -4752,8 +4761,10 @@ class MLXTrainer:
                 _ob = getattr(args, "orpo_beta", 0.1)
                 # TRL's ORPOConfig defaults disable_dropout=True; the single ORPO
                 # forward (SFT + odds-ratio) runs under train() mode, so nonzero
-                # LoRA dropout would perturb the log-probs vs TRL. Disable it.
-                _mlx_disable_lora_dropout(model)
+                # LoRA dropout would perturb the log-probs vs TRL. Disable it --
+                # but only once data setup has validated, since the disable is
+                # not reversible (see the flag's definition above).
+                _disable_preference_dropout = True
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
             elif getattr(args, "loss_type", "sft") == "dpo":
@@ -4790,8 +4801,9 @@ class MLXTrainer:
                 # perturb the policy log-probs (the reference forward is already
                 # clean via scale=0) and bias the preference margin vs TRL. Disable
                 # it. (reference_free runs still benefit: the policy is perturbed
-                # the same way.)
-                _mlx_disable_lora_dropout(model)
+                # the same way.) Deferred until data setup has validated, since
+                # the disable is not reversible (see the flag's definition above).
+                _disable_preference_dropout = True
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods, reference_free=_rf)
                 print("Unsloth: Using DPO loss (beta=" + str(_db) +
                       (", reference_free" if _rf else "") + ").")
@@ -4959,6 +4971,13 @@ class MLXTrainer:
                 ),
                 vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
+        # Data setup validated, so it is now safe to make the irreversible
+        # preference-parity mutation deferred above. Nothing between the loss-fn
+        # construction and this point runs a training forward, so disabling here
+        # is equivalent for the objective while leaving the model untouched if
+        # _prepare_data raised.
+        if _disable_preference_dropout:
+            _mlx_disable_lora_dropout(model)
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
         _prefetch_active = bool(

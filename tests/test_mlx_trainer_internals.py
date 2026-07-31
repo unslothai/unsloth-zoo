@@ -2733,18 +2733,29 @@ def test_dpo_orpo_setup_disables_lora_dropout_but_grpo_does_not():
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
+    # The disable is now DEFERRED: each preference branch RAISES A FLAG and the
+    # single mutation runs once data setup has validated, because
+    # _mlx_disable_lora_dropout rewrites the live model irreversibly and an
+    # aborted setup used to leave the caller's model with dropout off. Assert the
+    # same per-loss intent against that structure, plus the deferral itself.
     src = inspect.getsource(MLXTrainer._train_inner)
+    flag = "_disable_preference_dropout = True"
     call = "_mlx_disable_lora_dropout(model)"
-    assert src.count(call) == 2
     orpo_b = src.index("make_orpo_loss_fn")
     dpo_b = src.index("make_dpo_loss_fn")
     grpo_b = src.index("make_grpo_loss_fn")
-    # ORPO disables before its loss builder ...
-    assert src.index(call) < orpo_b
-    # ... DPO disables before its loss builder (after the ORPO builder) ...
-    assert orpo_b < src.index(call, orpo_b) < dpo_b
-    # ... and the GRPO branch has no disable call before its builder.
-    assert call not in src[dpo_b:grpo_b]
+    # Exactly the ORPO and DPO branches request it ...
+    assert src.count(flag) == 2
+    # ... ORPO before its loss builder ...
+    assert src.index(flag) < orpo_b
+    # ... DPO before its loss builder (after the ORPO builder) ...
+    assert orpo_b < src.index(flag, orpo_b) < dpo_b
+    # ... and the GRPO branch does not request it at all.
+    assert flag not in src[dpo_b:grpo_b]
+    # The mutation itself happens exactly once, and only AFTER _prepare_data has
+    # run its fail-fast validation.
+    assert src.count(call) == 1
+    assert src.index(call) > src.index("self._prepare_data(")
 
 
 def test_grpo_reward_aggregation_skips_none_values():
@@ -3983,6 +3994,105 @@ def test_preference_one_pass_length_is_the_full_pass_not_the_truncated_plan():
     )
     assert wide.cycle_length == 3          # ceil(10 / 4)
     assert len(wide) == 3
+
+
+def test_preference_rows_pad_with_the_tokenizer_pad_id():
+    # Preference rows padded with EOS instead of pad_token_id. That is invisible
+    # to the LOSS -- the scored span is the explicit [response_start, seq_end)
+    # and the model is causal, so right-padding cannot reach a scored position --
+    # but include_num_input_tokens_seen="non_padding" counts positions by
+    # comparing against pad_token_id, so on any tokenizer whose pad and eos ids
+    # differ the padding was counted as real input and inflated the token budget
+    # and throughput metrics. Match the SFT batchers: pad_token_id first.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class Tok:
+        eos_token_id = 2
+        pad_token_id = 7            # deliberately DIFFERENT from eos
+
+        def encode(self, s, add_special_tokens=True):
+            return [1] * max(1, len(s))
+
+    # Differing lengths so the shorter row is genuinely padded.
+    data = [
+        {"prompt": "p", "chosen": "aaaaaaaa", "rejected": "b"},
+        {"prompt": "p", "chosen": "a", "rejected": "bbbbbbbb"},
+    ]
+    batch, lengths, _ = create_preference_batches(
+        data, Tok(), batch_size=2, max_seq_length=64, pad_to_multiple=0,
+    )[0]
+    rows, lens = batch.tolist(), lengths.tolist()
+
+    padding = [t for i, r in enumerate(rows) for t in r[int(lens[i][1]):]]
+    assert padding, "no row was padded; test would be vacuous"
+    assert set(padding) == {7}, padding
+    # EOS is still appended as a real, trained completion token.
+    assert 2 in [t for i, r in enumerate(rows) for t in r[:int(lens[i][1])]]
+
+
+def test_preference_pad_falls_back_to_eos_without_a_pad_token():
+    # Tokenizers with no pad token keep the prior behaviour rather than
+    # silently switching to id 0.
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class Tok:
+        eos_token_id = 2
+        pad_token_id = None
+
+        def encode(self, s, add_special_tokens=True):
+            return [1] * max(1, len(s))
+
+    data = [
+        {"prompt": "p", "chosen": "aaaaaaaa", "rejected": "b"},
+        {"prompt": "p", "chosen": "a", "rejected": "bbbbbbbb"},
+    ]
+    batch, lengths, _ = create_preference_batches(
+        data, Tok(), batch_size=2, max_seq_length=64, pad_to_multiple=0,
+    )[0]
+    rows, lens = batch.tolist(), lengths.tolist()
+    padding = [t for i, r in enumerate(rows) for t in r[int(lens[i][1]):]]
+    assert padding and set(padding) == {2}, padding
+
+
+def test_aborted_preference_setup_leaves_dropout_untouched(monkeypatch):
+    # _mlx_disable_lora_dropout MUTATES the live model irreversibly (adapter
+    # dropout is swapped for an identity; only the probability is stashed, so the
+    # original modules cannot be restored). Running it during loss-fn
+    # construction meant a preference run that later failed _prepare_data's
+    # fail-fast checks left the caller's model with dropout permanently off, so a
+    # subsequent SFT run on that model would silently train without dropout.
+    #
+    # train() normally runs a _prepare_data preflight that catches bad configs
+    # first, but it is SKIPPED when streaming=True and _batches is None -- which
+    # is exactly the path that reaches the mutation before validation.
+    import tempfile
+    import types
+
+    from unsloth_zoo.mlx import trainer as trainer_mod
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXDPOConfig
+
+    calls = []
+    monkeypatch.setattr(
+        trainer_mod, "_mlx_disable_lora_dropout",
+        lambda model: calls.append(model) or 0,
+    )
+
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [{"prompt": "p", "chosen": " a", "rejected": " b"}],
+        args=MLXDPOConfig(
+            per_device_train_batch_size=1, gradient_accumulation_steps=1,
+            max_steps=1, learning_rate=1e-4, logging_steps=1,
+            max_seq_length=96, output_dir=tempfile.mkdtemp(),
+            seed=3407, report_to="none", reference_free=True, streaming=True,
+        ),
+    )
+    with pytest.raises(NotImplementedError):
+        trainer.train()
+
+    # The abort happened inside _prepare_data; the model must be untouched.
+    assert calls == [], "dropout was mutated before setup validated"
 
 
 def test_preference_batch_list_survives_a_pickle_roundtrip():

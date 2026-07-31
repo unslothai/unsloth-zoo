@@ -1733,7 +1733,20 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     """
     hf = _hf_encoding_tokenizer(tokenizer)
     eos_id = hf.eos_token_id
-    pad_id = eos_id if eos_id is not None else 0
+    # Prefer the tokenizer's OWN pad id, as every SFT/VLM batcher here does
+    # (_create_labeled_batches and friends read pad_token_id). Padding preference
+    # rows with EOS is invisible to the LOSS -- the scored span is the explicit
+    # [response_start, seq_end) and the model is causal, so right-padding cannot
+    # reach a scored position -- but it is not invisible to token accounting:
+    # include_num_input_tokens_seen="non_padding" counts positions by comparing
+    # against pad_token_id, so EOS padding was counted as real input on every
+    # tokenizer whose pad and eos ids differ, inflating the token-budget
+    # callbacks and the throughput metrics. EOS remains the fallback for
+    # tokenizers that define no pad token (the prior behavior), then 0.
+    _pad_id = getattr(hf, "pad_token_id", None)
+    if _pad_id is None:
+        _pad_id = eos_id
+    pad_id = int(_pad_id) if _pad_id is not None else 0
 
     def _with_eos(ids):
         # TRL appends the EOS id to each DPO/ORPO completion
