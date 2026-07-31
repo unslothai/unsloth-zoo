@@ -437,7 +437,6 @@ def test_audio_feature_batches_are_detected_for_eager_routing():
 
 
 def _audio_plan_stub():
-    """Finite plan reporting audio once surveyed."""
     from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
 
     class _Stub(FiniteVLMBatchPlan):
@@ -474,7 +473,6 @@ def _plan(batches, mode="best_effort", batch_iter=None, carries_audio=None):
 
 
 def test_audio_runs_route_eager_before_every_other_exit():
-    """Audio decides routing ahead of streaming and clip-eligibility exits."""
 
     _, report, compile_allowed, _ = _plan(_audio_plan_stub())
     assert compile_allowed is False and report.reason == "vlm_audio_inputs"
@@ -488,7 +486,6 @@ def test_audio_runs_route_eager_before_every_other_exit():
 
 
 def test_streaming_audio_is_detected_without_consuming_the_stream():
-    """Routing peeks one batch and chains it back, so nothing is lost."""
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     peek = MLXTrainer._peek_stream_carries_audio

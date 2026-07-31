@@ -2159,7 +2159,6 @@ def _audio_row(clip, text="hi", placeholder_only=False):
 
 
 def _qualify(monkeypatch, processor=None, version=None):
-    """Open the family allow-gate for one test."""
     from unsloth_zoo.mlx import utils as mlx_utils
     family = mlx_utils._audio_family_from_processor(
         processor or _FakeGemmaAudioProcessor())
@@ -2246,7 +2245,7 @@ def test_audio_source_forms_reach_the_processor_as_mono(monkeypatch, clip):
     row = _audio_row(clip)
     feats = np.asarray(_finalized_collate([row], _FakeGemmaAudioProcessor(),
                                           16, None)["input_features"])
-    assert feats.shape == (1, 10) and np.allclose(feats[0], 0.5)  # mono, averaged
+    assert feats.shape == (1, 10) and np.allclose(feats[0], 0.5)
     # A bare message list must reach extraction; a single dict rendering
     # without a placeholder must be refused, not trained on.
     bare = _finalized_collate([row["messages"]], _FakeGemmaAudioProcessor(), 16, None)
@@ -2262,7 +2261,7 @@ def test_multiple_clips_keep_their_order_and_untyped_parts_count(monkeypatch):
     loud = {"array": np.full(10, 0.75, np.float32), "sampling_rate": 16000}
     row = {"messages": [{"role": "user", "content": [
         {"type": "audio", "audio": quiet},
-        {"audio": loud},  # untyped part must still be inferred as audio
+        {"audio": loud},
         {"type": "text", "text": "hi"}]}, {"role": "assistant", "content": "ok"}]}
     feats = np.asarray(_finalized_collate([row], _FakeGemmaAudioProcessor(),
                                           32, None)["input_features"])
@@ -2287,9 +2286,8 @@ def test_unusable_audio_rows_are_rejected(monkeypatch, clip, message, max_len):
 
 
 def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
-    """A fixed per-clip budget detects a run that was clipped, not dropped."""
     class _Budgeted(_FakeGemmaAudioProcessor):
-        audio_seq_length = 3  # exactly 3 positions per clip
+        audio_seq_length = 3
 
     processor = _Budgeted(truncates=True)
     _qualify(monkeypatch, processor=processor)
@@ -2297,6 +2295,22 @@ def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
     # budget can tell the row was clipped.
     with pytest.raises(ValueError, match="merges 3 per clip"):
         _finalized_collate([_audio_row(_CLIP)], processor, 4, None)
+
+
+def test_a_prompt_completion_combine_cannot_clip_a_fixed_budget_run(monkeypatch):
+    """The combine truncates after the halves are checked, so it is its own
+    chance to cut a run short. One run per clip still survives that, which is
+    why the budget has to reach the post-combine check too."""
+    class _Budgeted(_FakeGemmaAudioProcessor):
+        audio_seq_length = 3
+
+    processor = _Budgeted()
+    _qualify(monkeypatch, processor=processor)
+    # The halves are checked untruncated and pass; the combine then cuts the
+    # run to 2 of 3, which still leaves one run for the count check to accept.
+    with pytest.raises(ValueError, match="merges 3 per clip"):
+        _finalized_collate([_PC_AUDIO_ROW], processor, 4, None,
+                           return_prompt_completion=True)
 
 
 def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
@@ -2451,6 +2465,33 @@ def test_prompt_completion_refuses_audio_stated_as_spans(monkeypatch):
                            return_prompt_completion=True)
 
 
+def test_the_deferred_combine_carries_the_fixed_budget_too(monkeypatch):
+    """MLX-valued halves defer the combine to the consumer thread, so the
+    budget has to survive the carrier as well -- a run the combine cuts short
+    still leaves one run per clip, and the count check alone accepts it."""
+    import mlx.core as current_mx
+    if current_mx is not mx:
+        pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
+    from unsloth_zoo.mlx.utils import _collate_vlm_batch, _finalize_vlm_batch
+
+    class _BudgetedMLXValued(_FakeGemmaAudioProcessor):
+        audio_seq_length = 3
+
+        def __call__(self, text, audio=None, max_length=None, **_kw):
+            return {k: mx.array(v)
+                    for k, v in super().__call__(text, audio, max_length).items()}
+
+    processor = _BudgetedMLXValued()
+    _qualify(monkeypatch, processor=processor)
+    staged, _ = _collate_vlm_batch([_PC_AUDIO_ROW], processor, 4, None,
+                                   reject_mlx_valued=True,
+                                   return_prompt_completion=True)
+    assert staged.pc_audio == ([1], [300], 3)
+    # The combine truncates to 4, cutting the run to 2 of 3.
+    with pytest.raises(ValueError, match="merges 3 per clip"):
+        _finalize_vlm_batch(staged)
+
+
 def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
     """Production must build the pc_audio carrier and honor it at finalize."""
     import mlx.core as current_mx
@@ -2458,7 +2499,7 @@ def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
         pytest.skip("requires real MLX runtime without mlx_simulation monkeypatch")
     from unsloth_zoo.mlx.utils import _collate_vlm_batch, _finalize_vlm_batch
 
-    class _MLXValued(_FakeGemmaAudioProcessor):  # forces the deferred path
+    class _MLXValued(_FakeGemmaAudioProcessor):
         def __call__(self, text, audio=None, max_length=None, **_kw):
             return {k: mx.array(v)
                     for k, v in super().__call__(text, audio, max_length).items()}
@@ -2469,8 +2510,10 @@ def test_deferred_prompt_completion_staging_rechecks_audio_runs(monkeypatch):
                                    reject_mlx_valued=True,
                                    return_prompt_completion=True)
     # MLX-valued halves defer the combine, so the counts must ride pc_audio for
-    # the post-combine check to be possible on the consumer thread.
-    assert staged.pc_opaque is not None and staged.pc_audio == ([1], [300])
+    # the post-combine check to be possible on the consumer thread. This family
+    # has no fixed budget, hence the third slot is empty.
+    assert staged.pc_opaque is not None
+    assert staged.pc_audio == ([1], [300], None)
     # Truncation drops the run; the deferred check must catch it.
     with pytest.raises(ValueError, match="0 placeholder run"):
         _finalize_vlm_batch(staged)
@@ -2496,7 +2539,6 @@ def test_audio_merge_compacts_valid_features_per_row():
 
 
 def test_qualified_families_carry_their_probed_requirements():
-    """The shipped gate names the families whose probes actually ran."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gate = mlx_utils._AUDIO_QUALIFIED_FAMILIES
@@ -2619,7 +2661,6 @@ class _ForwardsTheHook(Gemma4Processor):
 ])
 def test_gemma4_audio_placeholders_track_the_installed_extractor(
         samples, reference, floor_044, mask_blind):
-    """Counts must equal the positions the audio tower emits, per version."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     clip = np.zeros(samples, dtype=np.float32)
@@ -3452,7 +3493,6 @@ def test_overlong_rows_are_refused_by_what_the_model_attends():
 
 
 class _ProbeProcessor:
-    """A processor that reads its audio, as a capable checkpoint's does."""
 
     def __init__(self, needs_text=None):
         self.needs_text = needs_text
@@ -3677,3 +3717,28 @@ def test_even_a_base_exception_cannot_escape_the_capability_check():
 
     verdict = audio_input_capability(_Interrupts(), _ProbeProcessor())
     assert verdict.capable is False and "could not run" in verdict.reason
+
+
+def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
+    """Phi-4 spells its placeholder `<|endoftext11|>` and declares it in neither
+    the tokenizer attributes nor its checkpoint config, so the names the loss
+    mask collects from do not reach it and every audio position was supervised.
+    It is resolved the same way run counting resolves it."""
+    from unsloth_zoo.mlx.utils import (
+        _get_vlm_audio_soft_token_ids, _get_vlm_ignore_token_ids,
+    )
+
+    class _UndeclaredPlaceholder(_FakeProcessor):
+        # Phi-4's shape: the placeholder is in the vocabulary and nowhere else.
+        # No `audio_token` attribute, no config index -- only the spelling.
+        tokenizer = type("_Tok", (_FakeTokenizer,), {
+            "_vocab": dict(_FakeTokenizer._vocab, **{"<|endoftext11|>": 200011}),
+        })()
+
+    processor = _UndeclaredPlaceholder()
+    assert not hasattr(processor.tokenizer, "audio_token")
+    soft = _get_vlm_audio_soft_token_ids(processor)
+    assert soft, "this fixture must have a resolvable placeholder"
+    ignored = _get_vlm_ignore_token_ids(processor=processor) or []
+    for token_id in soft:
+        assert token_id in ignored, token_id

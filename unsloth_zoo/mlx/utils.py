@@ -1654,6 +1654,13 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
     ):
         _append_unique_int(ids, _config_get(config, key, None))
 
+    # The repeated audio placeholder, which the names above do not always reach:
+    # Phi-4 spells it `<|endoftext11|>` and declares it in neither the tokenizer
+    # attributes nor its checkpoint config, so every audio position was a
+    # supervised target. Resolved the same way run counting resolves it.
+    for token_id in _get_vlm_audio_soft_token_ids(processor, config) or ():
+        _append_unique_int(ids, token_id)
+
     if not ids:
         return None
     return ids  # plain Python list; avoids mx.eval in the hot path
@@ -1870,13 +1877,16 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
     if staged.pc_opaque is not None:
         (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
          completion_only_loss) = staged.pc_opaque
-        audio_counts, audio_soft_ids = staged.pc_audio or (None, None)
+        audio_counts, audio_soft_ids, audio_budget = (
+            staged.pc_audio or (None, None, None)
+        )
         inner = _combine_vlm_prompt_completion_inputs(
             prompt_inputs, completion_inputs, flush_side, pad_id,
             max_seq_length,
             ignore_token_ids=staged.ignore_token_ids,
             completion_only_loss=completion_only_loss,
             audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
+            audio_budget=audio_budget,
         )
         inner.config = staged.config
         return _finalize_vlm_batch(
@@ -5722,7 +5732,6 @@ _AUDIO_NO_OWN_HOOK = object()
 
 
 def _audio_count_corrected(processor):
-    """Whether this processor is carrying the corrected placeholder count."""
     hook = getattr(processor, "_compute_audio_num_tokens", None)
     return (isinstance(hook, partial)
             and hook.func is _gemma4_audio_placeholder_count)
@@ -5889,7 +5898,6 @@ def _audio_probe_fingerprint(value):
 
 
 def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
-    """One real processor call on a freshly built tone."""
     clip = _AudioClip(_audio_probe_tone(rate, hertz), rate)
     # Held for the probe's lifetime so no later buffer can reuse its address.
     held.append(clip)
@@ -6107,7 +6115,6 @@ def _normalize_audio_clip(clip, expected_rate):
 
 
 def _vlm_audio_part_state(messages):
-    """Whether messages carry audio placeholders and/or embedded audio."""
     bare_placeholders = False
     payloads = []
     if not isinstance(messages, list):
@@ -6536,7 +6543,6 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     if not soft_ids:
         if not any(audio_counts):
             return
-        # An unverifiable run is what this check exists to prevent.
         raise ValueError(
             f"Unsloth MLX: could not resolve the audio placeholder token for "
             f"{type(processor).__name__}, so audio/text alignment cannot be "
@@ -6592,7 +6598,6 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
             else np.ones(row.shape, dtype=bool)
         )
         is_soft = np.isin(row, soft_array) & valid
-        # Count maximal runs: a rising edge starts a new placeholder run.
         starts = int(np.sum(is_soft & ~np.concatenate(([False], is_soft[:-1]))))
         total_runs += starts
         if expected_clips and budget:
@@ -6652,7 +6657,6 @@ def _format_vlm_audio_for_processor(all_audio, processor=None):
 
 
 def _vlm_processor_audio_kwarg(processor):
-    """The audio keyword this processor accepts ('audio' or 'audios')."""
     try:
         parameters = inspect.signature(processor.__call__).parameters
     except (TypeError, ValueError):
@@ -7371,6 +7375,7 @@ def _collate_vlm_prompt_completion_batch(
     _assert_audio_runs_intact(
         prompt_inputs, audio_counts, processor, None, truncated=False,
     )
+    audio_budget = _audio_fixed_budget(processor)
     audio_soft_ids = (
         _get_vlm_audio_soft_token_ids(processor) if any(audio_counts) else None
     )
@@ -7400,7 +7405,7 @@ def _collate_vlm_prompt_completion_batch(
             ignore_token_ids=ignore_token_ids,
             pc_opaque=(prompt_inputs, completion_inputs, flush_side, pad_id,
                        max_seq_length, completion_only_loss),
-            pc_audio=(audio_counts, audio_soft_ids),
+            pc_audio=(audio_counts, audio_soft_ids, audio_budget),
         )
     return _combine_vlm_prompt_completion_inputs(
         prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
@@ -7408,6 +7413,7 @@ def _collate_vlm_prompt_completion_batch(
         completion_only_loss=completion_only_loss,
         reject_mlx_valued=reject_mlx_valued,
         audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
+        audio_budget=audio_budget,
     )
 
 
@@ -7422,6 +7428,7 @@ def _combine_vlm_prompt_completion_inputs(
     reject_mlx_valued=False,
     audio_counts=None,
     audio_soft_ids=None,
+    audio_budget=None,
 ):
     """Concatenate prompt/completion processor outputs into one staged batch.
 
@@ -7460,9 +7467,11 @@ def _combine_vlm_prompt_completion_inputs(
     )
     if audio_counts and any(audio_counts):
         # Flush + truncate is where a prompt-side run can actually be cut.
+        # With the family's fixed budget, since a run cut short still leaves one
+        # run per clip and only its length gives it away.
         _assert_audio_runs_intact_ids(
             input_ids, attention_mask, audio_counts, audio_soft_ids,
-            max_seq_length,
+            max_seq_length, budget=audio_budget,
         )
 
     combined_inputs = dict(prompt_inputs)
@@ -8317,7 +8326,6 @@ def remove_audio_merge_patch(model):
 
 
 def _masked_scatter_rowwise(embeds, mask, source):
-    """Place ``source`` rows at the masked positions, in order."""
     flat_mask = mask.flatten().astype(mx.int32)
     indices = mx.cumsum(flat_mask) - 1
     flat_source = source.flatten()
