@@ -414,7 +414,12 @@ def train_on_responses_only(
             use_tensors = True
             input_ids_ = input_ids_.tolist()
         if "labels" in examples:
-            labels_ = examples["labels"].tolist()
+            # Type-check labels the same way input_ids is above: under
+            # datasets.map(batched = True) a "labels" column arrives as a plain
+            # list of lists, which has no .tolist() and raised AttributeError.
+            labels_ = examples["labels"]
+            if type(labels_) is torch_Tensor:
+                labels_ = labels_.tolist()
             assert(len(labels_) == len(input_ids_))
         else:
             labels_ = [None]*len(input_ids_)
