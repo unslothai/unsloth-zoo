@@ -97,6 +97,19 @@ def test_empty_span_contributes_nothing():
     assert _mlx_supervised_token_count(_batch([[9, 9], [4, 10]])) == 6
 
 
+def test_labeled_sft_counts_only_shifted_unmasked_targets():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _mlx_supervised_token_count
+
+    batch = mx.zeros((2, 6), dtype=mx.int32)
+    lengths = mx.array([[1, 5], [2, 6]])
+    labels = mx.array([
+        [-100, 10, -100, 12, 13, 14],
+        [-100, 20, 21, -100, 23, 24],
+    ])
+    assert _mlx_supervised_token_count((batch, lengths, labels)) == 6
+
+
 @pytest.mark.parametrize("bad", [None, (), (1,), ("x", None)])
 def test_returns_none_when_lengths_are_unavailable(bad):
     """No lengths to count -> caller falls back to the loss fn's own value."""
@@ -179,6 +192,16 @@ def test_trainer_reports_tokens_from_the_telemetry_accumulator():
     # The loss weighting must still divide by n_tokens (pairs).
     assert "(metric_losses / metric_tokens)" in src
     assert "metric_tokens = self._distributed_all_sum(n_tokens" in src
+
+
+def test_zero_token_guard_uses_the_supervised_span_count():
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    assert "supervised_toks = toks if _real is None else" in src
+    assert "global_supervised_toks = self._distributed_all_sum(" in src
+    assert "if int(global_supervised_toks.item()) == 0:" in src
 
 
 def test_weighted_loss_denominator_stays_the_accumulation_weight():

@@ -1341,8 +1341,9 @@ def _mlx_supervised_token_count(batch_data):
     pair-mean loss must be weighted by pairs when accumulating; that value is
     therefore not a token count, and reporting it as one understates
     trained_tokens and tokens_per_second by the mean completion length. Count
-    the loss span [response_start, seq_end) instead, the same window the loss
-    masks. Returns None when the batch carries no lengths to count.
+    the loss span [response_start, seq_end) instead, intersected with the label
+    mask when labels are present. Returns None when the batch carries no lengths
+    to count.
     """
     if not isinstance(batch_data, (tuple, list)) or len(batch_data) < 2:
         return None
@@ -1353,6 +1354,28 @@ def _mlx_supervised_token_count(batch_data):
         spans = lengths.tolist()
     except AttributeError:
         return None
+    labels = batch_data[2] if len(batch_data) > 2 else None
+    if labels is not None:
+        try:
+            label_rows = labels.tolist()
+        except AttributeError:
+            return None
+        if len(label_rows) != len(spans):
+            return None
+        total = 0
+        for row, span in zip(label_rows, spans):
+            if (
+                not isinstance(row, (tuple, list))
+                or not isinstance(span, (tuple, list))
+                or len(span) < 2
+            ):
+                return None
+            start, end = int(span[0]), int(span[1])
+            total += sum(
+                int(token) != -100 and start <= position < end
+                for position, token in enumerate(row[1:], start=1)
+            )
+        return total
     total = 0
     for row in spans:
         if not isinstance(row, (tuple, list)) or len(row) < 2:
@@ -4653,9 +4676,6 @@ class MLXTrainer:
         else:
             if getattr(args, "loss_type", "sft") == "orpo":
                 _ob = getattr(args, "orpo_beta", 0.1)
-                # TRL's ORPOConfig defaults disable_dropout=True; dropout under
-                # train() would perturb the log-probs. No-op when dropout=0.
-                _mlx_disable_lora_dropout(model)
                 loss_fn = make_orpo_loss_fn(beta=_ob)
                 print("Unsloth: Using ORPO loss (beta=" + str(_ob) + ").")
             elif getattr(args, "loss_type", "sft") == "dpo":
@@ -4680,10 +4700,6 @@ class MLXTrainer:
                 # Handed to the loss so the reference forward can run it clean.
                 _neft = getattr(self, "_neftune_emb", None)
                 _neftune_mods = [_neft] if _neft is not None else []
-                # TRL's DPOConfig defaults disable_dropout=True; dropout would
-                # bias the margin (policy and reference would see different
-                # masks). No-op when dropout=0; reference is clean via scale=0.
-                _mlx_disable_lora_dropout(model)
                 loss_fn = make_dpo_loss_fn(beta=_db, lora_mods=_lora_mods,
                                            reference_free=_rf,
                                            neftune_mods=_neftune_mods)
@@ -4862,6 +4878,14 @@ class MLXTrainer:
             ),
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
+
+        # Preference configuration and data validation above must finish before
+        # mutating the live model. A rejected setup can then be corrected and
+        # retried as SFT without inheriting disabled dropout. TRL defaults both
+        # preference trainers to deterministic forwards, so neutralize dropout
+        # once the run is known to be trainable and before tracing the loss.
+        if not is_vlm and getattr(args, "loss_type", "sft") in ("orpo", "dpo"):
+            _mlx_disable_lora_dropout(model)
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
@@ -6715,21 +6739,26 @@ class MLXTrainer:
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
             mx.eval(*eval_targets)
-            global_toks = self._distributed_all_sum(toks, stream=mx.cpu)
-            mx.eval(global_toks)
-            if int(global_toks.item()) == 0:
+            supervised_toks = toks if _real is None else mx.array(
+                _real, dtype=mx.int32
+            )
+            global_supervised_toks = self._distributed_all_sum(
+                supervised_toks, stream=mx.cpu
+            )
+            mx.eval(global_supervised_toks)
+            if int(global_supervised_toks.item()) == 0:
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "
                     "reduce image size, or check the chat template / labels."
                 )
             # Global INPUT-token count for HF's num_input_tokens_seen, only when the
-            # run opted in (track_input_tokens). global_toks above is the loss mask's
-            # supervised-token count (used for the zero-token guard), not the
-            # input-token count HF's field reports, so counting it would undercount
-            # prompts and masked tokens. Sum the batch input positions the selected
-            # mode counts and all-reduce that (same global gather semantics as HF
-            # and as global_toks). The gate and the mode are rank-uniform config,
+            # run opted in (track_input_tokens). global_supervised_toks above is
+            # the loss mask's supervised-token count, not the input-token count
+            # HF's field reports, so counting it would undercount prompts and
+            # masked tokens. Sum the batch input positions the selected mode
+            # counts and all-reduce that (same global gather semantics as HF).
+            # The gate and the mode are rank-uniform config,
             # so every rank skips or runs it together.
             if track_input_tokens:
                 global_input_toks = self._distributed_all_sum(
@@ -6745,7 +6774,7 @@ class MLXTrainer:
                 mx.eval(global_input_toks)
                 # HF's num_input_tokens_seen is an all-rank count of INPUT tokens,
                 # read directly by token-budget callbacks. Use the all-reduced input
-                # count, not global_toks (label tokens) and not the rank-local value
+                # count, not supervised label tokens and not the rank-local value
                 # (undercounts by ~world_size). Incremented BEFORE on_optimizer_step,
                 # as HF advances it right after the forward, so a token-budget
                 # callback sees this microbatch at the step it fires on.
@@ -7332,14 +7361,15 @@ class MLXTrainer:
                 else getattr(args, "dataset_order", "default")
             )
             # Epoch-based runs pass num_batches=None; without num_epochs the
-            # modulo-cycled loop would replay one permutation every epoch. Only
-            # torch_randperm needs it -- the other modes already match SFT.
+            # modulo-cycled loop would replay one order every epoch. Sequential
+            # intentionally stays stable, while default and torch_randperm match
+            # the SFT path's per-epoch reshuffle.
             pref_num_epochs = (
                 float(args.num_train_epochs)
                 if (
                     args.max_steps <= 0
                     and getattr(args, "num_train_epochs", -1) > 0
-                    and pref_dataset_order == "torch_randperm"
+                    and pref_dataset_order in ("default", "torch_randperm")
                 )
                 else None
             )

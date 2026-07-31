@@ -117,6 +117,8 @@ jobs:
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference_content_parts.py \
             tests/test_mlx_preference_cycle_length.py \
+            tests/test_mlx_preference_fractional_epochs.py \
+            tests/test_mlx_preference_token_telemetry.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests

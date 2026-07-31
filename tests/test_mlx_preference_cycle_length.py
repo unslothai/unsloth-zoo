@@ -123,6 +123,24 @@ def test_empty_dataset_reports_no_cycle():
     assert batches.cycle_length is None
 
 
+def test_padding_uses_tokenizer_pad_id_and_shifted_multiple():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _PadTokenizer(_StubTokenizer):
+        pad_token_id = 99
+
+    batches = create_preference_batches(
+        [{"prompt": "p", "chosen": "c", "rejected": "r"}],
+        _PadTokenizer(), batch_size=1, max_seq_length=64,
+        pad_to_multiple=32, dataset_order="sequential",
+    )
+    batch, lengths, _labels = batches[0]
+    assert batch.shape[1] == 33
+    assert batch[:, :-1].shape[1] == 32
+    for row, (_start, end) in zip(batch.tolist(), lengths.tolist()):
+        assert row[end:] == [99] * (33 - end)
+
+
 # 2. What the trainer does with it -- the ragged-tail scenario.
 def test_bare_list_reports_no_epoch_boundary():
     """Document the bug: a plain list gives the helper nothing to work with."""

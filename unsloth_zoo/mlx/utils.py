@@ -1652,8 +1652,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``,
-    grouped into batches of ``batch_size`` PAIRS and padded to a multiple of
-    ``pad_to_multiple``.
+    grouped into batches of ``batch_size`` PAIRS and padded so the shifted
+    model input width is a multiple of ``pad_to_multiple``.
 
     ``dataset_order`` (mirrors the SFT/VLM builders for CUDA/TRL parity):
       "default"        length-sort — least padding; the historical behavior.
@@ -1661,8 +1661,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
       "torch_randperm" seeded permutation — CUDA ``RandomSampler``.
     ``preserve_dataset_order=True`` forces "sequential"; ``seed`` seeds
     "torch_randperm". ``num_epochs`` (epoch-based runs, ``num_batches`` None)
-    materializes one reseeded permutation per epoch for "torch_randperm" so the
-    modulo-cycled loop sees a fresh order each epoch.
+    materializes a fresh batch permutation for "default" and a fresh row
+    permutation for "torch_randperm" so each epoch sees a new order.
 
     ``append_eos`` (default True, as TRL) appends EOS to each completion before
     truncation, guarded against a double EOS; it lands inside the loss span and
@@ -1682,7 +1682,10 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         )
     hf = _hf_encoding_tokenizer(tokenizer)
     eos_id = hf.eos_token_id
-    pad_id = eos_id if eos_id is not None else 0
+    pad_id = getattr(hf, "pad_token_id", None)
+    pad_id = int(pad_id if pad_id is not None else (
+        eos_id if eos_id is not None else 0
+    ))
 
     def _with_eos(ids):
         if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
@@ -1746,7 +1749,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     # and a multi-pass run would replay one identical order every epoch.
     # "default" reshuffles BATCH order via numpy so it stays torch-free;
     # "torch_randperm" redraws a ROW permutation per pass; "sequential" is
-    # left single-pass. Pass 0 uses base_seed, so sub-epoch runs are unchanged.
+    # left single-pass. Step-based pass 0 uses base_seed. Epoch-based default
+    # keeps the length-sorted first pass, matching the SFT finite plan.
     base_starts = list(range(0, len(rows), batch_size))
     if order_mode == "default" and num_batches is not None and base_starts:
         rng = np.random.RandomState(_normalize_seed(seed))
@@ -1755,6 +1759,22 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             perm = rng.permutation(len(base_starts))
             ordered_starts.extend(base_starts[int(i)] for i in perm)
         chunks = [rows[s:s + batch_size] for s in ordered_starts[:num_batches]]
+    elif order_mode == "default" and num_epochs is not None and base_starts:
+        cycle = len(base_starts)
+        accum = max(1, int(grad_accum or 1))
+        per_epoch = max(1, math.ceil(cycle / accum))
+        budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+        whole, rem = divmod(budget, per_epoch)
+        target_batches = whole * cycle + rem * accum
+        base_seed = _normalize_seed(seed)
+        ordered_starts = list(base_starts)
+        epoch = 1
+        while len(ordered_starts) < target_batches:
+            rng = np.random.RandomState((base_seed + epoch) % (2 ** 32))
+            perm = rng.permutation(cycle)
+            ordered_starts.extend(base_starts[int(i)] for i in perm)
+            epoch += 1
+        chunks = [rows[s:s + batch_size] for s in ordered_starts[:target_batches]]
     elif order_mode == "torch_randperm" and num_batches is not None and rows:
         base_seed = _normalize_seed(seed)
         chunks = []
@@ -1804,11 +1824,12 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     out = []
     for chunk in chunks:
         Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
-        if pad_to_multiple:
-            Lmax = ((Lmax + pad_to_multiple - 1) // pad_to_multiple) * pad_to_multiple
-            # Cap the round-up: max_seq_length need not be a multiple of
-            # pad_to_multiple, and overshooting it would forward past the limit.
-            Lmax = min(Lmax, max_seq_length)
+        Lmax = _finite_text_pad_width(
+            Lmax,
+            pad_to_multiple=pad_to_multiple,
+            minimum_width=2,
+            max_seq_length=max_seq_length,
+        )
         chosen_rows, rejected_rows, lengths = [], [], []
         for pe, c, r in chunk:
             chosen_rows.append(c + [pad_id] * (Lmax - len(c)))

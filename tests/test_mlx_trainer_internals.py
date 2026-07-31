@@ -4057,9 +4057,9 @@ def test_preference_torch_randperm_reshuffles_batches_each_epoch():
     assert per_epoch[0] == _signatures(single)
 
 
-def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypatch):
-    # Regression: _prepare_data must thread num_epochs for epoch-based
-    # torch_randperm runs and flag _prepared_batches_include_epochs so
+def test_preference_prepare_data_threads_num_epochs_for_reshuffled_orders(monkeypatch):
+    # Regression: _prepare_data must thread num_epochs for epoch-based default
+    # and torch_randperm runs, then flag _prepared_batches_include_epochs so
     # total_steps divides the already-expanded list.
     from unsloth_zoo.mlx import trainer as mlx_trainer
 
@@ -4075,7 +4075,7 @@ def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypat
     )
 
     for loss_type in ("orpo", "dpo"):
-        # Epoch-based torch_randperm -> num_epochs threaded, num_batches None.
+        # Epoch-based torch_randperm gets an expanded, reshuffled schedule.
         MLXTrainerCls, trainer = _make_mlx_text_trainer(
             loss_type=loss_type, max_steps=0, num_train_epochs=3,
             dataset_order="torch_randperm",
@@ -4103,8 +4103,8 @@ def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypat
         assert captured["num_batches"] is not None
         assert trainer._prepared_batches_include_epochs is False
 
-        # Epoch-based DEFAULT order stays single-pass (matches SFT create_batches
-        # which also modulo-cycles one pass); num_epochs must NOT be threaded.
+        # Epoch-based default order also expands and reshuffles batch visits,
+        # matching the SFT default finite plan instead of replaying one order.
         MLXTrainerCls, trainer = _make_mlx_text_trainer(
             loss_type=loss_type, max_steps=0, num_train_epochs=3,
             dataset_order="default",
@@ -4113,8 +4113,8 @@ def test_preference_prepare_data_threads_num_epochs_for_torch_randperm(monkeypat
         trainer._prepared_batches_include_epochs = False
         MLXTrainerCls._prepare_data(trainer, is_vlm=False)
         assert captured["dataset_order"] == "default"
-        assert captured["num_epochs"] is None
-        assert trainer._prepared_batches_include_epochs is False
+        assert captured["num_epochs"] == 3
+        assert trainer._prepared_batches_include_epochs is True
 
 
 def test_dpo_reference_collects_nested_lora_modules():
@@ -4201,10 +4201,8 @@ def test_preference_disable_lora_dropout_neutralizes_adapter_dropout():
 
 
 def test_preference_setup_disables_dropout_for_orpo_and_dpo():
-    # The ORPO and DPO branches of _train_inner must call
-    # _mlx_disable_lora_dropout(model) before building the preference loss fn
-    # (mirroring TRL's disable_dropout=True default). Source-inspection guarded so
-    # the wiring cannot silently regress, matching the DoRA-guard test.
+    # Preference setup must disable dropout after data validation and before
+    # tracing the loss. A rejected setup must leave the reusable model untouched.
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -4212,11 +4210,12 @@ def test_preference_setup_disables_dropout_for_orpo_and_dpo():
     disable = "_mlx_disable_lora_dropout(model)"
     orpo_builder = src.index("make_orpo_loss_fn(beta=")
     dpo_builder = src.index("make_dpo_loss_fn(beta=")
-    orpo_branch = src.index('== "orpo"')
-    dpo_branch = src.index('== "dpo"')
-    # A disable call sits inside each branch, before that branch's loss builder.
-    assert disable in src[orpo_branch:orpo_builder]
-    assert disable in src[dpo_branch:dpo_builder]
+    prepare = src.index("batches, batch_iter = self._prepare_data(is_vlm)")
+    disable_at = src.index(disable)
+    trace = src.index("nn.value_and_grad(model, loss_fn)")
+    assert orpo_builder < prepare < disable_at < trace
+    assert dpo_builder < prepare < disable_at < trace
+    assert src.count(disable) == 1
 
 
 def test_preference_disable_dropout_neutralizes_base_model_dropout():
@@ -5841,6 +5840,43 @@ def _patch_value_and_grad_with_aux(monkeypatch):
         return wrapped
 
     monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+
+
+def test_preference_empty_response_batch_trips_zero_token_guard(monkeypatch):
+    import tempfile
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    _patch_value_and_grad_with_aux(monkeypatch)
+    args = MLXTrainingConfig(
+        max_steps=1,
+        loss_type="dpo",
+        reference_free=True,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0,
+        max_grad_leaf_norm=0.0,
+        disable_memory_limits=True,
+        output_dir=tempfile.mkdtemp(),
+    )
+    trainer = MLXTrainer(
+        _tiny_lm_for_loop_tests(),
+        types.SimpleNamespace(pad_token_id=99, eos_token_id=2),
+        [],
+        args=args,
+    )
+    batch = mx.array([[1, 2, 3, 4], [1, 2, 3, 5]], dtype=mx.int32)
+    lengths = mx.array([[4, 4], [4, 4]])
+    trainer._batches = [(batch, lengths, None)]
+    trainer._build_optimizer = _frozen_optimizer()
+    trainer.save_model = lambda *_a, **_kw: None
+
+    with pytest.raises(ValueError, match="zero supervised tokens"):
+        trainer.train()
 
 
 def test_resume_mid_epoch_fires_epoch_begin(monkeypatch):

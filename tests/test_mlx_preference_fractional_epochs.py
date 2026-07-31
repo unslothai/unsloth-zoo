@@ -143,3 +143,28 @@ def test_whole_epochs_are_byte_identical_to_the_integer_build():
         plan = _build(epochs)
         assert len(plan) == int(epochs) * 3, f"{epochs} epochs changed"
         assert not math.isclose(len(plan), 0)
+
+
+def test_default_order_reshuffles_batch_visits_each_epoch():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    plan = create_preference_batches(
+        _rows(), _Tok(), BATCH_SIZE, 64, dataset_order="default",
+        num_epochs=3, grad_accum=GRAD_ACCUM, seed=11,
+    )
+    assert len(plan) == 9
+
+    def signature(batch_data):
+        batch, _lengths, _labels = batch_data
+        return tuple(int(row[1]) for row in batch.tolist()[:BATCH_SIZE])
+
+    passes = [
+        [signature(item) for item in plan[start:start + 3]]
+        for start in range(0, len(plan), 3)
+    ]
+    first_pass = create_preference_batches(
+        _rows(), _Tok(), BATCH_SIZE, 64, dataset_order="default", seed=11,
+    )
+    assert passes[0] == [signature(item) for item in first_pass]
+    assert all(sorted(block) == sorted(passes[0]) for block in passes[1:])
+    assert any(block != passes[0] for block in passes[1:])
