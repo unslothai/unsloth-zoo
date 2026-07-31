@@ -7318,8 +7318,16 @@ class MLXTrainer:
                 )
                 else None
             )
+            # The local binding from _train_dataset_for_batches(), as every
+            # other builder here uses. Not a correctness fix: the SFT tokenized
+            # view copies the row and only ADDS input_ids/attention_mask, so
+            # prompt/chosen/rejected survive it and both objects yield the same
+            # preference values. It avoids tokenizing a text/messages column this
+            # path discards, and keeps one source of truth -- the elif in
+            # __init__ rebinds self.train_dataset without updating
+            # _mlx_train_dataset_for_batches, so the two can already differ.
             batches = create_preference_batches(
-                dataset=self.train_dataset,
+                dataset=train_dataset,
                 tokenizer=self.tokenizer,
                 batch_size=args.per_device_train_batch_size,
                 max_seq_length=args.max_seq_length,
