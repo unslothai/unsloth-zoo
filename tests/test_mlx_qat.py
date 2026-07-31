@@ -276,9 +276,13 @@ def test_lora_dropout_is_rejected():
 
 
 def test_model_without_lora_is_rejected():
-    holder = _Holder(nn.Linear(DIMS, DIMS))
+    # Quantized, so only the "no adapters" condition is violated -- otherwise
+    # the earlier unquantized-base preflight fires and this path is never hit.
+    quantized = nn.QuantizedLinear.from_linear(
+        nn.Linear(DIMS, DIMS, bias=False),
+        group_size=GROUP_SIZE, bits=BITS, mode="affine")
     with pytest.raises(ValueError, match="no LoRA layers"):
-        apply_mlx_qat(holder, "auto")
+        apply_mlx_qat(_Holder(quantized), "auto")
 
 
 def test_mixed_quantization_grids_are_rejected():

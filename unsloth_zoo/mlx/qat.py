@@ -84,6 +84,28 @@ def _dropout_probability(module):
     return 1.0 - float(p_1)
 
 
+def _model_has_quantized_module(model):
+    """True when anything in the tree carries MLX quantized weights.
+
+    Works before adapters exist (bare ``nn.QuantizedLinear``) and after
+    (``named_modules`` still walks into ``LoRALinear.linear``), so the same
+    check serves the pre-mutation preflight and the post-LoRA pass.
+    """
+    import mlx.nn as nn
+
+    quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        quantized_types.append(QuantizedSwitchLinear)
+    except Exception:
+        pass
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+    return any(
+        isinstance(module, quantized_types)
+        for _, module in model.named_modules()
+    )
+
+
 def _lora_layer_types():
     """(LoRALinear, DoRA types, switch/MoE LoRA types) for the installed stack."""
     from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
@@ -248,6 +270,18 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None):
             "Unsloth: qat_scheme requires lora_dropout=0 on MLX. QAT folds the "
             "adapter into the weight to match fuse(), which leaves no separate "
             f"LoRA activation path for dropout to act on (got {lora_dropout})."
+        )
+
+    # Checkable before adapters exist, so it belongs here rather than in the
+    # post-LoRA pass: otherwise get_peft_model installs and freezes 100+ LoRA
+    # layers and only then refuses, leaving a mutated model behind.
+    if not _model_has_quantized_module(model):
+        raise ValueError(
+            "Unsloth: qat_scheme requires a quantized base model — nothing in "
+            "this model is quantized, so save_method='merged_4bit' would not "
+            "requantize and there is no quantization for QAT to simulate. "
+            "Load with load_in_4bit=True (or a pre-quantized -4bit/-8bit repo) "
+            "to use QAT."
         )
 
     return requested_bits

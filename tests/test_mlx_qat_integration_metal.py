@@ -200,21 +200,57 @@ def test_full_finetuning_request_is_not_silently_dropped():
     assert mlx_qat_module_count(model) == 0
 
 
-def test_rejected_request_leaves_the_model_unmutated():
-    """A refused QAT request must not install LoRA first and raise after."""
+def _lora_layers_installed(model):
     from mlx_lm.tuner.lora import LoRALinear
+    return sum(
+        1 for _, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    )
 
+
+def test_dropout_refusal_leaves_the_model_unmutated():
+    """A refused QAT request must not install LoRA first and raise after."""
     model, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
     with pytest.raises(NotImplementedError, match="lora_dropout=0"):
         FastMLXModel.get_peft_model(
             model, r=8, lora_alpha=16, lora_dropout=0.1,
             qat_scheme="auto", use_gradient_checkpointing=False,
         )
-    installed = sum(
-        1 for _, module in model.named_modules()
-        if isinstance(module, LoRALinear)
-    )
+    installed = _lora_layers_installed(model)
     assert installed == 0, f"{installed} LoRA layers left behind after refusal"
+
+
+def test_unquantized_base_refusal_leaves_the_model_unmutated():
+    """Same guarantee for the unquantized-base refusal.
+
+    Whether the base is quantized is knowable before any adapter exists, so
+    refusing after installing and freezing 100+ LoRA layers would leave a
+    caller who catches the error with a mutated model.
+    """
+    from mlx.utils import tree_flatten
+
+    model, _ = FastMLXModel.from_pretrained(
+        "Qwen/Qwen2.5-0.5B-Instruct", max_seq_length=64,
+        load_in_16bit=True, load_in_4bit=False,
+    )
+
+    def trainable_size():
+        return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
+
+    # A freshly loaded model has everything trainable; get_peft_model is what
+    # freezes. So "unmutated" means unchanged, not zero.
+    before = trainable_size()
+    with pytest.raises(ValueError, match="requires a quantized base"):
+        FastMLXModel.get_peft_model(
+            model, r=8, lora_alpha=16, lora_dropout=0,
+            qat_scheme="auto", use_gradient_checkpointing=False,
+        )
+    installed = _lora_layers_installed(model)
+    assert installed == 0, f"{installed} LoRA layers left behind after refusal"
+    assert trainable_size() == before, (
+        f"trainability changed by the failed call: {before:,} -> "
+        f"{trainable_size():,}"
+    )
 
 
 def test_vlm_is_gated_off():
