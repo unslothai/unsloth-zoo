@@ -5499,8 +5499,13 @@ class MLXTrainer:
         eval_batches = None
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
+        # Warn on ANY configured eval, not just the step cadence. eval can also
+        # be requested by eval_strategy="epoch", a callback raising
+        # should_evaluate, or DefaultFlowCallback's final-step eval; all of them
+        # reach _prepare_eval_batches, get None, and are silently cleared by
+        # _run_eval. Gating this on eval_steps > 0 warned for one of the four.
         if (getattr(args, "loss_type", "sft") in ("orpo", "dpo")
-                and args.eval_steps > 0 and self.eval_dataset is not None):
+                and self.eval_dataset is not None):
             print(f"Unsloth: eval is not yet supported for {args.loss_type}; skipping eval.")
 
         def _prepare_eval_batches():
@@ -7226,6 +7231,26 @@ class MLXTrainer:
                 "this check they would silently train a plain SFT cross-entropy "
                 "objective. Use loss_type='dpo' (sigmoid DPO), 'orpo', or 'sft'."
             )
+        # Reject the eval-derived features outright: unlike the cadences above,
+        # these cannot degrade to "no metrics". Preference losses never populate
+        # eval_loss, so load_best_model_at_end restores nothing while reporting
+        # success, and EarlyStoppingCallback never advances its patience.
+        if _loss_type in ("orpo", "dpo"):
+            if bool(getattr(args, "load_best_model_at_end", False)):
+                raise ValueError(
+                    f"Unsloth MLX: load_best_model_at_end is not supported for "
+                    f"loss_type={_loss_type!r}. Preference losses have no eval "
+                    f"path yet, so {getattr(args, 'metric_for_best_model', 'eval_loss')!r} "
+                    "is never produced and no best checkpoint would be restored. "
+                    "Set load_best_model_at_end=False."
+                )
+            if int(getattr(args, "early_stopping_patience", 0) or 0) > 0:
+                raise ValueError(
+                    f"Unsloth MLX: early_stopping_patience is not supported for "
+                    f"loss_type={_loss_type!r}. Preference losses have no eval "
+                    "path yet, so no eval metric is ever produced and early "
+                    "stopping would never trigger. Set early_stopping_patience=0."
+                )
         self._streaming_epoch_batch_count = None
         train_dataset = self._train_dataset_for_batches()
         config = getattr(self.model, "_config", {})
