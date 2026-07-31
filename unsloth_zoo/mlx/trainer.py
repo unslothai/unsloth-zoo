@@ -1328,6 +1328,33 @@ def _shape_guard_report(
     )
 
 
+def _mlx_supervised_token_count(batch_data):
+    """Supervised tokens in one micro-batch, for throughput telemetry only.
+
+    The preference losses return the PAIR count as their second value because a
+    pair-mean loss must be weighted by pairs when accumulating; that value is
+    therefore not a token count, and reporting it as one understates
+    trained_tokens and tokens_per_second by the mean completion length. Count
+    the loss span [response_start, seq_end) instead, the same window the loss
+    masks. Returns None when the batch carries no lengths to count.
+    """
+    if not isinstance(batch_data, (tuple, list)) or len(batch_data) < 2:
+        return None
+    lengths = batch_data[1]
+    if lengths is None:
+        return None
+    try:
+        spans = lengths.tolist()
+    except AttributeError:
+        return None
+    total = 0
+    for row in spans:
+        if not isinstance(row, (tuple, list)) or len(row) < 2:
+            return None
+        total += max(0, int(row[1]) - int(row[0]))
+    return total
+
+
 def _mlx_epoch_microbatches(args, batches, *, includes_epochs=False):
     """Micro-batches in one epoch when epoch boundaries drive the schedule.
 
@@ -5731,6 +5758,11 @@ class MLXTrainer:
         pending_n_tokens = 0
         pending_steps = 0
         trained_tokens = 0
+        # Real supervised tokens, tracked beside n_tokens purely for telemetry:
+        # under ORPO/DPO n_tokens holds the PAIR count (the correct accumulation
+        # weight for a pair-mean loss), which is not a token count.
+        real_tokens = 0
+        pending_real_tokens = 0
         train_time = 0
         # Wall clock for the PENDING window, split like the loss/token counters
         # above: charging a forced log the pending micro-batches' time would
@@ -5815,6 +5847,7 @@ class MLXTrainer:
             on_log fires on every rank and self-gates on is_world_process_zero.
             """
             nonlocal losses, n_tokens, steps, train_time, trained_tokens
+            nonlocal real_tokens
             # Nothing accumulated since the last log: a callback can force
             # should_log again on a step that already logged, and the accumulators
             # are plain-int 0 after a reset, so .item() below would raise and a real
@@ -5832,7 +5865,14 @@ class MLXTrainer:
                 if metric_tokens.item() > 0 else 0.0
             )
             local_tok_count = int(n_tokens.item())
-            tok_count = int(metric_tokens.item())
+            # Two distinct quantities. weight_count is the accumulation weight
+            # (PAIRS under ORPO/DPO) and stays the denominator of the weighted
+            # loss; tok_count is the real supervised-token count, used only for
+            # reporting. They coincide on the SFT path.
+            weight_count = int(metric_tokens.item())
+            metric_real = self._distributed_all_sum(real_tokens, stream=mx.cpu)
+            mx.eval(metric_real)
+            tok_count = int(metric_real.item())
             trained_tokens += tok_count
             lr_val = optimizer.learning_rate.item()
             tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -5842,7 +5882,7 @@ class MLXTrainer:
             # metric_losses is already sum(loss * tokens) over the window, so these
             # totals give the exact global mean whatever the boundaries were.
             self._train_loss_token_sum += float(metric_losses.item())
-            self._train_loss_token_total += tok_count
+            self._train_loss_token_total += weight_count
             grad_norm_val = (
                 float(grad_norm.item())
                 if grad_norm is not None else None
@@ -5915,6 +5955,7 @@ class MLXTrainer:
 
             losses = 0
             n_tokens = 0
+            real_tokens = 0
             steps = 0
             train_time = 0
 
@@ -6630,6 +6671,10 @@ class MLXTrainer:
             # loss is folded into tr_loss only after the optimizer step).
             pending_losses += lvalue * toks
             pending_n_tokens += toks
+            _real = _mlx_supervised_token_count(batch_data)
+            pending_real_tokens += toks if _real is None else mx.array(
+                _real, dtype=mx.int32
+            )
             pending_steps += 1
             if do_update:
                 # Window applied: fold pending into committed and reset pending.
@@ -6637,9 +6682,11 @@ class MLXTrainer:
                 # pending contribution, so pending (now 0) needs no separate eval.
                 losses += pending_losses
                 n_tokens += pending_n_tokens
+                real_tokens += pending_real_tokens
                 steps += pending_steps
                 pending_losses = 0
                 pending_n_tokens = 0
+                pending_real_tokens = 0
                 pending_steps = 0
                 _metric_eval = (losses, n_tokens)
             else:
