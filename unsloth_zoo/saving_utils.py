@@ -5102,43 +5102,55 @@ def _local_snapshot_is_complete(local_path):
     An index that cannot be read answers False: completeness is unproven, and the
     unreachable Hub is then the more honest failure.
     """
+    indexed = None
     index_path = os.path.join(local_path, "model.safetensors.index.json")
     if os.path.isfile(index_path):
         try:
             with open(index_path, encoding = "utf-8") as f:
                 weight_map = json.load(f).get("weight_map", {})
-            shards = {os.path.split(v)[-1] for v in weight_map.values()}
+            indexed = {os.path.split(v)[-1] for v in weight_map.values()}
         except Exception:
             return False
-        if not shards: return False
-        if not all(os.path.isfile(os.path.join(local_path, shard)) for shard in shards):
+        if not indexed: return False
+        if not all(os.path.isfile(os.path.join(local_path, name)) for name in indexed):
             return False
-        # An index can itself be stale or half rebuilt: one naming
-        # `model-00001-of-00005.safetensors` and nothing else is answered by the name, which
-        # says four more belong to that set. So the names it gives are checked as names too.
-        return _one_whole_shard_set(shards)
 
     try:
         entries = os.listdir(local_path)
     except OSError:
         return False
-    # With no index the merge has nothing to filter against, so what it reads is every
-    # top-level `.safetensors` less the one exception it makes for itself. Ask that same
-    # question rather than a second one: the files it would read have to be one snapshot.
-    return _one_snapshot_on_disk(_safetensors_the_merge_would_read(entries))
+
+    selected = _safetensors_the_merge_would_read(entries, indexed)
+    if not _one_snapshot_on_disk(selected):
+        return False
+    # An index only settles the question if the merge ends up reading what it names. Its
+    # own two rules can disagree with it: `consolidated.safetensors` is dropped whenever any
+    # other safetensors exists, and when the survivors then intersect the index in nothing
+    # at all the filter keeps them. An index naming only the consolidated file, beside a
+    # half downloaded shard, is read as that shard.
+    if indexed is not None and set(selected) != indexed:
+        return False
+    return True
 pass
 
-def _safetensors_the_merge_would_read(entries):
-    """The `.safetensors` the local branch of `merge_and_overwrite_lora` would enumerate.
+def _safetensors_the_merge_would_read(entries, indexed = None):
+    """The `.safetensors` the local branch of `merge_and_overwrite_lora` would consume.
 
-    It lists them all and drops `consolidated.safetensors` when proper shards coexist,
-    because Mistral-7B-v0.3, Codestral, Nemo and Small ship one that duplicates their
-    shards. Mirrored here so a directory of that shape is not called incomplete, and so
-    this answer cannot drift from what is actually read.
+    Its two rules, in its order. It lists them all and drops `consolidated.safetensors`
+    when proper shards coexist, because Mistral-7B-v0.3, Codestral, Nemo and Small ship one
+    that duplicates their shards. Then, if an index is present and the survivors are not
+    already a subset of it, it keeps those the index names, but only when that leaves
+    something: an empty intersection leaves the non-indexed files in place.
+
+    Mirrored rather than approximated so this answer cannot drift from what is read.
     """
     files = [entry for entry in entries if entry.endswith(".safetensors")]
     if any(name != _CONSOLIDATED for name in files):
         files = [name for name in files if name != _CONSOLIDATED]
+    if indexed and not set(files).issubset(indexed):
+        kept = [name for name in files if name in indexed]
+        if kept and len(kept) != len(files):
+            files = kept
     return files
 
 def _one_snapshot_on_disk(files):
@@ -5274,11 +5286,14 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     try:
         hf_exists = check_hf_model_exists(model_name, token)
         if hf_exists:
-            # A rejected local copy must not answer for the Hub: this name can be both a
-            # directory and a repo id, and the directory is the thing that could not be
-            # read. The keyword is passed only then, so the ordinary call stays two
-            # arguments wide for anyone who has stubbed this function.
-            _ask_the_hub = {"local_ok": False} if local_config_error is not None else {}
+            # This call is about the Hub, so a local directory of the same name must not
+            # answer it. A name can be both, and then the callee's local branch reads the
+            # directory: a local nf4 copy beside an unquantized Hub repo came back `HF_nf4`,
+            # and a `merged_16bit` export refused a base that is 16bit on the Hub. Rejected
+            # or readable makes no difference to that. The condition mirrors the callee's
+            # own, so the keyword is passed exactly when it changes the answer and the
+            # ordinary call stays two arguments wide for anyone who has stubbed this.
+            _ask_the_hub = {"local_ok": False} if os.path.isdir(str(model_name)) else {}
             hf_is_quantized, hf_quant_type = check_model_quantization_status(
                 model_name, token, **_ask_the_hub,
             )

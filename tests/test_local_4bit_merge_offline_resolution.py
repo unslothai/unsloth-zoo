@@ -315,7 +315,9 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
         saving_utils, "check_model_quantization_status",
         # The local copy is consulted by resolved absolute path, the Hub by the name as
         # given, which is what tells the two calls apart.
-        lambda name, token = None: (True, "nf4") if os.path.isabs(str(name)) else (False, None),
+        # `**kwargs`: the Hub-side call passes `local_ok = False` when the name is also a
+        # directory, which is this fixture's situation.
+        lambda name, token = None, **kwargs: (True, "nf4") if os.path.isabs(str(name)) else (False, None),
     )
 
     name, is_local, source, _, _ = saving_utils.determine_base_model_source(

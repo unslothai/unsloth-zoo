@@ -376,6 +376,52 @@ def test_an_unnumbered_stale_copy_is_ambiguous_too(monkeypatch, tmp_path, error)
         saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
 
 
+def _write_index_named(directory, names):
+    index = {"weight_map": {f"layer{i}.weight": name for i, name in enumerate(names)}}
+    with open(os.path.join(directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
+        json.dump(index, f)
+
+
+@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
+def test_an_index_the_merge_will_not_honour_settles_nothing(monkeypatch, tmp_path, error):
+    """An index names `consolidated.safetensors` and a half downloaded shard sits beside it.
+    The merge drops the consolidated file whenever any other safetensors exists, and when the
+    survivors then intersect the index in nothing at all its filter keeps them, so what it
+    reads is the partial shard. Validating only the names the index gives called that
+    complete."""
+    monkeypatch.chdir(tmp_path)
+    directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
+    os.remove(os.path.join(directory, "model.safetensors"))
+    _shard(directory, "consolidated.safetensors")
+    _shard(directory, "model-00001-of-00005.safetensors")
+    _write_index_named(directory, ["consolidated.safetensors"])
+
+    assert saving_utils._local_snapshot_is_complete(directory) is False
+    _hub_raises(monkeypatch, error)
+    with pytest.raises(RuntimeError):
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+
+
+def test_an_indexed_consolidated_file_on_its_own_is_honoured(tmp_path):
+    """Nothing else is there for the merge to prefer, so it reads the file the index names."""
+    directory = str(tmp_path)
+    open(os.path.join(directory, "consolidated.safetensors"), "wb").close()
+    _write_index_named(directory, ["consolidated.safetensors"])
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
+def test_an_index_still_filters_a_stale_extra(tmp_path):
+    """The complement, and the reason the index branch is not simply the strict one: when the
+    survivors do intersect the index, the merge keeps that intersection, so a stale
+    `backup.safetensors` beside an indexed set is filtered and the snapshot is readable."""
+    directory = str(tmp_path)
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for name in shards + ["backup.safetensors"]:
+        open(os.path.join(directory, name), "wb").close()
+    _write_index_named(directory, shards)
+    assert saving_utils._local_snapshot_is_complete(directory) is True
+
+
 def test_an_unnumbered_extra_beside_a_whole_set_is_ambiguous(tmp_path):
     """The same, in the shape the numbered rules alone did not see."""
     directory = str(tmp_path)
@@ -471,7 +517,9 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_fp8_copy(monkeypatch,
         saving_utils, "check_model_quantization_status",
         # The local copy is consulted by resolved absolute path, the Hub by the name as
         # given, which is what tells the two calls apart.
-        lambda name, token = None: (True, "fp8") if os.path.isabs(str(name)) else (False, None),
+        # `**kwargs` because the Hub-side call now passes `local_ok = False` when the name
+        # is also a directory, which is exactly this fixture's situation.
+        lambda name, token = None, **kwargs: (True, "fp8") if os.path.isabs(str(name)) else (False, None),
     )
 
     name, is_local, source, is_quantized, quant_type = \

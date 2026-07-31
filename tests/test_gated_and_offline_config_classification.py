@@ -419,3 +419,37 @@ def test_an_unreachable_hub_still_wins_over_an_unreadable_local_config(monkeypat
     with pytest.raises(RuntimeError) as excinfo:
         saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
     assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
+
+
+def test_a_local_quantized_copy_does_not_answer_for_an_unquantized_hub_repo(monkeypatch, tmp_path):
+    """The Hub-side classification asked about the Hub and got the directory. A name can be
+    both, and `check_model_quantization_status` prefers the directory, so a local nf4 copy
+    beside a repo that is 16bit on the Hub came back `HF_nf4`: priority 4 instead of priority
+    3, and a `merged_16bit` export then refused a base the Hub serves in full precision."""
+    _require_a_case_sensitive_filesystem(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    directory = os.path.join("outputs", "mymodel")
+    os.makedirs(directory, exist_ok = True)
+    open(os.path.join(directory, "model.safetensors"), "wb").close()
+    with open(os.path.join(directory, "config.json"), "w", encoding = "utf-8") as f:
+        json.dump({"model_type": "llama",
+                   "quantization_config": {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}}, f)
+
+    def fake_ls(self, path, detail = True, **kwargs):
+        return [{"name": f"{path}/model.safetensors"}]
+    monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
+    # The Hub's own config, reached only if the directory is not consulted for it.
+    hub_config = tmp_path / "hub-config.json"
+    hub_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
+    import huggingface_hub
+    monkeypatch.setattr(
+        huggingface_hub, "hf_hub_download",
+        lambda *args, **kwargs: str(hub_config), raising = True,
+    )
+
+    name, is_local, source, is_quantized, quant_type = \
+        saving_utils.determine_base_model_source("outputs/mymodel", save_method = "merged_16bit")
+    assert source == "HF_unquantized", source
+    assert is_local is False
+    assert is_quantized is False
+    assert quant_type is None
