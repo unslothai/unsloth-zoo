@@ -2977,6 +2977,215 @@ def test_grpo_loss_returns_rollout_row_count_not_token_count(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# PR #832 round-8 review fixes: ragged epoch tails must be applied (GRPO budget
+# + preference one-pass length), and the GRPO KL probe must honour a disabled
+# logging interval.
+# ---------------------------------------------------------------------------
+
+def _grpo_prepare_data_trainer(n_prompts, **arg_overrides):
+    """MLXGRPOTrainer wired just enough to run _prepare_data's planning."""
+    import types
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer, MLXGRPOConfig
+
+    class _Tok:
+        eos_token_id = 0
+        chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+
+        def encode(self, text, add_special_tokens=True):
+            return [1, 2, 3]
+
+    cfg = dict(
+        max_steps=-1, num_train_epochs=1, gradient_accumulation_steps=2,
+    )
+    cfg.update(arg_overrides)
+    trainer = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    trainer.model = types.SimpleNamespace(_config={}, _hf_repo=None)
+    trainer.tokenizer = _Tok()
+    trainer.train_dataset = [{"prompt": f"p{i}"} for i in range(n_prompts)]
+    trainer.args = MLXGRPOConfig(**cfg)
+    trainer._prepare_data(is_vlm=False)
+    return trainer
+
+
+def _hf_update_steps_per_epoch(n_microbatches, grad_accum):
+    """transformers set_initial_training_values, verbatim."""
+    return max(
+        n_microbatches // grad_accum + int(n_microbatches % grad_accum > 0), 1,
+    )
+
+
+@pytest.mark.parametrize("n_prompts,grad_accum,epochs", [
+    (3, 2, 1), (4, 2, 1), (5, 2, 1), (3, 1, 1),
+    (5, 3, 1), (3, 2, 2), (2, 4, 1), (4, 3, 1),
+])
+def test_grpo_epoch_budget_ceils_a_ragged_prompt_tail(
+    n_prompts, grad_accum, epochs,
+):
+    # The GRPO epoch budget floor-divided (batches_per_epoch * epochs) //
+    # grad_accum. For a prompt count not divisible by grad_accum that plans one
+    # step too few and, with batches=None leaving the loop no epoch-final flush,
+    # the epoch's tail prompt was never generated, scored or applied: 3 prompts
+    # at grad_accum=2 consumed two rollouts and dropped the third.
+    #
+    # The budget must be HF's: num_update_steps_per_epoch is a CEIL
+    # (len//ga + int(len%ga > 0)) because do_sync_step forces an update on the
+    # epoch's last micro-batch, and max_steps = ceil(epochs * that).
+    import math
+
+    trainer = _grpo_prepare_data_trainer(
+        n_prompts, gradient_accumulation_steps=grad_accum,
+        num_train_epochs=epochs,
+    )
+    expected = math.ceil(
+        epochs * _hf_update_steps_per_epoch(n_prompts, grad_accum)
+    )
+    assert trainer._grpo_epoch_total_steps == expected
+    # One rank-local pass, so the loop can force the epoch-final update.
+    assert trainer._grpo_epoch_microbatches == n_prompts
+
+
+def test_grpo_epoch_length_is_exposed_to_the_loop_under_max_steps_too():
+    # HF's forced epoch-final update is not conditional on max_steps
+    # (do_sync_step reads len(dataloader); max_steps only decides when the run
+    # ENDS). _mlx_epoch_microbatches already returns a plan's cycle_length for
+    # max_steps runs, so GRPO must publish its epoch length there as well --
+    # otherwise a max_steps GRPO run still folds each pass's tail into the next.
+    trainer = _grpo_prepare_data_trainer(3, max_steps=4, num_train_epochs=1)
+    assert trainer._grpo_epoch_microbatches == 3
+    # max_steps keeps HF's behaviour of ignoring num_train_epochs for the budget.
+    assert trainer._grpo_epoch_total_steps is None
+
+
+def test_grpo_epoch_length_is_rank_local_under_ddp(monkeypatch):
+    # Rank r visits prompts[r::world_size], so a rank's pass is
+    # ceil(n_prompts / world_size), not n_prompts. Using the global prompt count
+    # would put the forced epoch-final update on the wrong micro-batch on every
+    # rank, and every rank must agree on it for DDP lockstep.
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    monkeypatch.setattr(MLXGRPOTrainer, "distributed_world_size", 2)
+    trainer = _grpo_prepare_data_trainer(7, gradient_accumulation_steps=2)
+    assert trainer._grpo_epoch_microbatches == 4          # ceil(7 / 2)
+    assert trainer._grpo_epoch_total_steps == 2           # ceil(4 / 2)
+
+
+def test_grpo_epoch_length_reaches_the_callback_epoch_accounting():
+    # _callback_batches_per_epoch returned None for every batches=None run,
+    # treating GRPO like a boundary-less stream: the epoch lifecycle never fired
+    # and the forced epoch-final update had no length to fire on.
+    import types
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    inst = MLXTrainer.__new__(MLXTrainer)
+    inst.args = types.SimpleNamespace(max_steps=-1, num_train_epochs=1)
+    # No GRPO length stashed: genuinely boundary-less, still None.
+    assert inst._callback_batches_per_epoch(None) is None
+    inst._grpo_epoch_microbatches = 3
+    assert inst._callback_batches_per_epoch(None) == 3
+
+
+def test_grpo_callback_epoch_total_matches_hf_under_max_steps():
+    # With an epoch length now available, the callback-visible num_train_epochs
+    # for a max_steps GRPO run becomes HF's:
+    #   num_train_epochs = max_steps // upe + int(max_steps % upe > 0)
+    # It previously fell back to the raw num_train_epochs, so a max_steps run
+    # over a small prompt set reported 1 epoch while state.epoch climbed past it.
+    import types
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    inst = MLXTrainer.__new__(MLXTrainer)
+    inst.args = types.SimpleNamespace(
+        num_train_epochs=1, max_steps=4, gradient_accumulation_steps=2,
+    )
+    inst._grpo_epoch_microbatches = 3          # 3 prompts, one per micro-batch
+    upe = _hf_update_steps_per_epoch(3, 2)     # 2
+    expected = 4 // upe + int(4 % upe > 0)     # 2
+    assert inst._callback_num_train_epochs(4, None) == expected
+
+
+def test_grpo_epoch_skip_repositions_instead_of_replaying_rollouts():
+    # Publishing a GRPO epoch length makes _honor_epoch_stop_skip reachable for
+    # GRPO for the first time. Its base hook DRAINS the producer, which for an
+    # on-policy rollout generator would generate num_generations completions per
+    # skipped prompt and run the reward functions on them purely to discard the
+    # result. GRPO must rebuild its generator at the boundary instead -- the same
+    # reasoning as _fast_forward_resume_batches.
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    calls = {}
+
+    def _fake_generator(skip_rollouts=0):
+        calls["skip_rollouts"] = skip_rollouts
+        return "rebuilt-generator"
+
+    inst = MLXGRPOTrainer.__new__(MLXGRPOTrainer)
+    inst._grpo_rollout_generator = _fake_generator
+
+    def _exploding_iter():
+        raise AssertionError("rollout generator must not be consumed")
+        yield  # pragma: no cover
+
+    result = inst._skip_batches_to_epoch_boundary(
+        _exploding_iter(), n_skip=4, boundary_index=6,
+    )
+    assert result == "rebuilt-generator"
+    # Positioned by ABSOLUTE index: the generator's prompt cursor and per-rollout
+    # seed are functions of total rollouts consumed, not of the skip length.
+    assert calls["skip_rollouts"] == 6
+
+
+def _grpo_kl_probe_code():
+    """The KL-probe gate's CODE lines (comments stripped)."""
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    probe = src[src.index("Pre-update GRPO KL probe"):]
+    probe = probe[:probe.index("_pending_grpo_kl = self._grpo_mean_kl")]
+    return "\n".join(
+        line for line in probe.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def test_grpo_kl_probe_honours_a_disabled_logging_interval():
+    # logging_steps=0 disables step logging everywhere else in the trainer
+    # (logging_strategy='no'; the logging path guards logging_steps > 0), but the
+    # GRPO KL probe took `_prospective_step % args.logging_steps` on the RAW arg
+    # and raised ZeroDivisionError on the first optimizer step. It must read
+    # state.logging_steps -- HF's RESOLVED absolute interval -- and require it to
+    # be positive, while still probing on the always-logged final step.
+    from unsloth_zoo.mlx.trainer import _resolve_interval_steps
+
+    probe = _grpo_kl_probe_code()
+    assert "args.logging_steps" not in probe
+    assert 'getattr(self.state, "logging_steps", 0)' in probe
+    assert "> 0" in probe
+
+    # The resolution the probe now reads: 0 disables, a ratio expands.
+    assert _resolve_interval_steps(0, 4) == 0
+    assert _resolve_interval_steps(0.5, 4) == 2
+    assert _resolve_interval_steps(1, 4) == 1
+
+
+def test_grpo_kl_probe_step_index_survives_an_epoch_flush():
+    # The probe indexed the step as `it // grad_accum`, which is only the step
+    # number under a flat accumulation model. Now that an epoch's ragged tail
+    # forces its own update, that mapping drifts (3 micro-batches at grad_accum=2
+    # is 2 steps, not 1), so the probe would fire on the wrong steps. It must use
+    # the counter the loop itself advances.
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    probe = _grpo_kl_probe_code()
+    assert "_prospective_step = self._global_step + 1" in probe
+    assert "it // grad_accum" not in probe
+    # The loop's own definition of the step this micro-batch closes.
+    assert "current_step = self._global_step + 1" in src
+
+
+# ---------------------------------------------------------------------------
 # PR #832 round-7 review fixes: ORPO/DPO gradient-accumulation weight must be
 # the PAIR count (not the response-token count), the GRPO rollout must score the
 # generated token IDs (not a decode->re-encode roundtrip), and preference
@@ -3429,6 +3638,93 @@ def test_create_preference_batches_samples_across_lengths_when_truncating():
     assert kept == expected
     # The length-sort-then-truncate bug would keep only the two shortest pairs.
     assert kept != [0, 1]
+
+
+def _preference_tokenizer():
+    class Tok:
+        eos_token_id = 0
+
+        def encode(self, s, add_special_tokens=True):
+            return [1] * max(1, len(s))
+
+    return Tok()
+
+
+def _preference_dataset(n):
+    return [
+        {"prompt": "p", "chosen": "a" * (i + 1), "rejected": "b" * (i + 1)}
+        for i in range(n)
+    ]
+
+
+def test_create_preference_batches_exposes_the_one_pass_length():
+    # A bare list carries no cycle_length, so _mlx_epoch_microbatches returned
+    # None on the max_steps path and the loop never forced an update on a ragged
+    # epoch tail: with 3 preference batches at grad_accum=2, batch 3 accumulated
+    # together with batch 1 of the NEXT pass instead of being applied on its own,
+    # changing the effective gradient.
+    import types
+    from unsloth_zoo.mlx.trainer import _mlx_epoch_microbatches
+    from unsloth_zoo.mlx.utils import (
+        create_preference_batches, PreferenceBatchList,
+    )
+
+    batches = create_preference_batches(
+        _preference_dataset(3), _preference_tokenizer(),
+        batch_size=1, max_seq_length=64, pad_to_multiple=0, num_batches=6,
+    )
+    assert isinstance(batches, PreferenceBatchList)
+    # Still a list for every existing consumer.
+    assert isinstance(batches, list)
+    assert len(batches) == 3
+    assert batches.cycle_length == 3
+
+    args = types.SimpleNamespace(max_steps=3, num_train_epochs=1)
+    assert _mlx_epoch_microbatches(args, batches) == 3
+
+
+def test_preference_one_pass_length_is_the_full_pass_not_the_truncated_plan():
+    # When num_batches truncates, the plan holds a random SUBSET of one pass and
+    # the run never reaches a dataset boundary. Reporting the truncated length
+    # would invent a boundary at the end of the subset: the loop would force an
+    # update there and state.epoch would report a completed epoch for a partial
+    # pass. The one-pass count is therefore taken BEFORE the truncation.
+    import types
+    from unsloth_zoo.mlx.trainer import _mlx_epoch_microbatches
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    batches = create_preference_batches(
+        _preference_dataset(10), _preference_tokenizer(),
+        batch_size=1, max_seq_length=64, pad_to_multiple=0, num_batches=6,
+    )
+    assert len(batches) == 6
+    assert batches.cycle_length == 10
+
+    args = types.SimpleNamespace(max_steps=3, num_train_epochs=1)
+    assert _mlx_epoch_microbatches(args, batches) == 10
+
+    # batch_size > 1: the pass is measured in micro-batches, not rows.
+    wide = create_preference_batches(
+        _preference_dataset(10), _preference_tokenizer(),
+        batch_size=4, max_seq_length=64, pad_to_multiple=0, num_batches=None,
+    )
+    assert wide.cycle_length == 3          # ceil(10 / 4)
+    assert len(wide) == 3
+
+
+def test_preference_batch_list_survives_a_pickle_roundtrip():
+    # __slots__ leaves no __dict__ for list's default reducer, so cycle_length
+    # would be dropped by any consumer that copies or pickles the plan.
+    import copy
+    import pickle
+    from unsloth_zoo.mlx.utils import PreferenceBatchList
+
+    plan = PreferenceBatchList([("a",), ("b",)], cycle_length=7)
+    assert pickle.loads(pickle.dumps(plan)).cycle_length == 7
+    assert copy.deepcopy(plan).cycle_length == 7
+    assert list(pickle.loads(pickle.dumps(plan))) == [("a",), ("b",)]
+    # An absent length stays absent rather than becoming 0.
+    assert PreferenceBatchList([], cycle_length=None).cycle_length is None
 
 
 def test_create_preference_batches_guards_double_bos_on_chat_prompts():
@@ -4286,7 +4582,14 @@ def test_should_epoch_stop_field_reset_and_honored():
     # honor itself on `batch_iter is None` dropped the request for streams.
     assert "def _honor_epoch_stop_skip" in src
     assert "batch_idx += next_boundary - it_val" in src
-    assert "for _ in range(next_boundary - it_val):" in src
+    # The producer skip goes through a hook so a source that must not be
+    # replayed can reposition instead of being consumed (MLXGRPOTrainer's
+    # on-policy rollout generator). The BASE hook still drains, which is what
+    # keeps declared-length streams landing on the same boundary.
+    assert "self._skip_batches_to_epoch_boundary(" in src
+    skip_src = inspect.getsource(MLXTrainer._skip_batches_to_epoch_boundary)
+    assert "for _ in range(n_skip):" in skip_src
+    assert "next(batch_iter)" in skip_src
     assert "batch_idx = next_boundary" in src
     assert "if batches_per_epoch and _sync_epoch_stop():" in src
     assert "batches_per_epoch and batch_iter is None" not in src

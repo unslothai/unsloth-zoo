@@ -1684,6 +1684,33 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected):
     return prompt, prompt + chosen, prompt + rejected
 
 
+class PreferenceBatchList(list):
+    """Eager preference batches carrying the length of ONE dataset pass.
+
+    The trainer reads that length as ``getattr(batches, "cycle_length", None)``
+    to force HF's epoch-final optimizer step; a plain list cannot carry it, so a
+    ragged pass never force-updates on its tail. Stays a ``list`` (and outside
+    the lazy-plan isinstance gates) so existing consumers are unchanged.
+    """
+
+    __slots__ = ("cycle_length",)
+
+    def __init__(self, batches=(), *, cycle_length=None):
+        super().__init__(batches)
+        # Not clamped to len(self): a num_batches horizon can truncate the list
+        # below one pass, matching how the SFT/VLM plans count theirs.
+        self.cycle_length = (
+            None if cycle_length is None else max(1, int(cycle_length))
+        )
+
+    def __reduce__(self):
+        # __slots__ leaves no __dict__ for the default list reducer to restore.
+        return (self.__class__, (list(self),), {"cycle_length": self.cycle_length})
+
+    def __setstate__(self, state):
+        self.cycle_length = state.get("cycle_length")
+
+
 def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         prompt_key="prompt", chosen_key="chosen",
                         rejected_key="rejected", pad_to_multiple=32,
@@ -1780,6 +1807,17 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         pe = pe0 - drop
         rows.append((pe, c_ids, r_ids))
 
+    # Micro-batches in ONE pass over the dataset, captured BEFORE the num_batches
+    # truncation below. This is the epoch length the trainer needs: it is where
+    # the loop's batches[it % len(batches)] cycle wraps, so it is where HF forces
+    # its epoch-final optimizer step (do_sync_step reads len(dataloader)).
+    # Deliberately the FULL count, not len(out): when num_batches truncates, the
+    # plan holds a random subset of a single pass and the run never reaches a
+    # dataset boundary, so reporting the truncated length instead would invent an
+    # epoch boundary at the end of the subset and make state.epoch report 1.0 for
+    # a partial pass.
+    one_pass_batches = math.ceil(len(rows) / max(1, int(batch_size)))
+
     # If num_batches would truncate the run, pick a random subset of pairs
     # BEFORE the length sort. Sorting all pairs by length and then keeping only
     # the first num_batches chunks would train exclusively on the shortest pairs
@@ -1825,7 +1863,11 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         if num_batches is not None and len(out) >= num_batches:
             break
     mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
-    return out
+    # Carry the one-pass length so _mlx_epoch_microbatches can force the update
+    # on a ragged epoch tail. Without it a max_steps run over a preference set
+    # smaller than its micro-batch budget accumulated the pass's last batch
+    # together with the next pass's first, changing the effective gradient.
+    return PreferenceBatchList(out, cycle_length=one_pass_batches or None)
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):

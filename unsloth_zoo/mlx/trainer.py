@@ -3115,7 +3115,17 @@ class MLXTrainer:
     def _callback_batches_per_epoch(self, batches):
         """Return the finite micro-batch count for one callback epoch."""
         if batches is None:
-            return None
+            # GRPO materializes no batches (its loop is driven by the rollout
+            # generator) but its prompt set IS finite: one rank-local pass is
+            # ceil(n_prompts / world_size), resolved by
+            # MLXGRPOTrainer._prepare_data. Report it so the epoch lifecycle, the
+            # forced epoch-final update and the step budget all read one length,
+            # as they do for the finite SFT/preference paths. Everything else
+            # with batches=None is genuinely boundary-less streaming.
+            grpo_epoch_microbatches = int(
+                getattr(self, "_grpo_epoch_microbatches", 0) or 0
+            )
+            return grpo_epoch_microbatches or None
         total = len(batches)
         if total <= 0:
             return None
@@ -4640,6 +4650,27 @@ class MLXTrainer:
                 raise fast_forward_error
         return batch_iter
 
+    def _skip_batches_to_epoch_boundary(self, batch_iter, n_skip, boundary_index):
+        """Advance a streaming producer to the next epoch boundary.
+
+        Called only when a callback sets should_epoch_stop mid-epoch. Base
+        (streaming SFT/VLM/text) path: pull and discard the epoch's remaining
+        ``n_skip`` batches, as HF abandons the rest of an epoch it breaks out of.
+        Each ``next`` is cheap and side-effect free there.
+
+        ``boundary_index`` is the absolute micro-batch index the producer must
+        sit at afterwards, for overrides that reposition a cursor rather than
+        consume. MLXGRPOTrainer overrides this for the same reason it overrides
+        _fast_forward_resume_batches: consuming its rollout generator would
+        generate and score rollouts only to throw them away.
+
+        Returns the iterator to keep using; the caller handles StopIteration and
+        routes failures through the distributed-failure collective.
+        """
+        for _ in range(n_skip):
+            next(batch_iter)
+        return batch_iter
+
     def _maybe_seed_grpo_rng(self):
         """Seed the global MLX RNG from ``args.seed`` for GRPO reproducibility.
 
@@ -4967,6 +4998,15 @@ class MLXTrainer:
             _stream_epoch_batches = int(
                 getattr(self, "_streaming_epoch_batch_count", 0) or 0
             )
+            if not _stream_epoch_batches:
+                # GRPO: the rollout generator materializes no batches, but its
+                # prompt set is finite and _prepare_data resolved one rank-local
+                # pass into _grpo_epoch_microbatches. Without a horizon a skipped
+                # epoch tail kept the full budget and the run made it up out of
+                # the next pass, overtraining past num_train_epochs.
+                _stream_epoch_batches = int(
+                    getattr(self, "_grpo_epoch_microbatches", 0) or 0
+                )
             if _stream_epoch_batches > 0:
                 _epoch_stop_total_microbatches = (
                     _stream_epoch_batches
@@ -4984,6 +5024,17 @@ class MLXTrainer:
                 self, "_prepared_batches_include_epochs", False,
             ),
         )
+        if _epoch_flush_microbatches is None and batches is None:
+            # GRPO drives the loop from a generator, so there is no plan to carry
+            # a cycle_length; _prepare_data resolved the same quantity from the
+            # finite prompt set. Reading it here is what lets the epoch's ragged
+            # tail force its own optimizer step instead of waiting for a window
+            # that the epoch never fills.
+            _grpo_epoch_microbatches = int(
+                getattr(self, "_grpo_epoch_microbatches", 0) or 0
+            )
+            if _grpo_epoch_microbatches > 0:
+                _epoch_flush_microbatches = _grpo_epoch_microbatches
         self._compile_shape_guard_report = _compile_shape_guard_report
 
         # Total planned optimizer steps for this run. Exposed so the GRPO rollout
@@ -6537,7 +6588,10 @@ class MLXTrainer:
             and _epoch_stop_total_microbatches are identical on every rank) and the
             on_epoch_end path reuses the lockstep collectives, so DDP stays in step.
             """
-            nonlocal batch_idx, total_steps
+            # batch_iter: the skip hook may REPLACE the producer rather than
+            # drain it (GRPO rebuilds its rollout generator at an advanced
+            # cursor), so the loop must pick up the returned iterator.
+            nonlocal batch_idx, total_steps, batch_iter
             # Keep the callback-visible epoch FRACTIONAL for this truncated epoch's
             # on_epoch_end, mirroring HF: state.epoch = epoch + (step+1)/steps_in_epoch
             # is set at the last optimizer step and stays fractional when a callback
@@ -6567,15 +6621,19 @@ class MLXTrainer:
                 # the epoch's remaining micro-batches instead. The producer replays
                 # passes back to back, so this lands on the next pass's first batch,
                 # where HF lands too: it rebuilds the iterator every epoch and a
-                # should_epoch_stop break abandons the rest of the current one. Only
-                # declared-length streams reach here, so the count is finite, and it
-                # is rank-consistent, so DDP stays in lockstep; a producer failure
-                # takes the same consensus path as the loop's own fetch. batch_idx
-                # is unused when streaming, so park the cursor on it.
+                # should_epoch_stop break abandons the rest of the current one. The
+                # count is finite (only sources with a declared epoch length reach
+                # here) and rank-consistent, so DDP stays in lockstep; a producer
+                # failure takes the same consensus path as the loop's own fetch.
+                # batch_idx is unused when streaming, so park the cursor on it.
+                # Dispatched through the hook so a producer that must not be
+                # replayed (GRPO's on-policy rollout generator) can advance its
+                # cursor instead of regenerating the skipped micro-batches.
                 _drain_error = None
                 try:
-                    for _ in range(next_boundary - it_val):
-                        next(batch_iter)
+                    batch_iter = self._skip_batches_to_epoch_boundary(
+                        batch_iter, next_boundary - it_val, next_boundary,
+                    )
                 except StopIteration:
                     # Exhausted early: the loop's own fetch reports it.
                     pass
@@ -6741,8 +6799,23 @@ class MLXTrainer:
             self._pending_grpo_kl = None
             if (do_update and hasattr(self, "_grpo_mean_kl")
                     and not isinstance(batch_data, dict)):
-                _prospective_step = it // grad_accum
-                if (_prospective_step % args.logging_steps == 0
+                # The step this micro-batch closes. it // grad_accum only equals
+                # it under a flat accumulation model; an epoch-final forced
+                # update moves the boundary, so read the same counter the loop
+                # advances below (current_step = self._global_step + 1).
+                _prospective_step = self._global_step + 1
+                # state.logging_steps is HF's RESOLVED absolute interval, which
+                # the logging path below already gates on. args.logging_steps is
+                # the raw field: 0 means "logging disabled" everywhere else in
+                # the trainer (logging_strategy='no', only final/forced logs) and
+                # would divide by zero here, and a ratio in (0, 1) is not a step
+                # count at all (0.5 % -> true on every step). The final step is
+                # always logged, so probe there regardless of the interval.
+                _kl_logging_steps = int(
+                    getattr(self.state, "logging_steps", 0) or 0
+                )
+                if ((_kl_logging_steps > 0
+                        and _prospective_step % _kl_logging_steps == 0)
                         or _prospective_step == total_steps):
                     self._pending_grpo_kl = self._grpo_mean_kl(
                         batch_data[0], batch_data[1])
@@ -8166,6 +8239,21 @@ class MLXGRPOTrainer(MLXTrainer):
         """
         return self._grpo_rollout_generator(skip_rollouts=n_skip)
 
+    def _skip_batches_to_epoch_boundary(self, batch_iter, n_skip, boundary_index):
+        """Skip a GRPO epoch's tail WITHOUT generating the skipped rollouts.
+
+        Same reasoning as _fast_forward_resume_batches: draining the base
+        implementation's ``n_skip`` items would generate ``num_generations``
+        completions per skipped prompt and run the (possibly side-effecting)
+        reward functions on them, purely to discard the result -- and it would
+        advance the sampling RNG by a different amount than an uninterrupted run.
+        The generator's prompt cursor and per-rollout seed are pure functions of
+        the number of rollouts consumed, so rebuilding it at ``boundary_index``
+        lands on exactly the prompt the drain would have reached, with no
+        generation, no scoring, and identical downstream sampling.
+        """
+        return self._grpo_rollout_generator(skip_rollouts=boundary_index)
+
     def _grpo_rollout_generator(self, skip_rollouts=0):
         """Infinite generator: each next() does generate->reward->advantage
         and yields (batch, lengths, advantages). Runs uncompiled.
@@ -8683,33 +8771,61 @@ class MLXGRPOTrainer(MLXTrainer):
             is_vlm=False,
             strict=False,
         )
-        # Epoch-based finite GRPO (TRL/HF's standard num_train_epochs path). The
-        # rollout generator returned below is an infinite cycle over the finite
-        # prompt set (idx % len(prompts)), so batches is None and _train_inner --
-        # which counts materialized batches -- cannot derive the step total and
-        # would otherwise fall into its streaming branch and wrongly raise
-        # "num_train_epochs requires a finite dataset" for this finite dataset.
-        # Compute the planned optimizer steps here instead, mirroring the SFT/DPO
-        # epoch formula (total_steps = batches_per_epoch * num_epochs // grad_accum,
-        # _train_inner:2289). One GRPO microbatch rolls out one prompt PER RANK
-        # (rank r visits prompts[r::world_size], the rollout generator's stride),
-        # so a rank's batches_per_epoch is ceil(len(prompts)/world_size). max_steps
-        # > 0 keeps the existing behavior (num_train_epochs ignored, matching HF),
-        # so only the epoch path stashes a value; otherwise leave it None.
+        # GRPO's rollout generator is an infinite cycle over the finite prompt set
+        # (idx % len(prompts)), so _prepare_data returns batches=None and
+        # _train_inner -- which reads its epoch length off the materialized
+        # batches -- can see neither the epoch boundary nor the step total. Both
+        # are knowable here: ONE GRPO micro-batch rolls out one prompt PER RANK
+        # (rank r visits prompts[r::world_size], the generator's stride), so a
+        # rank's one-pass micro-batch count is ceil(len(prompts)/world_size).
+        # Stash it and let the loop read it, exactly as the finite SFT/preference
+        # paths read `cycle_length` off their plans.
         self._grpo_epoch_total_steps = None
+        self._grpo_epoch_microbatches = None
+        n_prompts = len(self._grpo_prompts())
+        if n_prompts == 0:
+            raise ValueError(
+                "No GRPO prompts found. Check your dataset and the "
+                "'prompt' column."
+            )
+        world = max(1, int(getattr(self, "distributed_world_size", 1) or 1))
+        # Unconditional: HF's forced epoch-final update (do_sync_step reads
+        # len(dataloader)) is not conditional on max_steps -- max_steps decides
+        # when the run ENDS, never how an epoch's ragged tail is applied. This
+        # mirrors _mlx_epoch_microbatches, which returns the plan's cycle_length
+        # for max_steps runs too.
+        #
+        # Divided by world_size only: _grpo_rollout_generator yields ONE prompt
+        # group per micro-batch (prompts=[pids] * num_generations), so the rank's
+        # micro-batch count is its prompt count. If the rollout ever groups
+        # several prompts into one micro-batch (honoring
+        # per_device_train_batch_size), this must divide by that factor too or
+        # the forced update lands off the epoch boundary.
+        self._grpo_epoch_microbatches = max(1, math.ceil(n_prompts / world))
+        # Epoch-based finite GRPO (TRL/HF's standard num_train_epochs path).
+        # Without a step total here _train_inner falls into its streaming branch
+        # and wrongly raises "num_train_epochs requires a finite dataset".
+        # max_steps > 0 keeps HF's behavior (num_train_epochs ignored), so only
+        # the epoch path stashes a budget; otherwise leave it None.
         if (getattr(args, "max_steps", 0) <= 0
                 and getattr(args, "num_train_epochs", 0) > 0):
-            n_prompts = len(self._grpo_prompts())
-            if n_prompts == 0:
-                raise ValueError(
-                    "No GRPO prompts found. Check your dataset and the "
-                    "'prompt' column."
-                )
-            grad_accum = max(1, int(args.gradient_accumulation_steps))
-            world = max(1, int(getattr(self, "distributed_world_size", 1) or 1))
-            batches_per_epoch = math.ceil(n_prompts / world)
-            total_steps = int(
-                (batches_per_epoch * args.num_train_epochs) // grad_accum
+            grad_accum = max(1, int(
+                getattr(args, "gradient_accumulation_steps", 1) or 1
+            ))
+            # CEIL, not floor: the epoch's last micro-batch forces an optimizer
+            # step, so an epoch costs ceil(micro_per_epoch / grad_accum). This is
+            # HF's own arithmetic -- set_initial_training_values computes
+            # num_update_steps_per_epoch as len//ga + int(len%ga > 0) and then
+            # max_steps = ceil(num_train_epochs * that) -- and it is what the
+            # finite SFT/preference path already does via _mlx_steps_per_epoch
+            # (_resolve_training_steps). Flooring planned 1 step for 3 prompts at
+            # grad_accum=2, so the loop stopped after two rollouts and the
+            # epoch's third prompt was never generated, scored, or applied.
+            steps_per_epoch = _mlx_steps_per_epoch(
+                self._grpo_epoch_microbatches, grad_accum,
+            )
+            total_steps = math.ceil(
+                float(args.num_train_epochs) * steps_per_epoch
             )
             self._grpo_epoch_total_steps = max(1, total_steps)
         # GRPO drives the loop with a rollout generator, not static batches.
