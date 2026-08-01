@@ -36,8 +36,47 @@ def test_linux_prepends_nvidia_wheels_and_excludes_torch_lib(monkeypatch):
     assert all("torch" not in p for p in ld)       # torch/lib excluded on Linux
     assert env["PATH"] == "/usr/bin"               # PATH untouched on Linux
     assert env["CUDA_VISIBLE_DEVICES"] == "3"
-    assert env["NGL"] == "99"
+    assert env["NGL"] == "99"          # unset -> all layers, the historical default
     assert env["MAXTOK"] == "4096"
+
+
+def test_explicit_ngl_is_forwarded():
+    """A caller-supplied split reaches the child: the whole point of the knob (small-VRAM cards)."""
+    env = V._build_subprocess_env(
+        "/dg/srv", gpu = "0", maxtok = 0, ngl = 8,
+        base_env = {"PATH": "/usr/bin"}, os_name = "posix",
+    )
+    assert env["NGL"] == "8"
+
+
+def test_ngl_zero_is_not_treated_as_unset():
+    """CPU-only must survive the falsiness trap: 0 is a real request, not 'use the default'."""
+    env = V._build_subprocess_env(
+        "/dg/srv", ngl = 0, base_env = {"PATH": "/usr/bin"}, os_name = "posix",
+    )
+    assert env["NGL"] == "0"
+
+
+def test_env_ngl_is_honoured_when_caller_passes_none():
+    """Escape hatch for a user whose studio predates the plumbing."""
+    env = V._build_subprocess_env(
+        "/dg/srv", base_env = {"PATH": "/usr/bin", "NGL": "12"}, os_name = "posix",
+    )
+    assert env["NGL"] == "12"
+
+
+def test_explicit_ngl_beats_env():
+    env = V._build_subprocess_env(
+        "/dg/srv", ngl = 4, base_env = {"PATH": "/usr/bin", "NGL": "99"}, os_name = "posix",
+    )
+    assert env["NGL"] == "4"
+
+
+def test_garbage_env_ngl_falls_back_to_default():
+    env = V._build_subprocess_env(
+        "/dg/srv", base_env = {"PATH": "/usr/bin", "NGL": "all"}, os_name = "posix",
+    )
+    assert env["NGL"] == "99"
 
 
 # Note: paths here are colon-free so the assertions hold regardless of the host's
