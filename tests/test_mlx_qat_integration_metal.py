@@ -40,6 +40,8 @@ from unsloth_zoo.mlx.loader import FastMLXModel
 from unsloth_zoo.mlx.qat import mlx_qat_module_count
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
+# Unquantized source, for the rejection cases that need one.
+FP_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
 @pytest.fixture(autouse=True)
@@ -62,9 +64,16 @@ def _loss(model, ids):
     ).mean()
 
 
-def _train_then_save_and_reload(qat, steps=15, save_method="merged_4bit"):
-    """Train briefly, save through the product path, reload, report losses."""
+def _train_then_save_and_reload(qat, steps=15, save_method="merged_4bit", seed=0):
+    """Train briefly, save through the product path, reload, report losses.
+
+    Seeds before loading so the QAT and non-QAT arms start from identical LoRA
+    initialisations. Without this the two calls run sequentially in one
+    process, inheriting whatever RNG state earlier tests left behind, and
+    "QAT's saved model is better" would be a claim about random init.
+    """
     ids = _ids()
+    mx.random.seed(seed)
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
     kwargs = {"qat_scheme": "auto"} if qat else {}
     model = FastMLXModel.get_peft_model(
@@ -100,9 +109,12 @@ def test_qat_survives_the_merged_4bit_save_round_trip():
 
 
 def test_qat_saved_model_beats_the_non_qat_saved_model():
-    """The comparison that ships: both saved and reloaded, QAT wins."""
-    base_before, base_after = _train_then_save_and_reload(qat=False)
-    qat_before, qat_after = _train_then_save_and_reload(qat=True)
+    """The comparison that ships: both saved and reloaded, QAT wins.
+
+    Both arms are seeded identically so the only difference is QAT itself.
+    """
+    base_before, base_after = _train_then_save_and_reload(qat=False, seed=0)
+    qat_before, qat_after = _train_then_save_and_reload(qat=True, seed=0)
 
     # The non-QAT run must actually lose something, else there is nothing to fix.
     assert base_after - base_before > 10 * (qat_after - qat_before), (
@@ -208,49 +220,50 @@ def _lora_layers_installed(model):
     )
 
 
-def test_dropout_refusal_leaves_the_model_unmutated():
-    """A refused QAT request must not install LoRA first and raise after."""
-    model, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
-    with pytest.raises(NotImplementedError, match="lora_dropout=0"):
-        FastMLXModel.get_peft_model(
-            model, r=8, lora_alpha=16, lora_dropout=0.1,
-            qat_scheme="auto", use_gradient_checkpointing=False,
-        )
-    installed = _lora_layers_installed(model)
-    assert installed == 0, f"{installed} LoRA layers left behind after refusal"
+# Every way a QAT request can be refused. The property under test is
+# structural: validation of the would-be LoRA targets happens before any of
+# them are replaced, so no rejection can leave adapters attached or
+# trainability changed. Parametrized rather than written out per case so a new
+# rejection added later without a preflight fails here.
+_REFUSAL_CASES = [
+    ("bit-width mismatch", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "int8"}, ValueError),
+    ("lora_dropout > 0", MODEL, {}, {"lora_dropout": 0.1, "qat_scheme": "auto"}, NotImplementedError),
+    ("unquantized base", FP_MODEL, {"load_in_16bit": True, "load_in_4bit": False},
+     {"lora_dropout": 0, "qat_scheme": "auto"}, ValueError),
+    ("full_finetuning", FP_MODEL, {"full_finetuning": True}, {"qat_scheme": "auto"}, NotImplementedError),
+    ("torchao-only scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "fp8-fp8"}, NotImplementedError),
+    ("unknown scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "int3"}, ValueError),
+    ("non-string scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": 4}, TypeError),
+]
 
 
-def test_unquantized_base_refusal_leaves_the_model_unmutated():
-    """Same guarantee for the unquantized-base refusal.
-
-    Whether the base is quantized is knowable before any adapter exists, so
-    refusing after installing and freezing 100+ LoRA layers would leave a
-    caller who catches the error with a mutated model.
-    """
+@pytest.mark.parametrize(
+    "label,model_name,load_kwargs,peft_kwargs,expected",
+    _REFUSAL_CASES,
+    ids=[case[0] for case in _REFUSAL_CASES],
+)
+def test_refused_requests_leave_the_model_unmutated(
+    label, model_name, load_kwargs, peft_kwargs, expected,
+):
     from mlx.utils import tree_flatten
 
     model, _ = FastMLXModel.from_pretrained(
-        "Qwen/Qwen2.5-0.5B-Instruct", max_seq_length=64,
-        load_in_16bit=True, load_in_4bit=False,
-    )
+        model_name, max_seq_length=64, **load_kwargs)
 
     def trainable_size():
         return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
-    # A freshly loaded model has everything trainable; get_peft_model is what
-    # freezes. So "unmutated" means unchanged, not zero.
+    # A freshly loaded model has everything trainable until get_peft_model
+    # freezes, so "unmutated" is unchanged-from-before, not zero.
     before = trainable_size()
-    with pytest.raises(ValueError, match="requires a quantized base"):
+    with pytest.raises(expected):
         FastMLXModel.get_peft_model(
-            model, r=8, lora_alpha=16, lora_dropout=0,
-            qat_scheme="auto", use_gradient_checkpointing=False,
+            model, r=8, lora_alpha=16,
+            use_gradient_checkpointing=False, **peft_kwargs,
         )
     installed = _lora_layers_installed(model)
-    assert installed == 0, f"{installed} LoRA layers left behind after refusal"
-    assert trainable_size() == before, (
-        f"trainability changed by the failed call: {before:,} -> "
-        f"{trainable_size():,}"
-    )
+    assert installed == 0, f"{label}: {installed} LoRA layers left behind"
+    assert trainable_size() == before, f"{label}: trainability changed"
 
 
 def test_vlm_is_gated_off():
@@ -318,5 +331,8 @@ def test_qat_and_cpt_full_modules_are_mutually_exclusive():
                 mode=module.linear.mode,
             )
             module.linear = dq
-    with pytest.raises(ValueError, match="requires a quantized base"):
+    # The model still holds quantized modules the LoRA targets do not cover
+    # (a quantized embedding), so the model-level backstop passes and the
+    # target-level check is what refuses -- naming the unquantized targets.
+    with pytest.raises(ValueError, match="quantized LoRA targets"):
         apply_mlx_qat(plain, "auto")

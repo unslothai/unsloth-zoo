@@ -46,6 +46,7 @@ __all__ = (
     "SUPPORTED_MLX_QAT_SCHEMES",
     "TORCHAO_ONLY_QAT_SCHEMES",
     "validate_mlx_qat_request",
+    "validate_mlx_qat_target_modules",
     "apply_mlx_qat",
     "remove_mlx_qat",
     "mlx_qat_module_count",
@@ -103,6 +104,90 @@ def _model_has_quantized_module(model):
     return any(
         isinstance(module, quantized_types)
         for _, module in model.named_modules()
+    )
+
+
+def _quantization_grid(module):
+    """``(group_size, bits, mode)`` for a quantized base module.
+
+    ``mode`` is defaulted rather than read directly: published mlx-community
+    configs omit the key, and older quantized layers predate the attribute.
+    """
+    return (
+        module.group_size,
+        module.bits,
+        getattr(module, "mode", None) or "affine",
+    )
+
+
+def _validate_qat_base_modules(named_bases, requested_bits):
+    """Grid rules for the modules QAT will fake-quantize.
+
+    Single source of truth, called both by the preflight (against the modules
+    LoRA is *about* to wrap) and by the post-LoRA pass (against the modules it
+    actually wrapped), so the two cannot disagree about what is acceptable.
+
+    Returns the agreed ``(group_size, bits, mode)``.
+    """
+    import mlx.nn as nn
+
+    if not named_bases:
+        raise ValueError(
+            "Unsloth: qat_scheme was requested but no LoRA targets were "
+            "resolved, so there is nothing for QAT to fake-quantize. Check "
+            "target_modules / finetune_language_layers."
+        )
+
+    unquantized = [name for name, module in named_bases
+                   if not isinstance(module, nn.QuantizedLinear)]
+    if unquantized:
+        raise ValueError(
+            "Unsloth: qat_scheme requires quantized LoRA targets — "
+            f"{len(unquantized)} target(s) are unquantized "
+            f"({_preview(unquantized)}), so save_method='merged_4bit' would "
+            "not requantize them and there is no quantization for QAT to "
+            "simulate. Load with load_in_4bit=True (or a pre-quantized "
+            "-4bit/-8bit repo) to use QAT."
+        )
+
+    grids = {_quantization_grid(module) for _, module in named_bases}
+    if len(grids) != 1:
+        raise ValueError(
+            "Unsloth: qat_scheme requires a single quantization grid across "
+            f"all LoRA targets, found {sorted(grids)}."
+        )
+    group_size, bits, mode = next(iter(grids))
+
+    # Only the affine grid round-trips through the three-value
+    # quantize/dequantize the QAT forward uses: mx.quantize returns just
+    # (packed, scales) for mxfp4/nvfp4/mxfp8, and those grids need different
+    # fake-quant maths anyway.
+    if mode != "affine":
+        raise NotImplementedError(
+            f"Unsloth: qat_scheme is not supported for {mode!r}-quantized "
+            "bases on MLX yet — only the affine grid is implemented. Load the "
+            "model with load_in_4bit=True (affine) to use QAT."
+        )
+
+    if requested_bits is not None and requested_bits != bits:
+        raise ValueError(
+            f"Unsloth: qat_scheme requests {requested_bits}-bit weights but "
+            f"the LoRA targets are quantized to {bits}-bit. QAT must simulate "
+            "the grid that save_method='merged_4bit' will actually write. Use "
+            "qat_scheme='auto' to inherit the base quantization."
+        )
+    return group_size, bits, mode
+
+
+def validate_mlx_qat_target_modules(named_bases, qat_scheme="auto"):
+    """Validate the base modules LoRA is about to wrap, before it wraps them.
+
+    ``named_bases`` must be the exact ``(name, module)`` set that
+    ``linear_to_lora_layers`` will replace, so that every rejection happens
+    while the model is still untouched.
+    """
+    return _validate_qat_base_modules(
+        list(named_bases), _resolve_qat_bits(qat_scheme),
     )
 
 
@@ -200,12 +285,17 @@ def _resolve_qat_bits(qat_scheme):
 
 
 def _qat_targets(model):
-    """Split LoRA modules into (patchable, dora, switch, unquantized)."""
+    """Split LoRA modules into ``(patchable, dora, switch, lora_wrapped)``.
+
+    ``lora_wrapped`` is every plain LoRA layer regardless of whether its base
+    is quantized, so the shared grid validator can name the unquantized ones;
+    ``patchable`` is the quantized subset actually eligible for patching.
+    """
     import mlx.nn as nn
 
     lora_linear_type, dora_types, switch_types = _lora_layer_types()
 
-    patchable, dora, switch, unquantized = [], [], [], []
+    patchable, dora, switch, lora_wrapped = [], [], [], []
     for name, module in model.named_modules():
         if dora_types and isinstance(module, dora_types):
             dora.append(name)
@@ -215,12 +305,10 @@ def _qat_targets(model):
             continue
         if not isinstance(module, lora_linear_type):
             continue
-        base = getattr(module, "linear", None)
-        if isinstance(base, nn.QuantizedLinear):
+        lora_wrapped.append((name, module))
+        if isinstance(getattr(module, "linear", None), nn.QuantizedLinear):
             patchable.append((name, module))
-        else:
-            unquantized.append(name)
-    return patchable, dora, switch, unquantized
+    return patchable, dora, switch, lora_wrapped
 
 
 def _preview(names, limit=3):
@@ -272,9 +360,10 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None):
             f"LoRA activation path for dropout to act on (got {lora_dropout})."
         )
 
-    # Checkable before adapters exist, so it belongs here rather than in the
-    # post-LoRA pass: otherwise get_peft_model installs and freezes 100+ LoRA
-    # layers and only then refuses, leaving a mutated model behind.
+    # Cheap model-level backstop. The authoritative check is
+    # validate_mlx_qat_target_modules, run against the exact modules LoRA is
+    # about to wrap; this only catches the "nothing here is quantized at all"
+    # case for callers that never reach that path.
     if not _model_has_quantized_module(model):
         raise ValueError(
             "Unsloth: qat_scheme requires a quantized base model — nothing in "
@@ -303,7 +392,7 @@ def apply_mlx_qat(model, qat_scheme="auto"):
     # directly, not only through get_peft_model.
     requested_bits = validate_mlx_qat_request(model, qat_scheme)
 
-    patchable, dora, switch, unquantized = _qat_targets(model)
+    patchable, dora, switch, lora_wrapped = _qat_targets(model)
 
     if dora:
         raise NotImplementedError(
@@ -318,50 +407,18 @@ def apply_mlx_qat(model, qat_scheme="auto"):
             "experts on MLX yet — their fuse() merges a 3-D per-expert weight "
             f"with a different delta layout. Affected: {_preview(switch)}."
         )
-    if not patchable:
-        if unquantized:
-            raise ValueError(
-                "Unsloth: qat_scheme requires a quantized base model. The LoRA "
-                f"layers wrap unquantized modules ({_preview(unquantized)}), so "
-                "save_method='merged_4bit' would not requantize and there is no "
-                "quantization for QAT to simulate. Load with q_bits=4 (or a "
-                "pre-quantized -4bit/-8bit repo) to use QAT."
-            )
+    if not patchable and not lora_wrapped:
         raise ValueError(
             "Unsloth: qat_scheme was requested but the model has no LoRA "
             "layers. Call get_peft_model(...) with LoRA targets first."
         )
 
-    # Every layer must share one grid: the saved config records a single
-    # global quantization, and a mixed set cannot be expressed there.
-    grids = {
-        (m.linear.group_size, m.linear.bits, m.linear.mode) for _, m in patchable
-    }
-    if len(grids) != 1:
-        raise ValueError(
-            "Unsloth: qat_scheme requires a single quantization grid across all "
-            f"LoRA layers, found {sorted(grids)}."
-        )
-    group_size, bits, mode = next(iter(grids))
-
-    # Only the affine grid round-trips through the three-value
-    # quantize/dequantize used below: mx.quantize returns just (packed, scales)
-    # for mxfp4/nvfp4/mxfp8, and those grids need different fake-quant maths
-    # anyway. Reject explicitly rather than unpack-crash inside the forward.
-    if mode not in (None, "affine"):
-        raise NotImplementedError(
-            f"Unsloth: qat_scheme is not supported for {mode!r}-quantized "
-            "bases on MLX yet — only the affine grid is implemented. Load the "
-            "model with load_in_4bit=True (affine) to use QAT."
-        )
-
-    if requested_bits is not None and requested_bits != bits:
-        raise ValueError(
-            f"Unsloth: qat_scheme={qat_scheme!r} requests {requested_bits}-bit "
-            f"weights but the base model is quantized to {bits}-bit. QAT must "
-            "simulate the grid that save_method='merged_4bit' will actually "
-            "write. Use qat_scheme='auto' to inherit the base quantization."
-        )
+    # Same rules the preflight applied to the would-be targets, now applied to
+    # what LoRA actually wrapped. Shared so the two cannot diverge.
+    group_size, bits, mode = _validate_qat_base_modules(
+        [(name, module.linear) for name, module in lora_wrapped],
+        requested_bits,
+    )
 
     dropout_layers = [n for n, m in patchable if _dropout_probability(m) > 0.0]
     if dropout_layers:
