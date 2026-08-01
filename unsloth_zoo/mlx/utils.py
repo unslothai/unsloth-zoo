@@ -1705,11 +1705,18 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
             return p_len, c_full[:max_seq_length], r_full[:max_seq_length]
         # Reserve room for the longer response, keep the prompt END
         # (truncation_mode="keep_end"); both rows keep one response_start.
-        keep_prompt = max(0, max_seq_length - longer_resp)
+        # A completion longer than the whole window still needs one prompt
+        # token as causal context, so trim the responses instead of reducing
+        # the prompt to an empty prefix.
+        min_prompt = 1 if p_len > 0 and max_seq_length > 1 else 0
+        keep_prompt = min(
+            p_len, max(min_prompt, max_seq_length - longer_resp)
+        )
+        keep_response = max_seq_length - keep_prompt
         prompt_prefix = c_full[:p_len]  # == r_full[:p_len]
         prompt_kept = prompt_prefix[p_len - keep_prompt:]
-        c_ids = (prompt_kept + resp_c)[:max_seq_length]
-        r_ids = (prompt_kept + resp_r)[:max_seq_length]
+        c_ids = prompt_kept + resp_c[:keep_response]
+        r_ids = prompt_kept + resp_r[:keep_response]
         pe = min(keep_prompt, len(c_ids), len(r_ids))
         return pe, c_ids, r_ids
 
@@ -10993,6 +11000,10 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
+        # Some mlx-lm LoRA layouts store each factor in an nn.Linear child,
+        # whose flattened parameter name includes a trailing `.weight`.
+        adapter_keys.add(f"{prefix}lora_a.weight")
+        adapter_keys.add(f"{prefix}lora_b.weight")
         # Include DoRA magnitude `m`, gated on the DoRA class name so a
         # future LoRA wrapper with an unrelated `m` attribute isn't exported.
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):

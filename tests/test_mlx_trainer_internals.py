@@ -3881,6 +3881,34 @@ def test_preference_long_prompt_preserves_response_span():
     assert c_start > 0
 
 
+def test_preference_long_completion_preserves_prompt_context():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _WordTokenizer:
+        bos_token = None
+        eos_token_id = 500
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(tok[0]) for tok in text.split()]
+
+    dataset = [{
+        "prompt": "a b c ",
+        "chosen": "d e f g h i j k l",
+        "rejected": "m n o p q r s t u",
+    }]
+    batch, lengths, _ = create_preference_batches(
+        dataset, _WordTokenizer(), batch_size=1, max_seq_length=8,
+        pad_to_multiple=1, dataset_order="sequential",
+    )[0]
+
+    chosen = [int(token) for token in batch[0].tolist()]
+    rejected = [int(token) for token in batch[1].tolist()]
+    assert lengths.tolist() == [[1, 8], [1, 8]]
+    assert chosen[0] == rejected[0] == ord("c")
+    assert chosen[1:] == [ord(ch) for ch in "defghij"]
+    assert rejected[1:] == [ord(ch) for ch in "mnopqrs"]
+
+
 def test_preference_padding_capped_at_max_seq_length():
     # Rounding Lmax up to pad_to_multiple can overshoot max_seq_length (50 -> 64)
     # and forward past the cap; it must be capped back.
