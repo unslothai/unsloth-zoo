@@ -4523,7 +4523,25 @@ def test_dpo_reference_rejects_nonzero_initial_lora_delta():
     assert src.index(guard) < dpo_builder
     guard_region = src[src.index(guard) - 120:dpo_builder]
     assert "not _rf" in guard_region
+    assert "not _is_resuming" in guard_region
     assert "warm-started policy" in guard_region
+
+
+def test_dpo_reference_rejects_trainable_parameters_outside_lora():
+    import inspect
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    adapter_keys = "collect_mlx_lora_adapter_tensors(model)"
+    trainable = "model.trainable_parameters()"
+    dpo_builder = src.index("make_dpo_loss_fn(beta=")
+    assert src.index(adapter_keys) < dpo_builder
+    guard_region = src[src.index(adapter_keys) - 120:dpo_builder]
+    assert trainable in guard_region
+    assert "if name not in _adapter_keys" in guard_region
+    assert "if _lora_mods and not _rf" in guard_region
+    assert "reference would drift with the policy" in guard_region
 
 
 def test_dpo_reference_disables_neftune_noise(monkeypatch):

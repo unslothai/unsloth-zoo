@@ -4682,6 +4682,9 @@ class MLXTrainer:
             elif getattr(args, "loss_type", "sft") == "dpo":
                 _db = getattr(args, "dpo_beta", 0.1)
                 _rf = bool(getattr(args, "reference_free", False))
+                _is_resuming = bool(
+                    getattr(self, "_resume_from_checkpoint", None)
+                )
                 # Walk the module tree: tree_flatten treats a bare nn.Module as
                 # one leaf and would never reach nested LoRA layers.
                 _lora_mods = [mod for _, mod in iter_mlx_lora_modules(model)]
@@ -4701,6 +4704,7 @@ class MLXTrainer:
                 if (
                     _lora_mods
                     and not _rf
+                    and not _is_resuming
                     and mlx_lora_modules_have_nonzero_delta(_lora_mods)
                 ):
                     raise ValueError(
@@ -4712,6 +4716,32 @@ class MLXTrainer:
                         "into the base model and attach a fresh zero-initialized "
                         "LoRA adapter, or pass reference_free=True."
                     )
+                if _lora_mods and not _rf:
+                    _adapter_keys = set(
+                        collect_mlx_lora_adapter_tensors(model)
+                    )
+                    _non_lora_trainable = sorted(
+                        name
+                        for name, _ in tree_flatten(
+                            model.trainable_parameters()
+                        )
+                        if name not in _adapter_keys
+                    )
+                    if _non_lora_trainable:
+                        _shown = ", ".join(_non_lora_trainable[:5])
+                        _more = (
+                            f" and {len(_non_lora_trainable) - 5} more"
+                            if len(_non_lora_trainable) > 5
+                            else ""
+                        )
+                        raise ValueError(
+                            "Unsloth: referenced DPO on MLX requires LoRA to "
+                            "contain every trainable parameter. Disabling LoRA "
+                            "cannot freeze these non-LoRA trainable parameters, "
+                            "so the reference would drift with the policy: "
+                            f"{_shown}{_more}. Freeze them or pass "
+                            "reference_free=True."
+                        )
                 # Handed to the loss so the reference forward can run it clean.
                 _neft = getattr(self, "_neftune_emb", None)
                 _neftune_mods = [_neft] if _neft is not None else []
