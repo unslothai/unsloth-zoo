@@ -1350,562 +1350,6 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     return loss_fn
 
 
-# ORPO (Odds Ratio Preference Optimization) — text models. Mirrors TRL's
-# concatenated forward (chosen block then rejected block, one pass, then split).
-# L = L_SFT + beta * L_OR with the full p/(1-p) odds form per the ORPO paper.
-def _orpo_odds_ratio_loss(logp_c, logp_r):
-    """ORPO odds-ratio term L_OR, computed in float32 for numerical stability.
-
-    Returns -mean(log_sigmoid(log_odds_chosen - log_odds_rejected)) where the
-    per-side odds are p/(1-p), i.e. log(1-p) = log(-expm1(logp)). The inputs are
-    upcast to float32 before the log(1-p) step, mirroring TRL's
-    ORPOTrainer.odds_ratio_loss (policy_chosen_logps.float() /
-    policy_rejected_logps.float()). This is required, not merely defensive: in
-    float16 the 1e-12 floor underflows to 0.0 (float16's smallest positive
-    subnormal is ~5.96e-8), so on any perfectly-predicted response row
-    (logp -> 0, e.g. an empty response span where response_start == seq_end)
-    -expm1(logp) is 0.0, mx.maximum(0.0, 0.0) stays 0.0, and mx.log(0.0) = -inf,
-    producing NaN gradients. In float32 the floor is representable and the term
-    stays finite. See ORPO (arXiv:2403.07691) and TRL issue #1473 (ORPO NaN).
-    """
-    logp_c = logp_c.astype(mx.float32)
-    logp_r = logp_r.astype(mx.float32)
-    floor = mx.array(1e-12, mx.float32)
-    val_c = mx.maximum(-mx.expm1(logp_c), floor)
-    val_r = mx.maximum(-mx.expm1(logp_r), floor)
-    log_odds = (logp_c - mx.log(val_c)) - (logp_r - mx.log(val_r))
-    return -mx.mean(nn.log_sigmoid(log_odds))
-
-
-def make_orpo_loss_fn(beta=0.1):
-    """Create an ORPO loss function over a concatenated [chosen; rejected] batch.
-
-    Signature matches make_baseline_loss_fn: (model, batch, lengths, labels=None)
-    -> (loss, ntoks), so it drops into the trainer's text step path unchanged.
-
-    Expects ``batch`` shape (2B, L) where rows [0:B] are chosen and rows [B:2B]
-    are rejected, paired by index (produced by ``create_preference_batches``).
-    ``lengths`` is (2B, 2) with per-row [response_start, seq_end). The odds-ratio
-    term scores response tokens only; the SFT/NLL term (TRL chosen_nll_loss) is
-    computed over the full prompt+response span (all non-pad chosen tokens).
-    """
-    def loss_fn(model, batch, lengths, labels=None):
-        inputs = batch[:, :-1]
-        targets = batch[:, 1:]
-        logits = model(inputs)
-        steps = mx.arange(1, targets.shape[1] + 1)
-        ce_tok = nn.losses.cross_entropy(logits, targets)
-        mask = mx.logical_and(
-            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
-        ).astype(mx.float32)
-        logp_tok = -ce_tok * mask
-        ntok_row = mask.sum(axis=1)
-        logp = logp_tok.sum(axis=1) / mx.maximum(ntok_row, mx.array(1.0))
-        B = batch.shape[0] // 2
-        logp_c, logp_r = logp[:B], logp[B:]
-        # TRL chosen_nll_loss: token-mean CE over the full prompt+response span,
-        # NOT the response-only logp the odds-ratio term uses.
-        nll_mask = (steps < lengths[:, 1:]).astype(mx.float32)[:B]
-        sft = (ce_tok[:B] * nll_mask).sum() / mx.maximum(nll_mask.sum(), mx.array(1.0))
-        or_loss = _orpo_odds_ratio_loss(logp_c, logp_r)
-        loss = sft + beta * or_loss.astype(sft.dtype)
-        # PAIR count, not token count: this is a mean over pairs, so accumulation
-        # must weight microbatches by pairs to stay equivalent to a single batch.
-        return loss, mx.array(B, dtype=mx.int32)
-    return loss_fn
-
-
-def make_dpo_loss_fn(beta=0.1, lora_mods=None, reference_free=False,
-                     neftune_mods=None):
-    """Create a DPO (Direct Preference Optimization) loss function.
-
-    Operates on a concatenated [chosen; rejected] batch (same layout as
-    make_orpo_loss_fn / create_preference_batches): rows [0:B] chosen,
-    [B:2B] rejected. Signature matches the other loss fns:
-    (model, batch, lengths, labels=None) -> (loss, ntoks).
-
-    DPO compares the policy's per-response log-probs against a frozen
-    reference. For LoRA models the reference is the base model: obtained by
-    temporarily zeroing the LoRA scales (adapters off), running the reference
-    forward under stop_gradient, then restoring the scales in a finally block.
-    Mirrors TRL's disable-adapter approach (no second model copy). With
-    reference_free=True the reference term is dropped, matching TRL.
-
-    ``lora_mods`` is the list of LoRALinear modules to toggle; collected once
-    by the trainer at setup.
-
-    ``neftune_mods`` is the list of NEFTune-wrapped embedding modules (empty
-    unless ``neftune_noise_alpha > 0``). NEFTune adds fresh random noise to the
-    input embeddings whenever the module is training, and the DPO loop keeps the
-    model in train() for both forwards. Left alone, the reference (adapters-off)
-    forward would compare the policy against a SECOND noisy base-model pass, so
-    the DPO reward would carry random NEFTune noise. To keep the reference clean
-    (matching TRL, whose frozen reference logps are computed without NEFTune),
-    the reference pass temporarily disables the noise on these modules and
-    restores it in a finally block, so only the policy forward is augmented.
-    """
-    _mods = list(lora_mods) if lora_mods is not None else []
-    _neftune = list(neftune_mods) if neftune_mods is not None else []
-    if not _mods and not reference_free:
-        raise ValueError(
-            "Unsloth: DPO with a reference model is not yet supported for full "
-            "fine-tuning on MLX — the reference is obtained by disabling LoRA "
-            "adapters, but this model has none. Use a LoRA/PEFT model, or pass "
-            "reference_free=True to train without a reference (TRL-style "
-            "reference-free DPO)."
-        )
-
-    def _row_logp_and_mask(model, batch, lengths):
-        inputs = batch[:, :-1]
-        targets = batch[:, 1:]
-        logits = model(inputs)
-        steps = mx.arange(1, targets.shape[1] + 1)
-        mask = mx.logical_and(
-            steps >= lengths[:, 0:1], steps < lengths[:, 1:]
-        ).astype(mx.float32)
-        logp_tok = -nn.losses.cross_entropy(logits, targets) * mask
-        return logp_tok.sum(axis=1), mask.sum()
-
-    def loss_fn(model, batch, lengths, labels=None):
-        B = batch.shape[0] // 2
-        pol, _ = _row_logp_and_mask(model, batch, lengths)
-        pol_c, pol_r = pol[:B], pol[B:]
-
-        if reference_free or not _mods:
-            ref_c = mx.zeros(pol_c.shape)
-            ref_r = mx.zeros(pol_r.shape)
-        else:
-            saved = [md.scale for md in _mods]
-            # Silence NEFTune for the reference forward: the model stays in
-            # train(), so its noise would make the "frozen" reference logps noisy.
-            neft_saved = [
-                getattr(m, "_neftune_noise_enabled", True) for m in _neftune
-            ]
-            try:
-                for md in _mods:
-                    md.scale = 0.0
-                for m in _neftune:
-                    m._neftune_noise_enabled = False
-                ref, _ = _row_logp_and_mask(model, batch, lengths)
-                ref = mx.stop_gradient(ref)
-            finally:
-                for md, s in zip(_mods, saved):
-                    md.scale = s
-                for m, s in zip(_neftune, neft_saved):
-                    m._neftune_noise_enabled = s
-            ref_c, ref_r = ref[:B], ref[B:]
-
-        logits = beta * ((pol_c - ref_c) - (pol_r - ref_r))
-        loss = -mx.mean(nn.log_sigmoid(logits))
-        # PAIR count, not token count (see make_orpo_loss_fn).
-        return loss, mx.array(B, dtype=mx.int32)
-    return loss_fn
-
-
-def _hf_encoding_tokenizer(tokenizer):
-    """Return the Hugging Face tokenizer used for text encoding.
-
-    mlx-lm's ``TokenizerWrapper`` stores the HF tokenizer under ``_tokenizer``,
-    so unwrapping it exposes ``eos_token_id`` and a list-returning ``encode``.
-    HF fast tokenizers ALSO expose ``_tokenizer``, but there it is the
-    low-level Rust ``tokenizers.Tokenizer`` (no ``eos_token_id``; ``encode``
-    returns ``Encoding`` objects). Only unwrap when the object is not already
-    an HF tokenizer, mirroring ``_get_processor_tokenizer`` /
-    ``_resolve_response_mask_tokenizer``.
-    """
-    try:
-        from transformers import PreTrainedTokenizerBase
-        if isinstance(tokenizer, PreTrainedTokenizerBase):
-            return tokenizer
-    except Exception:
-        pass
-    return getattr(tokenizer, "_tokenizer", tokenizer)
-
-
-def _common_prefix_len(*seqs):
-    """Length of the longest shared leading prefix across all sequences.
-
-    Locates the prompt/completion boundary for a preference pair from the
-    standalone-prompt ids (``p_ids``) and the two concatenated prompt+completion
-    encodings (``c_full``, ``r_full``). It is correct whether or not the
-    tokenizer appends an end-of-sequence special token during ``encode``:
-
-    * With ``add_eos_token=True`` (e.g. a LLaMA tokenizer loaded that way), the
-      standalone prompt carries a trailing prompt-only EOS that is NOT present at
-      the prompt/completion seam inside ``encode(prompt + completion)``. A plain
-      ``min(len(...))`` boundary would then overcount the prompt by that EOS and
-      mask out (or, for a one-token completion, score only) the first completion
-      token. Walking the shared prefix stops at the first divergent id (the
-      prompt EOS vs. the first completion token), giving the true boundary.
-    * In the normal case (no prompt EOS) the standalone prompt IS a true prefix
-      of both completions, so this returns ``len(p_ids)`` -- identical to the old
-      ``min(len(...))`` and a no-op. It is also strictly more correct when the
-      concatenated tokenization merges the boundary token: the shared prefix is
-      then shorter than ``len(p_ids)``, so both rows keep a single, real
-      ``response_start`` (``c_full[:pe] == r_full[:pe]`` holds by construction).
-    """
-    if not seqs:
-        return 0
-    limit = min(len(s) for s in seqs)
-    first = seqs[0]
-    i = 0
-    while i < limit and all(s[i] == first[i] for s in seqs[1:]):
-        i += 1
-    return i
-
-
-def _is_conversational_messages(value):
-    """True if value is a non-empty list of {"role","content"} message dicts."""
-    return (
-        isinstance(value, list) and len(value) > 0
-        and isinstance(value[0], dict)
-        and "role" in value[0] and "content" in value[0]
-    )
-
-
-def _render_preference_example(tokenizer, prompt, chosen, rejected,
-                               tools=None, chat_template_kwargs=None):
-    """Return (prompt_str, prompt_chosen_str, prompt_rejected_str) for one row.
-
-    Mirrors TRL's maybe_apply_chat_template: conversational (message-list) rows
-    render through the chat template, plain string rows fall through unchanged.
-    Without this, concatenating message lists crashes in encode_mlx_text.
-
-    ``tools`` / ``chat_template_kwargs`` are per-row and thread into all three
-    renders, as TRL and the SFT path do; dropping them would train ORPO/DPO on
-    different text than SFT for the same row.
-    """
-    prompt_is_conversational = _is_conversational_messages(prompt)
-    chosen_is_conversational = _is_conversational_messages(chosen)
-    rejected_is_conversational = _is_conversational_messages(rejected)
-
-    if not prompt_is_conversational and (
-        chosen_is_conversational or rejected_is_conversational
-    ):
-        if not (chosen_is_conversational and rejected_is_conversational):
-            raise ValueError(
-                "Unsloth MLX preference: chosen and rejected must both use "
-                "conversational messages when either one does."
-            )
-        # Match TRL maybe_extract_prompt for datasets that retain a plain text
-        # prompt while chosen/rejected contain the full conversation. The text
-        # prompt is only a convenience column; the shared message prefix is the
-        # token-exact prompt that must be removed from both completions.
-        chosen = _normalize_mlx_messages(chosen, is_vlm=False)
-        rejected = _normalize_mlx_messages(rejected, is_vlm=False)
-        shared = 0
-        limit = min(len(chosen), len(rejected))
-        while shared < limit and chosen[shared] == rejected[shared]:
-            shared += 1
-        if shared == 0:
-            raise ValueError(
-                "Unsloth MLX preference: conversational chosen/rejected rows "
-                "paired with a text prompt must share a leading conversation."
-            )
-        prompt, chosen, rejected = (
-            chosen[:shared], chosen[shared:], rejected[shared:]
-        )
-        prompt_is_conversational = True
-
-    if prompt_is_conversational:
-        if not (chosen_is_conversational and rejected_is_conversational):
-            raise ValueError(
-                "Unsloth MLX preference: prompt, chosen, and rejected must all "
-                "use conversational messages when prompt is conversational."
-            )
-        # Flatten OpenAI-style content parts like the SFT path. Raw part-lists
-        # make Qwen2.5/SmolLM raise TypeError and Qwen3 render every turn empty
-        # (chosen == rejected, so the odds-ratio term is a constant log 2).
-        prompt = _normalize_mlx_messages(prompt, is_vlm=False)
-        chosen = _normalize_mlx_messages(chosen, is_vlm=False)
-        rejected = _normalize_mlx_messages(rejected, is_vlm=False)
-        last_role = prompt[-1].get("role")
-        if last_role == "user":
-            add_gen, cont = True, False
-        elif last_role == "assistant":
-            add_gen, cont = False, True
-        else:
-            raise ValueError(
-                "Unsloth MLX preference: conversational chat prompt has invalid "
-                f"last-message role {last_role!r}; expected 'user' or 'assistant'."
-            )
-        # Injected only when present, so rows without them render as before and
-        # tokenizers lacking a tools= parameter keep working.
-        extra_kwargs = dict(chat_template_kwargs or {})
-        if tools:
-            extra_kwargs["tools"] = tools
-        prompt_str = tokenizer.apply_chat_template(
-            prompt, tokenize=False,
-            add_generation_prompt=add_gen, continue_final_message=cont,
-            **extra_kwargs,
-        )
-        prompt_chosen_str = tokenizer.apply_chat_template(
-            list(prompt) + list(chosen), tokenize=False,
-            **extra_kwargs,
-        )
-        prompt_rejected_str = tokenizer.apply_chat_template(
-            list(prompt) + list(rejected), tokenize=False,
-            **extra_kwargs,
-        )
-        return prompt_str, prompt_chosen_str, prompt_rejected_str
-    # Plain string row: concatenate. tools / chat_template_kwargs do not apply.
-    return prompt, prompt + chosen, prompt + rejected
-
-
-class PreferenceBatchList(list):
-    """Eager preference batches carrying the length of ONE dataset pass.
-
-    The trainer reads that length as ``getattr(batches, "cycle_length", None)``
-    to force HF's epoch-final optimizer step; a plain list cannot carry it, so a
-    ragged pass never force-updates on its tail. Stays a ``list`` (and outside
-    the lazy-plan isinstance gates) so existing consumers are unchanged.
-    """
-
-    __slots__ = ("cycle_length",)
-
-    def __init__(self, batches=(), *, cycle_length=None):
-        super().__init__(batches)
-        # Not clamped to len(self): num_epochs makes the list several passes
-        # long and a num_batches horizon can truncate it below one, matching how
-        # the SFT/VLM plans count theirs.
-        self.cycle_length = (
-            None if cycle_length is None else max(1, int(cycle_length))
-        )
-
-    def __reduce__(self):
-        # __slots__ leaves no __dict__ for the default list reducer to restore.
-        return (self.__class__, (list(self),), {"cycle_length": self.cycle_length})
-
-    def __setstate__(self, state):
-        self.cycle_length = state.get("cycle_length")
-
-
-def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
-                        prompt_key="prompt", chosen_key="chosen",
-                        rejected_key="rejected", pad_to_multiple=32,
-                        num_batches=None, dataset_order="default",
-                        preserve_dataset_order=False, seed=None,
-                        append_eos=True, num_epochs=None, grad_accum=None,
-                        formatting_func=None):
-    """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
-
-    Each example contributes ``prompt + chosen`` and ``prompt + rejected``,
-    grouped into batches of ``batch_size`` PAIRS and padded so the shifted
-    model input width is a multiple of ``pad_to_multiple``.
-
-    ``dataset_order`` (mirrors the SFT/VLM builders for CUDA/TRL parity):
-      "default"        length-sort — least padding; the historical behavior.
-      "sequential"     dataset order — CUDA ``SequentialSampler``.
-      "torch_randperm" seeded permutation — CUDA ``RandomSampler``.
-    ``preserve_dataset_order=True`` forces "sequential"; ``seed`` seeds
-    "torch_randperm". ``num_epochs`` (epoch-based runs, ``num_batches`` None)
-    materializes a fresh batch permutation for "default" and a fresh row
-    permutation for "torch_randperm" so each epoch sees a new order.
-
-    ``append_eos`` (default True, as TRL) appends EOS to each completion before
-    truncation, guarded against a double EOS; it lands inside the loss span and
-    is trained on. Over-long rows truncate PROMPT-FIRST (keeping the prompt end,
-    TRL's ``truncation_mode="keep_end"``) so the response survives with a
-    non-empty span.
-
-    Returns ``PreferenceBatchList`` of ``(batch, lengths, None)``:
-      batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
-      lengths: (2B, 2) — per row [response_start, seq_end)
-
-    ``formatting_func``, when provided, is applied to each raw dataset row
-    before the preference columns are read. It must return a mapping containing
-    ``prompt_key``, ``chosen_key``, and ``rejected_key``.
-    """
-    order_mode = "sequential" if preserve_dataset_order else dataset_order
-    if order_mode not in ("default", "sequential", "torch_randperm"):
-        raise ValueError(
-            f"Unsloth MLX: unsupported preference dataset_order={order_mode!r}. "
-            "Expected 'default', 'sequential', or 'torch_randperm'."
-        )
-    hf = _hf_encoding_tokenizer(tokenizer)
-    eos_id = hf.eos_token_id
-    pad_id = getattr(hf, "pad_token_id", None)
-    pad_id = int(pad_id if pad_id is not None else (
-        eos_id if eos_id is not None else 0
-    ))
-
-    def _with_eos(ids):
-        # Preference EOS belongs to the TRL DPO/ORPO tokenization contract even
-        # after chat-template rendering. A template end-of-turn token does not
-        # replace tokenizer.eos_token_id, so append unless that exact id is last.
-        if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
-            ids = ids + [eos_id]
-        return ids
-
-    def _truncate_preference_pair(p_ids, c_full, r_full):
-        # Truncate prompt-first so the response survives (TRL tokenize_row); a
-        # plain right-truncation would empty the loss span on long prompts.
-        # Common prefix, not min(len): a prompt-only EOS would otherwise put the
-        # boundary one token past the seam and mask the first completion token.
-        p_len = _common_prefix_len(p_ids, c_full, r_full)
-        resp_c = c_full[p_len:]
-        resp_r = r_full[p_len:]
-        longer_resp = max(len(resp_c), len(resp_r))
-        if p_len + longer_resp <= max_seq_length:
-            return p_len, c_full[:max_seq_length], r_full[:max_seq_length]
-        # Reserve room for the longer response, keep the prompt END
-        # (truncation_mode="keep_end"); both rows keep one response_start.
-        # A completion longer than the whole window still needs one prompt
-        # token as causal context, so trim the responses instead of reducing
-        # the prompt to an empty prefix.
-        min_prompt = 1 if p_len > 0 and max_seq_length > 1 else 0
-        keep_prompt = min(
-            p_len, max(min_prompt, max_seq_length - longer_resp)
-        )
-        keep_response = max_seq_length - keep_prompt
-        prompt_prefix = c_full[:p_len]  # == r_full[:p_len]
-        prompt_kept = prompt_prefix[p_len - keep_prompt:]
-        c_ids = prompt_kept + resp_c[:keep_response]
-        r_ids = prompt_kept + resp_r[:keep_response]
-        pe = min(keep_prompt, len(c_ids), len(r_ids))
-        return pe, c_ids, r_ids
-
-    rows = []
-    for raw_ex in dataset:
-        ex = formatting_func(raw_ex) if formatting_func is not None else raw_ex
-        if formatting_func is not None and not isinstance(ex, Mapping):
-            raise ValueError(
-                "Unsloth MLX preference: formatting_func must provide mapping rows; "
-                f"got {type(ex).__name__}."
-            )
-        if prompt_key not in ex or chosen_key not in ex or rejected_key not in ex:
-            raise ValueError(
-                f"ORPO requires '{prompt_key}', '{chosen_key}', '{rejected_key}' "
-                f"columns; got {sorted(ex.keys())}."
-            )
-        prompt = ex[prompt_key]
-        _ex_tools = ex.get("tools") if isinstance(ex, Mapping) else None
-        _ex_template_kwargs = (
-            ex.get("chat_template_kwargs") if isinstance(ex, Mapping) else None
-        )
-        prompt, chosen_full_text, rejected_full_text = _render_preference_example(
-            tokenizer, prompt, ex[chosen_key], ex[rejected_key],
-            tools=_ex_tools, chat_template_kwargs=_ex_template_kwargs,
-        )
-        # encode_mlx_text, not raw hf.encode: a template-rendered prompt already
-        # carries a BOS and would otherwise get a second one.
-        p_ids = encode_mlx_text(hf, prompt)
-        c_full = _with_eos(encode_mlx_text(hf, chosen_full_text))
-        r_full = _with_eos(encode_mlx_text(hf, rejected_full_text))
-        pe, c_ids, r_ids = _truncate_preference_pair(p_ids, c_full, r_full)
-        rows.append((pe, c_ids, r_ids))
-
-    # rows are collected in dataset order above; reorder per the requested mode.
-    if order_mode == "default":
-        rows.sort(key=lambda t: max(len(t[1]), len(t[2])))
-    # "sequential": leave rows in dataset order (CUDA SequentialSampler parity).
-    # "torch_randperm" permutes the ROWS per pass below (RandomSampler parity),
-    # so it is intentionally NOT pre-permuted here.
-
-    # Reshuffle the pass order per epoch, mirroring the SFT path. Without it a
-    # sub-one-pass num_batches would train only the shortest pairs (length-sort),
-    # and a multi-pass run would replay one identical order every epoch.
-    # "default" reshuffles BATCH order via numpy so it stays torch-free;
-    # "torch_randperm" redraws a ROW permutation per pass; "sequential" is
-    # left single-pass. Step-based pass 0 uses base_seed. Epoch-based default
-    # keeps the length-sorted first pass, matching the SFT finite plan.
-    base_starts = list(range(0, len(rows), batch_size))
-    if order_mode == "default" and num_batches is not None and base_starts:
-        rng = np.random.RandomState(_normalize_seed(seed))
-        ordered_starts = []
-        while len(ordered_starts) < num_batches:
-            perm = rng.permutation(len(base_starts))
-            ordered_starts.extend(base_starts[int(i)] for i in perm)
-        chunks = [rows[s:s + batch_size] for s in ordered_starts[:num_batches]]
-    elif order_mode == "default" and num_epochs is not None and base_starts:
-        cycle = len(base_starts)
-        accum = max(1, int(grad_accum or 1))
-        per_epoch = max(1, math.ceil(cycle / accum))
-        budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-        whole, rem = divmod(budget, per_epoch)
-        target_batches = whole * cycle + rem * accum
-        base_seed = _normalize_seed(seed)
-        ordered_starts = list(base_starts)
-        epoch = 1
-        while len(ordered_starts) < target_batches:
-            rng = np.random.RandomState((base_seed + epoch) % (2 ** 32))
-            perm = rng.permutation(cycle)
-            ordered_starts.extend(base_starts[int(i)] for i in perm)
-            epoch += 1
-        chunks = [rows[s:s + batch_size] for s in ordered_starts[:target_batches]]
-    elif order_mode == "torch_randperm" and num_batches is not None and rows:
-        base_seed = _normalize_seed(seed)
-        chunks = []
-        epoch = 0
-        while len(chunks) < num_batches:
-            order = _torch_randperm_order(len(rows), base_seed + epoch)
-            rows_epoch = [rows[i] for i in order]
-            chunks.extend(
-                rows_epoch[j:j + batch_size]
-                for j in range(0, len(rows_epoch), batch_size)
-            )
-            epoch += 1
-        chunks = chunks[:num_batches]
-    elif order_mode == "torch_randperm" and num_epochs is not None and rows:
-        # Epoch-based run: one reseeded permutation per epoch, so the
-        # modulo-cycled loop draws a distinct order instead of replaying one.
-        # num_train_epochs is a float, so build to the same step budget the SFT
-        # ordered path uses (_create_ordered_text_plan): whole passes plus the
-        # accumulation windows of a partial one. int() instead collapsed 1.5 and
-        # 0.5 onto a single pass. Whole counts are unchanged.
-        base_seed = _normalize_seed(seed)
-        cycle = len(base_starts)
-        accum = max(1, int(grad_accum or 1))
-        per_epoch = max(1, math.ceil(cycle / accum))
-        budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-        whole, rem = divmod(budget, per_epoch)
-        target_batches = whole * cycle + rem * accum
-        chunks = []
-        _epoch = 0
-        while len(chunks) < target_batches:
-            order = _torch_randperm_order(len(rows), base_seed + _epoch)
-            rows_epoch = [rows[i] for i in order]
-            chunks.extend(
-                rows_epoch[j:j + batch_size]
-                for j in range(0, len(rows_epoch), batch_size)
-            )
-            _epoch += 1
-        chunks = chunks[:target_batches]
-    elif order_mode == "torch_randperm":
-        # Single seeded permutation, identical to pass 0 above.
-        order = _torch_randperm_order(len(rows), _normalize_seed(seed))
-        rows_ordered = [rows[i] for i in order]
-        chunks = [rows_ordered[s:s + batch_size] for s in base_starts]
-    else:
-        chunks = [rows[s:s + batch_size] for s in base_starts]
-
-    out = []
-    for chunk in chunks:
-        Lmax = max(max(len(c), len(r)) for _, c, r in chunk)
-        Lmax = _finite_text_pad_width(
-            Lmax,
-            pad_to_multiple=pad_to_multiple,
-            minimum_width=2,
-            max_seq_length=max_seq_length,
-        )
-        chosen_rows, rejected_rows, lengths = [], [], []
-        for pe, c, r in chunk:
-            chosen_rows.append(c + [pad_id] * (Lmax - len(c)))
-            lengths.append([pe, len(c)])
-        for pe, c, r in chunk:
-            rejected_rows.append(r + [pad_id] * (Lmax - len(r)))
-            lengths.append([pe, len(r)])
-        batch = mx.array(chosen_rows + rejected_rows, dtype=mx.int32)
-        lengths_arr = mx.array(lengths)
-        out.append((batch, lengths_arr, None))
-        if num_batches is not None and len(out) >= num_batches:
-            break
-    mx.eval([b for b, _, _ in out] + [l for _, l, _ in out])
-    # len(base_starts) is the one-pass count in every ordering branch above;
-    # len(out) is not, once num_epochs expands or num_batches truncates.
-    return PreferenceBatchList(out, cycle_length=len(base_starts) or None)
-
-
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -4666,15 +4110,42 @@ def _tokenize_mlx_prompt_completion(
     state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
+    encoded = _encode_mlx_prompt_completion(
+        tokenizer, prompt, prompt + completion, append_eos=False, state=state,
+    )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
-        prompt_ids,
-        input_ids,
+        list(encoded.prompt_ids),
+        list(encoded.input_ids),
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
     )
+
+
+@dataclass(frozen=True)
+class _MLXPromptCompletionTokens:
+    """Immutable encoding shared by SFT and preference tokenization."""
+
+    prompt_ids: tuple
+    input_ids: tuple
+
+
+def _encode_mlx_prompt_completion(
+    tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+):
+    """Encode a prompt and its full text with one EOS policy."""
+    prompt_ids = tuple(int(x) for x in encode_mlx_text(
+        tokenizer, prompt_text, state=state,
+    ))
+    input_ids = [int(x) for x in encode_mlx_text(
+        tokenizer, full_text, state=state,
+    )]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if append_eos and eos_id is not None and (
+        not input_ids or input_ids[-1] != int(eos_id)
+    ):
+        input_ids.append(int(eos_id))
+    return _MLXPromptCompletionTokens(prompt_ids, tuple(input_ids))
 
 
 def _mask_mlx_prompt_completion_labels(
@@ -9095,6 +8566,87 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
+    """Translate fractional epochs into HF-style accumulation windows."""
+    accum = max(1, int(grad_accum or 1))
+    per_epoch = max(1, math.ceil(cycle_length / accum))
+    budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+    whole, rem = divmod(budget, per_epoch)
+    return whole * cycle_length + rem * accum
+
+
+def _finite_row_schedule(
+    row_count,
+    batch_size,
+    *,
+    order_for_epoch,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    comm_group=None,
+):
+    """Build a finite, epoch-bounded microbatch schedule from row indices."""
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def batches_for_epoch(epoch):
+        order = list(order_for_epoch(epoch))
+        batches = []
+        for start in range(0, row_count, global_batch_size):
+            chunk = _rank_slice_distributed_batch(
+                order[start : start + global_batch_size],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=order,
+            )
+            if chunk:
+                batches.append(tuple(chunk))
+        return tuple(batches)
+
+    return _finite_batch_schedule(
+        batches_for_epoch,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+
+
+def _finite_batch_schedule(
+    batches_for_epoch,
+    *,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+):
+    """Build a finite horizon from already-bounded epoch microbatches."""
+    first_batches = tuple(tuple(batch) for batch in batches_for_epoch(0))
+    cycle_length = len(first_batches)
+    if cycle_length == 0:
+        return (), 0
+    target = num_batches
+    if target is None:
+        target = (
+            cycle_length
+            if num_epochs is None
+            else _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
+        )
+    schedule = []
+    epoch = 0
+    while len(schedule) < target:
+        batches = (
+            first_batches
+            if epoch == 0
+            else tuple(tuple(batch) for batch in batches_for_epoch(epoch))
+        )
+        if len(batches) != cycle_length:
+            raise ValueError("finite epoch schedules must have a stable batch count")
+        for batch in batches:
+            schedule.append(batch)
+            if len(schedule) >= target:
+                break
+        epoch += 1
+    return tuple(schedule), cycle_length
+
+
 def _create_ordered_text_plan(
     dataset,
     tokenizer,
@@ -9216,76 +8768,15 @@ def _create_ordered_text_plan(
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    schedule = []
-    epoch = 0
-    order = make_order(epoch)
-    order_pos = 0
-    seen = 0
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
-    # same length and a chunk's local slice is non-empty whatever rows it holds,
-    # so this is constant across epochs even under num_batches truncation.
-    cycle_length = sum(
-        1 for start in range(0, len(order), global_batch_size)
-        if _rank_slice_distributed_batch(
-            order[start : start + global_batch_size],
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
+    schedule, cycle_length = _finite_row_schedule(
+        len(tokenized),
+        batch_size,
+        order_for_epoch=make_order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+        comm_group=comm_group,
     )
-    # why: HF quantizes a fractional num_train_epochs to whole accumulation
-    # windows and re-iterates the dataloader rather than taking a proportional
-    # slice of rows, so 0.5 epochs of 5 rows at batch 2 / accum 2 is one update
-    # over 4 rows, not 3 rows. Build to that step budget: whole passes plus the
-    # windows of the partial one, where a pass's last micro-batch forces its own
-    # update. int(num_epochs) instead built 0 batches for 0 < epochs < 1, which
-    # surfaced as "No training batches created", and one pass for 1.5.
-    target_batches = None
-    if num_batches is None:
-        if num_epochs is None:
-            target_batches = cycle_length
-        else:
-            accum = max(1, int(grad_accum or 1))
-            per_epoch = max(1, math.ceil(cycle_length / accum))
-            budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-            whole, rem = divmod(budget, per_epoch)
-            target_batches = whole * cycle_length + rem * accum
-    while num_batches is None or len(schedule) < num_batches:
-        # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
-        # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
-        if order_pos >= len(order):
-            # Stop when num_batches or the epoch step budget is reached.
-            if (
-                num_batches is None
-                and (target_batches is None or len(schedule) >= target_batches)
-            ):
-                break
-            epoch += 1
-            order = make_order(epoch)
-            order_pos = 0
-
-        chunk = order[order_pos : order_pos + global_batch_size]
-        if not chunk:
-            break
-        order_pos += len(chunk)
-        seen += len(chunk)
-        chunk = _rank_slice_distributed_batch(
-            chunk,
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
-        if not chunk:
-            break
-        schedule.append(tuple(chunk))
-
-        if (
-            num_batches is None
-            and target_batches is not None
-            and len(schedule) >= target_batches
-        ):
-            break
 
     if labeled:
         rows = _finite_text_rows(tokenized)
@@ -10988,10 +10479,6 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        # Prefer the pre-disable stash so a checkpoint saved after ORPO/DPO
-        # (which swaps the live adapter dropout for an identity) still records
-        # the configured lora_dropout instead of 0.0; falls back to the live
-        # dropout module (mlx.nn.Dropout keep-prob in _p_1, else .p) otherwise.
         dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
@@ -11008,35 +10495,6 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
-def mlx_lora_modules_have_nonzero_delta(modules):
-    """Return whether any LoRA module may already change the base output.
-
-    Fresh MLX LoRA adapters initialize one factor to all zeros, which makes the
-    effective adapter delta exactly zero. A warm-started or otherwise nonzero
-    adapter normally has values in both factors. Treat an uninspectable factor
-    conservatively as nonzero so referenced DPO cannot silently use the bare
-    base model in place of its actual initial policy.
-    """
-    def _has_values(value):
-        if value is not None and not hasattr(value, "shape"):
-            value = getattr(value, "weight", None)
-        if value is None or not hasattr(value, "shape"):
-            return True
-        try:
-            nonzero = mx.any(value != 0)
-            mx.eval(nonzero)
-            return bool(nonzero.item())
-        except Exception:
-            return True
-
-    for module in modules:
-        if _has_values(getattr(module, "lora_a", None)) and _has_values(
-            getattr(module, "lora_b", None)
-        ):
-            return True
-    return False
-
-
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -11051,8 +10509,6 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
-        # Some mlx-lm LoRA layouts store each factor in an nn.Linear child,
-        # whose flattened parameter name includes a trailing `.weight`.
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
         # Include DoRA magnitude `m`, gated on the DoRA class name so a
@@ -11354,89 +10810,14 @@ def _get_mlx_dropout_probability(drop):
 
 
 def _read_mlx_lora_dropout(module):
-    """Return a LoRA module's CONFIGURED dropout probability for adapter_config.
-
-    ORPO/DPO neutralize adapter dropout for deterministic preference forwards by
-    replacing ``module.dropout`` with an identity (``_mlx_disable_lora_dropout``),
-    which erases the probability the live module would otherwise report -- so a
-    naive ``_get_mlx_dropout_probability(module.dropout)`` at save time would
-    persist ``dropout=0.0`` and break reload parity with the trained LoRA config.
-    That disable stashes the original probability on
-    ``module._unsloth_orig_lora_dropout`` first, so prefer it here and fall back
-    to reading the live dropout module for SFT / never-disabled adapters.
-    """
-    stashed = getattr(module, "_unsloth_orig_lora_dropout", None)
-    if stashed is not None:
-        try:
-            return float(stashed)
-        except (TypeError, ValueError):
-            pass
-    return _get_mlx_dropout_probability(getattr(module, "dropout", None))
-
-
-def _iter_mlx_dropout_modules(model):
-    """Yield every dropout-type module in the model tree (TRL parity).
-
-    TRL's ``disable_dropout_in_model`` (trl/trainer/utils.py) walks
-    ``model.modules()`` and zeroes EVERY ``nn.Dropout``, not just adapter
-    dropout. The MLX equivalent walks ``model.named_modules()`` and matches
-    mlx.nn's Dropout family (Dropout/Dropout2d/Dropout3d, which store the
-    keep-probability in ``_p_1``). Detection is by ``isinstance`` against the
-    installed mlx.nn dropout classes when available, plus a structural fallback
-    (a numeric ``_p_1`` keep-prob marker or a ``*Dropout`` class name) so it also
-    fires under the torch-backed test shim and for any dropout-like leaf.
-    """
-    dropout_types = ()
-    try:
-        import mlx.nn as _mlx_nn
-        dropout_types = tuple(
-            cls for cls in (
-                getattr(_mlx_nn, name, None)
-                for name in ("Dropout", "Dropout2d", "Dropout3d")
-            )
-            if isinstance(cls, type)
-        )
-    except Exception:
-        dropout_types = ()
-    named = getattr(model, "named_modules", None)
-    if not callable(named):
-        return
-    for _, mod in named():
-        if mod is None:
-            continue
-        if (
-            (dropout_types and isinstance(mod, dropout_types))
-            or getattr(mod, "_p_1", None) is not None
-            or type(mod).__name__.endswith("Dropout")
-        ):
-            yield mod
-
-
-def _disable_mlx_base_dropout(model):
-    """Neutralize every dropout module in the model tree in place (TRL parity).
-
-    Mirrors TRL's ``disable_dropout_in_model``, which sets ``module.p = 0`` on
-    every ``nn.Dropout`` so the DPO/ORPO forwards are deterministic under
-    ``disable_dropout=True``. ``_mlx_disable_lora_dropout`` already replaces the
-    LoRA/DoRA adapter dropout; this walks the WHOLE tree so a base transformer
-    that carries residual/attention dropout is disabled too. mlx-lm's base
-    transformers currently ship no dropout, so for common models this is a safe
-    no-op superset. Setting ``mlx.nn.Dropout._p_1 = 1`` makes its forward an
-    identity passthrough (``Dropout.__call__`` returns ``x`` unchanged when
-    ``_p_1 == 1``); ``.p = 0`` covers torch-style dropout leaves. Returns the
-    count of modules that were actually ACTIVE (dropout probability > 0) so an
-    already-off model reports 0.
-    """
-    count = 0
-    for mod in _iter_mlx_dropout_modules(model):
-        was_active = _get_mlx_dropout_probability(mod) > 0.0
-        if getattr(mod, "_p_1", None) is not None:
-            mod._p_1 = 1.0
-        if getattr(mod, "p", None) is not None:
-            mod.p = 0
-        if was_active:
-            count += 1
-    return count
+    """Read configured adapter dropout while a preference run has it disabled."""
+    drop = getattr(module, "dropout", None)
+    original = getattr(
+        drop, "_unsloth_preference_original_probability", None,
+    )
+    if original is not None:
+        return float(original)
+    return _get_mlx_dropout_probability(drop)
 
 
 def _coerce_mlx_lora_scale(scale, default=1.0):
@@ -11719,8 +11100,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                # Prefer the pre-disable stash so an adapter saved after ORPO/DPO
-                # still records the configured lora_dropout rather than 0.0.
                 lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.

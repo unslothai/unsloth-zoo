@@ -103,9 +103,8 @@ jobs:
         # + cache-completeness gate (CPU-pure; collect-only would let it
         # regress silently). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). The two preference files pin the ORPO/DPO content-part
-        # and epoch-boundary contracts (torch shim, no weights); they were
-        # collected but executed by no job before this.
+        # no weights). The preference suite pins token boundaries, scheduling,
+        # objective normalization, and reference lifecycle without model weights.
         # Executing them here keeps fixture/source drift visible.
         run: |
           python -m pytest \
@@ -115,10 +114,7 @@ jobs:
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
-            tests/test_mlx_preference_content_parts.py \
-            tests/test_mlx_preference_cycle_length.py \
-            tests/test_mlx_preference_fractional_epochs.py \
-            tests/test_mlx_preference_token_telemetry.py \
+            tests/test_mlx_preference.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
