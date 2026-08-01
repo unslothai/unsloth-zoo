@@ -1575,7 +1575,44 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
     renders, as TRL and the SFT path do; dropping them would train ORPO/DPO on
     different text than SFT for the same row.
     """
-    if _is_conversational_messages(prompt):
+    prompt_is_conversational = _is_conversational_messages(prompt)
+    chosen_is_conversational = _is_conversational_messages(chosen)
+    rejected_is_conversational = _is_conversational_messages(rejected)
+
+    if not prompt_is_conversational and (
+        chosen_is_conversational or rejected_is_conversational
+    ):
+        if not (chosen_is_conversational and rejected_is_conversational):
+            raise ValueError(
+                "Unsloth MLX preference: chosen and rejected must both use "
+                "conversational messages when either one does."
+            )
+        # Match TRL maybe_extract_prompt for datasets that retain a plain text
+        # prompt while chosen/rejected contain the full conversation. The text
+        # prompt is only a convenience column; the shared message prefix is the
+        # token-exact prompt that must be removed from both completions.
+        chosen = _normalize_mlx_messages(chosen, is_vlm=False)
+        rejected = _normalize_mlx_messages(rejected, is_vlm=False)
+        shared = 0
+        limit = min(len(chosen), len(rejected))
+        while shared < limit and chosen[shared] == rejected[shared]:
+            shared += 1
+        if shared == 0:
+            raise ValueError(
+                "Unsloth MLX preference: conversational chosen/rejected rows "
+                "paired with a text prompt must share a leading conversation."
+            )
+        prompt, chosen, rejected = (
+            chosen[:shared], chosen[shared:], rejected[shared:]
+        )
+        prompt_is_conversational = True
+
+    if prompt_is_conversational:
+        if not (chosen_is_conversational and rejected_is_conversational):
+            raise ValueError(
+                "Unsloth MLX preference: prompt, chosen, and rejected must all "
+                "use conversational messages when prompt is conversational."
+            )
         # Flatten OpenAI-style content parts like the SFT path. Raw part-lists
         # make Qwen2.5/SmolLM raise TypeError and Qwen3 render every turn empty
         # (chosen == rejected, so the odds-ratio term is a constant log 2).
@@ -1595,7 +1632,7 @@ def _render_preference_example(tokenizer, prompt, chosen, rejected,
         # Injected only when present, so rows without them render as before and
         # tokenizers lacking a tools= parameter keep working.
         extra_kwargs = dict(chat_template_kwargs or {})
-        if tools is not None:
+        if tools:
             extra_kwargs["tools"] = tools
         prompt_str = tokenizer.apply_chat_template(
             prompt, tokenize=False,
@@ -1693,6 +1730,9 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     ))
 
     def _with_eos(ids):
+        # Preference EOS belongs to the TRL DPO/ORPO tokenization contract even
+        # after chat-template rendering. A template end-of-turn token does not
+        # replace tokenizer.eos_token_id, so append unless that exact id is last.
         if append_eos and eos_id is not None and (not ids or ids[-1] != eos_id):
             ids = ids + [eos_id]
         return ids

@@ -4855,6 +4855,61 @@ def test_preference_conversational_render_threads_tools_and_template_kwargs():
     assert with_tools[0][0].tolist() != without_tools[0][0].tolist()
 
 
+def test_preference_conversational_render_omits_empty_tools():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    row = {
+        "prompt": [{"role": "user", "content": "hi"}],
+        "chosen": [{"role": "assistant", "content": "ok"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+        "tools": [],
+    }
+    tok = _RecordingChatTemplateTokenizer()
+    create_preference_batches(
+        [row], tok, batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )
+
+    assert len(tok.calls) == 3
+    assert all(call["tools"] is None for call in tok.calls)
+
+
+def test_preference_extracts_prompt_from_mixed_conversational_choices():
+    from unsloth_zoo.mlx.utils import _render_preference_example
+
+    prompt_turn = {"role": "user", "content": "hi"}
+    prompt, chosen, rejected = _render_preference_example(
+        _RecordingChatTemplateTokenizer(),
+        "Convenience prompt text",
+        [prompt_turn, {"role": "assistant", "content": "ok"}],
+        [prompt_turn, {"role": "assistant", "content": "no"}],
+    )
+
+    assert prompt == "U:hiA:"
+    assert chosen == "U:hiA:ok"
+    assert rejected == "U:hiA:no"
+
+
+def test_preference_chat_template_keeps_trl_eos_append_contract():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    row = {
+        "prompt": [{"role": "user", "content": "hi"}],
+        "chosen": [{"role": "assistant", "content": "ok"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+    }
+    tok = _RecordingChatTemplateTokenizer()
+    batch, lengths, _ = create_preference_batches(
+        [row], tok, batch_size=1, max_seq_length=64,
+        pad_to_multiple=0, num_batches=None, seed=0,
+    )[0]
+
+    chosen_end = int(lengths[0][1])
+    rejected_end = int(lengths[1][1])
+    assert int(batch[0][chosen_end - 1]) == tok.eos_token_id
+    assert int(batch[1][rejected_end - 1]) == tok.eos_token_id
+
+
 def test_preference_step_run_reshuffles_batch_order_each_pass():
     # Regression: one length-sorted pass was modulo-cycled, repeating the same
     # short->long order every epoch. Emit a fresh permutation per pass.
