@@ -132,6 +132,11 @@ jobs:
             tests/test_gated_and_offline_config_classification.py \
             -v
 
+      - name: pytest MLX adapter-filter gate (HARD GATE)
+        # Run in a fresh process so its module-scoped MLX simulation does not
+        # inherit module state from another MLX test file.
+        run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block

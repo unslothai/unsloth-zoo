@@ -4115,7 +4115,7 @@ def _tokenize_mlx_prompt_completion(
     )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
-        list(encoded.prompt_ids),
+        list(encoded.input_ids[:encoded.prompt_length]),
         list(encoded.input_ids),
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
@@ -4128,6 +4128,22 @@ class _MLXPromptCompletionTokens:
 
     prompt_ids: tuple
     input_ids: tuple
+    prompt_length: int
+
+
+def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
+    """Locate the completion after tolerating one boundary-merged token."""
+    prompt_ids = tuple(prompt_ids)
+    input_ids = tuple(input_ids)
+    if input_ids[:len(prompt_ids)] == prompt_ids:
+        return len(prompt_ids)
+    prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
+    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+        raise ValueError(
+            "Unsloth MLX: tokenized prompt and prompt+completion differ before "
+            "the final prompt token; only a boundary merge is supported."
+        )
+    return prompt_length
 
 
 def _encode_mlx_prompt_completion(
@@ -4145,7 +4161,12 @@ def _encode_mlx_prompt_completion(
         not input_ids or input_ids[-1] != int(eos_id)
     ):
         input_ids.append(int(eos_id))
-    return _MLXPromptCompletionTokens(prompt_ids, tuple(input_ids))
+    input_ids = tuple(input_ids)
+    return _MLXPromptCompletionTokens(
+        prompt_ids,
+        input_ids,
+        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
+    )
 
 
 def _mask_mlx_prompt_completion_labels(

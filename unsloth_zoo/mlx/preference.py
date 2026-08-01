@@ -25,19 +25,20 @@ from .utils import (
 
 @dataclass(frozen=True)
 class TokenizedPreferenceRow:
-    """One explicit prompt with its two response continuations."""
+    """Branch-specific prompt boundaries and response continuations."""
 
-    prompt_ids: tuple
+    chosen_prompt_ids: tuple
     chosen_ids: tuple
+    rejected_prompt_ids: tuple
     rejected_ids: tuple
 
     @property
     def chosen(self):
-        return self.prompt_ids + self.chosen_ids
+        return self.chosen_prompt_ids + self.chosen_ids
 
     @property
     def rejected(self):
-        return self.prompt_ids + self.rejected_ids
+        return self.rejected_prompt_ids + self.rejected_ids
 
 
 def _is_messages(value):
@@ -51,15 +52,6 @@ def _is_messages(value):
             for message in value
         )
     )
-
-
-def _common_prefix_length(*sequences):
-    limit = min((len(sequence) for sequence in sequences), default=0)
-    for index in range(limit):
-        value = sequences[0][index]
-        if any(sequence[index] != value for sequence in sequences[1:]):
-            return index
-    return limit
 
 
 def _chat_template(tokenizer, messages, *, tools, kwargs, **mode):
@@ -160,31 +152,38 @@ def tokenize_preference_row(
     rejected = _encode_mlx_prompt_completion(
         tokenizer, prompt_text, rejected_text, append_eos=append_eos,
     )
-    prompt_length = _common_prefix_length(
-        chosen.prompt_ids, chosen.input_ids, rejected.input_ids,
-    )
-    chosen_response = list(chosen.input_ids[prompt_length:])
-    rejected_response = list(rejected.input_ids[prompt_length:])
+    chosen_prompt = list(chosen.input_ids[:chosen.prompt_length])
+    rejected_prompt = list(rejected.input_ids[:rejected.prompt_length])
+    chosen_response = list(chosen.input_ids[chosen.prompt_length:])
+    rejected_response = list(rejected.input_ids[rejected.prompt_length:])
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "
             "least one response token."
         )
-    prompt_ids = list(chosen.input_ids[:prompt_length])
     max_response = max(len(chosen_response), len(rejected_response))
     if max_response >= max_seq_length:
         chosen_response = chosen_response[:max_seq_length - 1]
         rejected_response = rejected_response[:max_seq_length - 1]
-        prompt_ids = prompt_ids[-1:]
+        chosen_prompt = chosen_prompt[-1:]
+        rejected_prompt = rejected_prompt[-1:]
     else:
-        prompt_ids = prompt_ids[-(max_seq_length - max_response):]
-    if not prompt_ids or not chosen_response or not rejected_response:
+        prompt_budget = max_seq_length - max_response
+        chosen_prompt = chosen_prompt[-prompt_budget:]
+        rejected_prompt = rejected_prompt[-prompt_budget:]
+    if (
+        not chosen.prompt_ids
+        or not rejected.prompt_ids
+        or not chosen_response
+        or not rejected_response
+    ):
         raise ValueError(
             "Unsloth MLX preference: max_seq_length leaves no trainable prompt "
             "and response tokens."
         )
     return TokenizedPreferenceRow(
-        tuple(prompt_ids), tuple(chosen_response), tuple(rejected_response),
+        tuple(chosen_prompt), tuple(chosen_response),
+        tuple(rejected_prompt), tuple(rejected_response),
     )
 
 
@@ -268,13 +267,16 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         batch = np.full((2 * len(rows), width), self.pad_id, dtype=np.int32)
         lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
         for offset, row in enumerate(rows):
-            for output_row, values in (
-                (offset, row.chosen),
-                (offset + len(rows), row.rejected),
+            for output_row, values, prompt_length in (
+                (offset, row.chosen, len(row.chosen_prompt_ids)),
+                (
+                    offset + len(rows), row.rejected,
+                    len(row.rejected_prompt_ids),
+                ),
             ):
                 size = min(len(values), width)
                 batch[output_row, :size] = values[:size]
-                lengths[output_row] = (len(row.prompt_ids), size)
+                lengths[output_row] = (prompt_length, size)
         return mx.array(batch), mx.array(lengths), mx.array(
             self._normalizers[index], dtype=mx.int32,
         )

@@ -56,6 +56,17 @@ class Tokenizer:
         return rendered
 
 
+class MappingTokenizer:
+    eos_token_id = None
+    pad_token_id = 0
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def encode(self, text, add_special_tokens=True):
+        return self.mapping[text]
+
+
 def rows(count=6):
     return [
         {"prompt": f"question {index}: ", "chosen": "yes", "rejected": "no"}
@@ -147,12 +158,86 @@ def test_prompt_only_eos_does_not_consume_first_response_token():
     assert tokenized.chosen_ids[0] == expected_first
 
 
+@pytest.mark.parametrize(
+    "mapping,row,expected",
+    [
+        (
+            {"ab": [1, 2], "abc": [1, 3, 4], "abd": [1, 5, 6]},
+            {"prompt": "ab", "chosen": "c", "rejected": "d"},
+            ((1, 3, 4), (1, 5, 6), (1, 1)),
+        ),
+        (
+            {"a": [1], "ac": [2, 3], "ad": [4, 5]},
+            {"prompt": "a", "chosen": "c", "rejected": "d"},
+            ((2, 3), (4, 5), (0, 0)),
+        ),
+        (
+            {"ab": [1, 2], "abc": [1, 2, 3], "abd": [1, 4, 5]},
+            {"prompt": "ab", "chosen": "c", "rejected": "d"},
+            ((1, 2, 3), (1, 4, 5), (2, 1)),
+        ),
+    ],
+)
+def test_boundary_merges_preserve_each_branch(mapping, row, expected):
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan,
+        tokenize_preference_row,
+    )
+
+    tokenizer = MappingTokenizer(mapping)
+    tokenized = tokenize_preference_row(
+        tokenizer, row, max_seq_length=8,
+    )
+    chosen, rejected, prompt_lengths = expected
+    assert tokenized.chosen == chosen
+    assert tokenized.rejected == rejected
+
+    _, lengths, _ = create_preference_batch_plan(
+        [row], tokenizer, batch_size=1, max_seq_length=8,
+        num_batches=1, grad_accum=1, dataset_order="sequential",
+    )[0]
+    assert lengths.tolist() == [
+        [prompt_lengths[0], len(chosen)],
+        [prompt_lengths[1], len(rejected)],
+    ]
+
+
+def test_sft_and_preference_share_boundary_merge_tolerance():
+    from unsloth_zoo.mlx.utils import _tokenize_mlx_prompt_completion
+
+    input_ids, labels = _tokenize_mlx_prompt_completion(
+        MappingTokenizer({"ab": [1, 2], "abc": [1, 3, 4]}),
+        "ab", "c", completion_only_loss=True,
+    )
+    assert input_ids == [1, 3, 4]
+    assert labels == [-100, 3, 4]
+
+
+def test_prompt_mismatch_before_the_boundary_is_rejected():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    tokenizer = MappingTokenizer(
+        {
+                "abc": [1, 2, 3],
+                "abcd": [9, 2, 4, 5],
+                "abce": [8, 2, 6, 7],
+        }
+    )
+
+    with pytest.raises(ValueError, match="differ before the final prompt token"):
+        tokenize_preference_row(
+            tokenizer,
+            {"prompt": "abc", "chosen": "d", "rejected": "e"},
+            max_seq_length=8,
+        )
+
+
 def test_long_prompt_truncation_keeps_response_and_prompt_end():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
     row = {"prompt": "abcdefghijklmnopqrstuvwxyz", "chosen": "GOOD", "rejected": "BAD"}
     tokenized = tokenize_preference_row(Tokenizer(), row, max_seq_length=8)
-    assert tokenized.prompt_ids
+    assert tokenized.chosen_prompt_ids and tokenized.rejected_prompt_ids
     assert tokenized.chosen_ids and tokenized.rejected_ids
     assert len(tokenized.chosen) <= 8
     assert len(tokenized.rejected) <= 8
@@ -193,7 +278,12 @@ def test_assistant_ended_prompt_continues_the_same_message():
         "rejected": [{"role": "assistant", "content": " rejected"}],
     }
     result = tokenize_preference_row(tokenizer, row, max_seq_length=64)
-    assert result.prompt_ids and result.chosen_ids and result.rejected_ids
+    assert (
+        result.chosen_prompt_ids
+        and result.rejected_prompt_ids
+        and result.chosen_ids
+        and result.rejected_ids
+    )
 
 
 @pytest.mark.parametrize(
@@ -287,6 +377,7 @@ def test_orpo_nll_covers_the_full_chosen_sequence():
 
     plan = build_plan(num_batches=1, grad_accum=1)
     batch, lengths, normalizers = plan[0]
+    mx.random.seed(0)
     model = TinyModel()
     beta = 0.15
     targets = batch[:, 1:]
