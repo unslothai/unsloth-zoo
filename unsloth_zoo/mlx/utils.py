@@ -1648,7 +1648,8 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
                         rejected_key="rejected", pad_to_multiple=32,
                         num_batches=None, dataset_order="default",
                         preserve_dataset_order=False, seed=None,
-                        append_eos=True, num_epochs=None, grad_accum=None):
+                        append_eos=True, num_epochs=None, grad_accum=None,
+                        formatting_func=None):
     """Build concatenated [chosen; rejected] preference batches for ORPO/DPO.
 
     Each example contributes ``prompt + chosen`` and ``prompt + rejected``,
@@ -1673,6 +1674,10 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
     Returns ``PreferenceBatchList`` of ``(batch, lengths, None)``:
       batch:   (2B, L) int32 — rows [0:B] chosen, [B:2B] rejected, paired by index
       lengths: (2B, 2) — per row [response_start, seq_end)
+
+    ``formatting_func``, when provided, is applied to each raw dataset row
+    before the preference columns are read. It must return a mapping containing
+    ``prompt_key``, ``chosen_key``, and ``rejected_key``.
     """
     order_mode = "sequential" if preserve_dataset_order else dataset_order
     if order_mode not in ("default", "sequential", "torch_randperm"):
@@ -1721,7 +1726,13 @@ def create_preference_batches(dataset, tokenizer, batch_size, max_seq_length,
         return pe, c_ids, r_ids
 
     rows = []
-    for ex in dataset:
+    for raw_ex in dataset:
+        ex = formatting_func(raw_ex) if formatting_func is not None else raw_ex
+        if formatting_func is not None and not isinstance(ex, Mapping):
+            raise ValueError(
+                "Unsloth MLX preference: formatting_func must provide mapping rows; "
+                f"got {type(ex).__name__}."
+            )
         if prompt_key not in ex or chosen_key not in ex or rejected_key not in ex:
             raise ValueError(
                 f"ORPO requires '{prompt_key}', '{chosen_key}', '{rejected_key}' "

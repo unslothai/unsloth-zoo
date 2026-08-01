@@ -7438,6 +7438,7 @@ class MLXTrainer:
                 append_eos=bool(getattr(args, "append_eos", True)),
                 num_epochs=pref_num_epochs,
                 grad_accum=args.gradient_accumulation_steps,
+                formatting_func=self.formatting_func,
             )
             # When num_epochs was materialized the returned list already spans
             # every epoch, so total_steps must use n_batches // grad_accum (not

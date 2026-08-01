@@ -3789,6 +3789,66 @@ def test_create_preference_batches_runs_with_plain_fast_tokenizer():
     assert lengths.shape[0] == 4
 
 
+def test_preference_batches_apply_formatting_func_before_reading_columns():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    class _Tok:
+        eos_token_id = None
+        pad_token_id = 0
+        bos_token = None
+
+        def encode(self, text, add_special_tokens=True):
+            return [ord(ch) for ch in text]
+
+    calls = []
+
+    def formatting_func(row):
+        calls.append(row["id"])
+        return {
+            "prompt": row["question"] + " ",
+            "chosen": row["preferred"],
+            "rejected": row["other"],
+        }
+
+    batches = create_preference_batches(
+        dataset=[
+            {"id": 1, "question": "q1", "preferred": "yes", "other": "no"},
+            {"id": 2, "question": "q2", "preferred": "up", "other": "down"},
+        ],
+        tokenizer=_Tok(),
+        batch_size=2,
+        max_seq_length=32,
+        pad_to_multiple=1,
+        dataset_order="sequential",
+        formatting_func=formatting_func,
+    )
+
+    assert calls == [1, 2]
+    batch, lengths, labels = batches[0]
+    assert labels is None
+    assert batch.shape[0] == 4
+    assert lengths[:, 0].tolist() == [3, 3, 3, 3]
+
+
+def test_preference_batches_reject_non_mapping_formatter_output():
+    from unsloth_zoo.mlx.utils import create_preference_batches
+
+    tokenizer = types.SimpleNamespace(
+        eos_token_id=None,
+        pad_token_id=0,
+        bos_token=None,
+        encode=lambda text, add_special_tokens=True: [1, 2],
+    )
+    with pytest.raises(ValueError, match="formatting_func must provide mapping"):
+        create_preference_batches(
+            dataset=[{"raw": "row"}],
+            tokenizer=tokenizer,
+            batch_size=1,
+            max_seq_length=8,
+            formatting_func=lambda row: "not a preference mapping",
+        )
+
+
 def test_preference_tokenizer_avoids_double_bos_on_rendered_prompt():
     # Regression: raw hf.encode added a second BOS to a template-rendered prompt.
     # Must go through encode_mlx_text like the SFT path.
@@ -4143,6 +4203,32 @@ def test_preference_prepare_data_threads_num_epochs_for_reshuffled_orders(monkey
         assert captured["dataset_order"] == "default"
         assert captured["num_epochs"] == 3
         assert trainer._prepared_batches_include_epochs is True
+
+
+def test_preference_prepare_data_threads_formatting_func(monkeypatch):
+    from unsloth_zoo.mlx import trainer as mlx_trainer
+
+    captured = {}
+
+    def fake_create_preference_batches(**kwargs):
+        captured.update(kwargs)
+        return [("batch", "lengths", None)]
+
+    def formatting_func(row):
+        return row
+
+    monkeypatch.setattr(
+        mlx_trainer, "create_preference_batches", fake_create_preference_batches
+    )
+    MLXTrainerCls, trainer = _make_mlx_text_trainer(
+        loss_type="orpo", max_steps=1,
+    )
+    trainer.formatting_func = formatting_func
+    _pin_distributed(trainer, world_size=1)
+
+    MLXTrainerCls._prepare_data(trainer, is_vlm=False)
+
+    assert captured["formatting_func"] is formatting_func
 
 
 def test_dpo_reference_collects_nested_lora_modules():
