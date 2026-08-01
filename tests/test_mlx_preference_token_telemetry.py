@@ -97,6 +97,12 @@ def test_empty_span_contributes_nothing():
     assert _mlx_supervised_token_count(_batch([[9, 9], [4, 10]])) == 6
 
 
+def test_unlabeled_sft_excludes_the_unshifted_first_input_token():
+    from unsloth_zoo.mlx.trainer import _mlx_supervised_token_count
+
+    assert _mlx_supervised_token_count(_batch([[0, 6], [0, 4]])) == 8
+
+
 def test_labeled_sft_counts_only_shifted_unmasked_targets():
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import _mlx_supervised_token_count
@@ -202,6 +208,20 @@ def test_zero_token_guard_uses_the_supervised_span_count():
     assert "supervised_toks = toks if _real is None else" in src
     assert "global_supervised_toks = self._distributed_all_sum(" in src
     assert "if int(global_supervised_toks.item()) == 0:" in src
+
+
+def test_abandoned_accumulation_window_drops_real_token_telemetry():
+    import inspect
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    start = src.index("grad_accum_state = None      # abandon the partial window")
+    end = src.index("pending_time = 0", start)
+    abandoned = src[start:end]
+    assert "pending_losses = 0" in abandoned
+    assert "pending_n_tokens = 0" in abandoned
+    assert "pending_real_tokens = 0" in abandoned
+    assert "pending_steps = 0" in abandoned
 
 
 def test_weighted_loss_denominator_stays_the_accumulation_weight():

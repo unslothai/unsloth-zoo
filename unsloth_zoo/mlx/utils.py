@@ -10950,6 +10950,35 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def mlx_lora_modules_have_nonzero_delta(modules):
+    """Return whether any LoRA module may already change the base output.
+
+    Fresh MLX LoRA adapters initialize one factor to all zeros, which makes the
+    effective adapter delta exactly zero. A warm-started or otherwise nonzero
+    adapter normally has values in both factors. Treat an uninspectable factor
+    conservatively as nonzero so referenced DPO cannot silently use the bare
+    base model in place of its actual initial policy.
+    """
+    def _has_values(value):
+        if value is not None and not hasattr(value, "shape"):
+            value = getattr(value, "weight", None)
+        if value is None or not hasattr(value, "shape"):
+            return True
+        try:
+            nonzero = mx.any(value != 0)
+            mx.eval(nonzero)
+            return bool(nonzero.item())
+        except Exception:
+            return True
+
+    for module in modules:
+        if _has_values(getattr(module, "lora_a", None)) and _has_values(
+            getattr(module, "lora_b", None)
+        ):
+            return True
+    return False
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 

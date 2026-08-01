@@ -4495,6 +4495,37 @@ def test_dpo_reference_guard_rejects_dora_adapters():
     assert "reference_free=True" in src  # the error points at the escape hatch
 
 
+def test_dpo_reference_rejects_nonzero_initial_lora_delta():
+    import inspect
+    import types
+
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.utils import mlx_lora_modules_have_nonzero_delta
+
+    fresh_linear = types.SimpleNamespace(
+        lora_a=mx.ones((2, 3)), lora_b=mx.zeros((4, 2)),
+    )
+    fresh_embedding = types.SimpleNamespace(
+        lora_a=mx.zeros((3, 2)), lora_b=mx.ones((2, 4)),
+    )
+    warm_started = types.SimpleNamespace(
+        lora_a=mx.ones((2, 3)), lora_b=mx.ones((4, 2)),
+    )
+    assert not mlx_lora_modules_have_nonzero_delta([fresh_linear])
+    assert not mlx_lora_modules_have_nonzero_delta([fresh_embedding])
+    assert mlx_lora_modules_have_nonzero_delta([warm_started])
+
+    src = inspect.getsource(MLXTrainer._train_inner)
+    guard = "mlx_lora_modules_have_nonzero_delta(_lora_mods)"
+    dpo_builder = src.index("make_dpo_loss_fn(beta=")
+    assert src.index(guard) < dpo_builder
+    guard_region = src[src.index(guard) - 120:dpo_builder]
+    assert "not _rf" in guard_region
+    assert "warm-started policy" in guard_region
+
+
 def test_dpo_reference_disables_neftune_noise(monkeypatch):
     # Regression: the DPO loop keeps train() for both forwards, so the reference
     # compared against a SECOND noisy pass. It must silence the embedding, keep

@@ -530,6 +530,7 @@ from .utils import (
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
+    mlx_lora_modules_have_nonzero_delta,
     _disable_mlx_base_dropout,
     _get_mlx_dropout_probability,
     _read_mlx_lora_dropout,
@@ -1380,7 +1381,7 @@ def _mlx_supervised_token_count(batch_data):
     for row in spans:
         if not isinstance(row, (tuple, list)) or len(row) < 2:
             return None
-        total += max(0, int(row[1]) - int(row[0]))
+        total += max(0, int(row[1]) - max(1, int(row[0])))
     return total
 
 
@@ -4697,6 +4698,20 @@ class MLXTrainer:
                         "plain LoRA adapter, or pass reference_free=True to train "
                         "without a reference."
                     )
+                if (
+                    _lora_mods
+                    and not _rf
+                    and mlx_lora_modules_have_nonzero_delta(_lora_mods)
+                ):
+                    raise ValueError(
+                        "Unsloth: referenced DPO requires a zero-delta initial "
+                        "LoRA adapter on MLX. This adapter already has nonzero "
+                        "values in both LoRA factors, so disabling it would use "
+                        "the bare base model instead of the warm-started policy "
+                        "as the frozen reference. Merge the warm-started adapter "
+                        "into the base model and attach a fresh zero-initialized "
+                        "LoRA adapter, or pass reference_free=True."
+                    )
                 # Handed to the loss so the reference forward can run it clean.
                 _neft = getattr(self, "_neftune_emb", None)
                 _neftune_mods = [_neft] if _neft is not None else []
@@ -6848,6 +6863,7 @@ class MLXTrainer:
                         # update, as HF does.
                         pending_losses = 0
                         pending_n_tokens = 0
+                        pending_real_tokens = 0
                         pending_steps = 0
                         # Drop the abandoned window's time with its tokens, else
                         # the next window's tokens/s is deflated by it.
