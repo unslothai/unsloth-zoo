@@ -1405,6 +1405,12 @@ def grpo_accumulated_loss(
             hidden_states.requires_grad_(True)
 
             lm_head = ctx.lm_head
+            if ctx.lm_head_requires_grad:
+                # Recompute against a private leaf. A Tensor.register_hook on the real
+                # lm_head fires for tensors named in autograd.grad's inputs, so reusing
+                # it here would run a user's grad mask / scaler once on this local
+                # gradient and again when the returned gradient reaches lm_head.
+                lm_head = lm_head.detach().requires_grad_(True)
             index = ctx.index
 
             with torch.enable_grad():

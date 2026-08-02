@@ -370,6 +370,33 @@ def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
     assert "offload_retained_bytes" not in block
 
 
+@pytest.mark.parametrize("head", ["leaf", "nonleaf"])
+def test_offloaded_log_softmax_runs_head_hook_once(head):
+    # A Tensor.register_hook fires for tensors named in autograd.grad's `inputs`,
+    # so recomputing against the real lm_head would apply a user's grad mask or
+    # scaler twice. The recompute must use a private detached leaf.
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 0.0, 0.0, 0.0, 1.0)
+
+    def run(op, hook):
+        torch.manual_seed(0)
+        hs = (torch.randn(3, 32, 16) * 0.02).requires_grad_(True)
+        base = (torch.randn(64, 16) * 0.02).requires_grad_(True)
+        lm = base if head == "leaf" else base * 1.5
+        fired = []
+        lm.register_hook(lambda g: (fired.append(1), hook(g))[1])
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        op(hs, lm, idx, *args).backward(go)
+        return len(fired), base.grad
+
+    scale = lambda g: g * 0.5  # noqa: E731
+    n_fn, g_fn = run(Fn.apply, scale)
+    n_ref, g_ref = run(_eager_selective_log_softmax, scale)
+    assert n_fn == n_ref == 1, (n_fn, n_ref)
+    assert torch.allclose(g_fn, g_ref, atol=1e-6), (g_fn - g_ref).abs().max()
+
+
 def test_offloaded_log_softmax_preserves_preexisting_head_grad():
     # Accumulation must leave lm_head.grad at P + g, not 2*P + 2*g.
     Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
