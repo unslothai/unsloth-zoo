@@ -86,15 +86,45 @@ __all__ = [
     "is_hf_xet_available",
     "xet_force_disabled",
     "child_should_disable_xet",
+    "DEFAULT_STALL_TIMEOUT",
+    "DEFAULT_CONNECT_TIMEOUT",
+    "DEFAULT_HTTP_STALL_TIMEOUT",
 ]
 
 _CTX = mp.get_context("spawn")
 
-# Defaults match the existing Unsloth inference watchdog and hub shutdown deadline.
+# Stall thresholds are tiered by phase, because "no bytes yet" means different things at different
+# points. Once a partial exists, 30s of a frozen byte count is a hung Xet transfer -- Xet writes
+# continuously, so a working download never goes that long without growing. BEFORE any partial
+# exists the child is still doing DNS + TLS + metadata, which is legitimately slow on a congested
+# link, so that phase gets a much longer leash. HTTP keeps the old, patient threshold: it is the
+# fallback of last resort, and killing it has nowhere left to go.
+DEFAULT_STALL_TIMEOUT = 30.0
+DEFAULT_CONNECT_TIMEOUT = 90.0
+DEFAULT_HTTP_STALL_TIMEOUT = 180.0
+# How often the watchdog measures. Detection latency is up to one interval on top of the timeout,
+# so this has to be well under DEFAULT_STALL_TIMEOUT to honour it.
+DEFAULT_POLL_INTERVAL = 5.0
+# How often a "still downloading" status is pushed to the UI (independent of the measure rate).
 DEFAULT_HEARTBEAT_INTERVAL = 30.0
-DEFAULT_STALL_TIMEOUT = 180.0
 DEFAULT_GRACE_PERIOD = 10.0
 _POLL_INTERVAL = 0.5
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a positive float override from the environment; ignore junk rather than crash a load."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r", name, raw)
+        return default
+    return value
 
 # Serializes the parent-env (and __main__.__file__) mutation around a child spawn so
 # concurrent downloads cannot observe each other's transport env.
@@ -120,6 +150,67 @@ def _safe_status(callback: Optional[Callable[[str], None]], message: str) -> Non
         callback(message)
     except Exception as e:
         logger.debug("watchdog status callback raised (ignored): %s", e)
+
+
+def _xet_health_or_none():
+    """The machine's Xet verdict, or ``None`` when it cannot be determined.
+
+    ``probe = False`` deliberately: this runs on the download path, where a network probe would add
+    latency to every request and make the decision depend on the network we are about to use
+    anyway. Only the cheap, local signals (RAM floor, remembered verdict) are consulted here; the
+    probing form is for an explicit preflight such as Studio's transport picker.
+
+    Imported lazily and defensively: a health check must never be the reason a download refuses to
+    start, so any failure degrades to "no opinion" and the normal Xet-first ladder runs.
+    """
+    try:
+        from .hf_xet_health import xet_health
+
+        return xet_health(probe = False)
+    except Exception as e:
+        logger.debug("Xet health check unavailable: %s", e)
+        return None
+
+
+def _xet_log_dir() -> Optional[str]:
+    """Where hf_xet writes its own logs: ``HF_XET_LOG_DEST`` if pointed at a directory, else the
+    ``logs/`` subdir of the active Xet cache (hf_xet's default)."""
+    dest = os.environ.get("HF_XET_LOG_DEST")
+    if dest:
+        # An empty value means "log to console"; a value naming a file is not a directory we scan.
+        return dest if os.path.isdir(dest) else None
+    try:
+        from .hf_cache import _active_caches
+
+        _, _, xet_cache = _active_caches()
+        return str(xet_cache / "logs") if xet_cache is not None else None
+    except Exception:
+        return None
+
+
+def _xet_failure_reason(summary: str) -> str:
+    """Attach hf_xet's own ERROR/WARN lines to *summary* so the recorded verdict says WHY.
+
+    This is what turns a silent "Xet failed to fetch some files" into an actionable reason and a
+    deliberate transport switch rather than a mystery retry.
+    """
+    try:
+        from .hf_xet_tuning import scan_xet_log
+
+        messages = scan_xet_log(_xet_log_dir(), max_messages = 2)
+    except Exception:
+        messages = []
+    return f"{summary}: {' | '.join(messages)}" if messages else summary
+
+
+def _record_xet_outcome(ok: bool, reason: str = "") -> None:
+    """Report a finished Xet attempt to the health tracker; never raises."""
+    try:
+        from .hf_xet_health import record_xet_outcome
+
+        record_xet_outcome(ok, reason)
+    except Exception as e:
+        logger.debug("Could not record Xet outcome: %s", e)
 
 
 class DownloadStallError(RuntimeError):
@@ -375,18 +466,28 @@ def start_watchdog(
     on_stall: Callable[[str], None],
     repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
+    interval: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+    connect_timeout: Optional[float] = None,
+    heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     xet_disabled: bool = False,
     on_heartbeat: Optional[Callable[[str], None]] = None,
     watch_new_partials_only: bool = False,
     baseline_incomplete_blobs: Optional[set] = None,
     child_pid: Optional[int] = None,
 ) -> threading.Event:
-    """Start a daemon thread firing ``on_stall(message)`` once iff a ``*.incomplete`` is present AND the
-    on-disk size is unchanged for *stall_timeout* seconds. The timer resets while no ``*.incomplete``
-    exists, so post-download init is not misread as a stall. Returns a stop event the caller sets when
-    the download phase ends.
+    """Start a daemon thread firing ``on_stall(message)`` once when a download stops making progress.
+    Returns a stop event the caller sets when the download phase ends.
+
+    Two clocks, because a frozen byte count means different things before and after bytes start
+    flowing. Once a ``*.incomplete`` exists, *stall_timeout* (30s on Xet) of an unchanged on-disk
+    size is a hang. While NO partial exists the child is still resolving DNS / TLS / metadata, so
+    *connect_timeout* (90s) applies instead -- previously this phase simply reset the timer, which
+    meant a child hung before it ever opened a partial was never detected at all. Both clocks are
+    reset by real progress, and neither runs after the download completes.
+
+    Defaults are transport-aware (HTTP, as the last resort, keeps the patient 180s threshold) and
+    overridable via ``UNSLOTH_XET_STALL_TIMEOUT`` / ``UNSLOTH_XET_CONNECT_TIMEOUT``.
 
     *watch_new_partials_only* (single-file) measures progress only over the child's own partial, so a
     sibling pull of a different file cannot keep a hung child alive. That partial is identified by the
@@ -395,6 +496,16 @@ def start_watchdog(
     stop = threading.Event()
     transport = "https" if xet_disabled else "xet"
     fired = False
+    if stall_timeout is None:
+        stall_timeout = _env_seconds(
+            "UNSLOTH_XET_STALL_TIMEOUT",
+            DEFAULT_HTTP_STALL_TIMEOUT if xet_disabled else DEFAULT_STALL_TIMEOUT,
+        )
+    if connect_timeout is None:
+        connect_timeout = _env_seconds("UNSLOTH_XET_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
+    if interval is None:
+        # Never sample slower than the tighter of the two deadlines, or the timeout is meaningless.
+        interval = min(DEFAULT_POLL_INTERVAL, max(1.0, min(stall_timeout, connect_timeout) / 4.0))
     baseline = set(baseline_incomplete_blobs or ())
     single_repo_id = repo_ids[0] if repo_ids else ""
 
@@ -427,6 +538,16 @@ def start_watchdog(
         state = _measure()
         last_size = state[0] if state is not None else 0
         last_change = time.monotonic()
+        last_heartbeat = 0.0
+        # False until a partial has been observed at least once. Before that we are in the
+        # connect / metadata phase; after it, a partial going away means the transfer finished.
+        seen_incomplete = bool(state[1]) if state is not None else False
+
+        def _trip(message: str) -> None:
+            nonlocal fired
+            if not fired:
+                fired = True
+                on_stall(message)
 
         while not stop.wait(interval):
             state = _measure()
@@ -443,21 +564,35 @@ def start_watchdog(
             if current_size != last_size:
                 last_size = current_size
                 last_change = now
+            if has_incomplete:
+                seen_incomplete = True
 
-            # Reset unless .incomplete confirms an active download, so model init and lock waits
-            # are not counted as a stall.
-            if not has_incomplete:
-                last_change = now
-            elif now - last_change >= stall_timeout:
-                if not fired:
-                    fired = True
-                    on_stall(
+            elapsed = now - last_change
+            if has_incomplete:
+                # Bytes are flowing (or should be): a frozen count is a hang.
+                if elapsed >= stall_timeout:
+                    _trip(
                         f"Download appears stalled ({transport} transport) "
-                        f"-- no progress for {int(now - last_change)}s"
+                        f"-- no progress for {int(elapsed)}s"
                     )
-                return
+                    return
+            elif not seen_incomplete:
+                # No partial has EVER appeared: the child is stuck before the first byte. Without
+                # this branch such a child is invisible to the watchdog forever.
+                if elapsed >= connect_timeout:
+                    _trip(
+                        f"Download did not start ({transport} transport) "
+                        f"-- no data after {int(elapsed)}s"
+                    )
+                    return
+            else:
+                # Partial seen earlier and now gone: the transfer finished. Model init and lock
+                # waits happen here and must never be read as a stall.
+                last_change = now
 
-            _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
 
     threading.Thread(target = _beat, daemon = True, name = "hf-xet-watchdog").start()
     return stop
@@ -687,6 +822,15 @@ def _download_child_entry(
         os.environ["HF_HUB_DISABLE_XET"] = "1"
         # Keep the HTTP writer sequential and resumable (hf_transfer's sparse partials cannot).
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    else:
+        # Defensive: the parent already seeded these around the spawn, but a child launched by any
+        # other path must not inherit hf_xet's unbounded multi-GB buffer defaults.
+        try:
+            from unsloth_zoo.hf_xet_tuning import apply_xet_env
+
+            apply_xet_env()
+        except Exception as e:
+            logger.debug("Could not apply Xet tuning in child: %s", e)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
     repo_id = params["repo_id"]
@@ -770,8 +914,8 @@ def _run_download_attempt(
     repo_type: str,
     disable_xet: bool,
     cancel_event: Optional[threading.Event],
-    stall_timeout: float,
-    interval: float,
+    stall_timeout: Optional[float],
+    interval: Optional[float],
     grace_period: float,
     on_status: Optional[Callable[[str], None]],
 ) -> tuple[str, Optional[str]]:
@@ -810,6 +954,26 @@ def _run_download_attempt(
     if disable_xet:
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    else:
+        # hf_xet reads its config natively at import, so the buffer caps have to be in the
+        # environment BEFORE the child starts -- setting them inside the child is too late.
+        try:
+            from .hf_xet_tuning import xet_env_overrides
+
+            for key, value in xet_env_overrides().items():
+                # An explicit user setting still wins; only fill what is unset.
+                if key not in os.environ:
+                    child_env[key] = value
+            # High-performance mode is a preset applied after the environment is read, so it would
+            # override the caps above rather than merge with them. It has to be off for them to hold.
+            from .hf_xet_tuning import XET_HIGH_PERFORMANCE_VARS
+
+            if not _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
+                for var in XET_HIGH_PERFORMANCE_VARS:
+                    if _is_true(os.environ.get(var)):
+                        child_env[var] = "0"
+        except Exception as e:
+            logger.debug("Could not compute Xet tuning env: %s", e)
     with _SPAWN_ENV_LOCK:
         # Cache Hub's transport constants in the PARENT from the REAL env NOW, before the child-only
         # HF_HUB_DISABLE_XET=1 is briefly set below: else a concurrent thread's FIRST `import
@@ -1712,8 +1876,8 @@ def _download_with_xet_fallback(
     token: Optional[str],
     repo_type: str,
     cancel_event: Optional[threading.Event],
-    stall_timeout: float,
-    interval: float,
+    stall_timeout: Optional[float],
+    interval: Optional[float],
     grace_period: float,
     on_status: Optional[Callable[[str], None]],
     prepare_for_http_fn: Optional[Callable[[str, str], None]],
@@ -1730,6 +1894,17 @@ def _download_with_xet_fallback(
     with _SPAWN_ENV_LOCK:
         disable_xet = xet_force_disabled()
 
+    # Skip a doomed Xet attempt entirely on a machine already known to be bad at it (too little RAM,
+    # unreachable CAS, or a run of recent failures). Without this the ladder still recovers, but the
+    # user pays the full stalled attempt on every single download.
+    if not disable_xet:
+        health = _xet_health_or_none()
+        if health is not None and not health.use_xet:
+            logger.info("Starting '%s' on HTTP instead of Xet: %s", label, health.reason)
+            _safe_status(on_status, f"{label}: using HTTP ({health.reason})")
+            disable_xet = True
+    started_on_xet = not disable_xet
+
     for attempt in range(2):
         if disable_xet:
             # Purge a non-HTTP partial first (an HTTP resume over a sparse Xet/hf_transfer partial
@@ -1738,8 +1913,13 @@ def _download_with_xet_fallback(
             owned_incomplete = params.pop("_owned_incomplete_blobs", None)
             try:
                 if prepare_for_http_fn is None:
+                    # This grace decides whether a partial belongs to a LIVE sibling writer, which
+                    # is a different question from "has OUR child stalled". It stays at the patient
+                    # threshold even though the Xet stall trip is now 30s -- a 30s grace would read
+                    # a slow-but-healthy peer's partial as abandoned and delete it mid-write.
                     _default_prepare_for_http(
-                        repo_type, repo_id, cache_dir = cache_dir, active_grace = stall_timeout,
+                        repo_type, repo_id, cache_dir = cache_dir,
+                        active_grace = max(stall_timeout or 0.0, DEFAULT_HTTP_STALL_TIMEOUT),
                         owned_incomplete_blobs = owned_incomplete,
                     )
                 else:
@@ -1787,12 +1967,16 @@ def _download_with_xet_fallback(
                         "retrying with HF_HUB_DISABLE_XET=1", label
                     )
                     _safe_status(on_status, f"{label}: incomplete snapshot, retrying over HTTP")
+                    _record_xet_outcome(False, "Xet returned an incomplete snapshot")
                     disable_xet = True
                     continue
                 raise DownloadStallError(
                     f"Download for '{label}' returned an incomplete snapshot even with "
                     f"HF_HUB_DISABLE_XET=1 -- missing files, check your network connection"
                 )
+            if started_on_xet and not disable_xet:
+                # Completed on the transport it started on: this machine can do Xet.
+                _record_xet_outcome(True)
             return payload  # type: ignore[return-value]
         if kind_result == "cancelled":
             raise RuntimeError("Cancelled")
@@ -1808,6 +1992,7 @@ def _download_with_xet_fallback(
                     "with HF_HUB_DISABLE_XET=1: %s", label, payload
                 )
                 _safe_status(on_status, f"{label}: transient Xet error, retrying over HTTP")
+                _record_xet_outcome(False, _xet_failure_reason("transient Xet transport error"))
                 disable_xet = True
                 continue
             raise RuntimeError(payload)
@@ -1819,6 +2004,7 @@ def _download_with_xet_fallback(
                     "retrying with HF_HUB_DISABLE_XET=1", label
                 )
                 _safe_status(on_status, f"{label}: download crashed, retrying over HTTP")
+                _record_xet_outcome(False, _xet_failure_reason("Xet download process crashed"))
                 disable_xet = True
                 continue
             raise RuntimeError(payload)
@@ -1829,6 +2015,7 @@ def _download_with_xet_fallback(
             )
             # _safe_status: a raising status hook must not abort the retry before disable_xet is set.
             _safe_status(on_status, f"{label}: Xet stalled, retrying over HTTP")
+            _record_xet_outcome(False, _xet_failure_reason("Xet download stalled"))
             disable_xet = True
             continue
         raise DownloadStallError(
@@ -1852,8 +2039,8 @@ def hf_hub_download_with_xet_fallback(
     subfolder: Optional[str] = None,
     force_download: bool = False,
     local_files_only: bool = False,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    stall_timeout: Optional[float] = None,
+    interval: Optional[float] = None,
     grace_period: float = DEFAULT_GRACE_PERIOD,
     on_status: Optional[Callable[[str], None]] = None,
     prepare_for_http_fn: Optional[Callable[[str, str], None]] = None,
@@ -1936,8 +2123,8 @@ def snapshot_download_with_xet_fallback(
     local_files_only: bool = False,
     variant: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    stall_timeout: Optional[float] = None,
+    interval: Optional[float] = None,
     grace_period: float = DEFAULT_GRACE_PERIOD,
     on_status: Optional[Callable[[str], None]] = None,
     prepare_for_http_fn: Optional[Callable[[str, str], None]] = None,

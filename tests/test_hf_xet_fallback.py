@@ -4146,3 +4146,92 @@ def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
     _REAL_DEFAULT_PREPARE(
         "model", repo, cache_dir = str(tmp_path), active_grace = 180, owned_incomplete_blobs = None)
     assert not owned.exists() and not sibling.exists()
+
+
+# ---------------------------------------------------------------------------
+# Tiered stall detection: a hang BEFORE the first byte used to be invisible.
+# ---------------------------------------------------------------------------
+
+def test_connect_phase_hang_is_detected(hf_cache):
+    """A child stuck in DNS / TLS / metadata never creates a .incomplete.
+
+    The watchdog used to reset its clock on every tick where no partial existed, so this state --
+    the most common way a Xet download "just hangs at 0%" -- could not be detected at all. It is
+    now governed by connect_timeout instead.
+    """
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+    )
+    try:
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), \
+            "watchdog never fired on a child that produced no data at all"
+    finally:
+        stop.set()
+    assert "did not start" in calls[0].lower()
+
+
+def test_connect_grace_is_longer_than_the_stall_trip():
+    """Metadata round trips on a congested link are legitimately slow; only the ACTIVE phase gets
+    the aggressive 30s trip."""
+    assert xf.DEFAULT_CONNECT_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
+    assert xf.DEFAULT_STALL_TIMEOUT == 30.0
+    # HTTP is the fallback of last resort: killing it has nowhere left to go.
+    assert xf.DEFAULT_HTTP_STALL_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "xet_disabled, expected",
+    [(False, xf.DEFAULT_STALL_TIMEOUT), (True, xf.DEFAULT_HTTP_STALL_TIMEOUT)],
+)
+def test_default_stall_timeout_is_transport_aware(hf_cache, monkeypatch, xet_disabled, expected):
+    """With no explicit timeout the watchdog picks per transport: aggressive on Xet (a stall there
+    has somewhere to fall back to), patient on HTTP (it does not)."""
+    defaults: dict[str, float] = {}
+
+    def _record(name, default):
+        defaults[name] = default
+        return default
+
+    monkeypatch.setattr(xf, "_env_seconds", _record)
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = lambda _m: None, xet_disabled = xet_disabled,
+    )
+    stop.set()
+    assert defaults["UNSLOTH_XET_STALL_TIMEOUT"] == expected
+    assert defaults["UNSLOTH_XET_CONNECT_TIMEOUT"] == xf.DEFAULT_CONNECT_TIMEOUT
+
+
+def test_stall_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_STALL_TIMEOUT", "7.5")
+    assert xf._env_seconds("UNSLOTH_XET_STALL_TIMEOUT", 30.0) == 7.5
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1", "0", ""])
+def test_stall_timeout_env_ignores_junk(monkeypatch, bad):
+    """A typo in an env var must not disable stall detection or crash a model load."""
+    monkeypatch.setenv("UNSLOTH_XET_STALL_TIMEOUT", bad)
+    assert xf._env_seconds("UNSLOTH_XET_STALL_TIMEOUT", 30.0) == 30.0
+
+
+def test_post_download_init_is_not_a_stall(hf_cache):
+    """Once a partial has appeared and then gone, the transfer is done: model init and lock waits
+    that follow must never be read as a stall."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "finishing.incomplete"
+    part.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+    )
+    try:
+        time.sleep(0.15)
+        part.unlink()                      # download completed
+        (blobs / "finishing").write_bytes(b"\0" * 1024)
+        time.sleep(1.0)                    # well past connect_timeout
+        assert calls == [], "watchdog fired during post-download initialisation"
+    finally:
+        stop.set()
