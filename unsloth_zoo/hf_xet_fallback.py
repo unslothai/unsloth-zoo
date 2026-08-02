@@ -102,6 +102,14 @@ _CTX = mp.get_context("spawn")
 DEFAULT_STALL_TIMEOUT = 30.0
 DEFAULT_CONNECT_TIMEOUT = 90.0
 DEFAULT_HTTP_STALL_TIMEOUT = 180.0
+# The claim above -- "Xet writes continuously, so a working download never goes that long without
+# growing" -- holds only while the link outruns the reconstruction buffer. It does not on a slow
+# one: at 2.5 MB/s a 256MB per-file buffer is 100s of real progress with nothing on disk yet, and a
+# 20 Mbit/s throttled link was measured tripping the 30s deadline on a download that was working.
+# So when the child is demonstrably still reading (see _child_io_bytes) the deadline stretches to
+# this instead. Bounded, not disabled: a process that is merely busy still trips, just later, and
+# 180s is where the threshold sat before any of this.
+DEFAULT_BUFFERING_TIMEOUT = 180.0
 # How often the watchdog measures. Detection latency is up to one interval on top of the timeout,
 # so this has to be well under DEFAULT_STALL_TIMEOUT to honour it.
 DEFAULT_POLL_INTERVAL = 5.0
@@ -417,6 +425,53 @@ def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
     return open_blobs
 
 
+def _child_io_bytes(pid: int) -> Optional[int]:
+    """Bytes child *pid* (and its children) have read, from the OS I/O counters. ``None`` when
+    undeterminable.
+
+    Why the watchdog needs this at all: it otherwise measures progress purely from the growing
+    ``.incomplete`` on disk, and hf_xet accumulates chunks in its reconstruction buffer before
+    flushing. On a fast link that buffer fills in under a second and disk progress is continuous, so
+    disk alone is fine. On a slow link it is not: at 2.5 MB/s a 256MB per-file buffer is 100 seconds
+    of real network progress with ZERO bytes on disk, and a 30s disk-only deadline calls that a
+    stall. Measured -- a 20 Mbit/s link tripped the stall detector on a download that was working
+    perfectly.
+
+    ``read_chars`` counts every read(), not just sockets, so this is evidence the process is alive
+    and consuming input rather than proof it is downloading. The caller treats it as a reason to be
+    patient, never as a reason to wait forever.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+            total = 0
+            for p in [proc] + proc.children(recursive = True):
+                try:
+                    counters = p.io_counters()
+                except Exception:
+                    continue
+                # read_chars where available (Linux); read_bytes elsewhere (Windows). macOS exposes
+                # neither, and returns None overall so the caller degrades to disk-only.
+                total += getattr(counters, "read_chars", None) or getattr(counters, "read_bytes", 0)
+            return total
+        except Exception:
+            return None
+    # Linux fallback without psutil. Children are not walked here: the extra /proc scan is not worth
+    # it, and hf_xet does its reading in threads of the same process.
+    try:
+        with open(f"/proc/{pid}/io", "r") as fh:
+            for line in fh:
+                if line.startswith("rchar:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def get_hf_download_state(
     repo_ids: Optional[list[str]] = None,
     *,
@@ -469,6 +524,7 @@ def start_watchdog(
     interval: Optional[float] = None,
     stall_timeout: Optional[float] = None,
     connect_timeout: Optional[float] = None,
+    buffering_timeout: Optional[float] = None,
     heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     xet_disabled: bool = False,
     on_heartbeat: Optional[Callable[[str], None]] = None,
@@ -486,8 +542,16 @@ def start_watchdog(
     meant a child hung before it ever opened a partial was never detected at all. Both clocks are
     reset by real progress, and neither runs after the download completes.
 
+    A third clock covers the gap between the two: bytes arriving but not yet on disk. hf_xet buffers
+    chunks before flushing, so on a slow link the partial can legitimately sit unchanged for minutes
+    while the transfer is working (measured: a 20 Mbit/s link tripped the 30s deadline on a healthy
+    download). When *child_pid*'s OS read counters are still moving, the deadline stretches to
+    *buffering_timeout* (180s) instead of *stall_timeout*. Bounded, so a hung-but-busy child still
+    trips; and unavailable counters (macOS without psutil) simply degrade to the disk-only rule.
+
     Defaults are transport-aware (HTTP, as the last resort, keeps the patient 180s threshold) and
-    overridable via ``UNSLOTH_XET_STALL_TIMEOUT`` / ``UNSLOTH_XET_CONNECT_TIMEOUT``.
+    overridable via ``UNSLOTH_XET_STALL_TIMEOUT`` / ``UNSLOTH_XET_CONNECT_TIMEOUT`` /
+    ``UNSLOTH_XET_BUFFERING_TIMEOUT``.
 
     *watch_new_partials_only* (single-file) measures progress only over the child's own partial, so a
     sibling pull of a different file cannot keep a hung child alive. That partial is identified by the
@@ -503,6 +567,12 @@ def start_watchdog(
         )
     if connect_timeout is None:
         connect_timeout = _env_seconds("UNSLOTH_XET_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
+    if buffering_timeout is None:
+        buffering_timeout = _env_seconds(
+            "UNSLOTH_XET_BUFFERING_TIMEOUT", DEFAULT_BUFFERING_TIMEOUT
+        )
+    # A buffering grace shorter than the stall deadline would silently do nothing.
+    buffering_timeout = max(buffering_timeout, stall_timeout)
     if interval is None:
         # Never sample slower than the tighter of the two deadlines, or the timeout is meaningless.
         interval = min(DEFAULT_POLL_INTERVAL, max(1.0, min(stall_timeout, connect_timeout) / 4.0))
@@ -542,6 +612,8 @@ def start_watchdog(
         # False until a partial has been observed at least once. Before that we are in the
         # connect / metadata phase; after it, a partial going away means the transfer finished.
         seen_incomplete = bool(state[1]) if state is not None else False
+        last_io = _child_io_bytes(child_pid) if child_pid else None
+        last_io_change: Optional[float] = time.monotonic() if last_io is not None else None
 
         def _trip(message: str) -> None:
             nonlocal fired
@@ -567,15 +639,31 @@ def start_watchdog(
             if has_incomplete:
                 seen_incomplete = True
 
+            # Second progress signal, for the case where bytes are arriving but are still sitting in
+            # hf_xet's reconstruction buffer rather than on disk. See _child_io_bytes.
+            if child_pid:
+                io_now = _child_io_bytes(child_pid)
+                if io_now is not None and io_now != last_io:
+                    last_io = io_now
+                    last_io_change = now
+
             elapsed = now - last_change
             if has_incomplete:
                 # Bytes are flowing (or should be): a frozen count is a hang.
                 if elapsed >= stall_timeout:
-                    _trip(
-                        f"Download appears stalled ({transport} transport) "
-                        f"-- no progress for {int(elapsed)}s"
+                    buffering = (
+                        last_io_change is not None
+                        and now - last_io_change < stall_timeout
+                        and elapsed < buffering_timeout
                     )
-                    return
+                    if not buffering:
+                        _trip(
+                            f"Download appears stalled ({transport} transport) "
+                            f"-- no progress for {int(elapsed)}s"
+                        )
+                        return
+                    # Reading, but not yet writing. Bounded by buffering_timeout so a process that
+                    # is merely busy (a retry loop, say) still trips, just later.
             elif not seen_incomplete:
                 # No partial has EVER appeared: the child is stuck before the first byte. Without
                 # this branch such a child is invisible to the watchdog forever.
