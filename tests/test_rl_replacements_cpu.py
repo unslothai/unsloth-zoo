@@ -306,11 +306,15 @@ def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
     return out.reshape(index.shape)
 
 
-def _extract_offloaded_log_softmax(inner_fn):
-    # Exec the real Unsloth_Offloaded_Log_Softmax block against `inner_fn`.
+def _offloaded_block_source():
     import textwrap
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    block = textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+    return textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+
+
+def _extract_offloaded_log_softmax(inner_fn):
+    # Exec the real Unsloth_Offloaded_Log_Softmax block against `inner_fn`.
+    block = _offloaded_block_source()
     ns = {"torch": torch, "chunked_hidden_states_selective_log_softmax": inner_fn}
     exec(block, ns)
     return ns["Unsloth_Offloaded_Log_Softmax"]
@@ -352,11 +356,41 @@ def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
 
 
-def test_offloaded_log_softmax_keep_on_gpu_budget_is_cumulative():
-    # The padded GRPO loop runs N forwards before any backward; a per-chunk
-    # 4x-free check alone compounds retained chunks toward all free memory.
-    src = inspect.getsource(rr.grpo_accumulated_loss)
-    block = src[src.index("    def to_device"):src.index("    def efficient_log_softmax")]
-    assert "offload_retained_bytes = [0]" in block
-    assert "4 * (tensor_bytes + offload_retained_bytes[0]) <= free_bytes" in block
-    assert "offload_retained_bytes[0] += tensor_bytes" in block
+def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
+    # This Function only runs on long-completion / large-batch GRPO, i.e. when the
+    # caller is already memory bound, so hidden states must always leave the GPU.
+    # Retaining them instead raises the free VRAM needed to finish a step.
+    block = _offloaded_block_source()
+    assigns = [ln.strip() for ln in block.splitlines()
+               if "saved_hidden_states =" in ln and "ctx.saved_hidden_states" not in ln]
+    assert assigns == [
+        "saved_hidden_states = None",
+        "saved_hidden_states = pinned_buffer",
+        'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)',
+    ], assigns
+    # No memory-budget heuristic may decide to keep the tensor on device.
+    assert "mem_get_info" not in block
+    assert "offload_retained_bytes" not in block
+
+
+def test_offloaded_log_softmax_preserves_preexisting_head_grad():
+    # Behavioural guard for the bug this Function had: gradient accumulation must
+    # leave lm_head.grad at P + g, not 2*P + 2*g.
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 0.0, 0.0, 0.0, 1.0)
+
+    def run(op):
+        torch.manual_seed(0)
+        hs = (torch.randn(3, 32, 16) * 0.02).requires_grad_(True)
+        lm = (torch.randn(64, 16) * 0.02).requires_grad_(True)
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        pre = torch.randn(64, 16) * 0.01
+        lm.grad = pre.clone()
+        op(hs, lm, idx, *args).backward(go)
+        return lm.grad, pre
+
+    got, pre_got = run(Fn.apply)
+    ref, pre_ref = run(_eager_selective_log_softmax)
+    assert torch.equal(pre_got, pre_ref)
+    assert torch.allclose(got, ref, atol=1e-6), (got - ref).abs().max()
