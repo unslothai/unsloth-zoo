@@ -216,8 +216,7 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
 # ---------------------------------------------------------------------------
 # Unsloth_Offloaded_Log_Softmax backward returns LOCAL input gradients
 # ---------------------------------------------------------------------------
-# backward must return LOCAL grads via autograd.grad; backward + leaf .grad
-# double-counts through the outer AccumulateGrad when lm_head is trainable.
+# backward + leaf .grad double-counts through the outer AccumulateGrad.
 
 
 def test_offloaded_log_softmax_uses_autograd_grad_not_backward():
@@ -229,7 +228,7 @@ def test_offloaded_log_softmax_uses_autograd_grad_not_backward():
 
 
 def _recompute_fn(use_backward):
-    # Recompute-in-backward mirror; use_backward=True is the buggy variant, False the fix.
+    # Recompute-in-backward mirror; use_backward=True is the buggy variant.
     class _Fn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, W):
@@ -280,10 +279,10 @@ def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting)
 
 
 # ---------------------------------------------------------------------------
-# Unsloth_Offloaded_Log_Softmax offload paths (pinned / keep-on-GPU / CPU)
+# Unsloth_Offloaded_Log_Softmax offload paths (pinned CUDA / pageable CPU)
 # ---------------------------------------------------------------------------
-# Pins CPU-fallback numerics and CUDA-path source invariants; backward's event
-# wait is load-bearing (pinned non_blocking copy races without it).
+# backward's event wait is load-bearing: the pinned non_blocking copy races
+# without it.
 
 
 def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
@@ -313,7 +312,7 @@ def _offloaded_block_source():
 
 
 def _extract_offloaded_log_softmax(inner_fn):
-    # Exec the real Unsloth_Offloaded_Log_Softmax block against `inner_fn`.
+    # Exec the real block against `inner_fn` instead of the compiled kernel.
     block = _offloaded_block_source()
     ns = {"torch": torch, "chunked_hidden_states_selective_log_softmax": inner_fn}
     exec(block, ns)
@@ -346,20 +345,18 @@ def test_offloaded_log_softmax_cpu_path_grads_bitwise_exact(lm_requires_grad):
 def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     fwd = src[src.index("class Unsloth_Offloaded_Log_Softmax"):src.index("def efficient_log_softmax")]
-    # Pinned D2H must record an event, keep the source alive, and backward must wait on it.
     assert "pin_memory = True" in fwd
     assert "copy_event.record(copy_stream)" in fwd
     assert "record_stream(copy_stream)" in fwd
     assert "ctx.copy_event.wait(" in fwd
-    # CUDA machinery stays behind is_cuda; CPU-only platforms take the pageable path.
+    # CUDA machinery stays behind is_cuda so CPU-only platforms still work.
     assert "is_cuda" in fwd
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
 
 
 def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
-    # This Function only runs on long-completion / large-batch GRPO, i.e. when the
-    # caller is already memory bound, so hidden states must always leave the GPU.
-    # Retaining them instead raises the free VRAM needed to finish a step.
+    # The caller is already memory bound, so retaining hidden states on device
+    # would raise the free VRAM needed to finish a step.
     block = _offloaded_block_source()
     assigns = [ln.strip() for ln in block.splitlines()
                if "saved_hidden_states =" in ln and "ctx.saved_hidden_states" not in ln]
@@ -374,8 +371,7 @@ def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
 
 
 def test_offloaded_log_softmax_preserves_preexisting_head_grad():
-    # Behavioural guard for the bug this Function had: gradient accumulation must
-    # leave lm_head.grad at P + g, not 2*P + 2*g.
+    # Accumulation must leave lm_head.grad at P + g, not 2*P + 2*g.
     Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
     args = (4, 0.0, 0.0, 0.0, 1.0)
 

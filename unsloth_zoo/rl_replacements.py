@@ -1357,13 +1357,12 @@ def grpo_accumulated_loss(
             ctx.device = hidden_states.device
             ctx.copy_event = None
 
-            # Always offload. This path only runs on long-completion / large-batch GRPO,
-            # where the caller is memory bound by definition, so hidden states are never
-            # retained on GPU: the win here is overlapping the copy, not skipping it.
+            # Always offload: this path only runs when the caller is already memory bound
+            # (long completions / large batches), so the win is overlapping the copy.
             saved_hidden_states = None
             if detached_hidden_states.is_cuda:
-                # Async D2H via pinned buffer on a side stream; backward MUST wait on
-                # copy_event before the H2D reload or the copy races.
+                # Async D2H on a side stream; backward MUST wait on copy_event before
+                # the H2D reload or it races the copy.
                 try:
                     pinned_buffer = torch.empty_like(detached_hidden_states, device = "cpu", pin_memory = True)
                 except (RuntimeError, OSError):
@@ -1374,14 +1373,14 @@ def grpo_accumulated_loss(
                     copy_stream.wait_stream(current_stream)
                     with torch.cuda.stream(copy_stream):
                         pinned_buffer.copy_(detached_hidden_states, non_blocking = True)
-                    # record_stream keeps the GPU storage alive until the side-stream copy finishes.
+                    # Keeps the GPU storage alive until the side-stream copy finishes.
                     detached_hidden_states.record_stream(copy_stream)
                     copy_event = torch.cuda.Event()
                     copy_event.record(copy_stream)
                     saved_hidden_states = pinned_buffer
                     ctx.copy_event = copy_event
             if saved_hidden_states is None:
-                # CPU / no CUDA / pinned alloc failed: pageable copy.
+                # No CUDA, or pinned alloc failed: pageable copy.
                 saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
             ctx.saved_hidden_states = saved_hidden_states
 
@@ -1400,7 +1399,7 @@ def grpo_accumulated_loss(
         @staticmethod
         def backward(ctx, grad_output):
             if ctx.copy_event is not None:
-                # Wait for the async D2H offload before reloading H2D.
+                # The offload copy must land before the H2D reload.
                 ctx.copy_event.wait(torch.cuda.current_stream(ctx.device))
             hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
             hidden_states.requires_grad_(True)
@@ -1413,8 +1412,8 @@ def grpo_accumulated_loss(
                     hidden_states, lm_head, index, *ctx.args
                 )
 
-            # autograd.grad, not backward: backward writes leaf .grad, and returning
-            # lm_head.grad would be double-counted by the outer AccumulateGrad.
+            # autograd.grad, not backward: backward writes into leaf .grad, which the
+            # outer AccumulateGrad would then double-count.
             grad_inputs = torch.autograd.grad(
                 output,
                 (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
