@@ -535,6 +535,8 @@ from .utils import (
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
+    _probe_vlm_embedding_module,
+    _vlm_compares_embedding_values,
     _distributed_rank_size,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
@@ -1071,7 +1073,7 @@ class MLXTrainingConfig:
     metric_for_best_model: str = "eval_loss"
     greater_is_better: bool = False
     early_stopping_patience: int = 0  # 0 = disabled
-    neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
+    neftune_noise_alpha: float = 0.0  # 0 = disabled
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -3898,26 +3900,36 @@ class MLXTrainer:
 
     def _install_neftune(self):
         """NEFTune: add scaled uniform noise to input embeddings during training.
-        Text models only; no-op in eval. Uses __class__ reassignment (a real
-        subclass) rather than a module swap, so the embedding object is
-        unchanged -- .weight stays readable for tied LM-head models, and
-        __call__ resolves on the subtype so interception actually fires."""
+        No-op in eval. Text models read the embedding off the backbone; VLM
+        wrappers agree on too little for that, so theirs is identified by running
+        the text-only embed path. Uses __class__ reassignment rather than a
+        module swap, so .weight stays readable for tied LM-head models and
+        __call__ resolves on the subtype so interception fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
         # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
         # every embedding with nan/inf noise from step 0.
         if not math.isfinite(alpha) or alpha <= 0:
             return
         if self._is_vlm:
-            print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
-                  "for VLM models on MLX; ignoring.")
-            return
-        try:
-            tm = _get_text_model(self.model)
-            backbone = getattr(tm, "model", tm)
-            emb = backbone.embed_tokens
-        except Exception as e:
-            print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
-            return
+            if _vlm_compares_embedding_values(self.model):
+                print("Unsloth: NEFTune (neftune_noise_alpha) is not supported "
+                      "for this VLM on MLX: its forward identifies merged "
+                      "positions by comparing embedding values, which noise "
+                      "redrawn per call would defeat; ignoring.")
+                return
+            emb = _probe_vlm_embedding_module(self.model)
+            if emb is None:
+                print("Unsloth: NEFTune could not identify this VLM's token "
+                      "embedding; ignoring.")
+                return
+        else:
+            try:
+                tm = _get_text_model(self.model)
+                backbone = getattr(tm, "model", tm)
+                emb = backbone.embed_tokens
+            except Exception as e:
+                print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
+                return
         if getattr(emb, "_unsloth_neftune_active", False):
             return
 

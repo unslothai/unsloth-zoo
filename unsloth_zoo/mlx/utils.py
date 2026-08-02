@@ -653,6 +653,97 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
 
 
+def _vlm_compares_embedding_values(model):
+    """Whether the forward finds merged positions by comparing embedding
+    values, which noise redrawn per call invalidates. Read off the scale
+    families so the two cannot drift apart."""
+    return _vlm_embed_scale(model) is not None
+
+
+def _identify_vlm_embedding_module(model):
+    """The module a text-only embedding forward uses to build ``inputs_embeds``.
+
+    Observed, not looked up: wrappers disagree on attribute name and container,
+    some expose none, and an untied ``lm_head`` carries the same weight shape --
+    a quantized embedding carries no such shape at all. Of the modules producing
+    the returned shape, drop those another encloses, which picks an adapter over
+    the embedding it wraps. None means decline, never guess.
+    """
+    calls, stack, swapped, recorders = [], [], [], {}
+    def _recorder(base):
+        cls = recorders.get(base)
+        if cls is None:
+            class _Probe(base):
+                def __call__(self, *args, **kwargs):
+                    stack.append(id(self))
+                    enclosing = frozenset(stack[:-1])
+                    try:
+                        out = base.__call__(self, *args, **kwargs)
+                    finally:
+                        stack.pop()
+                    calls.append((self, getattr(out, "shape", None), enclosing))
+                    return out
+            # The save-window DoRA check reads the class name.
+            _Probe.__name__ = base.__name__
+            _Probe.__qualname__ = getattr(base, "__qualname__", base.__name__)
+            cls = recorders[base] = _Probe
+        return cls
+
+    try:
+        seen = set()
+        for _, module in model.named_modules():
+            # One module can appear under several names; wrapping it per name
+            # stacks recorders and leaves one installed.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            base = type(module)
+            try:
+                module.__class__ = _recorder(base)
+            except TypeError:
+                continue
+            swapped.append((module, base))
+        ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+        try:
+            embed_result = model.get_input_embeddings(ids, None)
+        except TypeError:
+            embed_result = model.get_input_embeddings(ids)
+        merged, _ = _unpack_embed_result(embed_result, model)
+    except Exception:
+        return None
+    finally:
+        for module, base in swapped:
+            module.__class__ = base
+
+    shape = getattr(merged, "shape", None)
+    if shape is None:
+        return None
+    matching = [(m, enclosing) for m, s, enclosing in calls if s == shape]
+    matching_ids = {id(m) for m, _ in matching}
+    outermost = {id(m): m for m, enclosing in matching
+                 if not (enclosing & matching_ids)}
+    if len(outermost) != 1:
+        return None
+    return next(iter(outermost.values()))
+
+
+def _probe_vlm_embedding_module(model):
+    """``_identify_vlm_embedding_module`` with the probe's own traces undone.
+
+    Training mode is deliberately untouched: a quantized-activation layer
+    requantizes its weights on every flip, and shapes do not depend on the mode.
+    """
+    # mx.random.state is the live list every draw rewrites, so holding it
+    # snapshots nothing and rebinding it restores nothing.
+    rng_state = [mx.array(key) for key in mx.random.state]
+    try:
+        return _identify_vlm_embedding_module(model)
+    except Exception:
+        return None
+    finally:
+        mx.random.state[:] = rng_state
+
+
 def _shared_kv_slot_count(model):
     """How many cache slots this stack needs, or 0 when it shares no K/V.
 
