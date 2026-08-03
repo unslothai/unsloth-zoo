@@ -355,17 +355,38 @@ def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
 
 
-def test_offloaded_log_softmax_stream_module_covers_amd_and_intel():
-    # torch.cuda is also the HIP backend, so ROCm needs no branch of its own;
-    # Intel has its own namespace, as in gradient_checkpointing.py. Every other
-    # device must return None and take the pageable copy rather than crash.
+@pytest.mark.parametrize(
+    "vendor,hip_version,device,expect",
+    [
+        # torch.cuda is also the HIP backend, so ROCm reports device.type "cuda"
+        # and needs no branch of its own; see gradient_checkpointing.py, which
+        # likewise treats DEVICE_TYPE in ("cuda", "hip") identically.
+        ("nvidia", None, "cuda", "torch.cuda"),
+        ("amd_rocm", "6.2.41134", "cuda", "torch.cuda"),
+        ("intel", None, "xpu", "torch.xpu"),
+        # anything else must return None and take the pageable copy, not crash
+        ("cpu_only", None, "cpu", None),
+        ("meta", None, "meta", None),
+    ],
+)
+def test_offloaded_log_softmax_stream_module_dispatch(monkeypatch, vendor, hip_version,
+                                                      device, expect):
+    if hip_version is not None:
+        monkeypatch.setattr(torch.version, "hip", hip_version, raising=False)
     pick = _exec_offloaded_block(_eager_selective_log_softmax)["_offload_device_module"]
-    assert pick(torch.device("cuda")) is torch.cuda           # NVIDIA and AMD/ROCm
-    assert pick(torch.device("xpu")) is getattr(torch, "xpu", None)   # Intel
-    for other in ("cpu", "meta"):
-        assert pick(torch.device(other)) is None, other
-    # accepts a tensor as well as a device
+    got = pick(torch.device(device))
+    if expect is None:
+        assert got is None, (vendor, got)
+    elif expect == "torch.cuda":
+        assert got is torch.cuda, (vendor, got)
+    else:
+        assert got is getattr(torch, "xpu", None), (vendor, got)
+
+
+def test_offloaded_log_softmax_stream_module_accepts_tensor_or_device():
+    pick = _exec_offloaded_block(_eager_selective_log_softmax)["_offload_device_module"]
     assert pick(torch.zeros(1)) is None
+    assert pick(torch.zeros(1).device) is None
 
 
 def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
