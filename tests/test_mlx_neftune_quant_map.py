@@ -539,3 +539,40 @@ def test_neftune_noise_is_divided_by_a_post_embedding_scale():
     uncorrected = alpha / ((clean.shape[-1] * clean.shape[-2]) ** 0.5) / (3 ** 0.5)
     rms = mx.sqrt(mx.mean(noise * noise)).item()
     assert rms == pytest.approx(uncorrected / embed_scale, rel=0.15), rms
+
+
+@metal_only
+def test_compiled_step_carries_the_rng_so_noise_is_redrawn():
+    """A compiled step traces its body once. Unless the random state is one of
+    the compiled inputs and outputs, every step replays a single draw and the
+    noise becomes a fixed offset -- which is not NEFTune at all, and is
+    invisible from the loss."""
+    import mlx.core as mx
+    from unittest import mock
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
+    model = FastMLXModel.get_peft_model(model, r=4)
+    captured, real_compile = [], mx.compile
+
+    def _recording_compile(fn, *args, **kwargs):
+        captured.append(kwargs.get("inputs"))
+        return real_compile(fn, *args, **kwargs)
+
+    trainer = MLXTrainer(
+        model=model, tokenizer=tok,
+        train_dataset=[{"text": f"row {i}"} for i in range(4)],
+        args=MLXTrainingConfig(
+            neftune_noise_alpha=5.0, max_steps=2, compile=True,
+            per_device_train_batch_size=1, gradient_accumulation_steps=1,
+            warmup_steps=0, output_dir="/tmp/neftune_compile", report_to="none",
+        ),
+    )
+    with mock.patch.object(mx, "compile", _recording_compile):
+        trainer.train()
+
+    states = [s for s in captured if s is not None]
+    assert states, "compile never ran, so this proves nothing"
+    assert any(any(part is mx.random.state for part in state) for state in states), \
+        "the random state is not compiled in; every step would replay one draw"
