@@ -197,6 +197,55 @@ def test_system_profile_is_sane_on_this_machine():
     assert dataclasses.asdict(profile)["ram_source"]
 
 
+def test_a_nested_cgroup_v1_limit_is_found(monkeypatch, tmp_path):
+    """Reading only the v1 controller ROOT is right inside a container -- runc bind-mounts the
+    container's own cgroup directory onto /sys/fs/cgroup/<controller> -- and wrong everywhere else.
+    A Slurm step lives at /sys/fs/cgroup/memory/slurm/uid_N/job_N/step_N, and the root file there
+    reads the "unlimited" sentinel, so a 32 GB step on a 1 TB node sized its download buffer from
+    1 TB and got OOM killed by the kernel it was told about. Mounts are often combined
+    ("cpu,cpuacct"), so the controller list has to be split rather than matched whole.
+    """
+    rel = "slurm/uid_2001/job_304876/step_0"
+    monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
+        "10:memory:/" + rel,
+        "4:cpu,cpuacct:/" + rel,     # combined mount: matching the list whole would miss this
+    ])
+    monkeypatch.setattr(tuning, "CGROUP_ROOT", tmp_path)
+
+    # Controller roots read "unlimited", exactly as they do on a real Slurm node.
+    (tmp_path / "memory").mkdir(parents = True)
+    (tmp_path / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (tmp_path / "cpu").mkdir(parents = True)
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+
+    nested_mem = tmp_path / "memory" / rel
+    nested_mem.mkdir(parents = True)
+    (nested_mem / "memory.limit_in_bytes").write_text(str(32 * GB) + "\n")
+    nested_cpu = tmp_path / "cpu" / rel
+    nested_cpu.mkdir(parents = True)
+    (nested_cpu / "cpu.cfs_quota_us").write_text("400000\n")
+    (nested_cpu / "cpu.cfs_period_us").write_text("100000\n")
+
+    assert tuning.cgroup_memory_limit() == 32 * GB
+    assert tuning.cgroup_cpu_limit() == 4.0
+
+
+def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp_path):
+    """The v2 line is not always line 1. Under systemd hybrid mode v1 controller lines share the
+    file, so scanning for "0::" is what makes the v2 read version independent."""
+    monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
+        "4:cpu,cpuacct:/user.slice",
+        "0::/user.slice/user-1000.slice/session-3.scope",
+    ])
+    monkeypatch.setattr(tuning, "CGROUP_ROOT", tmp_path)
+    scope = tmp_path / "user.slice/user-1000.slice/session-3.scope"
+    scope.mkdir(parents = True)
+    (scope / "memory.max").write_text(str(6 * GB) + "\n")
+
+    assert tuning.cgroup_memory_limit() == 6 * GB
+
+
 def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
     """Kubernetes "cpu: 500m" is a real half-core limit, not an absent one.
 

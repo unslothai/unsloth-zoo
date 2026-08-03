@@ -86,21 +86,25 @@ def _read_first_line(path: Path) -> Optional[str]:
         return None
 
 
-def _cgroup_v2_dirs() -> list[Path]:
-    """Candidate cgroup v2 dirs for THIS process, innermost first.
+# The cgroup mount point, as a module constant so tests can point the whole layer at a fixture tree
+# instead of monkeypatching the functions under test.
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
-    The root ``/sys/fs/cgroup/memory.max`` usually does not exist (the root cgroup has no limit
-    file), so the real limit lives at the path named in ``/proc/self/cgroup``. Every ancestor is
-    also checked because a limit set on a parent slice still binds us.
-    """
-    root = Path("/sys/fs/cgroup")
-    if not root.is_dir():
+
+def _proc_self_cgroup() -> list[str]:
+    """Lines of ``/proc/self/cgroup``, or empty if it is not readable (non-Linux, hidden procfs)."""
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError:
         return []
-    rel = None
-    content = _read_first_line(Path("/proc/self/cgroup"))
-    # cgroup v2 line is "0::<path>"; v1 lines carry a controller list instead.
-    if content is not None and content.startswith("0::"):
-        rel = content[3:].strip()
+
+
+def _walk_to_root(root: Path, rel: Optional[str]) -> list[Path]:
+    """``root/rel`` and every ancestor up to *root*, innermost first, then *root* itself.
+
+    A limit set on a parent slice still binds us, so ancestors are not optional.
+    """
     dirs: list[Path] = []
     if rel and rel != "/":
         current = root / rel.lstrip("/")
@@ -111,6 +115,50 @@ def _cgroup_v2_dirs() -> list[Path]:
             current = current.parent
     dirs.append(root)
     return dirs
+
+
+def _cgroup_v2_dirs() -> list[Path]:
+    """Candidate cgroup v2 dirs for THIS process, innermost first.
+
+    The root ``/sys/fs/cgroup/memory.max`` usually does not exist (the root cgroup has no limit
+    file), so the real limit lives at the path named in ``/proc/self/cgroup``.
+    """
+    root = CGROUP_ROOT
+    if not root.is_dir():
+        return []
+    rel = None
+    # The v2 line is "0::<path>". On a pure-v2 host it is the only line, but under systemd's hybrid
+    # mode v1 controller lines share the file, so scan rather than reading line 1.
+    for line in _proc_self_cgroup():
+        if line.startswith("0::"):
+            rel = line[3:].strip()
+            break
+    return _walk_to_root(root, rel)
+
+
+def _cgroup_v1_dirs(controller: str) -> list[Path]:
+    """Candidate cgroup v1 dirs for *controller*, innermost first, then the mount root.
+
+    Inside a Docker or Kubernetes container the root read is already correct: runc bind-mounts the
+    container's own cgroup directory onto ``/sys/fs/cgroup/<controller>``, so the limit file at the
+    top of that mount is the container's. Outside one it is not. A Slurm step lives at
+    ``/sys/fs/cgroup/memory/slurm/uid_<uid>/job_<id>/step_<n>``, and a systemd scope with
+    ``MemoryLimit=``/``CPUQuota=`` lives under its slice; in both cases the root file reads the
+    "unlimited" sentinel and the process's real ceiling is invisible. Sizing a download buffer from
+    the machine's RAM instead of the job's is how a 32 GB Slurm step on a 1 TB node gets OOM killed.
+    """
+    root = CGROUP_ROOT / controller
+    if not root.is_dir():
+        return []
+    rel = None
+    for line in _proc_self_cgroup():
+        parts = line.split(":", 2)
+        # "<hierarchy id>:<comma separated controllers>:<path>". Mounts are often combined, so the
+        # controller list has to be split rather than compared whole ("cpu,cpuacct").
+        if len(parts) == 3 and controller in parts[1].split(","):
+            rel = parts[2]
+            break
+    return _walk_to_root(root, rel)
 
 
 def _parse_limit(raw: Optional[str]) -> Optional[int]:
@@ -133,9 +181,10 @@ def cgroup_memory_limit() -> Optional[int]:
             value = _parse_limit(_read_first_line(d / name))
             if value is not None:
                 limits.append(value)
-    v1 = _parse_limit(_read_first_line(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")))
-    if v1 is not None:
-        limits.append(v1)
+    for d in _cgroup_v1_dirs("memory"):
+        value = _parse_limit(_read_first_line(d / "memory.limit_in_bytes"))
+        if value is not None:
+            limits.append(value)
     return min(limits) if limits else None
 
 
@@ -154,10 +203,11 @@ def cgroup_cpu_limit() -> Optional[float]:
                     quotas.append(quota / period)
             except ValueError:
                 pass
-    quota = _parse_limit(_read_first_line(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")))
-    period = _parse_limit(_read_first_line(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")))
-    if quota is not None and period:
-        quotas.append(quota / period)
+    for d in _cgroup_v1_dirs("cpu"):
+        quota = _parse_limit(_read_first_line(d / "cpu.cfs_quota_us"))
+        period = _parse_limit(_read_first_line(d / "cpu.cfs_period_us"))
+        if quota is not None and period:
+            quotas.append(quota / period)
     return min(quotas) if quotas else None
 
 
