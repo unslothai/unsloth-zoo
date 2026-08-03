@@ -35,7 +35,6 @@ import importlib.util
 import json
 import math
 import numbers
-import pathlib
 import operator
 import textwrap
 import numpy as np
@@ -822,20 +821,33 @@ def _identify_vlm_embedding_module(model):
 
 
 def _probe_vlm_embedding_module(model):
-    """``_identify_vlm_embedding_module`` with the probe's own traces undone.
+    """``_identify_vlm_embedding_module`` with the random stream it consumed put
+    back, where the backend lets it be captured.
 
     Training mode is deliberately untouched: a quantized-activation layer
     requantizes its weights on every flip, and shapes do not depend on the mode.
     """
     # mx.random.state is the live list every draw rewrites, so holding it
-    # snapshots nothing and rebinding it restores nothing.
-    rng_state = [mx.array(key) for key in mx.random.state]
+    # snapshots nothing and rebinding it restores nothing. A stub backend may
+    # not present it as a list at all; identification still runs there, and any
+    # draw it makes stays on the caller's stream rather than raising.
+    rng_state = None
+    try:
+        live = mx.random.state
+        if isinstance(live, list) and live:
+            rng_state = [mx.array(key) for key in live]
+    except Exception:
+        rng_state = None
     try:
         return _identify_vlm_embedding_module(model)
     except Exception:
         return None
     finally:
-        mx.random.state[:] = rng_state
+        if rng_state is not None:
+            try:
+                mx.random.state[:] = rng_state
+            except Exception:
+                pass
 
 
 def _shared_kv_slot_count(model):

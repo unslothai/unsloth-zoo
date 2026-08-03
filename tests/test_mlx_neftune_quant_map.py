@@ -576,3 +576,18 @@ def test_compiled_step_carries_the_rng_so_noise_is_redrawn():
     assert states, "compile never ran, so this proves nothing"
     assert any(any(part is mx.random.state for part in state) for state in states), \
         "the random state is not compiled in; every step would replay one draw"
+
+
+@metal_only
+@pytest.mark.parametrize("state", [(), None])
+def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state):
+    """A stub backend need not present the random state as a mutable list.
+    Identification still has to run: the snapshot is a courtesy, not a
+    precondition."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
+
+    model = _tree()
+    monkeypatch.setattr(mx.random, "state", state, raising=False)
+    found = _probe_vlm_embedding_module(model)
+    assert found is model.language_model.model.embed_tokens
