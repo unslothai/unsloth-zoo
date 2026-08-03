@@ -564,3 +564,32 @@ def test_streaming_audio_is_detected_without_consuming_the_stream():
     assert peek(None) == (False, None)
     carries, stream = peek(iter(()))
     assert carries is False and list(stream) == []
+
+
+def test_a_streamed_batch_that_turns_out_to_carry_audio_leaves_the_compiled_path():
+    """The peek sees one batch, so a text-first stream plans as compilable.
+    Every later batch is therefore asked directly: without this the audio batch
+    reaches the compiled step, and a strict run aborts only after earlier
+    optimizer updates rather than up front."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    leaves = MLXTrainer._streamed_audio_leaves_the_compiled_path
+    audio_batch = {"input_features": np.zeros((1, 8, 4), np.float32)}
+    plain_batch = {"pixel_values": np.zeros((1, 3, 4, 4), np.float32)}
+
+    assert leaves(audio_batch, None) is True
+    assert leaves(plain_batch, None) is False
+    # Loaders that yield (batch, extras): audio lives in the first element.
+    assert leaves((audio_batch, {"step": 3}), None) is True
+
+    # An empty payload is how some processors report "no audio here"; reading
+    # it as audio would drop every text batch on that checkpoint to eager.
+    assert leaves({"input_features": np.zeros((0, 8, 0), np.float32)}, None) is False
+
+    # A finite plan was surveyed whole and routed by `carries_audio_in`, so
+    # re-deciding per batch here would fight that routing.
+    plan = FiniteVLMBatchPlan.__new__(FiniteVLMBatchPlan)
+    assert leaves(audio_batch, plan) is False

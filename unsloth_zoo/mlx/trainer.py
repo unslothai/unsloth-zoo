@@ -3206,6 +3206,20 @@ class MLXTrainer:
         )
 
     @staticmethod
+    def _streamed_audio_leaves_the_compiled_path(batch_data, batches):
+        """Whether this streamed batch has to drop the run to eager.
+
+        The stream counterpart to the plan's ``carries_audio_in``: a finite
+        plan is surveyed whole and already routed, but a stream only ever
+        offered the one batch ``_peek_stream_carries_audio`` looked at, so
+        audio appearing later has to be noticed here.
+        """
+        if isinstance(batches, FiniteVLMBatchPlan):
+            return False
+        payload = batch_data[0] if isinstance(batch_data, tuple) else batch_data
+        return _vlm_batch_carries_audio(payload)
+
+    @staticmethod
     def _ensure_lora_frozen(model):
         """Freeze accidentally trainable norm params when LoRA is active.
 
@@ -6508,6 +6522,40 @@ class MLXTrainer:
                 )
             elif batch_error is not None:
                 raise batch_error
+
+            # A stream cannot be surveyed, so the plan's only audio evidence is
+            # the one batch peeked before training. Audio that first appears
+            # later would otherwise reach the compiled step: strict would abort
+            # after earlier optimizer updates, and best-effort would pay a
+            # runtime compile failure to discover it. Ask each streamed batch
+            # instead, so the switch is deterministic rather than resting on
+            # whether the compiled call happens to raise. Finite plans are
+            # already routed by the survey, and only compiled runs can care.
+            if (
+                _use_compile
+                and self._is_vlm
+                and self._streamed_audio_leaves_the_compiled_path(
+                    batch_data, batches,
+                )
+            ):
+                if not _compile_fallback_allowed():
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot plan audio training: "
+                        "audio feature shapes follow clip duration, so every "
+                        "distinct clip length would need its own compiled "
+                        "signature. This stream's first batch carried no audio, "
+                        "so the shape guard could not see it up front. Train "
+                        "audio with compile disabled."
+                    )
+                _main_print(
+                    "Unsloth: audio inputs appeared later in the stream; "
+                    "training continues eagerly because audio feature shapes "
+                    "cannot be compiled into fixed signatures."
+                )
+                step_fn = _uncompiled_step_fn
+                _use_compile = False
+                _compile_scope = "fallback_eager"
+                _compile_fallback_reason = "audio_inputs"
 
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch is
