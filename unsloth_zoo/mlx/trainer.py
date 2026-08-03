@@ -6583,6 +6583,15 @@ class MLXTrainer:
             # collective is confined to compiled streaming runs -- a surveyed
             # plan short-circuits before it, and once audio has appeared
             # `_use_compile` is False and the question stops being asked.
+            #
+            # Every operand of the guard below has to stay rank-invariant, or
+            # one rank enters this collective alone and hangs its peers. It
+            # holds today: `_is_vlm` and the plan type come from the same model
+            # and dataset everywhere, and every `_use_compile = False` that a
+            # DDP run can reach is itself driven by a collective -- the
+            # coordinated shape guard, the `_distributed_status_mask` setup
+            # consensus, and the DDP runtime fallback. Do not add a rank-local
+            # term here.
             if _use_compile and self._is_vlm and not isinstance(
                 batches, FiniteVLMBatchPlan,
             ):
