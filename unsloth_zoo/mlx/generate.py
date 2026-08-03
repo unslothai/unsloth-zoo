@@ -216,7 +216,7 @@ class GenerationResult:
 
     token_ids: list[int]
     text: str
-    logprobs: list[float] | None
+    logprobs: list[float]
     finish_reason: Literal["stop", "length", "stop_string"]
     stop_match: str | None = None
 
@@ -261,6 +261,8 @@ def _validate_text_requests(
             )
         if has_prompt and not isinstance(request.prompt, str):
             raise TypeError(f"requests[{index}].prompt must be a string.")
+        if has_prompt and not request.prompt:
+            raise ValueError(f"requests[{index}].prompt must not be empty.")
         if has_ids:
             try:
                 prompt_ids = list(request.prompt_token_ids)
@@ -323,6 +325,8 @@ def _validate_vlm_requests(
             )
         if not isinstance(request.prompt, str):
             raise TypeError(f"requests[{index}].prompt must be a string.")
+        if not request.prompt:
+            raise ValueError(f"requests[{index}].prompt must not be empty.")
         if request.image is not None and request.audio is not None:
             raise ValueError(
                 f"requests[{index}] carries both an image and audio; batched "
@@ -1019,13 +1023,25 @@ def _resolve_module_attr(candidates: Sequence[str], attribute: str):
     package can shadow the submodule, so candidates are imported by name.
     """
 
+    broken = None
     for name in candidates:
         try:
             module = importlib.import_module(name)
-        except Exception:
+        except ModuleNotFoundError as exc:
+            # Absent candidate, unless what is missing is a dependency of it.
+            missing = exc.name
+            if broken is None and missing and not name.startswith(missing):
+                broken = exc
+            continue
+        except Exception as exc:
+            if broken is None:
+                broken = exc
             continue
         if getattr(module, attribute, None) is not None:
             return module
+    if broken is not None:
+        # A partial install is not an unsupported release; say which it is.
+        raise broken
     return None
 
 
@@ -1191,7 +1207,16 @@ class _VLMBatchAdapter:
         stream = getattr(module, "generation_stream", None)
         try:
             return module.wired_limit(self.model, [stream] if stream else None)
-        except Exception:
+        except TypeError:
+            # Only a signature change reaches here: wired_limit is a context
+            # manager, so it sets the limit at __enter__, not on this call.
+            warnings.warn(
+                f"{_installed_mlx_vlm_version()} exposes an incompatible "
+                "wired_limit(); batched vision generation runs under the "
+                "caller's wired-memory limit.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return _null_context()
 
     def _add_special_tokens(self) -> bool:

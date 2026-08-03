@@ -84,6 +84,7 @@ def test_stop_scanner_trims_to_token_boundary():
         (GenerationRequest(), "exactly one"),
         (GenerationRequest(prompt="x", prompt_token_ids=[1]), "exactly one"),
         (GenerationRequest(prompt_token_ids=[]), "must not be empty"),
+        (GenerationRequest(prompt=""), "must not be empty"),
         (GenerationRequest(prompt="x", image=object()), "text prompts only"),
         (GenerationRequest(prompt="x", max_tokens=0), "must be positive"),
     ],
@@ -347,6 +348,7 @@ def test_vlm_requests_accept_stop_strings():
 def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     from unsloth_zoo.mlx.generate import _validate_vlm_requests
     cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
+        (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
         # One that stopped being refused would reach generation and be dropped.
         *((GenerationRequest(prompt="a"), GenerationDefaults(**{name: value}),
@@ -560,6 +562,20 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
     assert policy_calls  # the policy helper was consulted, not bypassed
     # The probed capability must reach the adapter, not merely exist on the module.
     assert adapter.cancel is not None
+
+
+def test_module_resolution_separates_an_absent_release_from_a_broken_install(monkeypatch):
+    # A missing dependency of a candidate must not be reported as an old release.
+    import importlib as importlib_module
+    from unsloth_zoo.mlx.generate import _resolve_module_attr
+    missing = {"mlx_vlm.generate": "timm", "mlx_vlm.generate.ar": "mlx_vlm.generate.ar"}
+    def fake_import(name):
+        raise ModuleNotFoundError(f"No module named {missing[name]!r}", name=missing[name])
+    monkeypatch.setattr(importlib_module, "import_module", fake_import)
+    with pytest.raises(ModuleNotFoundError, match="timm"):
+        _resolve_module_attr(("mlx_vlm.generate",), "BatchGenerator")
+    # The candidate itself being absent still degrades to None.
+    assert _resolve_module_attr(("mlx_vlm.generate.ar",), "BatchGenerator") is None
 
 
 def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
