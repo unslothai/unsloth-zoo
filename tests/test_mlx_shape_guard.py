@@ -453,6 +453,15 @@ def _audio_plan_stub():
             assert self.surveyed, "routing must survey before asking"
             return True
 
+        # Routing asks only about the batches the schedule executes, so the
+        # stub has to answer for a visit as well as for the whole plan.
+        def batch_index_for_visit(self, absolute_visit):
+            return 0
+
+        def carries_audio_in(self, indices):
+            assert self.surveyed, "routing must survey before asking"
+            return 0 in set(indices)
+
     return _Stub()
 
 
@@ -483,6 +492,59 @@ def test_audio_runs_route_eager_before_every_other_exit():
 
     with pytest.raises(RuntimeError, match="cannot plan audio training"):
         _plan(_audio_plan_stub(), mode="strict")
+
+
+def test_carries_audio_in_answers_only_for_the_batches_named():
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    plan = FiniteVLMBatchPlan.__new__(FiniteVLMBatchPlan)
+    plan._audio_flags = (False, False, True)     # audio only in the trailing batch
+    assert plan.carries_audio() is True
+    assert plan.carries_audio_in([0, 1]) is False
+    assert plan.carries_audio_in([0, 1, 2]) is True
+    assert plan.carries_audio_in([]) is False
+    assert plan.carries_audio_in([7]) is False   # out of range, not an IndexError
+
+    plan._audio_flags = None
+    with pytest.raises(RuntimeError, match="have not been surveyed"):
+        plan.carries_audio_in([0])
+
+
+def test_audio_routing_asks_only_about_executed_batches():
+    """A ragged epoch drops its trailing micro-batches. Audio only in that tail
+    reaches no compiled call, so it must not degrade the run to eager or abort
+    strict mode -- the same rule the family admission below it already follows."""
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    class _StopPlanning(Exception):
+        """Stops the planner right after the routing decision, so this test
+        depends on the decision alone and not on the rest of the stub."""
+
+    class _Spy(FiniteVLMBatchPlan):
+        def __init__(self):
+            self.asked_about = None
+
+        def __len__(self):
+            return 2
+
+        def ensure_descriptors(self):
+            pass
+
+        def carries_audio(self):               # whole-plan: batch 1 has audio
+            raise AssertionError("routing must not ask the whole plan")
+
+        def batch_index_for_visit(self, absolute_visit):
+            return 0                           # the schedule only visits batch 0
+
+        def carries_audio_in(self, indices):
+            self.asked_about = sorted(indices)
+            raise _StopPlanning
+
+    for mode in ("best_effort", "strict"):
+        spy = _Spy()
+        with pytest.raises(_StopPlanning):
+            _plan(spy, mode=mode)
+        assert spy.asked_about == [0], mode
 
 
 def test_streaming_audio_is_detected_without_consuming_the_stream():

@@ -1490,22 +1490,6 @@ def _plan_single_process_vlm_shapes(
         return None, report, False, None
 
     batches.ensure_descriptors()
-    if batches.carries_audio():
-        if effective_mode == "strict":
-            raise RuntimeError(
-                "Unsloth: strict mx.compile cannot plan audio training: audio "
-                "feature shapes follow clip duration, so every distinct clip "
-                "length would need its own compiled signature. Train audio "
-                "with compile disabled."
-            )
-        print(
-            "Unsloth: audio inputs detected; training runs eagerly because "
-            "audio feature shapes cannot be compiled into fixed signatures."
-        )
-        return None, _shape_guard_report(
-            "eager", "vlm_audio_inputs", cap, compile_scope,
-            cap_selection="not_applicable",
-        ), False, None
     # Admit only the batches the loop actually visits. The gradient-accumulation
     # floor drops the schedule's trailing micro-batches, and an unplannable
     # family confined to that tail would otherwise degrade the whole run to
@@ -1530,6 +1514,26 @@ def _plan_single_process_vlm_shapes(
         batches.batch_index_for_visit(microstep)
         for microstep in range(total_microsteps)
     })
+    # Scoped to `executed` for the same reason the family admission below is:
+    # a ragged epoch drops its trailing micro-batches, and audio confined to
+    # that tail must not route the whole run eagerly or abort strict mode over
+    # a batch no compiled call reaches.
+    if batches.carries_audio_in(executed):
+        if effective_mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan audio training: audio "
+                "feature shapes follow clip duration, so every distinct clip "
+                "length would need its own compiled signature. Train audio "
+                "with compile disabled."
+            )
+        print(
+            "Unsloth: audio inputs detected; training runs eagerly because "
+            "audio feature shapes cannot be compiled into fixed signatures."
+        )
+        return None, _shape_guard_report(
+            "eager", "vlm_audio_inputs", cap, compile_scope,
+            cap_selection="not_applicable",
+        ), False, None
     unplannable = [
         index
         for index in executed

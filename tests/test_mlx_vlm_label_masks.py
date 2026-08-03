@@ -3035,6 +3035,33 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
+def test_gemma4_audio_delimiters_are_not_targets():
+    """Gemma 4 spells them boa/eoa rather than audio_start/audio_end, and wraps
+    every clip in them: processing_gemma4 renders boa_token + placeholders +
+    eoa_token per clip, and gemma4/config.py declares boa_token_id/eoa_token_id.
+    The image pair boi/eoi was already resolved; without the audio pair the two
+    delimiters stayed supervised on every audio row."""
+    from unsloth_zoo.mlx.utils import _get_vlm_ignore_token_ids
+
+    class _Gemma4(_FakeProcessor):
+        tokenizer = type("_Tok", (_FakeTokenizer,), {
+            "boa_token": "<|begin_of_audio|>",
+            "eoa_token": "<|end_of_audio|>",
+            "_vocab": dict(_FakeTokenizer._vocab, **{
+                "<|begin_of_audio|>": 256000, "<|end_of_audio|>": 258883}),
+        })()
+
+    by_token = set(_get_vlm_ignore_token_ids(processor=_Gemma4()))
+    assert {256000, 258883} <= by_token, "resolved from the tokenizer attributes"
+
+    # And from the checkpoint config, which is where gemma4 actually declares them.
+    by_config = set(_get_vlm_ignore_token_ids(
+        processor=_FakeProcessor(),
+        config={"boa_token_id": 256000, "eoa_token_id": 258883},
+    ))
+    assert {256000, 258883} <= by_config
+
+
 def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
     """Every audio spelling ends up typed "audio", whether the caller wrote the
     type out or left it off. An untyped alias otherwise reaches neither the

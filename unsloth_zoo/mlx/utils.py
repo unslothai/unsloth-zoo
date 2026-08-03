@@ -1624,6 +1624,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             "audio_token",
             "boi_token",
             "eoi_token",
+            # Gemma 4 wraps every audio run in these, the way boi/eoi wrap an
+            # image run: processing_gemma4.py builds boa_token + placeholders +
+            # eoa_token per clip.
+            "boa_token",
+            "eoa_token",
         ):
             token = getattr(tokenizer, attr, None)
             if token is not None:
@@ -1637,6 +1642,8 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             # is, so they are no more a target than the run itself.
             "audio_start_id",
             "audio_end_id",
+            "boa_token_id",
+            "eoa_token_id",
         ):
             _append_unique_int(ids, getattr(tokenizer, attr, None))
 
@@ -1651,6 +1658,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         "boi_token_id",
         "eoi_token_index",
         "eoi_token_id",
+        # Gemma 4 declares its audio delimiters here (gemma4/config.py).
+        "boa_token_index",
+        "boa_token_id",
+        "eoa_token_index",
+        "eoa_token_id",
     ):
         _append_unique_int(ids, _config_get(config, key, None))
 
@@ -9224,6 +9236,22 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             return _vlm_batch_carries_audio(batch)
         finally:
             del batch
+
+    def carries_audio_in(self, indices):
+        """Whether any of the named surveyed batches carries audio.
+
+        The whole-plan answer counts batches the schedule drops, and audio
+        confined to that tail would route a run eagerly, or abort strict mode,
+        over a batch no compiled call reaches -- the same reason family
+        admission is restricted to the executed set.
+        """
+        flags = self._audio_flags
+        if flags is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return any(flags[index] for index in indices if 0 <= index < len(flags))
 
     def carries_audio(self):
         """Whether any surveyed batch carries audio feature tensors."""
