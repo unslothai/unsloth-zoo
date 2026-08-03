@@ -1783,6 +1783,73 @@ def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
     assert out[1][0] == pytest.approx(9.0)
 
 
+def _baseline_scale_model(model_type, hidden_size=16):
+    """A VLM whose merge leaves the ids-path scale off, as mlx-vlm's does.
+
+    `Model.__call__` sends ids through `get_input_embeddings`, which embeds
+    without the sqrt(hidden_size) factor the language stack applies on the ids
+    path; the stack then takes the `inputs_embeds` branch and never applies it.
+    Recording what the forward receives is the only way to see which route the
+    loss backend took.
+    """
+    from types import SimpleNamespace
+
+    mx_ = _utils_mx()
+    seen = {}
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=model_type, hidden_size=hidden_size)
+        def embed_tokens(self, ids):
+            return mx_.ones((*ids.shape, hidden_size), dtype=mx_.float32)
+
+    class _Model:
+        language_model = SimpleNamespace(model=_Backbone())
+        config = SimpleNamespace(model_type=model_type)
+
+        def get_input_embeddings(self, inputs, pixel_values=None, **_kwargs):
+            seen["merged"] = True
+            return SimpleNamespace(
+                inputs_embeds=_Backbone().embed_tokens(inputs))
+
+        def __call__(self, inputs, pixel_values=None, **kwargs):
+            seen["kwargs"] = kwargs
+            width = inputs.shape[1]
+            return mx_.zeros((inputs.shape[0], width, 8), dtype=mx_.float32)
+
+    return _Model(), seen, hidden_size ** 0.5
+
+
+@pytest.mark.parametrize("model_type,rescaled", [
+    ("gemma3n_text", True),
+    ("qwen2_vl", False),
+])
+def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
+        model_type, rescaled):
+    """use_cce={True,False} have to agree. `_vlm_cce_forward` merges and
+    rescales itself; handing the model ids on the baseline path skipped the
+    factor, training text embeddings ~sqrt(hidden_size) times too small beside
+    merged audio or image features."""
+    from unsloth_zoo.mlx.utils import make_vlm_baseline_loss_fn
+
+    mx_ = _utils_mx()
+    model, seen, scale = _baseline_scale_model(model_type)
+    ids = mx_.array([[3, 4, 5]], dtype=mx_.int32)
+    loss_fn = make_vlm_baseline_loss_fn(model, ignore_token_ids=[])
+    loss_fn(model, {
+        "input_ids": ids,
+        "attention_mask": mx_.ones((1, 3), dtype=mx_.int32),
+        "labels": ids,
+    })
+
+    embeds = seen.get("kwargs", {}).get("inputs_embeds")
+    if not rescaled:
+        # Every other family keeps the untouched ids path.
+        assert embeds is None and "merged" not in seen
+        return
+    assert embeds is not None, "the forward still received bare ids"
+    assert np.asarray(embeds)[0][0][0] == pytest.approx(scale)
+
+
 # --- paligemma: a prefix-LM mask, not a padding outer product ---------------
 
 
@@ -3302,6 +3369,66 @@ def test_stated_spans_refuse_the_left_padding_repair():
                                             [0, 0, 1, 1, 1, 1, 1, 1]], np.int32)
     with pytest.raises(ValueError, match=r"row\(s\) \[1\] content-first"):
         _right_pad_vlm_rows(later_row, _FakeProcessor())
+
+
+def _image_bound_inputs(bounds, mask):
+    """A MiniCPM-shaped batch: per-row (images, 2) columns into the ids."""
+    mask = np.array(mask, np.int32)
+    return {
+        "input_ids": np.arange(1, mask.size + 1, dtype=np.int32).reshape(mask.shape),
+        "attention_mask": mask,
+        "image_bound": [
+            np.array(row, np.int32).reshape(-1, 2) if row else np.zeros((0, 2), np.int32)
+            for row in bounds
+        ],
+    }
+
+
+def test_stated_image_bounds_refuse_the_left_padding_repair():
+    """`image_bound` is the same kind of thing as `audio_bounds`: absolute
+    columns into the layout the processor padded, which MiniCPM-V offsets by
+    each row's leading pad count. It is neither width-generated nor token
+    aligned -- an (images, 2) grid is not the ids shape -- so the sidecar
+    relocation leaves it behind, and the model would scatter each image's
+    features onto whatever tokens moved into those columns. The stale columns
+    stay attended, so nothing downstream objects."""
+    from unsloth_zoo.mlx.utils import _right_pad_vlm_rows
+
+    moved = _image_bound_inputs([[[2, 4]]], [[0, 0, 1, 1, 1]])
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
+        _right_pad_vlm_rows(moved, _FakeProcessor())
+    with pytest.raises(ValueError, match="image positions as spans"):
+        _right_pad_vlm_rows(
+            _image_bound_inputs([[[2, 4]]], [[0, 0, 1, 1, 1]]), _FakeProcessor())
+
+    # Interior padding moves tokens exactly as leading padding does.
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\] content-first"):
+        _right_pad_vlm_rows(
+            _image_bound_inputs([[[3, 4]]], [[1, 0, 0, 1, 1]]), _FakeProcessor())
+
+    # Already content-first: the repair is a no-op and must not refuse.
+    _right_pad_vlm_rows(
+        _image_bound_inputs([[[0, 2]]], [[1, 1, 1, 0, 0]]), _FakeProcessor())
+
+    # Reported on every batch, empty when the row has no image: keying the
+    # refusal on the field would strand text-only rows.
+    repaired = _right_pad_vlm_rows(
+        _image_bound_inputs([[], []], [[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]]),
+        _FakeProcessor())
+    assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
+
+    # Only the bound-free row moves, so the batch is still repairable.
+    repaired = _right_pad_vlm_rows(
+        _image_bound_inputs([[[0, 2]], []], [[1, 1, 1, 0, 0], [0, 0, 1, 1, 1]]),
+        _FakeProcessor())
+    assert np.asarray(repaired["attention_mask"])[:, 0].tolist() == [1, 1]
+
+    # The moving bound-bearing row is not row 0.
+    with pytest.raises(ValueError, match=r"row\(s\) \[1\] content-first"):
+        _right_pad_vlm_rows(
+            _image_bound_inputs([[[0, 2]], [[2, 4]]],
+                                [[1, 1, 1, 0, 0], [0, 0, 1, 1, 1]]),
+            _FakeProcessor())
 
 
 def test_spans_that_do_not_name_a_placeholder_run_are_refused():

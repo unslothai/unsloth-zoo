@@ -2079,6 +2079,28 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         shared_kv = _build_shared_kv_caches(model)
         if shared_kv is not None:
             fwd_kwargs["cache"] = shared_kv
+        # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
+        # only, and `Model.__call__` sends ids through `get_input_embeddings`,
+        # which does not scale. Handing the model ids therefore trains on text
+        # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
+        # already merges and rescales itself; do the same here so
+        # use_cce={True,False} stay in parity instead of differing by that.
+        if _vlm_embed_scale(model) is not None:
+            embed_result = model.get_input_embeddings(
+                inputs,
+                pixel_values,
+                mask=fwd_kwargs.get("mask"),
+                **{k: v for k, v in fwd_kwargs.items()
+                   if k not in ("mask", "cache")},
+            )
+            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            fwd_kwargs["inputs_embeds"] = _apply_vlm_embed_scale(
+                model, inputs, merged_embeds,
+            )
+            # per_layer_inputs and friends: the merge produced them, and
+            # recomputing from ids inside the stack would redo the work.
+            for key, value in embed_kwargs.items():
+                fwd_kwargs.setdefault(key, value)
         output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
@@ -6305,6 +6327,24 @@ def _assert_audio_features_present(inputs, expected, processor):
     )
 
 
+def _image_bounds_per_row(inputs):
+    """Per-row image placeholder spans, when the processor states them.
+
+    MiniCPM-V and MiniCPM-o report ``image_bound`` as absolute columns into the
+    layout they padded, offsetting it by each row's leading pad count. The
+    values are coordinates like ``audio_bounds``, not labels that travel with a
+    row, so a repair that moves the tokens invalidates them the same way.
+    """
+    bounds = inputs.get("image_bound") if isinstance(inputs, Mapping) else None
+    if bounds is None:
+        return None
+    rows = []
+    for row in bounds:
+        spans = np.asarray(row).reshape(-1, 2) if np.size(row) else np.empty((0, 2))
+        rows.append([(int(start), int(end)) for start, end in spans])
+    return rows
+
+
 def _audio_bounds_per_row(inputs):
     """Per-row ``(start, end)`` audio spans, when the processor states them.
 
@@ -7267,6 +7307,22 @@ def _right_pad_vlm_rows(inputs, processor):
             f"{stale} content-first despite being asked for right-padded rows, "
             f"and reports their audio positions as spans, which name the layout "
             f"the repair replaces."
+        )
+    # Same argument for image spans. `image_bound` is neither width-generated
+    # nor token-aligned -- an (images, 2) grid is not the ids shape -- so the
+    # sidecar relocation leaves it naming pre-repair columns, and the model
+    # would scatter each image's features onto whatever tokens moved there.
+    # Silent: the stale columns stay attended, so nothing downstream objects.
+    image_stale = [
+        index for index, spans in enumerate(_image_bounds_per_row(inputs) or ())
+        if spans and index < moved.shape[0] and bool(moved[index])
+    ]
+    if image_stale:
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} did not put row(s) "
+            f"{image_stale} content-first despite being asked for right-padded "
+            f"rows, and reports their image positions as spans, which name the "
+            f"layout the repair replaces."
         )
     ids = _as_numpy_vlm_field(inputs, "input_ids")
     extras = _vlm_token_aligned_sidecars(inputs, ids.shape)
