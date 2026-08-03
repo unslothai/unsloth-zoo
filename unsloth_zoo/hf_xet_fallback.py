@@ -723,9 +723,17 @@ def start_watchdog(
                 continue
 
             current_size, has_incomplete, partial_bytes = state
+            rss = _child_rss(child_pid) if child_pid else None
             if current_size != last_size:
                 last_size = current_size
                 last_change = now
+                # The disk moved, so the head-of-line block landed and the reconstruction buffer
+                # just drained. Re-base the RSS sensor on the CURRENT reading: xet's buffer is a
+                # process-wide byte budget reused across files, so the next buffering episode
+                # refills BELOW this one's peak. Carrying a lifetime high-water mark forward makes
+                # that fill invisible and trips the data clock on a child receiving at wire rate.
+                if rss is not None:
+                    last_rss = rss
             # Phase on partial bytes, not the repo-wide total: the latter includes blobs that were
             # already complete before this download started. last_size/last_change stay on the
             # repo-wide figure, which is still the right STALL signal -- only the PHASE signal was wrong.
@@ -737,7 +745,10 @@ def start_watchdog(
                 # Bytes have flowed into a partial that is still open: a frozen count is a hang --
                 # UNLESS the child is still filling its reconstruction buffer, which does not touch
                 # disk until the head-of-line block lands. See _child_rss.
-                rss = _child_rss(child_pid) if child_pid else None
+                if rss is not None and rss < last_rss:
+                    # Buffer handed back to the allocator: the baseline is the TROUGH since the last
+                    # reset, never a peak, or genuine growth below an old peak reads as no progress.
+                    last_rss = rss
                 if rss is not None and rss > last_rss + _RSS_PROGRESS_EPSILON:
                     last_rss = rss
                     last_change = now

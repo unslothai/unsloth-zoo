@@ -4575,3 +4575,68 @@ def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
         assert "did not start" in calls[0]
     finally:
         stop.set()
+
+
+def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monkeypatch):
+    """xet's reconstruction buffer is a process-wide budget reused across files.
+
+    So episode N+1 refills BELOW episode N's peak. Treating the baseline as a lifetime high-water
+    mark made that fill invisible and killed a child receiving at wire rate -- reachable on any
+    multi-shard snapshot, which is one child doing many fill/flush cycles.
+    """
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "shard.incomplete"
+    part.write_bytes(b"\0" * 4096)
+
+    rss = {"v": 400 * 1024 * 1024}          # episode 1 already peaked high
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(0.15)
+        part.write_bytes(b"\0" * 8192)      # the block landed: disk moves, buffer drains
+        rss["v"] = 90 * 1024 * 1024
+        time.sleep(0.15)
+        # Episode 2 now fills at wire rate, but stays far below episode 1's 400MB peak.
+        for _ in range(20):
+            rss["v"] += 12 * 1024 * 1024
+            time.sleep(0.05)
+        assert calls == [], f"a child refilling after a drain was killed: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
+    """Pins the decision NOT to compare consecutive samples.
+
+    Requiring the epsilon between consecutive polls demands a sustained ~6.7 Mbit/s floor at
+    production constants, so a slower link would false-trip on its very first buffering episode --
+    exactly the links this fallback exists for.
+    """
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "slow.incomplete").write_bytes(b"\0" * 4096)
+
+    rss = {"v": 100 * 1024 * 1024}
+
+    def _slow(_pid):
+        rss["v"] += 1_900_000            # well under _RSS_PROGRESS_EPSILON per tick
+        return rss["v"]
+
+    monkeypatch.setattr(xf, "_child_rss", _slow)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.6, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.0)
+        assert calls == [], f"a slow but healthy buffering child was killed: {calls}"
+    finally:
+        stop.set()
