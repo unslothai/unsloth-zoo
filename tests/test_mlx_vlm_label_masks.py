@@ -2285,6 +2285,26 @@ def test_unusable_audio_rows_are_rejected(monkeypatch, clip, message, max_len):
         _finalized_collate([row], processor, max_len, None)
 
 
+def test_an_audio_free_row_over_the_cap_still_collates(monkeypatch):
+    """The over_cap refusal above is for rows that carry audio. An omni
+    checkpoint resolves its soft token whether or not the run uses audio, so
+    without a clip-count guard the same cap refuses ordinary text and image
+    training -- and a rendered row wider than max_seq_length is normal, which
+    is why the shape planner plans for it rather than rejecting it."""
+    processor = _FakeGemmaAudioProcessor()
+    _qualify(monkeypatch, processor=processor)
+    row = {"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": "ok"}]}
+
+    batch = _finalized_collate([row], processor, 1, None)
+    ids = np.asarray(batch["input_ids"])
+    assert ids.shape[0] == 1
+    assert int(np.asarray(batch["attention_mask"]).sum()) > 1, (
+        "the row is deliberately wider than the cap it was collated under"
+    )
+
+
 def test_fixed_budget_families_reject_shortened_runs(monkeypatch):
     class _Budgeted(_FakeGemmaAudioProcessor):
         audio_seq_length = 3

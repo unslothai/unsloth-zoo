@@ -6362,7 +6362,9 @@ def _assert_audio_bounds_intact(rows, ids, attention_mask, audio_counts,
             width if mask_np is None
             else int(mask_np[index].astype(bool).sum())
         )
-        if max_seq_length and attended > int(max_seq_length):
+        # Audio-bearing rows only, as in the run path: a stated-span family
+        # reports bounds for every row, so an audio-free one would be capped too.
+        if expected and max_seq_length and attended > int(max_seq_length):
             # Padding is not the row's own length, so this counts what the model
             # attends -- the same quantity the run check caps.
             raise ValueError(
@@ -6635,7 +6637,12 @@ def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
                 f"tokenization. Every clip needs its own placeholder in the "
                 f"rendered text, and none may be dropped by truncation."
             )
-        if max_seq_length is None:
+        # Only rows that carry audio, as the two checks above are: the cap is
+        # here so a placeholder run is not cut unnoticed, and an audio-free row
+        # has none to cut. An omni checkpoint resolves soft ids whether or not
+        # the run uses audio, so without this a plain text or image batch wider
+        # than the cap is refused -- which the shape planner states is normal.
+        if max_seq_length is None or not expected_clips:
             continue
         if int(valid.sum()) > int(max_seq_length):
             # Some processors divert the truncation kwargs to their audio
