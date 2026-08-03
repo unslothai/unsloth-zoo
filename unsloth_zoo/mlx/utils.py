@@ -6173,6 +6173,14 @@ def _raw_row_has_audio(item):
     the data the user actually supplied. Shapes it cannot parse are reported as
     audio-free and left to the normal collation errors.
     """
+    if isinstance(item, list):
+        # A bare message list is a supported row shape -- _collate_vlm_batch
+        # normalizes one -- so it has to be scanned here too, or a formatter
+        # that drops its clips leaves the gate nothing to refuse.
+        try:
+            return any(_vlm_audio_part_state(_normalize_vlm_messages(item)))
+        except Exception:
+            return False
     if not isinstance(item, dict):
         return False
     for key in ("audio", "audios"):

@@ -3035,6 +3035,39 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
+def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
+    """A row that is itself a list of messages is a supported shape, which
+    _collate_vlm_batch normalizes. The pre-formatter scan has to see it too:
+    a formatting_func that drops the clips otherwise leaves the family gate
+    nothing to refuse, and the row trains as text with its audio discarded."""
+    from unsloth_zoo.mlx.utils import (
+        _format_vlm_row_gating_audio, _raw_row_has_audio,
+    )
+
+    clip = {"array": np.zeros(16, np.float32), "sampling_rate": 16000}
+    messages = [
+        {"role": "user", "content": [{"type": "audio", "audio": clip},
+                                     {"type": "text", "text": "transcribe"}]},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    assert _raw_row_has_audio({"messages": messages}) is True
+    assert _raw_row_has_audio(messages) is True, "the same row, unwrapped"
+
+    # An unqualified family must still be refused when the formatter hides the
+    # clips, which is the whole point of scanning before formatting.
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(
+        mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {"other": frozenset({"0.0.0"})},
+    )
+    strip_audio = lambda row: {"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "transcribe"}]},
+        {"role": "assistant", "content": "ok"}]}
+    with pytest.raises(NotImplementedError):
+        _format_vlm_row_gating_audio(messages, strip_audio, _FakeGemmaAudioProcessor())
+
+
 def test_gemma4_audio_delimiters_are_not_targets():
     """Gemma 4 spells them boa/eoa rather than audio_start/audio_end, and wraps
     every clip in them: processing_gemma4 renders boa_token + placeholders +
