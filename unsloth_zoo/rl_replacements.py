@@ -392,6 +392,9 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    # The off-policy mask uses vLLM sampling logprobs whenever the batch supplies them (matching TRL);
+    # the vLLM importance-sampling ratio is applied to the loss only when this flag is on.
+    vllm_importance_sampling_correction = kwargs.get("vllm_importance_sampling_correction", False)
     vllm_importance_sampling_mode = kwargs.get("vllm_importance_sampling_mode", "sequence_mask")
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     vllm_importance_sampling_clip_min = kwargs.get("vllm_importance_sampling_clip_min", None)
@@ -425,16 +428,23 @@ def grpo_compute_loss(
         advantages = advantages.unsqueeze(1)
 
     if off_policy_mask_threshold is not None:
+        # DeepSeek-V3.2 off-policy mask. The mismatch logprobs are sampling_per_token_logps (vLLM
+        # sampling logprobs) if present, else old, else new.detach() when both are absent
+        # (num_iterations == 1 with no vLLM). This mirrors TRL, which defaults old_per_token_logps to
+        # per_token_logps.detach() so get_off_policy_mask never receives None (it computes
+        # mismatch - per_token_logps.detach(), so new.detach() yields a zero-KL keep-all mask). The
+        # callable is a signature-stable adapter installed in grpo_accumulated_loss, so this stays
+        # fixed across TRL versions with no signature introspection inside this compiled function.
         off_policy_mask = get_off_policy_mask(
             advantages=advantages,
             per_token_logps=new,
-            old_per_token_logps=old,
+            sampling_per_token_logps=sampling_per_token_logps if sampling_per_token_logps is not None else (old if old is not None else new.detach()),
             mask=mask,
             off_policy_threshold=off_policy_mask_threshold,
         )
 
     with torch.no_grad():
-        if use_vllm and sampling_per_token_logps is not None:
+        if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
             # Filter out extra leading prompt tokens after left-padding input_ids.
             # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
             importance_sampling_ratio = (old - sampling_per_token_logps) * mask
@@ -543,7 +553,7 @@ def grpo_compute_loss(
     if off_policy_mask_threshold is not None:
         loss_i = loss_i * off_policy_mask
 
-    if use_vllm and sampling_per_token_logps is not None:
+    if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
         # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
         if loss_type != "vespo":
             loss_i = loss_i * importance_sampling_ratio
@@ -776,7 +786,17 @@ def grpo_accumulated_loss(
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
-    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
+    # Thread vLLM sampling logprobs when something actually consumes them: the off-policy mask
+    # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction). The mask
+    # needs them regardless of IS correction (matching TRL, which feeds them to get_off_policy_mask
+    # either way); the IS ratio stays gated on the correction flag inside grpo_compute_loss. On the
+    # plain vLLM path (neither active) they are dropped so nothing pays for an unused aligned/compiled
+    # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
+    _sampling_logps_used = (
+        getattr(trainer, "vllm_importance_sampling_correction", False)
+        or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
+    )
+    sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if _sampling_logps_used else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
     logit_scale_divide   = kwargs.get("logit_scale_divide", 0.0)
@@ -798,9 +818,53 @@ def grpo_accumulated_loss(
     kwargs["vespo_k_neg"] = trainer.args.vespo_k_neg if hasattr(trainer.args, "vespo_k_neg") else 3.0
     kwargs["vespo_lambda_pos"] = trainer.args.vespo_lambda_pos if hasattr(trainer.args, "vespo_lambda_pos") else 3.0
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
-    kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
-    kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    off_policy_mask_threshold = trainer.args.off_policy_mask_threshold if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    kwargs["off_policy_mask_threshold"] = off_policy_mask_threshold
+    # get_off_policy_mask exists on TRL >= 0.27.0; its 3rd parameter was `old_per_token_logps` in 0.27.0
+    # and renamed to `sampling_per_token_logps` in 0.27.1 (huggingface/trl#4857), so a fixed keyword call
+    # crashes on one side of the rename. Wrap it in a signature-stable adapter here, outside the compiled
+    # loss, so grpo_compute_loss always calls it with one keyword. Detect the real name once via inspect
+    # and cache the adapter on the trainer; a fresh closure every step would re-trigger torch.compile.
+    _off_policy_mask_fn = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
+    if _off_policy_mask_fn is None or off_policy_mask_threshold is None:
+        kwargs["get_off_policy_mask"] = None
+    else:
+        _adapter = getattr(trainer, "_unsloth_off_policy_mask_adapter", None)
+        # Compare by value, not identity: trainer.get_off_policy_mask returns a fresh bound-method
+        # object on every access, so `is not` would always miss and rebuild the adapter each step
+        # (re-triggering torch.compile). `!=` on bound methods compares __self__ and __func__, so the
+        # cached adapter is reused; the first call still rebuilds since None != the bound method.
+        if getattr(_adapter, "_unsloth_wrapped", None) != _off_policy_mask_fn:
+            import inspect as _inspect
+            try:
+                _params = _inspect.signature(_off_policy_mask_fn).parameters
+            except (TypeError, ValueError):
+                _params = {}
+            if "old_per_token_logps" in _params and "sampling_per_token_logps" not in _params:
+                # TRL 0.27.0 named the mismatch-logprobs parameter old_per_token_logps.
+                def _adapter(advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold):
+                    return _off_policy_mask_fn(
+                        advantages=advantages,
+                        per_token_logps=per_token_logps,
+                        old_per_token_logps=sampling_per_token_logps,
+                        mask=mask,
+                        off_policy_threshold=off_policy_threshold,
+                    )
+            else:
+                # TRL >= 0.27.1 / 1.7.x use sampling_per_token_logps (also the default going forward).
+                def _adapter(advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold):
+                    return _off_policy_mask_fn(
+                        advantages=advantages,
+                        per_token_logps=per_token_logps,
+                        sampling_per_token_logps=sampling_per_token_logps,
+                        mask=mask,
+                        off_policy_threshold=off_policy_threshold,
+                    )
+            _adapter._unsloth_wrapped = _off_policy_mask_fn
+            trainer._unsloth_off_policy_mask_adapter = _adapter
+        kwargs["get_off_policy_mask"] = _adapter
     kwargs["use_vllm"] = trainer.use_vllm
+    kwargs["vllm_importance_sampling_correction"] = getattr(trainer, "vllm_importance_sampling_correction", False)
     # Snap n_chunks to the closest divisor of bsz.
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -870,7 +934,7 @@ def grpo_accumulated_loss(
         completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
         completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
 
-        if trainer.use_vllm and sampling_per_token_logps is not None and getattr(trainer, "vllm_importance_sampling_correction", False):
+        if trainer.use_vllm and sampling_per_token_logps is not None:
             sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
         else:
             sampling_per_token_logps = None

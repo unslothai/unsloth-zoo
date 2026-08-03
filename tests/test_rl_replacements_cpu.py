@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -210,3 +211,252 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# get_off_policy_mask adapter: TRL renamed its 3rd parameter old_per_token_logps ->
+# sampling_per_token_logps in 0.27.1 (huggingface/trl#4857), so the old hardcoded keyword
+# crashed on TRL >= 0.27.1. grpo_compute_loss now passes a version-stable keyword that
+# grpo_accumulated_loss adapts to the installed parameter name.
+
+
+def test_grpo_compute_loss_uses_version_stable_off_policy_keyword():
+    src = inspect.getsource(rr.grpo_compute_loss)
+    flat = src.replace(" ", "")
+    # The off-policy branch calls get_off_policy_mask with the mismatch logprobs.
+    assert "get_off_policy_mask(" in src
+    assert "sampling_per_token_logps=sampling_per_token_logps" in flat, (
+        "grpo_compute_loss must pass the version-stable keyword; the adapter in "
+        "grpo_accumulated_loss maps it to the installed TRL parameter name."
+    )
+    # The removed TRL 0.27.0 keyword must NOT be passed here -- it is the crash source
+    # on TRL >= 0.27.1 and branching on it would live inside the compiled function.
+    assert "old_per_token_logps=" not in src, (
+        "grpo_compute_loss must not hardcode the old_per_token_logps= keyword "
+        "(TypeError on TRL >= 0.27.1)."
+    )
+
+
+def test_grpo_accumulated_loss_adapts_both_trl_off_policy_signatures():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    flat = src.replace(" ", "")
+    # Version detection happens here (eager, outside torch.compile), not in the loss.
+    assert "signature(" in src and "get_off_policy_mask" in src
+    # The adapter forwards the stable arg to BOTH the TRL 0.27.0 parameter name and
+    # the TRL >= 0.27.1 name, so it works across the huggingface/trl#4857 rename.
+    assert "old_per_token_logps=sampling_per_token_logps" in flat
+    assert "sampling_per_token_logps=sampling_per_token_logps" in flat
+
+
+def test_installed_trl_get_off_policy_mask_needs_signature_adapter():
+    """Behavioral pin against the actually-installed TRL: calling
+    get_off_policy_mask with the wrong (renamed-away) keyword raises TypeError,
+    while the installed name returns the (B, 1) Keep/Drop mask. This is the exact
+    failure the adapter routes around."""
+    pytest.importorskip("trl")
+    try:
+        from trl.trainer.grpo_trainer import GRPOTrainer
+    except Exception:  # pragma: no cover - environment dependent
+        pytest.skip("trl GRPOTrainer not importable")
+    fn = getattr(GRPOTrainer, "get_off_policy_mask", None)
+    if fn is None:
+        pytest.skip("TRL < 0.27.0 has no get_off_policy_mask")
+
+    params = list(inspect.signature(fn).parameters)
+    # (advantages, per_token_logps, <mismatch logprobs>, mask, off_policy_threshold)
+    mismatch_kw = params[2]
+    assert mismatch_kw in ("old_per_token_logps", "sampling_per_token_logps")
+    wrong_kw = (
+        "sampling_per_token_logps"
+        if mismatch_kw == "old_per_token_logps"
+        else "old_per_token_logps"
+    )
+
+    B, T = 4, 5
+    common = dict(
+        advantages=torch.randn(B, 1),
+        per_token_logps=torch.randn(B, T),
+        mask=torch.ones(B, T),
+        off_policy_threshold=0.5,
+    )
+    mismatch = torch.randn(B, T)
+
+    # Hardcoding the wrong keyword is the bug.
+    with pytest.raises(TypeError):
+        fn(**common, **{wrong_kw: mismatch})
+
+    # Routing to the installed name (what the adapter does) works.
+    out = fn(**common, **{mismatch_kw: mismatch})
+    assert out.shape == (B, 1)
+    assert set(out.unique().tolist()) <= {0.0, 1.0}
+
+
+# ---------------------------------------------------------------------------
+# off-policy mask None fallback (num_iterations == 1, no vLLM)
+# ---------------------------------------------------------------------------
+#
+# TRL defaults old_per_token_logps to per_token_logps.detach() when it is absent
+# (num_iterations == 1), then feeds that as the mismatch logprobs, so
+# get_off_policy_mask never receives None. grpo_compute_loss must do the same:
+# when both sampling_per_token_logps and old are None, fall back to new.detach().
+# get_off_policy_mask computes `mismatch - per_token_logps.detach()`, so None would
+# crash; new.detach() gives a zero-KL keep-all mask.
+
+
+def _trl_faithful_off_policy_mask(
+    advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold
+):
+    # Byte-for-byte TRL GRPOTrainer.get_off_policy_mask: crashes on a None mismatch.
+    kl_div = sampling_per_token_logps - per_token_logps.detach()
+    seq_kl_sum = (kl_div * mask).sum(dim=1, keepdim=True)
+    avg_seq_kl = seq_kl_sum / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+    is_pos_adv = advantages >= 0
+    is_low_kl = avg_seq_kl <= off_policy_threshold
+    return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)
+
+
+def test_grpo_compute_loss_off_policy_mask_falls_back_to_new_when_old_absent():
+    B, T, V = 4, 5, 11
+    torch.manual_seed(0)
+    new = torch.randn(B, T, dtype=torch.float64, requires_grad=True)
+    input_ids = torch.randint(0, V, (B, T))
+    mask = torch.ones(B, T, dtype=torch.float64)
+    advantages = torch.randn(B, dtype=torch.float64)
+
+    # num_iterations == 1 with no vLLM: old and sampling are both None.
+    loss, *_ = rr.grpo_compute_loss(
+        None, new, None, None, input_ids, mask, 0.0, advantages,
+        loss_type="grpo",
+        num_items_in_batch=float(mask.sum().item()),
+        num_processes=1,
+        current_gradient_accumulation_steps=1,
+        max_completion_length=T,
+        get_off_policy_mask=_trl_faithful_off_policy_mask,
+        off_policy_mask_threshold=0.5,
+    )
+    # No TypeError from a None mismatch, and a real finite loss came out.
+    assert torch.isfinite(loss)
+
+
+def test_grpo_compute_loss_source_has_new_detach_off_policy_fallback():
+    flat = inspect.getsource(rr.grpo_compute_loss).replace(" ", "")
+    # The mismatch logprobs must fall back to new.detach() when old is also None,
+    # matching TRL's old_per_token_logps = per_token_logps.detach() default.
+    assert "new.detach()" in flat
+    assert "oldifoldisnotNoneelsenew.detach()" in flat
+
+
+# ---------------------------------------------------------------------------
+# off-policy mask uses vLLM sampling logps independently of IS correction
+# ---------------------------------------------------------------------------
+#
+# TRL feeds the vLLM sampling logprobs to get_off_policy_mask whenever the batch
+# has them, regardless of vllm_importance_sampling_correction (which only gates the
+# IS ratio applied to the loss). grpo_compute_loss must do the same: the off-policy
+# mask sees sampling_per_token_logps even with correction off, while the IS ratio
+# stays gated on the flag.
+
+
+def _grpo_vllm_kwargs(mask, **extra):
+    base = dict(
+        loss_type="grpo",
+        use_vllm=True,
+        num_items_in_batch=float(mask.sum().item()),
+        num_processes=1,
+        current_gradient_accumulation_steps=1,
+        max_completion_length=mask.shape[1],
+        vllm_importance_sampling_mode="token_truncate",
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+    base.update(extra)
+    return base
+
+
+def test_opsm_uses_vllm_sampling_when_is_correction_off():
+    B, T, V = 4, 5, 11
+    torch.manual_seed(0)
+    new = torch.randn(B, T, dtype=torch.float64, requires_grad=True)
+    old = new.detach() + 0.1
+    sampling = new.detach() + 0.3  # distinct from old and new.detach()
+    input_ids = torch.randint(0, V, (B, T))
+    mask = torch.ones(B, T, dtype=torch.float64)
+    advantages = torch.randn(B, dtype=torch.float64)
+
+    captured = {}
+
+    def recording_mask(advantages, per_token_logps, sampling_per_token_logps, mask, off_policy_threshold):
+        captured["sampling"] = sampling_per_token_logps
+        return torch.ones(per_token_logps.shape[0], 1, dtype=mask.dtype)
+
+    rr.grpo_compute_loss(
+        None, new, old, sampling, input_ids, mask, 0.0, advantages,
+        get_off_policy_mask=recording_mask, off_policy_mask_threshold=0.5,
+        **_grpo_vllm_kwargs(mask, vllm_importance_sampling_correction=False),
+    )
+    # With correction off, the mask must still receive the real vLLM sampling logps.
+    assert torch.equal(captured["sampling"], sampling)
+
+
+def test_grpo_compute_loss_is_ratio_gated_on_correction_flag():
+    B, T, V = 4, 5, 11
+    torch.manual_seed(1)
+    new = torch.randn(B, T, dtype=torch.float64)
+    old = new + 0.1
+    sampling = new + 0.3
+    input_ids = torch.randint(0, V, (B, T))
+    mask = torch.ones(B, T, dtype=torch.float64)
+    advantages = torch.randn(B, dtype=torch.float64)
+
+    def loss_for(sampling_arg, correction):
+        return rr.grpo_compute_loss(
+            None, new.clone(), old, sampling_arg, input_ids, mask, 0.0, advantages,
+            **_grpo_vllm_kwargs(mask, vllm_importance_sampling_correction=correction),
+        )[0]
+
+    # No OPSM here (off_policy_mask_threshold defaults to None), so only the IS ratio matters.
+    loss_off = loss_for(sampling, False)
+    loss_none = loss_for(None, False)
+    loss_on = loss_for(sampling, True)
+    # Correction off: IS ratio not applied, so sampling present matches sampling absent.
+    assert torch.allclose(loss_off, loss_none)
+    # Correction on: IS ratio applied, so the loss changes.
+    assert not torch.allclose(loss_on, loss_none)
+
+
+def test_grpo_compute_loss_is_ratio_blocks_gated_on_correction_flag_source():
+    flat = inspect.getsource(rr.grpo_compute_loss).replace(" ", "")
+    # Both IS-ratio blocks must require the correction flag; the off-policy mask call must not.
+    assert flat.count("sampling_per_token_logpsisnotNoneandvllm_importance_sampling_correction") >= 2
+
+
+def test_off_policy_adapter_cache_compares_bound_method_by_value():
+    # trainer.get_off_policy_mask returns a fresh bound-method object every access, so the adapter
+    # cache must compare `_unsloth_wrapped` by value (`!=`), not identity (`is not`) - otherwise the
+    # cache never hits and a new closure is built every step, re-triggering torch.compile.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert 'getattr(_adapter, "_unsloth_wrapped", None) != _off_policy_mask_fn' in src
+    assert 'getattr(_adapter, "_unsloth_wrapped", None) is not _off_policy_mask_fn' not in src
+
+    # Behavioral proof of the underlying semantics the fix relies on.
+    class _T:
+        def get_off_policy_mask(self):  # pragma: no cover - only identity/eq is exercised
+            pass
+
+    t = _T()
+    assert t.get_off_policy_mask is not t.get_off_policy_mask  # fresh object each access
+    assert t.get_off_policy_mask == t.get_off_policy_mask      # but equal by value
+    assert (None != t.get_off_policy_mask) is True             # first-call guard still rebuilds
+
+
+def test_sampling_logps_gated_on_actual_consumer():
+    # grpo_accumulated_loss must keep vLLM sampling logps only when the off-policy mask
+    # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction)
+    # consumes them - otherwise the plain vLLM path pays for an unused aligned/compiled
+    # input and UnslothEfficientGRPO returns empty (not None) delta/flat_is_ratio.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    flat = src.replace(" ", "")
+    assert "_sampling_logps_used" in src
+    assert "vllm_importance_sampling_correction" in src
+    assert 'getattr(trainer.args,"off_policy_mask_threshold",None)isnotNone' in flat
+    # The gate must actually condition the read (not keep sampling unconditionally).
+    assert 'kwargs.get("sampling_per_token_logps",None)if_sampling_logps_usedelseNone' in flat
