@@ -311,12 +311,15 @@ def _offloaded_block_source():
     return textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
 
 
-def _extract_offloaded_log_softmax(inner_fn):
+def _exec_offloaded_block(inner_fn):
     # Exec the real block against `inner_fn` instead of the compiled kernel.
-    block = _offloaded_block_source()
     ns = {"torch": torch, "chunked_hidden_states_selective_log_softmax": inner_fn}
-    exec(block, ns)
-    return ns["Unsloth_Offloaded_Log_Softmax"]
+    exec(_offloaded_block_source(), ns)
+    return ns
+
+
+def _extract_offloaded_log_softmax(inner_fn):
+    return _exec_offloaded_block(inner_fn)["Unsloth_Offloaded_Log_Softmax"]
 
 
 @pytest.mark.parametrize("lm_requires_grad", [False, True])
@@ -349,9 +352,20 @@ def test_offloaded_log_softmax_pinned_offload_is_event_synced_and_guarded():
     assert "copy_event.record(copy_stream)" in fwd
     assert "record_stream(copy_stream)" in fwd
     assert "ctx.copy_event.wait(" in fwd
-    # CUDA machinery stays behind is_cuda so CPU-only platforms still work.
-    assert "is_cuda" in fwd
     assert 'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)' in fwd
+
+
+def test_offloaded_log_softmax_stream_module_covers_amd_and_intel():
+    # torch.cuda is also the HIP backend, so ROCm needs no branch of its own;
+    # Intel has its own namespace, as in gradient_checkpointing.py. Every other
+    # device must return None and take the pageable copy rather than crash.
+    pick = _exec_offloaded_block(_eager_selective_log_softmax)["_offload_device_module"]
+    assert pick(torch.device("cuda")) is torch.cuda           # NVIDIA and AMD/ROCm
+    assert pick(torch.device("xpu")) is getattr(torch, "xpu", None)   # Intel
+    for other in ("cpu", "meta"):
+        assert pick(torch.device(other)) is None, other
+    # accepts a tensor as well as a device
+    assert pick(torch.zeros(1)) is None
 
 
 def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
@@ -360,11 +374,13 @@ def test_offloaded_log_softmax_never_retains_hidden_states_on_gpu():
     block = _offloaded_block_source()
     assigns = [ln.strip() for ln in block.splitlines()
                if "saved_hidden_states =" in ln and "ctx.saved_hidden_states" not in ln]
-    assert assigns == [
-        "saved_hidden_states = None",
+    # Any number of "= None" resets is fine; what matters is that the only values
+    # ever stored are the pinned host buffer and the CPU copy, never the device tensor.
+    stored = [a for a in assigns if a != "saved_hidden_states = None"]
+    assert stored == [
         "saved_hidden_states = pinned_buffer",
         'saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)',
-    ], assigns
+    ], stored
     # No memory-budget heuristic may decide to keep the tensor on device.
     assert "mem_get_info" not in block
     assert "offload_retained_bytes" not in block
