@@ -3004,6 +3004,10 @@ def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
     assert granted == [True] * workers, "every caller must be told it holds"
     assert getattr(model, _AUDIO_MERGE_HOLDERS) == workers
     assert model.get_input_embeddings.__name__ == "patched", "exactly one wrapper"
+    # Note this alone does not prove serialization: the read and the write are
+    # adjacent, so the GIL rarely switches between them and the assertions
+    # above hold by luck even unlocked. The regression guard is the test below,
+    # which asserts the critical section is actually entered under the lock.
 
     # And the correction survives until the last release, not the first.
     for _ in range(workers - 1):
@@ -3011,6 +3015,42 @@ def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
         assert model.get_input_embeddings.__name__ == "patched"
     assert remove_audio_merge_patch(model) is True
     assert model.get_input_embeddings() == original()
+
+
+def test_the_hold_count_is_only_touched_under_the_lock(monkeypatch):
+    """The guard the threaded test above cannot be: assert the read/decide/write
+    really runs inside the lock, by counting acquisitions. Drop the `with` and
+    the count goes to zero, whatever the scheduler happens to do."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    acquired = []
+
+    class _RecordingLock:
+        def __init__(self):
+            self._lock = __import__("threading").Lock()
+
+        def __enter__(self):
+            acquired.append("in")
+            return self._lock.__enter__()
+
+        def __exit__(self, *exc):
+            return self._lock.__exit__(*exc)
+
+    monkeypatch.setattr(mlx_utils, "_AUDIO_MERGE_LOCK", _RecordingLock())
+
+    class _Model:
+        def get_input_embeddings(self, *a, **k):
+            return "original"
+
+    model = _Model()
+    mlx_utils.install_audio_merge_patch(model, 1)
+    assert len(acquired) == 1, "install did not serialize the hold count"
+    mlx_utils.install_audio_merge_patch(model, 1)
+    assert len(acquired) == 2, "the second hold bypassed the lock"
+    mlx_utils.remove_audio_merge_patch(model)
+    mlx_utils.remove_audio_merge_patch(model)
+    assert len(acquired) == 4, "release did not serialize the hold count"
+    assert model.get_input_embeddings() == "original"
 
 
 def test_patched_audio_merge_places_each_row_own_features():
