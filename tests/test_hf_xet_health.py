@@ -312,3 +312,42 @@ def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
     assert elapsed < 5.0, f"probe ran for {elapsed:.1f}s despite its budget"
     assert ok is None, "an unbounded probe measured nothing, so it must not demote"
     assert "budget" in reason
+
+
+def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
+    """Shared HF_HOME: scoping only the READ left writes merging streaks across nodes.
+
+    A peer's single failure could then demote a healthy node on its own first failure.
+    """
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
+
+    monkeypatch.setattr(health, "_machine_id", lambda: "node-a")
+    health.record_xet_outcome(False, "stall on A")
+
+    monkeypatch.setattr(health, "_machine_id", lambda: "node-b")
+    health._CACHED = None
+    health.record_xet_outcome(False, "first ever stall on B")
+    assert health.xet_health(probe = False).use_xet is True, (
+        "node B was demoted on its FIRST failure by inheriting node A's streak"
+    )
+
+
+def test_a_peer_nodes_successes_do_not_rescue_a_broken_node(monkeypatch, tmp_path):
+    """The mirror failure: a healthy peer's success kept zeroing a broken node's streak."""
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
+
+    for _ in range(2):
+        monkeypatch.setattr(health, "_machine_id", lambda: "node-b")
+        health._CACHED = None
+        health.record_xet_outcome(False, "stall on B")
+        monkeypatch.setattr(health, "_machine_id", lambda: "node-a")
+        health._CACHED = None
+        health.record_xet_outcome(True, "success on A")
+
+    monkeypatch.setattr(health, "_machine_id", lambda: "node-b")
+    health._CACHED = None
+    assert health.xet_health(probe = False).use_xet is False, (
+        "a genuinely broken node never demoted because peers kept clearing its streak"
+    )

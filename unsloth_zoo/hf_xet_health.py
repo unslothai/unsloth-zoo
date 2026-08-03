@@ -78,6 +78,10 @@ _LOCK = threading.Lock()
 # machine the probe exists to catch.
 _CACHED: "Optional[tuple[float, XetHealth, bool]]" = None
 _MEMO_SECONDS = 60.0  # a snapshot download asks repeatedly; don't re-probe per file
+# Bumped whenever a recorded outcome invalidates the memo. _evaluate() runs OUTSIDE the lock, so
+# without this a verdict read before a concurrent demotion could be published after it and keep
+# sending downloads to Xet for another memo window.
+_GENERATION = 0
 
 
 def _is_true(value: Optional[str]) -> bool:
@@ -137,6 +141,18 @@ def _machine_id() -> str:
         return "unknown"
 
 
+def _state_filename() -> str:
+    """One state file PER MACHINE.
+
+    Scoping only the READ was half a fix: `record_xet_outcome` still incremented whatever streak the
+    last writer left, so on a shared HF_HOME one node's single failure could demote a healthy peer
+    on its first failure, and conversely a healthy peer's success kept zeroing a genuinely broken
+    node's streak so it could never demote. A single flat record cannot hold per-machine state.
+    """
+    safe = "".join(c for c in _machine_id() if c.isalnum())[:32] or "unknown"
+    return f"unsloth_xet_health.{safe}.json"
+
+
 def health_state_path() -> Optional[Path]:
     """Where the verdict lives: beside the HF cache, so it follows a relocated ``HF_HOME``."""
     try:
@@ -152,9 +168,9 @@ def health_state_path() -> Optional[Path]:
         candidates = [hf_home, hub_cache.parent if hub_cache is not None else None]
         for base in candidates:
             if base is not None and _is_writable(base):
-                return base / STATE_FILENAME
+                return base / _state_filename()
         base = next((c for c in candidates if c is not None), None)
-        return base / STATE_FILENAME if base is not None else None
+        return base / _state_filename() if base is not None else None
     except Exception:
         return None
 
@@ -297,7 +313,7 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
 
 def xet_health(*, force: bool = False, probe: bool = True) -> XetHealth:
     """Whether a download should START on Xet. Cheap and safe to call per download."""
-    global _CACHED
+    global _CACHED, _GENERATION
 
     if _is_true(os.environ.get("UNSLOTH_DISABLE_XET")) or _is_true(
         os.environ.get("UNSLOTH_STABLE_DOWNLOADS")
@@ -307,6 +323,7 @@ def xet_health(*, force: bool = False, probe: bool = True) -> XetHealth:
         return XetHealth(True, "Xet forced by environment", "forced")
 
     with _LOCK:
+        generation = _GENERATION
         if (
             not force
             and _CACHED is not None
@@ -319,7 +336,8 @@ def xet_health(*, force: bool = False, probe: bool = True) -> XetHealth:
 
     result = _evaluate(force = force, probe = probe)
     with _LOCK:
-        _CACHED = (time.monotonic(), result, probe)
+        if generation == _GENERATION:
+            _CACHED = (time.monotonic(), result, probe)
     return result
 
 
@@ -369,7 +387,7 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
 
     Called from the download ladder, so it must never raise and never slow the caller down.
     """
-    global _CACHED
+    global _CACHED, _GENERATION
     try:
         state = _read_state()
         # A streak recorded against a different hf_xet build says nothing about this one.
@@ -403,13 +421,14 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
         })
         with _LOCK:
             _CACHED = None  # the next call must see the new verdict
+            _GENERATION += 1
     except Exception as e:
         logger.debug("Could not record Xet outcome: %s", e)
 
 
 def clear_xet_health() -> None:
     """Forget the verdict (used by tests and by an explicit user reset)."""
-    global _CACHED
+    global _CACHED, _GENERATION
     with _LOCK:
         _CACHED = None
     path = health_state_path()

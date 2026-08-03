@@ -4229,7 +4229,7 @@ def test_post_download_init_is_not_a_stall(hf_cache):
     calls: list[str] = []
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
-        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 5.0,
     )
     try:
         # Hold the partial long enough that the watchdog thread is certain to have measured it at
@@ -4239,7 +4239,7 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
-        time.sleep(1.0)                    # well past connect_timeout
+        time.sleep(1.0)                    # inside both budgets: finishing up is not a hang
         assert calls == [], "watchdog fired during post-download initialisation"
     finally:
         stop.set()
@@ -4494,5 +4494,33 @@ def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeyp
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a child owning a frozen partial never tripped"
         assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_a_hang_between_snapshot_files_is_detected(hf_cache):
+    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete.
+
+    So "bytes flowed and no partial is open" is a normal mid-download state, not just the finished
+    one. Resetting the clock unconditionally there made a child hung between files invisible to both
+    clocks forever, once any byte had been seen anywhere -- the exact unbounded hang this watchdog
+    exists to catch, and the reason the connect clock only ever protected the FIRST file.
+    """
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "first-file.incomplete"
+    part.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.4,
+    )
+    try:
+        time.sleep(0.3)                                  # healthy progress on file 1
+        part.unlink()
+        (blobs / "first-file").write_bytes(b"\0" * 1024)  # file 1 completed
+        # ...and now the child hangs in metadata for file 2, never opening a partial.
+        assert _wait(lambda: bool(calls), timeout = 4.0), "a hang between files was never detected"
+        assert "did not resume" in calls[0], calls
     finally:
         stop.set()

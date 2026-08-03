@@ -741,9 +741,19 @@ def start_watchdog(
                     )
                     return
             else:
-                # Bytes flowed and the partial is gone: the transfer finished. Model init and lock
-                # waits happen here and must never be read as a stall.
-                last_change = now
+                # Bytes flowed and no partial is open: either the transfer FINISHED (symlinking) or
+                # the child is BETWEEN FILES and hung before opening the next one -- a snapshot does
+                # metadata and the cache lock before creating the .incomplete, so this state is
+                # normal mid-download. Resetting unconditionally made that hang invisible to BOTH
+                # clocks forever once any byte had been seen, which is the failure this watchdog
+                # exists to catch. The patient connect clock governs the gap; real repo-wide
+                # progress resets it above, and a live peer is covered by the waiter gate.
+                if elapsed >= connect_timeout and not _waiting_on_a_peers_partial():
+                    _trip(
+                        f"Download did not resume ({transport} transport) "
+                        f"-- no data for {int(elapsed)}s"
+                    )
+                    return
 
             if now - last_heartbeat >= heartbeat_interval:
                 last_heartbeat = now
