@@ -1397,6 +1397,12 @@ def grpo_accumulated_loss(
                 # No accelerator, or the async copy is unavailable: pageable copy.
                 saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
             ctx.saved_hidden_states = saved_hidden_states
+            # Drop the clone before the log-softmax below. hidden_states is usually a
+            # [:, :-1, :] slice, so .contiguous() allocated a full copy; holding the
+            # reference across the forward would keep it resident alongside the chunk
+            # logits. record_stream still blocks reuse until the D2H lands, so the
+            # allocator reclaims it mid-compute rather than at the end of forward.
+            del detached_hidden_states
 
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad

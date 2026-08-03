@@ -383,6 +383,21 @@ def test_offloaded_log_softmax_stream_module_dispatch(monkeypatch, vendor, hip_v
         assert got is getattr(torch, "xpu", None), (vendor, got)
 
 
+def test_offloaded_log_softmax_releases_clone_before_forward_compute():
+    # hidden_states is normally a [:, :-1, :] slice, so .contiguous() allocates a
+    # full copy. Holding it across the no-grad log-softmax would keep it resident
+    # alongside the chunk logits and raise the forward-phase peak; measured at
+    # +0.376 GiB on an 8x8192x4096 bf16 chunk before this ordering was fixed.
+    # record_stream still blocks reuse until the D2H lands, so dropping the
+    # reference early is safe.
+    block = _offloaded_block_source()
+    released = block.index("del detached_hidden_states")
+    compute = block.index("with torch.no_grad():")
+    assert released < compute, "clone must be released before the forward compute"
+    # and nothing may use it after the release
+    assert "detached_hidden_states" not in block[released + 30:compute]
+
+
 def test_offloaded_log_softmax_stream_module_accepts_tensor_or_device():
     pick = _exec_offloaded_block(_eager_selective_log_softmax)["_offload_device_module"]
     assert pick(torch.zeros(1)) is None
