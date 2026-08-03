@@ -25,6 +25,7 @@ import math
 import os
 import threading
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from numbers import Integral
@@ -371,8 +372,9 @@ def _api_shape_error(details: str) -> RuntimeError:
     return RuntimeError(
         "Unsupported mlx-lm batch-generation API shape "
         f"({details}) in {_installed_mlx_lm_version()}. Batched generation "
-        "needs a BatchGenerator that streams per-token events; upgrade or "
-        "reinstall mlx-lm, or use model.generate for sequential decoding."
+        "needs a BatchGenerator that streams per-token events, which requires "
+        "mlx-lm 0.31.2 or newer; upgrade mlx-lm, or use model.generate for "
+        "sequential decoding."
     )
 
 
@@ -495,6 +497,10 @@ def _restore_training_flags(states: Sequence[tuple[Any, bool]]):
             set_mode = getattr(module, "_set_training_mode", None)
             if callable(set_mode):
                 set_mode(training)
+            elif isinstance(getattr(type(module), "training", None), property):
+                # mlx.nn.Module exposes training read-only; _set_training_mode
+                # only arrived in mlx 0.30.2, so write the backing attribute.
+                module._training = training
             else:
                 setattr(module, "training", training)
         except BaseException as exc:
@@ -1691,15 +1697,14 @@ def fast_generate(
     prefill_batch_size=8,
     completion_batch_size=32,
     max_kv_size=None,
-    kv_bits=None,
-    kv_group_size=None,
 ):
     """Batch-generate text rollouts from a training-resident MLX model.
 
     Accepts one rendered prompt or a sequence of rendered prompts and always
     returns a list of ``GenerationResult`` objects in input order. Callers that
-    need token-id prompts or heterogeneous per-request controls should use
-    ``generate_batch`` directly.
+    need token-id prompts, images or audio, or heterogeneous per-request
+    controls should use ``generate_batch`` directly. KV-cache quantisation is
+    not forwarded by this engine; use ``model.generate`` for that.
     """
 
     tokenizer = getattr(self, "_tokenizer", None)
@@ -1707,6 +1712,14 @@ def fast_generate(
         raise ValueError("Unsloth MLX: fast_generate requires model._tokenizer.")
     if isinstance(prompts, str):
         prompts = [prompts]
+    elif isinstance(prompts, Mapping):
+        # A vLLM prompt dict iterates to its keys, which are strings, so every
+        # guard below would pass and generation would run on the key names.
+        raise TypeError(
+            "Unsloth MLX: fast_generate takes rendered prompt strings, not "
+            "vLLM prompt dicts. Pass the rendered text, and use generate_batch "
+            "with GenerationRequest(prompt=..., image=...) for media."
+        )
     else:
         try:
             prompts = list(prompts)
@@ -1732,8 +1745,6 @@ def fast_generate(
         prefill_batch_size=prefill_batch_size,
         completion_batch_size=completion_batch_size,
         max_kv_size=max_kv_size,
-        kv_bits=kv_bits,
-        kv_group_size=kv_group_size,
     )
     requests = [GenerationRequest(prompt=prompt) for prompt in prompts]
     return generate_batch(self, tokenizer, requests, defaults=defaults)

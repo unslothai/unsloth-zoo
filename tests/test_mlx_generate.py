@@ -1,11 +1,19 @@
 import concurrent.futures
 import contextlib
+import importlib.util
 import inspect
 import pathlib
 import types
 from dataclasses import make_dataclass
 import pytest
-from unsloth_zoo.mlx.generate import (
+
+# These are logic tests, but they cross into mlx.core and mlx_vlm at a few
+# points, so off Apple Silicon they run against the torch-backed shim.
+if importlib.util.find_spec("mlx") is None:
+    from mlx_simulation import simulate_mlx_on_torch
+    simulate_mlx_on_torch()
+
+from unsloth_zoo.mlx.generate import (  # noqa: E402
     GenerationDefaults, GenerationRequest, SamplingParams,
     _GENERATION_MODE_LOCK, _PendingResult, _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
@@ -257,6 +265,14 @@ def test_fast_generate_binds_text_and_vision_models_and_maps_shared_controls(mon
     assert (captured["defaults"].prefill_batch_size, captured["defaults"].completion_batch_size, captured["defaults"].max_kv_size) == (2, 3, 32)
     with pytest.raises(TypeError, match="every fast_generate prompt"):
         model.fast_generate(["valid", 3])
+    # A vLLM prompt dict iterates to its keys, so it must be refused by type
+    # rather than silently generating from the key names.
+    with pytest.raises(TypeError, match="not vLLM prompt dicts"):
+        model.fast_generate({"prompt": "hi", "multi_modal_data": {}})
+    # KV-cache quantisation is never forwarded, so it is not a parameter.
+    for control in ("kv_bits", "kv_group_size"):
+        with pytest.raises(TypeError):
+            model.fast_generate(["one"], **{control: 4})
     vlm = types.SimpleNamespace(_is_vlm_model=True)
     _patch_mlx_saving(vlm, tokenizer)
     assert vlm.fast_generate(["look"]) is expected
