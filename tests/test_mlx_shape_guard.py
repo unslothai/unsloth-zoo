@@ -583,6 +583,42 @@ def test_streaming_audio_is_detected_without_consuming_the_stream():
     assert carries is False and list(stream) == []
 
 
+def test_the_peeked_stream_still_closes_the_producer_behind_it():
+    """The peek hands the run a wrapper, and the run's cleanup closes what it
+    was handed. A wrapper with no close of its own therefore ends the run with
+    the producer -- and the files, workers and buffers it holds -- still open."""
+    _requires_mlx()
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    def producer(batches):
+        try:
+            for batch in batches:
+                yield batch
+        finally:
+            closed.append(True)
+
+    for consumed in (0, 1, 3):
+        closed = []
+        _, stream = MLXTrainer._peek_stream_carries_audio(
+            producer([{"pixel_values": index} for index in range(3)])
+        )
+        for _, _batch in zip(range(consumed), stream):
+            pass
+
+        trainer = object.__new__(MLXTrainer)
+        trainer._active_batch_iter = stream
+        trainer._close_active_batch_iterator()
+        assert closed, f"the producer outlived the run ({consumed} consumed)"
+
+    # An exhausted source is still the run's to close, and a stream nobody
+    # peeked -- there is none -- is still reported as nothing to close.
+    closed = []
+    _, stream = MLXTrainer._peek_stream_carries_audio(producer([]))
+    stream.close()
+    assert closed
+    assert MLXTrainer._peek_stream_carries_audio(None) == (False, None)
+
+
 def test_a_streamed_batch_that_turns_out_to_carry_audio_leaves_the_compiled_path():
     """The peek sees one batch, so a text-first stream plans as compilable.
     Every later batch is therefore asked directly: without this the audio batch

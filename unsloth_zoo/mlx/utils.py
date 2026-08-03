@@ -6779,11 +6779,22 @@ def _audio_payload_as_pairs(clips, processor):
 
     A clip carries the rate it was decoded at; the processor's own extractor
     rate stands in for anything that does not.
+
+    The nested payload a processor like MiniCPM-o is handed keeps its shape: a
+    row is a list of clips, not a clip, so pairing it whole would fuse a row
+    into one 2-D "clip" carrying no rate -- or raise out of numpy when the
+    row's clips differ in length, which reports a payload the processor never
+    saw. Rows are paired clip by clip instead.
     """
     default_rate = audio_extractor_sampling_rate(processor)
-    return [(np.asarray(clip),
-             getattr(clip, "sampling_rate", None) or default_rate)
-            for clip in clips]
+
+    def _pair(clip):
+        return (np.asarray(clip),
+                getattr(clip, "sampling_rate", None) or default_rate)
+
+    return [[_pair(clip) for clip in row] if isinstance(row, (list, tuple))
+            else _pair(row)
+            for row in clips]
 
 
 def _format_vlm_audio_for_processor(all_audio, processor=None):
@@ -6903,7 +6914,19 @@ def _to_mx_vlm_batch(inputs):
                     for x in value
                 ])
             except Exception:
-                batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
+                if key in _AUDIO_FEATURE_PAYLOAD_KEYS and len(value) > 1:
+                    # Clips of unequal duration do not stack, and dropping to
+                    # value[0] would leave one clip behind ids, placeholder runs
+                    # and labels for all of them -- the pairing
+                    # `_assert_audio_features_present` just verified. Kept entry
+                    # by entry so the count survives; ragged audio never reaches
+                    # the compiled path, so there is no signature to hold.
+                    batch[key] = [
+                        x if isinstance(x, mx.array) else mx.array(np.asarray(x))
+                        for x in value
+                    ]
+                else:
+                    batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
         else:
             batch[key] = value
 

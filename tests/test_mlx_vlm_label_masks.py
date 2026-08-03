@@ -3729,6 +3729,67 @@ def test_ragged_image_metadata_survives_an_audio_batch():
     ]
 
 
+def test_clips_of_unequal_duration_all_reach_the_model():
+    """Audio features are one array per clip and clips run different lengths,
+    so they do not stack. Keeping only the first left a batch whose ids,
+    placeholder runs and labels still described every clip -- the pairing
+    `_assert_audio_features_present` verifies a step earlier, undone here, and
+    silently: the run trains against features belonging to another clip."""
+    from unsloth_zoo.mlx.utils import (
+        _assert_audio_features_present, _to_mx_vlm_batch,
+        _vlm_batch_carries_audio,
+    )
+
+    inputs = {
+        "input_ids": np.zeros((1, 8), dtype=np.int32),
+        "input_features": [np.zeros((80, 300), np.float32),
+                           np.zeros((80, 137), np.float32)],
+    }
+    # The count the collation established, before the conversion touches it.
+    _assert_audio_features_present(inputs, 2, _FakeProcessor())
+
+    features = _to_mx_vlm_batch(inputs)["input_features"]
+    assert len(features) == 2, "a clip was dropped by the conversion"
+    assert [tuple(f.shape) for f in features] == [(80, 300), (80, 137)]
+    # And the batch still reports itself as audio, so it is routed eagerly
+    # rather than into a compiled signature it has no fixed shape for.
+    assert _vlm_batch_carries_audio({"input_features": features}) is True
+
+    # Equal-length clips stack as before -- the fallback is not the usual path.
+    stacked = _to_mx_vlm_batch({
+        "input_features": [np.zeros((80, 300), np.float32)] * 2,
+    })["input_features"]
+    assert tuple(stacked.shape) == (2, 80, 300)
+
+
+def test_nested_audio_rows_are_paired_clip_by_clip():
+    """A processor that wants ``(samples, rate)`` pairs may also want its audio
+    nested per row (MiniCPM-o). Pairing the payload as though its entries were
+    clips fused each row into one 2-D 'clip' carrying no rate -- or, when the
+    row's clips ran different lengths, raised out of numpy, reporting a payload
+    the processor was never offered."""
+    from unsloth_zoo.mlx.utils import (
+        _AudioClip, _audio_payload_as_pairs, _format_vlm_audio_for_processor,
+    )
+
+    nesting = type("_MiniCPMOProcessor", (), {})
+    nesting.__module__ = "transformers.models.minicpmo.processing_minicpmo"
+
+    rows = [[_AudioClip(np.zeros(1600, np.float32), 16000),
+             _AudioClip(np.zeros(800, np.float32), 22050)],
+            [_AudioClip(np.zeros(1600, np.float32), 16000)]]
+    payload = _format_vlm_audio_for_processor(rows, processor=nesting())
+    paired = _audio_payload_as_pairs(payload, nesting())
+
+    assert [len(row) for row in paired] == [2, 1], "the row layout was lost"
+    assert [[rate for _, rate in row] for row in paired] == [
+        [16000, 22050], [16000]
+    ], "clips took a neighbour's rate"
+    assert [[tuple(s.shape) for s, _ in row] for row in paired] == [
+        [(1600,), (800,)], [(1600,)]
+    ]
+
+
 def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
     """The check can only see clips the collation passes it, so dropping that
     wiring would leave it live but blind."""

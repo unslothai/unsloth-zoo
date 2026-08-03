@@ -39,7 +39,6 @@ Usage mirrors TRL notebooks:
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 import concurrent.futures
 import hashlib
-import itertools
 import json
 import math
 import os
@@ -368,6 +367,35 @@ class _MLXTokenizedDatasetView:
         item["input_ids"] = encoded
         item["attention_mask"] = [1] * len(encoded)
         return item
+
+
+class _PeekedBatchStream:
+    """A peeked batch put back in front of its source, cleanup intact.
+
+    ``itertools.chain`` would do the putting back, but it owns no ``close`` and
+    the run's cleanup only closes what it is handed -- so the producer behind a
+    peeked stream, and whatever it holds open, would survive the run that made
+    it. Close is forwarded to the source instead, at whatever point the run
+    ends, including before the first batch is drawn.
+    """
+
+    def __init__(self, source, pending = ()):
+        self._pending = list(pending)
+        self._source = source
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pending:
+            return self._pending.pop(0)
+        return next(self._source)
+
+    def close(self):
+        self._pending.clear()
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            close()
 
 
 def _mlx_stream_declares_infinite(dataset):
@@ -3199,11 +3227,13 @@ class MLXTrainer:
         try:
             first = next(batch_iter)
         except StopIteration:
-            return False, iter(())
+            # Exhausted, but still the run's to close: the source may hold a
+            # file or a worker open past its last batch.
+            return False, _PeekedBatchStream(batch_iter)
         payload = first[0] if isinstance(first, tuple) else first
         return (
             _vlm_batch_carries_audio(payload),
-            itertools.chain((first,), batch_iter),
+            _PeekedBatchStream(batch_iter, (first,)),
         )
 
     @staticmethod
