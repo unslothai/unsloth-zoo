@@ -114,8 +114,18 @@ def health_state_path() -> Optional[Path]:
     try:
         from .hf_cache import _active_caches
 
+        from .hf_cache import _is_writable
+
         hf_home, hub_cache, _ = _active_caches()
-        base = hf_home or (hub_cache.parent if hub_cache is not None else None)
+        # HF_HOME resolves to a default even when it is read-only, so preferring it unconditionally
+        # sent the verdict to an unwritable path whenever a user relocated only HF_HUB_CACHE. Every
+        # write then failed silently, and since the failure streak is rebuilt from this file alone,
+        # such a machine could never be demoted no matter how often Xet stalled.
+        candidates = [hf_home, hub_cache.parent if hub_cache is not None else None]
+        for base in candidates:
+            if base is not None and _is_writable(base):
+                return base / STATE_FILENAME
+        base = next((c for c in candidates if c is not None), None)
         return base / STATE_FILENAME if base is not None else None
     except Exception:
         return None

@@ -4282,3 +4282,66 @@ def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
         assert "did not start" in calls[0]
     finally:
         stop.set()
+
+
+def test_empty_partial_gets_the_connect_deadline_not_the_stall_one(hf_cache):
+    """An .incomplete created before the first byte must not consume the 30s data budget.
+
+    Hub/hf_xet can open the destination before CAS setup finishes, so phasing on the file's
+    existence handed a healthy-but-slow connect the short deadline. Bytes mark the transition.
+    """
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "opened-but-empty.incomplete").write_bytes(b"")
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(1.0)  # way past stall_timeout, nowhere near connect_timeout
+        assert calls == [], f"empty partial was charged the data deadline: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_partial_that_stops_growing_still_trips(hf_cache):
+    """Once bytes have flowed, the short data deadline applies again."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "growing-then-frozen.incomplete"
+    part.write_bytes(b"\0" * 4096)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
+    )
+    try:
+        part.write_bytes(b"\0" * 8192)     # a byte of progress, then nothing
+        assert _wait(lambda: bool(calls), timeout = 3.0), "frozen partial never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
+    """The child we just killed leaves a ~30s-old partial, and the sibling grace is 180s.
+
+    Sparing it made has_active_incomplete_blobs() force force_download, which on a snapshot
+    re-downloads every already-complete shard over the slower transport. Uses the real prepare:
+    the autouse fixture stubs it to a no-op for the ladder tests.
+    """
+    blobs = _blobs_dir(hf_cache)
+    mine = blobs / "killed-child.incomplete"
+    theirs = blobs / "live-sibling.incomplete"
+    for f in (mine, theirs):
+        f.write_bytes(b"\0" * 1024)       # both are brand new, well inside the grace
+
+    _REAL_DEFAULT_PREPARE(
+        "model", REPO, cache_dir = str(hf_cache),
+        active_grace = 180.0,
+        owned_incomplete_blobs = {mine.name},
+    )
+
+    assert not mine.exists(), "the stalled child's own partial survived the purge"
+    assert theirs.exists(), "a live sibling's partial was deleted"

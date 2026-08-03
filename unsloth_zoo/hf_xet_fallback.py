@@ -331,9 +331,16 @@ def _default_prepare_for_http(
                         if owned_incomplete_blobs is not None and blob.name not in owned_incomplete_blobs:
                             continue
                         try:
-                            # Spare a partial touched within active_grace (a slow sibling, not stalled);
-                            # our killed partial has been static for the full stall timeout so it purges.
-                            if time.time() - blob.stat().st_mtime < active_grace:
+                            # The mtime grace exists only to GUESS whether a partial belongs to a live
+                            # sibling. When ownership is known the guess is not just redundant but wrong:
+                            # the child we killed 30s ago leaves a 30s-old partial, which a 180s grace
+                            # spares, so has_active_incomplete_blobs() then forces force_download and a
+                            # snapshot re-fetches every already-complete shard over HTTP.
+                            owned = (
+                                owned_incomplete_blobs is not None
+                                and blob.name in owned_incomplete_blobs
+                            )
+                            if not owned and time.time() - blob.stat().st_mtime < active_grace:
                                 continue
                             blob.unlink()
                         except OSError:
@@ -545,9 +552,12 @@ def start_watchdog(
         last_size = state[0] if state is not None else 0
         last_change = time.monotonic()
         last_heartbeat = 0.0
-        # False until a partial has been observed at least once. Before that we are in the
-        # connect / metadata phase; after it, a partial going away means the transfer finished.
-        seen_incomplete = bool(state[1]) if state is not None else False
+        # False until at least one BYTE has been observed. Phasing on the partial's existence
+        # instead was wrong in both directions: hub/hf_xet can create the .incomplete before CAS
+        # setup finishes, which handed a healthy-but-slow connect the 30s data deadline rather than
+        # the 90s connect one; and a partial going away after bytes flowed means the transfer
+        # finished. Bytes, not the file, mark the transition.
+        seen_bytes = bool(state[0]) if state is not None else False
         peer_size: Optional[int] = None
 
         def _peer_progressing() -> bool:
@@ -591,23 +601,24 @@ def start_watchdog(
             if current_size != last_size:
                 last_size = current_size
                 last_change = now
-            if has_incomplete:
-                seen_incomplete = True
+            if current_size:
+                seen_bytes = True
 
             elapsed = now - last_change
-            if has_incomplete:
-                # Bytes are flowing (or should be): a frozen count is a hang.
+            if has_incomplete and seen_bytes:
+                # Bytes have flowed into a partial that is still open: a frozen count is a hang.
                 if elapsed >= stall_timeout:
                     _trip(
                         f"Download appears stalled ({transport} transport) "
                         f"-- no progress for {int(elapsed)}s"
                     )
                     return
-            elif not seen_incomplete:
-                # No partial has EVER appeared: the child is stuck before the first byte, OR it is
-                # queued on the hub's per-file cache lock while another writer fetches the same
-                # blob. Without this branch such a child is invisible to the watchdog forever;
-                # without the peer check, a legitimate lock wait is killed at connect_timeout.
+            elif not seen_bytes:
+                # Not one byte yet, whether or not an empty .incomplete already exists: the child
+                # is stuck before the first byte, OR it is queued on the hub's per-file cache lock
+                # while another writer fetches the same blob. Without this branch such a child is
+                # invisible to the watchdog forever; without the peer check, a legitimate lock wait
+                # is killed at connect_timeout.
                 if _peer_progressing():
                     last_change = now
                 elif elapsed >= connect_timeout:
@@ -617,7 +628,7 @@ def start_watchdog(
                     )
                     return
             else:
-                # Partial seen earlier and now gone: the transfer finished. Model init and lock
+                # Bytes flowed and the partial is gone: the transfer finished. Model init and lock
                 # waits happen here and must never be read as a stall.
                 last_change = now
 
