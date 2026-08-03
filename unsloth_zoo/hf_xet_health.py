@@ -33,6 +33,7 @@ Design rules:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -72,6 +73,18 @@ _PROBE_REPO = "unsloth/Qwen3-30B-A3B-Instruct-2507"
 _TRUTHY = {"1", "true", "yes", "on"}
 _LOCK = threading.Lock()
 _PROBE_LOCK = threading.Lock()
+# Serialises the read-modify-write on the state FILE, which _LOCK does not cover (_LOCK guards the
+# in-memory memo only). Two writers matter because a success RESETS the streak while a failure
+# INCREMENTS it, so losing either one is not "the same answer one download later" -- interleave a
+# success with a failure and the file ends up recording two consecutive failures that never
+# happened, demoting a healthy machine to HTTP for a day. Concurrent writers are ordinary here: the
+# hub deliberately runs same-repo GGUF variants at once, and a multi-rank launch has every rank
+# calling from_pretrained.
+_STATE_MUTEX = threading.Lock()
+# How long a writer will wait for a peer PROCESS before giving up and writing unserialised. The
+# critical section is one small read plus one os.replace, so this is generous; and degrading is
+# safe because it is exactly today's behaviour. Never blocking a download outranks the race.
+_STATE_LOCK_TIMEOUT = 5.0
 # (worker, result sink) for the at-most-one in-flight probe. Read and replaced only under _PROBE_LOCK.
 _PROBE_INFLIGHT: "Optional[tuple[threading.Thread, list]]" = None
 # (timestamp, verdict, was_probed). The probe flag is part of the key because the download path
@@ -176,6 +189,38 @@ def health_state_path() -> Optional[Path]:
         return base / _state_filename() if base is not None else None
     except Exception:
         return None
+
+
+@contextlib.contextmanager
+def _state_file_guard():
+    """Hold the cross-process lock on the state file, or fall through unserialised.
+
+    The lock lives in a SIDECAR file: _write_state swaps the state file's inode via os.replace, so
+    writers locking the state file itself would end up holding locks on different objects.
+    """
+    lock = None
+    try:
+        from filelock import FileLock   # a huggingface_hub dependency, always installed
+
+        path = health_state_path()
+        if path is None:
+            # No writable cache dir: there is no state file to serialise access to, and building a
+            # lock path from the string "None" would litter the working directory.
+            yield
+            return
+        lock = FileLock(str(path) + ".lock", timeout = _STATE_LOCK_TIMEOUT)
+        lock.acquire()
+    except Exception as e:  # Timeout, read-only cache dir, filelock somehow absent
+        logger.debug("Xet health state lock unavailable (%s); writing unserialised", e)
+        lock = None
+    try:
+        yield
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
 
 
 def _read_state() -> dict:
@@ -385,16 +430,17 @@ def _evaluate(*, force: bool, probe: bool) -> XetHealth:
         # Inconclusive. Persist nothing: a wrong "unhealthy" downgrades a working machine for a
         # day, a wrong "healthy" costs one fallback.
         return XetHealth(True, reason, "default")
-    _write_state({
-        "verdict": "xet" if ok else "http",
-        "reason": reason,
-        "ts": time.time(),
-        "hf_xet_version": _hf_xet_version(),
-        "endpoint": _endpoint(),
-        "machine": _machine_id(),
-        # A fresh probe supersedes the old streak; failures are counted from here.
-        "consecutive_failures": 0,
-    })
+    with _STATE_MUTEX, _state_file_guard():
+        _write_state({
+            "verdict": "xet" if ok else "http",
+            "reason": reason,
+            "ts": time.time(),
+            "hf_xet_version": _hf_xet_version(),
+            "endpoint": _endpoint(),
+            "machine": _machine_id(),
+            # A fresh probe supersedes the old streak; failures are counted from here.
+            "consecutive_failures": 0,
+        })
     return XetHealth(ok, reason, "probe")
 
 
@@ -405,36 +451,10 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
     """
     global _CACHED, _GENERATION
     try:
-        state = _read_state()
-        # A streak recorded against a different hf_xet build says nothing about this one.
-        if state.get("hf_xet_version") != _hf_xet_version() or state.get("endpoint") != _endpoint():
-            state = {}
-        failures = 0 if ok else int(state.get("consecutive_failures") or 0) + 1
-
-        if ok:
-            verdict, note = "xet", reason or "Xet download succeeded"
-        elif failures >= DEMOTION_THRESHOLD:
-            verdict = "http"
-            note = reason or f"Xet failed {failures} times in a row on this machine"
-            logger.warning(
-                "Xet has now failed %d times in a row; new downloads will use HTTP for the next "
-                "%dh (set UNSLOTH_FORCE_XET=1 to override).",
-                failures, DEMOTED_TTL_SECONDS // 3600,
-            )
-        else:
-            # Below the threshold, keep whatever verdict stands rather than promoting on a failure.
-            verdict = str(state.get("verdict") or "xet")
-            note = str(state.get("reason") or "")
-
-        _write_state({
-            "verdict": verdict,
-            "reason": note,
-            "ts": time.time(),
-            "hf_xet_version": _hf_xet_version(),
-            "endpoint": _endpoint(),
-            "machine": _machine_id(),
-            "consecutive_failures": failures,
-        })
+        # The whole read-modify-write, not just the write: the streak is derived from what is on
+        # disk, so a peer landing between the two would be dropped.
+        with _STATE_MUTEX, _state_file_guard():
+            _record_outcome_locked(ok, reason)
         with _LOCK:
             _CACHED = None  # the next call must see the new verdict
             _GENERATION += 1
@@ -442,11 +462,49 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
         logger.debug("Could not record Xet outcome: %s", e)
 
 
+def _record_outcome_locked(ok: bool, reason: str) -> None:
+    """Body of record_xet_outcome. Caller holds _STATE_MUTEX and the state file guard."""
+    state = _read_state()
+    # A streak recorded against a different hf_xet build says nothing about this one.
+    if state.get("hf_xet_version") != _hf_xet_version() or state.get("endpoint") != _endpoint():
+        state = {}
+    failures = 0 if ok else int(state.get("consecutive_failures") or 0) + 1
+
+    if ok:
+        verdict, note = "xet", reason or "Xet download succeeded"
+    elif failures >= DEMOTION_THRESHOLD:
+        verdict = "http"
+        note = reason or f"Xet failed {failures} times in a row on this machine"
+        logger.warning(
+            "Xet has now failed %d times in a row; new downloads will use HTTP for the next "
+            "%dh (set UNSLOTH_FORCE_XET=1 to override).",
+            failures, DEMOTED_TTL_SECONDS // 3600,
+        )
+    else:
+        # Below the threshold, keep whatever verdict stands rather than promoting on a failure.
+        verdict = str(state.get("verdict") or "xet")
+        note = str(state.get("reason") or "")
+
+    _write_state({
+        "verdict": verdict,
+        "reason": note,
+        "ts": time.time(),
+        "hf_xet_version": _hf_xet_version(),
+        "endpoint": _endpoint(),
+        "machine": _machine_id(),
+        "consecutive_failures": failures,
+    })
+
+
 def clear_xet_health() -> None:
     """Forget the verdict (used by tests and by an explicit user reset)."""
     global _CACHED, _GENERATION
     with _LOCK:
         _CACHED = None
+        # Bump the generation too, or an evaluation that started before this clear passes its
+        # generation guard and republishes the verdict we just forgot. Symmetry with
+        # record_xet_outcome matters more than the current reachability: this is public API.
+        _GENERATION += 1
     path = health_state_path()
     if path is not None:
         try:

@@ -118,6 +118,59 @@ def test_two_failures_demote_and_a_success_recovers(monkeypatch):
     assert health.xet_health(probe = False).use_xet is True
 
 
+def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
+    """A success RESETS the streak while a failure INCREMENTS it, so the two are not commutative
+    and losing either one is not "the same answer, one download later". Starting from a streak of
+    1, no serial order reaches the threshold: (fail, ok) ends at 0, (ok, fail) ends at 1. A
+    demotion therefore proves an update was dropped, and it costs the user a full day on HTTP on a
+    machine where Xet works. Concurrent writers are ordinary here: the hub deliberately runs
+    same-repo GGUF variants at once, and every rank of a multi-rank launch calls from_pretrained.
+
+    The interleaving is forced rather than raced, so this cannot pass by luck of timing.
+    """
+    import threading
+
+    health.record_xet_outcome(False, "seed")           # streak = 1
+    assert json.loads(health.health_state_path().read_text())["consecutive_failures"] == 1
+
+    real_read = health._read_state
+    failure_thread = {"id": None}
+    failure_has_read = threading.Event()
+    success_done = threading.Event()
+
+    def _instrumented_read():
+        state = real_read()
+        if threading.get_ident() == failure_thread["id"]:
+            failure_has_read.set()
+            # Hand the success every chance to slip inside our read-modify-write. Under the guard
+            # it cannot, so this simply times out.
+            success_done.wait(1.0)
+        return state
+
+    monkeypatch.setattr(health, "_read_state", _instrumented_read)
+
+    def _failure():
+        failure_thread["id"] = threading.get_ident()
+        health.record_xet_outcome(False, "concurrent failure")
+
+    def _success():
+        assert failure_has_read.wait(5.0)
+        health.record_xet_outcome(True, "concurrent success")
+        success_done.set()
+
+    threads = [threading.Thread(target = _failure), threading.Thread(target = _success)]
+    failure_thread["id"] = None
+    threads[0].start()
+    threads[1].start()
+    for thread in threads:
+        thread.join(15.0)
+        assert not thread.is_alive()
+
+    final = json.loads(health.health_state_path().read_text())
+    assert final["verdict"] == "xet", f"a lost update demoted a healthy machine: {final}"
+    assert final["consecutive_failures"] < health.DEMOTION_THRESHOLD, final
+
+
 def test_verdict_expires(monkeypatch):
     _big_machine(monkeypatch)
     health.record_xet_outcome(False, "x")
