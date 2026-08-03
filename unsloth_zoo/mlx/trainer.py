@@ -6532,22 +6532,29 @@ class MLXTrainer:
             # whether the compiled call happens to raise. Finite plans are
             # already routed by the survey, and only compiled runs can care.
             #
-            # Single-process only, for the two reasons the runtime fallback
-            # below is: the DDP path runs its own local-grad step_fn with a
-            # different signature, and each rank shards its own stream, so a
-            # rank that alone saw audio would abort into a collective its peers
-            # still expect to reach. The planner scopes its streaming strict
-            # abort the same way.
-            if (
-                _use_compile
-                and self._is_vlm
-                and distributed_world_size <= 1
-                and not _ddp_compile_local_grad
-                and self._streamed_audio_leaves_the_compiled_path(
+            # Under DDP the answer has to be rank-wide before anyone acts on it:
+            # each rank shards its own stream, so one rank alone seeing audio
+            # must still take every rank off the compiled path together, and a
+            # rank that decided locally would abort into a collective its peers
+            # still expect to reach. `_distributed_any_flag` is the same
+            # primitive the per-batch failure consensus already uses, and the
+            # collective is confined to compiled streaming runs -- a surveyed
+            # plan short-circuits before it, and once audio has appeared
+            # `_use_compile` is False and the question stops being asked.
+            if _use_compile and self._is_vlm and not isinstance(
+                batches, FiniteVLMBatchPlan,
+            ):
+                _late_audio = self._streamed_audio_leaves_the_compiled_path(
                     batch_data, batches,
                 )
-            ):
+                if distributed_world_size > 1:
+                    _late_audio = self._distributed_any_flag(_late_audio)
+            else:
+                _late_audio = False
+            if _late_audio:
                 if not _compile_fallback_allowed():
+                    # Every rank reached the same verdict above, so this raises
+                    # on all of them together rather than stranding peers.
                     raise RuntimeError(
                         "Unsloth: strict mx.compile cannot plan audio training: "
                         "audio feature shapes follow clip duration, so every "
@@ -6561,7 +6568,13 @@ class MLXTrainer:
                     "training continues eagerly because audio feature shapes "
                     "cannot be compiled into fixed signatures."
                 )
-                step_fn = _uncompiled_step_fn
+                if _ddp_compile_local_grad:
+                    # The DDP local-grad path has its own eager step_fn with a
+                    # different signature; mirror its runtime fallback exactly.
+                    step_fn = _ddp_eager_local_step_fn
+                    _ddp_compile_local_grad = False
+                else:
+                    step_fn = _uncompiled_step_fn
                 _use_compile = False
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "audio_inputs"
