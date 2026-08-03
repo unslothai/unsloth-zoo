@@ -115,3 +115,18 @@ jobs:
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
         run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
+      - name: tests/test_mlx_qat.py
+        # QAT parity against the real fuse(dequantize=False) that merged_4bit
+        # writes, straight-through gradients, and the rejection guards.
+        run: python -m pytest tests/test_mlx_qat.py -v -rs
+
+      - name: tests/test_mlx_qat_metal.py
+        # QAT efficacy: trains with and without QAT from one seed, fuses both,
+        # and asserts the saved model is actually better.
+        run: python -m pytest tests/test_mlx_qat_metal.py -v -rs
+
+      - name: tests/test_mlx_qat_integration_metal.py
+        # QAT against the real product paths: merged_4bit save/reload, adapter
+        # export, MLXTrainer (compile + shape guard), VLM gate, CPT exclusion.
+        run: python -m pytest tests/test_mlx_qat_integration_metal.py -v -rs
