@@ -667,6 +667,16 @@ def _shared_kv_slot_count(model):
     config = getattr(backbone, "config", None)
     if not (_config_get(config, "num_kv_shared_layers") or 0):
         return 0
+    # mlx-vlm 0.5.0+ threads shared K/V itself, so `_fix_gemma4_kv_sharing`
+    # leaves those backbones alone and they keep the ordinary per-layer cache
+    # contract. These slots are shorter than the layer count by construction
+    # (`first_kv_shared_layer_idx == num_hidden_layers - num_kv_shared_layers`),
+    # so handing them over as `cache` would truncate the zip over layers and
+    # silently drop the shared tail of the stack. Imported here rather than at
+    # module scope: loader imports nothing from this module and vice versa.
+    from .loader import _gemma4_has_native_shared_kv
+    if _gemma4_has_native_shared_kv(backbone):
+        return 0
     return getattr(backbone, "first_kv_shared_layer_idx", 0) or 0
 
 

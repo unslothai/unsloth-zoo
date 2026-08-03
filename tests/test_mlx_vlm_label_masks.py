@@ -1743,6 +1743,40 @@ def test_baseline_loss_fn_forwards_real_shared_kv_slots():
     assert caches[0].state == (keys, values)
 
 
+def test_a_natively_shared_backbone_gets_no_legacy_slots():
+    """mlx-vlm 0.5.0+ threads shared K/V itself, so `_fix_gemma4_kv_sharing`
+    leaves those backbones alone and they keep the ordinary per-layer cache
+    contract. The legacy slot list is shorter than the layer count by
+    construction -- `first_kv_shared_layer_idx` is
+    `num_hidden_layers - num_kv_shared_layers` -- so forwarding it as `cache`
+    truncates the zip over layers and silently drops the shared tail."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _build_shared_kv_caches
+
+    def _model(layers, shared, native):
+        backbone = SimpleNamespace(
+            layers=[object() for _ in range(layers)],
+            config=SimpleNamespace(num_kv_shared_layers=shared,
+                                   model_type="gemma4_text"),
+            first_kv_shared_layer_idx=layers - shared,
+        )
+        if native:                       # the marker mlx-vlm 0.5.0+ exposes
+            backbone.previous_kvs = [None] * layers
+        return SimpleNamespace(language_model=SimpleNamespace(model=backbone))
+
+    # Native: no slots at all, so `cache` stays unset and every layer runs.
+    assert _build_shared_kv_caches(_model(4, 2, native=True)) is None
+
+    # Legacy backbones still get exactly one slot per producer layer.
+    legacy = _build_shared_kv_caches(_model(4, 2, native=False))
+    assert legacy is not None and len(legacy) == 2
+
+    # And a stack that shares nothing is unaffected either way.
+    assert _build_shared_kv_caches(_model(4, 0, native=False)) is None
+    assert _build_shared_kv_caches(_model(4, 0, native=True)) is None
+
+
 # --- gemma3n: the ids-path embedding scale a merge leaves off ---------------
 
 
