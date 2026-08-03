@@ -2349,11 +2349,13 @@ def _fix_gemma3_multimodal_image_feature_scale(model=None):
             final_embedding, image_mask_expanded, scaled_image_features,
         )
 
-        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
-        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
-        final_attention_mask_4d = mx.expand_dims(
-            attention_mask_expanded_1 * attention_mask_expanded_2,
-            1,
+        # Gemma3's layers use this verbatim, so it has to carry causality; an
+        # outer product of the padding mask does not. Same builder as the CCE
+        # path: causal, bidirectional inside each image block.
+        from .utils import _build_gemma_image_attention_mask
+        token_type_ids = (input_ids == image_token_index).astype(mx.int32)
+        final_attention_mask_4d = _build_gemma_image_attention_mask(
+            token_type_ids, attention_mask=attention_mask,
         )
         return final_embedding.astype(inputs_embeds.dtype), final_attention_mask_4d
 
@@ -2367,6 +2369,198 @@ def _fix_gemma3_multimodal_image_feature_scale(model=None):
     if model is not None:
         model._unsloth_gemma3_image_feature_scale = "text_embed_dim"
     return True
+def _altup_correct_handles_batch(altup):
+    """True when this AltUp already corrects a batch larger than one."""
+    import mlx.core as mx
+    hidden = getattr(getattr(altup, "config", None), "hidden_size", None)
+    inputs = getattr(getattr(altup, "config", None), "altup_num_inputs", None)
+    if not hidden or not inputs:
+        return True  # cannot tell, so leave it alone
+    activated = mx.zeros((2, 1, int(hidden)), dtype=mx.float32)
+    predictions = mx.zeros((int(inputs), 2, 1, int(hidden)), dtype=mx.float32)
+    try:
+        mx.eval(altup.correct(predictions, activated))
+    except Exception:
+        return False
+    return True
+
+
+def _fix_gemma3n_altup_batch(model=None):
+    """Correct Gemma 3n's AltUp coefficients for batches larger than one.
+
+    The correction transposes its coefficients as though the batch axis were
+    last, which only broadcasts when the batch is one; anything larger fails
+    outright. Upstream repaired this in mlx-vlm 0.5.0, so this only ever runs
+    against older releases, whose source no longer changes.
+    """
+    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
+                     "layers", None)
+    altup = getattr(layers[0], "altup", None) if layers else None
+    if altup is None:
+        return False
+    model_cls = type(altup)
+    if getattr(model_cls, "_unsloth_altup_batch_patched", False):
+        return True
+    if _altup_correct_handles_batch(altup):
+        return False
+
+    import mlx.core as mx
+
+    def correct(self, predictions, activated):
+        modalities = self.compute_router_modalities(activated)
+        self.correction_coefs.weight = self.correction_coefs.weight.astype(mx.float32)
+        if self.config.altup_coef_clip is not None:
+            self.correction_coefs.weight = mx.clip(
+                self.correction_coefs.weight,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip,
+            )
+        all_coefs = self.correction_coefs(modalities) + 1.0
+        innovation = activated - predictions[self.config.altup_active_idx]
+        # Coefficients are (batch, sequence, input); the correction needs them
+        # as (input, batch, sequence, 1) so they broadcast over the hidden axis.
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        corrected = innovation[None] * all_coefs
+        corrected += predictions
+        return corrected.astype(activated.dtype)
+
+    try:
+        model_cls.correct = correct
+        model_cls._unsloth_altup_batch_patched = True
+    except Exception:
+        return False
+    return True
+
+
+def _paligemma_prefix_lm_mask(token_type_ids, attention_mask):
+    """PaliGemma's prefix is bidirectional and only its suffix is causal.
+
+    Its processor marks the suffix with 1, the reverse of the convention the
+    builder reads, so the polarity is inverted before the group is formed.
+    """
+    from .utils import _build_gemma_image_attention_mask
+    prefix = (token_type_ids == 0).astype(token_type_ids.dtype)
+    return _build_gemma_image_attention_mask(prefix, attention_mask=attention_mask)
+
+
+def _paligemma_replace_mask(features, token_type_ids, attention_mask):
+    """Swap the outer-product mask for the prefix-LM one where the split is known.
+
+    Without token types there is no prefix boundary to derive, so upstream's mask
+    is left as it is rather than guessed at.
+    """
+    if token_type_ids is None or features.attention_mask_4d is None:
+        return features
+    features.attention_mask_4d = _paligemma_prefix_lm_mask(
+        token_type_ids, attention_mask,
+    )
+    return features
+
+
+# Where the call wrapper leaves the token types for the embedder wrapper. A
+# per-thread stack, not an attribute on the model: one model can serve several
+# callers at once, and an attribute would let them read each other's batch.
+_PALIGEMMA_TOKEN_TYPES = threading.local()
+
+
+def _paligemma_pending_token_types():
+    stack = getattr(_PALIGEMMA_TOKEN_TYPES, "stack", None)
+    return stack[-1] if stack else None
+
+
+def _paligemma_call_wrapper(original_call):
+    """Thread the token types through to the embedder.
+
+    Upstream's call embeds with a fixed three arguments, so the token types that
+    carry the prefix boundary never reach the mask on the plain loss path.
+    """
+
+    def __call__(self, *args, **kwargs):
+        stack = getattr(_PALIGEMMA_TOKEN_TYPES, "stack", None)
+        if stack is None:
+            stack = _PALIGEMMA_TOKEN_TYPES.stack = []
+        stack.append(kwargs.get("token_type_ids"))
+        try:
+            return original_call(self, *args, **kwargs)
+        finally:
+            stack.pop()
+
+    return __call__
+
+
+def _paligemma_causal_mask_wrapper(original):
+    """Wrap PaliGemma's embedder so its 4-D mask carries a causal suffix."""
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None,
+                             **kwargs):
+        features = original(self, input_ids, pixel_values, mask, **kwargs)
+        token_type_ids = kwargs.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = _paligemma_pending_token_types()
+        return _paligemma_replace_mask(features, token_type_ids, mask)
+
+    return get_input_embeddings
+
+
+def _install_paligemma_causal_mask(model_cls):
+    """Put both wrappers on a PaliGemma model class, or report why not."""
+    original_embed = getattr(model_cls, "get_input_embeddings", None)
+    original_call = getattr(model_cls, "__call__", None)
+    if not callable(original_embed) or not callable(original_call):
+        return False
+    model_cls.get_input_embeddings = _paligemma_causal_mask_wrapper(original_embed)
+    model_cls.__call__ = _paligemma_call_wrapper(original_call)
+    model_cls._unsloth_causal_mask_patched = True
+    return True
+
+
+def _fix_paligemma_multimodal_causal_mask(model=None):
+    """Give PaliGemma's prefix-LM mask a causal suffix.
+
+    Its 4-D mask is an outer product of the padding mask, so with nothing padded
+    every position sees every other and the suffix being trained on can read the
+    answer tokens after it. PaliGemma wants its prefix -- image plus prompt --
+    bidirectional and its suffix causal, which is what the reference builds from
+    `token_type_ids`, marking the suffix with 1 where Gemma3 marks the
+    bidirectional side.
+
+    Both loss paths are corrected: the cross-entropy path embeds directly and
+    already carries the token types, and the plain path goes through
+    `Model.__call__`, which the companion wrapper makes them survive.
+    """
+    try:
+        import mlx.core as mx
+        paligemma_module = importlib.import_module("mlx_vlm.models.paligemma.paligemma")
+    except Exception:
+        return False
+
+    model_cls = getattr(paligemma_module, "Model", None)
+    # A real class, not the simulation shim's stand-in object.
+    if not isinstance(model_cls, type):
+        return False
+    if getattr(model_cls, "_unsloth_causal_mask_patched", False):
+        return True
+    try:
+        return _install_paligemma_causal_mask(model_cls)
+    except Exception:
+        return False
+
+
+# Upstream corrections applied to every VLM as it loads, in order.
+_VLM_MODEL_FIXUPS = (
+    _fix_gemma4_kv_sharing,
+    _fix_gemma3_vision_post_layernorm_eps,
+    _fix_gemma3_vision_attention_fp32_sdpa,
+    _fix_gemma3_vision_encoder_fp32_layernorm,
+    _fix_gemma3_vision_post_layernorm_fp32,
+    _fix_gemma3_vision_mlp_fp32_activation,
+    _fix_gemma3_language_mlp_fp32_activation,
+    _fix_gemma3_multimodal_image_feature_scale,
+    _fix_paligemma_multimodal_causal_mask,
+    _fix_gemma3n_altup_batch,
+)
+
+
 def _disable_fused_mrope(model):
     """Flip fused_apply off so MRoPE training uses the differentiable
     cos/sin fallback; the fused Metal kernel has no VJP."""
@@ -7318,16 +7512,7 @@ class FastMLXModel:
                 model._unsloth_text_only_vlm = True
             model._is_vlm_model = True
             model._processor = processor
-            for fixup in (
-                _fix_gemma4_kv_sharing,
-                _fix_gemma3_vision_post_layernorm_eps,
-                _fix_gemma3_vision_attention_fp32_sdpa,
-                _fix_gemma3_vision_encoder_fp32_layernorm,
-                _fix_gemma3_vision_post_layernorm_fp32,
-                _fix_gemma3_vision_mlp_fp32_activation,
-                _fix_gemma3_language_mlp_fp32_activation,
-                _fix_gemma3_multimodal_image_feature_scale,
-            ):
+            for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
 
             model._config = getattr(model, "_config", config_data)

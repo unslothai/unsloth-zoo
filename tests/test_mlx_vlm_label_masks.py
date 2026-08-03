@@ -1538,3 +1538,563 @@ def test_gemma3n_token_type_ownership_survives_module_relocation():
     assert _vlm_processor_requests_mm_token_type_ids(
         processor("transformers.models.gemma3.processing_gemma3", "Gemma3Processor")
     ) is True
+
+
+# --- causality: a padding mask must never become the attention mask ---------
+
+
+def _utils_mx():
+    """The mlx the module under test is bound to (a sibling test may shim it)."""
+    from unsloth_zoo.mlx import utils
+    return utils.mx
+
+
+def _run_loss(model_type, kv_shared=0):
+    """Run the baseline loss and report what the model was handed."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import make_vlm_baseline_loss_fn
+
+    mx_ = _utils_mx()
+    seen = {}
+    ids = mx_.array([[1, 2, 3, 4]], dtype=mx_.int32)
+    batch = {"input_ids": ids, "labels": ids,
+             "attention_mask": mx_.ones(ids.shape, dtype=mx_.int32)}
+
+    class _Model:
+        config = SimpleNamespace(model_type=model_type)
+
+        # Declared and never read, exactly as molmo_point declares it.
+        def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None):
+            return None
+
+        # Keyword-only and required, as thirteen families declare it: omitting
+        # it is a TypeError, so every case below also proves it is always sent.
+        def __call__(self, inputs, pixel_values=None, *, mask, cache=None, **kw):
+            seen["mask"], seen["cache"] = mask, cache
+            return SimpleNamespace(
+                logits=mx_.zeros((*inputs.shape, 16), dtype=mx_.float32))
+
+    model = _Model()
+    if kv_shared:
+        model.language_model = SimpleNamespace(model=SimpleNamespace(
+            first_kv_shared_layer_idx=15,
+            config=SimpleNamespace(num_kv_shared_layers=kv_shared)))
+    make_vlm_baseline_loss_fn(model=None, ignore_token_ids=[])(model, batch)
+    return seen, batch
+
+
+# mlx-vlm model_type values, not module names: FastVLM reports either.
+_MASK_KEEPING_FAMILIES = (
+    "gemma3", "paligemma", "llava_qwen2", "fastvlm",
+    "falcon_ocr", "falcon_perception", "falcon-perception",
+)
+
+
+@pytest.mark.parametrize("model_type,keeps", [
+    *[(family, True) for family in _MASK_KEEPING_FAMILIES],
+    # mlx-vlm resolves the module case-insensitively, the config keeps its own.
+    ("Gemma3", True), ("FALCON-PERCEPTION", True),
+    ("qwen2_vl", False),
+    ("molmo_point", False),
+])
+def test_baseline_loss_fn_sends_the_padding_mask_only_where_it_is_read(
+        model_type, keeps):
+    # Elsewhere it reaches the layers verbatim and replaces causality, letting
+    # every supervised position read the token it is scored on.
+    seen, batch = _run_loss(model_type)
+    assert seen["mask"] is (batch["attention_mask"] if keeps else None)
+
+
+def test_mask_keeping_allowlist_is_exactly_these_families_and_all_their_aliases():
+    from unsloth_zoo.mlx.utils import _VLM_FAMILIES_KEEPING_FORWARDED_MASK as listed
+    assert set(listed) == set(_MASK_KEEPING_FAMILIES)
+    # A config keeps its model_type through mlx-vlm's remap, so an alias onto a
+    # listed module has to be listed under its own spelling too.
+    remap = pytest.importorskip("mlx_vlm.utils").MODEL_REMAPPING
+    assert not {a for a, t in remap.items() if t in listed and a not in listed}
+
+
+class _NoPadIdTokenizer(_FakeTokenizer):
+    pad_token_id = None
+
+
+class _LayoutProcessor(_FakeProcessor):
+    """Emits one fixed layout, honouring `padding_side` only when told to.
+
+    Instruct checkpoints ship `padding_side: left`; deepseek_vl_v2 and the
+    falcon pair left-pad multimodal rows whichever side they are asked for.
+    """
+
+    def __init__(self, rows, masks, honours_side=False, tokenizer=None, **extras):
+        self.rows, self.masks, self.extras = rows, masks, extras
+        self.honours_side = honours_side
+        self.tokenizer = tokenizer or _FakeTokenizer()
+
+    def __call__(self, text, padding_side=None, **_kwargs):
+        flush = self.honours_side and padding_side == "right"
+        ids, mask = [], []
+        for row, keep in zip(self.rows, self.masks):
+            body = [t for t, k in zip(row, keep) if k]
+            pad = [0] * (len(row) - len(body))
+            ids.append(body + pad if flush else list(row))
+            mask.append([1] * len(body) + pad if flush else list(keep))
+        out = {"input_ids": np.array(ids, dtype=np.int32),
+               "attention_mask": np.array(mask, dtype=np.int32)}
+        out.update({key: np.asarray(value) for key, value in self.extras.items()})
+        return out
+
+
+# One row already flush, one left-padded, so a repair has something to move.
+_RAGGED = ([[101, 10, 200, 11], [0, 0, 101, 200]],
+           [[1, 1, 1, 1], [0, 0, 1, 1]])
+_MARKS = np.array([[0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.int32)
+
+
+@pytest.mark.parametrize("honours_side", [True, False])
+def test_collation_delivers_content_then_padding(honours_side):
+    # Causality is all that excludes the pads once the mask is withheld, and it
+    # excludes a trailing pad, not a leading one.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2, _LayoutProcessor(*_RAGGED, honours_side=honours_side),
+        8, None)
+    ids, mask = np.asarray(batch["input_ids"]), np.asarray(batch["attention_mask"])
+    assert mask.tolist() == [[1, 1, 1, 1], [1, 1, 0, 0]]
+    assert ids[1][:2].tolist() == [101, 200]
+
+
+@pytest.mark.parametrize("key", ["mm_token_type_ids", "images_seq_mask"])
+def test_collation_moves_token_aligned_sidecars_with_their_tokens(key):
+    # gemma4 builds its bidirectional multimodal blocks from
+    # `mm_token_type_ids`, the deepseek pair place image embeddings at
+    # `images_seq_mask` indices; left behind, row 1's mark sits on a pad.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2,
+        _LayoutProcessor(*_RAGGED, mm_token_type_ids=_MARKS,
+                         images_seq_mask=_MARKS.astype(bool)), 8, None)
+    ids, marked = np.asarray(batch["input_ids"]), np.asarray(batch[key]).astype(bool)
+    assert marked.sum() == 2 and (ids[marked] == 200).all()
+    assert marked[1].tolist() == [False, True, False, False]
+
+
+@pytest.mark.parametrize("key", ["image_grid_hw", "some_unlisted_field"])
+def test_collation_leaves_an_unlisted_field_alone(key):
+    # Three images of two columns, in a batch of three rows two tokens wide:
+    # per-image metadata shaped exactly like a per-token array. Recognising
+    # sidecars by shape would compact row 1's to [5, 0], losing its height.
+    grid = np.array([[2, 3], [4, 5], [6, 7]], dtype=np.int32)
+    batch = _finalized_collate(
+        [{"text": "a"}] * 3,
+        _LayoutProcessor([[101, 200], [0, 200], [101, 200]],
+                         [[1, 1], [0, 1], [1, 1]],
+                         image_grid_hw=grid, some_unlisted_field=grid + 10),
+        8, None)
+    assert np.asarray(batch["input_ids"])[1].tolist() == [200, 0]
+    assert np.asarray(batch[key]).tolist() == (grid if key == "image_grid_hw"
+                                               else grid + 10).tolist()
+
+
+@pytest.mark.parametrize("key", ["position_ids", "rope_deltas"])
+def test_collation_refuses_a_processor_authored_layout_coordinate(key, monkeypatch):
+    # Sidecars label tokens and travel with them; these are coordinates of the
+    # layout the repair replaces. `rope_deltas` is injected into the pipeline's
+    # own collection, so naming "position_ids" inline would fail this.
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_VLM_WIDTH_GENERATED_KEYS",
+                        tuple(utils._VLM_WIDTH_GENERATED_KEYS) + ("rope_deltas",))
+    coords = np.tile(np.arange(4), (2, 1))
+    with pytest.raises(ValueError, match=key):
+        _finalized_collate([{"text": "a"}] * 2,
+                           _LayoutProcessor(*_RAGGED, **{key: coords}), 8, None)
+
+
+@pytest.mark.parametrize("honours_side", [True, False])
+def test_collation_does_not_require_a_pad_id(honours_side):
+    # falcon_ocr and falcon_perception ship no pad id and pad with 0, so
+    # demanding one would refuse batches they collate fine, repair or not.
+    batch = _finalized_collate(
+        [{"text": "a"}] * 2,
+        _LayoutProcessor(*_RAGGED, honours_side=honours_side,
+                         tokenizer=_NoPadIdTokenizer()), 8, None)
+    ids, mask = np.asarray(batch["input_ids"]), np.asarray(batch["attention_mask"])
+    assert mask[:, 0].tolist() == [1, 1] and (ids[mask == 0] == 0).all()
+
+
+# --- KV-shared layers borrow their K/V through the cache --------------------
+
+
+def test_baseline_loss_fn_forwards_real_shared_kv_slots():
+    # Slots, not placeholders, and one per producer: a list of Nones forwards
+    # the same shape while every shared layer rebuilds K/V from its own
+    # projections, and one slot repeated leaves them all reading the last.
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+
+    seen, _batch = _run_loss("gemma4", kv_shared=20)
+    caches = seen["cache"]
+    assert caches is not None and len(caches) == 15
+    assert all(isinstance(c, _SharedKVSlot) for c in caches)
+    assert len({id(c) for c in caches}) == 15
+    keys, values = object(), object()
+    # The producer stores through `update_and_fetch`, shared layers read `state`.
+    assert caches[0].offset == 0 and caches[0].borrow() is None
+    assert caches[0].update_and_fetch(keys, values) == (keys, values)
+    assert caches[0].state == (keys, values)
+
+
+# --- gemma3n: the ids-path embedding scale a merge leaves off ---------------
+
+
+def _scale_probe(model_type, hidden_size=16):
+    """Middle position carries a merged feature; the others are plain tokens."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils
+
+    mx_ = _utils_mx()
+    # Every position shares one token id, so an id-based mask cannot tell the
+    # feature-carrying position from the plain ones -- only a difference can.
+    ids = mx_.array([[7, 7, 7]], dtype=mx_.int32)
+    raw = mx_.ones((1, 3, hidden_size), dtype=mx_.float32)
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=model_type, hidden_size=hidden_size)
+        def embed_tokens(self, _ids): return raw
+
+    merged = mx_.concatenate(
+        [raw[:, :1], mx_.full((1, 1, hidden_size), 9.0), raw[:, 2:]], axis=1)
+    out = utils._apply_vlm_embed_scale(
+        SimpleNamespace(language_model=SimpleNamespace(model=_Backbone())),
+        ids, merged)
+    return np.asarray(out)[0], hidden_size ** 0.5
+
+
+@pytest.mark.parametrize("model_type,scaled", [
+    ("gemma3n_text", True),
+    # gemma3_text is compensated for in `_run_hidden_stack`, the route it takes,
+    # so scaling it here would apply the factor twice.
+    ("qwen2_vl", False), ("gemma3_text", False), ("gemma4_text", False),
+])
+def test_embed_scale_lifts_only_gemma3n_plain_tokens(model_type, scaled):
+    out, scale = _scale_probe(model_type)
+    assert out[0][0] == pytest.approx(scale if scaled else 1.0)
+    assert out[2][0] == pytest.approx(scale if scaled else 1.0)
+    # Merged features already carry the scaled magnitude; rescaling inflates.
+    assert out[1][0] == pytest.approx(9.0)
+
+
+# --- paligemma: a prefix-LM mask, not a padding outer product ---------------
+
+
+def test_paligemma_mask_is_bidirectional_on_the_prefix_and_causal_on_the_suffix():
+    """PaliGemma's own mask is an outer product of the padding mask, so with
+    nothing padded the suffix being trained on reads the tokens after it."""
+    from unsloth_zoo.mlx.loader import (
+        _VLM_MODEL_FIXUPS, _fix_paligemma_multimodal_causal_mask,
+        _paligemma_prefix_lm_mask,
+    )
+
+    # Loading a VLM has to apply the correction, not just define it.
+    assert _fix_paligemma_multimodal_causal_mask in _VLM_MODEL_FIXUPS
+
+    mx_ = _utils_mx()
+    seq = 8
+    # 0 marks the prefix, 1 the suffix: the reverse of Gemma3's convention.
+    token_type_ids = mx_.array([[0, 0, 0, 0, 1, 1, 0, 0]], dtype=mx_.int32)
+    padding = mx_.array([[1, 1, 1, 1, 1, 1, 0, 0]], dtype=mx_.int32)
+    m = np.asarray(
+        _paligemma_prefix_lm_mask(token_type_ids, padding)
+    ).reshape(-1, seq, seq)[0].astype(bool)
+
+    q_idx, kv_idx = np.indices(m.shape)
+    real = np.asarray(padding)[0] == 1
+    prefix = (np.asarray(token_type_ids)[0] == 0) & real
+    both_real = real[q_idx] & real[kv_idx]
+    both_prefix = prefix[q_idx] & prefix[kv_idx]
+    ahead = q_idx < kv_idx
+    # The suffix is causal: outside the prefix nothing reads ahead. Left as an
+    # outer product every one of these is visible.
+    assert not m[ahead & ~both_prefix & both_real].any()
+    # The prefix stays bidirectional, which is what PaliGemma is trained for.
+    assert m[both_prefix].all()
+    # The past is always visible, so this is a mask and not all-zeros.
+    assert m[(q_idx >= kv_idx) & both_real].all()
+    # And the pads are excluded, which the outer product did do and this must too.
+    assert not m[~both_real].any()
+
+
+def test_paligemma_mask_is_left_alone_without_token_types():
+    """`Model.__call__` forwards no extra kwargs, so on the plain loss path the
+    token types never arrive and there is no prefix boundary to derive."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _paligemma_causal_mask_wrapper, _paligemma_replace_mask,
+    )
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+
+    untouched = _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=outer_product), None, padding)
+    assert untouched.attention_mask_4d is outer_product
+    # Nor when upstream built no mask at all, e.g. a text-only batch.
+    assert _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=None),
+        mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
+    # But it is replaced once the token types are there.
+    replaced = _paligemma_replace_mask(
+        SimpleNamespace(attention_mask_4d=outer_product),
+        mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
+    assert replaced.attention_mask_4d is not outer_product
+    assert not np.asarray(replaced.attention_mask_4d).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
+    """The wrapper is what actually reaches a loaded model, so it has to hand the
+    token types on rather than return upstream's mask untouched."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import _paligemma_causal_mask_wrapper
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    seen = {}
+
+    def original(_self, input_ids=None, pixel_values=None, mask=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(attention_mask_4d=outer_product)
+
+    wrapped = _paligemma_causal_mask_wrapper(original)
+    got = wrapped(object(), mx_.zeros((1, 4), dtype=mx_.int32), None,
+                  mx_.ones((1, 4), dtype=mx_.int32),
+                  token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
+    # Upstream still runs and still sees its kwargs.
+    assert "token_type_ids" in seen["kwargs"]
+    # And its all-visible mask does not survive: the suffix cannot read ahead.
+    assert got.attention_mask_4d is not outer_product
+    assert not np.asarray(got.attention_mask_4d).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
+    """Upstream's call embeds with a fixed three arguments, dropping the token
+    types, so without threading them the `use_cce=False` path keeps leaking."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _paligemma_call_wrapper, _paligemma_causal_mask_wrapper,
+        _paligemma_pending_token_types,
+    )
+
+    mx_ = _utils_mx()
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    seen = {}
+
+    def upstream_embed(_self, input_ids=None, pixel_values=None, mask=None, **kw):
+        return SimpleNamespace(attention_mask_4d=outer_product)
+
+    class _Model:
+        get_input_embeddings = _paligemma_causal_mask_wrapper(upstream_embed)
+
+        def __call__(self, input_ids, pixel_values=None, mask=None, **kwargs):
+            # Upstream drops kwargs here, exactly as PaliGemma does.
+            seen["mask"] = self.get_input_embeddings(
+                input_ids, pixel_values, mask).attention_mask_4d
+            return seen["mask"]
+
+    _Model.__call__ = _paligemma_call_wrapper(_Model.__call__)
+    model = _Model()
+    model(mx_.zeros((1, 4), dtype=mx_.int32), None, padding,
+          token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
+
+    assert seen["mask"] is not outer_product
+    assert not np.asarray(seen["mask"]).reshape(4, 4)[2, 3]
+    # And nothing is left pending once the call returns.
+    assert _paligemma_pending_token_types() is None
+
+
+class _FakePaligemma:
+    """Upstream's shape: `__call__` embeds with a fixed three arguments, so the
+    token types it was given never reach the embedder on their own."""
+
+    outer_product = None          # set per test, so identity can be compared
+    seen = None
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None, mask=None,
+                             **kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(attention_mask_4d=self.outer_product)
+
+    def __call__(self, input_ids, pixel_values=None, mask=None, **kwargs):
+        import threading
+        from unsloth_zoo.mlx.loader import _paligemma_pending_token_types
+        if self.seen is not None:
+            self.seen[threading.current_thread().name] = \
+                _paligemma_pending_token_types()
+        return self.get_input_embeddings(input_ids, pixel_values, mask)
+
+
+def test_paligemma_install_puts_both_wrappers_on_the_class():
+    """Removing either assignment leaves the matching production loss path
+    unfixed, so the install itself has to be checked, not just the wrappers."""
+    from unsloth_zoo.mlx.loader import _install_paligemma_causal_mask
+
+    mx_ = _utils_mx()
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    token_type_ids = mx_.array([[0, 0, 1, 1]], dtype=mx_.int32)
+
+    class _Model(_FakePaligemma):
+        outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+        seen = {}
+
+    assert _install_paligemma_causal_mask(_Model)
+    model, ids = _Model(), mx_.zeros((1, 4), dtype=mx_.int32)
+
+    # The plain path: the call wrapper has to carry the token types across.
+    plain = model(ids, None, padding, token_type_ids=token_type_ids)
+    assert not np.asarray(plain.attention_mask_4d).reshape(4, 4)[2, 3]
+    # The cross-entropy path: the embedder wrapper receives them itself.
+    direct = model.get_input_embeddings(
+        ids, None, padding, token_type_ids=token_type_ids).attention_mask_4d
+    assert not np.asarray(direct).reshape(4, 4)[2, 3]
+
+
+def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
+    """One model can serve several callers at once; an attribute on the model
+    would let one read another's batch."""
+    import threading
+    from unsloth_zoo.mlx.loader import (
+        _install_paligemma_causal_mask, _paligemma_pending_token_types,
+    )
+
+    mx_ = _utils_mx()
+    padding = mx_.ones((1, 4), dtype=mx_.int32)
+    entered = threading.Barrier(2)
+
+    class _Model(_FakePaligemma):
+        outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+        seen = {}
+
+        def __call__(self, *args, **kwargs):
+            entered.wait(timeout=5)      # both callers inside their own call
+            return _FakePaligemma.__call__(self, *args, **kwargs)
+
+    assert _install_paligemma_causal_mask(_Model)
+    model = _Model()
+    marks = {"a": mx_.array([[0, 0, 1, 1]], dtype=mx_.int32),
+             "b": mx_.array([[0, 1, 1, 1]], dtype=mx_.int32)}
+    threads = [
+        threading.Thread(name=name, target=model,
+                         args=(mx_.zeros((1, 4), dtype=mx_.int32), None, padding),
+                         kwargs={"token_type_ids": mark})
+        for name, mark in marks.items()
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    # Each caller saw its own token types, not the other's.
+    for name, mark in marks.items():
+        assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
+    assert _paligemma_pending_token_types() is None
+
+
+# --- gemma3n: AltUp correction at batch sizes above one ---------------------
+
+
+def _broken_altup(mx_, hidden=4, inputs=3):
+    """A stand-in shaped like the AltUp whose correction assumes a batch of one."""
+    from types import SimpleNamespace
+
+    class _Coefs:  # callable like the real nn.Linear, with a weight to clip
+        weight = mx_.zeros((inputs, hidden), dtype=mx_.float32)
+
+        def __call__(self, modalities):
+            return mx_.zeros((*modalities.shape[:-1], inputs), dtype=mx_.float32)
+
+    class _Altup:
+        config = SimpleNamespace(hidden_size=hidden, altup_num_inputs=inputs,
+                                 altup_coef_clip=None, altup_active_idx=0)
+        correction_coefs = _Coefs()
+
+        def compute_router_modalities(self, x):
+            return x
+
+        def correct(self, predictions, activated):
+            all_coefs = mx_.ones((*activated.shape[:-1], inputs), dtype=mx_.float32)
+            innovation = activated - predictions[self.config.altup_active_idx]
+            # The batch axis is treated as though it were last.
+            all_coefs = all_coefs.transpose(2, 1, 0)
+            corrected = innovation[None] * all_coefs[:, None]
+            corrected += predictions
+            return corrected.astype(activated.dtype)
+
+    return _Altup
+
+
+def test_gemma3n_altup_correction_survives_a_batch_larger_than_one():
+    """Upstream transposes its coefficients as though the batch axis were last,
+    which only broadcasts when the batch is one."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _VLM_MODEL_FIXUPS, _altup_correct_handles_batch, _fix_gemma3n_altup_batch,
+    )
+
+    assert _fix_gemma3n_altup_batch in _VLM_MODEL_FIXUPS
+
+    mx_ = _utils_mx()
+    # Distinct batch and sequence, or transposing the two would look the same.
+    hidden, inputs, seq, rows = 4, 3, 5, 2
+    cls = _broken_altup(mx_, hidden, inputs)
+    altup = cls()
+    assert not _altup_correct_handles_batch(altup), "fixture should start broken"
+
+    upstream_correct = cls.correct
+    model = SimpleNamespace(language_model=SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
+    assert _fix_gemma3n_altup_batch(model)
+    assert _altup_correct_handles_batch(altup)
+
+    # Rows are independent, so a batch must equal the rows corrected separately.
+    rng = np.random.default_rng(0)
+    activated = mx_.array(
+        rng.normal(size=(rows, seq, hidden)).astype(np.float32))
+    # Non-zero, or subtracting the active prediction would not be observable.
+    predictions = mx_.array(
+        rng.normal(size=(inputs, rows, seq, hidden)).astype(np.float32))
+    both = np.asarray(altup.correct(predictions, activated))
+    assert both.shape == (inputs, rows, seq, hidden)
+    for row in range(rows):
+        one = np.asarray(altup.correct(
+            predictions[:, row:row + 1], activated[row:row + 1]))
+        assert np.allclose(both[:, row:row + 1], one, atol=1e-5), \
+            f"row {row} differs when corrected in a batch"
+
+    # The formula stays upstream's. At a batch of one, where upstream is
+    # already right, the replacement has to reproduce it exactly.
+    one_act, one_pred = activated[:1], predictions[:, :1]
+    assert np.allclose(np.asarray(altup.correct(one_pred, one_act)),
+                       np.asarray(upstream_correct(altup, one_pred, one_act)),
+                       atol=1e-6), "the replacement changed the correction itself"
+
+
+def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
+    """Upstream repaired this in 0.5.0, so the backport must leave it alone."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.loader import (
+        _altup_correct_handles_batch, _fix_gemma3n_altup_batch,
+    )
+
+    mx_ = _utils_mx()
+    cls = _broken_altup(mx_)
+
+    def fixed(self, predictions, activated):
+        all_coefs = (self.correction_coefs(activated) + 1.0)
+        all_coefs = all_coefs.transpose(2, 0, 1)[..., None]
+        return (activated - predictions[0])[None] * all_coefs + predictions
+
+    cls.correct = fixed
+    altup = cls()
+    assert _altup_correct_handles_batch(altup)
+    model = SimpleNamespace(language_model=SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
+    assert not _fix_gemma3n_altup_batch(model)
+    assert cls.correct is fixed, "an already-correct release must be left alone"

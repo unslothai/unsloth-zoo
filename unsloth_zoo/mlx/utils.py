@@ -434,10 +434,26 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
+        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        if slot is None:
+            def inner_fn(params, *args, **kwargs):
+                self.update(params)
+                return fn(self, *args, **kwargs)
+            return mx.checkpoint(inner_fn)(
+                self.trainable_parameters(), *args, **kwargs)
+
+        # Shared K/V crosses the checkpoint boundary as a traced argument and a
+        # traced result; read off the slot and the VJP drops the gradient.
+        def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
-            return fn(self, *args, **kwargs)
-        return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
+            slot.install(borrowed)
+            out = fn(self, *args, **kwargs)
+            return out, slot.recorded()
+
+        out, recorded = mx.checkpoint(inner_fn)(
+            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+        slot.install(recorded)
+        return out
 
     layer_cls.__call__ = checkpointed_fn
 
@@ -534,6 +550,131 @@ def _build_gemma_image_attention_mask(token_type_ids, attention_mask=None,
     return mx.expand_dims(mask, axis=1)
 
 
+# Families that read the padding mask, or whose layers fall back on a stored
+# `_full_attn_mask` without one -- falcon_perception never clears it, so a text
+# batch can inherit the previous image batch's. Elsewhere a supplied mask
+# reaches the layers, where it REPLACES causality. Listed rather than probed
+# from the signature, since molmo_point declares `mask` and never reads it, and
+# keyed on `model_type`, so aliases need their own entry.
+_VLM_FAMILIES_KEEPING_FORWARDED_MASK = frozenset({
+    "gemma3", "paligemma",
+    "llava_qwen2", "fastvlm",                    # FastVLM answers to both
+    "falcon_ocr", "falcon_perception", "falcon-perception",
+})
+
+
+def _keeps_forwarded_mask(model):
+    model_type = _config_get(getattr(model, "config", None), "model_type")
+    # mlx-vlm lower-cases model_type to resolve the module but leaves the
+    # config's own spelling alone, so match the way it resolves.
+    return str(model_type).lower() in _VLM_FAMILIES_KEEPING_FORWARDED_MASK
+
+
+class _SharedKVSlot:
+    """A cache with training semantics, so KV-shared layers borrow rather than
+    rebuild K/V that the reference implementation never recomputes.
+
+    Position stays 0 and nothing is ever trimmed; a prompt cache would forget
+    past its sliding window and re-rope queries at an advancing offset. No
+    version gate: gemma4 from mlx-vlm 0.5.0 reads shared K/V from its layer
+    results instead; the slots still travel with the batch, but stop being where
+    the sharing is read and leave the training result unchanged.
+
+    `borrow`/`install`/`recorded` exist because gradient checkpointing cannot
+    see an attribute read -- the recomputed VJP drops the gradient while the
+    forward stays correct -- so the wrapper passes K/V in as an argument and
+    takes it back as a result.
+    """
+
+    __slots__ = ("keys", "values")
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+
+    @property
+    def offset(self):
+        return 0
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    def update_and_fetch(self, keys, values):
+        self.keys, self.values = keys, values
+        return keys, values
+
+    def borrow(self):
+        """K/V to pass into the next layer's traced region, if any."""
+        return None if self.keys is None else (self.keys, self.values)
+
+    def install(self, borrowed):
+        if borrowed is not None:
+            self.keys, self.values = borrowed
+
+    def recorded(self):
+        return self.keys, self.values
+
+
+# Language models that scale token embeddings by sqrt(hidden_size) on the ids
+# path only, so every multimodal forward loses it. gemma3 is absent because
+# `_run_hidden_stack`, the route it takes, already compensates.
+_VLM_EMBED_SCALE_FAMILIES = frozenset({"gemma3n_text"})
+
+
+def _vlm_embed_scale(model):
+    """The embedding scale this family's LM applies only on the ids path."""
+    config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
+    if _config_get(config, "model_type") not in _VLM_EMBED_SCALE_FAMILIES:
+        return None
+    hidden_size = _config_get(config, "hidden_size")
+    return float(hidden_size) ** 0.5 if hidden_size else None
+
+
+def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
+    """Scale the token embeddings a multimodal merge left unscaled.
+
+    Only positions still holding a plain token embedding: merged features
+    already carry the scaled magnitude. Found by difference, not by token id --
+    gemma3n's closing audio delimiter carries a feature without being the audio
+    token, and an id-based mask would rescale it.
+    """
+    scale = _vlm_embed_scale(model)
+    if scale is None or input_ids is None:
+        return merged_embeds
+    backbone = getattr(_get_text_model(model), "model", None)
+    embed_tokens = getattr(backbone, "embed_tokens", None)
+    if embed_tokens is None:
+        return merged_embeds
+    raw = embed_tokens(input_ids).astype(merged_embeds.dtype)
+    untouched = mx.all(merged_embeds == raw, axis=-1, keepdims=True)
+    # In the embedding dtype, as the ids path does: an fp32 product rounded back
+    # lands on different bf16 values.
+    return mx.where(untouched, merged_embeds * scale, merged_embeds)
+
+
+def _shared_kv_slot_count(model):
+    """How many cache slots this stack needs, or 0 when it shares no K/V.
+
+    Not `first_kv_shared_layer_idx > 0`: upstream derives that as
+    `num_hidden_layers - num_kv_shared_layers`, so it is positive with zero
+    sharing too, as gemma4 12B/26B declare.
+    """
+    backbone = getattr(_get_text_model(model), "model", None)
+    if backbone is None:
+        return 0
+    config = getattr(backbone, "config", None)
+    if not (_config_get(config, "num_kv_shared_layers") or 0):
+        return 0
+    return getattr(backbone, "first_kv_shared_layer_idx", 0) or 0
+
+
+def _build_shared_kv_caches(model):
+    """Fresh per-forward slots for a stack that shares K/V, else None."""
+    slots = _shared_kv_slot_count(model)
+    return [_SharedKVSlot() for _ in range(slots)] if slots else None
+
+
 def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     """Execute a language stack up to pre-lm_head hidden states."""
     from mlx_vlm.models.base import create_attention_mask
@@ -552,8 +693,8 @@ def _run_hidden_stack(stack, inputs, inputs_embeds=None, **kwargs):
     mask = kwargs.get("mask")
     if mask is None:
         mask = kwargs.get("attention_mask_4d")
-    if mask is None:
-        mask = kwargs.get("attention_mask")
+    # No fallback to the 2-D `attention_mask`: layers use what they are handed
+    # verbatim, so it would replace causality.
     token_type_ids = kwargs.get("token_type_ids")
     token_type_mask = None
     if token_type_ids is not None:
@@ -1854,12 +1995,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         # Forward full sequence then shift (Qwen3-VL mRoPE/deepstack need it);
         # mirrors `_vlm_cce_forward` so use_cce={True,False} stay in parity.
         inputs = input_ids
-        fwd_mask = attention_mask
 
-        # Model owns the causal mask. Pass through extras (e.g. image_grid_thw
-        # for Qwen). Strip every private `_unsloth_*` carrier (raw-ids plus the
-        # _unsloth_collated_position_ids marker) so model(...) never sees a kwarg
-        # it would reject, matching _vlm_cce_forward's filter.
+        # Pass through extras (e.g. image_grid_thw); strip the private
+        # `_unsloth_*` carriers, matching _vlm_cce_forward's filter.
         fwd_kwargs = {
             k: v for k, v in batch_dict.items()
             if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
@@ -1867,7 +2005,15 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             and v is not None
         }
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
-        output = model(inputs, pixel_values=pixel_values, mask=fwd_mask, **fwd_kwargs)
+        # Always sent: 13 families declare `mask` without a default. None lets
+        # them build the mask they would use for generation.
+        fwd_kwargs["mask"] = (
+            attention_mask if _keeps_forwarded_mask(model) else None
+        )
+        shared_kv = _build_shared_kv_caches(model)
+        if shared_kv is not None:
+            fwd_kwargs["cache"] = shared_kv
+        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
@@ -2053,6 +2199,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         **extra_kwargs,
     )
     merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
+    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
@@ -2062,6 +2209,10 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+
+    shared_kv = _build_shared_kv_caches(model)
+    if shared_kv is not None:
+        backbone_kwargs["cache"] = shared_kv
 
     hidden = _forward_text_hidden_states(
         model,
@@ -5626,6 +5777,77 @@ def _as_numpy_vlm_field(inputs, key):
     return arr
 
 
+# Text-width-aligned arrays a processor authors for itself, beyond the ones the
+# pipeline owns in `_VLM_WIDTH_PADDABLE_KEYS`. The deepseek pair place image
+# embeddings at these indices.
+_VLM_PROCESSOR_TOKEN_ALIGNED_KEYS = ("images_seq_mask",)
+
+# Of those, the ones the compaction may move: inert at zero, which is what the
+# gather writes into a vacated slot. That drops the label carriers, which the
+# pipeline rebuilds from the repaired ids anyway; ids and mask move on their own.
+_VLM_RELOCATABLE_SIDECAR_KEYS = tuple(
+    key for key, inert in _VLM_WIDTH_PADDABLE_KEYS.items()
+    if inert == 0 and key != "attention_mask"
+) + _VLM_PROCESSOR_TOKEN_ALIGNED_KEYS
+
+
+def _vlm_token_aligned_sidecars(inputs, ids_shape):
+    """Return the processor fields whose columns are the token positions.
+
+    Left at the pre-repair columns these mark the wrong tokens: gemma4 builds
+    its bidirectional multimodal blocks from `mm_token_type_ids`, the deepseek
+    pair place image embeddings at `images_seq_mask` indices. Named, not
+    recognised by shape, since a shape does not say what indexes it -- an
+    (images, 2) grid matches a two-token batch -- so an unlisted sidecar is left
+    alone, as `_vlm_width_survey` also declines to guess.
+    """
+    sidecars = {}
+    for key in _VLM_RELOCATABLE_SIDECAR_KEYS:
+        if inputs.get(key) is None:
+            continue
+        values = _as_numpy_vlm_field(inputs, key)
+        if values.shape == ids_shape:
+            sidecars[key] = values
+    return sidecars
+
+
+def _right_pad_vlm_rows(inputs, processor):
+    """Compact each row's real tokens to the front.
+
+    Causality is all that excludes the pads once the mask is withheld, and it
+    excludes a trailing pad, not a leading one. deepseek_vl_v2 and the falcon
+    pair left-pad multimodal rows whatever side they are asked for, so the
+    layout is repaired rather than demanded.
+    """
+    value = inputs.get("attention_mask") if hasattr(inputs, "get") else None
+    if value is None:
+        return inputs
+    mask = _as_numpy_vlm_field(inputs, "attention_mask")
+    # Content-then-padding, so an interior pad counts as much as a leading one.
+    if not mask.size or bool(np.all(mask[:, :-1] >= mask[:, 1:])):
+        return inputs
+    generated = [
+        key for key in _VLM_WIDTH_GENERATED_KEYS if inputs.get(key) is not None
+    ]
+    if generated:
+        # Coordinates of the layout the repair replaces, not labels that travel.
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} left-padded this batch "
+            f"and supplied its own {', '.join(generated)}, which cannot be "
+            f"re-derived for the repaired row order."
+        )
+    ids = _as_numpy_vlm_field(inputs, "input_ids")
+    extras = _vlm_token_aligned_sidecars(inputs, ids.shape)
+    ids, mask, extras = _flush_vlm_arrays_to_side(
+        ids, mask, "right", _vlm_pad_token_id(processor, default=0), extras,
+    )
+    inputs["input_ids"] = ids
+    inputs["attention_mask"] = mask
+    for key, values in extras.items():
+        inputs[key] = values
+    return inputs
+
+
 def _common_text_prefix(left, right):
     """Return CUDA's shared rendered prompt prefix for VLM PC rows."""
     end = 0
@@ -5643,11 +5865,13 @@ def _vlm_tokenizer_padding_side(processor):
     return "left" if side == "left" else "right"
 
 
-def _vlm_pad_token_id(processor):
-    """Return the processor tokenizer pad id required for PC collation."""
+def _vlm_pad_token_id(processor, default=None):
+    """Return the processor tokenizer pad id, or ``default`` when it has none."""
     tokenizer = _get_processor_tokenizer(processor)
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
+        if default is not None:
+            return default
         raise ValueError(
             "Tokenizer must define `pad_token_id` for prompt-completion collation."
         )
@@ -5859,6 +6083,10 @@ def _combine_vlm_prompt_completion_inputs(
     input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
         input_ids, attention_mask, flush_side, max_seq_length, extras,
     )
+    # Truncation keeps CUDA's side; the rows still have to arrive right-padded.
+    input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
+        input_ids, attention_mask, "right", pad_id, extras,
+    )
 
     combined_inputs = dict(prompt_inputs)
     combined_inputs["input_ids"] = input_ids
@@ -5958,9 +6186,13 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
         all_images.append(images)
         all_suffixes.append(item.get("suffix") if isinstance(item, dict) else None)
 
-    inputs = _processor_vlm_inputs(
-        processor, all_texts, all_images, max_seq_length,
-        suffixes=all_suffixes,
+    inputs = _right_pad_vlm_rows(
+        _processor_vlm_inputs(
+            processor, all_texts, all_images, max_seq_length,
+            suffixes=all_suffixes,
+            padding_side="right",
+        ),
+        processor,
     )
     if _vlm_inputs_host_valued(inputs) and _vlm_ids_integer_host(inputs):
         label_mask = _stage_vlm_label_mask_np(
