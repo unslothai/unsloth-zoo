@@ -8421,6 +8421,13 @@ def install_audio_merge_patch(model, audio_token_id):
     until the last of them releases it. Returns True when a hold was taken, so
     every caller that gets True must release exactly once.
     """
+    # The whole sequence is under the lock, not just the count: capturing the
+    # current embedder, installing the wrapper and recording what to restore
+    # are one transition. Split across the lock boundary, an installer arriving
+    # while the last holder is restoring can capture the outgoing wrapper as
+    # its "original", and the remover can then overwrite the freshly installed
+    # one -- leaving the live run unpatched. Building the closure is pure
+    # Python with no I/O, so holding the lock across it costs nothing.
     with _AUDIO_MERGE_LOCK:
         holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
         if holders:
@@ -8428,44 +8435,42 @@ def install_audio_merge_patch(model, audio_token_id):
             # finishes first.
             setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
             return True
-        # Claim the slot before building the wrapper, so a second caller
-        # arriving mid-build takes a hold instead of installing its own.
+        original = model.get_input_embeddings
+        had_instance_attr = "get_input_embeddings" in vars(model)
+        audio_keys = ("input_features", "input_features_mask",
+                      "audio_features", "audio_mask")
+
+        def patched(input_ids=None, pixel_values=None, **kwargs):
+            features = kwargs.get("input_features", kwargs.get("audio_features"))
+            valid = kwargs.get("input_features_mask")
+            if features is None or valid is None:
+                return original(input_ids=input_ids, pixel_values=pixel_values, **kwargs)
+            # Model builds text and vision embeddings; audio is merged here.
+            rest = {k: v for k, v in kwargs.items() if k not in audio_keys}
+            result = original(input_ids=input_ids, pixel_values=pixel_values, **rest)
+            embeds = getattr(result, "inputs_embeds", result)
+            encoded, padding = model.audio_tower(features, ~valid)
+            audio_embeds = model.embed_audio(encoded)
+            placeholders = np.asarray(input_ids == audio_token_id).sum(axis=1)
+            source = _compact_audio_features(audio_embeds, padding, placeholders)
+            # Without this cast the merge widens the whole LM input to float32.
+            source = source.astype(embeds.dtype)
+            mask = mx.broadcast_to(
+                mx.expand_dims(input_ids == audio_token_id, -1), embeds.shape,
+            )
+            merged = _masked_scatter_rowwise(embeds, mask, source)
+            if hasattr(result, "inputs_embeds"):
+                result.inputs_embeds = merged
+                return result
+            return merged
+
+        model.get_input_embeddings = patched
+        setattr(model, _AUDIO_MERGE_SENTINEL, True)
         setattr(model, _AUDIO_MERGE_HOLDERS, 1)
-    original = model.get_input_embeddings
-    had_instance_attr = "get_input_embeddings" in vars(model)
-    audio_keys = ("input_features", "input_features_mask",
-                  "audio_features", "audio_mask")
-
-    def patched(input_ids=None, pixel_values=None, **kwargs):
-        features = kwargs.get("input_features", kwargs.get("audio_features"))
-        valid = kwargs.get("input_features_mask")
-        if features is None or valid is None:
-            return original(input_ids=input_ids, pixel_values=pixel_values, **kwargs)
-        # Model builds text and vision embeddings; audio is merged here.
-        rest = {k: v for k, v in kwargs.items() if k not in audio_keys}
-        result = original(input_ids=input_ids, pixel_values=pixel_values, **rest)
-        embeds = getattr(result, "inputs_embeds", result)
-        encoded, padding = model.audio_tower(features, ~valid)
-        audio_embeds = model.embed_audio(encoded)
-        placeholders = np.asarray(input_ids == audio_token_id).sum(axis=1)
-        source = _compact_audio_features(audio_embeds, padding, placeholders)
-        # Without this cast the merge widens the whole LM input to float32.
-        source = source.astype(embeds.dtype)
-        mask = mx.broadcast_to(
-            mx.expand_dims(input_ids == audio_token_id, -1), embeds.shape,
-        )
-        merged = _masked_scatter_rowwise(embeds, mask, source)
-        if hasattr(result, "inputs_embeds"):
-            result.inputs_embeds = merged
-            return result
-        return merged
-
-    model.get_input_embeddings = patched
-    setattr(model, _AUDIO_MERGE_SENTINEL, True)
-    # Put back exactly what was there: deleting would discard someone else's
-    # instance-level wrapper.
-    setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
-    return True
+        # Put back exactly what was there: deleting would discard someone else's
+        # instance-level wrapper.
+        setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
+        return True
 
 
 def remove_audio_merge_patch(model):
@@ -8477,20 +8482,22 @@ def remove_audio_merge_patch(model):
         if holders > 1:
             setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
             return False
-        # Last holder: drop the count inside the lock so a caller arriving now
-        # installs afresh rather than taking a hold on a patch being removed.
+        # Last holder. The restoration stays inside the lock with the count
+        # drop: released early, an installer could take the slot and capture
+        # the outgoing wrapper as its own "original", and this restore would
+        # then overwrite the wrapper that installer had just put in place.
+        previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
+        if previous is not None:
+            model.get_input_embeddings = previous
+        else:
+            try:
+                del model.get_input_embeddings
+            except AttributeError:
+                pass
+        setattr(model, _AUDIO_MERGE_SENTINEL, False)
+        setattr(model, _AUDIO_MERGE_ORIGINAL, None)
         setattr(model, _AUDIO_MERGE_HOLDERS, 0)
-    previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
-    if previous is not None:
-        model.get_input_embeddings = previous
-    else:
-        try:
-            del model.get_input_embeddings
-        except AttributeError:
-            pass
-    setattr(model, _AUDIO_MERGE_SENTINEL, False)
-    setattr(model, _AUDIO_MERGE_ORIGINAL, None)
-    return True
+        return True
 
 
 def _masked_scatter_rowwise(embeds, mask, source):

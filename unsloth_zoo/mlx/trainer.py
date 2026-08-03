@@ -4340,12 +4340,19 @@ class MLXTrainer:
                 # cannot keep this promise, because by the time audio appears
                 # the run is already partially applied.
                 #
-                # Both operands are rank-invariant (the mode is configured, the
-                # checkpoint is the same everywhere), so every rank refuses
-                # together without needing a collective. Deliberately not keyed
-                # on the peek, which is per-rank and would abort asymmetrically.
+                # `batch_iter is not None` is the planner's own test for an
+                # unsurveyable source, matched here so the two cannot drift: a
+                # finite plan is surveyed batch by batch below and admitted or
+                # routed on the evidence, and must not be refused.
+                #
+                # The remaining operands are rank-invariant (the mode is
+                # configured, the checkpoint is the same everywhere), so every
+                # rank refuses together without needing a collective.
+                # Deliberately not keyed on the peek, which is per-rank and
+                # would abort asymmetrically.
                 if (
-                    _effective_compile_mode(
+                    batch_iter is not None
+                    and _effective_compile_mode(
                         compile_policy, self._compile_decision,
                     ) == "strict"
                     and _model_carries_audio_modules(self.model)

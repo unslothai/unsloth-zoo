@@ -3053,6 +3053,61 @@ def test_the_hold_count_is_only_touched_under_the_lock(monkeypatch):
     assert model.get_input_embeddings() == "original"
 
 
+def test_the_wrapper_swap_happens_inside_the_critical_section(monkeypatch):
+    """Counting acquisitions is not enough: the capture, the install and the
+    restoration have to be *inside* the lock, not merely preceded by it. If the
+    lock is released after the count and before the swap, an installer arriving
+    while the last holder restores can capture the outgoing wrapper as its own
+    original, and the remover then overwrites the freshly installed one.
+
+    Observed by recording what `get_input_embeddings` is at lock entry and
+    exit: a swap that happened inside shows a difference across that span.
+    """
+    import threading
+
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    spans = []
+
+    class _ObservingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._model = None
+
+        def watch(self, model):
+            self._model = model
+
+        def __enter__(self):
+            self._entry = getattr(self._model, "get_input_embeddings", None)
+            return self._lock.__enter__()
+
+        def __exit__(self, *exc):
+            spans.append((
+                getattr(self._entry, "__name__", None),
+                getattr(getattr(self._model, "get_input_embeddings", None),
+                        "__name__", None),
+            ))
+            return self._lock.__exit__(*exc)
+
+    lock = _ObservingLock()
+    monkeypatch.setattr(mlx_utils, "_AUDIO_MERGE_LOCK", lock)
+
+    class _Model:
+        def get_input_embeddings(self, *a, **k):
+            return "original"
+
+    model = _Model()
+    lock.watch(model)
+
+    mlx_utils.install_audio_merge_patch(model, 1)
+    assert spans[-1] == ("get_input_embeddings", "patched"), (
+        "the wrapper was installed outside the lock: " + repr(spans[-1]))
+
+    mlx_utils.remove_audio_merge_patch(model)
+    assert spans[-1] == ("patched", "get_input_embeddings"), (
+        "the wrapper was restored outside the lock: " + repr(spans[-1]))
+
+
 def test_patched_audio_merge_places_each_row_own_features():
     """The correction must actually re-pair features, not just wrap the call."""
     import mlx.core as current_mx
