@@ -19,12 +19,23 @@ Covers:
   - `left_pack_padding` (stable sort that moves pad tokens to the right)
   - `align_logprobs_with_mask` (insert per-batch left padding into logprobs)
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
+  - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
+    top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
+  - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
+    ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
+    reference in loss, gradient and mean_kl for token and sequence IS levels
+  - `_warn_deprecated_n_chunks` (warn-once that unsloth_num_chunks has no effect)
+  - `UnslothEfficientGRPO` on the single-chunk path (the only path
+    grpo_accumulated_loss uses) matches a naive grpo_compute_loss pass in loss
+    and gradient for every loss type
   - `RL_REPLACEMENTS` dict integrity (every value is callable; the
     well-known public-API keys are populated).
 """
 
 from __future__ import annotations
 
+import inspect
+import logging
 import math
 from types import SimpleNamespace
 
@@ -210,3 +221,364 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     }
     missing = expected - set(rr.RL_REPLACEMENTS.keys())
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# _warn_unsupported_grpo_options
+# ---------------------------------------------------------------------------
+
+
+def _make_grpo_trainer(**args):
+    return SimpleNamespace(args=SimpleNamespace(**args))
+
+
+def test_warn_unsupported_grpo_options_silent_on_defaults(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+    assert trainer._unsloth_grpo_unsupported_warned is True
+
+
+def test_warn_unsupported_grpo_options_silent_when_attrs_missing(caplog):
+    trainer = _make_grpo_trainer()
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+
+
+def test_warn_unsupported_grpo_options_fires_for_top_entropy_quantile(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.2, use_bias_correction_kl=False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "top_entropy_quantile=0.2" in msgs[0]
+    assert "use_bias_correction_kl" not in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_silent_for_use_bias_correction_kl(caplog):
+    # Supported option: enabling it must not warn.
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+
+
+def test_warn_unsupported_grpo_options_never_mentions_use_bias_correction_kl(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.5, use_bias_correction_kl=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "top_entropy_quantile=0.5" in msgs[0]
+    assert "use_bias_correction_kl" not in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_fires_once(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.2)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+        rr._warn_unsupported_grpo_options(trainer)
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+
+
+def test_warn_unsupported_grpo_options_registered():
+    assert rr.RL_REPLACEMENTS.get("_warn_unsupported_grpo_options") is rr._warn_unsupported_grpo_options
+
+
+# ---------------------------------------------------------------------------
+# _warn_deprecated_n_chunks: unsloth_num_chunks is accepted but has no effect;
+# non-default values (not None / -1 / 1) warn once per process.
+# ---------------------------------------------------------------------------
+
+
+def test_warn_deprecated_n_chunks_silent_on_defaults(caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(None)
+        rr._warn_deprecated_n_chunks(-1)
+        rr._warn_deprecated_n_chunks(1)
+    assert caplog.records == []
+    # Defaults must not consume the warn-once flag.
+    assert rr._n_chunks_deprecation_warned is False
+
+
+@pytest.mark.parametrize("n_chunks", [-2, 0, 2, 4, 1000])
+def test_warn_deprecated_n_chunks_fires_for_non_default(n_chunks, caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(n_chunks)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "unsloth_num_chunks is deprecated" in msgs[0]
+
+
+def test_warn_deprecated_n_chunks_fires_once(caplog, monkeypatch):
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_deprecated_n_chunks(4)
+        rr._warn_deprecated_n_chunks(2)
+        rr._warn_deprecated_n_chunks(4)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+
+
+def test_warn_deprecated_n_chunks_registered():
+    assert rr.RL_REPLACEMENTS.get("_warn_deprecated_n_chunks") is rr._warn_deprecated_n_chunks
+
+
+def test_grpo_accumulated_loss_does_not_forward_n_chunks():
+    # n_chunks must not reach UnslothEfficientGRPO.apply.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "UnslothEfficientGRPO.apply" in src
+    apply_args = src.split("UnslothEfficientGRPO.apply(", 1)[1].split(")", 1)[0]
+    assert "n_chunks" not in apply_args
+
+
+# ---------------------------------------------------------------------------
+# UnslothEfficientGRPO single-chunk path (the only path grpo_accumulated_loss uses)
+# must match a naive grpo_compute_loss pass in loss and gradient for every loss type.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def disable_dynamo():
+    # Run UnslothEfficientGRPO's torch.compile step eagerly on CPU.
+    import torch._dynamo
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        yield
+    finally:
+        torch._dynamo.config.disable = prev
+
+
+def _vespo_gamma_weights(advantages, log_ratio_per_token, mask, importance_sampling_ratio,
+                         k_pos=2.0, lambda_pos=3.0, k_neg=3.0, lambda_neg=2.0):
+    # Per-sequence VESPO gamma weights, mirroring TRL GRPOTrainer.get_gamma_weights.
+    lower = math.log(1e-8)
+    seq_log_ratio = (torch.clamp(log_ratio_per_token, -20.0, 20.0) * mask).sum(-1, keepdim=True)
+    if importance_sampling_ratio is not None:
+        seq_log_ratio = seq_log_ratio + torch.clamp(
+            torch.log(importance_sampling_ratio), lower, 20.0
+        ).sum(-1, keepdim=True)
+    log_w = torch.clamp(seq_log_ratio, lower, 20.0)
+    w = torch.exp(log_w)
+    k = torch.where(advantages >= 0, k_pos, k_neg)
+    lam = torch.where(advantages >= 0, lambda_pos, lambda_neg)
+    return torch.exp(lam + k * log_w - lam * w).detach()
+
+
+def _grpo_loss_fixture(loss_type, B=6, T=5, V=17):
+    torch.manual_seed(123)
+    new = torch.randn(B, T, dtype=torch.float64)
+    old = new + 0.05 * torch.randn(B, T, dtype=torch.float64)
+    ref = new + 0.05 * torch.randn(B, T, dtype=torch.float64)
+    input_ids = torch.randint(0, V, (B, T))
+    mask = (torch.rand(B, T) > 0.3).to(torch.float64)
+    mask[:, 0] = 1.0  # guarantee at least one active token per row
+    advantages = torch.randn(B, dtype=torch.float64)
+    kwargs = dict(
+        loss_type=loss_type,
+        num_items_in_batch=float(mask.sum().item()),
+        num_processes=1,
+        current_gradient_accumulation_steps=1,
+        max_completion_length=T,
+    )
+    if loss_type == "vespo":
+        # vespo raises without a get_gamma_weights callable.
+        kwargs["get_gamma_weights"] = _vespo_gamma_weights
+    return new, old, ref, input_ids, mask, advantages, kwargs
+
+
+@pytest.mark.parametrize(
+    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
+)
+def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
+    beta = 0.04
+    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+
+    new_ref = new.clone().requires_grad_(True)
+    loss_ref = rr.grpo_compute_loss(
+        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    loss_ref.backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages,
+        beta, None, 1, kwargs,
+    )
+    out[0].backward()
+
+    assert torch.allclose(
+        out[0].detach().double(), loss_ref.detach().double(), atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: loss mismatch"
+    assert torch.allclose(
+        new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: gradient mismatch"
+
+
+# ---------------------------------------------------------------------------
+# use_bias_correction_kl (TRL GRPOConfig, DeepSeek-V3.2): per TRL _compute_loss
+# (main @ f782735), kl_i *= the pre-clamp non-detached coef_1 before the loss_type
+# dispatch, feeding both the loss's beta * kl term and the kl metric.
+# ---------------------------------------------------------------------------
+
+
+def _trl_mirror_grpo_loss(
+    ref, new, old, mask, beta, advantages,
+    importance_sampling_level="token", use_bias_correction_kl=False,
+    epsilon_low=0.2, epsilon_high=0.2,
+):
+    # Mirror of TRL _compute_loss for loss_type="grpo", independent of unsloth_zoo;
+    # mean_kl uses unsloth's per-row masked-mean convention for comparability.
+    if advantages.dim() == 1:
+        advantages = advantages.unsqueeze(1)
+    log_ratio = new - old
+    if importance_sampling_level == "token":
+        log_importance_weights = log_ratio
+    else:
+        log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = log_importance_weights.unsqueeze(-1)
+    coef_1 = torch.exp(log_importance_weights)
+    per_token_kl = torch.exp(ref - new) - (ref - new) - 1
+    if use_bias_correction_kl:
+        per_token_kl = per_token_kl * coef_1
+    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+    per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    per_token_loss = per_token_loss + beta * per_token_kl
+    loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+    mean_kl = ((per_token_kl * mask).sum(-1) / mask.sum(-1)).mean()
+    return loss, mean_kl
+
+
+@pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
+@pytest.mark.parametrize("use_bias_correction_kl", [False, True])
+def test_grpo_compute_loss_bias_correction_kl_matches_trl_mirror(
+    importance_sampling_level, use_bias_correction_kl
+):
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    kwargs["importance_sampling_level"] = importance_sampling_level
+    kwargs["use_bias_correction_kl"] = use_bias_correction_kl
+
+    new_ours = new.clone().requires_grad_(True)
+    loss, _completion_length, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new_ours, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss.backward()
+
+    new_trl = new.clone().requires_grad_(True)
+    loss_trl, mean_kl_trl = _trl_mirror_grpo_loss(
+        ref, new_trl, old, mask, beta, advantages,
+        importance_sampling_level=importance_sampling_level,
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+    loss_trl.backward()
+
+    assert torch.allclose(loss.detach(), loss_trl.detach(), atol=1e-10, rtol=1e-8)
+    assert torch.allclose(mean_kl.detach(), mean_kl_trl.detach(), atol=1e-10, rtol=1e-8)
+    # Gradient must flow through the NON-detached coef_1 in the corrected KL term.
+    assert torch.allclose(new_ours.grad, new_trl.grad, atol=1e-10, rtol=1e-8)
+
+
+def test_grpo_compute_loss_bias_correction_kl_changes_loss_and_mean_kl():
+    # Shift old by a constant so coef_1 != 1 everywhere and the correction visibly
+    # changes both the loss and the kl metric (symmetric noise averages it to ~0).
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    old = old - 0.5
+    loss_off, _, mean_kl_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss_on, _, mean_kl_on, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages,
+        use_bias_correction_kl=True, **kwargs
+    )
+    assert not torch.allclose(loss_on, loss_off)
+    assert not torch.allclose(mean_kl_on, mean_kl_off)
+
+
+def test_grpo_compute_loss_bias_correction_kl_defaults_off():
+    # Omitting the kwarg must equal use_bias_correction_kl=False (the TRL default).
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    loss_default, _, kl_default, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss_off, _, kl_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages,
+        use_bias_correction_kl=False, **kwargs
+    )
+    assert torch.equal(loss_default, loss_off)
+    assert torch.equal(kl_default, kl_off)
+
+
+def test_grpo_compute_loss_bias_correction_kl_noop_when_beta_zero():
+    # With beta == 0 there is no KL term, so the flag must have no effect.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    loss_off, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, 0.0, advantages, **kwargs
+    )
+    loss_on, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, 0.0, advantages,
+        use_bias_correction_kl=True, **kwargs
+    )
+    assert torch.equal(loss_on, loss_off)
+
+
+@pytest.mark.parametrize(
+    "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
+)
+def test_efficient_grpo_forwards_use_bias_correction_kl(loss_type, disable_dynamo):
+    # The flag passes through extra_kwargs, so the efficient path with the flag on
+    # must match the naive corrected pass for every loss type.
+    beta = 0.04
+    lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    # Constant shift so the correction moves the loss past allclose tolerance.
+    old = old - 0.5
+    kwargs["use_bias_correction_kl"] = True
+
+    new_ref = new.clone().requires_grad_(True)
+    loss_ref = rr.grpo_compute_loss(
+        ref, new_ref, old, None, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    loss_ref.backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages,
+        beta, None, 1, kwargs,
+    )
+    out[0].backward()
+
+    assert torch.allclose(
+        out[0].detach().double(), loss_ref.detach().double(), atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: loss mismatch"
+    assert torch.allclose(
+        new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
+    ), f"{loss_type}: gradient mismatch"
+
+    # Flag off must produce a different (uncorrected) loss.
+    kwargs_off = dict(kwargs)
+    kwargs_off["use_bias_correction_kl"] = False
+    out_off = rr.UnslothEfficientGRPO.apply(
+        new.clone().requires_grad_(True), old, ref, None, lm_head, input_ids, mask,
+        advantages, beta, None, 1, kwargs_off,
+    )
+    assert not torch.allclose(out[0].detach(), out_off[0].detach()), (
+        f"{loss_type}: use_bias_correction_kl had no effect"
+    )
+
+
+def test_grpo_accumulated_loss_forwards_use_bias_correction_kl():
+    # Read off trainer.args with getattr default False so older TRL stays uncorrected.
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert 'kwargs["use_bias_correction_kl"]' in src
+    assert 'getattr(trainer.args, "use_bias_correction_kl", False)' in src
