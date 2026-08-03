@@ -231,3 +231,45 @@ def test_probe_403_still_demotes(monkeypatch):
     ok, reason = health._probe_cas_reachable()
     assert ok is False
     assert "403" in reason
+
+
+def test_an_unprobed_memo_does_not_satisfy_an_explicit_probe(monkeypatch):
+    """The download path calls xet_health(probe=False) on every download.
+
+    Memoizing that optimistic default for all callers disarmed the explicit preflight for the next
+    minute, on exactly the CAS-blocked machine the probe exists to catch.
+    """
+    _big_machine(monkeypatch)
+    probes: list[bool] = []
+
+    def _blocked():
+        probes.append(True)
+        return (False, "CAS blocked by corporate proxy")
+
+    monkeypatch.setattr(health, "_probe_cas_reachable", _blocked)
+
+    cheap = health.xet_health(probe = False)
+    assert cheap.use_xet is True and cheap.source == "default"
+    assert probes == [], "the cheap path must not probe"
+
+    preflight = health.xet_health()          # probe defaults to True
+    assert probes == [True], "the explicit preflight was answered from an unprobed memo"
+    assert preflight.use_xet is False
+
+
+def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
+    """The memo must keep working for real verdicts, or a snapshot pays a probe per file."""
+    _big_machine(monkeypatch)
+    probes: list[bool] = []
+
+    def _reachable():
+        probes.append(True)
+        return (True, "Xet CAS reachable")
+
+    monkeypatch.setattr(health, "_probe_cas_reachable", _reachable)
+
+    health.xet_health(force = True)
+    assert probes == [True]
+    for _ in range(5):
+        health.xet_health()
+    assert probes == [True], "a real verdict should not be re-probed within the memo window"

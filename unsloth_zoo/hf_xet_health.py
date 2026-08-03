@@ -71,7 +71,12 @@ _PROBE_REPO = "unsloth/Qwen3-30B-A3B-Instruct-2507"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _LOCK = threading.Lock()
-_CACHED: "Optional[tuple[float, XetHealth]]" = None
+# (timestamp, verdict, was_probed). The probe flag is part of the key because the download path
+# calls this with probe = False on every download: without it, that cheap lookup memoizes the
+# optimistic "no cached verdict; defaulting to Xet" answer and silently disarms an explicit
+# preflight -- e.g. Studio's transport picker -- for the next minute, on exactly the CAS-blocked
+# machine the probe exists to catch.
+_CACHED: "Optional[tuple[float, XetHealth, bool]]" = None
 _MEMO_SECONDS = 60.0  # a snapshot download asks repeatedly; don't re-probe per file
 
 
@@ -239,12 +244,19 @@ def xet_health(*, force: bool = False, probe: bool = True) -> XetHealth:
         return XetHealth(True, "Xet forced by environment", "forced")
 
     with _LOCK:
-        if not force and _CACHED is not None and (time.monotonic() - _CACHED[0]) < _MEMO_SECONDS:
+        if (
+            not force
+            and _CACHED is not None
+            and (time.monotonic() - _CACHED[0]) < _MEMO_SECONDS
+            # An unprobed optimistic default only satisfies a caller that did not ask to probe. Any
+            # real verdict (cached / forced / probe) still short-circuits every caller.
+            and (_CACHED[2] or not probe or _CACHED[1].source != "default")
+        ):
             return _CACHED[1]
 
     result = _evaluate(force = force, probe = probe)
     with _LOCK:
-        _CACHED = (time.monotonic(), result)
+        _CACHED = (time.monotonic(), result, probe)
     return result
 
 

@@ -165,6 +165,10 @@ def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
     """An unmeasurable tick (state -> None) counts as progress, but a later frozen state still stalls."""
     seq = {"n": 0}
     frozen = (2048, True)  # constant size + active .incomplete
+    # A real partial on disk as well as the mocked repo-wide figure: the watchdog phases its two
+    # clocks on bytes in ACTIVE partials, so a mocked total alone would leave it in the connect
+    # phase (90s) and the 0.3s data deadline asserted below would never apply.
+    (_blobs_dir(hf_cache) / "frozen.incomplete").write_bytes(b"\0" * 2048)
 
     def fake_state(*args, **kwargs):
         seq["n"] += 1
@@ -4228,7 +4232,11 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
     )
     try:
-        time.sleep(0.15)
+        # Hold the partial long enough that the watchdog thread is certain to have measured it at
+        # least once (interval is 0.05s). A 0.15s hold was enough on an idle box but not under a
+        # loaded suite, where the thread could first run AFTER the unlink -- and a watchdog that
+        # never saw a partial genuinely cannot tell "finished" from "never started".
+        time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
         time.sleep(1.0)                    # well past connect_timeout
@@ -4345,3 +4353,97 @@ def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
 
     assert not mine.exists(), "the stalled child's own partial survived the purge"
     assert theirs.exists(), "a live sibling's partial was deleted"
+
+
+def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
+    """A snapshot whose config/tokenizer are already cached is still in its connect phase.
+
+    Repo-wide bytes include blobs that completed before this download began, so phasing on that
+    total latched the data deadline immediately and charged a healthy CAS setup the 30s budget
+    instead of the 90s one. This is the same scenario as the empty-partial test, plus one
+    already-complete blob -- i.e. every resume, and every snapshot where a small file landed first.
+    """
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "already-complete-config").write_bytes(b"\0" * 65536)  # no .incomplete suffix
+    (blobs / "opened-but-empty.incomplete").write_bytes(b"")
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(1.0)  # far past stall_timeout, nowhere near connect_timeout
+        assert calls == [], f"a cached blob was read as progress on the current file: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch):
+    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes.
+
+    Measured at a 20 Mbit/s proxy: 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
+    consecutive seconds. RSS is the sensor, because /proc io rchar counts VFS reads and reqwest
+    reads sockets with recv(2), so rchar is frozen on a perfectly healthy download.
+    """
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "buffering.incomplete").write_bytes(b"\0" * 4096)
+
+    rss = {"v": 100 * 1024 * 1024}
+
+    def _growing_rss(_pid):
+        rss["v"] += 12 * 1024 * 1024   # ~one 5s tick of a 20 Mbit link
+        return rss["v"]
+
+    monkeypatch.setattr(xf, "_child_rss", _growing_rss)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.2)  # 4x the stall deadline
+        assert calls == [], f"watchdog killed a child that was still receiving data: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_child_that_stops_receiving_still_trips(hf_cache, monkeypatch):
+    """The grace must not disarm a real hang: flat RSS and flat disk is a stall."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "hung.incomplete").write_bytes(b"\0" * 4096)
+
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)  # pinned
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a hung child never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeypatch):
+    """No psutil and no /proc (native Windows): fall back to the disk-only verdict."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "hung.incomplete").write_bytes(b"\0" * 4096)
+
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: None)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
+    finally:
+        stop.set()

@@ -105,6 +105,11 @@ DEFAULT_HTTP_STALL_TIMEOUT = 180.0
 # How often the watchdog measures. Detection latency is up to one interval on top of the timeout,
 # so this has to be well under DEFAULT_STALL_TIMEOUT to honour it.
 DEFAULT_POLL_INTERVAL = 5.0
+
+# A child buffering from the network grows RSS at roughly the wire rate. The threshold is well
+# above allocator noise but far below one poll's worth of even a thin link (20 Mbit/s is ~12 MB per
+# 5s tick), so a genuinely hung child cannot drift past it.
+_RSS_PROGRESS_EPSILON = 4 * 1024 * 1024
 # How often a "still downloading" status is pushed to the UI (independent of the measure rate).
 DEFAULT_HEARTBEAT_INTERVAL = 30.0
 DEFAULT_GRACE_PERIOD = 10.0
@@ -397,6 +402,42 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
+def _child_rss(pid: int) -> Optional[int]:
+    """Resident bytes of child *pid*, or ``None`` when undeterminable.
+
+    This is the sensor for "the child is receiving data but has not written it yet". xet-core
+    reconstructs a file strictly SEQUENTIALLY, so nothing reaches the ``.incomplete`` until the
+    head-of-line xorb block (up to 64 MiB) completes; every byte already fetched sits in the
+    reconstruction download buffer, i.e. in RSS. On a thin link that gap is minutes: measured at the
+    proxy, 431 MB arrived at a sustained 19.9 Mbit/s while the partial stayed flat at 0.5 MB for
+    171 consecutive seconds, with RSS climbing at the wire rate throughout.
+
+    Deliberately NOT ``/proc/<pid>/io`` ``rchar``: that counts VFS reads, and reqwest reads sockets
+    with ``recv(2)``, which does not increment it. Measured here, 67 MB over a socket moves rchar by
+    99 bytes. A healthy Xet download shows a frozen rchar, so it cannot distinguish one from a hang.
+
+    The signal self-bounds: once the buffer pool saturates, backpressure throttles the network down
+    to the write rate, so RSS goes flat exactly when the disk starts growing.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        try:
+            return int(psutil.Process(pid).memory_info().rss)
+        except Exception:
+            return None
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
     """Basenames of the ``*.incomplete`` blobs child *pid* has open -- exactly the partial THIS child is
     writing (incl. a resumed partial reusing a prior blob-hash name), not a sibling's (different pid).
@@ -522,7 +563,21 @@ def start_watchdog(
     baseline = set(baseline_incomplete_blobs or ())
     single_repo_id = repo_ids[0] if repo_ids else ""
 
-    def _measure() -> Optional[tuple[int, bool]]:
+    def _partial_bytes(ids) -> int:
+        """Bytes sitting in ACTIVE ``*.incomplete`` partials, nothing else."""
+        total = 0
+        for one in ids or []:
+            total += sum(_active_incomplete_blob_sizes(repo_type, one, cache_dir).values())
+        return total
+
+    def _measure() -> Optional[tuple[int, bool, int]]:
+        """``(bytes_watched, has_incomplete, bytes_in_active_partials)``.
+
+        The third element exists because the first cannot phase the two clocks in the repo-wide
+        modes: there *bytes_watched* also counts blobs that were ALREADY COMPLETE before this
+        download began -- a cached config or tokenizer, a shard from an earlier run -- so a nonzero
+        total says nothing about whether the CURRENT transfer has received its first byte.
+        """
         if watch_new_partials_only:
             sizes = _active_incomplete_blob_sizes(repo_type, single_repo_id, cache_dir)
             open_names = _child_open_incomplete_blobs(child_pid) if child_pid else None
@@ -531,20 +586,24 @@ def start_watchdog(
                 # siblings). hf_xet holds the .incomplete fd continuously, so an EMPTY set means the child
                 # owns no partial YET (connect / metadata phase), not a sibling's.
                 owned = {name: n for name, n in sizes.items() if name in open_names}
-                return (sum(owned.values()), len(owned) > 0)
+                owned_bytes = sum(owned.values())
+                return (owned_bytes, len(owned) > 0, owned_bytes)
             if child_pid:
                 # pid given but open files uninspectable (no psutil AND no /proc: native Windows / macOS
                 # without psutil). Post-baseline name filtering would forever EXCLUDE a resumed partial
                 # reusing a baseline name, so a frozen Xet resume never trips -- defeating the fallback.
                 # Fall back to the repo-wide measure (as snapshots do): the resume is watched, at the cost
                 # that a same-repo sibling's progress may mask this child's stall (accepted tradeoff).
-                return get_hf_download_state(
+                state = get_hf_download_state(
                     [single_repo_id], repo_type = repo_type, cache_dir = cache_dir
                 )
+                return None if state is None else (state[0], state[1], sum(sizes.values()))
             # No child pid at all: follow only newly-created (post-baseline) partials.
             owned = {name: n for name, n in sizes.items() if name not in baseline}
-            return (sum(owned.values()), len(owned) > 0)
-        return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+            owned_bytes = sum(owned.values())
+            return (owned_bytes, len(owned) > 0, owned_bytes)
+        state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+        return None if state is None else (state[0], state[1], _partial_bytes(repo_ids))
 
     def _beat() -> None:
         nonlocal fired
@@ -557,7 +616,8 @@ def start_watchdog(
         # setup finishes, which handed a healthy-but-slow connect the 30s data deadline rather than
         # the 90s connect one; and a partial going away after bytes flowed means the transfer
         # finished. Bytes, not the file, mark the transition.
-        seen_bytes = bool(state[0]) if state is not None else False
+        seen_bytes = bool(state[2]) if state is not None else False
+        last_rss = (_child_rss(child_pid) if child_pid else None) or 0
         peer_size: Optional[int] = None
 
         def _peer_progressing() -> bool:
@@ -597,17 +657,26 @@ def start_watchdog(
                 _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
                 continue
 
-            current_size, has_incomplete = state
+            current_size, has_incomplete, partial_bytes = state
             if current_size != last_size:
                 last_size = current_size
                 last_change = now
-            if current_size:
+            # Phase on partial bytes, not the repo-wide total: the latter includes blobs that were
+            # already complete before this download started. last_size/last_change stay on the
+            # repo-wide figure, which is still the right STALL signal -- only the PHASE signal was wrong.
+            if partial_bytes:
                 seen_bytes = True
 
             elapsed = now - last_change
             if has_incomplete and seen_bytes:
-                # Bytes have flowed into a partial that is still open: a frozen count is a hang.
-                if elapsed >= stall_timeout:
+                # Bytes have flowed into a partial that is still open: a frozen count is a hang --
+                # UNLESS the child is still filling its reconstruction buffer, which does not touch
+                # disk until the head-of-line block lands. See _child_rss.
+                rss = _child_rss(child_pid) if child_pid else None
+                if rss is not None and rss > last_rss + _RSS_PROGRESS_EPSILON:
+                    last_rss = rss
+                    last_change = now
+                elif elapsed >= stall_timeout:
                     _trip(
                         f"Download appears stalled ({transport} transport) "
                         f"-- no progress for {int(elapsed)}s"
