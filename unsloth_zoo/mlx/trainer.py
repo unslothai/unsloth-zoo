@@ -4331,25 +4331,14 @@ class MLXTrainer:
                 if deferred_check is not None:
                     # Global counts, so an all-masked dataset raises symmetrically.
                     deferred_check()
-                # Strict asks for a guarantee that an unsurveyable source
-                # cannot give: one peeked batch says nothing about the rest, so
-                # on a checkpoint that could produce audio at all, strict has to
-                # refuse here -- before any optimizer update, callback or
-                # checkpoint. The per-batch check in the training loop is a
-                # safety net for best-effort runs, which degrade to eager; it
-                # cannot keep this promise, because by the time audio appears
-                # the run is already partially applied.
-                #
-                # `batch_iter is not None` is the planner's own test for an
-                # unsurveyable source, matched here so the two cannot drift: a
-                # finite plan is surveyed batch by batch below and admitted or
-                # routed on the evidence, and must not be refused.
-                #
-                # The remaining operands are rank-invariant (the mode is
-                # configured, the checkpoint is the same everywhere), so every
-                # rank refuses together without needing a collective.
-                # Deliberately not keyed on the peek, which is per-rank and
-                # would abort asymmetrically.
+                # Strict asks for a guarantee an unsurveyable source cannot
+                # give, so refuse before anything is applied: the per-batch
+                # check in the loop only degrades best-effort runs to eager,
+                # and by the time audio appears the run is partly done.
+                # `batch_iter is not None` is the planner's own test for
+                # unsurveyable, matched so the two cannot drift. Every operand
+                # is rank-invariant, so ranks refuse together with no
+                # collective -- not keyed on the peek, which is per-rank.
                 if (
                     batch_iter is not None
                     and _effective_compile_mode(
@@ -6558,40 +6547,16 @@ class MLXTrainer:
             elif batch_error is not None:
                 raise batch_error
 
-            # A stream cannot be surveyed, so the plan's only audio evidence is
-            # the one batch peeked before training. Audio that first appears
-            # later would otherwise reach the compiled step and best-effort
-            # would pay a runtime compile failure to discover it. Ask each
-            # streamed batch instead, so the switch to eager is deterministic
-            # rather than resting on whether the compiled call happens to
-            # raise. Finite plans are already routed by the survey, and only
-            # compiled runs can care.
+            # A stream is surveyed only by the one batch the peek looked at, so
+            # audio appearing later must be caught here rather than at the
+            # compiled call, which may or may not raise. Under DDP each rank
+            # shards its own stream, so the verdict is agreed before anyone acts
+            # on it: one rank's audio takes every rank off the compiled path.
             #
-            # This does not rescue a strict run: by the time audio appears the
-            # run is partially applied, which is why strict refuses an
-            # audio-capable stream up front instead. The strict branch below
-            # remains for a checkpoint that carries no audio modules yet still
-            # produces audio features -- it should not happen, and if it does,
-            # stopping beats compiling shapes nothing planned for.
-            #
-            # Under DDP the answer has to be rank-wide before anyone acts on it:
-            # each rank shards its own stream, so one rank alone seeing audio
-            # must still take every rank off the compiled path together, and a
-            # rank that decided locally would abort into a collective its peers
-            # still expect to reach. `_distributed_any_flag` is the same
-            # primitive the per-batch failure consensus already uses, and the
-            # collective is confined to compiled streaming runs -- a surveyed
-            # plan short-circuits before it, and once audio has appeared
-            # `_use_compile` is False and the question stops being asked.
-            #
-            # Every operand of the guard below has to stay rank-invariant, or
-            # one rank enters this collective alone and hangs its peers. It
-            # holds today: `_is_vlm` and the plan type come from the same model
-            # and dataset everywhere, and every `_use_compile = False` that a
-            # DDP run can reach is itself driven by a collective -- the
-            # coordinated shape guard, the `_distributed_status_mask` setup
-            # consensus, and the DDP runtime fallback. Do not add a rank-local
-            # term here.
+            # Every operand below must stay rank-invariant, or one rank enters
+            # the collective alone and hangs its peers. It holds today: every
+            # `_use_compile = False` a DDP run reaches is itself driven by a
+            # collective. Do not add a rank-local term here.
             if _use_compile and self._is_vlm and not isinstance(
                 batches, FiniteVLMBatchPlan,
             ):

@@ -8336,14 +8336,10 @@ _AUDIO_TOWER_ATTRS = (
 _AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
 _AUDIO_MERGE_HOLDERS = "_unsloth_audio_merge_holders"
 _AUDIO_MERGE_ORIGINAL = "_unsloth_audio_merge_original"
-# The hold count is read, decided on and written back, which is three
-# statements and therefore not atomic under the GIL. Two trainers starting
-# close together -- the case install_audio_merge_patch documents as supported
-# -- could both read zero, both install a wrapper, and both leave the count at
-# one; the first to finish would then restore the original embedder while the
-# other was still training, silently reinstating the merge bug. Module-level
-# rather than per-model: it is taken twice per run, so contention is
-# irrelevant, and a per-model lock would need this same guard to create.
+# The hold count is read, decided on and written back, which the GIL does not
+# make atomic, so two trainers starting close together could both install a
+# wrapper and the first to finish would restore the original mid-training.
+# Module-level: it is taken twice per run, so contention is irrelevant.
 _AUDIO_MERGE_LOCK = threading.Lock()
 
 # Families whose merge walks a flattened feature block with a running
@@ -8421,13 +8417,9 @@ def install_audio_merge_patch(model, audio_token_id):
     until the last of them releases it. Returns True when a hold was taken, so
     every caller that gets True must release exactly once.
     """
-    # The whole sequence is under the lock, not just the count: capturing the
-    # current embedder, installing the wrapper and recording what to restore
-    # are one transition. Split across the lock boundary, an installer arriving
-    # while the last holder is restoring can capture the outgoing wrapper as
-    # its "original", and the remover can then overwrite the freshly installed
-    # one -- leaving the live run unpatched. Building the closure is pure
-    # Python with no I/O, so holding the lock across it costs nothing.
+    # Capture, install and record are one transition, so all of it is under the
+    # lock: split, an installer arriving mid-restore captures the outgoing
+    # wrapper as its "original" and the remover overwrites the new one.
     with _AUDIO_MERGE_LOCK:
         holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
         if holders:
@@ -8482,10 +8474,8 @@ def remove_audio_merge_patch(model):
         if holders > 1:
             setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
             return False
-        # Last holder. The restoration stays inside the lock with the count
-        # drop: released early, an installer could take the slot and capture
-        # the outgoing wrapper as its own "original", and this restore would
-        # then overwrite the wrapper that installer had just put in place.
+        # Last holder: restore inside the lock with the count drop, for the
+        # reason install gives.
         previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
         if previous is not None:
             model.get_input_embeddings = previous
