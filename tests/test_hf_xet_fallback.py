@@ -4524,3 +4524,54 @@ def test_a_hang_between_snapshot_files_is_detected(hf_cache):
         assert "did not resume" in calls[0], calls
     finally:
         stop.set()
+
+
+def test_single_file_lock_waiter_survives_a_buffering_peer(hf_cache):
+    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive.
+
+    A healthy Xet transfer writes strictly sequentially: measured, the .incomplete sat unchanged for
+    171s at 20 Mbit/s while data piled up in the reconstruction buffer. Requiring continuous growth
+    killed the waiter at connect_timeout while the lock holder was downloading normally.
+    """
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "held-by-a-buffering-peer.incomplete"
+    peer.write_bytes(b"\0" * 4096)          # present and fresh, and it never grows
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {peer.name},
+        child_pid = None,
+    )
+    try:
+        time.sleep(1.2)  # 4x the connect deadline, with zero disk growth anywhere
+        assert calls == [], f"a waiter was killed while its peer was buffering: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
+    """The liveness signal is mtime-bounded, so an abandoned leftover cannot disarm the clock."""
+    import os as _os
+
+    blobs = _blobs_dir(hf_cache)
+    stale = blobs / "abandoned.incomplete"
+    stale.write_bytes(b"\0" * 4096)
+    old = time.time() - 10_000
+    _os.utime(stale, (old, old))
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {stale.name},
+        child_pid = None,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a stale partial masked a real hang"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()

@@ -638,6 +638,31 @@ def start_watchdog(
             if current is None or current != peer_size:
                 peer_size = current
                 return True
+            # Flat disk is NOT proof the peer is dead: a healthy Xet transfer writes strictly
+            # sequentially, so its .incomplete can sit unchanged for minutes while data piles up in
+            # the reconstruction buffer (measured: 171s at 20 Mbit/s). Requiring continuous growth
+            # therefore killed a waiter at connect_timeout while the holder was downloading fine.
+            # A fresh peer-owned partial is the liveness signal; its mtime bounds a stale leftover.
+            fresh = max(connect_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+            now_wall = time.time()
+            for one in repo_ids or []:
+                for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
+                    blobs_dir = entry / "blobs"
+                    if not blobs_dir.is_dir():
+                        continue
+                    try:
+                        for blob in blobs_dir.iterdir():
+                            try:
+                                if (
+                                    blob.name.endswith(INCOMPLETE_SUFFIX)
+                                    and blob.is_file()
+                                    and now_wall - blob.stat().st_mtime < fresh
+                                ):
+                                    return True
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
             return False
 
         def _waiting_on_a_peers_partial() -> bool:
