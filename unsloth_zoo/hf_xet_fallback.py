@@ -110,6 +110,13 @@ DEFAULT_POLL_INTERVAL = 5.0
 # above allocator noise but far below one poll's worth of even a thin link (20 Mbit/s is ~12 MB per
 # 5s tick), so a genuinely hung child cannot drift past it.
 _RSS_PROGRESS_EPSILON = 4 * 1024 * 1024
+
+# An absolute cap on how long peer liveness may keep resetting the connect clock. The case being
+# protected is "queued behind one live download", and the hub lock is per blob, so the wait is
+# bounded by a single blob: a ~5GB shard on a slow link is well under an hour. Without a cap, a
+# continuous series of UNRELATED same-repo downloads suppresses the clock forever and a genuinely
+# hung child never falls back, because the parent cannot tell which blob its child is waiting for.
+PEER_SUPPRESSION_CEILING = 3600.0
 # How often a "still downloading" status is pushed to the UI (independent of the measure rate).
 DEFAULT_HEARTBEAT_INTERVAL = 30.0
 DEFAULT_GRACE_PERIOD = 10.0
@@ -617,6 +624,10 @@ def start_watchdog(
         # the 90s connect one; and a partial going away after bytes flowed means the transfer
         # finished. Bytes, not the file, mark the transition.
         seen_bytes = bool(state[2]) if state is not None else False
+        # Sticky, unlike seen_bytes: it only selects the "did not resume" wording for the gap
+        # between files, and must not reset when a partial set momentarily empties.
+        seen_bytes_ever = seen_bytes
+        peer_wait_start: Optional[float] = None
         last_rss = (_child_rss(child_pid) if child_pid else None) or 0
         peer_size: Optional[int] = None
 
@@ -734,11 +745,16 @@ def start_watchdog(
                 # that fill invisible and trips the data clock on a child receiving at wire rate.
                 if rss is not None:
                     last_rss = rss
-            # Phase on partial bytes, not the repo-wide total: the latter includes blobs that were
-            # already complete before this download started. last_size/last_change stay on the
-            # repo-wide figure, which is still the right STALL signal -- only the PHASE signal was wrong.
-            if partial_bytes:
-                seen_bytes = True
+            # Phase on the partials open RIGHT NOW, not a run-once latch. Partial bytes rather than
+            # the repo-wide total, because that total includes blobs already complete before this
+            # download began; and re-evaluated every tick, because a latch stayed true after file N
+            # finished and charged file N+1's empty .incomplete the 30s data deadline while it was
+            # still doing CAS setup. last_size/last_change stay on the repo-wide figure, which is
+            # still the right STALL signal -- only the deadline SELECTION was wrong.
+            seen_bytes = bool(partial_bytes)
+            if seen_bytes:
+                seen_bytes_ever = True
+                peer_wait_start = None      # a byte landed: we are not a lock waiter
 
             elapsed = now - last_change
             if has_incomplete and seen_bytes:
@@ -762,32 +778,43 @@ def start_watchdog(
                         f"-- no progress for {int(elapsed)}s"
                     )
                     return
-            elif not seen_bytes:
-                # Not one byte yet, whether or not an empty .incomplete already exists: the child
-                # is stuck before the first byte, OR it is queued on the hub's per-file cache lock
-                # while another writer fetches the same blob. Without this branch such a child is
-                # invisible to the watchdog forever; without the peer check, a legitimate lock wait
-                # is killed at connect_timeout.
-                if _peer_progressing():
+            elif not has_incomplete and seen_bytes_ever:
+                # Bytes flowed earlier and no partial is open now: either the transfer FINISHED
+                # (symlinking) or the child is BETWEEN FILES and hung before opening the next one --
+                # a snapshot does metadata and the cache lock before creating the .incomplete, so
+                # this state is normal mid-download. Resetting unconditionally made that hang
+                # invisible to BOTH clocks forever once any byte had been seen, which is the failure
+                # this watchdog exists to catch. The patient connect clock governs the gap; real
+                # repo-wide progress resets it above, and a live peer is covered by the waiter gate.
+                if elapsed >= connect_timeout and not _waiting_on_a_peers_partial():
+                    _trip(
+                        f"Download did not resume ({transport} transport) "
+                        f"-- no data for {int(elapsed)}s"
+                    )
+                    return
+            else:
+                # Not one byte in the partials open right now, whether or not an empty .incomplete
+                # already exists: the child is stuck before its first byte, OR it is queued on the
+                # hub's per-file cache lock while another writer fetches the same blob. Without this
+                # branch such a child is invisible to the watchdog forever; without the peer check,
+                # a legitimate lock wait is killed at connect_timeout.
+                #
+                # The peer check is deliberately weaker than the question being asked: the hub lock
+                # is per blob, but the parent cannot observe WHICH blob its child is waiting for
+                # (filelock closes the lock fd between poll attempts), so any fresh partial in the
+                # repo counts. The ceiling bounds how long that approximation may hold off the
+                # clock, so an unrelated series of downloads cannot suppress it indefinitely.
+                if _peer_progressing() and (
+                    peer_wait_start is None
+                    or now - peer_wait_start < PEER_SUPPRESSION_CEILING
+                ):
+                    if peer_wait_start is None:
+                        peer_wait_start = now
                     last_change = now
                 elif elapsed >= connect_timeout:
                     _trip(
                         f"Download did not start ({transport} transport) "
                         f"-- no data after {int(elapsed)}s"
-                    )
-                    return
-            else:
-                # Bytes flowed and no partial is open: either the transfer FINISHED (symlinking) or
-                # the child is BETWEEN FILES and hung before opening the next one -- a snapshot does
-                # metadata and the cache lock before creating the .incomplete, so this state is
-                # normal mid-download. Resetting unconditionally made that hang invisible to BOTH
-                # clocks forever once any byte had been seen, which is the failure this watchdog
-                # exists to catch. The patient connect clock governs the gap; real repo-wide
-                # progress resets it above, and a live peer is covered by the waiter gate.
-                if elapsed >= connect_timeout and not _waiting_on_a_peers_partial():
-                    _trip(
-                        f"Download did not resume ({transport} transport) "
-                        f"-- no data for {int(elapsed)}s"
                     )
                     return
 

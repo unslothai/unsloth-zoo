@@ -71,6 +71,9 @@ _PROBE_REPO = "unsloth/Qwen3-30B-A3B-Instruct-2507"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _LOCK = threading.Lock()
+_PROBE_LOCK = threading.Lock()
+# (worker, result sink) for the at-most-one in-flight probe. Read and replaced only under _PROBE_LOCK.
+_PROBE_INFLIGHT: "Optional[tuple[threading.Thread, list]]" = None
 # (timestamp, verdict, was_probed). The probe flag is part of the key because the download path
 # calls this with probe = False on every download: without it, that cheap lookup memoizes the
 # optimistic "no cached verdict; defaulting to Xet" answer and silently disarms an explicit
@@ -234,16 +237,29 @@ def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
     or a proxy trickling the response blows straight past PROBE_TIMEOUT_SECONDS. That matters now
     that an explicit preflight really probes: the module's rule is that every probe is time-boxed.
     """
-    result: list = []
+    global _PROBE_INFLIGHT
 
-    def _run() -> None:
+    def _run(sink: list) -> None:
         try:
-            result.append(_probe_cas_reachable_inner())
+            sink.append(_probe_cas_reachable_inner())
         except Exception as e:  # noqa: BLE001 - the probe must never raise into a download
-            result.append((False, f"Xet CAS unreachable: {type(e).__name__}"))
+            sink.append((False, f"Xet CAS unreachable: {type(e).__name__}"))
 
-    worker = threading.Thread(target = _run, daemon = True, name = "unsloth-xet-probe")
-    worker.start()
+    # Single-flight. join(timeout) abandons the worker, it cannot kill it, and a thread blocked in
+    # getaddrinfo or on a trickling socket is unreachable by any in-process cancellation. Without
+    # this, one blocked thread per preflight would accumulate for the life of a server process on
+    # exactly the broken network this probe exists to detect. Only a LIVE worker is reused, so a
+    # finished-but-unread result can never be served stale.
+    with _PROBE_LOCK:
+        inflight = _PROBE_INFLIGHT
+        if inflight is None or not inflight[0].is_alive():
+            sink: list = []
+            worker = threading.Thread(
+                target = _run, args = (sink,), daemon = True, name = "unsloth-xet-probe",
+            )
+            inflight = _PROBE_INFLIGHT = (worker, sink)
+            worker.start()
+    worker, result = inflight
     worker.join(PROBE_TIMEOUT_SECONDS + 0.5)
     if not result:
         # Inconclusive rather than a demotion: we could not bound the clock, so we did not measure

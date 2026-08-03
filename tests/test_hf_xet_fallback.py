@@ -4640,3 +4640,60 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
         assert calls == [], f"a slow but healthy buffering child was killed: {calls}"
     finally:
         stop.set()
+
+
+def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
+    """The phase latch left files 2..N unprotected.
+
+    Once file 1 had bytes, `seen_bytes` stayed true, so file 2's empty .incomplete -- created before
+    its CAS setup finishes -- was charged the 30s data deadline with elapsed still running from
+    file 1's last write. That is the identical defect already fixed for file 1.
+    """
+    blobs = _blobs_dir(hf_cache)
+    first = blobs / "file-one.incomplete"
+    first.write_bytes(b"\0" * 4096)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(0.15)
+        first.rename(blobs / "file-one")                  # file 1 completed
+        (blobs / "file-two.incomplete").write_bytes(b"")  # file 2 opens, still in CAS setup
+        time.sleep(1.0)                                   # 3x the data deadline
+        assert calls == [], f"file 2 was charged the data deadline: {calls}"
+    finally:
+        stop.set()
+
+
+def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
+    """The parent cannot tell which blob its child waits for, so peer liveness is approximate.
+
+    A continuous series of UNRELATED same-repo downloads therefore reset the connect clock on every
+    tick and a genuinely hung child never fell back. The ceiling bounds that approximation.
+    """
+    monkeypatch.setattr(xf, "PEER_SUPPRESSION_CEILING", 0.5)
+    blobs = _blobs_dir(hf_cache)
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True, child_pid = 4242,
+    )
+    try:
+        # A never-ending series of unrelated blobs, each one "live" for a moment.
+        for i in range(40):
+            peer = blobs / f"unrelated-{i}.incomplete"
+            peer.write_bytes(b"\0" * (1024 * (i + 1)))
+            time.sleep(0.05)
+            if calls:
+                break
+        assert calls, "an unrelated series suppressed the connect clock indefinitely"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()
