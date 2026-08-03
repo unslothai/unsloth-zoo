@@ -6531,9 +6531,18 @@ class MLXTrainer:
             # instead, so the switch is deterministic rather than resting on
             # whether the compiled call happens to raise. Finite plans are
             # already routed by the survey, and only compiled runs can care.
+            #
+            # Single-process only, for the two reasons the runtime fallback
+            # below is: the DDP path runs its own local-grad step_fn with a
+            # different signature, and each rank shards its own stream, so a
+            # rank that alone saw audio would abort into a collective its peers
+            # still expect to reach. The planner scopes its streaming strict
+            # abort the same way.
             if (
                 _use_compile
                 and self._is_vlm
+                and distributed_world_size <= 1
+                and not _ddp_compile_local_grad
                 and self._streamed_audio_leaves_the_compiled_path(
                     batch_data, batches,
                 )
