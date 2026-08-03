@@ -165,9 +165,9 @@ def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
     """An unmeasurable tick (state -> None) counts as progress, but a later frozen state still stalls."""
     seq = {"n": 0}
     frozen = (2048, True)  # constant size + active .incomplete
-    # A real partial on disk as well as the mocked repo-wide figure: the watchdog phases its two
-    # clocks on bytes in ACTIVE partials, so a mocked total alone would leave it in the connect
-    # phase (90s) and the 0.3s data deadline asserted below would never apply.
+    # A real partial as well as the mocked repo-wide figure: the watchdog phases its clocks on bytes
+    # in ACTIVE partials, so a mocked total alone would leave it in the 90s connect phase and the
+    # 0.3s data deadline asserted below would never apply.
     (_blobs_dir(hf_cache) / "frozen.incomplete").write_bytes(b"\0" * 2048)
 
     def fake_state(*args, **kwargs):
@@ -4152,22 +4152,17 @@ def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
     assert not owned.exists() and not sibling.exists()
 
 
-# ---------------------------------------------------------------------------
 # Tiered stall detection: a hang BEFORE the first byte used to be invisible.
-# ---------------------------------------------------------------------------
 
 def test_connect_phase_hang_is_detected(hf_cache):
-    """A child stuck in DNS / TLS / metadata never creates a .incomplete.
-
-    The watchdog used to reset its clock on every tick where no partial existed, so this state --
-    the most common way a Xet download "just hangs at 0%" -- could not be detected at all. It is
-    now governed by connect_timeout instead.
-    """
+    """A child stuck in DNS / TLS / metadata never creates a .incomplete. The watchdog used to reset
+    its clock whenever no partial existed, so this state (a Xet download "hanging at 0%") could not
+    be detected at all; connect_timeout governs it now."""
     calls: list[str] = []
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
-        # Supervising a download child: the connect clock is theirs, not a whole-load caller's.
+        # A download child to kill, so the connect clock applies.
         watch_connect = True,
     )
     try:
@@ -4192,8 +4187,8 @@ def test_connect_grace_is_longer_than_the_stall_trip():
     [(False, xf.DEFAULT_STALL_TIMEOUT), (True, xf.DEFAULT_HTTP_STALL_TIMEOUT)],
 )
 def test_default_stall_timeout_is_transport_aware(hf_cache, monkeypatch, xet_disabled, expected):
-    """With no explicit timeout the watchdog picks per transport: aggressive on Xet (a stall there
-    has somewhere to fall back to), patient on HTTP (it does not)."""
+    """No explicit timeout: aggressive on Xet (a stall there has somewhere to fall back to), patient
+    on HTTP (it does not)."""
     defaults: dict[str, float] = {}
 
     def _record(name, default):
@@ -4234,10 +4229,10 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 5.0,
     )
     try:
-        # Hold the partial long enough that the watchdog thread is certain to have measured it at
-        # least once (interval is 0.05s). A 0.15s hold was enough on an idle box but not under a
-        # loaded suite, where the thread could first run AFTER the unlink -- and a watchdog that
-        # never saw a partial genuinely cannot tell "finished" from "never started".
+        # Hold the partial long enough that the watchdog thread certainly measured it once: a 0.15s
+        # hold passed on an idle box but not under a loaded suite, where the thread could first run
+        # AFTER the unlink, and a watchdog that never saw a partial cannot tell "finished" from
+        # "never started".
         time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
@@ -4248,12 +4243,9 @@ def test_post_download_init_is_not_a_stall(hf_cache):
 
 
 def test_lock_wait_behind_a_live_peer_is_not_a_stall(hf_cache):
-    """Two callers of the same uncached file serialise on the hub's per-file lock.
-
-    The waiter owns no .incomplete of its own, so in watch_new_partials_only mode it looks exactly
-    like a child stuck before the first byte -- and the connect clock killed it. Repo-wide growth
-    is what tells the two apart: as long as the lock HOLDER is still writing, the waiter is fine.
-    """
+    """Two callers of the same uncached file serialise on the hub's per-file lock. The waiter owns no
+    .incomplete, so in watch_new_partials_only mode it looks like a child stuck before the first byte
+    and the connect clock killed it; repo-wide growth tells the two apart."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-the-other-writer.incomplete"
     peer.write_bytes(b"\0" * 1024)
@@ -4286,7 +4278,7 @@ def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
         watch_new_partials_only = True,
         child_pid = None,
-        # Supervising a download child: the connect clock is theirs, not a whole-load caller's.
+        # A download child to kill, so the connect clock applies.
         watch_connect = True,
     )
     try:
@@ -4297,11 +4289,9 @@ def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
 
 
 def test_empty_partial_gets_the_connect_deadline_not_the_stall_one(hf_cache):
-    """An .incomplete created before the first byte must not consume the 30s data budget.
-
-    Hub/hf_xet can open the destination before CAS setup finishes, so phasing on the file's
-    existence handed a healthy-but-slow connect the short deadline. Bytes mark the transition.
-    """
+    """An .incomplete created before the first byte must not consume the 30s data budget: hub/hf_xet
+    can open the destination before CAS setup finishes, so phasing on the file's existence handed a
+    healthy-but-slow connect the short deadline. Bytes mark the transition."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
 
@@ -4337,12 +4327,9 @@ def test_a_partial_that_stops_growing_still_trips(hf_cache):
 
 
 def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
-    """The child we just killed leaves a ~30s-old partial, and the sibling grace is 180s.
-
-    Sparing it made has_active_incomplete_blobs() force force_download, which on a snapshot
-    re-downloads every already-complete shard over the slower transport. Uses the real prepare:
-    the autouse fixture stubs it to a no-op for the ladder tests.
-    """
+    """The child we just killed leaves a ~30s-old partial and the sibling grace is 180s. Sparing it
+    made has_active_incomplete_blobs() force force_download, re-downloading every complete shard over
+    the slower transport. Uses the real prepare (the autouse fixture stubs it out)."""
     blobs = _blobs_dir(hf_cache)
     mine = blobs / "killed-child.incomplete"
     theirs = blobs / "live-sibling.incomplete"
@@ -4360,13 +4347,10 @@ def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
 
 
 def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
-    """A snapshot whose config/tokenizer are already cached is still in its connect phase.
-
-    Repo-wide bytes include blobs that completed before this download began, so phasing on that
-    total latched the data deadline immediately and charged a healthy CAS setup the 30s budget
-    instead of the 90s one. This is the same scenario as the empty-partial test, plus one
-    already-complete blob -- i.e. every resume, and every snapshot where a small file landed first.
-    """
+    """A snapshot whose config/tokenizer are already cached is still in its connect phase. Repo-wide
+    bytes include blobs completed before this download began, so phasing on that total latched the
+    data deadline and charged a healthy CAS setup the 30s budget instead of 90s -- i.e. every resume,
+    and every snapshot where a small file landed first."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "already-complete-config").write_bytes(b"\0" * 65536)  # no .incomplete suffix
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
@@ -4384,12 +4368,10 @@ def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
 
 
 def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch):
-    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes.
-
-    Measured at a 20 Mbit/s proxy: 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
-    consecutive seconds. RSS is the sensor, because /proc io rchar counts VFS reads and reqwest
-    reads sockets with recv(2), so rchar is frozen on a perfectly healthy download.
-    """
+    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes:
+    measured at a 20 Mbit/s proxy, 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
+    consecutive seconds. RSS is the sensor because /proc io rchar counts VFS reads and reqwest reads
+    sockets with recv(2), so rchar is frozen on a healthy download."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "buffering.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4454,12 +4436,10 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
 
 
 def test_snapshot_lock_waiter_is_not_killed_while_a_peer_owns_the_partial(hf_cache, monkeypatch):
-    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes.
-
-    That lands it in the data branch, where its own disk and its own RSS are both flat by
-    definition, and it was killed at stall_timeout and charged a Xet failure. On a multi-rank launch
-    of one model that reaches the demotion threshold on the first run.
-    """
+    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes and
+    lands in the data branch where its own disk and RSS are flat by definition. It was killed at
+    stall_timeout and charged a Xet failure, hitting the demotion threshold on a multi-rank launch's
+    first run."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "owned-by-the-writer.incomplete"
     peer.write_bytes(b"\0" * (8 * 1024 * 1024))   # peer is buffering: present, fresh, not growing
@@ -4503,13 +4483,10 @@ def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeyp
 
 
 def test_a_hang_between_snapshot_files_is_detected(hf_cache):
-    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete.
-
-    So "bytes flowed and no partial is open" is a normal mid-download state, not just the finished
-    one. Resetting the clock unconditionally there made a child hung between files invisible to both
-    clocks forever, once any byte had been seen anywhere -- the exact unbounded hang this watchdog
-    exists to catch, and the reason the connect clock only ever protected the FIRST file.
-    """
+    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete, so "bytes
+    flowed and no partial is open" is a normal mid-download state, not only the finished one.
+    Resetting the clock there made a child hung between files invisible to both clocks forever once
+    any byte had been seen, so the connect clock only ever protected the FIRST file."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "first-file.incomplete"
     part.write_bytes(b"\0" * 1024)
@@ -4518,7 +4495,7 @@ def test_a_hang_between_snapshot_files_is_detected(hf_cache):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.4,
-        # Supervising a download child: the connect clock is theirs, not a whole-load caller's.
+        # A download child to kill, so the connect clock applies.
         watch_connect = True,
     )
     try:
@@ -4533,12 +4510,10 @@ def test_a_hang_between_snapshot_files_is_detected(hf_cache):
 
 
 def test_single_file_lock_waiter_survives_a_buffering_peer(hf_cache):
-    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive.
-
-    A healthy Xet transfer writes strictly sequentially: measured, the .incomplete sat unchanged for
-    171s at 20 Mbit/s while data piled up in the reconstruction buffer. Requiring continuous growth
-    killed the waiter at connect_timeout while the lock holder was downloading normally.
-    """
+    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive: a
+    healthy Xet transfer writes strictly sequentially and the .incomplete sat unchanged for 171s at
+    20 Mbit/s. Requiring continuous growth killed the waiter at connect_timeout while the lock holder
+    downloaded normally."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-a-buffering-peer.incomplete"
     peer.write_bytes(b"\0" * 4096)          # present and fresh, and it never grows
@@ -4575,7 +4550,7 @@ def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
         watch_new_partials_only = True,
         baseline_incomplete_blobs = {stale.name},
         child_pid = None,
-        # Supervising a download child: the connect clock is theirs, not a whole-load caller's.
+        # A download child to kill, so the connect clock applies.
         watch_connect = True,
     )
     try:
@@ -4586,12 +4561,9 @@ def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
 
 
 def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monkeypatch):
-    """xet's reconstruction buffer is a process-wide budget reused across files.
-
-    So episode N+1 refills BELOW episode N's peak. Treating the baseline as a lifetime high-water
-    mark made that fill invisible and killed a child receiving at wire rate -- reachable on any
-    multi-shard snapshot, which is one child doing many fill/flush cycles.
-    """
+    """xet's reconstruction buffer is a process-wide budget reused across files, so episode N+1
+    refills BELOW episode N's peak. A lifetime high-water baseline made that fill invisible and
+    killed a child receiving at wire rate, on any multi-shard snapshot."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "shard.incomplete"
     part.write_bytes(b"\0" * 4096)
@@ -4620,12 +4592,9 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
 
 
 def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
-    """Pins the decision NOT to compare consecutive samples.
-
-    Requiring the epsilon between consecutive polls demands a sustained ~6.7 Mbit/s floor at
-    production constants, so a slower link would false-trip on its very first buffering episode --
-    exactly the links this fallback exists for.
-    """
+    """Pins the decision NOT to compare consecutive samples: requiring the epsilon between polls
+    demands a sustained ~6.7 Mbit/s floor at production constants, so a slower link would false-trip
+    on its first buffering episode."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "slow.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4651,12 +4620,9 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
 
 
 def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
-    """The phase latch left files 2..N unprotected.
-
-    Once file 1 had bytes, `seen_bytes` stayed true, so file 2's empty .incomplete -- created before
-    its CAS setup finishes -- was charged the 30s data deadline with elapsed still running from
-    file 1's last write. That is the identical defect already fixed for file 1.
-    """
+    """The phase latch left files 2..N unprotected: once file 1 had bytes `seen_bytes` stayed true,
+    so file 2's empty .incomplete was charged the 30s data deadline with elapsed still running from
+    file 1's last write."""
     blobs = _blobs_dir(hf_cache)
     first = blobs / "file-one.incomplete"
     first.write_bytes(b"\0" * 4096)
@@ -4677,11 +4643,10 @@ def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
 
 
 def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, monkeypatch):
-    """The peer liveness window used to be max(connect_timeout, 180s). A healthy Xet peer writes
-    only at head-of-line boundaries, and the measurement quoted in the code is 171s of flat disk at
-    20 Mbit/s -- 9 seconds of margin. Any slower link expired the peer mid-transfer and killed the
-    waiter, which on a multi-rank launch reaches the demotion threshold on the first run and pins a
-    machine where Xet works fine to HTTP for a day. The window is the suppression ceiling now."""
+    """The peer liveness window used to be max(connect_timeout, 180s), only 9s above the measured
+    171s of flat disk at 20 Mbit/s, so any slower link expired the peer mid-transfer and killed the
+    waiter -- reaching the demotion threshold on a multi-rank launch's first run. The window is the
+    suppression ceiling now."""
     import os as _os
 
     blobs = _blobs_dir(hf_cache)
@@ -4708,9 +4673,9 @@ def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, mo
 
 
 def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch):
-    """Widening the peer window to an hour means the mtime no longer bounds a stale leftover, so
-    the ceiling has to. The post-byte branches suppress while seen_bytes is true, which is exactly
-    when the pre-byte branch clears its own bookkeeping, so they need a bound of their own."""
+    """Widening the peer window to an hour means the mtime no longer bounds a stale leftover, so the
+    ceiling has to. The post-byte branches suppress while seen_bytes is true, exactly when the
+    pre-byte branch clears its bookkeeping, so they need a bound of their own."""
     import os as _os
     import threading as _threading
 
@@ -4722,9 +4687,8 @@ def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch
     peer = blobs / "peer-owned.incomplete"
     peer.write_bytes(b"\0" * (16 * 1024 * 1024))
 
-    # Keep the peer's mtime permanently fresh so the freshness window can never be what ends the
-    # suppression. Only the hold ceiling can, which is the thing under test -- otherwise this
-    # passes for the wrong reason.
+    # Keep the peer's mtime permanently fresh so only the hold ceiling under test can end the
+    # suppression, else this passes for the wrong reason.
     done = _threading.Event()
 
     def _keep_fresh():
@@ -4754,16 +4718,15 @@ def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch
 
 
 def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch):
-    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor. xet writes the file only at head-of-line
-    term boundaries, so under that rate the disk is flat AND the RSS gain per window is below the
-    epsilon at the same time, and a healthy transfer on tethered mobile or rural DSL was killed
-    mid-flight. Growth above the noise floor but below the epsilon means receiving-but-slow, and
-    earns the patient deadline instead."""
+    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor, and xet writes only at head-of-line term
+    boundaries, so under that rate the disk is flat AND the RSS gain is below the epsilon at once,
+    killing a healthy tethered-mobile or rural-DSL transfer mid-flight. Growth above the noise floor
+    but below the epsilon means receiving-but-slow and earns the patient deadline."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)   # opened, then flat for the whole run
 
-    # 400 KiB per 0.05s tick against a 0.4s deadline: comfortably over the 256 KiB noise floor,
-    # comfortably under the 4 MiB epsilon -- the regime that used to trip.
+    # 400 KiB per 0.05s tick against a 0.4s deadline: over the 256 KiB noise floor, under the 4 MiB
+    # epsilon -- the regime that used to trip.
     rss = {"v": 100 * 1024 * 1024}
     monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
     monkeypatch.setattr(xf, "DEFAULT_HTTP_STALL_TIMEOUT", 30.0)
@@ -4784,9 +4747,9 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
 
 
 def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch):
-    """The patient deadline is for a child that is demonstrably receiving. One whose RSS is flat
-    too has both sensors saying nothing is arriving, and must still fall back fast -- otherwise the
-    slow-link fix would quietly turn every 30s stall into a 180s one."""
+    """The patient deadline is for a child demonstrably receiving. Flat RSS plus flat disk means both
+    sensors say nothing is arriving, and must still fall back fast, else the slow-link fix would turn
+    every 30s stall into a 180s one."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4807,12 +4770,10 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
 
 
 def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
-    """Studio's inference and training workers wrap start_watchdog around the ENTIRE load_model, not
-    around a spawned downloader. For them "no partial and a frozen byte count" is the normal case:
-    the repo is already cached and the time is going into quantising to 4-bit or moving weights to
-    the GPU. Both connect trips would fire on a download that already succeeded, and the message
-    ("Download did not start") would be a lie about a model that was never downloaded. Only the
-    stall clock, which needs a demonstrably open partial, applies to them."""
+    """Callers wrapping start_watchdog around the ENTIRE load_model see "no partial and a frozen byte
+    count" as the normal case: the repo is cached and the time goes into quantising to 4-bit. Both
+    connect trips would fire on a download that already succeeded. Only the stall clock, which needs
+    a demonstrably open partial, applies to them."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "cached-weights").write_bytes(b"\0" * 4096)   # fully cached, nothing in flight
 
@@ -4830,9 +4791,8 @@ def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
 
 
 def test_an_exited_child_is_finalising_not_hung(hf_cache):
-    """A supervised downloader that has already exited cannot be wedged, and its exit code is what
-    the ladder acts on. Tripping here would kill an already-dead process group and charge the
-    machine's Xet health record a failure it did not earn."""
+    """An exited downloader cannot be wedged and its exit code is what the ladder acts on; tripping
+    would kill a dead process group and charge the machine a Xet failure it did not earn."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "done").write_bytes(b"\0" * 4096)
 
@@ -4853,11 +4813,9 @@ def test_an_exited_child_is_finalising_not_hung(hf_cache):
 
 
 def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
-    """The parent cannot tell which blob its child waits for, so peer liveness is approximate.
-
-    A continuous series of UNRELATED same-repo downloads therefore reset the connect clock on every
-    tick and a genuinely hung child never fell back. The ceiling bounds that approximation.
-    """
+    """The parent cannot tell which blob its child waits for, so peer liveness is approximate: a
+    continuous series of UNRELATED same-repo downloads reset the connect clock on every tick and a
+    genuinely hung child never fell back. The ceiling bounds that approximation."""
     monkeypatch.setattr(xf, "PEER_SUPPRESSION_CEILING", 0.5)
     blobs = _blobs_dir(hf_cache)
     monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())

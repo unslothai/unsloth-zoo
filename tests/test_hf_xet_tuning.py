@@ -41,8 +41,8 @@ def _profile(ram_gb: float, cpus: int = 8) -> tuning.SystemProfile:
 @pytest.mark.parametrize(
     "ram_gb, limit, size, perfile, files",
     [
-        # limit is raised to the true worst case (size + files*perfile) where that exceeds the
-        # tier's headline figure, so the three numbers describe one coherent budget.
+        # limit is raised to the worst case (size + files*perfile) where that exceeds the tier's
+        # headline figure, so the three numbers describe one budget.
         (8, 1024 * MB, 512 * MB, 128 * MB, 4),
         (11.9, 1024 * MB, 512 * MB, 128 * MB, 4),
         (16, 2 * GB, 768 * MB, 192 * MB, 6),
@@ -59,11 +59,8 @@ def test_tier_table(ram_gb, limit, size, perfile, files):
 
 
 def test_worst_case_buffer_stays_under_the_limit():
-    """size + files*perfile is what hf_xet can actually hold; it must not exceed the tier cap.
-
-    Guards the arithmetic itself: the stock defaults (2GB + 8*512MB, capped at 8GB) are exactly
-    how an 8GB spike happens, so a future tier edit that reintroduces that shape should fail here.
-    """
+    """size + files*perfile is what hf_xet can hold, so it must not exceed the tier cap. The stock
+    defaults (2GB + 8*512MB, capped at 8GB) are exactly how an 8GB spike happens."""
     for ram_gb in (4, 8, 16, 32, 64, 512):
         env = tuning.xet_env_overrides(_profile(ram_gb))
         worst = (
@@ -94,8 +91,7 @@ def test_durations_carry_a_unit_suffix():
 
 
 def test_high_performance_is_turned_off():
-    """xet-core applies the high-performance preset AFTER reading the environment, so leaving it on
-    would discard every cap above rather than merely competing with it."""
+    """xet-core applies the preset AFTER reading the environment, so leaving it on discards every cap."""
     env = tuning.xet_env_overrides(_profile(16))
     assert env["HF_XET_HIGH_PERFORMANCE"] == "0"
     assert env["HF_XET_HP"] == "0"
@@ -142,8 +138,8 @@ def test_user_can_opt_back_into_high_performance(monkeypatch):
 
 
 def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
-    """Inside a container psutil reports the HOST's RAM; using it is how a 16GB runner gets an 8GB
-    buffer. The cgroup ceiling has to win."""
+    """Inside a container psutil reports the HOST's RAM, which is how a 16GB runner gets an 8GB
+    buffer, so the cgroup ceiling has to win."""
     monkeypatch.setattr(tuning, "_psutil_memory", lambda: (512 * GB, 500 * GB))
     monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: 8 * GB)
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 2.0)
@@ -152,8 +148,8 @@ def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
     assert profile.ram_source == "cgroup"
     assert profile.cpu_count == 2
     env = tuning.xet_env_overrides(profile)
-    # Smallest tier, and with only 2 cores just 2 files in flight, so the headline 1GB limit is
-    # already above the worst case (512MB + 2*128MB) and stands unchanged.
+    # Smallest tier and only 2 files in flight, so the 1GB limit is already above the worst case
+    # (512MB + 2*128MB) and stands unchanged.
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
     assert int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == 2
 
@@ -198,12 +194,11 @@ def test_system_profile_is_sane_on_this_machine():
 
 
 def test_a_nested_cgroup_v1_limit_is_found(monkeypatch, tmp_path):
-    """Reading only the v1 controller ROOT is right inside a container -- runc bind-mounts the
-    container's own cgroup directory onto /sys/fs/cgroup/<controller> -- and wrong everywhere else.
-    A Slurm step lives at /sys/fs/cgroup/memory/slurm/uid_N/job_N/step_N, and the root file there
-    reads the "unlimited" sentinel, so a 32 GB step on a 1 TB node sized its download buffer from
-    1 TB and got OOM killed by the kernel it was told about. Mounts are often combined
-    ("cpu,cpuacct"), so the controller list has to be split rather than matched whole.
+    """Reading only the v1 controller ROOT is right inside a container (runc bind-mounts the
+    container's own cgroup dir onto /sys/fs/cgroup/<controller>) and wrong elsewhere: a Slurm step at
+    /sys/fs/cgroup/memory/slurm/uid_N/job_N/step_N reads the "unlimited" sentinel at the root, so a
+    32 GB step on a 1 TB node sized its buffer from 1 TB and was OOM killed. Mounts are often
+    combined ("cpu,cpuacct"), so the controller list has to be split rather than matched whole.
     """
     rel = "slurm/uid_2001/job_304876/step_0"
     monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
@@ -232,8 +227,8 @@ def test_a_nested_cgroup_v1_limit_is_found(monkeypatch, tmp_path):
 
 
 def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp_path):
-    """The v2 line is not always line 1. Under systemd hybrid mode v1 controller lines share the
-    file, so scanning for "0::" is what makes the v2 read version independent."""
+    """Under systemd hybrid mode v1 controller lines share the file, so scanning for "0::" rather
+    than reading line 1 is what makes the v2 read version independent."""
     monkeypatch.setattr(tuning, "_proc_self_cgroup", lambda: [
         "4:cpu,cpuacct:/user.slice",
         "0::/user.slice/user-1000.slice/session-3.scope",
@@ -247,11 +242,8 @@ def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp
 
 
 def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
-    """Kubernetes "cpu: 500m" is a real half-core limit, not an absent one.
-
-    It arrives as cpu.max "50000 100000" -> 0.5. Requiring >= 1 discarded it and fell back to the
-    host's core count, so a half-core pod opened streams sized for the whole node.
-    """
+    """Kubernetes "cpu: 500m" arrives as cpu.max "50000 100000" -> 0.5. Requiring >= 1 discarded it
+    and fell back to the host's core count, so a half-core pod opened streams sized for the node."""
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 0.5)
     profile = tuning.system_profile()
     assert profile.cpu_count == 1
@@ -262,11 +254,9 @@ def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
 
 
 def test_fail_fast_timeouts_are_opt_out():
-    """The shortened Xet timeouts belong in a supervised download child, not process-wide.
-
-    xet-core reads its config once per process and applies it to uploads and to direct
-    huggingface_hub downloads too, neither of which our HTTP ladder can catch.
-    """
+    """The shortened Xet timeouts belong in a supervised download child, not process-wide: xet-core
+    reads its config once per process and applies it to uploads and direct huggingface_hub downloads
+    too, neither of which our HTTP ladder can catch."""
     supervised = tuning.xet_env_overrides(_profile(16))
     global_env = tuning.xet_env_overrides(_profile(16), fail_fast = False)
 

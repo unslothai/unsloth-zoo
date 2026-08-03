@@ -119,14 +119,10 @@ def test_two_failures_demote_and_a_success_recovers(monkeypatch):
 
 
 def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
-    """A success RESETS the streak while a failure INCREMENTS it, so the two are not commutative
-    and losing either one is not "the same answer, one download later". Starting from a streak of
-    1, no serial order reaches the threshold: (fail, ok) ends at 0, (ok, fail) ends at 1. A
-    demotion therefore proves an update was dropped, and it costs the user a full day on HTTP on a
-    machine where Xet works. Concurrent writers are ordinary here: the hub deliberately runs
-    same-repo GGUF variants at once, and every rank of a multi-rank launch calls from_pretrained.
-
-    The interleaving is forced rather than raced, so this cannot pass by luck of timing.
+    """A success RESETS the streak while a failure INCREMENTS it, so from a streak of 1 no serial
+    order reaches the threshold: (fail, ok) ends at 0, (ok, fail) ends at 1. A demotion therefore
+    proves a dropped update, costing a full day on HTTP on a machine where Xet works. The
+    interleaving is forced rather than raced, so this cannot pass by luck of timing.
     """
     import threading
 
@@ -142,8 +138,8 @@ def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
         state = real_read()
         if threading.get_ident() == failure_thread["id"]:
             failure_has_read.set()
-            # Hand the success every chance to slip inside our read-modify-write. Under the guard
-            # it cannot, so this simply times out.
+            # Hand the success every chance to slip inside our read-modify-write; under the guard it
+            # cannot, so this simply times out.
             success_done.wait(1.0)
         return state
 
@@ -243,11 +239,8 @@ def test_result_is_truthy_like_a_bool(monkeypatch):
 
 
 def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
-    """An HF_ENDPOINT mirror that does not host the probe repo answers 404.
-
-    That is proof the endpoint is REACHABLE, which is the only thing this probe measures. Treating
-    it as "Xet unreachable" pinned every on-prem or mirror user to HTTP for 24h.
-    """
+    """An HF_ENDPOINT mirror that does not host the probe repo answers 404, which proves the endpoint
+    is REACHABLE. Treating it as "Xet unreachable" pinned every mirror user to HTTP for 24h."""
     import urllib.error
     import urllib.request
 
@@ -287,11 +280,9 @@ def test_probe_403_still_demotes(monkeypatch):
 
 
 def test_an_unprobed_memo_does_not_satisfy_an_explicit_probe(monkeypatch):
-    """The download path calls xet_health(probe=False) on every download.
-
-    Memoizing that optimistic default for all callers disarmed the explicit preflight for the next
-    minute, on exactly the CAS-blocked machine the probe exists to catch.
-    """
+    """The download path calls xet_health(probe=False) every time; memoizing that optimistic default
+    for all callers disarmed the explicit preflight for a minute, on exactly the CAS-blocked machine
+    the probe exists to catch."""
     _big_machine(monkeypatch)
     probes: list[bool] = []
 
@@ -329,11 +320,8 @@ def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
 
 
 def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
-    """HF_HOME is routinely a shared filesystem on multi-node clusters.
-
-    Without machine scoping, one node with blocked CAS demotes every node for 24h -- and since no
-    node then starts on Xet, nothing can record the success that would clear it.
-    """
+    """HF_HOME is routinely shared across a cluster: without machine scoping, one node with blocked
+    CAS demotes every node for 24h, and no node then starts on Xet to record the clearing success."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
@@ -368,10 +356,8 @@ def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
 
 
 def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
-    """Shared HF_HOME: scoping only the READ left writes merging streaks across nodes.
-
-    A peer's single failure could then demote a healthy node on its own first failure.
-    """
+    """Shared HF_HOME: scoping only the READ left writes merging streaks across nodes, so a peer's
+    single failure demoted a healthy node on its own first failure."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 

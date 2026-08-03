@@ -52,8 +52,8 @@ if _offline_env:
         os.environ[_v] = "1"
 del _OFFLINE_TRUE, _offline_env
 
-# Check "429 Too Many Requests" in hf_xet's own logs. A 429 means the ACCOUNT, not the machine, is
-# the bottleneck, so it lowers the download stream ceiling rather than the memory caps.
+# A 429 in hf_xet's own logs means the ACCOUNT, not the machine, is the bottleneck, so it lowers
+# the stream ceiling rather than the memory caps.
 from pathlib import Path
 def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
@@ -72,13 +72,11 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
-# Size hf_xet's download buffers from THIS machine's RAM and cores. Previously Unsloth defaulted
-# HF_XET_HIGH_PERFORMANCE=1 here, which in xet-core is a preset applied AFTER the environment is
-# read: it raises the reconstruction buffer cap to 64GB and the stream count to 124, and it
-# overwrites any explicit HF_XET_RECONSTRUCTION_* cap. That is the source of the multi-GB RSS
-# spikes during downloads. apply_xet_env() turns it off and writes RAM-derived caps instead;
-# anything the user set in their own environment is left untouched.
-#
+# Size hf_xet's download buffers from THIS machine's RAM and cores. HF_XET_HIGH_PERFORMANCE=1 (the
+# old default here) is an xet-core preset applied AFTER the environment is read: it raises the
+# reconstruction buffer cap to 64GB and the stream count to 124 and overwrites any explicit
+# HF_XET_RECONSTRUCTION_* cap, which is the source of the multi-GB RSS spikes. apply_xet_env()
+# turns it off and writes RAM-derived caps instead, leaving user-set variables untouched.
 # _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and returns None entries
 # instead of raising when home is unresolvable.
 from .hf_xet_tuning import apply_xet_env
