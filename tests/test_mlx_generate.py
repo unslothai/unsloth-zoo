@@ -227,11 +227,13 @@ def test_generation_mode_releases_lock_when_limit_restore_raises(monkeypatch):
     model.named_modules = lambda: [("", model)]
     model.eval = lambda: setattr(model, "training", False)
 
+    # Patch the loaded module: a string target reimports unsloth_zoo, whose
+    # install guard fires on a CPU checkout without the unsloth package.
+    from unsloth_zoo.mlx import generate as generate_module
+    monkeypatch.setattr(generate_module, "_snapshot_metal_limits", lambda: {"memory": 1})
     monkeypatch.setattr(
-        "unsloth_zoo.mlx.generate._snapshot_metal_limits", lambda: {"memory": 1}
-    )
-    monkeypatch.setattr(
-        "unsloth_zoo.mlx.generate._restore_metal_limits",
+        generate_module,
+        "_restore_metal_limits",
         lambda _snapshot: (_ for _ in ()).throw(RuntimeError("restore failed")),
     )
     with pytest.raises(RuntimeError, match="restore failed"):
