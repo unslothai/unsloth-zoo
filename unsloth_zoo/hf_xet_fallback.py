@@ -640,6 +640,46 @@ def start_watchdog(
                 return True
             return False
 
+        def _waiting_on_a_peers_partial() -> bool:
+            """Repo-wide (snapshot) mode: does another PROCESS own the transfer we are watching?
+
+            A child parked on the hub's per-blob cache lock holds no ``.incomplete`` of its own,
+            yet the repo-wide phase signal already latched ``seen_bytes`` from the PEER's partial,
+            so it lands in the data branch -- where both of its own signals, disk and RSS, are flat
+            by definition. Without this it is killed at stall_timeout and records a false Xet
+            failure; on a multi-rank launch of one model that reaches the demotion threshold on the
+            first run and pins a machine where Xet demonstrably works to HTTP for 24h.
+
+            Bounded by the partial's mtime so a stale leftover cannot mask a genuinely hung child.
+            """
+            if watch_new_partials_only or not child_pid:
+                return False
+            owned = _child_open_incomplete_blobs(child_pid)
+            if owned is None or owned:
+                # Uninspectable -> keep the disk-only verdict. Non-empty -> the partial is ours.
+                return False
+            fresh = max(connect_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+            now_wall = time.time()
+            for one in repo_ids or []:
+                for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
+                    blobs_dir = entry / "blobs"
+                    if not blobs_dir.is_dir():
+                        continue
+                    try:
+                        for blob in blobs_dir.iterdir():
+                            try:
+                                if (
+                                    blob.name.endswith(INCOMPLETE_SUFFIX)
+                                    and blob.is_file()
+                                    and now_wall - blob.stat().st_mtime < fresh
+                                ):
+                                    return True
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
+            return False
+
         def _trip(message: str) -> None:
             nonlocal fired
             if not fired:
@@ -677,6 +717,10 @@ def start_watchdog(
                     last_rss = rss
                     last_change = now
                 elif elapsed >= stall_timeout:
+                    if _waiting_on_a_peers_partial():
+                        # Someone else owns this transfer; we are a lock waiter, not a stall.
+                        last_change = now
+                        continue
                     _trip(
                         f"Download appears stalled ({transport} transport) "
                         f"-- no progress for {int(elapsed)}s"

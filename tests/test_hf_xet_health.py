@@ -273,3 +273,42 @@ def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
     for _ in range(5):
         health.xet_health()
     assert probes == [True], "a real verdict should not be re-probed within the memo window"
+
+
+def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
+    """HF_HOME is routinely a shared filesystem on multi-node clusters.
+
+    Without machine scoping, one node with blocked CAS demotes every node for 24h -- and since no
+    node then starts on Xet, nothing can record the success that would clear it.
+    """
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
+
+    health.record_xet_outcome(False, "stall")
+    health.record_xet_outcome(False, "stall")
+    demoted = health.xet_health(probe = False)
+    assert demoted.use_xet is False, "this node should be demoted by its own failures"
+
+    monkeypatch.setattr(health, "_machine_id", lambda: "some-other-node")
+    health._CACHED = None
+    assert health.xet_health(probe = False).use_xet is True, (
+        "a peer node's verdict on a shared cache must not demote this one"
+    )
+
+
+def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
+    """urlopen's timeout is per operation and does not cover DNS, so the probe needs its own bound."""
+    import time as _time
+
+    monkeypatch.setattr(
+        health, "_probe_cas_reachable_inner", lambda: (_time.sleep(30), (True, "never"))[1]
+    )
+    monkeypatch.setattr(health, "PROBE_TIMEOUT_SECONDS", 0.2)
+
+    started = _time.monotonic()
+    ok, reason = _UNSTUBBED_PROBE()   # the autouse fixture stubs the module attribute
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 5.0, f"probe ran for {elapsed:.1f}s despite its budget"
+    assert ok is None, "an unbounded probe measured nothing, so it must not demote"
+    assert "budget" in reason

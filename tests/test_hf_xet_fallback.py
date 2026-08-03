@@ -4447,3 +4447,52 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
         assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
     finally:
         stop.set()
+
+
+def test_snapshot_lock_waiter_is_not_killed_while_a_peer_owns_the_partial(hf_cache, monkeypatch):
+    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes.
+
+    That lands it in the data branch, where its own disk and its own RSS are both flat by
+    definition, and it was killed at stall_timeout and charged a Xet failure. On a multi-rank launch
+    of one model that reaches the demotion threshold on the first run.
+    """
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "owned-by-the-writer.incomplete"
+    peer.write_bytes(b"\0" * (8 * 1024 * 1024))   # peer is buffering: present, fresh, not growing
+
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())  # we own nothing
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)        # flat, we idle
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.2)  # 4x the stall deadline
+        assert calls == [], f"a snapshot cache-lock waiter was killed as stalled: {calls}"
+    finally:
+        stop.set()
+
+
+def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeypatch):
+    """The waiter escape hatch must not disarm a child that genuinely owns the stuck partial."""
+    blobs = _blobs_dir(hf_cache)
+    mine = blobs / "owned-by-me.incomplete"
+    mine.write_bytes(b"\0" * (8 * 1024 * 1024))
+
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: {mine.name})
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a child owning a frozen partial never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()

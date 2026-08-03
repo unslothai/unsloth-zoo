@@ -114,6 +114,29 @@ def _hf_xet_version() -> Optional[str]:
         return "unknown"
 
 
+def _machine_id() -> str:
+    """Identity of the box a verdict was measured on.
+
+    HF_HOME is routinely a shared filesystem on multi-node clusters, so without this one node with
+    blocked CAS persists an HTTP verdict that every node honours -- and since no node then starts on
+    Xet, nothing can record the success that would clear it before the TTL expires.
+    """
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path) as f:
+                value = f.read().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    try:
+        import platform
+
+        return platform.node() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def health_state_path() -> Optional[Path]:
     """Where the verdict lives: beside the HF cache, so it follows a relocated ``HF_HOME``."""
     try:
@@ -178,6 +201,9 @@ def _state_is_current(state: dict) -> bool:
         return False
     if state.get("endpoint") != _endpoint():
         return False
+    if state.get("machine") != _machine_id():
+        # A foreign node's verdict on a shared cache. Losing it falls open to Xet, the safe side.
+        return False
     ttl = HEALTHY_TTL_SECONDS if state.get("verdict") == "xet" else DEMOTED_TTL_SECONDS
     try:
         return (time.time() - float(state.get("ts", 0))) < ttl
@@ -186,6 +212,31 @@ def _state_is_current(state: dict) -> bool:
 
 
 def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
+    """Hard wall-clock bound around the probe.
+
+    urlopen's timeout is per blocking operation and does not cover getaddrinfo, so a stuck resolver
+    or a proxy trickling the response blows straight past PROBE_TIMEOUT_SECONDS. That matters now
+    that an explicit preflight really probes: the module's rule is that every probe is time-boxed.
+    """
+    result: list = []
+
+    def _run() -> None:
+        try:
+            result.append(_probe_cas_reachable_inner())
+        except Exception as e:  # noqa: BLE001 - the probe must never raise into a download
+            result.append((False, f"Xet CAS unreachable: {type(e).__name__}"))
+
+    worker = threading.Thread(target = _run, daemon = True, name = "unsloth-xet-probe")
+    worker.start()
+    worker.join(PROBE_TIMEOUT_SECONDS + 0.5)
+    if not result:
+        # Inconclusive rather than a demotion: we could not bound the clock, so we did not measure
+        # anything, and a wrong "unhealthy" costs a working machine a day.
+        return (None, "Xet probe exceeded its time budget")
+    return result[0]
+
+
+def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
     """Can we get a Xet read token and reach the CAS endpoint it names?
 
     A token is NOT required: the endpoint answers anonymously, so this measures reachability
@@ -198,6 +249,15 @@ def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
         url = f"{_endpoint()}/api/models/{_PROBE_REPO}/xet-read-token/main"
         request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-xet-probe"})
         token = os.environ.get("HF_TOKEN")
+        if not token:
+            # Covers `hf auth login` (the file store) and the Colab secret, which the real download
+            # authenticates from but a bare HF_TOKEN lookup misses.
+            try:
+                from huggingface_hub.utils import get_token
+
+                token = get_token()
+            except Exception:
+                token = None
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
@@ -225,8 +285,11 @@ def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
         # probe repo is not hosted here -- an HF_ENDPOINT mirror or on-prem deployment -- and must
         # not pin the machine to HTTP for 24h. A 401/403 still demotes: a blocking corporate proxy
         # legitimately answers that way.
-        if e.code == 404:
-            return (None, "Xet probe repo absent on this endpoint; assuming Xet")
+        if e.code == 404 or (e.code == 401 and not token):
+            # 404: the probe repo is not hosted here (mirror / on-prem). 401 with no credentials
+            # sent: we proved reachability but never attempted auth, so this says nothing about
+            # whether Xet works. 403/407 still demote -- that is how a blocking proxy answers.
+            return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:
         return (False, f"Xet CAS unreachable: {type(e).__name__}")
@@ -294,6 +357,7 @@ def _evaluate(*, force: bool, probe: bool) -> XetHealth:
         "ts": time.time(),
         "hf_xet_version": _hf_xet_version(),
         "endpoint": _endpoint(),
+        "machine": _machine_id(),
         # A fresh probe supersedes the old streak; failures are counted from here.
         "consecutive_failures": 0,
     })
@@ -334,6 +398,7 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
             "ts": time.time(),
             "hf_xet_version": _hf_xet_version(),
             "endpoint": _endpoint(),
+            "machine": _machine_id(),
             "consecutive_failures": failures,
         })
         with _LOCK:
