@@ -31,9 +31,11 @@ import contextlib
 import copy
 import inspect
 import importlib
+import importlib.util
 import json
 import math
 import numbers
+import pathlib
 import operator
 import textwrap
 import numpy as np
@@ -51,7 +53,7 @@ import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 
 
@@ -651,6 +653,98 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
     # In the embedding dtype, as the ids path does: an fp32 product rounded back
     # lands on different bf16 values.
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
+
+
+# Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
+# the module returns, without exposing the factor as an attribute.
+_MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
+    "gemma", "gemma2", "gemma3_text", "gemma3n_text",
+})
+# Architectures transformers has always scaled inside the embedding, used when
+# the installed transformers cannot be asked because it predates them.
+_SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
+    "gemma3_text", "gemma3n_text", "gemma4_text", "gemma4_unified_text",
+    "minicpm3",
+})
+
+
+@lru_cache(maxsize=None)
+def _transformers_scales_inside_embedding(model_type):
+    """Whether the installed transformers applies this architecture's embedding
+    multiply inside the embedding module, so its NEFTune hook fires after it.
+
+    Asked rather than assumed: transformers moved gemma and gemma2's multiply
+    into the module partway through the version range this package supports, so
+    a fixed answer would be wrong for one end of it. None when the question
+    cannot be put -- in practice, an installed transformers with no such
+    architecture, since it ships its modeling modules as Python.
+
+    Read through the loader rather than imported: a modeling module needs torch,
+    which this package deliberately does not install on macOS arm64, so
+    importing would fail on a working MLX setup. Source first, then the compiled
+    code, so the answer survives a package shipped without its source.
+    """
+    base = str(model_type or "").removesuffix("_text")
+    if not base:
+        return None
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{base}.modeling_{base}")
+    except Exception:
+        return None
+    if spec is None or spec.loader is None:
+        return None
+    marker = "ScaledWordEmbedding"
+    try:
+        source = spec.loader.get_source(spec.name)
+    except Exception:
+        source = None
+    if source is not None:
+        return marker in source
+    try:
+        code = spec.loader.get_code(spec.name)
+    except Exception:
+        code = None
+    if code is None:
+        return None
+    # A module-level class binds its name, so the flat scan is enough.
+    return any(marker in name for name in code.co_names)
+
+
+def _neftune_embed_scale(model):
+    """The multiply applied after the embedding returns that NEFTune noise has
+    to be divided by, or None when nothing needs correcting.
+
+    MLX multiplies once the embedding module has returned, so noise injected
+    there rides through it; transformers adds its noise after the same multiply
+    wherever it keeps it inside the embedding.
+    """
+    text_model = _get_text_model(model)
+    backbone = getattr(text_model, "model", None)
+    # mlx-lm keeps this on `args`, mlx-vlm on `config`, at either level.
+    holders = (backbone, text_model, getattr(backbone, "args", None),
+               getattr(backbone, "config", None), getattr(text_model, "args", None),
+               getattr(text_model, "config", None))
+
+    def _first(key):
+        for holder in holders:
+            value = None if holder is None else _config_get(holder, key)
+            if value is not None:
+                return value
+        return None
+
+    model_type = str(_first("model_type") or "")
+    scale = getattr(backbone, "embed_scale", None)      # gemma4, gemma4_unified
+    if not scale:
+        scale = _first("scale_emb")                     # minicpm3, and not a sqrt
+    if not scale and model_type in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+        hidden_size = _first("hidden_size")
+        scale = float(hidden_size) ** 0.5 if hidden_size else None
+    if not scale:
+        return None
+    inside = _transformers_scales_inside_embedding(model_type)
+    if inside is None:
+        inside = model_type in _SCALED_INSIDE_WHEN_UNASKABLE
+    return float(scale) if inside else None
 
 
 def _vlm_compares_embedding_values(model):

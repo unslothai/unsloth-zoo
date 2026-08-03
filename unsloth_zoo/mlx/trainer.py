@@ -535,6 +535,7 @@ from .utils import (
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
+    _neftune_embed_scale,
     _probe_vlm_embedding_module,
     _vlm_compares_embedding_values,
     _distributed_rank_size,
@@ -3935,6 +3936,10 @@ class MLXTrainer:
 
         _Base = type(emb)
         _alpha = alpha
+        # These families multiply the embedding after this module returns, so
+        # undivided noise would be scaled with it; transformers adds its noise
+        # after that multiply.
+        _embed_scale = _neftune_embed_scale(self.model) or 1.0
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
@@ -3942,7 +3947,7 @@ class MLXTrainer:
                 out = _Base.__call__(self, x)
                 if getattr(self, "training", False):
                     dim = out.shape[-1] * out.shape[-2]
-                    scale = _alpha / (dim ** 0.5)
+                    scale = _alpha / (dim ** 0.5) / _embed_scale
                     noise = mx.random.uniform(
                         low=-1.0, high=1.0, shape=out.shape
                     ).astype(out.dtype) * scale

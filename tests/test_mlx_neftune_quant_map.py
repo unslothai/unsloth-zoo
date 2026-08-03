@@ -201,12 +201,13 @@ def vlm():
     return FastMLXModel.from_pretrained(VLM_MODEL, max_seq_length=128)[0]
 
 
-def _install(model, alpha=5.0):
+def _install(model, alpha=5.0, is_vlm=None):
     """Drive the real installer without building a whole trainer."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.trainer import MLXTrainer
     trainer = MLXTrainer.__new__(MLXTrainer)
-    trainer.model, trainer._is_vlm = model, True
+    trainer.model = model
+    trainer._is_vlm = hasattr(model, "language_model") if is_vlm is None else is_vlm
     trainer.args = SimpleNamespace(neftune_noise_alpha=alpha)
     trainer._install_neftune()
     return trainer
@@ -381,3 +382,160 @@ def test_neftune_declines_for_value_comparing_families():
         model_type=sorted(mlx_utils._VLM_EMBED_SCALE_FAMILIES)[0], hidden_size=H)
     assert mlx_utils._vlm_compares_embedding_values(model)
     assert getattr(_install(model), "_neftune_emb", None) is None
+
+
+# --- NEFTune noise magnitude on families that scale after the embedding ----
+
+GEMMA3_TEXT = "mlx-community/gemma-3-270m-it-4bit"
+
+
+@metal_only
+@pytest.mark.parametrize("model_type,inside,scaled", [
+    # transformers moved gemma and gemma2's multiply inside the embedding
+    # partway through the supported version range, so the answer follows the
+    # installed transformers rather than a fixed list.
+    ("gemma", True, True),
+    ("gemma", False, False),
+    ("gemma2", True, True),
+    ("gemma2", False, False),
+    ("gemma3_text", True, True),
+    ("gemma3n_text", True, True),
+    # nothing multiplies after the embedding here, so there is nothing to cancel
+    ("qwen3", True, False),
+])
+def test_embed_scale_follows_the_installed_transformers(monkeypatch, model_type, inside, scaled):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_transformers_scales_inside_embedding",
+                        lambda _mt: inside)
+    model = _tree()
+    model.language_model.model.config = SimpleNamespace(
+        model_type=model_type, hidden_size=H)
+    found = mlx_utils._neftune_embed_scale(model)
+    assert found == (pytest.approx(H ** 0.5) if scaled else None)
+
+
+@metal_only
+def test_embed_scale_probe_reads_the_installed_transformers():
+    """The probe must answer from the installed package, not a table."""
+    import importlib.util
+    import pathlib
+    import sys
+    from unittest import mock
+    from unsloth_zoo.mlx.utils import _transformers_scales_inside_embedding as probe
+
+    # gemma3 has scaled inside the embedding in every transformers that has it.
+    assert probe("gemma3_text") is True
+    # A plain-embedding architecture, and one transformers does not know at all.
+    assert probe("qwen3") is False
+    assert probe("not_a_real_architecture") is None
+    # It must answer without importing: a modeling module needs torch, which is
+    # not installed alongside MLX on macOS arm64.
+    sys.modules.pop("transformers.models.gemma3.modeling_gemma3", None)
+    probe.cache_clear()
+    with mock.patch.dict(sys.modules, {"torch": None}):
+        assert probe("gemma3_text") is True, "the probe needs torch importable"
+    probe.cache_clear()
+
+    # And it must go through the loader, so a package that is not loose files
+    # on disk still answers rather than silently reporting "no such thing".
+    spec = importlib.util.find_spec("transformers.models.gemma3.modeling_gemma3")
+    assert spec.loader.get_source(spec.name).count("ScaledWordEmbedding") > 0
+
+    # A package shipped without source still answers, from the compiled code.
+    loader = type(spec.loader)
+    with mock.patch.object(loader, "get_source", lambda self, name: None):
+        assert probe("gemma3_text") is True, "source-less package must still answer"
+    probe.cache_clear()
+    # Only when neither is available is the question genuinely unanswerable.
+    def _raise(self, name):
+        raise OSError("no code")
+    with mock.patch.object(loader, "get_source", lambda self, name: None), \
+         mock.patch.object(loader, "get_code", _raise):
+        assert probe("gemma3_text") is None
+    probe.cache_clear()
+
+
+@metal_only
+@pytest.mark.parametrize("model_type,scaled", [
+    # transformers 4.x predates these, so the probe cannot answer; they have
+    # scaled inside the embedding in every transformers that has them.
+    ("gemma4_text", True),
+    ("gemma4_unified_text", True),
+    ("minicpm3", True),
+    ("gemma", False),   # genuinely version-dependent, so not assumed
+])
+def test_embed_scale_falls_back_when_transformers_cannot_be_asked(
+        monkeypatch, model_type, scaled):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_transformers_scales_inside_embedding",
+                        lambda _mt: None)
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.config = SimpleNamespace(model_type=model_type, hidden_size=H)
+    backbone.embed_scale = H ** 0.5
+    found = mlx_utils._neftune_embed_scale(model)
+    assert found == (pytest.approx(H ** 0.5) if scaled else None)
+
+
+@metal_only
+@pytest.mark.parametrize("key,value,expected", [
+    ("scale_emb", 12.0, 12.0),      # minicpm3 scales by a config value, not a sqrt
+    (None, None, H ** 0.5),
+])
+def test_embed_scale_reads_a_non_sqrt_factor(monkeypatch, key, value, expected):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_transformers_scales_inside_embedding",
+                        lambda _mt: True)
+    model = _tree()
+    fields = {"model_type": "gemma3_text", "hidden_size": H}
+    if key:
+        fields[key] = value
+    model.language_model.model.config = SimpleNamespace(**fields)
+    assert mlx_utils._neftune_embed_scale(model) == pytest.approx(expected)
+
+
+@metal_only
+def test_embed_scale_prefers_the_backbone_attribute():
+    """gemma4 exposes the multiply it uses; a derived value could disagree."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _neftune_embed_scale
+
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.config = SimpleNamespace(model_type="gemma4_text", hidden_size=H)
+    backbone.embed_scale = 7.5
+    assert _neftune_embed_scale(model) == pytest.approx(7.5)
+
+
+@metal_only
+def test_neftune_noise_is_divided_by_a_post_embedding_scale():
+    """On these families the model multiplies after the embedding returns, so
+    the injected noise has to be smaller by that factor to land where
+    transformers puts it."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import _neftune_embed_scale
+
+    model, _ = FastMLXModel.from_pretrained(GEMMA3_TEXT, max_seq_length=128)
+    embed_scale = _neftune_embed_scale(model)
+    assert embed_scale == pytest.approx(640 ** 0.5), embed_scale
+
+    alpha, ids = 15.0, mx.array([list(range(8))], dtype=mx.int32)
+    trainer = _install(model, alpha=alpha)
+    emb = trainer._neftune_emb
+    try:
+        emb._set_training_mode(False)
+        clean = emb(ids).astype(mx.float32)
+        emb._set_training_mode(True)
+        noise = emb(ids).astype(mx.float32) - clean
+    finally:
+        trainer._remove_neftune()
+    uncorrected = alpha / ((clean.shape[-1] * clean.shape[-2]) ** 0.5) / (3 ** 0.5)
+    rms = mx.sqrt(mx.mean(noise * noise)).item()
+    assert rms == pytest.approx(uncorrected / embed_scale, rel=0.15), rms
