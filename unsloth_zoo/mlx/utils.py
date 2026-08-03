@@ -8336,6 +8336,15 @@ _AUDIO_TOWER_ATTRS = (
 _AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
 _AUDIO_MERGE_HOLDERS = "_unsloth_audio_merge_holders"
 _AUDIO_MERGE_ORIGINAL = "_unsloth_audio_merge_original"
+# The hold count is read, decided on and written back, which is three
+# statements and therefore not atomic under the GIL. Two trainers starting
+# close together -- the case install_audio_merge_patch documents as supported
+# -- could both read zero, both install a wrapper, and both leave the count at
+# one; the first to finish would then restore the original embedder while the
+# other was still training, silently reinstating the merge bug. Module-level
+# rather than per-model: it is taken twice per run, so contention is
+# irrelevant, and a per-model lock would need this same guard to create.
+_AUDIO_MERGE_LOCK = threading.Lock()
 
 # Families whose merge walks a flattened feature block with a running
 # placeholder count, so a padded row's tail is consumed by the next row. Gemma 3n
@@ -8412,11 +8421,16 @@ def install_audio_merge_patch(model, audio_token_id):
     until the last of them releases it. Returns True when a hold was taken, so
     every caller that gets True must release exactly once.
     """
-    holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
-    if holders:
-        # Another run holds it: take a hold so it outlives whoever finishes first.
-        setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
-        return True
+    with _AUDIO_MERGE_LOCK:
+        holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+        if holders:
+            # Another run holds it: take a hold so it outlives whoever
+            # finishes first.
+            setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
+            return True
+        # Claim the slot before building the wrapper, so a second caller
+        # arriving mid-build takes a hold instead of installing its own.
+        setattr(model, _AUDIO_MERGE_HOLDERS, 1)
     original = model.get_input_embeddings
     had_instance_attr = "get_input_embeddings" in vars(model)
     audio_keys = ("input_features", "input_features_mask",
@@ -8448,7 +8462,6 @@ def install_audio_merge_patch(model, audio_token_id):
 
     model.get_input_embeddings = patched
     setattr(model, _AUDIO_MERGE_SENTINEL, True)
-    setattr(model, _AUDIO_MERGE_HOLDERS, 1)
     # Put back exactly what was there: deleting would discard someone else's
     # instance-level wrapper.
     setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
@@ -8457,12 +8470,16 @@ def install_audio_merge_patch(model, audio_token_id):
 
 def remove_audio_merge_patch(model):
     """Release one hold on the corrected merge, restoring it at the last."""
-    holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
-    if holders <= 0:
-        return False
-    if holders > 1:
-        setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
-        return False
+    with _AUDIO_MERGE_LOCK:
+        holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+        if holders <= 0:
+            return False
+        if holders > 1:
+            setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
+            return False
+        # Last holder: drop the count inside the lock so a caller arriving now
+        # installs afresh rather than taking a hold on a patch being removed.
+        setattr(model, _AUDIO_MERGE_HOLDERS, 0)
     previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
     if previous is not None:
         model.get_input_embeddings = previous
@@ -8472,7 +8489,6 @@ def remove_audio_merge_patch(model):
         except AttributeError:
             pass
     setattr(model, _AUDIO_MERGE_SENTINEL, False)
-    setattr(model, _AUDIO_MERGE_HOLDERS, 0)
     setattr(model, _AUDIO_MERGE_ORIGINAL, None)
     return True
 

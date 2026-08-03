@@ -492,6 +492,7 @@ def _mlx_declared_iterable_length(dataset):
 
 from .utils import (
     _config_get,
+    _model_carries_audio_modules,
     _vlm_batch_carries_audio,
     audio_merge_patch_needed,
     freeze_audio_modules,
@@ -4330,6 +4331,33 @@ class MLXTrainer:
                 if deferred_check is not None:
                     # Global counts, so an all-masked dataset raises symmetrically.
                     deferred_check()
+                # Strict asks for a guarantee that an unsurveyable source
+                # cannot give: one peeked batch says nothing about the rest, so
+                # on a checkpoint that could produce audio at all, strict has to
+                # refuse here -- before any optimizer update, callback or
+                # checkpoint. The per-batch check in the training loop is a
+                # safety net for best-effort runs, which degrade to eager; it
+                # cannot keep this promise, because by the time audio appears
+                # the run is already partially applied.
+                #
+                # Both operands are rank-invariant (the mode is configured, the
+                # checkpoint is the same everywhere), so every rank refuses
+                # together without needing a collective. Deliberately not keyed
+                # on the peek, which is per-rank and would abort asymmetrically.
+                if (
+                    _effective_compile_mode(
+                        compile_policy, self._compile_decision,
+                    ) == "strict"
+                    and _model_carries_audio_modules(self.model)
+                ):
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot be honored for a "
+                        "streaming dataset on an audio-capable checkpoint: the "
+                        "source cannot be surveyed, so audio may appear in any "
+                        "later batch and audio feature shapes have no fixed "
+                        "compiled signature. Use a finite dataset, or train "
+                        "with compile disabled or in best-effort mode."
+                    )
                 # No plan to survey: peek one batch, chained back.
                 stream_carries_audio, batch_iter = (
                     self._peek_stream_carries_audio(batch_iter)
@@ -6525,12 +6553,19 @@ class MLXTrainer:
 
             # A stream cannot be surveyed, so the plan's only audio evidence is
             # the one batch peeked before training. Audio that first appears
-            # later would otherwise reach the compiled step: strict would abort
-            # after earlier optimizer updates, and best-effort would pay a
-            # runtime compile failure to discover it. Ask each streamed batch
-            # instead, so the switch is deterministic rather than resting on
-            # whether the compiled call happens to raise. Finite plans are
-            # already routed by the survey, and only compiled runs can care.
+            # later would otherwise reach the compiled step and best-effort
+            # would pay a runtime compile failure to discover it. Ask each
+            # streamed batch instead, so the switch to eager is deterministic
+            # rather than resting on whether the compiled call happens to
+            # raise. Finite plans are already routed by the survey, and only
+            # compiled runs can care.
+            #
+            # This does not rescue a strict run: by the time audio appears the
+            # run is partially applied, which is why strict refuses an
+            # audio-capable stream up front instead. The strict branch below
+            # remains for a checkpoint that carries no audio modules yet still
+            # produces audio features -- it should not happen, and if it does,
+            # stopping beats compiling shapes nothing planned for.
             #
             # Under DDP the answer has to be rank-wide before anyone acts on it:
             # each rank shards its own stream, so one rank alone seeing audio

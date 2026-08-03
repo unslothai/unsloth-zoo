@@ -2965,6 +2965,54 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
 
 
 
+def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
+    """The hold count is read, decided on and written back, which is not atomic
+    under the GIL. Two trainers starting close together -- the case this
+    function documents as supported -- could otherwise both read zero, both
+    install a wrapper, and both leave the count at one, so the first to finish
+    would restore the original embedder while the other was still training.
+
+    The barrier lines the threads up on the read, which is where they would
+    interleave; without the lock the count lands on 1 instead of the number of
+    holders."""
+    import threading
+
+    from unsloth_zoo.mlx.utils import (
+        _AUDIO_MERGE_HOLDERS, install_audio_merge_patch, remove_audio_merge_patch,
+    )
+
+    class _Model:
+        def get_input_embeddings(self, *a, **k):
+            return "original"
+
+    workers = 8
+    model = _Model()
+    original = model.get_input_embeddings
+    barrier = threading.Barrier(workers)
+    granted = []
+
+    def _install():
+        barrier.wait()
+        granted.append(install_audio_merge_patch(model, 1))
+
+    threads = [threading.Thread(target=_install) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert granted == [True] * workers, "every caller must be told it holds"
+    assert getattr(model, _AUDIO_MERGE_HOLDERS) == workers
+    assert model.get_input_embeddings.__name__ == "patched", "exactly one wrapper"
+
+    # And the correction survives until the last release, not the first.
+    for _ in range(workers - 1):
+        assert remove_audio_merge_patch(model) is False
+        assert model.get_input_embeddings.__name__ == "patched"
+    assert remove_audio_merge_patch(model) is True
+    assert model.get_input_embeddings() == original()
+
+
 def test_patched_audio_merge_places_each_row_own_features():
     """The correction must actually re-pair features, not just wrap the call."""
     import mlx.core as current_mx
