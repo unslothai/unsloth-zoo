@@ -17,6 +17,8 @@
 __version__ = "2026.8.2"
 
 import os
+import platform
+import sys
 import warnings
 import re
 # Stop TOKENIZERS_PARALLELISM warning
@@ -33,8 +35,21 @@ _offline_env = (
     or os.environ.get("HF_DATASETS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
 )
 
+# hf_transfer's Rust extension cannot complete a download on Windows on ARM:
+# every fetch dies with "an error occurred while downloading using hf_transfer",
+# and the same fetch succeeds once it is off. PROCESSOR_ARCHITEW6432 covers an
+# x64 Python emulated on the same machine, where machine() reports AMD64.
+_windows_on_arm = sys.platform == "win32" and (
+    platform.machine().lower() in ("arm64", "aarch64")
+    or os.environ.get("PROCESSOR_ARCHITEW6432", "").strip().lower() == "arm64"
+)
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
-if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ and not _offline_env:
+if (
+    "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+    and not _offline_env
+    and not _windows_on_arm
+):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # More stable downloads
