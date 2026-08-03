@@ -110,6 +110,15 @@ DEFAULT_POLL_INTERVAL = 5.0
 # above allocator noise but far below one poll's worth of even a thin link (20 Mbit/s is ~12 MB per
 # 5s tick), so a genuinely hung child cannot drift past it.
 _RSS_PROGRESS_EPSILON = 4 * 1024 * 1024
+# Growth below _RSS_PROGRESS_EPSILON but above this is a child receiving, just slowly: 4 MiB over a
+# 30s deadline is a 1.12 Mbit/s floor, and xet only touches the file at head-of-line boundaries, so
+# a link under that has flat disk AND sub-epsilon RSS growth at the same time and was being killed
+# mid-transfer. Tethered mobile, rural DSL and throttled corporate egress all live down there.
+# Dropping the epsilon instead would eat the noise margin the frozen-child case depends on, so the
+# window moves rather than the threshold. 256 KiB over 30s is about 68 kbit/s -- below any link a
+# download could finish on, and far above allocator drift (measured at 0 KiB over 32s for a wedged
+# child in a socket retry loop).
+_RSS_SLOW_LINK_EPSILON = 256 * 1024
 
 # An absolute cap on how long peer liveness may keep resetting the connect clock. The case being
 # protected is "queued behind one live download", and the hub lock is per blob, so the wait is
@@ -536,6 +545,7 @@ def start_watchdog(
     watch_new_partials_only: bool = False,
     baseline_incomplete_blobs: Optional[set] = None,
     child_pid: Optional[int] = None,
+    watch_connect: Optional[bool] = None,
 ) -> threading.Event:
     """Start a daemon thread firing ``on_stall(message)`` once when a download stops making progress.
     Returns a stop event the caller sets when the download phase ends.
@@ -549,6 +559,13 @@ def start_watchdog(
 
     Defaults are transport-aware (HTTP, as the last resort, keeps the patient 180s threshold) and
     overridable via ``UNSLOTH_XET_STALL_TIMEOUT`` / ``UNSLOTH_XET_CONNECT_TIMEOUT``.
+
+    The connect clock only runs when there is a download process to kill, which is what *child_pid*
+    signals; *watch_connect* forces it either way. Callers that wrap the whole of ``from_pretrained``
+    rather than a spawned downloader cannot distinguish "no bytes because the child is wedged" from
+    "no bytes because the repo is already cached and we are quantising to 4-bit", and for them a
+    frozen byte count is the normal case, not a hang. Those callers keep the stall clock, which only
+    runs against a partial that is demonstrably open.
 
     *watch_new_partials_only* (single-file) measures progress only over the child's own partial, so a
     sibling pull of a different file cannot keep a hung child alive. That partial is identified by the
@@ -568,6 +585,7 @@ def start_watchdog(
         # Never sample slower than the tighter of the two deadlines, or the timeout is meaningless.
         interval = min(DEFAULT_POLL_INTERVAL, max(1.0, min(stall_timeout, connect_timeout) / 4.0))
     baseline = set(baseline_incomplete_blobs or ())
+    connect_clock = (child_pid is not None) if watch_connect is None else bool(watch_connect)
     single_repo_id = repo_ids[0] if repo_ids else ""
 
     def _partial_bytes(ids) -> int:
@@ -628,6 +646,12 @@ def start_watchdog(
         # between files, and must not reset when a partial set momentarily empties.
         seen_bytes_ever = seen_bytes
         peer_wait_start: Optional[float] = None
+        # Same role as peer_wait_start, for the two branches that suppress on a peer AFTER bytes
+        # have been seen. It needs its own variable because those branches run while seen_bytes is
+        # true, which is exactly when peer_wait_start is cleared. Without a ceiling here a stale
+        # peer partial -- now bounded only by that ceiling rather than by its mtime -- could hold
+        # the clock off forever.
+        peer_hold_start: Optional[float] = None
         last_rss = (_child_rss(child_pid) if child_pid else None) or 0
         peer_size: Optional[int] = None
 
@@ -654,7 +678,14 @@ def start_watchdog(
             # the reconstruction buffer (measured: 171s at 20 Mbit/s). Requiring continuous growth
             # therefore killed a waiter at connect_timeout while the holder was downloading fine.
             # A fresh peer-owned partial is the liveness signal; its mtime bounds a stale leftover.
-            fresh = max(connect_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+            #
+            # The bound is the peer SUPPRESSION ceiling, not a stall timeout. Sizing it at 180s put
+            # it 9 seconds above the 171s window measured just above, so any link slower than
+            # 20 Mbit/s expired the peer's liveness mid-transfer and killed the waiter. The ceiling
+            # is the number that already answers "how long may an approximate peer signal hold the
+            # clock off", and the caller enforces it independently, so a stale leftover is still
+            # bounded -- by that enforcement rather than by an mtime that races the link speed.
+            fresh = PEER_SUPPRESSION_CEILING
             now_wall = time.time()
             for one in repo_ids or []:
                 for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
@@ -686,7 +717,10 @@ def start_watchdog(
             failure; on a multi-rank launch of one model that reaches the demotion threshold on the
             first run and pins a machine where Xet demonstrably works to HTTP for 24h.
 
-            Bounded by the partial's mtime so a stale leftover cannot mask a genuinely hung child.
+            Bounded by the caller's PEER_SUPPRESSION_CEILING rather than by the partial's mtime:
+            an mtime window has to be longer than the peer's own head-of-line pause, which scales
+            with the link, so any value short enough to bound a leftover is also short enough to
+            expire on a healthy slow peer.
             """
             if watch_new_partials_only or not child_pid:
                 return False
@@ -694,7 +728,7 @@ def start_watchdog(
             if owned is None or owned:
                 # Uninspectable -> keep the disk-only verdict. Non-empty -> the partial is ours.
                 return False
-            fresh = max(connect_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+            fresh = PEER_SUPPRESSION_CEILING
             now_wall = time.time()
             for one in repo_ids or []:
                 for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
@@ -715,6 +749,23 @@ def start_watchdog(
                     except OSError:
                         continue
             return False
+
+        def _child_exited(pid: Optional[int]) -> bool:
+            """Has the supervised downloader already gone? A process that has exited is not hung, and
+            its exit code is what the ladder acts on, so neither connect trip should fire for it."""
+            if not pid or not os.path.isdir("/proc"):
+                return False
+            return not os.path.isdir(f"/proc/{pid}")
+
+        def _peer_hold_ok(now: float) -> bool:
+            """May a peer keep holding the clock off? Bounded by PEER_SUPPRESSION_CEILING."""
+            nonlocal peer_hold_start
+            if not _waiting_on_a_peers_partial():
+                return False
+            if peer_hold_start is None:
+                peer_hold_start = now
+                return True
+            return now - peer_hold_start < PEER_SUPPRESSION_CEILING
 
         def _trip(message: str) -> None:
             nonlocal fired
@@ -745,6 +796,7 @@ def start_watchdog(
                 # that fill invisible and trips the data clock on a child receiving at wire rate.
                 if rss is not None:
                     last_rss = rss
+                peer_hold_start = None      # our own transfer moved: we are not holding on a peer
             # Phase on the partials open RIGHT NOW, not a run-once latch. Partial bytes rather than
             # the repo-wide total, because that total includes blobs already complete before this
             # download began; and re-evaluated every tick, because a latch stayed true after file N
@@ -768,8 +820,8 @@ def start_watchdog(
                 if rss is not None and rss > last_rss + _RSS_PROGRESS_EPSILON:
                     last_rss = rss
                     last_change = now
-                elif elapsed >= stall_timeout:
-                    if _waiting_on_a_peers_partial():
+                elif elapsed >= _deadline(rss, last_rss, stall_timeout):
+                    if _peer_hold_ok(now):
                         # Someone else owns this transfer; we are a lock waiter, not a stall.
                         last_change = now
                         continue
@@ -786,7 +838,17 @@ def start_watchdog(
                 # invisible to BOTH clocks forever once any byte had been seen, which is the failure
                 # this watchdog exists to catch. The patient connect clock governs the gap; real
                 # repo-wide progress resets it above, and a live peer is covered by the waiter gate.
-                if elapsed >= connect_timeout and not _waiting_on_a_peers_partial():
+                #
+                # Only where there is a download child to kill: for a caller wrapping the whole of
+                # from_pretrained this state is also what a FINISHED download looks like while the
+                # weights are being quantised, and the repo-wide total does not move across the
+                # final .incomplete -> blob rename, so the clock would be counting model init.
+                if (
+                    connect_clock
+                    and not _child_exited(child_pid)
+                    and elapsed >= connect_timeout
+                    and not _peer_hold_ok(now)
+                ):
                     _trip(
                         f"Download did not resume ({transport} transport) "
                         f"-- no data for {int(elapsed)}s"
@@ -811,7 +873,11 @@ def start_watchdog(
                     if peer_wait_start is None:
                         peer_wait_start = now
                     last_change = now
-                elif elapsed >= connect_timeout:
+                elif (
+                    connect_clock
+                    and not _child_exited(child_pid)
+                    and elapsed >= connect_timeout
+                ):
                     _trip(
                         f"Download did not start ({transport} transport) "
                         f"-- no data after {int(elapsed)}s"
@@ -824,6 +890,20 @@ def start_watchdog(
 
     threading.Thread(target = _beat, daemon = True, name = "hf-xet-watchdog").start()
     return stop
+
+
+def _deadline(rss: Optional[int], trough: int, stall_timeout: float) -> float:
+    """How long a flat disk may last before it counts as a hang.
+
+    The short deadline assumes a flat disk means nothing is arriving. That holds only when the
+    other sensor agrees: if RSS has grown since its trough the child IS receiving, and on a slow
+    enough link the reconstruction buffer legitimately fills for minutes between writes. Give that
+    case the patient HTTP threshold; a child whose RSS is also flat, or whose RSS cannot be read at
+    all, keeps the short one.
+    """
+    if rss is not None and rss > trough + _RSS_SLOW_LINK_EPSILON:
+        return max(stall_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+    return stall_timeout
 
 
 def _scrub_in_child(text: str, token: Optional[str]) -> str:
