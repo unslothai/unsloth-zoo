@@ -195,3 +195,47 @@ def test_system_profile_is_sane_on_this_machine():
     assert profile.cpu_count >= 1
     assert profile.total_ram_bytes > 0
     assert dataclasses.asdict(profile)["ram_source"]
+
+
+def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
+    """Kubernetes "cpu: 500m" is a real half-core limit, not an absent one.
+
+    It arrives as cpu.max "50000 100000" -> 0.5. Requiring >= 1 discarded it and fell back to the
+    host's core count, so a half-core pod opened streams sized for the whole node.
+    """
+    monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 0.5)
+    profile = tuning.system_profile()
+    assert profile.cpu_count == 1
+    assert profile.cpu_source == "cgroup"
+
+    env = tuning.xet_env_overrides(profile)
+    assert int(env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) <= 4
+
+
+def test_fail_fast_timeouts_are_opt_out():
+    """The shortened Xet timeouts belong in a supervised download child, not process-wide.
+
+    xet-core reads its config once per process and applies it to uploads and to direct
+    huggingface_hub downloads too, neither of which our HTTP ladder can catch.
+    """
+    supervised = tuning.xet_env_overrides(_profile(16))
+    global_env = tuning.xet_env_overrides(_profile(16), fail_fast = False)
+
+    for key in tuning._FAIL_FAST_KEYS:
+        assert key in supervised
+        assert key not in global_env
+
+    # The memory caps -- the whole point of the module -- are unaffected either way.
+    for key in ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "HF_XET_HIGH_PERFORMANCE"):
+        assert global_env[key] == supervised[key]
+
+
+def test_apply_xet_env_does_not_shorten_timeouts_process_wide():
+    env: dict[str, str] = {}
+    tuning.apply_xet_env(env, profile = _profile(16))
+    assert "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS" not in env
+    assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]
+
+    child: dict[str, str] = {}
+    tuning.apply_xet_env(child, profile = _profile(16), fail_fast = True)
+    assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"

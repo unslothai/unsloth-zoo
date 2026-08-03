@@ -4235,3 +4235,50 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         assert calls == [], "watchdog fired during post-download initialisation"
     finally:
         stop.set()
+
+
+def test_lock_wait_behind_a_live_peer_is_not_a_stall(hf_cache):
+    """Two callers of the same uncached file serialise on the hub's per-file lock.
+
+    The waiter owns no .incomplete of its own, so in watch_new_partials_only mode it looks exactly
+    like a child stuck before the first byte -- and the connect clock killed it. Repo-wide growth
+    is what tells the two apart: as long as the lock HOLDER is still writing, the waiter is fine.
+    """
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "held-by-the-other-writer.incomplete"
+    peer.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {peer.name},
+        child_pid = None,
+    )
+    try:
+        # The lock holder keeps downloading well past connect_timeout; we own nothing the whole time.
+        for _ in range(20):
+            peer.write_bytes(peer.read_bytes() + b"\0" * 4096)
+            time.sleep(0.05)
+        assert calls == [], f"watchdog killed a legitimate cache-lock wait: {calls}"
+    finally:
+        stop.set()
+
+
+def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
+    """The peer-progress escape hatch must not disarm genuine pre-first-byte hangs."""
+    _blobs_dir(hf_cache)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        child_pid = None,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "connect timeout never fired"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()

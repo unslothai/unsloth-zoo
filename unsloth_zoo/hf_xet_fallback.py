@@ -197,7 +197,13 @@ def _xet_failure_reason(summary: str) -> str:
     try:
         from .hf_xet_tuning import scan_xet_log
 
-        messages = scan_xet_log(_xet_log_dir(), max_messages = 2)
+        # Scrubbed like any other child error: a reqwest failure Displays the full URL it was
+        # fetching, and CAS/S3 reads go through presigned URLs carrying an X-Amz-Signature. This
+        # reason is persisted to the health state and echoed into Studio's UI for 24h.
+        messages = [
+            _default_scrub_secrets(m)
+            for m in scan_xet_log(_xet_log_dir(), max_messages = 2)
+        ]
     except Exception:
         messages = []
     return f"{summary}: {' | '.join(messages)}" if messages else summary
@@ -542,6 +548,27 @@ def start_watchdog(
         # False until a partial has been observed at least once. Before that we are in the
         # connect / metadata phase; after it, a partial going away means the transfer finished.
         seen_incomplete = bool(state[1]) if state is not None else False
+        peer_size: Optional[int] = None
+
+        def _peer_progressing() -> bool:
+            """Is some OTHER writer downloading into this repo right now?
+
+            huggingface_hub serialises two callers of the same uncached file on an unbounded
+            per-file lock, and the waiter owns no .incomplete of its own -- so in
+            watch_new_partials_only mode it is indistinguishable from a child stuck before the
+            first byte. Repo-wide growth is what separates "queued behind a live download" from
+            "hung". Without this, a first download lasting longer than connect_timeout makes every
+            concurrent second caller fail hard.
+            """
+            nonlocal peer_size
+            if not watch_new_partials_only:
+                return False  # the snapshot measure is already repo-wide
+            peer = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+            current = peer[0] if peer is not None else None
+            if current is None or current != peer_size:
+                peer_size = current
+                return True
+            return False
 
         def _trip(message: str) -> None:
             nonlocal fired
@@ -577,9 +604,13 @@ def start_watchdog(
                     )
                     return
             elif not seen_incomplete:
-                # No partial has EVER appeared: the child is stuck before the first byte. Without
-                # this branch such a child is invisible to the watchdog forever.
-                if elapsed >= connect_timeout:
+                # No partial has EVER appeared: the child is stuck before the first byte, OR it is
+                # queued on the hub's per-file cache lock while another writer fetches the same
+                # blob. Without this branch such a child is invisible to the watchdog forever;
+                # without the peer check, a legitimate lock wait is killed at connect_timeout.
+                if _peer_progressing():
+                    last_change = now
+                elif elapsed >= connect_timeout:
                     _trip(
                         f"Download did not start ({transport} transport) "
                         f"-- no data after {int(elapsed)}s"
@@ -828,7 +859,9 @@ def _download_child_entry(
         try:
             from unsloth_zoo.hf_xet_tuning import apply_xet_env
 
-            apply_xet_env()
+            # This IS a supervised download child, so the shortened Xet timeouts belong here: a
+            # failure surfaces to the ladder above instead of being retried for ~6 minutes.
+            apply_xet_env(fail_fast = True)
         except Exception as e:
             logger.debug("Could not apply Xet tuning in child: %s", e)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")

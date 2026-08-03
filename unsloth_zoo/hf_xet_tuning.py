@@ -214,8 +214,11 @@ def system_profile() -> SystemProfile:
         cpus = os.cpu_count() or 1
         cpu_source = "cpu_count"
     cg_cpu = cgroup_cpu_limit()
-    if cg_cpu is not None and cg_cpu >= 1 and int(cg_cpu) < cpus:
-        cpus = int(cg_cpu)
+    if cg_cpu is not None and cg_cpu > 0 and cg_cpu < cpus:
+        # A fractional quota still binds: Kubernetes "cpu: 500m" is cpu.max "50000 100000", i.e.
+        # 0.5. Requiring >= 1 discarded it and fell back to the host's core count, which is the
+        # opposite of the intent -- a half-core pod would open 64 streams.
+        cpus = max(1, int(cg_cpu))
         cpu_source = "cgroup"
 
     return SystemProfile(
@@ -231,15 +234,30 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+# Shortened Xet client timeouts. Safe in a download child we supervise, wrong process-wide -- see
+# xet_env_overrides(fail_fast = ...).
+_FAIL_FAST_KEYS = (
+    "HF_XET_CLIENT_READ_TIMEOUT",
+    "HF_XET_CLIENT_CONNECT_TIMEOUT",
+    "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS",
+    "HF_XET_CLIENT_RETRY_MAX_DURATION",
+)
+
+
 def xet_env_overrides(
     profile: Optional[SystemProfile] = None,
     *,
     throttled: bool = False,
+    fail_fast: bool = True,
 ) -> dict[str, str]:
     """RAM/CPU-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
 
     *throttled* halves the download stream ceiling; Unsloth sets it when a previous session logged
     "429 Too Many Requests", which means the account, not the machine, is the limiting factor.
+
+    *fail_fast* controls the shortened Xet client timeouts. They are only appropriate where our
+    Xet -> HTTP ladder can act on the resulting failure, so callers building a download child keep
+    them on and the process-wide import-time application leaves them off.
 
     An unknown total RAM (0) yields the smallest tier: guessing low costs a little throughput,
     guessing high costs an OOM.
@@ -261,7 +279,7 @@ def xet_env_overrides(
     # the true ceiling instead of silently truncating the other two.
     limit = max(limit, size + max_files * perfile)
 
-    return {
+    env = {
         # Memory. The effective buffer is size + max_files * perfile, capped by limit.
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(limit),
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE": str(size),
@@ -286,6 +304,15 @@ def xet_env_overrides(
         "HF_XET_HIGH_PERFORMANCE": "0",
         "HF_XET_HP": "0",
     }
+
+    if not fail_fast:
+        # xet-core reads its config once per process, and these four apply to every CAS call in it
+        # -- uploads and direct huggingface_hub downloads included, none of which have our HTTP
+        # ladder to catch the failure. Process-wide they would turn a transient CAS 5xx into a hard
+        # error after ~12s of backoff instead of the ~363s xet-core would have spent retrying.
+        for key in _FAIL_FAST_KEYS:
+            env.pop(key, None)
+    return env
 
 
 def xet_log_env(log_dir: "str | Path", *, diagnostics: bool = False) -> dict[str, str]:
@@ -313,6 +340,7 @@ def apply_xet_env(
     profile: Optional[SystemProfile] = None,
     throttled: bool = False,
     force: bool = False,
+    fail_fast: bool = False,
 ) -> dict[str, str]:
     """Apply the overrides to *env* (default: ``os.environ``) and return only what was written.
 
@@ -326,9 +354,14 @@ def apply_xet_env(
     ``UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE=1`` (which drops the caps it would have voided).
 
     *force* overwrites every variable regardless, for callers building a fresh child environment.
+
+    *fail_fast* defaults to False here, unlike in ``xet_env_overrides``, because this function is
+    what runs at import: the shortened Xet timeouts would otherwise apply to every direct
+    ``huggingface_hub`` download and every upload in the process, none of which our HTTP fallback
+    ladder supervises. Download children we do supervise pass ``fail_fast = True``.
     """
     target = os.environ if env is None else env
-    overrides = xet_env_overrides(profile, throttled = throttled)
+    overrides = xet_env_overrides(profile, throttled = throttled, fail_fast = fail_fast)
 
     if _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
         for var in XET_HIGH_PERFORMANCE_VARS:

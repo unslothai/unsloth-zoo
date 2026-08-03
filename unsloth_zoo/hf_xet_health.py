@@ -170,7 +170,7 @@ def _state_is_current(state: dict) -> bool:
         return False
 
 
-def _probe_cas_reachable() -> "tuple[bool, str]":
+def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
     """Can we get a Xet read token and reach the CAS endpoint it names?
 
     A token is NOT required: the endpoint answers anonymously, so this measures reachability
@@ -205,6 +205,14 @@ def _probe_cas_reachable() -> "tuple[bool, str]":
         except urllib.error.HTTPError:
             pass
         return (True, "Xet CAS reachable")
+    except urllib.error.HTTPError as e:
+        # The endpoint ANSWERED, which is the only thing this probe measures. A 404 just means the
+        # probe repo is not hosted here -- an HF_ENDPOINT mirror or on-prem deployment -- and must
+        # not pin the machine to HTTP for 24h. A 401/403 still demotes: a blocking corporate proxy
+        # legitimately answers that way.
+        if e.code == 404:
+            return (None, "Xet probe repo absent on this endpoint; assuming Xet")
+        return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:
         return (False, f"Xet CAS unreachable: {type(e).__name__}")
 
@@ -254,6 +262,10 @@ def _evaluate(*, force: bool, probe: bool) -> XetHealth:
         return XetHealth(True, "no cached verdict; defaulting to Xet", "default")
 
     ok, reason = _probe_cas_reachable()
+    if ok is None:
+        # Inconclusive. Persist nothing: a wrong "unhealthy" downgrades a working machine for a
+        # day, a wrong "healthy" costs one fallback.
+        return XetHealth(True, reason, "default")
     _write_state({
         "verdict": "xet" if ok else "http",
         "reason": reason,

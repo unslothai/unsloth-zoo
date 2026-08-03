@@ -33,6 +33,9 @@ from unsloth_zoo import hf_xet_tuning as tuning
 
 GB = 1_000_000_000
 
+# Grabbed at import, before the autouse fixture stubs it out.
+_UNSTUBBED_PROBE = health._probe_cas_reachable
+
 
 @pytest.fixture(autouse = True)
 def _clean(monkeypatch, tmp_path):
@@ -184,3 +187,47 @@ def test_result_is_truthy_like_a_bool(monkeypatch):
     _big_machine(monkeypatch)
     assert bool(health.XetHealth(True, "", "test")) is True
     assert bool(health.XetHealth(False, "", "test")) is False
+
+
+def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
+    """An HF_ENDPOINT mirror that does not host the probe repo answers 404.
+
+    That is proof the endpoint is REACHABLE, which is the only thing this probe measures. Treating
+    it as "Xet unreachable" pinned every on-prem or mirror user to HTTP for 24h.
+    """
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://mirror/x", 404, "Not Found", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    assert ok is None, reason
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+    assert verdict.source == "default"
+    assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
+
+
+def test_probe_403_still_demotes(monkeypatch):
+    """A blocking corporate proxy legitimately answers 403, and that machine should use HTTP."""
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://hf/x", 403, "Forbidden", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    assert ok is False
+    assert "403" in reason
