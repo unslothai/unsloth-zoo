@@ -250,8 +250,18 @@ def stream_exact_ceiling(grid, cap):
     finite path makes with ``SMALL_EXACT_SIGNATURE_THRESHOLD``. Exact
     signatures are sunk in the compile cache, so the allowance is also held
     to a quarter of the cap and, for an anchored grid, to whatever the
-    endpoints leave unclaimed. ``None`` disables it: widen from the first
-    batch, which is the behaviour of a run with no headroom to spend.
+    endpoints leave unclaimed.
+
+    ``None`` disables the allowance and widens from the first batch. An
+    anchored grid's endpoint count grows with ``max_seq_length``, so a long
+    enough context, or a cap at or below the endpoint count, leaves nothing to
+    reserve. Widening immediately is the safe answer there, not a free one: an
+    allowance spent first would sink signatures the endpoints still need, so a
+    diverse stream would reach the cap and fall back to eager. A stream narrow
+    enough to have stayed under the cap regardless pays padding it never needed,
+    which is the price of not being able to tell the two apart in advance.
+    The corollary is that a stream is only guaranteed to stage exactly what an
+    unguarded run would when this returns a positive allowance.
     """
     cap = int(cap)
     ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)

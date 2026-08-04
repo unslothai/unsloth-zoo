@@ -10189,11 +10189,15 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 skip_batches=prefetch_skip_batches,
                 # The prefetch path's terminal width point. Safe to widen
                 # here: response-masked streams are rejected at iterator entry,
-                # so no mask can follow.
+                # so no mask can follow. Chosen on the policy's presence and
+                # never on ``armed``: this generator body runs at the first
+                # advance, which the audio peek performs before the policy is
+                # armed, so latching on ``armed`` would pin the plain finalizer
+                # and the stream would never widen. Widening is identity while
+                # the policy declines, so deciding per call is safe.
                 finalize=(
                     _finalize_vlm_batch
                     if width_policy is None
-                    or not getattr(width_policy, "armed", True)
                     else lambda staged, policy=width_policy: (
                         _widen_finalized_vlm_batch(
                             _finalize_vlm_batch(staged, phase="content"),
