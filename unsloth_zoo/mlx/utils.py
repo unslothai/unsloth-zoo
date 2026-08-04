@@ -14642,7 +14642,11 @@ def save_pretrained_gguf(
         first_conversion: Optional override for the intermediate GGUF
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
-            ``"f16"`` / ``"bf16"`` to force a specific intermediate
+            ``"f16"`` / ``"bf16"`` to force a specific intermediate.
+            When left as ``None`` it is derived: a lone full-precision
+            target is converted to directly, a set containing ``"f32"``
+            converts through f32 so no target is built from rounded
+            weights, and anything else uses a bf16 intermediate.
     """
     from ..llama_cpp import (
         convert_to_gguf,
@@ -14682,13 +14686,29 @@ def save_pretrained_gguf(
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
 
-    # Determine first_conversion (the single intermediate every requested quant
-    # is produced from). Only a lone full-precision target can be emitted by
-    # convert_hf_to_gguf directly; any k-quant/q8_0 in the set - even alongside
-    # a full-precision one - needs a bf16 intermediate for llama-quantize.
+    # Determine first_conversion: the single intermediate every requested quant
+    # is produced from. Only honoured when the caller did not pin one
+    # (unslothai/unsloth unsloth/save.py:1953 derives it under the same
+    # `first_conversion is None` guard).
     if first_conversion is None:
         if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+            # A lone full-precision target is emitted by convert_hf_to_gguf
+            # directly - no intermediate, no llama-quantize pass.
             first_conversion = quant_types[0]
+        elif "f32" in quant_types:
+            # Everything the intermediate can be (bf16, f16, f32) is exactly
+            # representable in f32 - bf16 is literally the high 16 bits of an
+            # IEEE f32 - so an f32 intermediate can never round the weights that
+            # the other targets are quantized from. Converting to bf16 first
+            # instead built the requested *.F32.gguf out of bf16-rounded data:
+            # f32-shaped, but only 8 mantissa bits of real signal.
+            #
+            # Only f32 is a safe promotion. f16 and bf16 are NOT orderable
+            # against each other - bf16 has the wider exponent, f16 the longer
+            # mantissa - so promoting a requested f16 to the intermediate would
+            # clip the range of a bf16 checkpoint, which is why a requested f16
+            # alone still goes through bf16 below.
+            first_conversion = "f32"
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"

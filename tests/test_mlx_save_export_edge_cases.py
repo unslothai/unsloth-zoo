@@ -1362,6 +1362,71 @@ def test_gguf_scalar_full_precision_keeps_its_pre_pr_behaviour(monkeypatch, tmp_
     assert (out / "EdgeModel.BF16.gguf").exists()
 
 
+# --- Group 11e: intermediate must not down-convert an f32 request -----------
+
+
+def test_gguf_f32_request_converts_directly_to_f32(monkeypatch, tmp_path):
+    """bf16 and f16 both embed exactly in f32, so an f32 intermediate is never a
+    precision regression for the other targets -- but a bf16 intermediate makes
+    the requested F32.gguf f32-shaped bf16 data."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "f16"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16"]
+    assert (out / "EdgeModel.F32.gguf").exists()
+    assert (out / "EdgeModel.F16.gguf").exists()
+
+
+def test_gguf_f32_request_alongside_a_kquant_still_converts_to_f32(
+    monkeypatch, tmp_path
+):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert {c["input_gguf"] for c in calls["quantize_calls"]} == {
+        str(out / "EdgeModel.F32.gguf")
+    }
+    assert (out / "EdgeModel.F32.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+
+
+def test_gguf_without_f32_the_intermediate_stays_bf16(monkeypatch, tmp_path):
+    """Deliberate non-change. f16 and bf16 are not orderable -- bf16 has the
+    wider exponent, f16 the longer mantissa -- so promoting a requested f16 to
+    the intermediate would CLIP the range of a bf16 checkpoint. Only f32, which
+    represents all three exactly, is a safe promotion."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f16", "q4_k_m"])
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+
+
+def test_gguf_two_full_precision_no_f32_keeps_bf16_intermediate(
+    monkeypatch, tmp_path
+):
+    """Companion to the above for the all-full-precision set."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "f16"])
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+
+
+def test_gguf_explicit_first_conversion_beats_the_f32_promotion(
+    monkeypatch, tmp_path
+):
+    """An explicit `first_conversion` is always honoured; the derivation only
+    runs when it is None (unslothai/unsloth unsloth/save.py:1953)."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"], first_conversion="bf16")
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f32", "q4_k_m"]
+
+
 def test_mlx_model_method_forwards_a_quant_list(monkeypatch, tmp_path):
     """The user-facing hop: model.save_pretrained_gguf(...) in loader.py."""
     import unsloth_zoo.mlx.loader as loader
