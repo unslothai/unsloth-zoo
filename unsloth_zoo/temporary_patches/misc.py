@@ -1032,6 +1032,158 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path on pre-Ampere GPUs.
+
+    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
+    and `is_fast_path_available` is True, so transformers routes into
+    `cuda_kernels_forward` and Triton only fails once training starts, with an
+    opaque `RuntimeError: PassManager::run failed`.
+
+    `is_fast_path_available` is baked in at module import, so flip both the
+    availability predicates (for modules imported later) and the flag on
+    already-imported modules. A capability check rather than a trial launch
+    like the causal_conv1d probe above, which would pay a Triton compile at
+    every import just to watch it fail. Real NVIDIA CUDA only.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    if (major, minor) >= (8, 0):
+        return  # Ampere or newer; the fast path is fine
+
+    try:
+        import mamba_ssm  # noqa: F401
+    except Exception:
+        return  # Not installed, so nothing routes into it anyway
+
+    import sys
+
+    # 1. Modules imported LATER see the package as unavailable, so their
+    #    `is_fast_path_available` evaluates to False at import time.
+    try:
+        import transformers.utils.import_utils as _iu
+        for _pred in ("is_mamba_ssm_available", "is_mamba_2_ssm_available"):
+            if hasattr(_iu, _pred):
+                setattr(_iu, _pred, lambda: False)
+    except Exception:
+        pass
+    pass
+
+    # 2. Modules ALREADY imported have baked the flag in; flip it directly.
+    #    Confined to transformers' own model modules so vLLM's independent
+    #    Triton kernels are left alone.
+    _touched = False
+    for _name, _mod in list(sys.modules.items()):
+        if not _name.startswith("transformers.models.") or _mod is None:
+            continue
+        if not getattr(_mod, "is_fast_path_available", False):
+            continue
+        try:
+            _mod.is_fast_path_available = False
+            for _sym in (
+                "selective_state_update",
+                "mamba_chunk_scan_combined",
+                "mamba_split_conv1d_scan_combined",
+            ):
+                if getattr(_mod, _sym, None) is not None:
+                    setattr(_mod, _sym, None)
+            _touched = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    print(
+        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
+        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
+        f"Mamba models."
+    )
+    return _touched
+
+
+TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
+def patch_datasets_map_worker_death_retry():
+    """Retry `Dataset.map` single-process when a worker is killed outright.
+
+    Long-text corpora can have the kernel OOM-kill a `dataset_num_proc`
+    worker, which datasets turns into "One of the subprocesses has abruptly
+    died during map operation", killing the run inside SFTTrainer.__init__.
+    The map is issued deep inside TRL, so the user cannot disable
+    multiprocessing themselves.
+
+    Narrow by design: only a vanished worker (OOM-kill, segfault) matches, a
+    genuine exception from the map function is re-raised as itself and still
+    propagates, single-process maps re-raise untouched, and the retry cannot
+    recurse because num_proc is pinned to 1.
+    """
+    try:
+        from datasets import Dataset
+    except Exception:
+        return  # datasets not installed
+
+    original_map = getattr(Dataset, "map", None)
+    if original_map is None or getattr(original_map, "_unsloth_worker_death_retry", False):
+        return
+
+    import functools
+
+    @functools.wraps(original_map)
+    def map(self, *args, **kwargs):
+        try:
+            return original_map(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "abruptly died" not in str(exc):
+                raise
+            # num_proc has to end up as a keyword we can override, so a call
+            # that passed it positionally is re-expanded into keywords first.
+            call_args, call_kwargs = args, dict(kwargs)
+            num_proc = call_kwargs.get("num_proc", None)
+            if num_proc is None and args:
+                try:
+                    sig = inspect.signature(original_map)
+                    if any(p.kind is p.VAR_POSITIONAL for p in sig.parameters.values()):
+                        raise TypeError("cannot normalise *args")
+                    bound = sig.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    num_proc = bound.arguments.get("num_proc", None)
+                    var_kw = {}
+                    for p in sig.parameters.values():
+                        if p.kind is p.VAR_KEYWORD:
+                            var_kw = bound.arguments.pop(p.name, None) or {}
+                    bound.arguments.pop("self", None)
+                    call_args = ()
+                    call_kwargs = {**bound.arguments, **var_kw}
+                except Exception:
+                    call_args, call_kwargs = args, dict(kwargs)
+                    num_proc = None
+            if not isinstance(num_proc, int) or num_proc <= 1:
+                raise
+            print(
+                f"Unsloth: a dataset worker was killed with num_proc={num_proc} "
+                f"(most likely out of system RAM). Retrying single-process; "
+                f"this is slower but survives."
+            )
+            call_kwargs["num_proc"] = 1
+            return original_map(self, *call_args, **call_kwargs)
+        pass
+    pass
+
+    map._unsloth_worker_death_retry = True
+    Dataset.map = map
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
@@ -1669,3 +1821,86 @@ def patch_deepseek_v2_moe_alias():
         m.DeepseekV2MoE = m.DeepseekV2Moe
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_longrope_impossible_attention_factor():
+    """Ignore a LongRoPE `attention_factor` that cannot be a real one.
+
+    The factor is by construction
+
+        sqrt(1 + log(factor) / log(original_max_position_embeddings))
+
+    a number near 1. transformers derives that when the key is absent, but
+    takes the config's word for it when present, and
+    unsloth/Phi-3.5-mini-instruct{,-bnb-4bit} set it equal to `factor` (32.0),
+    roughly 27x the real value. Nothing raises; the model just predicts badly
+    (4.74 vs 2.13 cross-entropy on the same text).
+
+    The signature is exact on purpose: attention_factor == factor AND
+    factor > 2. A genuine attention factor is never the extension ratio and
+    never much above 1.5. The real remedy is republishing those configs.
+    """
+    try:
+        import functools
+        import math
+        from transformers import modeling_rope_utils as _rope
+    except Exception:
+        return
+    original = getattr(_rope, "_compute_longrope_parameters", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    def _sanitise(config):
+        scaling = getattr(config, "rope_scaling", None)
+        if not isinstance(scaling, dict):
+            return
+        factor = scaling.get("factor")
+        attention_factor = scaling.get("attention_factor")
+        if attention_factor is None or factor is None:
+            return
+        try:
+            if float(attention_factor) != float(factor) or float(factor) <= 2.0:
+                return
+        except (TypeError, ValueError):
+            return
+        original_max = getattr(config, "original_max_position_embeddings", None) \
+            or getattr(config, "max_position_embeddings", None)
+        try:
+            correct = math.sqrt(1 + math.log(float(factor)) / math.log(float(original_max)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            correct = None
+        cleaned = dict(scaling)
+        cleaned.pop("attention_factor", None)
+        try:
+            config.rope_scaling = cleaned
+        except Exception:
+            return
+        print(
+            f"Unsloth: This model's config sets a LongRoPE attention_factor of "
+            f"{attention_factor}, which equals its extension factor and cannot be "
+            f"a real attention factor"
+            + (f" (the derived value is {correct:.4f})" if correct else "")
+            + ". Ignoring it so attention is scaled correctly."
+        )
+
+    @functools.wraps(original)
+    def _compute_longrope_parameters(config, device, seq_len = None, **kwargs):
+        try:
+            _sanitise(config)
+        except Exception:
+            # Never let the guard itself break a model that would have loaded.
+            pass
+        return original(config, device, seq_len = seq_len, **kwargs)
+
+    _compute_longrope_parameters._unsloth_patched = True
+    try:
+        _rope._compute_longrope_parameters = _compute_longrope_parameters
+        # Models resolve the callable through this dict, not the module
+        # attribute, so patching only the attribute would be a no-op.
+        if getattr(_rope, "ROPE_INIT_FUNCTIONS", None) is not None:
+            if _rope.ROPE_INIT_FUNCTIONS.get("longrope") is original:
+                _rope.ROPE_INIT_FUNCTIONS["longrope"] = _compute_longrope_parameters
+    except Exception:
+        return
+pass
+TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
