@@ -129,11 +129,18 @@ jobs:
         # so a 3.10-only `match` and a module-level `str | Path` both reached main and
         # made the package un-importable on 3.9. It reads the floor from pyproject, so
         # raising requires-python relaxes it rather than making it lie.
+        #
+        # test_mlx_group_by_length pins the HF-exact ordering algorithm (checked
+        # against a transcription of transformers' get_length_grouped_indices),
+        # the conflicting-knob rejections, and that the labeled and unlabeled
+        # text paths order rows identically. CPU-pure index math plus torch's
+        # RNG; the real-MLX end-to-end half lives in the _metal companion.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_group_by_length.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \

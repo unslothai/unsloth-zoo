@@ -111,6 +111,13 @@ jobs:
         # CPT partition, target normalization and full-module save routing.
         run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
 
+      - name: tests/test_mlx_group_by_length_metal.py
+        # group_by_length through the real text plan builder: full row coverage,
+        # per-epoch reshuffle, seed determinism, and that padded cells actually
+        # drop versus torch_randperm. Needs real MLX because the plan builder
+        # cannot tokenize under the simulation shim.
+        run: python -m pytest tests/test_mlx_group_by_length_metal.py -v -rs
+
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
