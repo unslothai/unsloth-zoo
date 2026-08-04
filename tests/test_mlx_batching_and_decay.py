@@ -577,6 +577,35 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
     assert family({"t": Point(1, 2)}) != family({"t": (1, 2)})
 
 
+def test_per_row_audio_spans_stay_plannable():
+    """Spans are carried one array per row, since rows hold different clip
+    counts and stacking them raises. Leaving them as host arrays would describe
+    every batch of the family as opaque, sending it to eager and making a
+    strict run raise -- text-only batches of that family included."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import (
+        _to_mx_vlm_batch,
+        _vlm_batch_family as family,
+        _vlm_family_is_plannable as plannable,
+    )
+
+    cases = [
+        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),         # a text-only batch
+        ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])],
+         [[[1, 3]], [[1, 3], [4, 7]]]),
+    ]
+    for spans, expected in cases:
+        batch = _to_mx_vlm_batch({
+            "input_ids": np.zeros((2, 8), dtype=np.int32),
+            "audio_bounds": spans,
+        })
+        # Both halves matter here: the generic conversion also yields something
+        # plannable, by stacking equal rows and keeping only the first of ragged
+        # ones, so plannability alone would not show the rows survived.
+        assert [np.asarray(row).tolist() for row in batch["audio_bounds"]] == expected
+        assert plannable(family(batch))
+
+
 class _VarWidthProcessor(_CountingProcessor):
     """Batch width AND structure follow content: different scheduled
     batches produce genuinely distinct families even after the text axis

@@ -1346,6 +1346,16 @@ def grpo_accumulated_loss(
         if tensor is None: return None
         return tensor.to(device, non_blocking=non_blocking)
 
+    def _offload_device_module(tensor_or_device):
+        # Stream/Event module for the offload copy. torch.cuda is also the HIP
+        # backend, so ROCm reports is_cuda and needs no branch of its own; XPU has
+        # its own namespace, matching gradient_checkpointing.py. Anything else
+        # (CPU, MPS, ...) returns None and takes the pageable copy.
+        device = getattr(tensor_or_device, "device", tensor_or_device)
+        if device.type == "cuda": return torch.cuda
+        if device.type == "xpu": return getattr(torch, "xpu", None)
+        return None
+
     class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
         """Manual gradient checkpointing / CPU offloading for log softmax."""
         @staticmethod
@@ -1353,9 +1363,46 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             # Detach so we don't keep the graph (and extra memory) on CPU.
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
+            detached_hidden_states = hidden_states.detach().contiguous()
             ctx.device = hidden_states.device
-            ctx.dtype = hidden_states.dtype
+            ctx.copy_event = None
+
+            # Always offload: this path only runs when the caller is already memory bound
+            # (long completions / large batches), so the win is overlapping the copy.
+            saved_hidden_states = None
+            device_module = _offload_device_module(detached_hidden_states)
+            if device_module is not None:
+                # Async D2H on a side stream; backward MUST wait on copy_event before
+                # the H2D reload or it races the copy.
+                try:
+                    pinned_buffer = torch.empty_like(detached_hidden_states, device = "cpu", pin_memory = True)
+                    if pinned_buffer is not None:
+                        current_stream = device_module.current_stream(detached_hidden_states.device)
+                        copy_stream = device_module.Stream(device = detached_hidden_states.device)
+                        copy_stream.wait_stream(current_stream)
+                        with device_module.stream(copy_stream):
+                            pinned_buffer.copy_(detached_hidden_states, non_blocking = True)
+                        # Keeps the GPU storage alive until the side-stream copy finishes.
+                        detached_hidden_states.record_stream(copy_stream)
+                        copy_event = device_module.Event()
+                        copy_event.record(copy_stream)
+                        saved_hidden_states = pinned_buffer
+                        ctx.copy_event = copy_event
+                except (RuntimeError, OSError, AttributeError):
+                    # Any accelerator that cannot do pinned side-stream copies falls
+                    # back below; correctness never depends on this path.
+                    saved_hidden_states = None
+                    ctx.copy_event = None
+            if saved_hidden_states is None:
+                # No accelerator, or the async copy is unavailable: pageable copy.
+                saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
+            ctx.saved_hidden_states = saved_hidden_states
+            # Drop the clone before the log-softmax below. hidden_states is usually a
+            # [:, :-1, :] slice, so .contiguous() allocated a full copy; holding the
+            # reference across the forward would keep it resident alongside the chunk
+            # logits. record_stream still blocks reuse until the D2H lands, so the
+            # allocator reclaims it mid-compute rather than at the end of forward.
+            del detached_hidden_states
 
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad
@@ -1371,17 +1418,20 @@ def grpo_accumulated_loss(
 
         @staticmethod
         def backward(ctx, grad_output):
+            if ctx.copy_event is not None:
+                # The offload copy must land before the H2D reload.
+                device_module = _offload_device_module(ctx.device)
+                ctx.copy_event.wait(device_module.current_stream(ctx.device))
             hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
-            hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
 
             lm_head = ctx.lm_head
-            # #Possibly redundant lines
-            # if ctx.lm_head_requires_grad:
-            #     hidden_states.requires_grad_(True)
-            # else:
-            #     lm_head = lm_head.detach()
-
+            if ctx.lm_head_requires_grad:
+                # Recompute against a private leaf. A Tensor.register_hook on the real
+                # lm_head fires for tensors named in autograd.grad's inputs, so reusing
+                # it here would run a user's grad mask / scaler once on this local
+                # gradient and again when the returned gradient reaches lm_head.
+                lm_head = lm_head.detach().requires_grad_(True)
             index = ctx.index
 
             with torch.enable_grad():
@@ -1389,11 +1439,17 @@ def grpo_accumulated_loss(
                     hidden_states, lm_head, index, *ctx.args
                 )
 
-            torch.autograd.backward(output, grad_output)
+            # autograd.grad, not backward: backward writes into leaf .grad, which the
+            # outer AccumulateGrad would then double-count.
+            grad_inputs = torch.autograd.grad(
+                output,
+                (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
+                grad_output,
+            )
 
             return (
-                hidden_states.grad,
-                lm_head.grad if ctx.lm_head_requires_grad else None,
+                grad_inputs[0],
+                grad_inputs[1] if ctx.lm_head_requires_grad else None,
                 None,
                 None,
                 None,
