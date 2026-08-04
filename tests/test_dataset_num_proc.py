@@ -624,15 +624,13 @@ def test_memory_budget_follows_the_cgroup_not_the_host(monkeypatch, dnp):
     monkeypatch.setattr(
         psutil, "virtual_memory", lambda: type("m", (), {"available": 512 * 1024**3})()
     )
-    monkeypatch.setattr(dnp, "_cgroup_memory_used", lambda: 0)
-
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (None, None))
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: None)
     assert dnp.get_dataset_num_proc(None) == dnp.AUTO_NUM_PROC_CAP
 
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (2 * 1024**3, None))
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: 2 * 1024**3)
     assert dnp.get_dataset_num_proc(None) is None, "a 2GB container has no room for workers"
 
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (8 * 1024**3, None))
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: 8 * 1024**3)
     assert dnp.get_dataset_num_proc(None) == 4
 
 
@@ -645,12 +643,11 @@ def test_memory_already_spent_in_the_container_is_not_counted_as_free(monkeypatc
     monkeypatch.setattr(
         psutil, "virtual_memory", lambda: type("m", (), {"available": 512 * 1024**3})()
     )
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (32 * 1024**3, None))
-
-    monkeypatch.setattr(dnp, "_cgroup_memory_used", lambda: 0)
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: 32 * 1024**3)
     assert dnp.get_dataset_num_proc(None) == dnp.AUTO_NUM_PROC_CAP
 
-    monkeypatch.setattr(dnp, "_cgroup_memory_used", lambda: 30 * 1024**3)
+    # 30 of the 32GB already spent leaves 2, which is not enough for workers.
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: 2 * 1024**3)
     assert dnp.get_dataset_num_proc(None) is None
 
 
@@ -659,7 +656,7 @@ def test_cpu_count_follows_the_affinity_mask(monkeypatch, dnp):
     # run on, and workers would only contend for the cores it does have.
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(psutil, "cpu_count", lambda *a, **k: 128)
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (None, None))
+    monkeypatch.setattr(dnp, "_cgroup_cpu_quota", lambda: None)
     monkeypatch.setattr(dnp.os, "sched_getaffinity", lambda pid: set(range(4)), raising = False)
     assert dnp._usable_cpus() == 4
 
@@ -671,7 +668,7 @@ def test_cpu_count_follows_a_fractional_cgroup_quota(monkeypatch, dnp):
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(psutil, "cpu_count", lambda *a, **k: 128)
     monkeypatch.setattr(dnp.os, "sched_getaffinity", lambda pid: set(range(128)), raising = False)
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (None, 0.5))
+    monkeypatch.setattr(dnp, "_cgroup_cpu_quota", lambda: 0.5)
     assert dnp._usable_cpus() == 1
 
 
@@ -683,11 +680,10 @@ def test_a_single_usable_cpu_tokenizes_in_process(monkeypatch, dnp):
 
 def test_the_cgroup_readers_never_raise(dnp):
     # They run on every auto-sizing call, on hosts with no cgroup at all.
-    limit, quota = dnp._cgroup_limits()
-    assert limit is None or isinstance(limit, int)
+    free = dnp._cgroup_free_bytes()
+    assert free is None or (isinstance(free, int) and free >= 0)
+    quota = dnp._cgroup_cpu_quota()
     assert quota is None or isinstance(quota, float)
-    used = dnp._cgroup_memory_used()
-    assert used is None or isinstance(used, int)
 
 
 # ---------- the zoo reads the other module ----------
@@ -739,39 +735,105 @@ def test_agreeing_modules_are_left_alone(monkeypatch, dnp):
     monkeypatch.setattr(
         psutil, "virtual_memory", lambda: type("m", (), {"available": 256 * 1024**3})()
     )
-    monkeypatch.setattr(dnp, "_cgroup_limits", lambda: (None, None))
+    monkeypatch.setattr(dnp, "_cgroup_free_bytes", lambda: None)
 
     trainer = type("t", (), {"train_dataset": _Split(dnp.ZOO_MIN_ROWS_FOR_MULTIPROC * 2)})()
     assert dnp.resolve_responses_only_num_proc(trainer, None) == dnp.AUTO_NUM_PROC_CAP
     assert dnp.resolve_responses_only_num_proc(trainer, 1) == 1
 
 
-def test_cgroup_usage_is_read_from_the_directory_that_set_the_limit(monkeypatch, dnp, tmp_path):
-    """Not from /sys/fs/cgroup/memory.current.
-
-    At the root that file is the whole machine's usage. Subtracting it from a
-    systemd unit's own MemoryMax would leave every run with nothing free and
-    silently serialise tokenization on ordinary hosts.
-    """
+def _fake_cgroup_module(monkeypatch, v2_dirs = (), v1_dirs = ()):
     import types
 
-    inner = tmp_path / "user.slice" / "session.scope"
-    inner.mkdir(parents = True)
-    (inner / "memory.current").write_text("3221225472\n")     # 3 GB, this unit
-    (tmp_path / "memory.current").write_text("400000000000\n")  # 400 GB, the box
+    def _read_first_line(path):
+        return path.read_text() if path.is_file() else None
+
+    def _parse_limit(raw):
+        if not raw or raw.strip() == "max":
+            return None
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
 
     fake = types.ModuleType("unsloth_zoo.hf_xet_tuning")
-    fake._cgroup_v2_dirs = lambda: [inner, tmp_path]
-    fake._cgroup_v1_dirs = lambda controller: []
-    fake._read_first_line = lambda path: path.read_text() if path.is_file() else None
+    fake._cgroup_v2_dirs = lambda: list(v2_dirs)
+    fake._cgroup_v1_dirs = lambda controller: list(v1_dirs)
+    fake._read_first_line = _read_first_line
+    fake._parse_limit = _parse_limit
+    fake.cgroup_memory_limit = lambda: None
+    fake.cgroup_cpu_limit = lambda: None
     monkeypatch.setitem(sys.modules, "unsloth_zoo.hf_xet_tuning", fake)
+    return fake
 
-    assert dnp._cgroup_memory_used() == 3 * 1024**3
+
+def test_free_memory_pairs_each_limit_with_its_own_usage(monkeypatch, dnp, tmp_path):
+    """The binding limit is often an ancestor's, and so is the usage that fills it.
+
+    A leaf's usage against a slice's limit reports memory that siblings have
+    already spent as free. The other direction is worse: the root
+    memory.current is the whole machine, and against a unit's own MemoryMax it
+    leaves every run with nothing.
+    """
+    slice_dir = tmp_path / "user.slice"
+    leaf = slice_dir / "session.scope"
+    leaf.mkdir(parents = True)
+
+    # The slice caps 32GB and 30 of them are spent, mostly by a sibling; this
+    # leaf has a 16GB cap of its own and has spent 1.
+    (slice_dir / "memory.max").write_text("34359738368\n")
+    (slice_dir / "memory.current").write_text("32212254720\n")
+    (leaf / "memory.max").write_text("17179869184\n")
+    (leaf / "memory.current").write_text("1073741824\n")
+
+    _fake_cgroup_module(monkeypatch, v2_dirs = [leaf, slice_dir])
+    # 34 - 32 = 2GB from the slice, 16 - 1 = 15GB from the leaf. The slice binds.
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+
+
+def test_free_memory_is_never_negative(monkeypatch, dnp, tmp_path):
+    # An over-committed cgroup reports more usage than its limit under pressure.
+    leaf = tmp_path / "scope"
+    leaf.mkdir()
+    (leaf / "memory.max").write_text("1073741824\n")
+    (leaf / "memory.current").write_text("2147483648\n")
+    _fake_cgroup_module(monkeypatch, v2_dirs = [leaf])
+    assert dnp._cgroup_free_bytes() == 0
+
+
+def test_an_unlimited_cgroup_is_not_a_ceiling(monkeypatch, dnp, tmp_path):
+    leaf = tmp_path / "scope"
+    leaf.mkdir()
+    (leaf / "memory.max").write_text("max\n")
+    (leaf / "memory.current").write_text("1073741824\n")
+    _fake_cgroup_module(monkeypatch, v2_dirs = [leaf])
+    assert dnp._cgroup_free_bytes() is None
+
+
+def test_a_readable_limit_with_no_readable_usage_still_binds(monkeypatch, dnp, tmp_path):
+    leaf = tmp_path / "scope"
+    leaf.mkdir()
+    (leaf / "memory.max").write_text("2147483648\n")
+    _fake_cgroup_module(monkeypatch, v2_dirs = [leaf])
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
 
 
 def test_missing_cgroup_readers_fall_back_to_the_limit_alone(monkeypatch, dnp):
-    # An older unsloth_zoo has no such helpers. Subtracting nothing is never
-    # worse than not subtracting, so the limit still binds.
+    """An older unsloth_zoo has no such private helpers.
+
+    The public limit reader alone can only overstate what is free, never
+    understate it, so the ceiling still binds.
+    """
+    import types
+
+    fake = types.ModuleType("unsloth_zoo.hf_xet_tuning")
+    fake.cgroup_memory_limit = lambda: 4 * 1024**3
+    fake.cgroup_cpu_limit = lambda: None
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.hf_xet_tuning", fake)
+    assert dnp._cgroup_free_bytes() == 4 * 1024**3
+
+
+def test_no_unsloth_zoo_at_all_is_not_a_ceiling(monkeypatch, dnp):
     import builtins
 
     real_import = builtins.__import__
@@ -782,4 +844,46 @@ def test_missing_cgroup_readers_fall_back_to_the_limit_alone(monkeypatch, dnp):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _no_hf_xet)
-    assert dnp._cgroup_memory_used() is None
+    assert dnp._cgroup_free_bytes() is None
+    assert dnp._cgroup_cpu_quota() is None
+
+
+def test_env_forced_serial_is_in_process_on_a_small_split(monkeypatch, dnp):
+    """The documented recovery has to actually recover.
+
+    UNSLOTH_DATASET_NUM_PROC=0 with the config sentinel 1 arriving as an explicit
+    count used to return 1, which bypasses the small-split guard and builds a
+    Pool(1) on datasets >= 4.1. Under the threshold the guard is in-process, so
+    None is what expresses the request exactly.
+    """
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_stdlib_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "0")
+
+    small = type("t", (), {"train_dataset": _Split(100)})()
+    assert dnp.resolve_responses_only_num_proc(small, 1) is None
+    assert dnp.resolve_responses_only_num_proc(small, None) is None
+
+    # Over the threshold the guard is gone, and 1 is the least it can be given.
+    big = type("t", (), {"train_dataset": _Split(dnp.ZOO_MIN_ROWS_FOR_MULTIPROC * 2)})()
+    assert dnp.resolve_responses_only_num_proc(big, 1) == 1
+
+
+def test_a_memory_starved_explicit_count_is_in_process_on_a_small_split(monkeypatch, dnp):
+    # Same shape without the env var: the memory clamp resolves to serial, and
+    # under the threshold that has an exact encoding.
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_stdlib_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.setattr(dnp, "_affordable_workers", lambda: 0)
+
+    small = type("t", (), {"train_dataset": _Split(100)})()
+    assert dnp.resolve_responses_only_num_proc(small, 16) is None
+
+
+def test_an_explicit_count_the_host_can_afford_is_untouched_by_the_row_guard(monkeypatch, dnp):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_stdlib_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.setattr(dnp, "_affordable_workers", lambda: 1000)
+
+    small = type("t", (), {"train_dataset": _Split(100)})()
+    assert dnp.resolve_responses_only_num_proc(small, 4) == 4
