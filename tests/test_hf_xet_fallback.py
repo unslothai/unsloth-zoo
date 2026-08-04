@@ -165,6 +165,10 @@ def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
     """An unmeasurable tick (state -> None) counts as progress, but a later frozen state still stalls."""
     seq = {"n": 0}
     frozen = (2048, True)  # constant size + active .incomplete
+    # A real partial as well as the mocked repo-wide figure: the watchdog phases its clocks on bytes
+    # in ACTIVE partials, so a mocked total alone would leave it in the 90s connect phase and the
+    # 0.3s data deadline asserted below would never apply.
+    (_blobs_dir(hf_cache) / "frozen.incomplete").write_bytes(b"\0" * 2048)
 
     def fake_state(*args, **kwargs):
         seq["n"] += 1
@@ -4146,3 +4150,695 @@ def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
     _REAL_DEFAULT_PREPARE(
         "model", repo, cache_dir = str(tmp_path), active_grace = 180, owned_incomplete_blobs = None)
     assert not owned.exists() and not sibling.exists()
+
+
+# Tiered stall detection: a hang BEFORE the first byte used to be invisible.
+
+def test_connect_phase_hang_is_detected(hf_cache):
+    """A child stuck in DNS / TLS / metadata never creates a .incomplete. The watchdog used to reset
+    its clock whenever no partial existed, so this state (a Xet download "hanging at 0%") could not
+    be detected at all; connect_timeout governs it now."""
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        # A download child to kill, so the connect clock applies.
+        watch_connect = True,
+    )
+    try:
+        assert _wait(lambda: len(calls) >= 1, timeout = 3.0), \
+            "watchdog never fired on a child that produced no data at all"
+    finally:
+        stop.set()
+    assert "did not start" in calls[0].lower()
+
+
+def test_connect_grace_is_longer_than_the_stall_trip():
+    """Metadata round trips on a congested link are legitimately slow; only the ACTIVE phase gets
+    the aggressive 30s trip."""
+    assert xf.DEFAULT_CONNECT_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
+    assert xf.DEFAULT_STALL_TIMEOUT == 30.0
+    # HTTP is the fallback of last resort: killing it has nowhere left to go.
+    assert xf.DEFAULT_HTTP_STALL_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "xet_disabled, expected",
+    [(False, xf.DEFAULT_STALL_TIMEOUT), (True, xf.DEFAULT_HTTP_STALL_TIMEOUT)],
+)
+def test_default_stall_timeout_is_transport_aware(hf_cache, monkeypatch, xet_disabled, expected):
+    """No explicit timeout: aggressive on Xet (a stall there has somewhere to fall back to), patient
+    on HTTP (it does not)."""
+    defaults: dict[str, float] = {}
+
+    def _record(name, default):
+        defaults[name] = default
+        return default
+
+    monkeypatch.setattr(xf, "_env_seconds", _record)
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = lambda _m: None, xet_disabled = xet_disabled,
+    )
+    stop.set()
+    assert defaults["UNSLOTH_XET_STALL_TIMEOUT"] == expected
+    assert defaults["UNSLOTH_XET_CONNECT_TIMEOUT"] == xf.DEFAULT_CONNECT_TIMEOUT
+
+
+def test_stall_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_STALL_TIMEOUT", "7.5")
+    assert xf._env_seconds("UNSLOTH_XET_STALL_TIMEOUT", 30.0) == 7.5
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1", "0", ""])
+def test_stall_timeout_env_ignores_junk(monkeypatch, bad):
+    """A typo in an env var must not disable stall detection or crash a model load."""
+    monkeypatch.setenv("UNSLOTH_XET_STALL_TIMEOUT", bad)
+    assert xf._env_seconds("UNSLOTH_XET_STALL_TIMEOUT", 30.0) == 30.0
+
+
+def test_post_download_init_is_not_a_stall(hf_cache):
+    """Once a partial has appeared and then gone, the transfer is done: model init and lock waits
+    that follow must never be read as a stall."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "finishing.incomplete"
+    part.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 5.0,
+    )
+    try:
+        # Hold the partial long enough that the watchdog thread certainly measured it once: a 0.15s
+        # hold passed on an idle box but not under a loaded suite, where the thread could first run
+        # AFTER the unlink, and a watchdog that never saw a partial cannot tell "finished" from
+        # "never started".
+        time.sleep(0.6)
+        part.unlink()                      # download completed
+        (blobs / "finishing").write_bytes(b"\0" * 1024)
+        time.sleep(1.0)                    # inside both budgets: finishing up is not a hang
+        assert calls == [], "watchdog fired during post-download initialisation"
+    finally:
+        stop.set()
+
+
+def test_lock_wait_behind_a_live_peer_is_not_a_stall(hf_cache):
+    """Two callers of the same uncached file serialise on the hub's per-file lock. The waiter owns no
+    .incomplete, so in watch_new_partials_only mode it looks like a child stuck before the first byte
+    and the connect clock killed it; repo-wide growth tells the two apart."""
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "held-by-the-other-writer.incomplete"
+    peer.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {peer.name},
+        child_pid = None,
+    )
+    try:
+        # The lock holder keeps downloading well past connect_timeout; we own nothing the whole time.
+        for _ in range(20):
+            peer.write_bytes(peer.read_bytes() + b"\0" * 4096)
+            time.sleep(0.05)
+        assert calls == [], f"watchdog killed a legitimate cache-lock wait: {calls}"
+    finally:
+        stop.set()
+
+
+def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
+    """The peer-progress escape hatch must not disarm genuine pre-first-byte hangs."""
+    _blobs_dir(hf_cache)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        child_pid = None,
+        # A download child to kill, so the connect clock applies.
+        watch_connect = True,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "connect timeout never fired"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_empty_partial_gets_the_connect_deadline_not_the_stall_one(hf_cache):
+    """An .incomplete created before the first byte must not consume the 30s data budget: hub/hf_xet
+    can open the destination before CAS setup finishes, so phasing on the file's existence handed a
+    healthy-but-slow connect the short deadline. Bytes mark the transition."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "opened-but-empty.incomplete").write_bytes(b"")
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(1.0)  # way past stall_timeout, nowhere near connect_timeout
+        assert calls == [], f"empty partial was charged the data deadline: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_partial_that_stops_growing_still_trips(hf_cache):
+    """Once bytes have flowed, the short data deadline applies again."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "growing-then-frozen.incomplete"
+    part.write_bytes(b"\0" * 4096)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
+    )
+    try:
+        part.write_bytes(b"\0" * 8192)     # a byte of progress, then nothing
+        assert _wait(lambda: bool(calls), timeout = 3.0), "frozen partial never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
+    """The child we just killed leaves a ~30s-old partial and the sibling grace is 180s. Sparing it
+    made has_active_incomplete_blobs() force force_download, re-downloading every complete shard over
+    the slower transport. Uses the real prepare (the autouse fixture stubs it out)."""
+    blobs = _blobs_dir(hf_cache)
+    mine = blobs / "killed-child.incomplete"
+    theirs = blobs / "live-sibling.incomplete"
+    for f in (mine, theirs):
+        f.write_bytes(b"\0" * 1024)       # both are brand new, well inside the grace
+
+    _REAL_DEFAULT_PREPARE(
+        "model", REPO, cache_dir = str(hf_cache),
+        active_grace = 180.0,
+        owned_incomplete_blobs = {mine.name},
+    )
+
+    assert not mine.exists(), "the stalled child's own partial survived the purge"
+    assert theirs.exists(), "a live sibling's partial was deleted"
+
+
+def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
+    """A snapshot whose config/tokenizer are already cached is still in its connect phase. Repo-wide
+    bytes include blobs completed before this download began, so phasing on that total latched the
+    data deadline and charged a healthy CAS setup the 30s budget instead of 90s -- i.e. every resume,
+    and every snapshot where a small file landed first."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "already-complete-config").write_bytes(b"\0" * 65536)  # no .incomplete suffix
+    (blobs / "opened-but-empty.incomplete").write_bytes(b"")
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(1.0)  # far past stall_timeout, nowhere near connect_timeout
+        assert calls == [], f"a cached blob was read as progress on the current file: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch):
+    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes:
+    measured at a 20 Mbit/s proxy, 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
+    consecutive seconds. RSS is the sensor because /proc io rchar counts VFS reads and reqwest reads
+    sockets with recv(2), so rchar is frozen on a healthy download."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "buffering.incomplete").write_bytes(b"\0" * 4096)
+
+    rss = {"v": 100 * 1024 * 1024}
+
+    def _growing_rss(_pid):
+        rss["v"] += 12 * 1024 * 1024   # ~one 5s tick of a 20 Mbit link
+        return rss["v"]
+
+    monkeypatch.setattr(xf, "_child_rss", _growing_rss)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.2)  # 4x the stall deadline
+        assert calls == [], f"watchdog killed a child that was still receiving data: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_child_that_stops_receiving_still_trips(hf_cache, monkeypatch):
+    """The grace must not disarm a real hang: flat RSS and flat disk is a stall."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "hung.incomplete").write_bytes(b"\0" * 4096)
+
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)  # pinned
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a hung child never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeypatch):
+    """No psutil and no /proc (native Windows): fall back to the disk-only verdict."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "hung.incomplete").write_bytes(b"\0" * 4096)
+
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: None)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
+    finally:
+        stop.set()
+
+
+def test_snapshot_lock_waiter_is_not_killed_while_a_peer_owns_the_partial(hf_cache, monkeypatch):
+    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes and
+    lands in the data branch where its own disk and RSS are flat by definition. It was killed at
+    stall_timeout and charged a Xet failure, hitting the demotion threshold on a multi-rank launch's
+    first run."""
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "owned-by-the-writer.incomplete"
+    peer.write_bytes(b"\0" * (8 * 1024 * 1024))   # peer is buffering: present, fresh, not growing
+
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())  # we own nothing
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)        # flat, we idle
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.2)  # 4x the stall deadline
+        assert calls == [], f"a snapshot cache-lock waiter was killed as stalled: {calls}"
+    finally:
+        stop.set()
+
+
+def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeypatch):
+    """The waiter escape hatch must not disarm a child that genuinely owns the stuck partial."""
+    blobs = _blobs_dir(hf_cache)
+    mine = blobs / "owned-by-me.incomplete"
+    mine.write_bytes(b"\0" * (8 * 1024 * 1024))
+
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: {mine.name})
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a child owning a frozen partial never tripped"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_a_hang_between_snapshot_files_is_detected(hf_cache):
+    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete, so "bytes
+    flowed and no partial is open" is a normal mid-download state, not only the finished one.
+    Resetting the clock there made a child hung between files invisible to both clocks forever once
+    any byte had been seen, so the connect clock only ever protected the FIRST file."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "first-file.incomplete"
+    part.write_bytes(b"\0" * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.4,
+        # A download child to kill, so the connect clock applies.
+        watch_connect = True,
+    )
+    try:
+        time.sleep(0.3)                                  # healthy progress on file 1
+        part.unlink()
+        (blobs / "first-file").write_bytes(b"\0" * 1024)  # file 1 completed
+        # ...and now the child hangs in metadata for file 2, never opening a partial.
+        assert _wait(lambda: bool(calls), timeout = 4.0), "a hang between files was never detected"
+        assert "did not resume" in calls[0], calls
+    finally:
+        stop.set()
+
+
+def test_single_file_lock_waiter_survives_a_buffering_peer(hf_cache):
+    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive: a
+    healthy Xet transfer writes strictly sequentially and the .incomplete sat unchanged for 171s at
+    20 Mbit/s. Requiring continuous growth killed the waiter at connect_timeout while the lock holder
+    downloaded normally."""
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "held-by-a-buffering-peer.incomplete"
+    peer.write_bytes(b"\0" * 4096)          # present and fresh, and it never grows
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {peer.name},
+        child_pid = None,
+    )
+    try:
+        time.sleep(1.2)  # 4x the connect deadline, with zero disk growth anywhere
+        assert calls == [], f"a waiter was killed while its peer was buffering: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
+    """The liveness signal is mtime-bounded, so an abandoned leftover cannot disarm the clock."""
+    import os as _os
+
+    blobs = _blobs_dir(hf_cache)
+    stale = blobs / "abandoned.incomplete"
+    stale.write_bytes(b"\0" * 4096)
+    old = time.time() - 10_000
+    _os.utime(stale, (old, old))
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        baseline_incomplete_blobs = {stale.name},
+        child_pid = None,
+        # A download child to kill, so the connect clock applies.
+        watch_connect = True,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a stale partial masked a real hang"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monkeypatch):
+    """xet's reconstruction buffer is a process-wide budget reused across files, so episode N+1
+    refills BELOW episode N's peak. A lifetime high-water baseline made that fill invisible and
+    killed a child receiving at wire rate, on any multi-shard snapshot."""
+    blobs = _blobs_dir(hf_cache)
+    part = blobs / "shard.incomplete"
+    part.write_bytes(b"\0" * 4096)
+
+    rss = {"v": 400 * 1024 * 1024}          # episode 1 already peaked high
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(0.15)
+        part.write_bytes(b"\0" * 8192)      # the block landed: disk moves, buffer drains
+        rss["v"] = 90 * 1024 * 1024
+        time.sleep(0.15)
+        # Episode 2 now fills at wire rate, but stays far below episode 1's 400MB peak.
+        for _ in range(20):
+            rss["v"] += 12 * 1024 * 1024
+            time.sleep(0.05)
+        assert calls == [], f"a child refilling after a drain was killed: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
+    """Pins the decision NOT to compare consecutive samples: requiring the epsilon between polls
+    demands a sustained ~6.7 Mbit/s floor at production constants, so a slower link would false-trip
+    on its first buffering episode."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "slow.incomplete").write_bytes(b"\0" * 4096)
+
+    rss = {"v": 100 * 1024 * 1024}
+
+    def _slow(_pid):
+        rss["v"] += 1_900_000            # well under _RSS_PROGRESS_EPSILON per tick
+        return rss["v"]
+
+    monkeypatch.setattr(xf, "_child_rss", _slow)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.6, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        time.sleep(1.0)
+        assert calls == [], f"a slow but healthy buffering child was killed: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
+    """The phase latch left files 2..N unprotected: once file 1 had bytes `seen_bytes` stayed true,
+    so file 2's empty .incomplete was charged the 30s data deadline with elapsed still running from
+    file 1's last write."""
+    blobs = _blobs_dir(hf_cache)
+    first = blobs / "file-one.incomplete"
+    first.write_bytes(b"\0" * 4096)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+    )
+    try:
+        time.sleep(0.15)
+        first.rename(blobs / "file-one")                  # file 1 completed
+        (blobs / "file-two.incomplete").write_bytes(b"")  # file 2 opens, still in CAS setup
+        time.sleep(1.0)                                   # 3x the data deadline
+        assert calls == [], f"file 2 was charged the data deadline: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, monkeypatch):
+    """The peer liveness window used to be max(connect_timeout, 180s), only 9s above the measured
+    171s of flat disk at 20 Mbit/s, so any slower link expired the peer mid-transfer and killed the
+    waiter -- reaching the demotion threshold on a multi-rank launch's first run. The window is the
+    suppression ceiling now."""
+    import os as _os
+
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "peer-owned.incomplete"
+    peer.write_bytes(b"\0" * (16 * 1024 * 1024))
+    old = time.time() - 200.0                 # past the old 180s window, inside the 1h ceiling
+    _os.utime(peer, (old, old))
+
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())   # we own nothing
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True, baseline_incomplete_blobs = {peer.name},
+        child_pid = os.getpid(), watch_connect = True,
+    )
+    try:
+        time.sleep(1.5)      # 5x the connect budget
+        assert calls == [], f"a healthy peer on a slow link was treated as dead: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch):
+    """Widening the peer window to an hour means the mtime no longer bounds a stale leftover, so the
+    ceiling has to. The post-byte branches suppress while seen_bytes is true, exactly when the
+    pre-byte branch clears its bookkeeping, so they need a bound of their own."""
+    import os as _os
+    import threading as _threading
+
+    monkeypatch.setattr(xf, "PEER_SUPPRESSION_CEILING", 0.5)
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    blobs = _blobs_dir(hf_cache)
+    peer = blobs / "peer-owned.incomplete"
+    peer.write_bytes(b"\0" * (16 * 1024 * 1024))
+
+    # Keep the peer's mtime permanently fresh so only the hold ceiling under test can end the
+    # suppression, else this passes for the wrong reason.
+    done = _threading.Event()
+
+    def _keep_fresh():
+        while not done.wait(0.05):
+            now = time.time()
+            try:
+                _os.utime(peer, (now, now))
+            except OSError:
+                return
+
+    toucher = _threading.Thread(target = _keep_fresh, daemon = True)
+    toucher.start()
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
+        child_pid = os.getpid(),
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 4.0), "a stale peer held the clock off forever"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+        done.set()
+        toucher.join(2.0)
+
+
+def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch):
+    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor, and xet writes only at head-of-line term
+    boundaries, so under that rate the disk is flat AND the RSS gain is below the epsilon at once,
+    killing a healthy tethered-mobile or rural-DSL transfer mid-flight. Growth above the noise floor
+    but below the epsilon means receiving-but-slow and earns the patient deadline."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)   # opened, then flat for the whole run
+
+    # 400 KiB per 0.05s tick against a 0.4s deadline: over the 256 KiB noise floor, under the 4 MiB
+    # epsilon -- the regime that used to trip.
+    rss = {"v": 100 * 1024 * 1024}
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
+    monkeypatch.setattr(xf, "DEFAULT_HTTP_STALL_TIMEOUT", 30.0)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        for _ in range(30):                      # ~1.5s, nearly 4x the short deadline
+            rss["v"] += 400 * 1024
+            time.sleep(0.05)
+        assert calls == [], f"a slow but healthy link was killed: {calls}"
+    finally:
+        stop.set()
+
+
+def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch):
+    """The patient deadline is for a child demonstrably receiving. Flat RSS plus flat disk means both
+    sensors say nothing is arriving, and must still fall back fast, else the slow-link fix would turn
+    every 30s stall into a 180s one."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)
+
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)   # frozen
+    monkeypatch.setattr(xf, "DEFAULT_HTTP_STALL_TIMEOUT", 30.0)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
+        child_pid = 4242,
+    )
+    try:
+        assert _wait(lambda: bool(calls), timeout = 3.0), "a frozen child was given the patient deadline"
+        assert "no progress" in calls[0]
+    finally:
+        stop.set()
+
+
+def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
+    """Callers wrapping start_watchdog around the ENTIRE load_model see "no partial and a frozen byte
+    count" as the normal case: the repo is cached and the time goes into quantising to 4-bit. Both
+    connect trips would fire on a download that already succeeded. Only the stall clock, which needs
+    a demonstrably open partial, applies to them."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "cached-weights").write_bytes(b"\0" * 4096)   # fully cached, nothing in flight
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        child_pid = None,        # no supervised downloader -> nothing to kill, nothing to time
+    )
+    try:
+        time.sleep(1.5)          # 5x the connect budget
+        assert calls == [], f"a cached whole-model load was reported as a stall: {calls}"
+    finally:
+        stop.set()
+
+
+def test_an_exited_child_is_finalising_not_hung(hf_cache):
+    """An exited downloader cannot be wedged and its exit code is what the ladder acts on; tripping
+    would kill a dead process group and charge the machine a Xet failure it did not earn."""
+    blobs = _blobs_dir(hf_cache)
+    (blobs / "done").write_bytes(b"\0" * 4096)
+
+    dead = subprocess.Popen([sys.executable, "-c", ""])
+    dead.wait()
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        child_pid = dead.pid, watch_connect = True,
+    )
+    try:
+        time.sleep(1.0)
+        assert calls == [], f"an exited child was reported as a stall: {calls}"
+    finally:
+        stop.set()
+
+
+def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
+    """The parent cannot tell which blob its child waits for, so peer liveness is approximate: a
+    continuous series of UNRELATED same-repo downloads reset the connect clock on every tick and a
+    genuinely hung child never fell back. The ceiling bounds that approximation."""
+    monkeypatch.setattr(xf, "PEER_SUPPRESSION_CEILING", 0.5)
+    blobs = _blobs_dir(hf_cache)
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set())
+    monkeypatch.setattr(xf, "_child_rss", lambda _pid: 100 * 1024 * 1024)
+
+    calls: list[str] = []
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append,
+        interval = 0.05, stall_timeout = 5.0, connect_timeout = 0.3,
+        watch_new_partials_only = True,
+        # A LIVE pid: an exited child is finalising, not hung, so the connect clock skips it.
+        child_pid = os.getpid(),
+        watch_connect = True,
+    )
+    try:
+        # A never-ending series of unrelated blobs, each one "live" for a moment.
+        for i in range(40):
+            peer = blobs / f"unrelated-{i}.incomplete"
+            peer.write_bytes(b"\0" * (1024 * (i + 1)))
+            time.sleep(0.05)
+            if calls:
+                break
+        assert calls, "an unrelated series suppressed the connect clock indefinitely"
+        assert "did not start" in calls[0]
+    finally:
+        stop.set()

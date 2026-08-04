@@ -64,6 +64,9 @@ jobs:
           pip install "torch>=2.4.0,<2.13.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
+          # The vision model used by tests/test_mlx_generate_metal.py loads
+          # remote processor code that imports timm, which .[mlx] does not pull.
+          pip install timm
 
       - name: MLX module import smoke
         run: |
@@ -90,6 +93,19 @@ jobs:
         # Real LoRA training smoke: tiny 4-bit model through FastMLXModel +
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
+
+      - name: tests/test_mlx_generate.py
+        # Batched-generation logic that needs no Metal but does need the mlx-vlm
+        # import: release-protocol handling, prompt-kwarg splitting, stop-string
+        # trimming, the audio fallback contract, and request validation.
+        run: python -m pytest tests/test_mlx_generate.py -v -rs
+
+      - name: tests/test_mlx_generate_metal.py
+        # Batched generation on real models: batched-vs-sequential greedy
+        # equivalence with aligned sampled-token logprobs, memory-limit
+        # restoration, compiled train/generate interplay, and the vision
+        # ordering and stop-string contracts.
+        run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
 
       - name: tests/test_mlx_cpt_partition_metal.py
         # CPT partition, target normalization and full-module save routing.
