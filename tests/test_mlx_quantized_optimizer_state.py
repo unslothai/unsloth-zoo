@@ -320,11 +320,17 @@ def test_zero_gradient_coordinates_never_move():
     denominator is eps alone and any dequantization residue is amplified ~1e8x.
     Plain Adam moves it by exactly nothing and so must this."""
     steps, lr = 500, 1e-3
-    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+    # MIN_QUANTIZE_SIZE elements, so the moment really is packed: a smaller
+    # parameter is ineligible and the test would never reach the residue at all.
+    width = MIN_QUANTIZE_SIZE
+    grad = mx.array([[1.0] + [0.0] * (width - 1)])
 
     def drive(opt):
-        param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+        param = mx.zeros((1, width))
         opt.init({"w": param})
+        assert isinstance(opt.state["w"]["m"], (tuple, list)), (
+            "fixture is not exercising the quantized path"
+        )
         for _ in range(steps):
             param = opt.apply_gradients({"w": grad}, {"w": param})["w"]
             mx.eval(param, opt.state)
@@ -386,11 +392,15 @@ def test_unpacking_does_not_carry_the_zero_residue_out():
     to a plain optimizer would divide it by eps while v == 0, reintroducing the
     blow-up on the far side of the switch."""
     steps, lr = 200, 1e-3
-    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+    width = MIN_QUANTIZE_SIZE
+    grad = mx.array([[1.0] + [0.0] * (width - 1)])
 
     packed = QuantizedMomentAdam(lr, bias_correction=True)
-    param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    param = mx.zeros((1, width))
     packed.init({"w": param})
+    assert isinstance(packed.state["w"]["m"], (tuple, list)), (
+        "fixture is not exercising the quantized path"
+    )
     for _ in range(steps):
         param = packed.apply_gradients({"w": grad}, {"w": param})["w"]
         mx.eval(param, packed.state)
@@ -401,13 +411,13 @@ def test_unpacking_does_not_carry_the_zero_residue_out():
     assert residue == 0.0, f"unpacked moment kept a {residue:.3e} residue where v == 0"
 
     plain = optim.Adam(learning_rate=lr, bias_correction=True)
-    resumed = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    resumed = mx.zeros((1, width))
     plain.init({"w": resumed})
     plain.state = unpacked
     for _ in range(steps):
         resumed = plain.apply_gradients({"w": grad}, {"w": resumed})["w"]
         mx.eval(resumed, plain.state)
-    drift = max(abs(float(resumed[0, i])) for i in range(1, DEFAULT_GROUP_SIZE))
+    drift = float(mx.abs(resumed[0, 1:]).max())
     assert drift == 0.0, f"zero-gradient coordinates drifted {drift:.3e} after unpacking"
 
 
