@@ -1040,7 +1040,11 @@ def sft_prepare_dataset(
             else:
                 test_text = None  # chat template handles BOS
         else:
-            test_text = next(iter(dataset))[dataset_text_field][0]
+            # No [0] on a str: that is the first CHARACTER, so startswith(bos_token)
+            # below could never match. Only unwrap when the field really is a list.
+            test_text = next(iter(dataset))[dataset_text_field]
+            if isinstance(test_text, (list, tuple)):
+                test_text = test_text[0] if len(test_text) != 0 else None
 
         chat_template = getattr(processing_class, 'chat_template', '')
         if chat_template == '' and is_vlm:
