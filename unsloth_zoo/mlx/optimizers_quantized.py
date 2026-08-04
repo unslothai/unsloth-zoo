@@ -31,7 +31,10 @@ packed moment is being compared against 2 bytes, not 4.
 Eligibility is measured in elements, not shape: moments are quantized over a
 flattened view, so a rank-16 LoRA_B and a 3-D MoE expert stack pack as readily as
 a square matrix. An earlier rule required 2-D with a divisible last axis, which
-silently excluded LoRA_B below rank 64 and held r=16/r=32 to 18.3%.
+silently excluded LoRA_B below rank 64 and held r=16/r=32 to 18.3%. Anything under
+``MIN_QUANTIZE_SIZE`` elements keeps a full-width moment: those are the norms and
+biases, worth no bytes and the least tolerant of the error. bitsandbytes draws the
+same line at the same threshold (``min_8bit_size``).
 
 This shrinks PERSISTENT state, not peak allocation: ``apply_single`` materialises
 a full-width ``m`` per parameter per step, and peak rose 11.7% on Metal and 29.9%
@@ -83,6 +86,7 @@ __all__ = [
     "MIN_QUANTIZE_SIZE",
     "unpack_quantized_moments",
     "state_has_quantized_moments",
+    "announce_quantized_optimizer",
 ]
 
 DEFAULT_GROUP_SIZE = 64
@@ -92,6 +96,8 @@ SUPPORTED_GROUP_SIZES = (32, 64, 128)
 # Below this, packing a moment saves bytes that do not matter on parameters that
 # do not tolerate the error well. Matches bitsandbytes' min_8bit_size default.
 MIN_QUANTIZE_SIZE = 4096
+# Names already announced in this process; see announce_quantized_optimizer.
+_ANNOUNCED = set()
 
 
 def _as_int(value, name):
@@ -222,18 +228,30 @@ class QuantizedMomentAdamW(_QuantizedFirstMomentMixin, optim.AdamW):
 
 
 def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE):
-    """What an 8-bit request actually gets. The old behaviour rewrote
-    ``adamw_8bit`` to ``adamw`` silently; a quieter surprise would be no better."""
+    """One line. The only thing a user cannot infer from the name is that this
+    quantizes ONE moment, where bitsandbytes' ``adamw_8bit`` quantizes both.
+    Eligibility, dtype and memory behaviour live in this module's docstring; they
+    are reference material and do not belong in stdout on every run."""
     return (
-        f"Unsloth: {optimizer_name} on MLX quantizes the optimizer's FIRST moment "
-        f"to 8-bit (group_size={group_size}); the second moment is not quantized "
-        "(affine 8-bit quantization of the second moment diverges). Parameters of "
-        f"at least {MIN_QUANTIZE_SIZE} elements, in a whole number of groups of "
-        f"{group_size}, are quantized; all others keep unquantized moments. "
-        "Moments follow the "
-        "parameter dtype, so this saves about 36% of optimizer state in float32 "
-        "and about 23% in bfloat16, and it does not lower peak memory."
+        f"Unsloth: {optimizer_name} on MLX quantizes Adam's first moment to 8-bit "
+        f"(group_size={group_size}); the second moment is unquantized."
     )
+
+
+def announce_quantized_optimizer(
+    optimizer_name, group_size = DEFAULT_GROUP_SIZE, enabled = True,
+):
+    """Print the routing line at most once per process. Returns whether it printed.
+
+    ``_build_optimizer`` runs per training run and per rank, so an unguarded print
+    put five wrapped lines on screen for every rank and every re-run of a notebook
+    cell, for what is the default optimizer in every Unsloth example.
+    """
+    if not enabled or optimizer_name in _ANNOUNCED:
+        return False
+    _ANNOUNCED.add(optimizer_name)
+    print(describe_quantized_optimizer(optimizer_name, group_size))
+    return True
 
 
 def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFAULT_BITS):

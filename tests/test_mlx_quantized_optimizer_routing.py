@@ -72,17 +72,40 @@ def test_8bit_names_are_advertised_as_supported():
     assert "adam_8bit" in SUPPORTED_MLX_OPTIMIZERS
 
 
-def test_description_states_what_is_and_is_not_quantized():
-    """The message must name the actual shape of the saving."""
+def test_description_names_the_one_thing_the_name_does_not():
+    """bitsandbytes' adamw_8bit quantizes both moments; this quantizes one. That
+    is the whole reason to print anything, so it must fit on one line."""
     from unsloth_zoo.mlx.optimizers_quantized import describe_quantized_optimizer
     message = describe_quantized_optimizer("adamw_8bit")
 
     assert "adamw_8bit" in message
-    assert "FIRST moment" in message
+    assert "first moment" in message
     assert "group_size=64" in message
-    assert "second moment is not quantized" in message
-    # Eligibility counts elements, not axes: the banner must not claim a 2-D rule.
-    assert "4096 elements" in message and "groups of 64" in message
+    assert "second moment is unquantized" in message
+    # Eligibility counts elements, not axes, so the line must not revive a 2-D claim.
     assert "2-D" not in message
-    # The saving depends on the state dtype, so the banner must not imply one number.
-    assert "bfloat16" in message and "peak memory" in message
+    assert "\n" not in message
+    assert len(message) <= 120, f"routing line grew to {len(message)} chars: {message}"
+
+
+def test_the_routing_line_is_printed_once_per_process(capsys):
+    """_build_optimizer runs per training run and per rank."""
+    from unsloth_zoo.mlx import optimizers_quantized as oq
+
+    oq._ANNOUNCED.discard("adamw_8bit")
+    assert oq.announce_quantized_optimizer("adamw_8bit") is True
+    first = capsys.readouterr().out
+    assert first.count("Unsloth:") == 1
+
+    for _ in range(3):
+        assert oq.announce_quantized_optimizer("adamw_8bit") is False
+    assert capsys.readouterr().out == ""
+
+
+def test_non_main_processes_stay_quiet(capsys):
+    from unsloth_zoo.mlx import optimizers_quantized as oq
+
+    oq._ANNOUNCED.discard("adam_8bit")
+    assert oq.announce_quantized_optimizer("adam_8bit", enabled=False) is False
+    assert capsys.readouterr().out == ""
+    assert "adam_8bit" not in oq._ANNOUNCED, "a silenced rank must not consume the slot"
