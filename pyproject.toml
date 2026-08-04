@@ -33,9 +33,9 @@ dependencies = [
     "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
     # --- MLX-only deps (macOS arm64) ---
     "mlx>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    # mlx_lm.utils._download replaced get_model_path in mlx-lm 0.28.3; the MLX
-    # loader imports it unconditionally, so 0.28.3 is the real minimum.
-    "mlx-lm>=0.28.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # GenerationBatch.Response and BatchGenerator.next_generated, which batched
+    # generation drives, first ship in mlx-lm 0.31.2.
+    "mlx-lm>=0.31.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "mlx-vlm>=0.4.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
@@ -72,7 +72,7 @@ exclude = ["images*"]
 mlx = [
     "mlx>=0.22.0",
     # Keep in sync with the MLX-only dependency pin above.
-    "mlx-lm>=0.28.3",
+    "mlx-lm>=0.31.2",
     "mlx-vlm>=0.4.4",
 ]
 core = [

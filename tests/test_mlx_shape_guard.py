@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import types
 
 import pytest
 
@@ -17,6 +18,18 @@ from unsloth_zoo.mlx.shape_guard import (
     resolve_compile_max_variants,
     select_text_shape_padding_budget,
 )
+
+
+def _requires_mlx():
+    """Skip a test that reaches `unsloth_zoo.mlx.{utils,trainer}`.
+
+    Both import `mlx.core` at module scope. The rest of this file is pure
+    shape planning against `unsloth_zoo.mlx.shape_guard`, which has no such
+    dependency, so the module keeps running where mlx is not installed --
+    every Linux and Windows CI environment. Without the guard those tests
+    turn a passing module into failures rather than skips.
+    """
+    pytest.importorskip("mlx.core")
 
 
 def _event(family, width, phase="p", frequency=1, batch_size=1):
@@ -423,3 +436,214 @@ def test_shared_cap_materialization_preserves_both_padding_budgets():
     assert shared.report.padding_work_fraction <= 0.05
     assert shared.report.max_width_stretch <= 1.5
     assert shared.report.budget_satisfied is True
+
+
+def test_audio_feature_batches_are_detected_for_eager_routing():
+    """Audio feature extents follow clip duration, so they cannot be planned."""
+    _requires_mlx()
+    from unsloth_zoo.mlx.utils import _vlm_batch_carries_audio
+
+    for batch in ({"input_features": object()}, {"input_audio_embeds": object()}):
+        assert _vlm_batch_carries_audio(batch) is True
+    for batch in ({"pixel_values": object()}, {"input_features": None}, None):
+        assert _vlm_batch_carries_audio(batch) is False
+
+
+def _audio_plan_stub():
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    class _Stub(FiniteVLMBatchPlan):
+        def __init__(self):
+            self.surveyed = False
+
+        def __len__(self):
+            return 1
+
+        def ensure_descriptors(self):
+            self.surveyed = True
+
+        def carries_audio(self):
+            assert self.surveyed, "routing must survey before asking"
+            return True
+
+        # Routing asks only about the batches the schedule executes, so the
+        # stub has to answer for a visit as well as for the whole plan.
+        def batch_index_for_visit(self, absolute_visit):
+            return 0
+
+        def carries_audio_in(self, indices):
+            assert self.surveyed, "routing must survey before asking"
+            return 0 in set(indices)
+
+    return _Stub()
+
+
+def _plan(batches, mode="best_effort", batch_iter=None, carries_audio=None):
+    from unsloth_zoo.mlx import trainer as T
+
+    ns = types.SimpleNamespace
+    return T._plan_single_process_vlm_shapes(
+        batches, batch_iter,
+        args=ns(compile_max_variants=None, gradient_accumulation_steps=1,
+                max_grad_norm=0.0, max_grad_value=None),
+        total_steps=1, distributed_world_size=1,
+        compile_policy=ns(mode=mode),
+        compile_decision=ns(enabled=True, policy_mode=mode, should_raise=False,
+                            arch="gemma3n", reason="qualified"),
+        install_plan=False, carries_audio=carries_audio,
+    )
+
+
+def test_audio_runs_route_eager_before_every_other_exit():
+    _requires_mlx()
+
+    _, report, compile_allowed, _ = _plan(_audio_plan_stub())
+    assert compile_allowed is False and report.reason == "vlm_audio_inputs"
+    # Streaming: the caller's flag must win over the streaming exit.
+    _, report, compile_allowed, _ = _plan(None, batch_iter=iter(()),
+                                          carries_audio=True)
+    assert compile_allowed is False and report.reason == "vlm_audio_inputs"
+
+    with pytest.raises(RuntimeError, match="cannot plan audio training"):
+        _plan(_audio_plan_stub(), mode="strict")
+
+
+def test_carries_audio_in_answers_only_for_the_batches_named():
+    _requires_mlx()
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    plan = FiniteVLMBatchPlan.__new__(FiniteVLMBatchPlan)
+    plan._audio_flags = (False, False, True)     # audio only in the trailing batch
+    assert plan.carries_audio() is True
+    assert plan.carries_audio_in([0, 1]) is False
+    assert plan.carries_audio_in([0, 1, 2]) is True
+    assert plan.carries_audio_in([]) is False
+    assert plan.carries_audio_in([7]) is False   # out of range, not an IndexError
+
+    plan._audio_flags = None
+    with pytest.raises(RuntimeError, match="have not been surveyed"):
+        plan.carries_audio_in([0])
+
+
+def test_audio_routing_asks_only_about_executed_batches():
+    """A ragged epoch drops its trailing micro-batches. Audio only in that tail
+    reaches no compiled call, so it must not degrade the run to eager or abort
+    strict mode -- the same rule the family admission below it already follows."""
+    _requires_mlx()
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    class _StopPlanning(Exception):
+        """Stops the planner right after the routing decision, so this test
+        depends on the decision alone and not on the rest of the stub."""
+
+    class _Spy(FiniteVLMBatchPlan):
+        def __init__(self):
+            self.asked_about = None
+
+        def __len__(self):
+            return 2
+
+        def ensure_descriptors(self):
+            pass
+
+        def carries_audio(self):               # whole-plan: batch 1 has audio
+            raise AssertionError("routing must not ask the whole plan")
+
+        def batch_index_for_visit(self, absolute_visit):
+            return 0                           # the schedule only visits batch 0
+
+        def carries_audio_in(self, indices):
+            self.asked_about = sorted(indices)
+            raise _StopPlanning
+
+    for mode in ("best_effort", "strict"):
+        spy = _Spy()
+        with pytest.raises(_StopPlanning):
+            _plan(spy, mode=mode)
+        assert spy.asked_about == [0], mode
+
+
+def test_streaming_audio_is_detected_without_consuming_the_stream():
+    _requires_mlx()
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    peek = MLXTrainer._peek_stream_carries_audio
+    audio_batch = {"input_features": object()}
+    plain_batch = {"pixel_values": object()}
+
+    carries, stream = peek(iter([audio_batch, plain_batch]))
+    assert carries is True and list(stream) == [audio_batch, plain_batch]
+
+    # Only the first batch is observable ahead of the run.
+    carries, stream = peek(iter([plain_batch, audio_batch]))
+    assert carries is False and list(stream) == [plain_batch, audio_batch]
+
+    assert peek(None) == (False, None)
+    carries, stream = peek(iter(()))
+    assert carries is False and list(stream) == []
+
+
+def test_the_peeked_stream_still_closes_the_producer_behind_it():
+    """The peek hands the run a wrapper, and the run's cleanup closes what it
+    was handed. A wrapper with no close of its own therefore ends the run with
+    the producer -- and the files, workers and buffers it holds -- still open."""
+    _requires_mlx()
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    def producer(batches):
+        try:
+            for batch in batches:
+                yield batch
+        finally:
+            closed.append(True)
+
+    for consumed in (0, 1, 3):
+        closed = []
+        _, stream = MLXTrainer._peek_stream_carries_audio(
+            producer([{"pixel_values": index} for index in range(3)])
+        )
+        for _, _batch in zip(range(consumed), stream):
+            pass
+
+        trainer = object.__new__(MLXTrainer)
+        trainer._active_batch_iter = stream
+        trainer._close_active_batch_iterator()
+        assert closed, f"the producer outlived the run ({consumed} consumed)"
+
+    # An exhausted source is still the run's to close, and a stream nobody
+    # peeked -- there is none -- is still reported as nothing to close.
+    closed = []
+    _, stream = MLXTrainer._peek_stream_carries_audio(producer([]))
+    stream.close()
+    assert closed
+    assert MLXTrainer._peek_stream_carries_audio(None) == (False, None)
+
+
+def test_a_streamed_batch_that_turns_out_to_carry_audio_leaves_the_compiled_path():
+    """The peek sees one batch, so a text-first stream plans as compilable.
+    Every later batch is therefore asked directly: without this the audio batch
+    reaches the compiled step, and a strict run aborts only after earlier
+    optimizer updates rather than up front."""
+    _requires_mlx()
+    import numpy as np
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan
+
+    leaves = MLXTrainer._streamed_audio_leaves_the_compiled_path
+    audio_batch = {"input_features": np.zeros((1, 8, 4), np.float32)}
+    plain_batch = {"pixel_values": np.zeros((1, 3, 4, 4), np.float32)}
+
+    assert leaves(audio_batch, None) is True
+    assert leaves(plain_batch, None) is False
+    # Loaders that yield (batch, extras): audio lives in the first element.
+    assert leaves((audio_batch, {"step": 3}), None) is True
+
+    # An empty payload is how some processors report "no audio here"; reading
+    # it as audio would drop every text batch on that checkpoint to eager.
+    assert leaves({"input_features": np.zeros((0, 8, 0), np.float32)}, None) is False
+
+    # A finite plan was surveyed whole and routed by `carries_audio_in`, so
+    # re-deciding per batch here would fight that routing.
+    plan = FiniteVLMBatchPlan.__new__(FiniteVLMBatchPlan)
+    assert leaves(audio_batch, plan) is False

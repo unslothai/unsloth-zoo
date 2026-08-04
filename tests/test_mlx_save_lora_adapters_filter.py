@@ -307,6 +307,38 @@ def test_collect_lora_helper_finds_adapters_after_reload():
     assert set(found.keys()) == {"q_proj.lora_a", "q_proj.lora_b"}, found
 
 
+def test_collect_lora_helper_finds_linear_backed_adapter_factors():
+    from unsloth_zoo.mlx.utils import collect_mlx_lora_adapter_tensors
+
+    class _Factor:
+        def __init__(self, shape):
+            self.weight = torch.zeros(*shape)
+
+    class _LinearBackedLoRA:
+        def __init__(self):
+            self.lora_a = _Factor((8, 4))
+            self.lora_b = _Factor((4, 16))
+
+    adapter = _LinearBackedLoRA()
+
+    class _Model:
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": {"weight": adapter.lora_a.weight},
+                    "lora_b": {"weight": adapter.lora_b.weight},
+                }
+            }
+
+        def named_modules(self):
+            yield "q_proj", adapter
+
+    found = collect_mlx_lora_adapter_tensors(_Model())
+    assert set(found) == {
+        "q_proj.lora_a.weight", "q_proj.lora_b.weight",
+    }
+
+
 def test_ensure_lora_frozen_freezes_norm_when_lora_is_actively_trained():
     # Active LoRA training with an accidentally trainable norm. The
     # module-anchored detector finds q_proj.lora_a/lora_b in the
