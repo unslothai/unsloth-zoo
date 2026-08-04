@@ -3688,7 +3688,23 @@ def unsloth_compile_transformers(
 
     modeling_file.__UNSLOTH_PATCHED__ = True
     functions = dir(modeling_file)
-    full_source = inspect.getsource(modeling_file)
+    try:
+        full_source = inspect.getsource(modeling_file)
+    except (OSError, TypeError) as exception:
+        # Everything below is source-level feature detection, so with no source
+        # there is nothing to do. Unguarded the OSError propagates out of
+        # FastModel.from_pretrained and the model fails to LOAD, over a file we
+        # only wanted in order to make it faster.
+        #
+        # Return rather than continue with an empty string: checks of the form
+        # `"_supports_sdpa = False" not in full_source` are TRUE on empty and
+        # would enable a path the model never claimed to support.
+        logger.warning(
+            f"Unsloth: Could not read the source of {getattr(modeling_file, '__name__', modeling_file)} "
+            f"({type(exception).__name__}: {exception}), so source-level "
+            f"optimisations are skipped for it. The model still works."
+        )
+        return
 
     # Order by definition position. A bare-name find() also matches
     # forward references in annotations, docstrings and type unions,
@@ -4783,7 +4799,22 @@ def unsloth_compile_transformers(
             if hasattr(function.forward, "get_compiler_config"):
                 continue
 
-            source = inspect.getsource(function.forward).rstrip()
+            try:
+                source = inspect.getsource(function.forward).rstrip()
+            except (OSError, TypeError):
+                # A forward built by exec, or one whose file has gone. Unguarded
+                # the OSError propagates out of FastModel.from_pretrained and
+                # the model does not load, over source we only wanted in order
+                # to patch a dtype cast. `get_compiler_config` above only covers
+                # torch.compile wrappers.
+                #
+                # The precondition is not fully characterised: two plain Qwen
+                # loads do not trigger it, and after such a load no torch.nn
+                # forward is unreadable (both measured). This guards a state we
+                # have seen, not a theory about how it arises. Either way source
+                # we cannot read cannot be source-patched, and every other
+                # unsupported case in this loop already skips.
+                continue
 
             if module in _conv_modules:
                 # Conv modules: cast input to weight dtype before the conv op,
