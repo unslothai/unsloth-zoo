@@ -783,6 +783,40 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+# Keywords a processor's __call__ can name its audio argument, in the order the
+# collator prefers them. Every audio processor in transformers that accepts
+# audio names one of these; the two that name the plural (Clap, SeamlessM4T)
+# also name the singular, so today the singular always wins.
+_AUDIO_CALL_KWARGS = ("audio", "audios")
+
+
+def _audio_call_kwarg(processor):
+    # Which keyword `processor(text=..., <kwarg>=clips)` must use, or None when
+    # __call__ names no audio argument at all (VoxtralProcessor, WhisperProcessor,
+    # MusicgenProcessor, ... -- these cannot batch audio through this collator).
+    #
+    # Callers must use the returned name rather than a hard-coded "audio":
+    # deciding admission on one spelling and then sending the other means an
+    # `audios=`-only processor constructs successfully and then loses its clips
+    # (the unexpected `audio=` is swallowed by **kwargs while the parameter the
+    # processor actually reads stays None), or raises an unexpected-keyword
+    # TypeError on the first audio batch.
+    #
+    # Capability check rather than a class-name check, so a processor added to
+    # transformers later is classified by what it accepts. The limit of a
+    # signature check is a processor that takes audio only through **kwargs with
+    # no named parameter; none in transformers does that today. If __call__
+    # cannot be introspected at all (a minimal stub), fail open with the
+    # historical spelling rather than regress a processor that works.
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return _AUDIO_CALL_KWARGS[0]
+    for name in _AUDIO_CALL_KWARGS:
+        if name in params: return name
+    return None
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -792,6 +826,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "audio_call_kwarg",
     )
 
     def __init__(
@@ -832,47 +867,33 @@ class UnslothVisionDataCollator:
                 "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
             )
 
+        # Resolve, once, the keyword this processor names its audio argument.
+        # This is both the admission test and the keyword every audio call site
+        # in this class uses, so the keyword sent can never drift from the
+        # keyword accepted -- see _audio_call_kwarg for why that matters.
+        audio_call_kwarg = _audio_call_kwarg(processor)
+
         # An audio-only processor (no image_processor) reaches the collator's
-        # audio path, which calls self.processor(text=..., audio=...). Some audio
-        # processors do not accept an `audio=` argument in __call__ -- notably
-        # transformers' VoxtralProcessor, whose __call__ is (text, **kwargs) with
-        # no audio parameter and which raises when the rendered text contains its
-        # audio token (it requires audio to go through apply_chat_template). Such a
-        # processor passes the acceptance guard above (it has a feature_extractor)
-        # but then fails inside the collate call. Reject it up front instead.
-        #
-        # Capability check rather than a class-name check: the audio processors the
-        # collator does support (Qwen2-Audio, Granite-Speech, ...) declare a named
-        # `audio` parameter on __call__ and process it, while Voxtral does not --
-        # so the presence of a named audio parameter is a reliable, forward-
-        # compatible signal. Both spellings are checked: `audio`, and `audios`
-        # for the only two audio processors that name it in the plural today,
-        # Clap and SeamlessM4T (both of which also expose `audio`). If __call__
-        # cannot be introspected we fail open (accept) rather than regress a
-        # working processor.
-        #
-        # The check is signature-based: a processor that consumed audio only
-        # through **kwargs, with no named audio/audios parameter, would be
-        # rejected here despite working -- none of transformers' audio processors
-        # do this today.
-        if getattr(processor, "image_processor", None) is None:
-            try:
-                _call_params = inspect.signature(processor.__call__).parameters
-            except (AttributeError, TypeError, ValueError):
-                # No/uninspectable __call__ (e.g. a minimal stub): fail open.
-                _call_params = None
-            if _call_params is not None and not (
-                "audio" in _call_params or "audios" in _call_params
-            ):
-                raise TypeError(
-                    f"Unsloth: UnslothVisionDataCollator does not yet support "
-                    f"{type(processor).__name__}: its processor __call__ takes no "
-                    "`audio=` argument, so audio cannot be batched through the "
-                    "collator (e.g. VoxtralProcessor requires audio to go through "
-                    "apply_chat_template and rejects text containing its audio "
-                    "token). Prepare audio with processor.apply_chat_template("
-                    "..., tokenize=True, return_dict=True) instead."
-                )
+        # audio path, which calls self.processor(text=..., <audio kwarg>=...).
+        # Some audio processors accept no audio argument at all -- notably
+        # transformers' VoxtralProcessor, whose __call__ is (text, **kwargs) and
+        # which raises when the rendered text contains its audio token (it
+        # requires audio to go through apply_chat_template). Such a processor
+        # passes the acceptance guard above (it has a feature_extractor) but then
+        # fails inside the collate call, so reject it up front instead.
+        if getattr(processor, "image_processor", None) is None and audio_call_kwarg is None:
+            raise TypeError(
+                f"Unsloth: UnslothVisionDataCollator does not yet support "
+                f"{type(processor).__name__}: its processor __call__ takes no "
+                "`audio=` argument, so audio cannot be batched through the "
+                "collator (e.g. VoxtralProcessor requires audio to go through "
+                "apply_chat_template and rejects text containing its audio "
+                "token). Prepare audio with processor.apply_chat_template("
+                "..., tokenize=True, return_dict=True) instead."
+            )
+        # Vision-only processors name no audio argument and never send one
+        # (`audios` stays empty), so the historical spelling is a safe default.
+        self.audio_call_kwarg = audio_call_kwarg or "audio"
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
@@ -1084,7 +1105,10 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 proc_kwargs[k] = v
         if audios:
-            proc_kwargs["audio"] = audios
+            # Send the keyword __init__ verified this processor names. getattr
+            # with a default because instances built via __new__ (several tests
+            # do) leave the slot unset; the collator has always sent `audio=`.
+            proc_kwargs[getattr(self, "audio_call_kwarg", None) or "audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self.processor(**proc_kwargs)
@@ -1594,7 +1618,8 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
         if audios:
-            prompt_kwargs["audio"] = audios
+            # Same keyword as the __call__ path above; see the note there.
+            prompt_kwargs[getattr(self, "audio_call_kwarg", None) or "audio"] = audios
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
         # Encode completions (RIGHT pad) text-only

@@ -44,6 +44,7 @@ import torch
 
 from unsloth_zoo.vision_utils import (
     UnslothVisionDataCollator,
+    _audio_call_kwarg,
     _fix_audio_feature_extractor_padding_side,
     _is_audio_mapping,
     extract_audio_info,
@@ -685,7 +686,8 @@ from types import SimpleNamespace
 class _ChatTemplateMixin:
     # Minimal apply_chat_template: renders text parts, ignores modality parts.
     # Accepts the {"type": "image"} probe __init__ runs without raising.
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
+                            **kwargs):
         out = []
         for m in messages:
             content = m.get("content", "")
@@ -840,6 +842,120 @@ def test_capability_check_matches_real_transformers_processors():
         "VoxtralProcessor.__call__ unexpectedly grew an audio= param; revisit the guard"
     )
     assert "audio" in qwen or "audios" in qwen
+    # ... and the resolver reports the keyword the collator must actually send.
+    assert _audio_call_kwarg(Voxtral) is None
+    assert _audio_call_kwarg(Qwen2Audio) == "audio"
+
+
+# ---------------------------------------------------------------------------
+# The keyword the guard accepts must be the keyword the collator sends.
+#
+# The guard admits a processor whose __call__ names `audio` OR `audios`, but
+# both audio call sites used to hard-code `audio=`. An `audios=`-only processor
+# therefore constructed fine and then lost its clips on the first batch: the
+# unexpected `audio=` is absorbed by **kwargs while the plural parameter the
+# processor actually reads stays None. _audio_call_kwarg is now the single
+# resolution used by the guard AND by both call sites, so they cannot drift.
+# ---------------------------------------------------------------------------
+
+class _AudiosOnlyProcessor(_ChatTemplateMixin):
+    # __call__ names ONLY the plural. Records the audio kwarg it was handed.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+        # One entry per __call__; the prompt/completion path calls twice.
+        self.calls = []
+
+    def __call__(self, text=None, audios=None, padding=None, padding_side="right",
+                 return_tensors=None, add_special_tokens=None, **kwargs):
+        self.calls.append((audios, sorted(kwargs)))
+        n = len(text) if isinstance(text, (list, tuple)) else 1
+        return {
+            "input_ids": torch.tensor([[PAD_ID, AUDIO_ID, 5, 6]] * n),
+            "attention_mask": torch.tensor([[0, 1, 1, 1]] * n),
+            "input_features": torch.zeros(n, 128, 3000),
+        }
+
+
+AUDIO_EXAMPLE = {"messages": [
+    {"role": "user", "content": [
+        {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+]}
+
+
+def _assert_clips_arrived_under_plural(proc):
+    delivered = [audios for audios, _ in proc.calls if audios]
+    assert len(delivered) == 1 and len(delivered[0]) == 1, (
+        "clips were sent under a keyword this processor does not read; "
+        f"calls={proc.calls}"
+    )
+    # And never under the singular, which would land in **kwargs and be dropped.
+    assert all("audio" not in stray for _, stray in proc.calls), proc.calls
+
+
+def test_audios_only_processor_gets_the_plural_kwarg_in_call_path():
+    proc = _AudiosOnlyProcessor()
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert collator.audio_call_kwarg == "audios"
+    collator([AUDIO_EXAMPLE])
+    _assert_clips_arrived_under_plural(proc)
+
+
+def test_audios_only_processor_gets_the_plural_kwarg_in_prompt_completion_path():
+    # Second entry point: _collate_prompt_completion has its own audio kwarg
+    # assignment, and a fix that only covered __call__ would miss it.
+    proc = _AudiosOnlyProcessor()
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    collator([{
+        "prompt": AUDIO_EXAMPLE["messages"][:1],
+        "completion": AUDIO_EXAMPLE["messages"][1:],
+    }])
+    _assert_clips_arrived_under_plural(proc)
+
+
+def test_singular_kwarg_still_used_for_audio_processors():
+    # Backward compatibility: the historical spelling must not change for any
+    # processor that names `audio`, which is every audio processor transformers
+    # ships today except the plural-also pair (Clap, SeamlessM4T).
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioKwargProcessor())
+    assert collator.audio_call_kwarg == "audio"
+    # Vision-only processors name no audio argument and never send one; the
+    # slot must still hold the historical default rather than None.
+    vision = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
+    assert vision.audio_call_kwarg == "audio"
+
+
+def test_every_transformers_audio_processor_is_classified_by_what_it_accepts():
+    # Derive the expectation from transformers itself: for every processor class
+    # that ships an audio sub-processor, the resolver must return a keyword its
+    # __call__ actually binds (or None, meaning "reject at construction").
+    pytest.importorskip("transformers")
+    import importlib, pkgutil
+    import transformers.models as models_pkg
+
+    checked = 0
+    for module_info in pkgutil.iter_modules(models_pkg.__path__):
+        name = module_info.name
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.processing_{name}")
+        except Exception:
+            continue
+        for cls in vars(module).values():
+            if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
+            attrs = getattr(cls, "attributes", None) or ()
+            if not ({"feature_extractor", "audio_processor"} & set(attrs)): continue
+            try:
+                params = inspect.signature(cls.__call__).parameters
+            except (TypeError, ValueError):
+                continue
+            checked += 1
+            kwarg = _audio_call_kwarg(cls)
+            if kwarg is None:
+                assert "audio" not in params and "audios" not in params, cls.__name__
+            else:
+                assert kwarg in params, f"{cls.__name__}: __call__ has no {kwarg}="
+    assert checked > 10, f"only inspected {checked} audio processors; scan broke"
 
 
 class _RoundTripAudioProcessor(_AudioOnlyProcessor):
