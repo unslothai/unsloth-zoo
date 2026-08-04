@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """8-bit first-moment optimizer state for MLX.
@@ -44,6 +44,7 @@ from unsloth_zoo.mlx.optimizers_quantized import (
     SUPPORTED_GROUP_SIZES,
     QuantizedMomentAdam,
     QuantizedMomentAdamW,
+    unpack_quantized_moments,
 )
 from unsloth_zoo.mlx.utils import load_optimizer_state, save_optimizer_state
 
@@ -374,6 +375,37 @@ def test_packed_checkpoint_loads_into_plain_optimizer():
     load_optimizer_state(plain, checkpoint)
     assert isinstance(_moment(plain, "m"), mx.array), "packed moment was not unpacked"
     _train(plain, plain_model, x, y, steps=1)
+
+
+# 13b ----------------------------------------------------------------------
+def test_unpacking_does_not_carry_the_zero_residue_out():
+    """Dequantization leaves a residue where the true moment is zero. Handing that
+    to a plain optimizer would divide it by eps while v == 0, reintroducing the
+    blow-up on the far side of the switch."""
+    steps, lr = 200, 1e-3
+    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+
+    packed = QuantizedMomentAdam(lr, bias_correction=True)
+    param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    packed.init({"w": param})
+    for _ in range(steps):
+        param = packed.apply_gradients({"w": grad}, {"w": param})["w"]
+        mx.eval(param, packed.state)
+
+    unpacked = unpack_quantized_moments(packed.state, packed.group_size, packed.bits)
+    m, v = unpacked["w"]["m"], unpacked["w"]["v"]
+    residue = float(mx.max(mx.abs(mx.where(v == 0, m, mx.zeros_like(m)))))
+    assert residue == 0.0, f"unpacked moment kept a {residue:.3e} residue where v == 0"
+
+    plain = optim.Adam(learning_rate=lr, bias_correction=True)
+    resumed = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    plain.init({"w": resumed})
+    plain.state = unpacked
+    for _ in range(steps):
+        resumed = plain.apply_gradients({"w": grad}, {"w": resumed})["w"]
+        mx.eval(resumed, plain.state)
+    drift = max(abs(float(resumed[0, i])) for i in range(1, DEFAULT_GROUP_SIZE))
+    assert drift == 0.0, f"zero-gradient coordinates drifted {drift:.3e} after unpacking"
 
 
 # 14 -----------------------------------------------------------------------

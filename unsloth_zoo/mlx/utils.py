@@ -10844,15 +10844,19 @@ def load_optimizer_state(optimizer, path):
     )
 
     state_path = f"{path}/optimizer_state.safetensors"
-    flat, metadata = mx.load(state_path), {}
+    # Metadata form first: loading twice would keep two full copies of a
+    # multi-GB optimizer checkpoint live at once. Backends without the flag (the
+    # torch shim) still return a bare dict, so check the shape of what came back
+    # rather than trusting the kwarg to have been honoured.
+    metadata = {}
     try:
-        # Backends that do not support the flag (the torch shim) still return a
-        # bare dict, so check the shape of what came back rather than trusting it.
         loaded = mx.load(state_path, return_metadata=True)
-        if isinstance(loaded, tuple) and len(loaded) == 2:
-            flat, metadata = loaded
     except TypeError:
-        pass
+        loaded = mx.load(state_path)
+    if isinstance(loaded, tuple) and len(loaded) == 2:
+        flat, metadata = loaded
+    else:
+        flat = loaded
     state = mlx.utils.tree_unflatten(list(flat.items()))
 
     if state_has_quantized_moments(state):

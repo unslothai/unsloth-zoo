@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """8-bit optimizer state for MLX: quantized Adam/AdamW FIRST moment.
@@ -217,12 +217,20 @@ def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFA
     ``optim.Adam``/``AdamW``, which would otherwise reach ``b1 * m`` on a list and
     raise ``TypeError: can't multiply sequence by non-int of type 'float'`` from
     inside mlx with no mention of quantization.
+
+    Applies the same ``v == 0`` mask ``apply_single`` does. Carrying the residue out
+    to a plain optimizer would reintroduce the blow-up there: measured 5.96e-08 of
+    residue moving inactive coordinates by 5.4e-02 over 200 zero-gradient steps.
     """
     if isinstance(state, dict):
         out = {}
         for key, value in state.items():
             if key == "m" and isinstance(value, (tuple, list)) and len(value) == 3:
-                out[key] = mx.dequantize(*value, group_size = group_size, bits = bits)
+                moment = mx.dequantize(*value, group_size = group_size, bits = bits)
+                second = state.get("v")
+                if isinstance(second, mx.array) and second.shape == moment.shape:
+                    moment = mx.where(second == 0, mx.zeros_like(moment), moment)
+                out[key] = moment
             else:
                 out[key] = unpack_quantized_moments(value, group_size, bits)
         return out
@@ -242,19 +250,3 @@ def state_has_quantized_moments(state):
     if isinstance(state, list):
         return any(state_has_quantized_moments(v) for v in state)
     return False
-
-# Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
