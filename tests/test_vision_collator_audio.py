@@ -43,6 +43,7 @@ import pytest
 import torch
 
 from unsloth_zoo.vision_utils import (
+    _AUDIO_SUB_PROCESSOR_ATTRS,
     UnslothVisionDataCollator,
     _audio_call_kwarg,
     _fix_audio_feature_extractor_padding_side,
@@ -1003,7 +1004,7 @@ def test_real_audio_processor_constructs_and_round_trips(model_id):
         proc = transformers.AutoProcessor.from_pretrained(model_id)
     except Exception as e:  # offline, gated, or missing deps
         pytest.skip(f"real processor unavailable: {e}")
-    assert not hasattr(proc, "image_processor")
+    assert getattr(proc, "image_processor", None) is None
     assert getattr(proc, "feature_extractor", None) is not None
 
     collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc, max_seq_length=512)
@@ -1176,3 +1177,49 @@ def test_text_only_prompt_completion_truncation_still_allowed():
         "completion": [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}],
     }])
     assert out["input_ids"].shape[1] == 2
+
+
+def test_audio_sub_processor_attr_names_cover_transformers():
+    # Derive the attribute set from transformers, not from our own code: every
+    # `attributes` entry that transformers binds to a *FeatureExtractor class is
+    # an audio sub-processor the gate, the padding-side normalisation and the
+    # sampling-rate read must all see. Today that is exactly
+    # {"feature_extractor", "audio_processor"} -- a new spelling appearing
+    # upstream must widen _AUDIO_SUB_PROCESSOR_ATTRS or this fails.
+    pytest.importorskip("transformers")
+    import importlib, pkgutil
+    import transformers.models as models_pkg
+
+    upstream = set()
+    for module_info in pkgutil.iter_modules(models_pkg.__path__):
+        name = module_info.name
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.processing_{name}")
+        except Exception:
+            continue
+        for cls in vars(module).values():
+            if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
+            for attr in (getattr(cls, "attributes", None) or ()):
+                klass = getattr(cls, f"{attr}_class", None)
+                if isinstance(klass, str) and "FeatureExtractor" in klass:
+                    upstream.add(attr)
+    assert upstream, "scan found no feature-extractor attributes; the scan broke"
+    assert upstream <= set(_AUDIO_SUB_PROCESSOR_ATTRS), (
+        f"transformers uses audio sub-processor attribute(s) the collator does not "
+        f"resolve: {sorted(upstream - set(_AUDIO_SUB_PROCESSOR_ATTRS))}"
+    )
+
+
+def test_all_three_consumers_agree_on_an_audio_processor_only_shape():
+    # One shape, three consumers: the gate must admit it, the padding-side fix
+    # must normalise it, and the sampling-rate read must use it. Each of these
+    # was patched in a separate round of this branch after the others; they now
+    # share _audio_sub_processors, so they cannot disagree again.
+    proc = _AudioProcessorAttrProcessor()
+    proc.audio_processor.padding_side = "left"
+
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)  # gate
+    assert proc.audio_processor.padding_side == "right"                        # padding
+    with pytest.raises(ValueError, match="sampling_rate"):                     # rate
+        collator._extract_audio_for_example(
+            {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])

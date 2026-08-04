@@ -544,17 +544,33 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+# Transformers processors do not agree on what to call the audio sub-processor:
+# `attributes` is ["feature_extractor", "tokenizer"] for Qwen2-Audio, Voxtral,
+# Whisper and most speech models, but ["audio_processor", "tokenizer"] for
+# Granite-Speech and ["image_processor", "audio_processor", "tokenizer"] for
+# Phi-4-multimodal. Resolve it in ONE place: the constructor gate, the
+# padding-side normalisation and the sampling-rate read must agree on what
+# counts as audio support, and updating one without the others is exactly how
+# this collator ended up admitting processors it then could not serve.
+_AUDIO_SUB_PROCESSOR_ATTRS = ("feature_extractor", "audio_processor")
+
+
+def _audio_sub_processors(processor):
+    # Every audio sub-processor the processor exposes, in preference order.
+    # Empty means "no audio support" -- the gate's rejection condition.
+    subs = []
+    for attr in _AUDIO_SUB_PROCESSOR_ATTRS:
+        sub = getattr(processor, attr, None)
+        if sub is not None: subs.append(sub)
+    return subs
+
+
 def _fix_audio_feature_extractor_padding_side(processor):
     # The loader's padding_side="left" (a text setting) leaks into the audio
     # feature extractor via from_pretrained. Frame-validity masks assume right
     # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
-    # Audio processors do not agree on the sub-processor attribute name
-    # (feature_extractor for Qwen2-Audio/Voxtral, audio_processor for
-    # Granite-Speech), so normalize whichever is present -- matching the
-    # sampling-rate fallback in _extract_audio_for_example.
-    for attr in ("feature_extractor", "audio_processor"):
-        sub = getattr(processor, attr, None)
-        if sub is not None and getattr(sub, "padding_side", None) == "left":
+    for sub in _audio_sub_processors(processor):
+        if getattr(sub, "padding_side", None) == "left":
             sub.padding_side = "right"
 
 
@@ -852,16 +868,12 @@ class UnslothVisionDataCollator:
     ):
         # Accept image processors, audio-only processors, and combined
         # vision+audio processors. Reject only a bare text tokenizer.
-        # Audio processors do not agree on one attribute name: Qwen2-Audio and
-        # Voxtral expose "feature_extractor", while Granite-Speech exposes
-        # "audio_processor" (see each model's processor .attributes in
-        # transformers), so both spellings are accepted here. getattr(...) is
-        # None rather than hasattr so a processor that defines the attribute and
-        # sets it to None is treated as not having it.
+        # getattr(...) is None rather than hasattr so a processor that defines
+        # image_processor and sets it to None is treated as not having one; the
+        # audio side goes through the shared _audio_sub_processors resolution.
         if (
             getattr(processor, "image_processor", None) is None
-            and getattr(processor, "feature_extractor", None) is None
-            and getattr(processor, "audio_processor", None) is None
+            and not _audio_sub_processors(processor)
         ):
             raise TypeError(
                 "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
@@ -1202,16 +1214,14 @@ class UnslothVisionDataCollator:
 
     def _extract_audio_for_example(self, example, messages):
         # Read the expected sampling rate from whichever audio sub-processor the
-        # processor exposes: Qwen2-Audio and Voxtral use "feature_extractor",
-        # Granite-Speech uses "audio_processor". Without the audio_processor
-        # fallback, an audio_processor-only processor yields target_sr=None and
-        # the sampling-rate check is skipped, so a clip decoded at the wrong rate
+        # processor exposes (same resolution the gate admitted it on). Without
+        # this, an audio_processor-only processor yields target_sr=None and the
+        # sampling-rate check is skipped, so a clip decoded at the wrong rate
         # would be trained on silently instead of raising _check_audio_sampling_rate.
-        audio_sub = (
-            getattr(self.processor, "feature_extractor", None)
-            or getattr(self.processor, "audio_processor", None)
-        )
-        target_sr = getattr(audio_sub, "sampling_rate", None)
+        target_sr = None
+        for audio_sub in _audio_sub_processors(self.processor):
+            target_sr = getattr(audio_sub, "sampling_rate", None)
+            if target_sr is not None: break
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
