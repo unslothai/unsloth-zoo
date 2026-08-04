@@ -717,6 +717,24 @@ def _is_recompile_limit_unsupported(exc):
             or "recompile_limit reached" in text)
 
 
+# The complete set of texts Dynamo uses to refuse a disabled callable, one per
+# wording, each a literal from the single `_torchdynamo_disable` branch of
+# `UserFunctionVariable.call_function` in `torch/_dynamo/variables/functions.py`.
+# Nothing else in Dynamo emits them, which is what keeps the match narrow.
+#
+#   torch 2.4 to 2.6  unimplemented(f"call torch._dynamo.disable() wrapped
+#                     function {self.value}")   (2.4.0 L604, 2.5.1 L655, 2.6.0 L620)
+#   torch 2.7+        unimplemented_v2(gb_type="Skip calling
+#                     `torch.compiler.disable()`d function", ...)  (2.7.0 L1173)
+#
+# Both spellings stay listed: pyproject allows torch>=2.4, and the older one is
+# all those releases ever emit.
+_DISABLED_HOOK_SIGNATURES = (
+    ("Skip calling", "torch.compiler.disable"),
+    ("torch._dynamo.disable() wrapped function",),
+)
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -725,15 +743,21 @@ def _is_our_own_disabled_hook(exc):
 
         Unsupported: Skip calling `torch.compiler.disable()`d function
 
-    Matched narrowly on that signature: any other graph break under fullgraph
+    or, before torch 2.7 renamed it,
+
+        Unsupported: call torch._dynamo.disable() wrapped function <...>
+
+    Matched narrowly on those signatures: any other graph break under fullgraph
     must still raise, since those point at real problems.
     """
     try:
         text = str(exc)
     except Exception:
         return False
-    return ("torch.compiler.disable" in text
-            and "Skip calling" in text)
+    return any(
+        all(part in text for part in signature)
+        for signature in _DISABLED_HOOK_SIGNATURES
+    )
 
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):

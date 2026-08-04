@@ -58,6 +58,37 @@ def test_it_recognises_our_own_disabled_hook():
     assert U._is_our_own_disabled_hook(RuntimeError(DISABLE_MSG))
 
 
+_HOOK = ("<function requires_grad_for_gradient_checkpointing.<locals>."
+         "requires_grad_pre_hook at 0x7f00>")
+
+# Dynamo's refusal to trace a disabled callable, once per wording inside the
+# torch>=2.4,<2.13 pyproject declares. 2.4 to 2.6 emit the `_dynamo.disable`
+# text from `variables/functions.py` (2.4.0 L604, 2.5.1 L655, 2.6.0 L620); 2.7
+# replaced it with the structured `unimplemented_v2` block (2.7.0 L1173) and 2.8
+# added the trailing reason. Missing a wording means the run dies on that torch
+# instead of slowing down, which is exactly what this fallback exists to stop.
+_OLD_WORDING = f"call torch._dynamo.disable() wrapped function {_HOOK}"
+_NEW_WORDING = (
+    "Skip calling `torch.compiler.disable()`d function\n"
+    f"  Explanation: Skip calling function `{_HOOK}` since it was wrapped "
+    "with `torch.compiler.disable`\n"
+    "  Hint: Remove the `torch.compiler.disable` call\n"
+    f"\n  Developer debug context: {_HOOK}\n"
+)
+
+
+@pytest.mark.parametrize("versions,message", [
+    ("2.4 / 2.5 / 2.6", _OLD_WORDING),
+    ("2.7", _NEW_WORDING),
+    ("2.8+", DISABLE_MSG),
+])
+def test_every_supported_torch_wording_is_recognised(versions, message):
+    assert U._is_our_own_disabled_hook(RuntimeError(message)), versions
+    def compiled(*a, **k):
+        raise _unsupported(message)
+    assert _wrap(compiled)() == "eager", versions
+
+
 def test_an_ordinary_graph_break_is_not_matched():
     """The whole point. These must keep raising."""
     for text in (
@@ -74,6 +105,10 @@ def test_a_mention_of_disable_alone_is_not_enough():
     talks about torch.compiler.disable does not qualify."""
     assert not U._is_our_own_disabled_hook(
         RuntimeError("consider using torch.compiler.disable here"))
+    # Same for the pre-2.7 wording: the whole literal is required, not the
+    # decorator's name, so advice to apply it is not a disabled-hook break.
+    assert not U._is_our_own_disabled_hook(
+        RuntimeError("try torch._dynamo.disable() on this function"))
 
 
 def test_an_unstringifiable_exception_does_not_crash():
