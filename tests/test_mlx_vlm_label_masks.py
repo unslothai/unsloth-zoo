@@ -2718,12 +2718,12 @@ def test_qualified_families_carry_their_probed_requirements():
     ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
     ("0.6.5", False),        # which this package caps at 5.5.0
     ("0.6.9", False),
-    ("0.5.0rc1", False),     # prerelease inside the window: never qualified
+    ("0.5.0rc1", False),     # prereleases inside the window: never qualified
     ("0.4.5.dev0", False),
-    ("0.4.4.post1", False),  # nor a post-release or a local build of one
+    ("0.4.4.post1", False),  # nor post-releases or local builds
     ("0.6.4.post1", False),
     ("0.4.4+local", False),
-    ("", False),             # unreadable version: not evidence of anything
+    ("", False),             # unreadable: not evidence of anything
     ("not-a-version", False),
 ])
 def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):

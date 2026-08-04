@@ -5594,17 +5594,13 @@ class _AudioVersions(NamedTuple):
             return False
         try:
             found = _Version(installed)
-            # Only published final releases were qualified. mlx-vlm has
-            # published no prerelease, post-release or local build in 73
-            # releases, so none of these is a version anyone was probed
-            # against, and each can carry code the probes never saw -- a local
-            # build most of all.
+            # Only published final releases were probed, and mlx-vlm has shipped
+            # no prerelease, post-release or local build in 73 releases.
             if found.is_prerelease or found.is_postrelease or found.local:
                 return False
             return _Version(self.minimum) <= found <= _Version(self.maximum)
         except Exception:
-            # Neither an unparseable installed version nor an unparseable bound
-            # is evidence of anything. Refusing beats raising out of collation.
+            # An unparseable version is not evidence; refusing beats raising.
             return False
 
     def __str__(self):
@@ -5615,15 +5611,13 @@ class _AudioVersions(NamedTuple):
 
 # Families and the mlx-vlm releases their audio path is qualified for.
 #
-# The probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a processor that
-# is byte-identical from 0.4.4 through 0.6.9, so the probed code is the code
-# that runs; the ceiling is 0.6.4 only because mlx-vlm 0.6.5+ requires
-# transformers>=5.14, which this package caps at 5.5.0.
+# Probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a byte-identical
+# processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
+# 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
 #
-# Gemma 4 stays at the probed version: its processor changed in 0.5.0, upstream
-# reports it failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526),
-# and 0.6.3 added a separate `gemma4_unified` family. Re-probing needs a real
-# checkpoint on Apple hardware.
+# Gemma 4 stays at 0.4.4: its processor changed in 0.5.0, upstream reports it
+# failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526), and 0.6.3
+# added a separate `gemma4_unified` family. Re-probing needs Apple hardware.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
     "gemma4": _AudioVersions("0.4.4", "0.4.4"),
@@ -5690,10 +5684,9 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        # PEP 440, not int(split(".")): "5.5rc1" or a v-prefixed tag would
-        # raise and be refused as a version that could not be determined.
-        # Compared whole rather than by `.release`, which would read 5.5rc1 as
-        # 5.5 and admit a prerelease of the floor -- PEP 440 sorts it below.
+        # PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed
+        # tag. Compared whole, not by `.release`: that reads 5.5rc1 as 5.5, and
+        # PEP 440 sorts the prerelease below 5.5.0.
         found = _Version(version)
     except Exception:
         raise NotImplementedError(
@@ -5909,8 +5902,7 @@ def _check_audio_family_gate(processor):
         return family
     renamed = _AUDIO_FAMILY_RENAMES.get(family)
     if renamed and renamed in _AUDIO_QUALIFIED_FAMILIES:
-        # The entry under the old name says nothing about the renamed
-        # implementation, so say that instead of "unrecognised family".
+        # The old name's entry says nothing about the renamed implementation.
         raise NotImplementedError(
             f"Unsloth MLX: audio training is not supported for '{family}'. "
             f"mlx-vlm {installed or 'unknown'} loads this checkpoint as "
