@@ -1064,8 +1064,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
 def _reject_group_by_length(order, context):
     """Fail loudly where length grouping cannot be honored.
 
-    ``context`` is ``"vlm"`` or ``"streaming"``. A no-op for every other order,
-    so the existing paths are untouched.
+    ``context`` is ``"vlm"``, ``"streaming"`` or ``"preference"``. A no-op for
+    every other order, so the existing paths are untouched.
     """
     if order != "length_grouped":
         return
@@ -1085,6 +1085,18 @@ def _reject_group_by_length(order, context):
             "is not supported with streaming=True. Use "
             "streaming_text_length_window_batches to group lazily, or drop "
             "streaming."
+        )
+    if context == "preference":
+        # A preference row is a (chosen, rejected) pair with two lengths, so
+        # there is no single length to group on. CUDA rejects it too, just less
+        # helpfully: TRL leaves Trainer._get_train_sampler in place, and its
+        # LengthGroupedSampler raises "Can only automatically infer lengths for
+        # datasets whose items are dictionaries with an 'input_ids' key" on a
+        # prompt/chosen/rejected dataset.
+        raise ValueError(
+            "Unsloth MLX preference: group_by_length=True is not supported for "
+            "DPO/ORPO; a preference row has a chosen and a rejected length, "
+            "not one length to group on. Leave it unset."
         )
     raise ValueError(f"Unsloth MLX: unknown group_by_length context {context!r}.")
 
@@ -7538,6 +7550,10 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
+            # MLXDPOConfig/MLXORPOConfig inherit the field, and this branch
+            # returns before `_resolve_text_dataset_order`, so without this the
+            # knob would be accepted and silently ignored.
+            _reject_group_by_length(_resolve_text_dataset_order(args), "preference")
             if (
                 self.eval_dataset is not None
                 or args.eval_steps > 0

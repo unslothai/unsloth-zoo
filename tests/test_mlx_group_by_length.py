@@ -416,7 +416,32 @@ def test_streaming_rejects_length_grouping():
         _reject_group_by_length("length_grouped", "streaming")
 
 
-@pytest.mark.parametrize("context", ["vlm", "streaming"])
+def test_preference_rejects_length_grouping():
+    """MLXDPOConfig/MLXORPOConfig inherit the field, and the preference branch
+    of `_prepare_data` never reaches the text order resolution, so an accepted
+    group_by_length=True would train in the default preference order instead.
+    CUDA rejects it too: TRL keeps Trainer._get_train_sampler, whose
+    LengthGroupedSampler cannot infer lengths from prompt/chosen/rejected rows.
+    """
+    from unsloth_zoo.mlx.trainer import _reject_group_by_length
+
+    with pytest.raises(ValueError, match="DPO/ORPO"):
+        _reject_group_by_length("length_grouped", "preference")
+
+
+def test_preference_configs_resolve_to_the_grouped_order():
+    """The guard above only fires if the inherited field resolves; pins that
+    the preference configs carry it rather than dropping it on the copy."""
+    from unsloth_zoo.mlx.trainer import (
+        MLXDPOConfig, MLXORPOConfig, _resolve_text_dataset_order,
+    )
+
+    for config_class in (MLXDPOConfig, MLXORPOConfig):
+        args = config_class(group_by_length=True)
+        assert _resolve_text_dataset_order(args) == "length_grouped"
+
+
+@pytest.mark.parametrize("context", ["vlm", "streaming", "preference"])
 @pytest.mark.parametrize(
     "order", ["default", "sequential", "torch_randperm", None],
 )
