@@ -1,0 +1,166 @@
+"""Tests for the vLLM direct LoRA hot-load path.
+
+Drives the real `prepare_vllm_lora_loading` / `load_lora_directly` against fake PEFT
+modules and fake vLLM stacked buffers. No GPU, no real vLLM needed.
+
+Asserts the contract:
+  - every projection lands in its own vLLM slot, gate_up slot 1 being up_proj (gate and
+    up share shapes, so the shape asserts alone cannot catch a mis-pairing);
+  - the effective delta each slot carries equals scaling * B @ A;
+  - a vLLM B slot sharing storage with any training tensor is rejected before any copy
+    when the scaling is not 1, including when it aliases a different pair;
+  - independent buffers scale the destination only and never the training weights.
+"""
+
+from __future__ import annotations
+
+import types
+
+import pytest
+import torch
+
+
+@pytest.fixture(scope="module")
+def vllm_utils():
+    try:
+        import unsloth_zoo.vllm_utils as m
+    except Exception as e:  # no GPU / accelerator on this host
+        pytest.skip(f"unsloth_zoo.vllm_utils unavailable: {e}")
+    return m
+
+
+HIDDEN, INTER, KV, RANK = 8, 12, 4, 4
+SHAPES = {
+    "q": (HIDDEN, HIDDEN), "k": (KV, HIDDEN), "v": (KV, HIDDEN), "o": (HIDDEN, HIDDEN),
+    "gate": (INTER, HIDDEN), "up": (INTER, HIDDEN), "down": (HIDDEN, INTER),
+}
+SCALING = {"q": 1.0, "k": 1.0, "v": 1.0, "o": 1.0, "gate": 3.0, "up": 2.0, "down": 1.0}
+
+
+def _peft_linear(name):
+    """PEFT-wrapped nn.Linear stand-in, with weights unique to this projection."""
+    out_features, in_features = SHAPES[name]
+    return types.SimpleNamespace(
+        lora_A=types.SimpleNamespace(default=types.SimpleNamespace(
+            weight=torch.randn(RANK, in_features))),
+        lora_B=types.SimpleNamespace(default=types.SimpleNamespace(
+            weight=torch.randn(out_features, RANK))),
+        scaling={"default": SCALING[name]},
+    )
+
+
+def _vllm_slot(name):
+    """vLLM allocates (max_loras, 1, r, in) / (max_loras, 1, out, r) zero buffers."""
+    out_features, in_features = SHAPES[name]
+    return (torch.zeros(1, 1, RANK, in_features), torch.zeros(1, 1, out_features, RANK))
+
+
+def _make_model(n_layers=2):
+    m_layers, v_layers = [], []
+    for _ in range(n_layers):
+        m_layers.append(types.SimpleNamespace(
+            self_attn=types.SimpleNamespace(**{
+                f"{n}_proj": _peft_linear(n) for n in ("q", "k", "v", "o")}),
+            mlp=types.SimpleNamespace(**{
+                f"{n}_proj": _peft_linear(n) for n in ("gate", "up", "down")}),
+        ))
+        qkv_a, qkv_b = zip(*(_vllm_slot(n) for n in ("q", "k", "v")))
+        gu_a, gu_b = zip(*(_vllm_slot(n) for n in ("gate", "up")))
+        o_a, o_b = _vllm_slot("o")
+        d_a, d_b = _vllm_slot("down")
+        v_layers.append(types.SimpleNamespace(
+            self_attn=types.SimpleNamespace(
+                qkv_proj=types.SimpleNamespace(lora_a_stacked=qkv_a, lora_b_stacked=qkv_b),
+                o_proj=types.SimpleNamespace(lora_a_stacked=(o_a,), lora_b_stacked=(o_b,))),
+            mlp=types.SimpleNamespace(
+                gate_up_proj=types.SimpleNamespace(lora_a_stacked=gu_a, lora_b_stacked=gu_b),
+                down_proj=types.SimpleNamespace(lora_a_stacked=(d_a,), lora_b_stacked=(d_b,))),
+        ))
+    vllm_model = types.SimpleNamespace(model=types.SimpleNamespace(layers=v_layers))
+    return types.SimpleNamespace(
+        model=types.SimpleNamespace(model=types.SimpleNamespace(layers=m_layers)),
+        vllm_engine=types.SimpleNamespace(llm_engine=types.SimpleNamespace(
+            model_executor=types.SimpleNamespace(driver_worker=types.SimpleNamespace(
+                model_runner=types.SimpleNamespace(model=vllm_model))))),
+    )
+
+
+def _slots(model, layer):
+    v = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
+    L = v.model.layers[layer]
+    return {
+        "q": (L.self_attn.qkv_proj.lora_a_stacked[0], L.self_attn.qkv_proj.lora_b_stacked[0]),
+        "k": (L.self_attn.qkv_proj.lora_a_stacked[1], L.self_attn.qkv_proj.lora_b_stacked[1]),
+        "v": (L.self_attn.qkv_proj.lora_a_stacked[2], L.self_attn.qkv_proj.lora_b_stacked[2]),
+        "o": (L.self_attn.o_proj.lora_a_stacked[0], L.self_attn.o_proj.lora_b_stacked[0]),
+        "gate": (L.mlp.gate_up_proj.lora_a_stacked[0], L.mlp.gate_up_proj.lora_b_stacked[0]),
+        "up": (L.mlp.gate_up_proj.lora_a_stacked[1], L.mlp.gate_up_proj.lora_b_stacked[1]),
+        "down": (L.mlp.down_proj.lora_a_stacked[0], L.mlp.down_proj.lora_b_stacked[0]),
+    }
+
+
+def _module(model, layer, name):
+    holder = (model.model.model.layers[layer].self_attn if name in ("q", "k", "v", "o")
+              else model.model.model.layers[layer].mlp)
+    return getattr(holder, f"{name}_proj")
+
+
+def _pairs(model_B, vllm_B, scalings, model_A=None, vllm_A=None):
+    return types.SimpleNamespace(
+        model_loras_A=model_A or [], vllm_loras_A=vllm_A or [],
+        model_loras_B=model_B, vllm_loras_B=list(zip(vllm_B, scalings)))
+
+
+@pytest.fixture(autouse=True)
+def _no_cuda_sync(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+
+
+def test_every_projection_reaches_its_own_slot(vllm_utils):
+    torch.manual_seed(0)
+    model = _make_model()
+    vllm_utils.prepare_vllm_lora_loading(model)
+    vllm_utils.load_lora_directly(model)
+
+    for layer in range(len(model.model.model.layers)):
+        for name, (slot_a, slot_b) in _slots(model, layer).items():
+            module = _module(model, layer, name)
+            lora_a = module.lora_A.default.weight
+            lora_b = module.lora_B.default.weight
+            assert torch.equal(slot_a.squeeze(0).squeeze(0), lora_a), name
+            # vLLM folds the scaling into B, so the slot holds scaling * B
+            assert torch.allclose(slot_b.squeeze(0).squeeze(0), SCALING[name] * lora_b), name
+            # and therefore applies exactly scaling * B @ A to the base weight
+            delta = slot_b.squeeze(0).squeeze(0) @ slot_a.squeeze(0).squeeze(0)
+            assert torch.allclose(delta, SCALING[name] * (lora_b @ lora_a), atol=1e-5), name
+
+
+def test_aliased_slot_is_rejected_before_anything_is_copied(vllm_utils):
+    clean_dst, shared = torch.zeros(1, 1, 4, 2), torch.full((4, 2), 5.0)
+    model = _pairs([torch.full((4, 2), 3.0), shared], [clean_dst, shared], [2.0, 2.0])
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(model)
+    assert shared.max().item() == 5.0
+    assert clean_dst.max().item() == 0.0
+
+
+def test_alias_of_a_different_pair_is_also_rejected(vllm_utils):
+    src_0, src_1 = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
+    model = _pairs([src_0, src_1], [torch.zeros(1, 1, 4, 2), src_0], [None, 2.0])
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(model)
+    assert src_0.max().item() == 3.0
+
+
+def test_aliased_slot_without_scaling_is_allowed(vllm_utils):
+    shared = torch.full((4, 2), 3.0)
+    vllm_utils.load_lora_directly(_pairs([shared], [shared], [None]))
+    assert shared.max().item() == 3.0
+
+
+def test_independent_buffers_scale_the_destination_only(vllm_utils):
+    src, dst = torch.full((4, 2), 3.0), torch.zeros(1, 1, 4, 2)
+    for _ in range(3):
+        vllm_utils.load_lora_directly(_pairs([src], [dst], [2.0]))
+    assert dst.max().item() == 6.0
+    assert src.max().item() == 3.0

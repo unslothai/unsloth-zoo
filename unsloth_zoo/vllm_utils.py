@@ -2856,6 +2856,39 @@ def prepare_vllm_lora_loading(model):
 pass
 
 
+def _lora_storage_span(tensor):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Byte range of the storage, so partial overlaps are seen and not just equal starts
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr() + tensor.storage_offset() * tensor.element_size()
+    return storage.data_ptr(), start, start + tensor.numel() * tensor.element_size()
+pass
+
+
+def check_vllm_loras_not_aliased(model_loras, vllm_loras_B):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # A vLLM B slot sharing storage with a training tensor cannot be scaled in place, since
+    # that memory would have to hold both B and s*B, so the scale compounds onto the training
+    # weights on every load. Checked against every training tensor before anything is copied,
+    # so a failure leaves both sides untouched.
+    spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
+    for vllm_lora_B, s in vllm_loras_B:
+        if s is None or vllm_lora_B.numel() == 0: continue
+        v_ptr, v_start, v_end = _lora_storage_span(vllm_lora_B)
+        for (m_ptr, m_start, m_end), m_device in spans:
+            if m_ptr != v_ptr or m_device != vllm_lora_B.device: continue
+            if v_start >= m_end or m_start >= v_end: continue
+            raise RuntimeError(
+                "Unsloth: a vLLM LoRA B slot shares storage with a training tensor while the "
+                f"effective LoRA scaling is {s} != 1. Scaling in place would corrupt the "
+                "training weights on every load. Give vLLM its own buffer, or use an adapter "
+                "with scaling 1 (LoRA: lora_alpha == r, rsLoRA: lora_alpha == sqrt(r))."
+            )
+        pass
+    pass
+pass
+
+
 def load_lora_directly(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Load LoRAs directly from model into vLLM internal LoRAs
@@ -2864,24 +2897,14 @@ def load_lora_directly(model):
     vllm_loras_A  = model. vllm_loras_A
     vllm_loras_B  = model. vllm_loras_B
 
+    check_vllm_loras_not_aliased(model_loras_A + model_loras_B, vllm_loras_B)
+
     for model_lora_A, vllm_lora_A in zip(model_loras_A, vllm_loras_A):
         vllm_lora_A.copy_(model_lora_A, non_blocking = True)
     pass
 
     # Must also scale B with scaling since vLLM does this
     for model_lora_B, (vllm_lora_B, s) in zip(model_loras_B, vllm_loras_B):
-        if s is not None and vllm_lora_B.data_ptr() == model_lora_B.data_ptr():
-            # Zero-copy slot: the vLLM buffer ALIASES the training tensor. copy_ is
-            # then a self-copy no-op and the in-place scale compounds s onto the
-            # TRAINING weights on every load (x s^8 per optimizer step observed),
-            # rotting rollouts into gibberish. No scaling scheme is correct on a
-            # shared buffer, so hard-require s == 1 instead of corrupting silently.
-            raise RuntimeError(
-                "Unsloth Zoo: vLLM LoRA-B slot aliases the training tensor while "
-                f"lora scaling == {s} != 1. In-place scaling would corrupt the "
-                "training weights (compounds every load). Set lora_alpha == "
-                "lora_rank (and rescale learning_rate to compensate)."
-            )
         vllm_lora_B.copy_(model_lora_B, non_blocking = True)
         if s is not None: vllm_lora_B *= s
     pass
