@@ -10907,6 +10907,10 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
     the largest batch run first so an OOM shows up immediately rather than
     minutes in.
 
+    ``batch_size`` must be the batch the schedule actually consumes -- the
+    global micro-batch under DDP, not a rank's local slice -- or a consumed
+    batch straddles two independently sorted mega-batches.
+
     With torch installed the permutation is seeded exactly as HF seeds its
     sampler generator, so for a given seed this reproduces CUDA's order; see
     ``_length_grouped_permutation`` for the torch-free fallback.
@@ -11061,9 +11065,13 @@ def _create_ordered_text_plan(
         if dataset_order == "length_grouped":
             # Reseeded per epoch like torch_randperm, so the mega-batch shuffle
             # differs each pass instead of repeating one grouping forever.
+            # Grouped at the GLOBAL micro-batch: `_finite_row_schedule` below
+            # consumes the order in global-batch chunks and hands each rank its
+            # slice, so cutting mega-batches at the local batch would let a
+            # consumed chunk straddle two independently sorted windows.
             return _length_grouped_order(
                 [_text_row_length(row) for row in tokenized],
-                batch_size,
+                _distributed_global_batch_size(batch_size, comm_group),
                 base_seed + epoch,
             )
         if dataset_order not in (None, "sequential"):

@@ -8178,6 +8178,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 2. Sample order; must agree with unlabeled `create_ordered_batches`
     # (utils.py:2845-2849) so `train_on_responses_only` sees the same stream.
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     _order_requested = preserve_dataset_order or (
         dataset_order not in (None, "default")
     )
@@ -8202,13 +8203,14 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             )
             return order
         if dataset_order == "length_grouped":
-            # Same helper and same per-epoch reseed as the unlabeled plan in
-            # `_create_ordered_text_plan`, so train_on_responses_only sees the
-            # identical stream (pinned by test_mlx_group_by_length.py).
+            # Same helper, same per-epoch reseed and same global-batch grouping
+            # as the unlabeled plan in `_create_ordered_text_plan`, so
+            # train_on_responses_only sees the identical stream (pinned by
+            # test_mlx_group_by_length.py).
             from .utils import _length_grouped_order, _normalize_seed
             return _length_grouped_order(
                 [len(item[0]) for item in all_items],
-                batch_size,
+                global_batch_size,
                 _normalize_seed(seed) + epoch_idx,
             )
         # legacy default: length-sort once
@@ -8226,7 +8228,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     schedule = []
     widths = []
     cycle_length = None
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
     for epoch_idx in range(_n_epochs_materialize):
         epoch_order = _order_indices_for_epoch(epoch_idx)
         epoch_schedule = []

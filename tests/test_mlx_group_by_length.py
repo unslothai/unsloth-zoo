@@ -442,3 +442,43 @@ def test_length_grouping_survives_rank_sharding():
     assert local_padding(order) < local_padding(
         _torch_randperm_order(len(lengths), 21)
     ) / 4
+
+
+def test_grouping_is_cut_at_the_global_batch_not_the_local_one():
+    """The plan builders consume the order in chunks of the GLOBAL micro-batch
+    (`_finite_row_schedule`), so that is the size the mega-batches have to be
+    cut at. Grouped at the per-rank batch, the 50x mega-batch multiplier gives
+    100-row windows against a consumed global batch of 8, and 100 % 8 != 0 --
+    every straddling chunk pairs the shortest rows of one sorted window with
+    the longest of the next, which is the padding this option exists to avoid.
+    """
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order,
+        _rank_slice_distributed_batch,
+    )
+
+    world_size, local_batch = 4, 2
+    global_batch = local_batch * world_size
+    rng = random.Random(13)
+    # Large enough that mega_batch_mult saturates at HF's 50 cap, which is
+    # where the local/global mismatch shows up.
+    lengths = [rng.randint(1, 1024) for _ in range(1600)]
+
+    def local_padding(order_source):
+        waste = 0
+        for start in range(0, len(order_source), global_batch):
+            chunk = order_source[start : start + global_batch]
+            for r in range(world_size):
+                s = _rank_slice_distributed_batch(
+                    chunk, local_batch, comm_group=_FakeWorld(r, world_size),
+                    pad_source=order_source,
+                )
+                if not s:
+                    continue
+                widest = max(lengths[i] for i in s)
+                waste += sum(widest - lengths[i] for i in s)
+        return waste
+
+    grouped_globally = local_padding(_length_grouped_order(lengths, global_batch, 31))
+    grouped_locally = local_padding(_length_grouped_order(lengths, local_batch, 31))
+    assert grouped_globally < grouped_locally
