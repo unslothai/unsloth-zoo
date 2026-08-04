@@ -61,10 +61,19 @@ XET_HIGH_PERFORMANCE_VARS = ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP")
 _TRUTHY = {"1", "true", "yes", "on"}
 
 # (exclusive upper bound on total RAM, buffer_limit, buffer_size, perfile_size, max_concurrent_files)
+#
+# The table used to stop at 24 GB, so a 2 TB server was held to a 24 GB laptop's 4 GB buffer. That
+# is not a neutral default: measured on a 192-core / 1996 GiB box against a 20 Gbit/s link, the old
+# top tier ran at 4586 Mbit/s where xet-core's own defaults managed 6553 -- capping cost 30% BELOW
+# stock, because the buffer gates how much can be in flight, which gates CPU, which gates the wire.
+# Big machines get tiers that scale; the small ones are unchanged, which is where the cap earns its
+# keep.
 _TIERS = (
-    (12 * _GB, 1 * _GB, 512 * _MB, 128 * _MB, 4),
-    (24 * _GB, 2 * _GB, 768 * _MB, 192 * _MB, 6),
-    (None,     4 * _GB, 1 * _GB,   256 * _MB, 8),
+    (12 * _GB,  1 * _GB,  512 * _MB, 128 * _MB,  4),
+    (24 * _GB,  2 * _GB,  768 * _MB, 192 * _MB,  6),
+    (64 * _GB,  4 * _GB,  1 * _GB,   256 * _MB,  8),
+    (256 * _GB, 16 * _GB, 4 * _GB,   512 * _MB, 16),
+    (None,      32 * _GB, 8 * _GB,   1 * _GB,   24),
 )
 
 # Below this much usable RAM, callers prefer HTTP over Xet (see hf_xet_health).
@@ -272,6 +281,17 @@ def _clamp(value: int, low: int, high: int) -> int:
 
 
 # Shortened Xet client timeouts: safe in a download child we supervise, wrong process-wide.
+# Sizing knobs that exist only to bound memory. When the user has asked for high-performance mode
+# they have opted out of that bound, and applying these anyway would shrink the transfer while
+# xet-core ignores the limit -- slower than either choice made cleanly.
+_CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
+    "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
+    "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
+)
+
 _FAIL_FAST_KEYS = (
     "HF_XET_CLIENT_READ_TIMEOUT",
     "HF_XET_CLIENT_CONNECT_TIMEOUT",
@@ -375,10 +395,13 @@ def apply_xet_env(
     """Apply the overrides to *env* (default: ``os.environ``) and return only what was written.
 
     ``setdefault`` semantics: a user-set variable is left alone, so a shell's
-    ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins. High-performance mode is the
-    exception -- being applied AFTER the environment is read, an enabled ``HF_XET_HIGH_PERFORMANCE``
-    discards every cap above rather than competing with it, so it is turned off even when already
-    set; ``UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE=1`` keeps it (and drops the caps it would have voided).
+    ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins -- and that now includes
+    ``HF_XET_HIGH_PERFORMANCE``. Enabling it is a deliberate act by someone who knows their machine,
+    and since xet-core applies it AFTER reading the environment it voids the caps rather than
+    competing with them, so the honest response is to stand down: we drop the caps it would have
+    discarded and leave the flag alone. Measured on a 192-core / 1996 GiB box, overriding it cost
+    2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
+    Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
 
     *force* overwrites every variable, for callers building a fresh child environment. *fail_fast*
     defaults to False here, unlike ``xet_env_overrides``, because this runs at import: the shortened
@@ -388,13 +411,24 @@ def apply_xet_env(
     target = os.environ if env is None else env
     overrides = xet_env_overrides(profile, throttled = throttled, fail_fast = fail_fast)
 
-    if _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
-        for var in XET_HIGH_PERFORMANCE_VARS:
+    # A user who turned high-performance mode on keeps it, and keeps the headroom it implies:
+    # leaving our caps in place alongside it would be the worst of both, since xet-core would void
+    # the limit but still honour the smaller per-file and concurrency numbers.
+    user_wants_hp = any(_is_true(target.get(var)) for var in XET_HIGH_PERFORMANCE_VARS)
+    forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
+    # Only one of these may hold: either the user's flag wins and our sizing stands down, or the
+    # caps win and the flag has to be turned off, because xet-core reads it last and would void
+    # them. Overwritable is the set we are allowed to write over an existing value.
+    overwritable: tuple = ()
+    if user_wants_hp and not forcing_caps:
+        for var in (*XET_HIGH_PERFORMANCE_VARS, *_CAPS_VOIDED_BY_HIGH_PERFORMANCE):
             overrides.pop(var, None)
+    elif forcing_caps:
+        overwritable = XET_HIGH_PERFORMANCE_VARS
 
     written: dict[str, str] = {}
     for key, value in overrides.items():
-        if force or key not in target or (key in XET_HIGH_PERFORMANCE_VARS and _is_true(target.get(key))):
+        if force or key not in target or key in overwritable:
             target[key] = value
             written[key] = value
     return written

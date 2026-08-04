@@ -39,19 +39,24 @@ def _profile(ram_gb: float, cpus: int = 8) -> tuning.SystemProfile:
 
 
 @pytest.mark.parametrize(
-    "ram_gb, limit, size, perfile, files",
+    "ram_gb, limit, size, perfile, files, cpus",
     [
         # limit is raised to the worst case (size + files*perfile) where that exceeds the tier's
         # headline figure, so the three numbers describe one budget.
-        (8, 1024 * MB, 512 * MB, 128 * MB, 4),
-        (11.9, 1024 * MB, 512 * MB, 128 * MB, 4),
-        (16, 2 * GB, 768 * MB, 192 * MB, 6),
-        (32, 4 * GB, 1 * GB, 256 * MB, 8),
-        (2048, 4 * GB, 1 * GB, 256 * MB, 8),  # a huge host is still capped
+        (8, 1024 * MB, 512 * MB, 128 * MB, 4, 8),
+        (11.9, 1024 * MB, 512 * MB, 128 * MB, 4, 8),
+        (16, 2 * GB, 768 * MB, 192 * MB, 6, 8),
+        (32, 4 * GB, 1 * GB, 256 * MB, 8, 8),
+        # A big host is still bounded, but by a budget proportional to what it has. Holding a 2 TB
+        # server to the 32 GB row cost 30% against xet-core's own defaults.
+        (128, 16 * GB, 4 * GB, 512 * MB, 16, 32),
+        (2048, 32 * GB, 8 * GB, 1000 * MB, 24, 192),
+        # ...but never more files in flight than cores, however much RAM there is.
+        (2048, 32 * GB, 8 * GB, 1000 * MB, 8, 8),
     ],
 )
-def test_tier_table(ram_gb, limit, size, perfile, files):
-    env = tuning.xet_env_overrides(_profile(ram_gb))
+def test_tier_table(ram_gb, limit, size, perfile, files, cpus):
+    env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == limit
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"]) == size
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"]) == perfile
@@ -70,7 +75,10 @@ def test_worst_case_buffer_stays_under_the_limit():
         )
         limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
         assert worst <= limit, f"{ram_gb}GB: worst case {worst} exceeds limit {limit}"
-        assert limit <= 4 * GB  # never the stock 8GB, let alone high-performance's 64GB
+        # The bound that matters is proportional, not absolute: never more than a third of the
+        # machine's RAM, so the buffer cannot be the reason a box OOMs. A large host is allowed a
+        # large budget precisely because it has one to spare.
+        assert worst <= ram_gb * GB / 3, f"{ram_gb}GB: worst case {worst} is too much of it"
 
 
 def test_unknown_ram_picks_the_smallest_tier():
@@ -122,19 +130,54 @@ def test_apply_never_overwrites_a_user_setting():
     assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"] == str(192 * MB)
 
 
-def test_apply_clears_an_inherited_high_performance_flag():
-    """The one deliberate exception to setdefault: an inherited "1" would void every cap."""
+def test_a_user_set_high_performance_flag_is_left_alone():
+    """We used to clear it, which is how a machine that had opted in lost 2.55x of its download
+    throughput the moment it imported unsloth_zoo (16684 -> 6553 Mbit/s, measured on a 192-core
+    1996 GiB box). Enabling it is a deliberate act; setdefault applies to it like everything else."""
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP"):
+        env = {var: "1"}
+        written = tuning.apply_xet_env(env, profile = _profile(16))
+        assert env[var] == "1", var
+        assert var not in written, var
+
+
+def test_high_performance_also_stands_our_sizing_down():
+    """Leaving the caps on alongside it is the worst of both: xet-core reads the flag last and
+    voids the LIMIT, but still honours the smaller per-file and concurrency numbers, so the
+    transfer ends up smaller than either choice made cleanly."""
     env = {"HF_XET_HIGH_PERFORMANCE": "1"}
     tuning.apply_xet_env(env, profile = _profile(16))
-    assert env["HF_XET_HIGH_PERFORMANCE"] == "0"
+    for key in tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        assert key not in env, key
+    # Non-sizing settings are unrelated to the memory bound and still apply.
+    assert env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == "0"
 
 
-def test_user_can_opt_back_into_high_performance(monkeypatch):
-    monkeypatch.setenv("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE", "1")
+def test_force_caps_still_overrides_high_performance(monkeypatch):
+    """The escape hatch for someone who really does want a machine bounded: the flag has to be
+    turned off for the caps to mean anything, so this is the one case that overwrites it."""
+    monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
     env = {"HF_XET_HIGH_PERFORMANCE": "1"}
     written = tuning.apply_xet_env(env, profile = _profile(16))
-    assert env["HF_XET_HIGH_PERFORMANCE"] == "1"
-    assert "HF_XET_HIGH_PERFORMANCE" not in written
+    assert env["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert written["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"] == str(2 * GB)
+
+
+def test_a_large_machine_is_not_held_to_a_laptops_buffer():
+    """The table used to flat-line at 24 GB, so a 2 TB server got a 24 GB laptop's 4 GB buffer.
+    Measured, that ran 30% BELOW xet-core's own defaults, because the buffer gates how much can be
+    in flight. Each tier must be strictly larger than the one below it."""
+    seen = []
+    for ram_gb in (8, 16, 32, 128, 512, 2048):
+        env = tuning.xet_env_overrides(_profile(ram_gb, cpus = 64))
+        seen.append((ram_gb, int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])))
+    for (small_ram, small), (big_ram, big) in zip(seen, seen[1:]):
+        assert big >= small, f"{big_ram}GB got {big} but {small_ram}GB got {small}"
+    assert seen[-1][1] > seen[2][1], f"a 2TB box still capped like a 32GB one: {seen}"
+    # And the small end is untouched, which is where the cap earns its keep. (1024MB, not 1000MB:
+    # the limit is raised to the tier's own worst case, 512MB + 4*128MB.)
+    assert seen[0][1] == 1024 * MB
 
 
 def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
