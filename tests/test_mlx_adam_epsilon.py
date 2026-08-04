@@ -281,6 +281,30 @@ def test_appended_field_stays_an_exact_suffix():
         assert tail == _MLX_CONFIG_OPTIONAL_COPY_FIELDS, config_class.__name__
 
 
+def test_the_preference_trainers_share_the_one_entry_point():
+    """_build_optimizer is the only optimizer construction site in
+    unsloth_zoo/mlx, and MLXORPOTrainer / MLXDPOTrainer inherit it rather than
+    building their own. That is what makes "one guard covers every objective"
+    true; a subclass that grows its own optimizer has to revisit the epsilon."""
+    from unsloth_zoo.mlx.trainer import (
+        MLXDPOConfig,
+        MLXDPOTrainer,
+        MLXORPOConfig,
+        MLXORPOTrainer,
+        MLXTrainer,
+    )
+
+    for trainer_class in (MLXORPOTrainer, MLXDPOTrainer):
+        assert (
+            trainer_class._build_optimizer is MLXTrainer._build_optimizer
+        ), trainer_class.__name__
+    # And the preference configs carry the field, so the knob is reachable from
+    # every objective the trainer supports.
+    for config_class in (MLXORPOConfig, MLXDPOConfig):
+        assert config_class(adam_epsilon=1e-6).adam_epsilon == pytest.approx(1e-6)
+        assert config_class().adam_epsilon is None
+
+
 def test_a_pre_pr_positional_config_copy_still_maps(monkeypatch):
     """An old config dump has no adam_epsilon. Copying it positionally must land
     every value in the same slot it came from and leave the epsilon unset."""
