@@ -112,11 +112,18 @@ jobs:
         # CPU-pure and monkeypatch every Hub entry point, so they cost under two
         # seconds. Left out of a gate they would have been collected but never
         # run: `pytest tests/ --collect-only` above proves only that they import.
+        #
+        # test_mlx_save_export_edge_cases pins the MLX GGUF export contract:
+        # which quant targets are produced, that the expensive merge/convert
+        # runs once per export, and when the intermediate is scratch versus a
+        # requested artifact. It fakes llama.cpp end to end (no binary, no
+        # weights) and the whole file runs in well under a second.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_save_export_edge_cases.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
