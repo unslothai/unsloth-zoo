@@ -1331,6 +1331,37 @@ def test_gguf_rejects_non_string_first_conversion_before_the_merge(
     assert "convert_count" not in calls
 
 
+# --- Group 11d: singleton list is a list, not a scalar ----------------------
+
+
+def test_gguf_singleton_list_full_precision_is_still_emitted(monkeypatch, tmp_path):
+    """Upstream runs a llama-quantize pass for every requested method that is not
+    the intermediate, with no full-precision exemption
+    (unslothai/unsloth unsloth/save.py:2067-2070). The scalar carve-out here is a
+    pre-PR MLX behaviour; a singleton LIST is the new list contract and must
+    emit what was asked for."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f16"], first_conversion="bf16")
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16"]
+    assert (out / "EdgeModel.F16.gguf").exists()
+    # bf16 was never requested, so the intermediate is scratch.
+    assert not (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_scalar_full_precision_keeps_its_pre_pr_behaviour(monkeypatch, tmp_path):
+    """The scalar form must NOT change: pre-PR a lone full-precision string ran
+    no quantize pass whatever `first_conversion` said."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, "f16", first_conversion="bf16")
+
+    assert "quantize_calls" not in calls
+    assert (out / "EdgeModel.BF16.gguf").exists()
+
+
 def test_mlx_model_method_forwards_a_quant_list(monkeypatch, tmp_path):
     """The user-facing hop: model.save_pretrained_gguf(...) in loader.py."""
     import unsloth_zoo.mlx.loader as loader

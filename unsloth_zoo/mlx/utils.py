@@ -14560,8 +14560,16 @@ def _normalize_gguf_quantization_methods(quantization_method):
     merge+convert can produce several GGUFs. Deduplicates while preserving
     order: repeats would otherwise re-run llama-quantize onto an identical
     output path, since filenames are derived from the quant type alone.
+
+    Returns ``(quant_types, requested_as_sequence)``. The flag is the ONLY
+    record of how the caller spelled the request once the value is a list, and
+    Step 6 needs it: the scalar form carries a pre-PR full-precision exemption
+    that the list form must not inherit. Deriving it here keeps the "was this a
+    sequence" predicate in one place instead of re-testing the raw argument at
+    the use site, where it would drift from this branch.
     """
-    if isinstance(quantization_method, (list, tuple)):
+    requested_as_sequence = isinstance(quantization_method, (list, tuple))
+    if requested_as_sequence:
         methods = list(quantization_method)
     elif isinstance(quantization_method, str) or quantization_method is None:
         methods = [quantization_method]
@@ -14600,7 +14608,7 @@ def _normalize_gguf_quantization_methods(quantization_method):
 
     # Dedup now also collapses case/whitespace variants, which name the same
     # output path and would otherwise re-run llama-quantize onto it.
-    return list(dict.fromkeys(resolved))
+    return list(dict.fromkeys(resolved)), requested_as_sequence
 
 
 def save_pretrained_gguf(
@@ -14648,7 +14656,9 @@ def save_pretrained_gguf(
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
-    quant_types = _normalize_gguf_quantization_methods(quantization_method)
+    quant_types, requested_as_sequence = _normalize_gguf_quantization_methods(
+        quantization_method
+    )
 
     # first_conversion is the other half of the same quant spec: it is compared
     # against quant_types and .upper()-ed into the intermediate's path, so it
@@ -14833,12 +14843,22 @@ def save_pretrained_gguf(
         # The merge and convert above are the expensive steps and already ran
         # once, so extra targets only cost their own llama-quantize pass.
         base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
-        # Pre-existing single-target contract: a lone full-precision request is
+        # Pre-existing SCALAR-ONLY contract: a lone full-precision string is
         # satisfied by whatever convert_hf_to_gguf emitted, with no llama-quantize
         # pass, even when an explicit first_conversion names a different dtype.
-        # Kept as-is; only the list form follows the CUDA rule below.
+        # Kept for the string form so pre-PR callers see no change.
+        #
+        # A singleton LIST is not that form. Upstream has no full-precision
+        # exemption at all - it quantizes every requested method that is not the
+        # intermediate (unslothai/unsloth unsloth/save.py:2067-2070,
+        # `[m for m in dict.fromkeys(quantization_method) if m != first_conversion]`)
+        # - so ["f16"] with first_conversion="bf16" must emit F16.gguf. Letting
+        # the list form inherit the scalar exemption left only Model.BF16.gguf
+        # and silently dropped the one target that was asked for.
         legacy_single_full_precision = (
-            len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES
+            not requested_as_sequence
+            and len(quant_types) == 1
+            and quant_types[0] in _GGUF_FULL_PRECISION_TYPES
         )
         quantized_any = False
         for quant_type in quant_types:
