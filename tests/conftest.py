@@ -251,3 +251,25 @@ def _apply_upstream_import_fixes_for_tests() -> None:
 
 
 _apply_upstream_import_fixes_for_tests()
+
+
+# Xet health state isolation: the ladder persists per-machine verdicts next to the HF cache, so
+# without this fixture a suite of SIMULATED failures would demote the real machine and later tests
+# would start on HTTP and contradict their own assertions.
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse = True)
+def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
+    state_dir = tmp_path_factory.mktemp("xet_health_home")
+    monkeypatch.setenv("HF_HOME", str(state_dir))
+    try:
+        from unsloth_zoo import hf_xet_health
+
+        hf_xet_health.clear_xet_health()
+        yield
+        hf_xet_health.clear_xet_health()
+    except Exception:
+        # Module absent (partial checkout / security-only suite): nothing to isolate.
+        yield
