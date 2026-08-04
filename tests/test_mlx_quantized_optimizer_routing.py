@@ -82,6 +82,8 @@ def test_description_names_the_one_thing_the_name_does_not():
     assert "first moment" in message
     assert "group_size=64" in message
     assert "second moment is unquantized" in message
+    # Eligibility counts elements, not axes, so the line must not revive a 2-D claim.
+    assert "2-D" not in message
     assert "\n" not in message
     assert len(message) <= 120, f"routing line grew to {len(message)} chars: {message}"
 

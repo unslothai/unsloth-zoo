@@ -21,14 +21,25 @@ Packing ``m`` to 8 bits cuts that by ``1 - (f*(1/b + 2/G) + (1-f) + 1)/2`` for a
 dtype of ``b`` bytes, group size ``G`` and an eligible byte fraction ``f``.
 Measured end to end on SmolLM2-135M, group_size=64:
 
-    full fine-tune, float32 state   35.9%     LoRA r=64        35.9%
-    full fine-tune, bfloat16 state  23.4%     LoRA r=16/r=32   18.3%
+    full fine-tune, float32 state   35.9%     LoRA r=32/r=64   35.9%
+    full fine-tune, bfloat16 state  23.4%     LoRA r=16        34.6%
 
 Only the first two are the "8-bit vs 32-bit" figure. MLX creates moments with
 ``mx.zeros_like(parameter)``, so a bfloat16 model has bfloat16 moments and the
-packed moment is being compared against 2 bytes, not 4. Under LoRA only one of
-each adapter pair is eligible unless the group size divides the rank, so r=32
-reaches 34.4% at ``group_size=32`` but only 18.3% at 64.
+packed moment is being compared against 2 bytes, not 4.
+
+Eligibility is measured in elements, not shape: moments are quantized over a
+flattened view, so a rank-16 LoRA_B and a 3-D MoE expert stack pack as readily as
+a square matrix. An earlier rule required 2-D with a divisible last axis, which
+silently excluded LoRA_B below rank 64 and held r=16/r=32 to 18.3%. Anything under
+``MIN_QUANTIZE_SIZE`` elements keeps a full-width moment: those are the norms and
+biases, worth no bytes and the least tolerant of the error. bitsandbytes draws the
+same line at the same threshold (``min_8bit_size``).
+
+That floor is why r=16 lands at 34.6% rather than 35.9%: under grouped-query
+attention the k/v projections are narrow, so their LoRA_B is ``(kv_dim, r)`` and at
+r=16 that is 3072 elements on a 135M model. The figure is therefore model-shape
+dependent below r=32; a square fixture will report the full 35.9% and overstate it.
 
 This shrinks PERSISTENT state, not peak allocation: ``apply_single`` materialises
 a full-width ``m`` per parameter per step, and peak rose 11.7% on Metal and 29.9%
@@ -77,6 +88,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE",
     "DEFAULT_BITS",
     "SUPPORTED_GROUP_SIZES",
+    "MIN_QUANTIZE_SIZE",
     "unpack_quantized_moments",
     "state_has_quantized_moments",
     "announce_quantized_optimizer",
@@ -86,6 +98,9 @@ DEFAULT_GROUP_SIZE = 64
 DEFAULT_BITS = 8
 # mx.quantize's supported group sizes; all three are exercised by the test suite.
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
+# Below this, packing a moment saves bytes that do not matter on parameters that
+# do not tolerate the error well. Matches bitsandbytes' min_8bit_size default.
+MIN_QUANTIZE_SIZE = 4096
 # Names already announced in this process; see announce_quantized_optimizer.
 _ANNOUNCED = set()
 
@@ -123,24 +138,44 @@ class _QuantizedFirstMomentMixin:
         self.bits = bits
 
     def is_quantizable(self, parameter):
-        """``mx.quantize`` needs 2-D with last dim divisible by group_size.
-        Everything else keeps a full-width moment and still trains, saving nothing."""
-        return parameter.ndim == 2 and parameter.shape[-1] % self.group_size == 0
+        """``mx.quantize`` constrains the LAST axis only, so a flattened view makes
+        eligibility a question of element count rather than shape. That admits 3-D
+        MoE expert stacks and LoRA_B at rank 16/32, which the previous 2-D rule
+        rejected while their partner matrices were packed.
+
+        Tensors under ``MIN_QUANTIZE_SIZE`` stay full width: they are a rounding
+        error in the state budget but include the norm and bias parameters, which
+        are the ones least worth adding quantization error to. bitsandbytes draws
+        the same line at the same threshold (``min_8bit_size``)."""
+        return (
+            parameter.size >= MIN_QUANTIZE_SIZE
+            and parameter.size % self.group_size == 0
+        )
+
+    def _pack(self, moment):
+        """Quantize over a flat view; the parameter's shape is restored on unpack."""
+        return mx.quantize(
+            moment.reshape(1, -1), group_size=self.group_size, bits=self.bits,
+        )
+
+    def _unpack(self, packed, shape):
+        """``mx.dequantize`` is self-describing, so this also reads checkpoints
+        written by the earlier per-row layout, whose triple carries its own shape."""
+        moment = mx.dequantize(
+            *packed, group_size=self.group_size, bits=self.bits,
+        )
+        return moment.reshape(shape)
 
     def init_single(self, parameter, state):
         super().init_single(parameter, state)
         if self.is_quantizable(parameter):
-            state["m"] = mx.quantize(
-                state["m"], group_size=self.group_size, bits=self.bits,
-            )
+            state["m"] = self._pack(state["m"])
 
     def apply_single(self, gradient, parameter, state):
         packed = state["m"]
         # tuple OR list: mx.quantize and tree_unflatten both give a list.
         if isinstance(packed, (tuple, list)):
-            moment = mx.dequantize(
-                *packed, group_size=self.group_size, bits=self.bits,
-            )
+            moment = self._unpack(packed, parameter.shape)
             # Affine dequantization does not land exactly on zero, and v == 0
             # means this coordinate has only seen zero gradients, so its true
             # moment is zero. Without this the residue is divided by eps alone.
@@ -149,9 +184,7 @@ class _QuantizedFirstMomentMixin:
         # Re-pack from eligibility, not from what was loaded: a checkpoint
         # written by plain AdamW arrives unpacked and must not stay that way.
         if self.is_quantizable(parameter):
-            state["m"] = mx.quantize(
-                state["m"], group_size=self.group_size, bits=self.bits,
-            )
+            state["m"] = self._pack(state["m"])
         return updated
 
 
@@ -244,7 +277,10 @@ def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFA
             if key == "m" and isinstance(value, (tuple, list)) and len(value) == 3:
                 moment = mx.dequantize(*value, group_size = group_size, bits = bits)
                 second = state.get("v")
-                if isinstance(second, mx.array) and second.shape == moment.shape:
+                # ``v`` is the only full-width leaf here, so it carries the shape a
+                # flat-packed moment has to be restored to before the mask lines up.
+                if isinstance(second, mx.array) and second.size == moment.size:
+                    moment = moment.reshape(second.shape)
                     moment = mx.where(second == 0, mx.zeros_like(moment), moment)
                 out[key] = moment
             else:
