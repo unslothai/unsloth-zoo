@@ -36,13 +36,10 @@ import pytest
 import torch
 
 
-@pytest.fixture(scope="module")
-def vllm_utils():
-    try:
-        import unsloth_zoo.vllm_utils as m
-    except Exception as e:  # no GPU on this host
-        pytest.skip(f"unsloth_zoo.vllm_utils unavailable: {e}")
-    return m
+# Imported at module level on purpose: this file is a CI hard gate and needs neither a GPU nor
+# vLLM (tests/conftest.py handles the device-type probe), so an import failure is a regression
+# and must fail the gate instead of skipping it.
+import unsloth_zoo.vllm_utils as vllm_utils
 
 
 HIDDEN, INTER, KV, RANK = 8, 12, 4, 4
@@ -132,7 +129,7 @@ def _no_cuda_sync(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
 
-def test_every_projection_reaches_its_own_slot(vllm_utils):
+def test_every_projection_reaches_its_own_slot():
     torch.manual_seed(0)
     model = _make_model()
     vllm_utils.prepare_vllm_lora_loading(model)
@@ -150,7 +147,7 @@ def test_every_projection_reaches_its_own_slot(vllm_utils):
             assert torch.allclose(delta, SCALING[name] * (lora_b @ lora_a), atol=1e-5), name
 
 
-def test_aliased_slot_is_rejected_before_anything_is_copied(vllm_utils):
+def test_aliased_slot_is_rejected_before_anything_is_copied():
     clean_dst, shared = torch.zeros(1, 1, 4, 2), torch.full((4, 2), 5.0)
     model = _pairs([torch.full((4, 2), 3.0), shared], [clean_dst, shared], [2.0, 2.0])
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
@@ -159,7 +156,7 @@ def test_aliased_slot_is_rejected_before_anything_is_copied(vllm_utils):
     assert clean_dst.max().item() == 0.0
 
 
-def test_alias_of_a_different_pair_is_also_rejected(vllm_utils):
+def test_alias_of_a_different_pair_is_also_rejected():
     src_0, src_1 = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
     model = _pairs([src_0, src_1], [torch.zeros(1, 1, 4, 2), src_0], [None, 2.0])
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
@@ -167,7 +164,7 @@ def test_alias_of_a_different_pair_is_also_rejected(vllm_utils):
     assert src_0.max().item() == 3.0
 
 
-def test_unscaled_alias_of_a_different_pair_is_rejected(vllm_utils):
+def test_unscaled_alias_of_a_different_pair_is_rejected():
     # no multiplication, but the copy still overwrites the other pair's training tensor
     src_0, src_1 = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
     model = _pairs([src_0, src_1], [torch.zeros(1, 1, 4, 2), src_0], [None, None])
@@ -176,7 +173,7 @@ def test_unscaled_alias_of_a_different_pair_is_rejected(vllm_utils):
     assert src_0.max().item() == 3.0
 
 
-def test_aliased_A_destination_is_rejected(vllm_utils):
+def test_aliased_A_destination_is_rejected():
     src_a, src_b = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
     model = _pairs([src_b], [torch.zeros(1, 1, 4, 2)], [None],
                    model_A=[src_a], vllm_A=[src_b])
@@ -185,13 +182,13 @@ def test_aliased_A_destination_is_rejected(vllm_utils):
     assert src_b.max().item() == 5.0
 
 
-def test_aliased_slot_without_scaling_is_allowed(vllm_utils):
+def test_aliased_slot_without_scaling_is_allowed():
     shared = torch.full((4, 2), 3.0)
     vllm_utils.load_lora_directly(_pairs([shared], [shared], [None]))
     assert shared.max().item() == 3.0
 
 
-def test_independent_buffers_scale_the_destination_only(vllm_utils):
+def test_independent_buffers_scale_the_destination_only():
     src, dst = torch.full((4, 2), 3.0), torch.zeros(1, 1, 4, 2)
     for _ in range(3):
         vllm_utils.load_lora_directly(_pairs([src], [dst], [2.0]))
