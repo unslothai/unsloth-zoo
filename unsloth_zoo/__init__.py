@@ -14,9 +14,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.8.2"
+# Keeps PEP 604 annotations (`str | Path`) from being evaluated at def time, which
+# is a TypeError on the 3.9 floor pyproject declares.
+from __future__ import annotations
+
+__version__ = "2026.8.3"
 
 import os
+import platform
+import sys
 import warnings
 import re
 # Stop TOKENIZERS_PARALLELISM warning
@@ -33,8 +39,40 @@ _offline_env = (
     or os.environ.get("HF_DATASETS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
 )
 
+# hf_transfer's Rust extension cannot complete a download on Windows on ARM:
+# every fetch dies with "an error occurred while downloading using hf_transfer",
+# and the same fetch succeeds once it is off.
+def _detect_windows_on_arm() -> bool:
+    if sys.platform != "win32":
+        return False
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    # An x64 process emulated on ARM64 still reports AMD64 on Python < 3.12,
+    # which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets
+    # the latter for 32-bit processes only, so nothing there names the host.
+    # IsWow64Process2's pNativeMachine does, emulated or not.
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        process, native = ctypes.c_ushort(), ctypes.c_ushort()
+        if kernel32.IsWow64Process2(
+            kernel32.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)
+        ):
+            return native.value == 0xAA64  # IMAGE_FILE_MACHINE_ARM64
+    except Exception:
+        pass  # pre-1709 Windows has no IsWow64Process2; fall back to "not ARM".
+    return False
+
+
+_windows_on_arm = _detect_windows_on_arm()
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
-if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ and not _offline_env:
+if (
+    "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+    and not _offline_env
+    and not _windows_on_arm
+):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # More stable downloads
@@ -82,7 +120,6 @@ redirect_hf_cache_if_readonly()
 from .hf_xet_tuning import apply_xet_env
 _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
-os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
 del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches, apply_xet_env
 
 # More verbose HF Hub info

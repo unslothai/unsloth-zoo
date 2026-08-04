@@ -1002,6 +1002,9 @@ class _FakeProc:
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
         self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
         self._rec["main_file"] = getattr(sys.modules.get("__main__"), "__file__", None)
+        # What the child would actually inherit: hf_xet reads these natively at import, so the
+        # spawn window is the only moment they can be set.
+        self._rec["xet"] = {k: v for k, v in os.environ.items() if k.startswith("HF_XET_")}
 
     def is_alive(self):
         return False
@@ -1066,6 +1069,115 @@ def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
     )
     # On the Xet-first attempt, do not force-disable Xet for the child.
     assert rec["disable_xet"] is None
+
+
+def _spawn_xet_env(monkeypatch) -> dict:
+    """Run one Xet-first attempt against a fake spawn and return the child's HF_XET_* env."""
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    return rec["xet"]
+
+
+def test_child_keeps_a_user_set_high_performance_flag(monkeypatch):
+    """The download child is the only process that matters here, so standing our sizing down for a
+    user who asked for high-performance mode has to hold on this path too. Forcing the flag back to
+    0 and re-adding the caps is the behaviour that cost a 192-core host 2.55x."""
+    from unsloth_zoo.hf_xet_tuning import _CAPS_VOIDED_BY_HIGH_PERFORMANCE
+
+    for var in ("HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS", "UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE"):
+        monkeypatch.delenv(var, raising = False)
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "1"
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        assert key not in child, key
+    # The settings the preset does not touch are still tuned for the child.
+    assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"
+
+
+def test_child_is_capped_when_nothing_asked_otherwise(monkeypatch):
+    """The default path is unchanged: no flag means the caps go to the child and the preset that
+    would void them is turned off."""
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert child["HF_XET_HP"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
+
+
+def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
+    """The escape hatch survives: someone who wants a machine bounded regardless still gets the
+    caps, which only mean anything once the preset is off."""
+    monkeypatch.delenv("HF_XET_HP", raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+    monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
+
+
+def test_the_child_is_sized_for_the_cache_dir_it_was_given(monkeypatch, tmp_path):
+    """``cache_dir`` is what huggingface_hub uses (``file_download.py``: ``if cache_dir is None:
+    cache_dir = constants.HF_HUB_CACHE``), so it, not the process's HF_HUB_CACHE, is the volume the
+    child writes to. Sizing from the global cache hands a nearly full target disk the whole budget,
+    and clamps a roomy target to the floor whenever an unrelated default cache is full."""
+    import collections
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    def _child(cache_dir, hub_cache) -> dict:
+        monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+        rec: dict = {}
+        monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(cache_dir)}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+        return rec["xet"]
+
+    # Full target volume, roomy default cache: the clamp still bites.
+    child = _child(tight / "hub", roomy / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+    # Roomy target volume, full default cache: the download is not throttled for it.
+    child = _child(roomy / "hub", tight / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
 
 
 class _EmptyQueue:
@@ -4842,3 +4954,120 @@ def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
         assert "did not start" in calls[0]
     finally:
         stop.set()
+
+
+def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch, tmp_path):
+    """The real parent has already sized itself at import, so its environment carries a buffer limit
+    computed for the global cache. Because the pre-spawn call is setdefault, that stale number would
+    survive into the child unless our own seeded values are dropped first."""
+    import collections
+    import os
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+
+    # Exactly what import leaves behind: the roomy default cache's numbers, in the environment and
+    # recorded as ours.
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot",
+        params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert int(rec["xet"][key]) == 1 * GB
+    assert os.environ[key] == str(64 * GB)  # the parent's own environment is untouched
+
+
+def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monkeypatch, tmp_path):
+    """The spawn window puts the child's ``HF_XET_*`` into the parent environment for the duration of
+    ``proc.start()``. Sizing from a copy taken outside the lock can catch that overlay, and since
+    those values are not the ones we seeded they read as explicit user settings, so setdefault keeps
+    them and this child is left with the import-time sizing instead of its own destination's."""
+    import collections
+    import shutil
+    import threading
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        return usage(9000 * GB, 1000 * GB, 8000 * GB)
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    holding = threading.Event()
+    done = threading.Event()
+
+    def _other_spawn():
+        # Exactly what the spawn window does: another child's numbers, briefly, in our environment.
+        with xf._SPAWN_ENV_LOCK:
+            os.environ[key] = str(7 * GB)
+            holding.set()
+            done.wait(5.0)
+            os.environ[key] = str(64 * GB)
+
+    peer = threading.Thread(target = _other_spawn, daemon = True)
+    peer.start()
+    assert holding.wait(5.0), "the peer never took the spawn lock"
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    waiter = threading.Timer(0.4, done.set)
+    waiter.start()
+    try:
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+    finally:
+        waiter.cancel()
+        done.set()
+        peer.join(5.0)
+    assert int(rec["xet"][key]) == 1 * GB, "the child was sized from the peer's overlay"

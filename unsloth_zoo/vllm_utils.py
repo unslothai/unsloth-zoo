@@ -2819,7 +2819,7 @@ def prepare_vllm_lora_loading(model):
         vllm_loras_B .append((v_layer.self_attn.o_proj.lora_b_stacked[0], so,))
 
         model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
+        model_loras_A.append(m_layer.mlp.  up_proj.lora_A.default.weight)
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
 
@@ -2828,7 +2828,7 @@ def prepare_vllm_lora_loading(model):
         sg = None if sg == 1.0 else sg
         su = None if su == 1.0 else su
         model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
+        model_loras_B.append( m_layer.mlp.  up_proj.lora_B.default.weight)
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
 

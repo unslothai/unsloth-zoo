@@ -55,6 +55,8 @@ from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
 
+from packaging.version import Version as _Version
+
 
 from .cce import _get_runtime_cce
 from .cce.runtime_cce import _normalize_label_smoothing
@@ -4398,14 +4400,62 @@ def _tokenize_mlx_prompt_completion(
     state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
+    encoded = _encode_mlx_prompt_completion(
+        tokenizer, prompt, prompt + completion, append_eos=False, state=state,
+    )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
-        prompt_ids,
-        input_ids,
+        list(encoded.input_ids[:encoded.prompt_length]),
+        list(encoded.input_ids),
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
+    )
+
+
+@dataclass(frozen=True)
+class _MLXPromptCompletionTokens:
+    """Immutable encoding shared by SFT and preference tokenization."""
+
+    prompt_ids: tuple
+    input_ids: tuple
+    prompt_length: int
+
+
+def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
+    """Locate the completion after tolerating one boundary-merged token."""
+    prompt_ids = tuple(prompt_ids)
+    input_ids = tuple(input_ids)
+    if input_ids[:len(prompt_ids)] == prompt_ids:
+        return len(prompt_ids)
+    prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
+    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+        raise ValueError(
+            "Unsloth MLX: tokenized prompt and prompt+completion differ before "
+            "the final prompt token; only a boundary merge is supported."
+        )
+    return prompt_length
+
+
+def _encode_mlx_prompt_completion(
+    tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+):
+    """Encode a prompt and its full text with one EOS policy."""
+    prompt_ids = tuple(int(x) for x in encode_mlx_text(
+        tokenizer, prompt_text, state=state,
+    ))
+    input_ids = [int(x) for x in encode_mlx_text(
+        tokenizer, full_text, state=state,
+    )]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if append_eos and eos_id is not None and (
+        not input_ids or input_ids[-1] != int(eos_id)
+    ):
+        input_ids.append(int(eos_id))
+    input_ids = tuple(input_ids)
+    return _MLXPromptCompletionTokens(
+        prompt_ids,
+        input_ids,
+        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
     )
 
 
@@ -5575,15 +5625,56 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
     "<|endoftext11|>",
 )
 
-# Families and the exact mlx-vlm versions their audio path was validated on.
-# Anything else is refused: merge contracts differ per family and mlx-vlm has
-# changed audio preprocessing within its supported span.
-_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
-    "gemma3n": frozenset({"0.4.4"}),
-    "gemma4": frozenset({"0.4.4"}),
-    "phi4mm": frozenset({"0.4.4"}),
-    "minicpmo": frozenset({"0.4.4"}),
+class _AudioVersions(NamedTuple):
+    """The mlx-vlm releases a family's audio path is qualified for.
+
+    Bounded at both ends on purpose. An unreleased version is refused rather
+    than assumed good, which is the property the whole gate exists for: a wrong
+    "yes" here trains against misaligned features and fails silently, where a
+    wrong "no" only asks someone to pin.
+    """
+
+    minimum: str
+    maximum: str
+
+    def admits(self, installed):
+        if not installed:
+            return False
+        try:
+            found = _Version(installed)
+            # Only published final releases were probed, and mlx-vlm has shipped
+            # no prerelease, post-release or local build in 73 releases.
+            if found.is_prerelease or found.is_postrelease or found.local:
+                return False
+            return _Version(self.minimum) <= found <= _Version(self.maximum)
+        except Exception:
+            # An unparseable version is not evidence; refusing beats raising.
+            return False
+
+    def __str__(self):
+        if self.minimum == self.maximum:
+            return self.minimum
+        return f"{self.minimum} to {self.maximum}"
+
+
+# Families and the mlx-vlm releases their audio path is qualified for.
+#
+# Probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a byte-identical
+# processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
+# 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
+#
+# Gemma 4 stays at 0.4.4: its processor changed in 0.5.0, upstream reports it
+# failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526), and 0.6.3
+# added a separate `gemma4_unified` family. Re-probing needs Apple hardware.
+_AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
+    "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
+    "gemma4": _AudioVersions("0.4.4", "0.4.4"),
+    "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
+    "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
+
+# Names upstream renamed, so a refusal can point at the qualified entry.
+_AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
 
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
@@ -5641,14 +5732,17 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        parts = tuple(int(x) for x in version.split(".")[:2])
+        # PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed
+        # tag. Compared whole, not by `.release`: that reads 5.5rc1 as 5.5, and
+        # PEP 440 sorts the prerelease below 5.5.0.
+        found = _Version(version)
     except Exception:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' requires transformers "
             f"{floor[0]}.{floor[1]} or newer, and the installed version could "
             f"not be determined."
         ) from None
-    if parts < floor:
+    if found < _Version(f"{floor[0]}.{floor[1]}"):
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' was verified on "
             f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "
@@ -5851,9 +5945,20 @@ def _check_audio_family_gate(processor):
     family = _audio_family_from_processor(processor)
     probed = _AUDIO_QUALIFIED_FAMILIES.get(family)
     installed = _installed_mlx_vlm_version()
-    if probed and installed in probed:
+    if probed and probed.admits(installed):
         _check_audio_transformers_floor(family)
         return family
+    renamed = _AUDIO_FAMILY_RENAMES.get(family)
+    if renamed and renamed in _AUDIO_QUALIFIED_FAMILIES:
+        # The old name's entry says nothing about the renamed implementation.
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training is not supported for '{family}'. "
+            f"mlx-vlm {installed or 'unknown'} loads this checkpoint as "
+            f"'{family}', which is a different implementation from the "
+            f"'{renamed}' this package qualified on mlx-vlm "
+            f"{_AUDIO_QUALIFIED_FAMILIES[renamed]}. Pin that version to train "
+            f"on audio with this model."
+        )
     if not _AUDIO_QUALIFIED_FAMILIES:
         raise NotImplementedError(
             f"Unsloth MLX: audio inputs were found in this dataset, but audio "
@@ -5862,13 +5967,13 @@ def _check_audio_family_gate(processor):
             f"image parts of this dataset."
         )
     supported = ", ".join(
-        f"{name} (mlx-vlm {', '.join(sorted(versions))})"
+        f"{name} (mlx-vlm {versions})"
         for name, versions in sorted(_AUDIO_QUALIFIED_FAMILIES.items())
     )
     if probed:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' has only been verified "
-            f"on mlx-vlm {', '.join(sorted(probed))}, but mlx-vlm "
+            f"on mlx-vlm {probed}, but mlx-vlm "
             f"{installed or 'unknown'} is installed. Pin a verified version to "
             f"train on audio. Verified: {supported}."
         )
@@ -10677,6 +10782,87 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
+    """Translate fractional epochs into HF-style accumulation windows."""
+    accum = max(1, int(grad_accum or 1))
+    per_epoch = max(1, math.ceil(cycle_length / accum))
+    budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+    whole, rem = divmod(budget, per_epoch)
+    return whole * cycle_length + rem * accum
+
+
+def _finite_row_schedule(
+    row_count,
+    batch_size,
+    *,
+    order_for_epoch,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    comm_group=None,
+):
+    """Build a finite, epoch-bounded microbatch schedule from row indices."""
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def batches_for_epoch(epoch):
+        order = list(order_for_epoch(epoch))
+        batches = []
+        for start in range(0, row_count, global_batch_size):
+            chunk = _rank_slice_distributed_batch(
+                order[start : start + global_batch_size],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=order,
+            )
+            if chunk:
+                batches.append(tuple(chunk))
+        return tuple(batches)
+
+    return _finite_batch_schedule(
+        batches_for_epoch,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+
+
+def _finite_batch_schedule(
+    batches_for_epoch,
+    *,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+):
+    """Build a finite horizon from already-bounded epoch microbatches."""
+    first_batches = tuple(tuple(batch) for batch in batches_for_epoch(0))
+    cycle_length = len(first_batches)
+    if cycle_length == 0:
+        return (), 0
+    target = num_batches
+    if target is None:
+        target = (
+            cycle_length
+            if num_epochs is None
+            else _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
+        )
+    schedule = []
+    epoch = 0
+    while len(schedule) < target:
+        batches = (
+            first_batches
+            if epoch == 0
+            else tuple(tuple(batch) for batch in batches_for_epoch(epoch))
+        )
+        if len(batches) != cycle_length:
+            raise ValueError("finite epoch schedules must have a stable batch count")
+        for batch in batches:
+            schedule.append(batch)
+            if len(schedule) >= target:
+                break
+        epoch += 1
+    return tuple(schedule), cycle_length
+
+
 def _create_ordered_text_plan(
     dataset,
     tokenizer,
@@ -10798,76 +10984,15 @@ def _create_ordered_text_plan(
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    schedule = []
-    epoch = 0
-    order = make_order(epoch)
-    order_pos = 0
-    seen = 0
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
-    # same length and a chunk's local slice is non-empty whatever rows it holds,
-    # so this is constant across epochs even under num_batches truncation.
-    cycle_length = sum(
-        1 for start in range(0, len(order), global_batch_size)
-        if _rank_slice_distributed_batch(
-            order[start : start + global_batch_size],
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
+    schedule, cycle_length = _finite_row_schedule(
+        len(tokenized),
+        batch_size,
+        order_for_epoch=make_order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+        comm_group=comm_group,
     )
-    # why: HF quantizes a fractional num_train_epochs to whole accumulation
-    # windows and re-iterates the dataloader rather than taking a proportional
-    # slice of rows, so 0.5 epochs of 5 rows at batch 2 / accum 2 is one update
-    # over 4 rows, not 3 rows. Build to that step budget: whole passes plus the
-    # windows of the partial one, where a pass's last micro-batch forces its own
-    # update. int(num_epochs) instead built 0 batches for 0 < epochs < 1, which
-    # surfaced as "No training batches created", and one pass for 1.5.
-    target_batches = None
-    if num_batches is None:
-        if num_epochs is None:
-            target_batches = cycle_length
-        else:
-            accum = max(1, int(grad_accum or 1))
-            per_epoch = max(1, math.ceil(cycle_length / accum))
-            budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-            whole, rem = divmod(budget, per_epoch)
-            target_batches = whole * cycle_length + rem * accum
-    while num_batches is None or len(schedule) < num_batches:
-        # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
-        # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
-        if order_pos >= len(order):
-            # Stop when num_batches or the epoch step budget is reached.
-            if (
-                num_batches is None
-                and (target_batches is None or len(schedule) >= target_batches)
-            ):
-                break
-            epoch += 1
-            order = make_order(epoch)
-            order_pos = 0
-
-        chunk = order[order_pos : order_pos + global_batch_size]
-        if not chunk:
-            break
-        order_pos += len(chunk)
-        seen += len(chunk)
-        chunk = _rank_slice_distributed_batch(
-            chunk,
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
-        if not chunk:
-            break
-        schedule.append(tuple(chunk))
-
-        if (
-            num_batches is None
-            and target_batches is not None
-            and len(schedule) >= target_batches
-        ):
-            break
 
     if labeled:
         rows = _finite_text_rows(tokenized)
@@ -12570,23 +12695,7 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
-        if drop is None:
-            dropout = 0.0
-        else:
-            keep = getattr(drop, "_p_1", None)
-            if keep is not None:
-                try:
-                    dropout = float(1.0 - float(keep))
-                except (TypeError, ValueError):
-                    dropout = 0.0
-            else:
-                p = getattr(drop, "p", None)
-                try:
-                    dropout = float(p) if p is not None else 0.0
-                except (TypeError, ValueError):
-                    dropout = 0.0
+        dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
 
@@ -12616,6 +12725,8 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
+        adapter_keys.add(f"{prefix}lora_a.weight")
+        adapter_keys.add(f"{prefix}lora_b.weight")
         # Include DoRA magnitude `m`, gated on the DoRA class name so a
         # future LoRA wrapper with an unrelated `m` attribute isn't exported.
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
@@ -12704,16 +12815,30 @@ def save_optimizer_state(optimizer, path):
     to ``<path>/optimizer_state.safetensors`` so training can resume from a
     checkpoint with identical optimizer dynamics.
 
-    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``.
-    ``tree_flatten`` produces dotted-name string keys (e.g.
-    ``"layers.0.lora_a.weight.m"``), all values are arrays, so the whole tree
-    serializes cleanly with ``mx.save_safetensors``. Round-trip preserves
-    bytes exactly for the optimizer's ``.state`` dict.
+    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``,
+    except that a quantized first moment is a 3-element list that ``tree_flatten``
+    decomposes into ``<param>.m.0/.1/.2``. Either way the flattened values are all
+    arrays, so the whole tree serializes cleanly with ``mx.save_safetensors``.
+
+    ``group_size``/``bits`` live on the optimizer instance rather than in the state
+    tree, so they are written as safetensors metadata; without them a resume cannot
+    tell how the packed moments were laid out.
     """
     import os
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
-    mx.save_safetensors(f"{path}/optimizer_state.safetensors", flat)
+    target = f"{path}/optimizer_state.safetensors"
+    if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
+        metadata = {
+            "quantized_moment_group_size" : str(optimizer.group_size),
+            "quantized_moment_bits"       : str(optimizer.bits),
+        }
+        try:
+            mx.save_safetensors(target, flat, metadata = metadata)
+            return
+        except TypeError:
+            pass  # backend without metadata support; fall through
+    mx.save_safetensors(target, flat)
 
 
 def load_optimizer_state(optimizer, path):
@@ -12724,10 +12849,52 @@ def load_optimizer_state(optimizer, path):
     Raises FileNotFoundError if the file is missing -- a resume request with
     no optimizer state is a hard error, not silent fall-back, because resuming
     with a fresh optimizer would silently restart Adam's moment estimates.
+
+    Reconciles a quantized first moment with the optimizer being resumed into.
+    Loading packed moments into a plain Adam/AdamW would otherwise reach
+    ``b1 * m`` on a list and raise a bare ``TypeError`` from inside mlx, and a
+    group_size mismatch would only surface as a dequantize shape error.
     """
+    from .optimizers_quantized import (
+        state_has_quantized_moments,
+        unpack_quantized_moments,
+    )
+
     state_path = f"{path}/optimizer_state.safetensors"
-    flat = mx.load(state_path)
-    optimizer.state = mlx.utils.tree_unflatten(list(flat.items()))
+    # Metadata form first: loading twice would keep two full copies of a
+    # multi-GB optimizer checkpoint live at once. Backends without the flag (the
+    # torch shim) still return a bare dict, so check the shape of what came back
+    # rather than trusting the kwarg to have been honoured.
+    metadata = {}
+    try:
+        loaded = mx.load(state_path, return_metadata=True)
+    except TypeError:
+        loaded = mx.load(state_path)
+    if isinstance(loaded, tuple) and len(loaded) == 2:
+        flat, metadata = loaded
+    else:
+        flat = loaded
+    state = mlx.utils.tree_unflatten(list(flat.items()))
+
+    if state_has_quantized_moments(state):
+        saved_group = int((metadata or {}).get(
+            "quantized_moment_group_size", getattr(optimizer, "group_size", 64),
+        ))
+        saved_bits = int((metadata or {}).get(
+            "quantized_moment_bits", getattr(optimizer, "bits", 8),
+        ))
+        if not hasattr(optimizer, "group_size"):
+            # Resuming an 8-bit checkpoint into a plain optimizer.
+            state = unpack_quantized_moments(state, saved_group, saved_bits)
+        elif (optimizer.group_size, optimizer.bits) != (saved_group, saved_bits):
+            print(
+                f"Unsloth: optimizer checkpoint packs its first moment with "
+                f"group_size={saved_group}, bits={saved_bits}; adopting those over "
+                f"group_size={optimizer.group_size}, bits={optimizer.bits}."
+            )
+            optimizer.group_size, optimizer.bits = saved_group, saved_bits
+
+    optimizer.state = state
 
 
 def save_trainer_state(trainer_state, path):
@@ -12912,6 +13079,17 @@ def _get_mlx_dropout_probability(drop):
         except (TypeError, ValueError):
             pass
     return 0.0
+
+
+def _read_mlx_lora_dropout(module):
+    """Read configured adapter dropout while a preference run has it disabled."""
+    drop = getattr(module, "dropout", None)
+    original = getattr(
+        drop, "_unsloth_preference_original_probability", None,
+    )
+    if original is not None:
+        return float(original)
+    return _get_mlx_dropout_probability(drop)
 
 
 def _coerce_mlx_lora_scale(scale, default=1.0):
@@ -13194,9 +13372,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
+                lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
