@@ -16,18 +16,25 @@
 
 """8-bit first-moment optimizer state for MLX.
 
-Behaviour over steps, not construction. Real MLX required, so this skips on Linux;
-the routing half runs under the torch shim. No ``Dataset.map`` here, so the
-spawn-vs-fork matrix does not apply.
+Behaviour over steps, not construction. Needs a real mlx runtime: Apple Silicon
+Metal, or Linux via ``mlx-cpu`` (both are wired up in CI). The routing half runs
+under the torch shim, which cannot implement ``mx.quantize``. No ``Dataset.map``
+here, so the spawn-vs-fork matrix does not apply.
 """
 
 import tempfile
 
 import pytest
 
-mx = pytest.importorskip("mlx.core", reason="MLX is only available on Apple Silicon")
-nn = pytest.importorskip("mlx.nn", reason="MLX is only available on Apple Silicon")
-optim = pytest.importorskip("mlx.optimizers", reason="MLX is only available on Apple Silicon")
+_SKIP = "Requires a real mlx runtime (Apple Silicon Metal, or Linux mlx-cpu)"
+
+mx = pytest.importorskip("mlx.core", reason=_SKIP)
+nn = pytest.importorskip("mlx.nn", reason=_SKIP)
+optim = pytest.importorskip("mlx.optimizers", reason=_SKIP)
+# importorskip alone is not enough: another test module may have installed the
+# mlx-on-torch shim into sys.modules first, and the shim raises on mx.quantize.
+if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
+    pytest.skip(_SKIP, allow_module_level=True)
 
 from mlx.utils import tree_flatten, tree_unflatten
 
@@ -39,6 +46,17 @@ from unsloth_zoo.mlx.optimizers_quantized import (
     QuantizedMomentAdamW,
 )
 from unsloth_zoo.mlx.utils import load_optimizer_state, save_optimizer_state
+
+
+@pytest.fixture(autouse=True)
+def _reject_shimmed_session():
+    """The shim is installed by other modules at test time, after this one was
+    imported, and it then owns mx.quantize for whichever unsloth_zoo module
+    imported mlx later. CI runs this file in its own pytest invocation (and fails
+    the job if it skips), so skipping here only affects mixed local runs."""
+    import sys
+    if "mlx_simulation" in sys.modules:
+        pytest.skip("the mlx-on-torch shim is active in this process")
 
 
 STEPS = 8
@@ -60,6 +78,21 @@ def _build_ineligible_model():
 
 
 def _batch(width=256, rows=32):
+    mx.random.seed(1)
+    return mx.random.normal((rows, width)), mx.random.normal((rows, width))
+
+
+def _build_bottleneck_model(width=256, hidden=64):
+    """Both weights stay quantization-eligible, but the model has far fewer
+    parameters than _underdetermined_batch has targets, so the loss floors above
+    zero instead of collapsing to ~1e-9."""
+    mx.random.seed(0)
+    model = nn.Sequential(nn.Linear(width, hidden), nn.ReLU(), nn.Linear(hidden, width))
+    mx.eval(model.parameters())
+    return model
+
+
+def _underdetermined_batch(width=256, rows=512):
     mx.random.seed(1)
     return mx.random.normal((rows, width)), mx.random.normal((rows, width))
 
@@ -110,16 +143,24 @@ def test_loss_decreases_with_quantized_first_moment():
 
 
 # 2 ------------------------------------------------------------------------
-def test_final_loss_matches_fp32_baseline():
-    x, y = _batch()
-    fp32 = _train(optim.Adam(learning_rate=1e-3, bias_correction=True), _build_model(), x, y)
-    int8 = _train(QuantizedMomentAdam(1e-3, bias_correction=True), _build_model(), x, y)
+def test_loss_trajectory_tracks_fp32_baseline():
+    """Compare the whole trajectory over a target the model CANNOT fit. On the
+    overparameterised fixture the loss reaches ~1e-9, where a relative comparison
+    measures nothing but float noise."""
+    x, y = _underdetermined_batch()
+    steps = 200
+    fp32 = _train(optim.Adam(learning_rate=1e-3, bias_correction=True),
+                  _build_bottleneck_model(), x, y, steps=steps)
+    int8 = _train(QuantizedMomentAdam(1e-3, bias_correction=True),
+                  _build_bottleneck_model(), x, y, steps=steps)
 
-    delta = abs(fp32[-1] - int8[-1])
-    assert delta < 1e-4, (
-        f"quantized first moment changed the final loss by {delta:.3e} "
-        f"(fp32 {fp32[-1]:.6f} vs int8 {int8[-1]:.6f})"
+    tail = slice(steps // 2, None)
+    mape = sum(abs(a - b) / abs(b) for a, b in zip(int8[tail], fp32[tail])) / (steps - steps // 2)
+    assert mape < 0.05, (
+        f"quantized first moment moved the loss trajectory by {mape:.2%} MAPE over the "
+        f"last {steps - steps // 2} steps (fp32 {fp32[-1]:.6e} vs int8 {int8[-1]:.6e})"
     )
+    assert all(l == l for l in int8), "quantized run produced a NaN"
 
 
 # 3 ------------------------------------------------------------------------
@@ -143,6 +184,9 @@ def test_optimizer_state_is_measurably_smaller():
 
 # 4 ------------------------------------------------------------------------
 def test_quantized_state_saves_reloads_and_resumes_identically():
+    """Compares POST-update parameters and every state leaf. ``_train`` returns the
+    loss computed before the update, so comparing that would pass even with
+    load_optimizer_state removed entirely."""
     x, y = _batch()
     model = _build_model()
     opt = QuantizedMomentAdam(1e-3, bias_correction=True)
@@ -152,7 +196,9 @@ def test_quantized_state_saves_reloads_and_resumes_identically():
     save_optimizer_state(opt, checkpoint)
     weights = dict(tree_flatten(model.parameters()))
 
-    continuous = _train(opt, model, x, y, steps=1)[0]
+    _train(opt, model, x, y, steps=1)
+    continuous = dict(tree_flatten(model.parameters()))
+    continuous_state = dict(tree_flatten(opt.state))
 
     resumed_model = _build_model()
     resumed_model.update(tree_unflatten(list(weights.items())))
@@ -164,11 +210,18 @@ def test_quantized_state_saves_reloads_and_resumes_identically():
     load_optimizer_state(resumed_opt, checkpoint)
     mx.eval(resumed_model.parameters(), resumed_opt.state)
 
-    resumed = _train(resumed_opt, resumed_model, x, y, steps=1)[0]
+    _train(resumed_opt, resumed_model, x, y, steps=1)
+    resumed = dict(tree_flatten(resumed_model.parameters()))
+    resumed_state = dict(tree_flatten(resumed_opt.state))
 
-    assert resumed == continuous, (
-        f"resume diverged: continuous {continuous:.8f} vs resumed {resumed:.8f}"
-    )
+    for name, expected in continuous.items():
+        delta = float(mx.abs(resumed[name] - expected).max())
+        assert delta == 0.0, f"resumed parameter {name} differs by {delta:.3e}"
+    assert resumed_state.keys() == continuous_state.keys(), "state tree shape changed"
+    for name, expected in continuous_state.items():
+        delta = float(mx.abs(resumed_state[name].astype(mx.float32)
+                             - expected.astype(mx.float32)).max())
+        assert delta == 0.0, f"resumed state leaf {name} differs by {delta:.3e}"
 
 
 # 5 ------------------------------------------------------------------------
@@ -180,9 +233,10 @@ def test_second_moment_is_never_quantized():
 
     second = _moment(opt, "v")
     assert isinstance(second, mx.array), (
-        f"second moment must stay a single fp32 array, got {type(second).__name__} "
+        f"second moment must stay a single unquantized array, got {type(second).__name__} "
         "(a tuple/list means it was quantized)"
     )
+    # This fixture is fp32; dtype tracking in general is test_moments_follow_the_parameter_dtype.
     assert second.dtype == mx.float32, f"second moment dtype is {second.dtype}, expected float32"
 
     first = _moment(opt, "m")
@@ -256,6 +310,117 @@ def test_unsupported_group_size_is_rejected(group_size):
 
 
 # 10 -----------------------------------------------------------------------
+# 11 -----------------------------------------------------------------------
+def test_zero_gradient_coordinates_never_move():
+    """A coordinate whose gradient is identically zero keeps v == 0, so the Adam
+    denominator is eps alone and any dequantization residue is amplified ~1e8x.
+    Plain Adam moves it by exactly nothing and so must this."""
+    steps, lr = 500, 1e-3
+    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+
+    def drive(opt):
+        param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+        opt.init({"w": param})
+        for _ in range(steps):
+            param = opt.apply_gradients({"w": grad}, {"w": param})["w"]
+            mx.eval(param, opt.state)
+        return param
+
+    got = drive(QuantizedMomentAdam(lr, bias_correction=True))
+    moved = float(mx.abs(got[0, 1:]).max())
+    assert moved == 0.0, (
+        f"a zero-gradient coordinate moved {moved:.6f} ({moved / (lr * steps):.1f}x the "
+        "lr*steps budget); plain Adam leaves it at exactly 0"
+    )
+    assert float(got[0, 0]) != 0.0, "the live coordinate should still train"
+
+
+# 12 -----------------------------------------------------------------------
+def test_plain_checkpoint_migrates_to_packed_on_resume():
+    """Before this optimizer existed, adamw_8bit produced plain AdamW state. Such a
+    checkpoint must not leave the moment full width for the rest of the run."""
+    x, y = _batch()
+    model = _build_model()
+    plain = optim.Adam(learning_rate=1e-3, bias_correction=True)
+    _train(plain, model, x, y, steps=4)
+    checkpoint = tempfile.mkdtemp()
+    save_optimizer_state(plain, checkpoint)
+
+    resumed = QuantizedMomentAdam(1e-3, bias_correction=True)
+    resumed_model = _build_model()
+    _train(resumed, resumed_model, x, y, steps=1)
+    load_optimizer_state(resumed, checkpoint)
+    assert isinstance(_moment(resumed, "m"), mx.array), "fixture is wrong: not a plain array"
+
+    _train(resumed, resumed_model, x, y, steps=1)
+    assert isinstance(_moment(resumed, "m"), (tuple, list)), (
+        "an eligible moment loaded from a pre-quantization checkpoint stayed full width"
+    )
+
+
+# 13 -----------------------------------------------------------------------
+def test_packed_checkpoint_loads_into_plain_optimizer():
+    """Switching back to optim="adamw" must not hand a list to mlx's b1 * m."""
+    x, y = _batch()
+    model = _build_model()
+    packed = QuantizedMomentAdam(1e-3, bias_correction=True)
+    _train(packed, model, x, y, steps=4)
+    checkpoint = tempfile.mkdtemp()
+    save_optimizer_state(packed, checkpoint)
+
+    plain = optim.Adam(learning_rate=1e-3, bias_correction=True)
+    plain_model = _build_model()
+    _train(plain, plain_model, x, y, steps=1)
+    load_optimizer_state(plain, checkpoint)
+    assert isinstance(_moment(plain, "m"), mx.array), "packed moment was not unpacked"
+    _train(plain, plain_model, x, y, steps=1)
+
+
+# 14 -----------------------------------------------------------------------
+@pytest.mark.parametrize("saved,resumed", [(32, 128), (128, 32)])
+def test_group_size_is_read_back_from_the_checkpoint(saved, resumed):
+    """group_size is an instance attribute, so it rides in safetensors metadata."""
+    x, y = _batch()
+    opt = QuantizedMomentAdam(1e-3, bias_correction=True, group_size=saved)
+    _train(opt, _build_model(), x, y, steps=2)
+    checkpoint = tempfile.mkdtemp()
+    save_optimizer_state(opt, checkpoint)
+
+    other = QuantizedMomentAdam(1e-3, bias_correction=True, group_size=resumed)
+    other_model = _build_model()
+    _train(other, other_model, x, y, steps=1)
+    load_optimizer_state(other, checkpoint)
+    assert other.group_size == saved
+    _train(other, other_model, x, y, steps=1)
+
+
+# 15 -----------------------------------------------------------------------
+@pytest.mark.parametrize("kwargs", [{"bits": 8.9}, {"group_size": 64.9}, {"bits": True}])
+def test_non_integral_settings_are_rejected(kwargs):
+    """int() truncates, so bits=8.9 would silently pass the bits == 8 check."""
+    with pytest.raises(ValueError, match="must be an integer"):
+        QuantizedMomentAdam(1e-3, **kwargs)
+
+
+# 16 -----------------------------------------------------------------------
+def test_moments_follow_the_parameter_dtype():
+    """The saving is 8-bit against the parameter dtype, not against float32."""
+    mx.random.seed(0)
+    model = nn.Sequential(nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, 256))
+    model.set_dtype(mx.bfloat16)
+    mx.eval(model.parameters())
+    mx.random.seed(1)
+    x = mx.random.normal((32, 256)).astype(mx.bfloat16)
+    y = mx.random.normal((32, 256)).astype(mx.bfloat16)
+
+    opt = QuantizedMomentAdam(1e-3, bias_correction=True)
+    _train(opt, model, x, y, steps=2)
+    assert _moment(opt, "v").dtype == mx.bfloat16, (
+        "v follows the parameter dtype; it is unquantized, not float32"
+    )
+    assert isinstance(_moment(opt, "m"), (tuple, list))
+
+
 def test_adamw_variant_also_quantizes():
 
     x, y = _batch()

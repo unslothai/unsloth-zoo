@@ -115,3 +115,8 @@ jobs:
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
         run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
+      - name: tests/test_mlx_quantized_optimizer_state.py
+        # 8-bit first-moment numerics on Metal: the affine quantizer rounds
+        # differently per backend, so the mlx-cpu job is not a substitute.
+        run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs

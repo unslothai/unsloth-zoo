@@ -10798,16 +10798,30 @@ def save_optimizer_state(optimizer, path):
     to ``<path>/optimizer_state.safetensors`` so training can resume from a
     checkpoint with identical optimizer dynamics.
 
-    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``.
-    ``tree_flatten`` produces dotted-name string keys (e.g.
-    ``"layers.0.lora_a.weight.m"``), all values are arrays, so the whole tree
-    serializes cleanly with ``mx.save_safetensors``. Round-trip preserves
-    bytes exactly for the optimizer's ``.state`` dict.
+    The optimizer's ``.state`` is a nested dict whose leaves are ``mx.array``,
+    except that a quantized first moment is a 3-element list that ``tree_flatten``
+    decomposes into ``<param>.m.0/.1/.2``. Either way the flattened values are all
+    arrays, so the whole tree serializes cleanly with ``mx.save_safetensors``.
+
+    ``group_size``/``bits`` live on the optimizer instance rather than in the state
+    tree, so they are written as safetensors metadata; without them a resume cannot
+    tell how the packed moments were laid out.
     """
     import os
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
-    mx.save_safetensors(f"{path}/optimizer_state.safetensors", flat)
+    target = f"{path}/optimizer_state.safetensors"
+    if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
+        metadata = {
+            "quantized_moment_group_size" : str(optimizer.group_size),
+            "quantized_moment_bits"       : str(optimizer.bits),
+        }
+        try:
+            mx.save_safetensors(target, flat, metadata = metadata)
+            return
+        except TypeError:
+            pass  # backend without metadata support; fall through
+    mx.save_safetensors(target, flat)
 
 
 def load_optimizer_state(optimizer, path):
@@ -10818,10 +10832,48 @@ def load_optimizer_state(optimizer, path):
     Raises FileNotFoundError if the file is missing -- a resume request with
     no optimizer state is a hard error, not silent fall-back, because resuming
     with a fresh optimizer would silently restart Adam's moment estimates.
+
+    Reconciles a quantized first moment with the optimizer being resumed into.
+    Loading packed moments into a plain Adam/AdamW would otherwise reach
+    ``b1 * m`` on a list and raise a bare ``TypeError`` from inside mlx, and a
+    group_size mismatch would only surface as a dequantize shape error.
     """
+    from .optimizers_quantized import (
+        state_has_quantized_moments,
+        unpack_quantized_moments,
+    )
+
     state_path = f"{path}/optimizer_state.safetensors"
-    flat = mx.load(state_path)
-    optimizer.state = mlx.utils.tree_unflatten(list(flat.items()))
+    flat, metadata = mx.load(state_path), {}
+    try:
+        # Backends that do not support the flag (the torch shim) still return a
+        # bare dict, so check the shape of what came back rather than trusting it.
+        loaded = mx.load(state_path, return_metadata=True)
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            flat, metadata = loaded
+    except TypeError:
+        pass
+    state = mlx.utils.tree_unflatten(list(flat.items()))
+
+    if state_has_quantized_moments(state):
+        saved_group = int((metadata or {}).get(
+            "quantized_moment_group_size", getattr(optimizer, "group_size", 64),
+        ))
+        saved_bits = int((metadata or {}).get(
+            "quantized_moment_bits", getattr(optimizer, "bits", 8),
+        ))
+        if not hasattr(optimizer, "group_size"):
+            # Resuming an 8-bit checkpoint into a plain optimizer.
+            state = unpack_quantized_moments(state, saved_group, saved_bits)
+        elif (optimizer.group_size, optimizer.bits) != (saved_group, saved_bits):
+            print(
+                f"Unsloth: optimizer checkpoint packs its first moment with "
+                f"group_size={saved_group}, bits={saved_bits}; adopting those over "
+                f"group_size={optimizer.group_size}, bits={optimizer.bits}."
+            )
+            optimizer.group_size, optimizer.bits = saved_group, saved_bits
+
+    optimizer.state = state
 
 
 def save_trainer_state(trainer_state, path):
