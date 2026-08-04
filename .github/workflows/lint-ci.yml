@@ -42,9 +42,8 @@ jobs:
       - run: pip install 'ruff==0.15.12' 'pyyaml>=6'
 
       - name: Python AST/syntax check (every committed .py must compile)
-        # continue-on-error during CI bootstrap: pyproject.toml declares
-        # `requires-python = ">=3.9,<3.15"` but temporary_patches/gpt_oss.py
-        # uses a 3.10+ `match` statement. Tracked as a separate cleanup PR.
+        # This runs on 3.12, so it cannot see syntax that is merely newer than the
+        # declared floor. tests/test_python39_compatibility.py is what pins that.
         continue-on-error: true
         run: |
           python -m compileall -q -j 0 unsloth_zoo tests scripts
@@ -52,7 +51,8 @@ jobs:
       - name: Python ruff check (narrow gate)
         # E9 / F63 / F7 / F82: syntax errors, broken comparisons, undefined names.
         # continue-on-error during CI bootstrap: first run on main surfaced 13
-        # latent findings (rl_replacements.py L1128 F821, gpt_oss match-on-3.9).
+        # latent findings (rl_replacements.py L1128 F821). The gpt_oss match-on-3.9
+        # one is fixed; the rest still need clearing before this can gate.
         continue-on-error: true
         run: |
           ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts

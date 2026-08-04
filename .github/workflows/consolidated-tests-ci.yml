@@ -103,7 +103,15 @@ jobs:
         # + cache-completeness gate (CPU-pure; collect-only would let it
         # regress silently). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). Executing them here keeps fixture/source drift visible.
+        # no weights). test_mlx_quantized_optimizer_routing pins which optim
+        # names reach the 8-bit path; it runs under the torch shim so it
+        # EXECUTES here rather than skipping (the numerics need real MLX and run
+        # in the mlx-cpu job below and on the Apple Silicon job).
+        # test_find_common_token_ids_no_match pins the no-match contract for
+        # chat-marker core recovery (stub tokenizer, no weights).
+        # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
+        # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
+        # pins add_special_tokens for text that already carries BOS.
         #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
@@ -112,6 +120,12 @@ jobs:
         # CPU-pure and monkeypatch every Hub entry point, so they cost under two
         # seconds. Left out of a gate they would have been collected but never
         # run: `pytest tests/ --collect-only` above proves only that they import.
+        #
+        # test_python39_compatibility pins the package to the floor pyproject
+        # declares. No job here runs that floor -- the matrix above starts at 3.10 --
+        # so a 3.10-only `match` and a module-level `str | Path` both reached main and
+        # made the package un-importable on 3.9. It reads the floor from pyproject, so
+        # raising requires-python relaxes it rather than making it lie.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -120,6 +134,7 @@ jobs:
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
+            tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
             tests/test_quant_status_transport_errors.py \
@@ -127,6 +142,10 @@ jobs:
             tests/test_local_fp8_base_offline_resolution.py \
             tests/test_local_4bit_merge_offline_resolution.py \
             tests/test_gated_and_offline_config_classification.py \
+            tests/test_find_common_token_ids_no_match.py \
+            tests/test_vllm_direct_lora_loading.py \
+            tests/test_sft_prepare_dataset_double_bos.py \
+            tests/test_python39_compatibility.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
@@ -142,6 +161,50 @@ jobs:
             tests/test_zoo_history_regressions.py \
             tests/test_pypi_version_sync.py \
             -v
+
+  # Real MLX numerics on Linux. mlx-cpu publishes a manylinux x86-64 wheel and
+  # mx.quantize/dequantize/compile all run on it, so the 8-bit optimizer state
+  # is gated on every PR instead of only on the opt-in Apple Silicon job.
+  # Separate job: tests/mlx_simulation/ must never be in sys.modules here.
+  mlx-cpu-numerics:
+    name: MLX numerics (Linux CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install torch CPU + zoo + mlx-cpu
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
+
+      - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
+        # -rs surfaces skips; the next step fails the job if the file skipped,
+        # because a skipped numeric suite is not a gate.
+        run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      - name: Fail if the numeric tests skipped
+        run: |
+          python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
+          if grep -qiE '[0-9]+ skipped' out.txt; then
+            echo "real mlx is installed but the numeric tests skipped"; exit 1
+          fi
 
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults. fail-fast=false; drift in one cell shouldn't cancel others.
@@ -290,3 +353,90 @@ jobs:
             tests/test_transformers_moe_structure_drift.py \
             tests/test_moe_merge_e2e_cpu.py \
             tests/test_merge_e2e_hub_unreachable.py
+
+  # The MLX VLM/shape/batching suites on Linux CPU MLX: mlx ships manylinux CPU
+  # wheels and mlx-lm/mlx-vlm are py3-none-any, so these cost no macOS minutes.
+  # mlx-ci.yml runs the same three files against real Metal.
+  #
+  # No job ran them before: `pytest tests/ --collect-only` proves only that they
+  # import, and is continue-on-error besides. That is how the audio family gate
+  # reached main admitting one exact mlx-vlm string while pyproject allows every
+  # later release, leaving the feature unreachable on a normal install.
+  #
+  # Separate from mlx-cpu-numerics: these need mlx-lm and mlx-vlm, which that job
+  # deliberately omits, and resolving them there could move transformers.
+  mlx-cpu-tests:
+    name: MLX suites (Linux CPU MLX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install CPU torch + zoo + CPU MLX
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in
+        # unsloth_zoo/__init__.py; mlx-cpu is the Linux runtime, spelled as
+        # mlx-cpu-numerics spells it.
+        #
+        # The MLX packages must resolve in the SAME pip call as .[core]. Split,
+        # pip solves them independently and mlx-vlm 0.6.9 (transformers>=5.14)
+        # drags transformers past the <=5.5.0 this project pins: measured
+        # 5.5.0 -> 5.14.1. Together, pip honours the cap and lands on the newest
+        # mlx-vlm that fits, which is the 0.6.4 ceiling the audio gate records.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core] \
+            "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4"
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+
+      - name: Assert the real MLX runtime is what got installed
+        # All three files importorskip mlx.core, and a module that skips
+        # wholesale still exits 0, so without this the job could go green having
+        # run nothing. tests/mlx_simulation/ is the torch-backed shim.
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          origin = str(getattr(mx, "__file__", "") or "")
+          assert "mlx_simulation" not in origin, f"shim, not real mlx: {origin}"
+          assert int(mx.array([1, 2, 3]).sum()) == 6, "mlx cannot add"
+          print("real mlx at", origin)
+          PY
+          python -c "import mlx_vlm, mlx_lm; print('mlx-vlm', mlx_vlm.__version__)"
+          # If the joint resolution missed the transformers cap, this job is
+          # gating an environment the package forbids.
+          python - <<'PY'
+          from importlib.metadata import version
+          from packaging.version import Version
+          transformers = Version(version("transformers"))
+          assert transformers <= Version("5.5.0"), (
+              f"transformers {transformers} exceeds the cap this package pins; "
+              "the MLX packages were resolved without it"
+          )
+          print("transformers", transformers, "within the pinned cap")
+          PY
+
+      # One pytest process per file: tests/mlx_simulation/ replaces
+      # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
+      - name: tests/test_mlx_shape_guard.py
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: tests/test_mlx_vlm_label_masks.py
+        # Audio collation, label masking and the family/version gate.
+        run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
+
+      - name: tests/test_mlx_batching_and_decay.py
+        run: python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
