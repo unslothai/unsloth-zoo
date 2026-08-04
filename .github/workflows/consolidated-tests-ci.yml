@@ -350,6 +350,10 @@ jobs:
   # import, and is continue-on-error besides. That is how the audio family gate
   # reached main admitting one exact mlx-vlm string while pyproject allows every
   # later release, leaving the feature unreachable on a normal install.
+  #
+  # Kept separate from mlx-cpu-numerics rather than folded into it: these suites
+  # need mlx-lm and mlx-vlm, which that job deliberately does not install, and
+  # resolving them there could move transformers under an established gate.
   mlx-cpu-tests:
     name: MLX suites (Linux CPU MLX)
     runs-on: ubuntu-latest
@@ -371,13 +375,14 @@ jobs:
 
       - name: Install CPU torch + zoo + CPU MLX
         # --no-deps unsloth satisfies the find_spec("unsloth") guard in
-        # unsloth_zoo/__init__.py; mlx[cpu] is the Linux runtime.
+        # unsloth_zoo/__init__.py; mlx-cpu is the Linux runtime, spelled as
+        # mlx-cpu-numerics spells it.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.11.0"
           pip install -e .[core]
-          pip install "mlx[cpu]>=0.22.0" "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4"
+          pip install "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4"
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3
 
