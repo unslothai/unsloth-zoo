@@ -41,14 +41,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "unsloth_zoo"
 
 # Imported eagerly by unsloth_zoo/__init__.py, so they must hold on the floor even
-# though the rest of mlx/ is lazy.
-MLX_IMPORT_TIME = {"__init__.py", "runtime.py"}
+# though the rest of mlx/ is lazy. Package-relative, since mlx/cce/__init__.py shares
+# a file name with mlx/__init__.py but is lazy like the rest of the subpackage.
+MLX_IMPORT_TIME = {"mlx/__init__.py", "mlx/runtime.py"}
 
 
 def declared_floor():
     """The ``>=X.Y`` in requires-python, as a tuple for ast.parse(feature_version=)."""
     text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r"^requires-python\s*=\s*[\"']([^\"']+)[\"']", text, re.M)
+    match = re.search(r"^requires-python\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
     assert match, "no requires-python in pyproject.toml"
     floor = re.search(r">=\s*(\d+)\.(\d+)", match.group(1))
     assert floor, f"no >= lower bound in requires-python = {match.group(1)!r}"
@@ -57,10 +58,10 @@ def declared_floor():
 
 def in_scope(path):
     """Files that must work on the floor, with the two exclusions applied."""
-    rel = path.relative_to(PACKAGE_ROOT).parts
-    if rel[0] == "_vendored":
+    rel = path.relative_to(PACKAGE_ROOT)
+    if rel.parts[0] == "_vendored":
         return False
-    if rel[0] == "mlx" and path.name not in MLX_IMPORT_TIME:
+    if rel.parts[0] == "mlx" and rel.as_posix() not in MLX_IMPORT_TIME:
         return False
     return True
 
@@ -72,18 +73,71 @@ def scoped_files():
     return files
 
 
-def annotations_of(node):
-    """Annotation expressions that this node evaluates at def/exec time."""
-    if isinstance(node, ast.AnnAssign):
-        return [node.annotation] if node.annotation else []
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return []
+def signature_annotations(node):
+    """Parameter and return annotations, evaluated when the ``def`` executes."""
     args = node.args
     out = [a.annotation for a in
            [*args.args, *args.kwonlyargs, *args.posonlyargs, args.vararg, args.kwarg]
            if a is not None and a.annotation is not None]
     if node.returns:
         out.append(node.returns)
+    return out
+
+
+def evaluated_annotations(tree):
+    """Annotations Python evaluates, so the future import is what defers them.
+
+    Variable annotations are evaluated at module and class scope only; inside a
+    function body they are never evaluated, so flagging those is a false positive.
+    Signature annotations are evaluated wherever their ``def`` is.
+    """
+    out = []
+
+    def walk(node, in_function):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.AnnAssign) and child.annotation and not in_function:
+                out.append(child.annotation)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.extend(signature_annotations(child))
+            nested = isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            walk(child, in_function or nested)
+
+    walk(tree, False)
+    return out
+
+
+def looks_like_a_type(node):
+    """Conservative: enough for ``str | Path``, not enough for ``re.A | re.M``.
+
+    Flag constants are ALL_CAPS by convention, so requiring a non-caps name keeps
+    bitwise arithmetic (``re.DOTALL | re.MULTILINE``, ``os.W_OK | os.X_OK``) out.
+    """
+    if isinstance(node, ast.Constant):
+        return node.value is None
+    if isinstance(node, ast.Subscript):
+        return looks_like_a_type(node.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return looks_like_a_type(node.left) and looks_like_a_type(node.right)
+    name = getattr(node, "id", None) or getattr(node, "attr", None)
+    return bool(name) and not name.isupper()
+
+
+def evaluated_values(tree):
+    """Assigned values at module and class scope, which run on import.
+
+    Type aliases are the case that matters: ``PathLike = str | Path`` raises below
+    3.10 and, unlike an annotation, the future import does not defer it.
+    """
+    out = []
+
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None:
+                out.append(child.value)
+            if isinstance(child, ast.ClassDef):
+                walk(child)
+
+    walk(tree)
     return out
 
 
@@ -110,40 +164,79 @@ def test_every_module_parses_on_the_declared_floor():
 
 
 def test_no_pep604_unions_are_evaluated_on_the_declared_floor():
-    """`X | Y` is a TypeError below 3.10 unless the module defers annotations."""
+    """``X | Y`` is a TypeError below 3.10 unless the module defers it."""
     if declared_floor() >= (3, 10):
         pytest.skip("floor is 3.10+, PEP 604 evaluates fine")
     offenders = []
     for path in scoped_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if has_future_annotations(tree):
-            continue
-        for node in ast.walk(tree):
-            for annotation in annotations_of(node):
-                for inner in ast.walk(annotation):
-                    if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr):
-                        offenders.append(
-                            f"{path.relative_to(REPO_ROOT)}:{inner.lineno}: "
-                            f"{ast.unparse(inner)}"
-                        )
+        where = path.relative_to(REPO_ROOT)
+        # The future import defers annotations only; an assigned value still runs.
+        deferred = has_future_annotations(tree)
+        for expression in ([] if deferred else evaluated_annotations(tree)):
+            for inner in ast.walk(expression):
+                if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr):
+                    offenders.append(
+                        f"{where}:{inner.lineno}: {ast.unparse(inner)} (annotation)")
+        for expression in evaluated_values(tree):
+            for inner in ast.walk(expression):
+                if (isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr)
+                        and looks_like_a_type(inner)):
+                    offenders.append(
+                        f"{where}:{inner.lineno}: {ast.unparse(inner)} (type alias)")
     assert not offenders, (
-        "PEP 604 unions evaluated at def time; add `from __future__ import "
-        "annotations` to these modules:\n  " + "\n  ".join(sorted(set(offenders)))
+        "PEP 604 unions evaluated below 3.10. Annotations are deferred by `from "
+        "__future__ import annotations`; type aliases need typing.Union, which that "
+        "import does NOT defer:\n  " + "\n  ".join(sorted(set(offenders)))
     )
 
 
+def _is_floor_version_check(node):
+    """``sys.version_info < (3, 10)``, as an expression."""
+    if not (isinstance(node, ast.Compare) and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Lt)):
+        return False
+    left = node.left
+    if not (isinstance(left, ast.Attribute) and left.attr == "version_info"):
+        return False
+    right = node.comparators[0]
+    return (isinstance(right, ast.Tuple) and len(right.elts) == 2
+            and [getattr(e, "value", None) for e in right.elts] == [3, 10])
+
+
 def test_vendored_fla_stays_gated_below_310():
-    """The exclusion above is only sound while this guard skips the injection."""
-    source = (PACKAGE_ROOT / "temporary_patches" / "fla_vendor.py").read_text(encoding="utf-8")
-    assert re.search(r"sys\.version_info\s*<\s*\(\s*3\s*,\s*10\s*\)", source), (
-        "the <3.10 guard in fla_vendor.py is gone, so the vendored kernels can now be "
-        "injected on the floor - either restore it or bring _vendored/fla into scope here"
+    """Excluding _vendored/fla is sound only while this guard bails out on the floor.
+
+    Asserted structurally, not by grepping: a commented-out or dead-code check would
+    satisfy a text search while the injection went ahead anyway.
+    """
+    path = PACKAGE_ROOT / "temporary_patches" / "fla_vendor.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    guard = next((n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == "_torch_triton_cuda_supported"), None)
+    assert guard is not None, (
+        "_torch_triton_cuda_supported is gone from fla_vendor.py; this test pins the "
+        "guard that lets _vendored/fla stay out of scope, so re-point it or drop that "
+        "exclusion in in_scope()"
+    )
+    bails_out = any(
+        _is_floor_version_check(node.test)
+        and any(isinstance(inner, ast.Return)
+                and getattr(inner.value, "value", None) is False
+                for inner in ast.walk(node))
+        for node in ast.walk(guard) if isinstance(node, ast.If)
+    )
+    assert bails_out, (
+        "no `if sys.version_info < (3, 10): return False` controls "
+        "_torch_triton_cuda_supported, so the vendored FLA kernels can now be injected "
+        "on the floor - restore the guard or bring _vendored/fla into in_scope()"
     )
 
 
 def test_mlx_modules_reachable_at_import_are_in_scope():
     """mlx/ is excluded as lazy, but these two are imported by unsloth_zoo/__init__.py."""
-    for name in sorted(MLX_IMPORT_TIME):
-        path = PACKAGE_ROOT / "mlx" / name
+    for relative in sorted(MLX_IMPORT_TIME):
+        path = PACKAGE_ROOT / relative
         assert path.exists(), f"{path} vanished; update MLX_IMPORT_TIME"
-        assert in_scope(path), f"{name} must stay in scope, it is imported eagerly"
+        assert in_scope(path), f"{relative} must stay in scope, it is imported eagerly"
