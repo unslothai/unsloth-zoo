@@ -193,11 +193,33 @@ def evaluated_values(tree):
                 out.extend(child.decorator_list)
             if isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None:
                 out.append(child.value)
+            if isinstance(child, ast.Expr):
+                out.append(child.value)   # a bare call runs on import too
             if isinstance(child, scoped):
                 walk(child)
 
     walk(tree)
     return out
+
+
+def union_nodes(expression):
+    """``BinOp(BitOr)`` nodes in an annotation, skipping ``Literal[...]`` contents.
+
+    ``Literal[re.I | re.M]`` is flag arithmetic over values, evaluates fine on 3.9,
+    and must not be read as a union.
+    """
+    if isinstance(expression, ast.Subscript):
+        base = expression.value
+        name = getattr(base, "id", None) or getattr(base, "attr", None)
+        if name == "Literal":
+            return union_nodes(base)
+        return union_nodes(base) + union_nodes(expression.slice)
+    found = []
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.BitOr):
+        found.append(expression)
+    for child in ast.iter_child_nodes(expression):
+        found.extend(union_nodes(child))
+    return found
 
 
 def has_future_annotations(tree):
@@ -251,14 +273,12 @@ def test_no_pep604_unions_are_evaluated_on_the_declared_floor():
         # The future import defers annotations only; an assigned value still runs.
         deferred = has_future_annotations(tree)
         for expression in ([] if deferred else evaluated_annotations(tree)):
-            for inner in ast.walk(expression):
-                if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr):
-                    offenders.append(
-                        f"{where}:{inner.lineno}: {ast.unparse(inner)} (annotation)")
+            for inner in union_nodes(expression):
+                offenders.append(
+                    f"{where}:{inner.lineno}: {ast.unparse(inner)} (annotation)")
         for expression in evaluated_values(tree):
-            for inner in ast.walk(expression):
-                if (isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr)
-                        and looks_like_a_type_alias(inner, known_typing_names)):
+            for inner in union_nodes(expression):
+                if looks_like_a_type_alias(inner, known_typing_names):
                     offenders.append(
                         f"{where}:{inner.lineno}: {ast.unparse(inner)} (type alias)")
     assert not offenders, (
