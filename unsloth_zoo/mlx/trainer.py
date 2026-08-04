@@ -830,11 +830,16 @@ _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
 
 
-def _normalize_mlx_scheduler_type(name):
+def _canonical_mlx_scheduler_name(name):
+    """Spelling-normalized scheduler name, before aliasing."""
     if hasattr(name, "value"):
         name = name.value
     sched_type = str(name or "linear").strip().lower()
-    sched_type = sched_type.rsplit(".", 1)[-1].replace("-", "_")
+    return sched_type.rsplit(".", 1)[-1].replace("-", "_")
+
+
+def _normalize_mlx_scheduler_type(name):
+    sched_type = _canonical_mlx_scheduler_name(name)
     sched_type = _MLX_LR_SCHEDULER_ALIASES.get(sched_type, sched_type)
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
         supported = ", ".join(
@@ -3520,6 +3525,7 @@ class MLXTrainer:
         # parameters the additional scheduler types need.
         warmup = self._resolve_warmup_steps(total_steps)
         requested_type = self.args.lr_scheduler_type
+        requested_name = _canonical_mlx_scheduler_name(requested_type)
         sched_type = _normalize_mlx_scheduler_type(requested_type)
 
         # HF parity: scheduler knobs ride in `lr_scheduler_kwargs` on a ported
@@ -3567,6 +3573,21 @@ class MLXTrainer:
             raise ValueError(
                 "Unsloth: only one of lr_scheduler_kwargs['min_lr'] or "
                 "['min_lr_rate'] may be set."
+            )
+        if (
+            requested_name == "cosine_with_min_lr"
+            and min_lr is None
+            and min_lr_rate_kwarg is None
+            and getattr(self.args, "lr_scheduler_min_lr_rate", None) is None
+        ):
+            # HF requires the floor rather than defaulting it
+            # (transformers/optimization.py:374-375). Without this the alias
+            # would accept a config HF rejects and quietly train a plain
+            # cosine down to 0.
+            raise ValueError(
+                "Unsloth: lr_scheduler_type='cosine_with_min_lr' requires one of "
+                "lr_scheduler_kwargs['min_lr'] or ['min_lr_rate'] (or the "
+                "lr_scheduler_min_lr_rate config attribute) to be set."
             )
         if sched_type == "polynomial":
             lr_end = float(knob("lr_end", None, 1e-7))

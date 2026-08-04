@@ -8463,6 +8463,32 @@ def test_cosine_warmup_with_min_lr_is_not_silently_aliased():
         _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr")
 
 
+def test_cosine_with_min_lr_requires_a_floor_like_hf():
+    """HF raises when neither min_lr nor min_lr_rate is given
+    (transformers/optimization.py:374-375). Accepting the name without the
+    floor would train a plain cosine to 0 for a config HF refuses to build."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="cosine_with_min_lr",
+    )
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(60)
+
+    for floor in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5}):
+        trainer.args.lr_scheduler_kwargs = floor
+        assert callable(trainer._build_schedule(60))
+    trainer.args.lr_scheduler_kwargs = None
+    trainer.args.lr_scheduler_min_lr_rate = 0.1
+    assert callable(trainer._build_schedule(60))
+
+    # Plain cosine is unaffected: a floor is optional there.
+    trainer.args.lr_scheduler_type = "cosine"
+    trainer.args.lr_scheduler_min_lr_rate = None
+    assert callable(trainer._build_schedule(60))
+
+
 def test_cosine_with_restarts_does_not_wrap_to_full_lr_past_the_end():
     """HF returns 0 once progress hits 1 rather than starting a fresh cycle
     (transformers/optimization.py:181-182). A ragged final epoch can force one
