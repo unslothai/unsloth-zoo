@@ -3497,6 +3497,182 @@ def calls_output_capture_target(init, source, target_names):
     return False
 
 
+def _install_patched_forward(model_location, module, forward, combined_module):
+    """Bind one rewritten forward everywhere the old one is reachable."""
+    exec(
+        f"{model_location}.torch.nn.{module}.forward = forward",
+        globals(),
+        locals(),
+    )
+    try:
+        exec(f"{model_location}.nn.{module}.forward = forward", globals(), locals())
+    except:
+        pass
+    if combined_module is not None:
+        exec(
+            f"combined_module.torch.nn.{module}.forward = forward",
+            globals(),
+            locals(),
+        )
+        try:
+            exec(f"combined_module.nn.{module}.forward = forward", globals(), locals())
+        except:
+            pass
+    pass
+
+
+def _dtype_safe_forward(original_forward, is_conv, disable):
+    """The dtype casts of the source rewrite, without needing the source.
+
+    Same three shapes: a conv casts its input to the weight dtype and the
+    result back; an eager norm does the same but only when it is affine; a
+    compiled norm only casts the result, since casting in changes batched
+    numerics.
+    """
+
+    def forward(self, input, *args, **kwargs):
+        original_dtype = input.dtype
+        if is_conv:
+            input = input.to(self.weight.dtype)
+        elif disable and getattr(self, "weight", None) is not None:
+            input = input.to(self.weight.dtype)
+        return original_forward(self, input, *args, **kwargs).to(original_dtype)
+
+    forward.__unsloth_dtype_wrapped__ = True
+    return forward
+
+
+def _patch_torch_dtype_modules(
+    model_location,
+    functions,
+    torch_compile_options,
+    compile_torch_modules,
+    disable,
+    combined_module,
+):
+    """Patch torch.nn conv / norm forwards for mixed-precision dtypes.
+
+    Lifted out of ``unsloth_compile_transformers`` unchanged so the
+    unreadable-source path can still run it: these rewrites read torch's
+    own source, never the model's, so they work when the model's does not.
+    """
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
+    if compile_torch_modules:
+        if not disable:
+            # Compiled global F.layer_norm: only when compiling is allowed
+            from .patch_torch_functions import patch_torch_functions
+
+            patch_torch_functions()
+
+        _conv_modules = frozenset([
+            "Conv1d", "Conv2d", "Conv3d",
+            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
+        ])
+        for module in _patch_functions:
+            try:
+                source = eval(f"{model_location}.torch")
+            except:
+                continue
+            if not hasattr(source, "nn"):
+                continue
+            if not hasattr(source.nn, module):
+                continue
+            function = eval(f"source.nn.{module}")
+            if not hasattr(function, "forward"):
+                continue
+            if hasattr(function.forward, "get_compiler_config"):
+                continue
+            if getattr(function.forward, "__unsloth_dtype_wrapped__", False):
+                continue
+
+            try:
+                source = inspect.getsource(function.forward).rstrip()
+            except (OSError, TypeError):
+                # A forward built by exec, or one whose file has gone. Unguarded
+                # the OSError propagates out of FastModel.from_pretrained and
+                # the model does not load, over source we only wanted in order
+                # to patch a dtype cast. `get_compiler_config` above only covers
+                # torch.compile wrappers.
+                #
+                # The precondition is not fully characterised: two plain Qwen
+                # loads do not trigger it, and after such a load no torch.nn
+                # forward is unreadable (both measured). This guards a state we
+                # have seen, not a theory about how it arises.
+                #
+                # Skipping would only move the failure to the first forward, so
+                # wrap instead: the casts do not need the source, only the
+                # rewrite does.
+                _install_patched_forward(
+                    model_location,
+                    module,
+                    _dtype_safe_forward(
+                        function.forward, module in _conv_modules, disable
+                    ),
+                    combined_module,
+                )
+                continue
+
+            if module in _conv_modules:
+                # Conv modules: cast input to weight dtype before the conv op,
+                # then cast output back to original input dtype. This prevents
+                # dtype mismatches under mixed-precision autocast (eg bf16
+                # weight + fp16 input crashes F.conv1d).
+                lines = source.split("\n")
+                def_line = lines[0]
+                body_lines = lines[1:]
+                first_body = next((l for l in body_lines if l.strip()), "")
+                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                prologue = [
+                    body_indent + "original_dtype = input.dtype",
+                    body_indent + "input = input.to(self.weight.dtype)",
+                ]
+                source = "\n".join([def_line] + prologue + body_lines)
+                append_str = ".to(original_dtype)\n"
+            else:
+                # Norm modules: detect the actual parameter name (input or x)
+                import re as _re
+                m = _re.search(r"def forward\(self,\s*(\w+)", source)
+                param_name = m.group(1) if m else "input"
+                if disable:
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
+                    lines = source.split("\n")
+                    def_line = lines[0]
+                    body_lines = lines[1:]
+                    first_body = next((l for l in body_lines if l.strip()), "")
+                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    prologue = [
+                        body_indent + f"original_dtype = {param_name}.dtype",
+                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                    ]
+                    source = "\n".join([def_line] + prologue + body_lines)
+                    append_str = ".to(original_dtype)\n"
+                else:
+                    append_str = f".to({param_name}.dtype)\n"
+
+            forward = create_new_function(
+                module,
+                source,
+                model_location,
+                functions,
+                prepend=_license_header
+                + f"\ntorch_compile_options = {torch_compile_options}\n",
+                append=append_str,
+                overwrite=False,
+                add_torch_compile=False,
+            ).forward
+
+            _install_patched_forward(
+                model_location, module, forward, combined_module
+            )
+            pass
+        pass
+    pass
+
+
 def unsloth_compile_transformers(
     model_type: str = "llama",
     sdpa_dynamic_mask: bool = True,
@@ -3703,6 +3879,22 @@ def unsloth_compile_transformers(
             f"Unsloth: Could not read the source of {getattr(modeling_file, '__name__', modeling_file)} "
             f"({type(exception).__name__}: {exception}), so source-level "
             f"optimisations are skipped for it. The model still works."
+        )
+        # Say so explicitly: the caller seeds this True and only the normal
+        # path writes it, so returning silently leaves SDPA selected for a
+        # model that never claimed it. Eager is always available.
+        modeling_file.__UNSLOTH_SUPPORTS_SDPA__ = False
+        if supports_sdpa is not None:
+            assert type(supports_sdpa) is list and len(supports_sdpa) == 1
+            supports_sdpa[0] = False
+        # These read torch's source, not the model's, so they still work here.
+        _patch_torch_dtype_modules(
+            model_location,
+            functions,
+            torch_compile_options,
+            compile_torch_modules,
+            disable,
+            None,
         )
         return
 
@@ -4770,133 +4962,14 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    # These rewrites never compile (add_torch_compile=False), so run them even
-    # when compiling is disabled: norms are fp32 upcast at load regardless, and
-    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
-    if compile_torch_modules:
-        if not disable:
-            # Compiled global F.layer_norm: only when compiling is allowed
-            from .patch_torch_functions import patch_torch_functions
-
-            patch_torch_functions()
-
-        _conv_modules = frozenset([
-            "Conv1d", "Conv2d", "Conv3d",
-            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
-        ])
-        for module in _patch_functions:
-            try:
-                source = eval(f"{model_location}.torch")
-            except:
-                continue
-            if not hasattr(source, "nn"):
-                continue
-            if not hasattr(source.nn, module):
-                continue
-            function = eval(f"source.nn.{module}")
-            if not hasattr(function, "forward"):
-                continue
-            if hasattr(function.forward, "get_compiler_config"):
-                continue
-
-            try:
-                source = inspect.getsource(function.forward).rstrip()
-            except (OSError, TypeError):
-                # A forward built by exec, or one whose file has gone. Unguarded
-                # the OSError propagates out of FastModel.from_pretrained and
-                # the model does not load, over source we only wanted in order
-                # to patch a dtype cast. `get_compiler_config` above only covers
-                # torch.compile wrappers.
-                #
-                # The precondition is not fully characterised: two plain Qwen
-                # loads do not trigger it, and after such a load no torch.nn
-                # forward is unreadable (both measured). This guards a state we
-                # have seen, not a theory about how it arises. Either way source
-                # we cannot read cannot be source-patched, and every other
-                # unsupported case in this loop already skips.
-                continue
-
-            if module in _conv_modules:
-                # Conv modules: cast input to weight dtype before the conv op,
-                # then cast output back to original input dtype. This prevents
-                # dtype mismatches under mixed-precision autocast (eg bf16
-                # weight + fp16 input crashes F.conv1d).
-                lines = source.split("\n")
-                def_line = lines[0]
-                body_lines = lines[1:]
-                first_body = next((l for l in body_lines if l.strip()), "")
-                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
-                prologue = [
-                    body_indent + "original_dtype = input.dtype",
-                    body_indent + "input = input.to(self.weight.dtype)",
-                ]
-                source = "\n".join([def_line] + prologue + body_lines)
-                append_str = ".to(original_dtype)\n"
-            else:
-                # Norm modules: detect the actual parameter name (input or x)
-                import re as _re
-                m = _re.search(r"def forward\(self,\s*(\w+)", source)
-                param_name = m.group(1) if m else "input"
-                if disable:
-                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
-                    # and out. Compiled path left untouched (adding the cast there
-                    # changes batched numerics). weight is None when affine=False.
-                    lines = source.split("\n")
-                    def_line = lines[0]
-                    body_lines = lines[1:]
-                    first_body = next((l for l in body_lines if l.strip()), "")
-                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
-                    prologue = [
-                        body_indent + f"original_dtype = {param_name}.dtype",
-                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
-                    ]
-                    source = "\n".join([def_line] + prologue + body_lines)
-                    append_str = ".to(original_dtype)\n"
-                else:
-                    append_str = f".to({param_name}.dtype)\n"
-
-            forward = create_new_function(
-                module,
-                source,
-                model_location,
-                functions,
-                prepend=_license_header
-                + f"\ntorch_compile_options = {torch_compile_options}\n",
-                append=append_str,
-                overwrite=False,
-                add_torch_compile=False,
-            ).forward
-
-            exec(
-                f"{model_location}.torch.nn.{module}.forward = forward",
-                globals(),
-                locals(),
-            )
-            try:
-                exec(
-                    f"{model_location}.nn.{module}.forward = forward",
-                    globals(),
-                    locals(),
-                )
-            except:
-                pass
-            if combined_module is not None:
-                exec(
-                    f"combined_module.torch.nn.{module}.forward = forward",
-                    globals(),
-                    locals(),
-                )
-                try:
-                    exec(
-                        f"combined_module.nn.{module}.forward = forward",
-                        globals(),
-                        locals(),
-                    )
-                except:
-                    pass
-            pass
-        pass
-    pass
+    _patch_torch_dtype_modules(
+        model_location,
+        functions,
+        torch_compile_options,
+        compile_torch_modules,
+        disable,
+        combined_module,
+    )
     # Quick exit
     if combined_module is None or full_disable:
         print(
