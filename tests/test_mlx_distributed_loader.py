@@ -79,6 +79,32 @@ def _write_config(tmp_path, config):
     return path
 
 
+def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+    text = tmp_path / "text"
+    text.mkdir()
+    (text / "config.py").write_text("class ModelConfig:\n    text_config: object\n")
+    omni = tmp_path / "omni"
+    omni.mkdir()
+    (omni / "config.py").write_text("class ThinkerConfig:\n    vision_config: object\n")
+    assert not loader._config_source_has_modality(text)
+    assert loader._config_source_has_modality(omni)
+    models = tmp_path / "models"
+    models.mkdir()
+    static_vlm = models / "static_vlm"
+    static_vlm.mkdir()
+    (static_vlm / "__init__.py").write_text("raise RuntimeError('must not import')\n")
+    (static_vlm / "config.py").write_text("class ModelConfig:\n    vision_config: object\n")
+    import mlx_vlm.models as mlx_vlm_models
+    monkeypatch.setattr(mlx_vlm_models, "__path__", [str(models)])
+    assert "static_vlm" in loader._build_vlm_model_types()
+    monkeypatch.setattr(loader, "_vlm_model_types_cache", frozenset({"vendored_vlm"}))
+    assert loader._is_vlm({"vision_config": {"hidden_size": 32}})
+    assert loader._is_vlm({"model_type": "vendored_vlm"})
+    assert not loader._is_vlm({"model_type": "text_only", "architectures": ["TextForCausalLM"]})
+    assert not loader._is_vlm({"vision_config": {}, "model_type": "text_only"})
+
+
 def test_apply_mlx_distributed_sharding_modes_and_guards():
     from unsloth_zoo.mlx.loader import (
         _apply_mlx_distributed_sharding,
@@ -207,9 +233,21 @@ def test_load_mlx_lm_distributed_tensor_uses_strict_fallback(monkeypatch, tmp_pa
 
 
 def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
     calls = []
+    bound_calls = []
+    def bind(sharded):
+        def wrapped(*args, **kwargs):
+            bound_calls.append(True)
+            return sharded(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", bind)
     model_dir = _write_config(tmp_path, {"model_type": "raw"})
+    (model_dir / "model.safetensors").write_text("weights")
+    monkeypatch.chdir(tmp_path)
     messages = ["The model does not support pipeline parallelism", "Model type kimi_k25 not supported", "Unsupported model type kimi_k25", "checkpoint exploded"]
 
     class _FakeVLM:
@@ -223,7 +261,7 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
         return _FakeVLM(), types.SimpleNamespace(name="processor")
 
     vlm_utils = types.ModuleType("mlx_vlm.utils")
-    vlm_utils.get_model_path = lambda repo, revision=None: model_dir
+    vlm_utils.get_model_path = lambda repo, revision=None: Path("model")
     vlm_utils.sharded_load = sharded_load
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
@@ -236,33 +274,57 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
         _load_mlx_vlm_distributed("fake/vlm", "kimi_k25", pipeline_group=pipeline_group)
     assert calls[0][3] == "patched"
     assert Path(calls[0][0]).exists()
+    assert (Path(calls[0][0]) / "model.safetensors").read_text() == "weights"
     assert model._unsloth_mlx_config_view_paths == [str(calls[0][0])]
     model._unsloth_mlx_config_view_finalizers[0]()
     assert not Path(calls[0][0]).exists()
     assert "Unsloth:" not in str(exc_info.value)
     assert calls[0][1:3] == (tensor_group, None)
     assert all(call[1:3] == (None, pipeline_group) for call in calls[1:])
+    assert len(bound_calls) == 5
 
 
-def test_from_pretrained_distributed_vlm_passes_override_without_temp_view(monkeypatch, tmp_path):
+def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatch, tmp_path):
     import mlx_lm.utils as mlx_lm_utils
     import unsloth_zoo.mlx.loader as loader
     from unsloth_zoo.mlx.loader import FastMLXModel
 
-    config = {"model_type": "raw", "vision_config": {}, "architectures": ["DeepSeekOCRForCausalLM"], "auto_map": {"x": "y"}}
+    config = {
+        "model_type": "raw",
+        "vision_config": {},
+        "architectures": ["DeepSeekOCRForCausalLM"],
+        "auto_map": {"x": "y"},
+    }
     model_path, calls = _write_config(tmp_path, config), []
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *_a, **_k: model_path)
-    monkeypatch.setattr(loader, "_materialize_mlx_vlm_config_data", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("first temp view")))
-    monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", lambda *_a, config_override_data=None, **_k: (calls.append(config_override_data), (types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())))[1])
-    for name in ("install_mlx_compile_patches", "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype", "_patch_mixed_precision_set_dtype", "_fix_gemma4_kv_sharing", "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa", "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32", "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation", "_fix_gemma3_multimodal_image_feature_scale"):
+
+    def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
+        calls.append((model_type, config_override_data, allow_remote_code))
+        return types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())
+
+    monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", distributed)
+    noops = (
+        "install_mlx_compile_patches", "_ensure_vlm_processor_inputs_patched",
+        "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype",
+        "_patch_mixed_precision_set_dtype", "_ensure_minicpmo_mlx_sanitize",
+        "_ensure_minicpmo_vision_dtype", "_fix_gemma4_kv_sharing",
+        "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa",
+        "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32",
+        "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation",
+        "_fix_gemma3_multimodal_image_feature_scale",
+    )
+    for name in noops:
         monkeypatch.setattr(loader, name, lambda *_a, **_k: None)
     monkeypatch.setattr(loader, "_repair_degraded_vlm_processor", lambda processor, *_a, **_k: processor)
     monkeypatch.setattr(loader, "_infer_snapshot_commit", lambda *_a, **_k: "commit")
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.SimpleNamespace(load=lambda *_a, **_k: None))
 
-    FastMLXModel.from_pretrained("fake/vlm", text_only=False, tensor_group=_FakeGroup(), load_in_4bit=False)
-
-    assert calls == [{k: v for k, v in config.items() if k != "auto_map"} | {"model_type": "deepseekocr"}]
+    FastMLXModel.from_pretrained(
+        "fake/vlm", text_only=False, tensor_group=_FakeGroup(),
+        load_in_4bit=False, trust_remote_code=True,
+    )
+    expected = {key: value for key, value in config.items() if key != "auto_map"}
+    assert calls == [("deepseekocr", expected | {"model_type": "deepseekocr"}, True)]
 
 
 def _patch_fast_mlx_text_load(monkeypatch, tmp_path, config):

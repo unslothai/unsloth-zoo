@@ -86,15 +86,63 @@ __all__ = [
     "is_hf_xet_available",
     "xet_force_disabled",
     "child_should_disable_xet",
+    "DEFAULT_STALL_TIMEOUT",
+    "DEFAULT_CONNECT_TIMEOUT",
+    "DEFAULT_HTTP_STALL_TIMEOUT",
 ]
 
 _CTX = mp.get_context("spawn")
 
-# Defaults match the existing Unsloth inference watchdog and hub shutdown deadline.
+# Stall thresholds are tiered by phase. Once a partial exists, 30s of a frozen byte count is a hung
+# Xet transfer, since Xet writes continuously. BEFORE any partial exists the child is still doing
+# DNS + TLS + metadata, legitimately slow on a congested link, so that phase gets a longer leash.
+# HTTP keeps the patient threshold: it is the last resort, and killing it has nowhere left to go.
+DEFAULT_STALL_TIMEOUT = 30.0
+DEFAULT_CONNECT_TIMEOUT = 90.0
+DEFAULT_HTTP_STALL_TIMEOUT = 180.0
+# How often the watchdog measures. Detection latency is up to one interval on top of the timeout,
+# so this has to be well under DEFAULT_STALL_TIMEOUT to honour it.
+DEFAULT_POLL_INTERVAL = 5.0
+
+# A child buffering from the network grows RSS at roughly the wire rate. Well above allocator noise
+# but far below one poll's worth of even a thin link (20 Mbit/s is ~12 MB per 5s tick), so a
+# genuinely hung child cannot drift past it.
+_RSS_PROGRESS_EPSILON = 4 * 1024 * 1024
+# Growth below _RSS_PROGRESS_EPSILON but above this is a child receiving, just slowly: 4 MiB over a
+# 30s deadline is a 1.12 Mbit/s floor, and xet only touches the file at head-of-line boundaries, so
+# a slower link (tethered mobile, rural DSL, throttled corporate egress) has flat disk AND
+# sub-epsilon RSS growth at once and was being killed mid-transfer. The window moves rather than the
+# epsilon, which the frozen-child case needs as noise margin. 256 KiB over 30s is about 68 kbit/s,
+# below any link a download could finish on and far above allocator drift (measured 0 KiB over 32s
+# for a wedged child in a socket retry loop).
+_RSS_SLOW_LINK_EPSILON = 256 * 1024
+
+# Absolute cap on how long peer liveness may keep resetting the connect clock. The case protected is
+# "queued behind one live download" and the hub lock is per blob, so the wait is bounded by a single
+# blob: a ~5GB shard on a slow link is well under an hour. Without a cap, a continuous series of
+# UNRELATED same-repo downloads suppresses the clock forever and a genuinely hung child never falls
+# back, because the parent cannot tell which blob its child is waiting for.
+PEER_SUPPRESSION_CEILING = 3600.0
+# How often a "still downloading" status is pushed to the UI (independent of the measure rate).
 DEFAULT_HEARTBEAT_INTERVAL = 30.0
-DEFAULT_STALL_TIMEOUT = 180.0
 DEFAULT_GRACE_PERIOD = 10.0
 _POLL_INTERVAL = 0.5
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a positive float override from the environment; ignore junk rather than crash a load."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r", name, raw)
+        return default
+    return value
 
 # Serializes the parent-env (and __main__.__file__) mutation around a child spawn so
 # concurrent downloads cannot observe each other's transport env.
@@ -120,6 +168,66 @@ def _safe_status(callback: Optional[Callable[[str], None]], message: str) -> Non
         callback(message)
     except Exception as e:
         logger.debug("watchdog status callback raised (ignored): %s", e)
+
+
+def _xet_health_or_none():
+    """The machine's Xet verdict, or ``None`` when it cannot be determined.
+
+    ``probe = False`` deliberately: on the download path a network probe would add latency to every
+    request, so only the cheap local signals (RAM floor, remembered verdict) are consulted; probing
+    is for an explicit preflight. Imported lazily and defensively -- a health check must never stop a
+    download starting, so any failure degrades to "no opinion" and the Xet-first ladder runs.
+    """
+    try:
+        from .hf_xet_health import xet_health
+
+        return xet_health(probe = False)
+    except Exception as e:
+        logger.debug("Xet health check unavailable: %s", e)
+        return None
+
+
+def _xet_log_dir() -> Optional[str]:
+    """Where hf_xet writes its own logs: ``HF_XET_LOG_DEST`` if pointed at a directory, else the
+    ``logs/`` subdir of the active Xet cache (hf_xet's default)."""
+    dest = os.environ.get("HF_XET_LOG_DEST")
+    if dest:
+        # An empty value means "log to console"; a file path is not a directory we can scan.
+        return dest if os.path.isdir(dest) else None
+    try:
+        from .hf_cache import _active_caches
+
+        _, _, xet_cache = _active_caches()
+        return str(xet_cache / "logs") if xet_cache is not None else None
+    except Exception:
+        return None
+
+
+def _xet_failure_reason(summary: str) -> str:
+    """Attach hf_xet's own ERROR/WARN lines to *summary* so the recorded verdict says WHY."""
+    try:
+        from .hf_xet_tuning import scan_xet_log
+
+        # Scrubbed like any other child error: a reqwest failure Displays the full URL, and CAS/S3
+        # reads use presigned URLs carrying an X-Amz-Signature. This reason is persisted to the
+        # health state and shown in the UI for 24h.
+        messages = [
+            _default_scrub_secrets(m)
+            for m in scan_xet_log(_xet_log_dir(), max_messages = 2)
+        ]
+    except Exception:
+        messages = []
+    return f"{summary}: {' | '.join(messages)}" if messages else summary
+
+
+def _record_xet_outcome(ok: bool, reason: str = "") -> None:
+    """Report a finished Xet attempt to the health tracker; never raises."""
+    try:
+        from .hf_xet_health import record_xet_outcome
+
+        record_xet_outcome(ok, reason)
+    except Exception as e:
+        logger.debug("Could not record Xet outcome: %s", e)
 
 
 class DownloadStallError(RuntimeError):
@@ -234,9 +342,15 @@ def _default_prepare_for_http(
                         if owned_incomplete_blobs is not None and blob.name not in owned_incomplete_blobs:
                             continue
                         try:
-                            # Spare a partial touched within active_grace (a slow sibling, not stalled);
-                            # our killed partial has been static for the full stall timeout so it purges.
-                            if time.time() - blob.stat().st_mtime < active_grace:
+                            # The mtime grace only GUESSES whether a partial belongs to a live sibling,
+                            # and when ownership is known the guess is wrong: a 180s grace spares the
+                            # 30s-old partial of the child we just killed, so has_active_incomplete_blobs()
+                            # forces force_download and the snapshot re-fetches every complete shard.
+                            owned = (
+                                owned_incomplete_blobs is not None
+                                and blob.name in owned_incomplete_blobs
+                            )
+                            if not owned and time.time() - blob.stat().st_mtime < active_grace:
                                 continue
                             blob.unlink()
                         except OSError:
@@ -291,6 +405,41 @@ def _active_incomplete_blob_sizes(
     except Exception:
         pass
     return sizes
+
+
+def _child_rss(pid: int) -> Optional[int]:
+    """Resident bytes of child *pid*, or ``None`` when undeterminable.
+
+    The sensor for "receiving data but not written yet": xet-core reconstructs strictly SEQUENTIALLY,
+    so nothing reaches the ``.incomplete`` until the head-of-line xorb block (up to 64 MiB)
+    completes and every fetched byte sits in the reconstruction buffer, i.e. in RSS. Measured at the
+    proxy, 431 MB arrived at a sustained 19.9 Mbit/s while the partial stayed flat at 0.5 MB for 171
+    consecutive seconds, with RSS climbing at the wire rate throughout.
+
+    Deliberately NOT ``/proc/<pid>/io`` ``rchar``: that counts VFS reads and reqwest reads sockets
+    with ``recv(2)``, which does not increment it (measured: 67 MB over a socket moves rchar by 99
+    bytes), so a healthy Xet download shows a frozen rchar.
+
+    The signal self-bounds: once the buffer pool saturates, backpressure throttles the network to the
+    write rate, so RSS goes flat exactly when the disk starts growing.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None  # type: ignore
+    if psutil is not None:
+        try:
+            return int(psutil.Process(pid).memory_info().rss)
+        except Exception:
+            return None
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
@@ -375,30 +524,69 @@ def start_watchdog(
     on_stall: Callable[[str], None],
     repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
+    interval: Optional[float] = None,
+    stall_timeout: Optional[float] = None,
+    connect_timeout: Optional[float] = None,
+    heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     xet_disabled: bool = False,
     on_heartbeat: Optional[Callable[[str], None]] = None,
     watch_new_partials_only: bool = False,
     baseline_incomplete_blobs: Optional[set] = None,
     child_pid: Optional[int] = None,
+    watch_connect: Optional[bool] = None,
 ) -> threading.Event:
-    """Start a daemon thread firing ``on_stall(message)`` once iff a ``*.incomplete`` is present AND the
-    on-disk size is unchanged for *stall_timeout* seconds. The timer resets while no ``*.incomplete``
-    exists, so post-download init is not misread as a stall. Returns a stop event the caller sets when
-    the download phase ends.
+    """Start a daemon thread firing ``on_stall(message)`` once when a download stops making progress.
+    Returns a stop event the caller sets when the download phase ends.
 
-    *watch_new_partials_only* (single-file) measures progress only over the child's own partial, so a
-    sibling pull of a different file cannot keep a hung child alive. That partial is identified by the
-    blobs *child_pid* has open (precise across a resume), else the partials not in
-    *baseline_incomplete_blobs* (captured pre-spawn). Snapshots keep the repo-wide measurement."""
+    Two clocks, because a frozen byte count means different things before and after bytes flow. Once
+    a ``*.incomplete`` exists, *stall_timeout* (30s on Xet) of an unchanged on-disk size is a hang.
+    While NO partial exists the child is still resolving DNS / TLS / metadata, so *connect_timeout*
+    (90s) applies instead; this phase used to just reset the timer, so a child hung before it ever
+    opened a partial was never detected. Both clocks are reset by real progress and neither runs
+    after the download completes. Defaults are transport-aware (HTTP keeps the patient 180s) and
+    overridable via ``UNSLOTH_XET_STALL_TIMEOUT`` / ``UNSLOTH_XET_CONNECT_TIMEOUT``.
+
+    The connect clock only runs when there is a download process to kill, which *child_pid* signals
+    and *watch_connect* forces either way. Callers wrapping the whole of ``from_pretrained`` cannot
+    distinguish "no bytes because the child is wedged" from "no bytes because the repo is cached and
+    we are quantising to 4-bit", so for them a frozen byte count is normal; they keep the stall
+    clock, which only runs against a demonstrably open partial.
+
+    *watch_new_partials_only* (single-file) measures only the child's own partial, so a sibling pull
+    cannot keep a hung child alive. That partial is identified by the blobs *child_pid* has open
+    (precise across a resume), else the partials not in *baseline_incomplete_blobs* (captured
+    pre-spawn). Snapshots keep the repo-wide measurement."""
     stop = threading.Event()
     transport = "https" if xet_disabled else "xet"
     fired = False
+    if stall_timeout is None:
+        stall_timeout = _env_seconds(
+            "UNSLOTH_XET_STALL_TIMEOUT",
+            DEFAULT_HTTP_STALL_TIMEOUT if xet_disabled else DEFAULT_STALL_TIMEOUT,
+        )
+    if connect_timeout is None:
+        connect_timeout = _env_seconds("UNSLOTH_XET_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)
+    if interval is None:
+        # Never sample slower than the tighter of the two deadlines, or the timeout is meaningless.
+        interval = min(DEFAULT_POLL_INTERVAL, max(1.0, min(stall_timeout, connect_timeout) / 4.0))
     baseline = set(baseline_incomplete_blobs or ())
+    connect_clock = (child_pid is not None) if watch_connect is None else bool(watch_connect)
     single_repo_id = repo_ids[0] if repo_ids else ""
 
-    def _measure() -> Optional[tuple[int, bool]]:
+    def _partial_bytes(ids) -> int:
+        """Bytes sitting in ACTIVE ``*.incomplete`` partials, nothing else."""
+        total = 0
+        for one in ids or []:
+            total += sum(_active_incomplete_blob_sizes(repo_type, one, cache_dir).values())
+        return total
+
+    def _measure() -> Optional[tuple[int, bool, int]]:
+        """``(bytes_watched, has_incomplete, bytes_in_active_partials)``.
+
+        The third element exists because in the repo-wide modes *bytes_watched* also counts blobs
+        already COMPLETE before this download began (a cached config, a shard from an earlier run),
+        so a nonzero total says nothing about whether the CURRENT transfer got its first byte.
+        """
         if watch_new_partials_only:
             sizes = _active_incomplete_blob_sizes(repo_type, single_repo_id, cache_dir)
             open_names = _child_open_incomplete_blobs(child_pid) if child_pid else None
@@ -407,26 +595,159 @@ def start_watchdog(
                 # siblings). hf_xet holds the .incomplete fd continuously, so an EMPTY set means the child
                 # owns no partial YET (connect / metadata phase), not a sibling's.
                 owned = {name: n for name, n in sizes.items() if name in open_names}
-                return (sum(owned.values()), len(owned) > 0)
+                owned_bytes = sum(owned.values())
+                return (owned_bytes, len(owned) > 0, owned_bytes)
             if child_pid:
-                # pid given but open files uninspectable (no psutil AND no /proc: native Windows / macOS
-                # without psutil). Post-baseline name filtering would forever EXCLUDE a resumed partial
-                # reusing a baseline name, so a frozen Xet resume never trips -- defeating the fallback.
-                # Fall back to the repo-wide measure (as snapshots do): the resume is watched, at the cost
-                # that a same-repo sibling's progress may mask this child's stall (accepted tradeoff).
-                return get_hf_download_state(
+                # pid given but open files uninspectable (no psutil AND no /proc). Post-baseline name
+                # filtering would forever EXCLUDE a resumed partial reusing a baseline name, so a frozen
+                # Xet resume would never trip. Fall back to the repo-wide measure, accepting that a
+                # same-repo sibling's progress may mask this child's stall.
+                state = get_hf_download_state(
                     [single_repo_id], repo_type = repo_type, cache_dir = cache_dir
                 )
+                return None if state is None else (state[0], state[1], sum(sizes.values()))
             # No child pid at all: follow only newly-created (post-baseline) partials.
             owned = {name: n for name, n in sizes.items() if name not in baseline}
-            return (sum(owned.values()), len(owned) > 0)
-        return get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+            owned_bytes = sum(owned.values())
+            return (owned_bytes, len(owned) > 0, owned_bytes)
+        state = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+        return None if state is None else (state[0], state[1], _partial_bytes(repo_ids))
 
     def _beat() -> None:
         nonlocal fired
         state = _measure()
         last_size = state[0] if state is not None else 0
         last_change = time.monotonic()
+        last_heartbeat = 0.0
+        # False until at least one BYTE has been observed. Phasing on the partial's existence was
+        # wrong both ways: hub/hf_xet can create the .incomplete before CAS setup finishes, handing a
+        # healthy-but-slow connect the 30s data deadline instead of the 90s connect one, and a
+        # partial going away after bytes flowed means the transfer finished.
+        seen_bytes = bool(state[2]) if state is not None else False
+        # Sticky, unlike seen_bytes: it only selects the "did not resume" wording for the gap between
+        # files, and must not reset when a partial set momentarily empties.
+        seen_bytes_ever = seen_bytes
+        peer_wait_start: Optional[float] = None
+        # peer_wait_start's role for the branches that suppress on a peer AFTER bytes have been seen;
+        # a separate variable because those run while seen_bytes is true, exactly when peer_wait_start
+        # is cleared. Without a ceiling here a stale peer partial could hold the clock off forever.
+        peer_hold_start: Optional[float] = None
+        last_rss = (_child_rss(child_pid) if child_pid else None) or 0
+        peer_size: Optional[int] = None
+
+        def _peer_progressing() -> bool:
+            """Is some OTHER writer downloading into this repo right now?
+
+            huggingface_hub serialises two callers of the same uncached file on an unbounded per-file
+            lock and the waiter owns no .incomplete, so in watch_new_partials_only mode it looks like
+            a child stuck before the first byte. Repo-wide growth separates "queued behind a live
+            download" from "hung"; without it, a first download lasting longer than connect_timeout
+            makes every concurrent second caller fail hard.
+            """
+            nonlocal peer_size
+            if not watch_new_partials_only:
+                return False  # the snapshot measure is already repo-wide
+            peer = get_hf_download_state(repo_ids, repo_type = repo_type, cache_dir = cache_dir)
+            current = peer[0] if peer is not None else None
+            if current is None or current != peer_size:
+                peer_size = current
+                return True
+            # Flat disk is NOT proof the peer is dead: a healthy Xet transfer writes strictly
+            # sequentially, so its .incomplete can sit unchanged for minutes while data piles up in
+            # the reconstruction buffer (measured: 171s at 20 Mbit/s), and requiring continuous
+            # growth killed a waiter at connect_timeout while the holder downloaded fine. A fresh
+            # peer-owned partial is the liveness signal.
+            #
+            # The bound is the peer SUPPRESSION ceiling, not a stall timeout: 180s sits only 9s above
+            # that measured 171s window, so any link slower than 20 Mbit/s expired the peer's
+            # liveness mid-transfer. The caller enforces the ceiling independently, so a stale
+            # leftover stays bounded by that rather than by an mtime that races the link speed.
+            fresh = PEER_SUPPRESSION_CEILING
+            now_wall = time.time()
+            for one in repo_ids or []:
+                for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
+                    blobs_dir = entry / "blobs"
+                    if not blobs_dir.is_dir():
+                        continue
+                    try:
+                        for blob in blobs_dir.iterdir():
+                            try:
+                                if (
+                                    blob.name.endswith(INCOMPLETE_SUFFIX)
+                                    and blob.is_file()
+                                    and now_wall - blob.stat().st_mtime < fresh
+                                ):
+                                    return True
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
+            return False
+
+        def _waiting_on_a_peers_partial() -> bool:
+            """Repo-wide (snapshot) mode: does another PROCESS own the transfer we are watching?
+
+            A child parked on the hub's per-blob cache lock holds no ``.incomplete``, yet the
+            repo-wide phase signal already latched ``seen_bytes`` from the PEER's partial, so it
+            lands in the data branch where its own disk and RSS signals are flat by definition.
+            Without this it is killed at stall_timeout and records a false Xet failure; a multi-rank
+            launch then hits the demotion threshold on the first run and pins a working machine to
+            HTTP for 24h.
+
+            Bounded by the caller's PEER_SUPPRESSION_CEILING, not the partial's mtime: an mtime
+            window must exceed the peer's head-of-line pause, which scales with the link, so any
+            value short enough to bound a leftover also expires on a healthy slow peer.
+            """
+            if watch_new_partials_only or not child_pid:
+                return False
+            owned = _child_open_incomplete_blobs(child_pid)
+            if owned is None or owned:
+                # Uninspectable -> keep the disk-only verdict. Non-empty -> the partial is ours.
+                return False
+            fresh = PEER_SUPPRESSION_CEILING
+            now_wall = time.time()
+            for one in repo_ids or []:
+                for entry in iter_active_repo_cache_dirs(repo_type, one, cache_dir = cache_dir):
+                    blobs_dir = entry / "blobs"
+                    if not blobs_dir.is_dir():
+                        continue
+                    try:
+                        for blob in blobs_dir.iterdir():
+                            try:
+                                if (
+                                    blob.name.endswith(INCOMPLETE_SUFFIX)
+                                    and blob.is_file()
+                                    and now_wall - blob.stat().st_mtime < fresh
+                                ):
+                                    return True
+                            except OSError:
+                                continue
+                    except OSError:
+                        continue
+            return False
+
+        def _child_exited(pid: Optional[int]) -> bool:
+            """Has the supervised downloader already gone? An exited process is not hung, and its exit
+            code is what the ladder acts on, so neither connect trip should fire for it."""
+            if not pid or not os.path.isdir("/proc"):
+                return False
+            return not os.path.isdir(f"/proc/{pid}")
+
+        def _peer_hold_ok(now: float) -> bool:
+            """May a peer keep holding the clock off? Bounded by PEER_SUPPRESSION_CEILING."""
+            nonlocal peer_hold_start
+            if not _waiting_on_a_peers_partial():
+                return False
+            if peer_hold_start is None:
+                peer_hold_start = now
+                return True
+            return now - peer_hold_start < PEER_SUPPRESSION_CEILING
+
+        def _trip(message: str) -> None:
+            nonlocal fired
+            if not fired:
+                fired = True
+                on_stall(message)
 
         while not stop.wait(interval):
             state = _measure()
@@ -439,28 +760,120 @@ def start_watchdog(
                 _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
                 continue
 
-            current_size, has_incomplete = state
+            current_size, has_incomplete, partial_bytes = state
+            rss = _child_rss(child_pid) if child_pid else None
             if current_size != last_size:
                 last_size = current_size
                 last_change = now
+                # The head-of-line block landed and the reconstruction buffer just drained, so re-base
+                # the RSS sensor on the CURRENT reading: xet's buffer is a process-wide budget reused
+                # across files, so the next episode refills BELOW this peak, and a lifetime high-water
+                # mark would hide that fill and trip the data clock on a child receiving at wire rate.
+                if rss is not None:
+                    last_rss = rss
+                peer_hold_start = None      # our own transfer moved: we are not holding on a peer
+            # Phase on the partials open RIGHT NOW, not a run-once latch: partial bytes rather than
+            # the repo-wide total (which includes blobs complete before this download began), and
+            # re-evaluated every tick, because a latch stayed true after file N finished and charged
+            # file N+1's empty .incomplete the 30s data deadline during CAS setup. last_size /
+            # last_change stay repo-wide; only the deadline SELECTION was wrong.
+            seen_bytes = bool(partial_bytes)
+            if seen_bytes:
+                seen_bytes_ever = True
+                peer_wait_start = None      # a byte landed: we are not a lock waiter
 
-            # Reset unless .incomplete confirms an active download, so model init and lock waits
-            # are not counted as a stall.
-            if not has_incomplete:
-                last_change = now
-            elif now - last_change >= stall_timeout:
-                if not fired:
-                    fired = True
-                    on_stall(
+            elapsed = now - last_change
+            if has_incomplete and seen_bytes:
+                # Bytes flowed into a still-open partial, so a frozen count is a hang UNLESS the child
+                # is filling its reconstruction buffer, which does not touch disk until the
+                # head-of-line block lands. See _child_rss.
+                if rss is not None and rss < last_rss:
+                    # Buffer handed back to the allocator: the baseline is the TROUGH since the last
+                    # reset, never a peak, or growth below an old peak reads as no progress.
+                    last_rss = rss
+                if rss is not None and rss > last_rss + _RSS_PROGRESS_EPSILON:
+                    last_rss = rss
+                    last_change = now
+                elif elapsed >= _deadline(rss, last_rss, stall_timeout):
+                    if _peer_hold_ok(now):
+                        # Someone else owns this transfer; we are a lock waiter, not a stall.
+                        last_change = now
+                        continue
+                    _trip(
                         f"Download appears stalled ({transport} transport) "
-                        f"-- no progress for {int(now - last_change)}s"
+                        f"-- no progress for {int(elapsed)}s"
                     )
-                return
+                    return
+            elif not has_incomplete and seen_bytes_ever:
+                # Bytes flowed earlier and no partial is open now: either the transfer FINISHED
+                # (symlinking) or the child is BETWEEN FILES and hung before opening the next one,
+                # which is normal mid-download since a snapshot does metadata and the cache lock
+                # first. Resetting unconditionally made that hang invisible to BOTH clocks forever
+                # once any byte had been seen. The patient connect clock governs the gap; repo-wide
+                # progress resets it above and a live peer is covered by the waiter gate.
+                #
+                # Only where there is a download child to kill: for a caller wrapping the whole of
+                # from_pretrained this state is also what a FINISHED download looks like while the
+                # weights are quantised, and the repo-wide total does not move across the final
+                # .incomplete -> blob rename, so the clock would be counting model init.
+                if (
+                    connect_clock
+                    and not _child_exited(child_pid)
+                    and elapsed >= connect_timeout
+                    and not _peer_hold_ok(now)
+                ):
+                    _trip(
+                        f"Download did not resume ({transport} transport) "
+                        f"-- no data for {int(elapsed)}s"
+                    )
+                    return
+            else:
+                # Not one byte in the partials open right now, empty .incomplete or not: the child is
+                # stuck before its first byte, OR queued on the hub's per-file cache lock while
+                # another writer fetches the same blob. Without this branch such a child is invisible
+                # forever; without the peer check, a legitimate lock wait is killed at connect_timeout.
+                #
+                # The peer check is deliberately weaker than the question asked: the hub lock is per
+                # blob but the parent cannot observe WHICH blob its child waits for (filelock closes
+                # the lock fd between poll attempts), so any fresh partial in the repo counts. The
+                # ceiling bounds how long that approximation may hold the clock off.
+                if _peer_progressing() and (
+                    peer_wait_start is None
+                    or now - peer_wait_start < PEER_SUPPRESSION_CEILING
+                ):
+                    if peer_wait_start is None:
+                        peer_wait_start = now
+                    last_change = now
+                elif (
+                    connect_clock
+                    and not _child_exited(child_pid)
+                    and elapsed >= connect_timeout
+                ):
+                    _trip(
+                        f"Download did not start ({transport} transport) "
+                        f"-- no data after {int(elapsed)}s"
+                    )
+                    return
 
-            _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                _safe_status(on_heartbeat, f"Downloading ({transport} transport)...")
 
     threading.Thread(target = _beat, daemon = True, name = "hf-xet-watchdog").start()
     return stop
+
+
+def _deadline(rss: Optional[int], trough: int, stall_timeout: float) -> float:
+    """How long a flat disk may last before it counts as a hang.
+
+    The short deadline assumes a flat disk means nothing is arriving, which holds only if RSS agrees:
+    growth since the trough means the child IS receiving, and on a slow link the reconstruction
+    buffer legitimately fills for minutes between writes, so that case gets the patient HTTP
+    threshold. Flat or unreadable RSS keeps the short one.
+    """
+    if rss is not None and rss > trough + _RSS_SLOW_LINK_EPSILON:
+        return max(stall_timeout, DEFAULT_HTTP_STALL_TIMEOUT)
+    return stall_timeout
 
 
 def _scrub_in_child(text: str, token: Optional[str]) -> str:
@@ -687,6 +1100,17 @@ def _download_child_entry(
         os.environ["HF_HUB_DISABLE_XET"] = "1"
         # Keep the HTTP writer sequential and resumable (hf_transfer's sparse partials cannot).
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    else:
+        # Defensive: the parent already seeded these around the spawn, but a child launched by any
+        # other path must not inherit hf_xet's unbounded multi-GB buffer defaults.
+        try:
+            from unsloth_zoo.hf_xet_tuning import apply_xet_env
+
+            # A supervised child, so the shortened Xet timeouts belong here: a failure surfaces to
+            # the ladder instead of being retried for ~6 minutes.
+            apply_xet_env(fail_fast = True)
+        except Exception as e:
+            logger.debug("Could not apply Xet tuning in child: %s", e)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
     repo_id = params["repo_id"]
@@ -770,8 +1194,8 @@ def _run_download_attempt(
     repo_type: str,
     disable_xet: bool,
     cancel_event: Optional[threading.Event],
-    stall_timeout: float,
-    interval: float,
+    stall_timeout: Optional[float],
+    interval: Optional[float],
     grace_period: float,
     on_status: Optional[Callable[[str], None]],
 ) -> tuple[str, Optional[str]]:
@@ -810,6 +1234,26 @@ def _run_download_attempt(
     if disable_xet:
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    else:
+        # hf_xet reads its config natively at import, so the buffer caps must be in the environment
+        # BEFORE the child starts; setting them inside the child is too late.
+        try:
+            from .hf_xet_tuning import xet_env_overrides
+
+            for key, value in xet_env_overrides().items():
+                # An explicit user setting still wins; only fill what is unset.
+                if key not in os.environ:
+                    child_env[key] = value
+            # High-performance mode is a preset applied after the environment is read, so it would
+            # override the caps above rather than merge with them.
+            from .hf_xet_tuning import XET_HIGH_PERFORMANCE_VARS
+
+            if not _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
+                for var in XET_HIGH_PERFORMANCE_VARS:
+                    if _is_true(os.environ.get(var)):
+                        child_env[var] = "0"
+        except Exception as e:
+            logger.debug("Could not compute Xet tuning env: %s", e)
     with _SPAWN_ENV_LOCK:
         # Cache Hub's transport constants in the PARENT from the REAL env NOW, before the child-only
         # HF_HUB_DISABLE_XET=1 is briefly set below: else a concurrent thread's FIRST `import
@@ -1712,8 +2156,8 @@ def _download_with_xet_fallback(
     token: Optional[str],
     repo_type: str,
     cancel_event: Optional[threading.Event],
-    stall_timeout: float,
-    interval: float,
+    stall_timeout: Optional[float],
+    interval: Optional[float],
     grace_period: float,
     on_status: Optional[Callable[[str], None]],
     prepare_for_http_fn: Optional[Callable[[str, str], None]],
@@ -1730,6 +2174,17 @@ def _download_with_xet_fallback(
     with _SPAWN_ENV_LOCK:
         disable_xet = xet_force_disabled()
 
+    # Skip a doomed Xet attempt on a machine already known to be bad at it (too little RAM,
+    # unreachable CAS, recent failures): the ladder still recovers, but the user would pay the full
+    # stalled attempt on every download.
+    if not disable_xet:
+        health = _xet_health_or_none()
+        if health is not None and not health.use_xet:
+            logger.info("Starting '%s' on HTTP instead of Xet: %s", label, health.reason)
+            _safe_status(on_status, f"{label}: using HTTP ({health.reason})")
+            disable_xet = True
+    started_on_xet = not disable_xet
+
     for attempt in range(2):
         if disable_xet:
             # Purge a non-HTTP partial first (an HTTP resume over a sparse Xet/hf_transfer partial
@@ -1738,8 +2193,12 @@ def _download_with_xet_fallback(
             owned_incomplete = params.pop("_owned_incomplete_blobs", None)
             try:
                 if prepare_for_http_fn is None:
+                    # This grace asks whether a partial belongs to a LIVE sibling, not whether OUR
+                    # child stalled, so it stays patient even though the Xet stall trip is 30s: a
+                    # 30s grace would delete a slow-but-healthy peer's partial mid-write.
                     _default_prepare_for_http(
-                        repo_type, repo_id, cache_dir = cache_dir, active_grace = stall_timeout,
+                        repo_type, repo_id, cache_dir = cache_dir,
+                        active_grace = max(stall_timeout or 0.0, DEFAULT_HTTP_STALL_TIMEOUT),
                         owned_incomplete_blobs = owned_incomplete,
                     )
                 else:
@@ -1787,12 +2246,16 @@ def _download_with_xet_fallback(
                         "retrying with HF_HUB_DISABLE_XET=1", label
                     )
                     _safe_status(on_status, f"{label}: incomplete snapshot, retrying over HTTP")
+                    _record_xet_outcome(False, "Xet returned an incomplete snapshot")
                     disable_xet = True
                     continue
                 raise DownloadStallError(
                     f"Download for '{label}' returned an incomplete snapshot even with "
                     f"HF_HUB_DISABLE_XET=1 -- missing files, check your network connection"
                 )
+            if started_on_xet and not disable_xet:
+                # Completed on the transport it started on: this machine can do Xet.
+                _record_xet_outcome(True)
             return payload  # type: ignore[return-value]
         if kind_result == "cancelled":
             raise RuntimeError("Cancelled")
@@ -1808,6 +2271,7 @@ def _download_with_xet_fallback(
                     "with HF_HUB_DISABLE_XET=1: %s", label, payload
                 )
                 _safe_status(on_status, f"{label}: transient Xet error, retrying over HTTP")
+                _record_xet_outcome(False, _xet_failure_reason("transient Xet transport error"))
                 disable_xet = True
                 continue
             raise RuntimeError(payload)
@@ -1819,6 +2283,7 @@ def _download_with_xet_fallback(
                     "retrying with HF_HUB_DISABLE_XET=1", label
                 )
                 _safe_status(on_status, f"{label}: download crashed, retrying over HTTP")
+                _record_xet_outcome(False, _xet_failure_reason("Xet download process crashed"))
                 disable_xet = True
                 continue
             raise RuntimeError(payload)
@@ -1829,6 +2294,7 @@ def _download_with_xet_fallback(
             )
             # _safe_status: a raising status hook must not abort the retry before disable_xet is set.
             _safe_status(on_status, f"{label}: Xet stalled, retrying over HTTP")
+            _record_xet_outcome(False, _xet_failure_reason("Xet download stalled"))
             disable_xet = True
             continue
         raise DownloadStallError(
@@ -1852,8 +2318,8 @@ def hf_hub_download_with_xet_fallback(
     subfolder: Optional[str] = None,
     force_download: bool = False,
     local_files_only: bool = False,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    stall_timeout: Optional[float] = None,
+    interval: Optional[float] = None,
     grace_period: float = DEFAULT_GRACE_PERIOD,
     on_status: Optional[Callable[[str], None]] = None,
     prepare_for_http_fn: Optional[Callable[[str, str], None]] = None,
@@ -1936,8 +2402,8 @@ def snapshot_download_with_xet_fallback(
     local_files_only: bool = False,
     variant: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
-    stall_timeout: float = DEFAULT_STALL_TIMEOUT,
-    interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    stall_timeout: Optional[float] = None,
+    interval: Optional[float] = None,
     grace_period: float = DEFAULT_GRACE_PERIOD,
     on_status: Optional[Callable[[str], None]] = None,
     prepare_for_http_fn: Optional[Callable[[str, str], None]] = None,

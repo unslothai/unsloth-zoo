@@ -335,4 +335,3 @@ def test_vlm_resume_from_checkpoint_matches_fresh_run(tmp_path):
             f"step {i}: fresh={a!r} resumed={b!r}\n"
             f"fresh={fresh_hist}\nresumed={resumed_hist}"
         )
-
