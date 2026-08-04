@@ -1069,3 +1069,110 @@ def test_real_unpatched_decoder_decodes_in_fresh_process():
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     assert result.stdout.strip().endswith("OK")
+
+
+# ---------------------------------------------------------------------------
+# Audio-span truncation must be guarded on BOTH collation paths.
+#
+# __call__ truncates via _truncate_sequence_tensors, which refuses to cut into
+# the expanded audio placeholders. _collate_prompt_completion truncates via
+# _truncate_by_side, which had no such check -- while `out = dict(proc_prompts)`
+# carries input_features through at full width. A prompt/completion example
+# whose audio span exceeds max_seq_length therefore reached the model with N
+# audio embeddings and fewer than N placeholder slots, silently, where the
+# messages path raises. The check now lives in one helper used by both.
+# ---------------------------------------------------------------------------
+
+N_EXPANDED_AUDIO = 8
+_PC_VOCAB = {"hi": 1, "ok": 2}
+
+
+class _ExpandingAudioProcessor(_ChatTemplateMixin):
+    # Renders an audio part as a marker that __call__ expands into
+    # N_EXPANDED_AUDIO placeholder ids, like a real audio processor does.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer(padding_side="right")
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        out = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                out.append(content)
+                continue
+            for part in content:
+                if not isinstance(part, dict): continue
+                if part.get("type") == "text": out.append(part.get("text", ""))
+                elif part.get("type") == "audio": out.append("<AUD>")
+        return " ".join(out)
+
+    def __call__(self, text=None, audio=None, padding=None, padding_side="right",
+                 return_tensors=None, add_special_tokens=None, **kwargs):
+        rows = []
+        for s in text:
+            row = []
+            for word in s.split():
+                if word == "<AUD>": row += [AUDIO_ID] * N_EXPANDED_AUDIO
+                else: row.append(_PC_VOCAB.get(word, 3))
+            rows.append(row)
+        width = max(len(r) for r in rows)
+        ids, mask = [], []
+        for r in rows:
+            pad = [PAD_ID] * (width - len(r))
+            if padding_side == "left":
+                ids.append(pad + r); mask.append([0] * len(pad) + [1] * len(r))
+            else:
+                ids.append(r + pad); mask.append([1] * len(r) + [0] * len(pad))
+        out = {"input_ids": torch.tensor(ids), "attention_mask": torch.tensor(mask)}
+        if audio is not None:
+            # Full-width features, exactly what makes a short input_ids dangerous.
+            out["input_features"] = torch.zeros(len(rows), 128, 3000)
+        return out
+
+
+_AUDIO_PC_MESSAGES = [
+    {"role": "user", "content": [
+        {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+]
+
+
+@pytest.mark.parametrize("path", ["messages", "prompt_completion"])
+def test_audio_span_truncation_raises_on_both_paths(path):
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=4,
+    )
+    if path == "messages":
+        batch = [{"messages": _AUDIO_PC_MESSAGES}]
+    else:
+        batch = [{"prompt": _AUDIO_PC_MESSAGES[:1], "completion": _AUDIO_PC_MESSAGES[1:]}]
+    with pytest.raises(ValueError, match="cuts into the expanded audio tokens"):
+        collator(batch)
+
+
+@pytest.mark.parametrize("path", ["messages", "prompt_completion"])
+def test_audio_span_fits_is_not_rejected_on_either_path(path):
+    # The guard must only fire when placeholders are actually lost.
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=64,
+    )
+    if path == "messages":
+        batch = [{"messages": _AUDIO_PC_MESSAGES}]
+    else:
+        batch = [{"prompt": _AUDIO_PC_MESSAGES[:1], "completion": _AUDIO_PC_MESSAGES[1:]}]
+    out = collator(batch)
+    assert int((out["input_ids"] == AUDIO_ID).sum()) == N_EXPANDED_AUDIO
+
+
+def test_text_only_prompt_completion_truncation_still_allowed():
+    # Backward compatibility: the new guard must not turn ordinary text
+    # truncation in the prompt/completion path into an error.
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=2,
+    )
+    out = collator([{
+        "prompt": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "completion": [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}],
+    }])
+    assert out["input_ids"].shape[1] == 2

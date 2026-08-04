@@ -1283,14 +1283,7 @@ class UnslothVisionDataCollator:
             normalized.append(clip)
         return normalized
 
-    def _truncate_sequence_tensors(self, batch, seq_len):
-        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
-        # input_features [B, frames, mel] or input_features_mask [B, frames].
-        new_len = self.max_seq_length
-        keys = [
-            k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
-            if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
-        ]
+    def _audio_token_ids(self, device):
         tok = getattr(self.processor, "tokenizer", self.processor)
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
@@ -1299,12 +1292,37 @@ class UnslothVisionDataCollator:
         # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
         # miscounted as an audio token and tripping the alignment check below.
         unk_id = getattr(tok, "unk_token_id", None)
-        audio_ids = torch.tensor(
+        return torch.tensor(
             [i for i in tok.convert_tokens_to_ids(audio_tokens)
              if isinstance(i, int) and i >= 0 and i != unk_id],
-            device=batch["input_ids"].device,
+            device=device,
         )
-        n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())
+
+    def _check_audio_tokens_survived(self, before_ids, after_ids, new_len):
+        # Truncation may only remove text: the audio feature tensors keep their
+        # full width, so dropping expanded audio placeholders leaves the model
+        # splicing N audio embeddings into fewer than N slots. Shared by the
+        # __call__ path (_truncate_sequence_tensors) and the prompt/completion
+        # path (_truncate_by_side) -- checking only one of them lets the other
+        # corrupt the batch silently.
+        audio_ids = self._audio_token_ids(before_ids.device)
+        if audio_ids.numel() == 0: return
+        if int(torch.isin(after_ids, audio_ids).sum()) == \
+           int(torch.isin(before_ids, audio_ids).sum()): return
+        raise ValueError(
+            f"Unsloth: max_seq_length = {new_len} cuts into the expanded audio tokens, which "
+            "breaks audio alignment at model forward. Increase max_seq_length or shorten the audio."
+        )
+
+    def _truncate_sequence_tensors(self, batch, seq_len):
+        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
+        # input_features [B, frames, mel] or input_features_mask [B, frames].
+        new_len = self.max_seq_length
+        keys = [
+            k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
+            if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
+        ]
+        pre_truncation_ids = batch["input_ids"]
         if self._tokenizer_padding_side() == "left":
             # Keep each row's first new_len content tokens and re-pad on the left,
             # otherwise short rows keep only their left padding.
@@ -1316,11 +1334,7 @@ class UnslothVisionDataCollator:
         else:
             for k in keys:
                 batch[k] = batch[k][..., :new_len]
-        if int(torch.isin(batch["input_ids"], audio_ids).sum()) != n_audio:
-            raise ValueError(
-                f"Unsloth: max_seq_length = {new_len} cuts into the expanded audio tokens, which "
-                "breaks audio alignment at model forward. Increase max_seq_length or shorten the audio."
-            )
+        self._check_audio_tokens_survived(pre_truncation_ids, batch["input_ids"], new_len)
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
@@ -1505,6 +1519,11 @@ class UnslothVisionDataCollator:
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
         sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+
+        # Same guard the __call__ path applies in _truncate_sequence_tensors: the
+        # prompt batch's input_features are carried through at full width, so
+        # slicing away audio placeholders here would desync audio at forward.
+        self._check_audio_tokens_survived(input_ids, input_ids[:, sl], max_len)
 
         input_ids       = input_ids[:, sl]
         attention_mask  = attention_mask[:, sl]
