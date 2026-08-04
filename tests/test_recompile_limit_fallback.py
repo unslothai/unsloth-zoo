@@ -24,7 +24,28 @@ from unsloth_zoo.temporary_patches.utils import (  # noqa: E402
     _recompile_limit_errors,
 )
 
-from torch._dynamo.exc import FailOnRecompileLimitHit  # noqa: E402
+import torch._dynamo.exc as _dynamo_exc  # noqa: E402
+
+# Dynamo does not agree on these names across the torch>=2.4,<2.13 pyproject
+# declares: 2.4 has none of them, 2.5 has only CacheLimitExceeded, 2.6+ has
+# RecompileLimitExceeded and FailOnRecompileLimitHit. Importing one by name
+# would kill collection on a supported torch, so look them up the way
+# _recompile_limit_errors does.
+_LIMIT_ERROR = next(
+    (
+        e for e in (
+            getattr(_dynamo_exc, n, None)
+            for n in ("FailOnRecompileLimitHit", "RecompileLimitExceeded", "CacheLimitExceeded")
+        )
+        if isinstance(e, type) and issubclass(e, BaseException)
+    ),
+    None,
+)
+
+pytestmark = pytest.mark.skipif(
+    _LIMIT_ERROR is None,
+    reason = "this torch exposes no Dynamo recompile-limit exception",
+)
 
 
 def _pair(compiled_raises = None, calls = None):
@@ -47,7 +68,7 @@ def _pair(compiled_raises = None, calls = None):
 # ---- the failure that must stop being fatal -------------------------------
 
 def test_recompile_limit_falls_back_instead_of_raising():
-    c, e, calls = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
+    c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(3) == 6
     assert calls == {"c": 1, "e": 1}
@@ -69,7 +90,7 @@ def test_the_fallback_latches():
     latch flips, and `force_eager_fallback` exists for unsloth to catch that
     single assertion and retry that step.
     """
-    c, e, calls = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
+    c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     for _ in range(5):
         assert w(1) == 2
@@ -79,7 +100,7 @@ def test_the_fallback_latches():
 
 def test_the_latch_is_per_wrapper_not_global():
     """Two separately wrapped functions must not knock each other eager."""
-    c1, e1, calls1 = _pair(FailOnRecompileLimitHit("recompile_limit reached"))
+    c1, e1, calls1 = _pair(_LIMIT_ERROR("recompile_limit reached"))
     c2, e2, calls2 = _pair()
     w1 = _fall_back_to_eager_on_recompile_limit(c1, e1, "A.forward")
     w2 = _fall_back_to_eager_on_recompile_limit(c2, e2, "B.forward")
@@ -89,7 +110,9 @@ def test_the_latch_is_per_wrapper_not_global():
 
 
 def test_recompile_limit_exceeded_is_also_caught():
-    from torch._dynamo.exc import RecompileLimitExceeded
+    RecompileLimitExceeded = getattr(_dynamo_exc, "RecompileLimitExceeded", None)
+    if RecompileLimitExceeded is None:
+        pytest.skip("this torch has no torch._dynamo.exc.RecompileLimitExceeded")
     c, e, _ = _pair(RecompileLimitExceeded("recompile_limit reached"))
     assert _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")(4) == 8
 
@@ -175,9 +198,20 @@ def test_wrapper_is_added_for_the_graph_break_alone(monkeypatch):
     assert u._fall_back_to_eager_on_recompile_limit(c, e, "M.forward") is not c
 
 
+def test_no_version_specific_dynamo_name_is_imported_at_module_level():
+    """torch 2.4 has none of the recompile-limit exceptions and 2.5 has only
+    CacheLimitExceeded, both inside the torch>=2.4,<2.13 pyproject declares. A
+    top-level `from torch._dynamo.exc import <name>` would therefore fail
+    collection on a supported torch instead of exercising the compatibility
+    path the helper under test exists for."""
+    src = Path(__file__).read_text(encoding = "utf-8")
+    for name in ("FailOnRecompileLimitHit", "RecompileLimitExceeded", "CacheLimitExceeded"):
+        assert f"import {name}" not in src, f"{name} must be looked up with getattr"
+
+
 def test_error_tuple_is_non_empty_on_this_torch():
     errs = _recompile_limit_errors()
-    assert FailOnRecompileLimitHit in errs
+    assert _LIMIT_ERROR in errs
     assert all(issubclass(x, BaseException) for x in errs)
 
 
