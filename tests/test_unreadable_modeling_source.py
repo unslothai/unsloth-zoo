@@ -153,7 +153,7 @@ def test_a_bare_return_is_the_functions_contract():
 
 def _nn_patch_region() -> str:
     i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
-    return SRC[max(0, i - 700):i + 1400]
+    return SRC[max(0, i - 1600):i + 1400]
 
 
 def test_the_nn_forward_patch_loop_is_guarded():
@@ -250,16 +250,21 @@ def unreadable_llama(monkeypatch):
     import transformers.models.llama.modeling_llama as modeling
 
     _break_getsource(monkeypatch, modeling)
-    had = hasattr(modeling, "__UNSLOTH_PATCHED__")
-    for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__"):
-        if hasattr(modeling, name):
+    # Both markers, with their values: restoring only the patched one leaves a
+    # module that reports itself done and then declines to answer, so a later
+    # test's supports_sdpa accumulator is silently left untouched.
+    _MISSING = object()
+    saved = {name: getattr(modeling, name, _MISSING)
+             for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__")}
+    for name in saved:
+        if saved[name] is not _MISSING:
             delattr(modeling, name)
     yield modeling
-    for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__"):
+    for name, value in saved.items():
         if hasattr(modeling, name):
             delattr(modeling, name)
-    if had:
-        modeling.__UNSLOTH_PATCHED__ = True
+        if value is not _MISSING:
+            setattr(modeling, name, value)
 
 
 def test_sdpa_is_reported_unsupported(unreadable_llama):
@@ -416,6 +421,76 @@ def test_the_wrapper_is_marked_so_it_is_not_wrapped_twice():
 def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
     region = _nn_patch_region()
     assert "_dtype_safe_forward(" in region
+
+
+def test_the_tensor_may_arrive_by_keyword():
+    """These become the public forward. torch.nn.RMSNorm declares `x`, not
+    `input`, and `rms_norm(x = t)` works today, so a hard-coded parameter name
+    would start raising TypeError on a call that used to be fine."""
+    import torch
+
+    from unsloth_zoo.compiler import _dtype_safe_forward
+
+    def original(self, x):
+        return x.to(torch.float32)
+
+    forward = _dtype_safe_forward(original, False, False)
+    assert forward(_Weighted(torch.float32),
+                   x = torch.zeros(2, dtype = torch.bfloat16)).dtype \
+        == torch.bfloat16
+
+
+def test_a_call_it_cannot_read_is_passed_straight_through():
+    """Better to cast nothing than to guess which argument is the activation."""
+    import torch
+
+    from unsloth_zoo.compiler import _dtype_safe_forward
+
+    seen = {}
+
+    def original(self, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1)
+
+    forward = _dtype_safe_forward(original, False, False)
+    forward(_Weighted(torch.float32), other = 1)
+    assert seen == {"other": 1}
+
+
+def test_the_wrapper_records_the_compile_mode_it_was_built_for():
+    """`disable` decides whether a norm casts its input, and it is baked into
+    the closure, so a second load with the other setting must be able to tell."""
+    from unsloth_zoo.compiler import _dtype_safe_forward
+
+    def original(self, x):
+        return x
+
+    for disable in (True, False):
+        forward = _dtype_safe_forward(original, False, disable)
+        assert forward.__unsloth_dtype_disable__ is disable
+        assert forward.__unsloth_dtype_original__ is original
+
+
+def test_a_rebuild_wraps_the_original_not_the_wrapper():
+    """Otherwise each load in a process adds another layer of casts."""
+    from unsloth_zoo.compiler import _dtype_safe_forward
+
+    def original(self, x):
+        return x
+
+    once = _dtype_safe_forward(original, False, True)
+    twice = _dtype_safe_forward(once.__unsloth_dtype_original__, False, False)
+    assert twice.__unsloth_dtype_original__ is original
+
+
+def test_the_loop_rebuilds_on_a_mode_change():
+    region = _nn_patch_region()
+    i = SRC.index('__unsloth_dtype_wrapped__", False)')
+    window = SRC[i:i + 800]
+    assert "__unsloth_dtype_disable__" in window, (
+        "a wrapper built for the other compile mode must not be reused")
+    assert "__unsloth_dtype_original__" in window, (
+        "rebuild from the original, or the wrappers stack")
 
 
 if __name__ == "__main__":

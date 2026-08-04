@@ -3528,17 +3528,37 @@ def _dtype_safe_forward(original_forward, is_conv, disable):
     result back; an eager norm does the same but only when it is affine; a
     compiled norm only casts the result, since casting in changes batched
     numerics.
-    """
 
-    def forward(self, input, *args, **kwargs):
-        original_dtype = input.dtype
+    The tensor is taken by whatever name the original declares, because these
+    are public forwards: `RMSNorm.forward(self, x)` and `rms_norm(x = t)` both
+    work today and a hard-coded `input` would start raising TypeError.
+    """
+    try:
+        first = list(inspect.signature(original_forward).parameters)[1]
+    except Exception:
+        first = "input"
+
+    def forward(self, *args, **kwargs):
+        if args:
+            tensor, rest = args[0], args[1:]
+        elif first in kwargs:
+            tensor, rest = kwargs.pop(first), ()
+        else:
+            # Not a shape we know how to cast; leave it entirely alone.
+            return original_forward(self, *args, **kwargs)
+        original_dtype = tensor.dtype
         if is_conv:
-            input = input.to(self.weight.dtype)
+            tensor = tensor.to(self.weight.dtype)
         elif disable and getattr(self, "weight", None) is not None:
-            input = input.to(self.weight.dtype)
-        return original_forward(self, input, *args, **kwargs).to(original_dtype)
+            tensor = tensor.to(self.weight.dtype)
+        return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
 
     forward.__unsloth_dtype_wrapped__ = True
+    # `disable` is baked into the closure above, so a later load in the same
+    # process with the other setting needs a new wrapper built from the same
+    # original rather than one stacked on this one.
+    forward.__unsloth_dtype_disable__ = disable
+    forward.__unsloth_dtype_original__ = original_forward
     return forward
 
 
@@ -3585,6 +3605,20 @@ def _patch_torch_dtype_modules(
             if hasattr(function.forward, "get_compiler_config"):
                 continue
             if getattr(function.forward, "__unsloth_dtype_wrapped__", False):
+                if getattr(function.forward, "__unsloth_dtype_disable__", None) == disable:
+                    continue
+                # Compile mode changed since the wrapper was built. Rebuild from
+                # the original so the casts match, and so wrappers never stack.
+                _install_patched_forward(
+                    model_location,
+                    module,
+                    _dtype_safe_forward(
+                        function.forward.__unsloth_dtype_original__,
+                        module in _conv_modules,
+                        disable,
+                    ),
+                    combined_module,
+                )
                 continue
 
             try:
