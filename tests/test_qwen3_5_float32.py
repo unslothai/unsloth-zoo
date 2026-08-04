@@ -3,8 +3,8 @@
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or (at
-# your option) any later version.
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 
 """Regression tests for ``temporary_patches/qwen3_5_float32.py``.
 
@@ -36,12 +36,12 @@ def _apply_temporary_patches():
         patch_fn()
 
 
-def _tiny_text_config():
+def _tiny_text_config(layer_types=("linear_attention", "full_attention")):
     return Qwen3_5TextConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=2,
+        num_hidden_layers=len(layer_types),
         num_attention_heads=4,
         num_key_value_heads=2,
         hidden_act="silu",
@@ -50,7 +50,7 @@ def _tiny_text_config():
         head_dim=16,
         attention_dropout=0.0,
         rms_norm_eps=1e-06,
-        layer_types=["linear_attention", "full_attention"],
+        layer_types=list(layer_types),
         tie_word_embeddings=False,
         partial_rotary_factor=0.25,
     )
@@ -91,3 +91,21 @@ def test_qwen3_5_attention_dtype_mismatch_fixed(monkeypatch):
     )
     assert out.shape == hidden.shape
     assert out.dtype == hidden.dtype
+
+
+def test_qwen3_5_for_causal_lm_dtype_mismatch_fixed(monkeypatch):
+    """``Qwen3_5ForCausalLM`` must complete forward passes with fp16 weights."""
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    _apply_temporary_patches()
+
+    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
+    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+
+    outputs = model(input_ids, use_cache=False)
+    assert outputs.logits.shape == (2, 4, config.vocab_size)
+
+    # The wrapper must preserve the standard Transformers tuple-output contract.
+    tuple_outputs = model(input_ids, use_cache=False, return_dict=False)
+    assert isinstance(tuple_outputs, tuple)
+    assert tuple_outputs[0].shape == (2, 4, config.vocab_size)
