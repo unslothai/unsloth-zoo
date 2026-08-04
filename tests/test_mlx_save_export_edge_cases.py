@@ -1256,6 +1256,81 @@ def test_gguf_keeps_intermediate_when_nothing_was_quantized(monkeypatch, tmp_pat
     assert (out / "EdgeModel.F16.gguf").exists()
 
 
+# --- Group 11c: quant-spec normalization ------------------------------------
+#
+# Output filenames are derived as `{base}.{quant.upper()}.gguf`, so two spellings
+# of one type name are the SAME artifact on disk. Every downstream decision
+# (which intermediate to convert to, which targets still need a llama-quantize
+# pass, whether the intermediate is scratch) compares quant names as strings, so
+# they must all see one canonical spelling. llama.cpp's own side already works
+# this way: unsloth_zoo/llama_cpp.py:2174 `check_quantization_type` lowercases
+# before validating.
+
+
+def test_gguf_case_variant_target_is_the_same_artifact(monkeypatch, tmp_path):
+    """`["BF16", "q4_k_m"]` is the llama.cpp spelling of `["bf16", "q4_k_m"]`.
+
+    Un-normalized it produced an in-place `llama-quantize BF16.gguf BF16.gguf`
+    pass and then deleted the requested BF16 artifact as if it were scratch.
+    """
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["BF16", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    # BF16 IS the intermediate: it must not be re-quantized onto its own path.
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    for c in calls["quantize_calls"]:
+        assert c["input_gguf"] != c["output_gguf"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+
+
+def test_gguf_case_variant_first_conversion_matches_requested_target(
+    monkeypatch, tmp_path
+):
+    """`first_conversion` is the other half of the same spec and needs the same
+    normalization: spelled `"BF16"` against a requested `"bf16"` it both ran an
+    in-place quantize pass and deleted the requested artifact."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "q4_k_m"], first_conversion="BF16")
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    for c in calls["quantize_calls"]:
+        assert c["input_gguf"] != c["output_gguf"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_dedup_is_case_insensitive_and_strips(monkeypatch, tmp_path):
+    """Dedup exists because repeats re-run llama-quantize onto an identical
+    output path -- which is exactly what case/whitespace variants also do."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["Q4_K_M", "q4_k_m", " q4_k_m ", "Q8_0"])
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m", "q8_0"]
+
+
+def test_gguf_case_variant_alias_resolves(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["Fast_Quantized"])
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q8_0"]
+
+
+def test_gguf_rejects_non_string_first_conversion_before_the_merge(
+    monkeypatch, tmp_path
+):
+    """Same "reject before the expensive merge" contract the quant list has."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(TypeError, match="first_conversion"):
+        _export(mutils, out, ["q4_k_m"], first_conversion=["bf16"])
+    assert "merge_count" not in calls
+    assert "convert_count" not in calls
+
+
 def test_mlx_model_method_forwards_a_quant_list(monkeypatch, tmp_path):
     """The user-facing hop: model.save_pretrained_gguf(...) in loader.py."""
     import unsloth_zoo.mlx.loader as loader

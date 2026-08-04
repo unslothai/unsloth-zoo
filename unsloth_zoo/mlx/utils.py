@@ -14532,6 +14532,27 @@ _GGUF_QUANT_ALIASES = {
 }
 
 
+def _normalize_gguf_quant_name(name):
+    """Fold one quant/dtype name to the single spelling the rest of the export
+    compares against.
+
+    GGUF output paths are ``{base}.{name.upper()}.gguf``, so ``"BF16"``,
+    ``" bf16 "`` and ``"bf16"`` all name the *same file on disk*. Every decision
+    downstream - which intermediate to convert to, which targets still need a
+    llama-quantize pass, whether the intermediate is scratch or a requested
+    artifact - compares these names as plain strings, so they must all see one
+    spelling or they disagree about which file is which. Left un-folded,
+    ``["BF16", "q4_k_m"]`` ran ``llama-quantize`` with input and output both
+    pointing at ``*.BF16.gguf`` and then deleted that requested artifact.
+
+    llama.cpp's own entry point already normalizes this way:
+    ``check_quantization_type`` (``unsloth_zoo/llama_cpp.py:2174``) lowercases
+    before validating, which is why the converter accepts ``"BF16"`` while this
+    module's string comparisons did not.
+    """
+    return name.strip().lower()
+
+
 def _normalize_gguf_quantization_methods(quantization_method):
     """Resolve ``quantization_method`` to an ordered list of llama.cpp types.
 
@@ -14558,15 +14579,27 @@ def _normalize_gguf_quantization_methods(quantization_method):
 
     resolved = []
     for method in methods:
-        if not (isinstance(method, str) or method is None):
+        if method is None:
+            resolved.append(_GGUF_QUANT_ALIASES[None])
+            continue
+        if not isinstance(method, str):
             raise TypeError(
                 "Unsloth: every quantization_method entry must be a string - "
                 f"got {type(method).__name__}."
             )
-        # Alias lookup is exact (matching CUDA); unknown names pass through to
-        # llama-quantize, which reports the supported ftypes on failure.
+        method = _normalize_gguf_quant_name(method)
+        if not method:
+            raise ValueError(
+                "Unsloth: quantization_method contained an empty quantization "
+                "type; pass a llama.cpp quant name such as 'q4_k_m'."
+            )
+        # Aliases are matched on the folded name, so "Not_Quantized" resolves
+        # like "not_quantized". Unknown names pass through to llama-quantize,
+        # which reports the supported ftypes on failure.
         resolved.append(_GGUF_QUANT_ALIASES.get(method, method))
 
+    # Dedup now also collapses case/whitespace variants, which name the same
+    # output path and would otherwise re-run llama-quantize onto it.
     return list(dict.fromkeys(resolved))
 
 
@@ -14616,6 +14649,25 @@ def save_pretrained_gguf(
     save_directory.mkdir(parents=True, exist_ok=True)
 
     quant_types = _normalize_gguf_quantization_methods(quantization_method)
+
+    # first_conversion is the other half of the same quant spec: it is compared
+    # against quant_types and .upper()-ed into the intermediate's path, so it
+    # has to be folded identically or the two halves disagree about which file
+    # the intermediate is. Validated here, before the LoRA merge, so a bad
+    # argument does not cost a merge + convert (it used to surface as
+    # `AttributeError: 'list' object has no attribute 'upper'` after both).
+    if first_conversion is not None:
+        if not isinstance(first_conversion, str):
+            raise TypeError(
+                "Unsloth: first_conversion must be a string naming a GGUF dtype "
+                f"- got {type(first_conversion).__name__}."
+            )
+        first_conversion = _normalize_gguf_quant_name(first_conversion)
+        if not first_conversion:
+            raise ValueError(
+                "Unsloth: first_conversion was empty; pass 'f32', 'f16' or "
+                "'bf16', or leave it as None to derive it."
+            )
 
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
