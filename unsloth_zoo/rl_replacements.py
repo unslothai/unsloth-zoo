@@ -26,11 +26,16 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import (
+    torch_compile_options,
+    _maybe_compile,
+)
+
+
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -40,7 +45,7 @@ def selective_log_softmax(logits, index):
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
@@ -67,7 +72,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -79,7 +84,16 @@ def chunked_hidden_states_selective_log_softmax(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    # Take the reduction dim from lm_head, not hidden_states. Same number, but
+    # under dynamic = True hidden_states' last dim stays a free symbol that
+    # Dynamo cannot prove equal to lm_head's concrete one, so the matmul guard
+    # fails before anything runs:
+    #     a and b must have same reduction dim, but got
+    #     [((s47*s87 + 255)//256), s33] X [1536, 151936]
+    # torch._check states the equality to the shape system, and in eager mode
+    # asserts it instead of letting a mismatched lm_head reach the matmul.
+    torch._check(hidden_states.shape[-1] == lm_head.shape[-1])
+    flat_hidden_states = hidden_states.reshape(-1, lm_head.shape[-1])
     flat_index = index.reshape(-1)
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)

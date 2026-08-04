@@ -187,3 +187,17 @@ else:
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []
+
+
+def _maybe_compile(**kwargs):
+    """torch.compile, unless UNSLOTH_COMPILE_DISABLE asks for it to be off.
+
+    Defined here, not beside its callers: the compiler copies decorated function
+    source verbatim into the generated trainer modules, so a name local to
+    rl_replacements.py NameErrors there at import, and that failure is swallowed.
+    compiler.py emits the import when the name appears, as it does for
+    torch_compile.
+    """
+    if UNSLOTH_COMPILE_DISABLE:
+        return lambda fn: fn
+    return torch.compile(**kwargs)
