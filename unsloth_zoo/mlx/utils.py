@@ -4400,14 +4400,62 @@ def _tokenize_mlx_prompt_completion(
     state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
+    encoded = _encode_mlx_prompt_completion(
+        tokenizer, prompt, prompt + completion, append_eos=False, state=state,
+    )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
-        prompt_ids,
-        input_ids,
+        list(encoded.input_ids[:encoded.prompt_length]),
+        list(encoded.input_ids),
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
+    )
+
+
+@dataclass(frozen=True)
+class _MLXPromptCompletionTokens:
+    """Immutable encoding shared by SFT and preference tokenization."""
+
+    prompt_ids: tuple
+    input_ids: tuple
+    prompt_length: int
+
+
+def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
+    """Locate the completion after tolerating one boundary-merged token."""
+    prompt_ids = tuple(prompt_ids)
+    input_ids = tuple(input_ids)
+    if input_ids[:len(prompt_ids)] == prompt_ids:
+        return len(prompt_ids)
+    prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
+    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+        raise ValueError(
+            "Unsloth MLX: tokenized prompt and prompt+completion differ before "
+            "the final prompt token; only a boundary merge is supported."
+        )
+    return prompt_length
+
+
+def _encode_mlx_prompt_completion(
+    tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+):
+    """Encode a prompt and its full text with one EOS policy."""
+    prompt_ids = tuple(int(x) for x in encode_mlx_text(
+        tokenizer, prompt_text, state=state,
+    ))
+    input_ids = [int(x) for x in encode_mlx_text(
+        tokenizer, full_text, state=state,
+    )]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if append_eos and eos_id is not None and (
+        not input_ids or input_ids[-1] != int(eos_id)
+    ):
+        input_ids.append(int(eos_id))
+    input_ids = tuple(input_ids)
+    return _MLXPromptCompletionTokens(
+        prompt_ids,
+        input_ids,
+        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
     )
 
 
@@ -10734,6 +10782,87 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
+    """Translate fractional epochs into HF-style accumulation windows."""
+    accum = max(1, int(grad_accum or 1))
+    per_epoch = max(1, math.ceil(cycle_length / accum))
+    budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+    whole, rem = divmod(budget, per_epoch)
+    return whole * cycle_length + rem * accum
+
+
+def _finite_row_schedule(
+    row_count,
+    batch_size,
+    *,
+    order_for_epoch,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    comm_group=None,
+):
+    """Build a finite, epoch-bounded microbatch schedule from row indices."""
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def batches_for_epoch(epoch):
+        order = list(order_for_epoch(epoch))
+        batches = []
+        for start in range(0, row_count, global_batch_size):
+            chunk = _rank_slice_distributed_batch(
+                order[start : start + global_batch_size],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=order,
+            )
+            if chunk:
+                batches.append(tuple(chunk))
+        return tuple(batches)
+
+    return _finite_batch_schedule(
+        batches_for_epoch,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+
+
+def _finite_batch_schedule(
+    batches_for_epoch,
+    *,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+):
+    """Build a finite horizon from already-bounded epoch microbatches."""
+    first_batches = tuple(tuple(batch) for batch in batches_for_epoch(0))
+    cycle_length = len(first_batches)
+    if cycle_length == 0:
+        return (), 0
+    target = num_batches
+    if target is None:
+        target = (
+            cycle_length
+            if num_epochs is None
+            else _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
+        )
+    schedule = []
+    epoch = 0
+    while len(schedule) < target:
+        batches = (
+            first_batches
+            if epoch == 0
+            else tuple(tuple(batch) for batch in batches_for_epoch(epoch))
+        )
+        if len(batches) != cycle_length:
+            raise ValueError("finite epoch schedules must have a stable batch count")
+        for batch in batches:
+            schedule.append(batch)
+            if len(schedule) >= target:
+                break
+        epoch += 1
+    return tuple(schedule), cycle_length
+
+
 def _create_ordered_text_plan(
     dataset,
     tokenizer,
@@ -10855,76 +10984,15 @@ def _create_ordered_text_plan(
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    schedule = []
-    epoch = 0
-    order = make_order(epoch)
-    order_pos = 0
-    seen = 0
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
-    # same length and a chunk's local slice is non-empty whatever rows it holds,
-    # so this is constant across epochs even under num_batches truncation.
-    cycle_length = sum(
-        1 for start in range(0, len(order), global_batch_size)
-        if _rank_slice_distributed_batch(
-            order[start : start + global_batch_size],
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
+    schedule, cycle_length = _finite_row_schedule(
+        len(tokenized),
+        batch_size,
+        order_for_epoch=make_order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+        comm_group=comm_group,
     )
-    # why: HF quantizes a fractional num_train_epochs to whole accumulation
-    # windows and re-iterates the dataloader rather than taking a proportional
-    # slice of rows, so 0.5 epochs of 5 rows at batch 2 / accum 2 is one update
-    # over 4 rows, not 3 rows. Build to that step budget: whole passes plus the
-    # windows of the partial one, where a pass's last micro-batch forces its own
-    # update. int(num_epochs) instead built 0 batches for 0 < epochs < 1, which
-    # surfaced as "No training batches created", and one pass for 1.5.
-    target_batches = None
-    if num_batches is None:
-        if num_epochs is None:
-            target_batches = cycle_length
-        else:
-            accum = max(1, int(grad_accum or 1))
-            per_epoch = max(1, math.ceil(cycle_length / accum))
-            budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-            whole, rem = divmod(budget, per_epoch)
-            target_batches = whole * cycle_length + rem * accum
-    while num_batches is None or len(schedule) < num_batches:
-        # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
-        # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
-        if order_pos >= len(order):
-            # Stop when num_batches or the epoch step budget is reached.
-            if (
-                num_batches is None
-                and (target_batches is None or len(schedule) >= target_batches)
-            ):
-                break
-            epoch += 1
-            order = make_order(epoch)
-            order_pos = 0
-
-        chunk = order[order_pos : order_pos + global_batch_size]
-        if not chunk:
-            break
-        order_pos += len(chunk)
-        seen += len(chunk)
-        chunk = _rank_slice_distributed_batch(
-            chunk,
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
-        if not chunk:
-            break
-        schedule.append(tuple(chunk))
-
-        if (
-            num_batches is None
-            and target_batches is not None
-            and len(schedule) >= target_batches
-        ):
-            break
 
     if labeled:
         rows = _finite_text_rows(tokenized)
@@ -12627,23 +12695,7 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
-        if drop is None:
-            dropout = 0.0
-        else:
-            keep = getattr(drop, "_p_1", None)
-            if keep is not None:
-                try:
-                    dropout = float(1.0 - float(keep))
-                except (TypeError, ValueError):
-                    dropout = 0.0
-            else:
-                p = getattr(drop, "p", None)
-                try:
-                    dropout = float(p) if p is not None else 0.0
-                except (TypeError, ValueError):
-                    dropout = 0.0
+        dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
 
@@ -12673,6 +12725,8 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
+        adapter_keys.add(f"{prefix}lora_a.weight")
+        adapter_keys.add(f"{prefix}lora_b.weight")
         # Include DoRA magnitude `m`, gated on the DoRA class name so a
         # future LoRA wrapper with an unrelated `m` attribute isn't exported.
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
@@ -13027,6 +13081,17 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
+def _read_mlx_lora_dropout(module):
+    """Read configured adapter dropout while a preference run has it disabled."""
+    drop = getattr(module, "dropout", None)
+    original = getattr(
+        drop, "_unsloth_preference_original_probability", None,
+    )
+    if original is not None:
+        return float(original)
+    return _get_mlx_dropout_probability(drop)
+
+
 def _coerce_mlx_lora_scale(scale, default=1.0):
     """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
 
@@ -13307,9 +13372,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
+                lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
