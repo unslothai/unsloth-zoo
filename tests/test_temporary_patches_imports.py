@@ -60,6 +60,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.mxfp4",
     "unsloth_zoo.temporary_patches.pixtral",
     "unsloth_zoo.temporary_patches.qwen3_5_moe",
+    "unsloth_zoo.temporary_patches.qwen3_5_float32",
     "unsloth_zoo.temporary_patches.qwen3_moe",
     "unsloth_zoo.temporary_patches.qwen3_moe_float32",
     "unsloth_zoo.temporary_patches.qwen3_next_moe",
