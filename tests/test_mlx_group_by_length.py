@@ -86,6 +86,30 @@ def test_matches_hf_reference_bit_for_bit():
         assert order(lengths, batch_size, seed) == expected
 
 
+def test_window_matches_hf_sampler_construction():
+    """HF constructs the sampler with ``train_batch_size *
+    gradient_accumulation_steps`` (``Trainer._get_train_sampler``), so the
+    mega-batch spans a whole accumulation window. The config defaults to 4,
+    which means dropping the factor changes the order for stock settings."""
+    from unsloth_zoo.mlx.utils import _length_grouped_window
+
+    order = _helper()
+    rng = random.Random(1)
+    for _ in range(100):
+        n = rng.randint(1, 400)
+        batch_size = rng.randint(1, 8)
+        grad_accum = rng.randint(1, 8)
+        seed = rng.randint(0, 10**6)
+        lengths = [rng.randint(1, 2048) for _ in range(n)]
+
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        expected = _hf_reference(lengths, batch_size * grad_accum, generator)
+
+        window = _length_grouped_window(batch_size, None, grad_accum)
+        assert order(lengths, window, seed) == expected
+
+
 def test_is_a_permutation_and_deterministic_per_seed():
     order = _helper()
     lengths = [random.Random(1).randint(1, 512) for _ in range(101)]
@@ -240,18 +264,20 @@ def test_labeled_and_unlabeled_paths_produce_the_same_order():
     Nothing pinned this before, which is how their accepted `dataset_order`
     vocabularies were able to drift apart.
     """
-    from unsloth_zoo.mlx.utils import _length_grouped_order, _normalize_seed
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order, _length_grouped_window, _normalize_seed,
+    )
 
     rng = random.Random(5)
     rows = [[0] * rng.randint(2, 300) for _ in range(233)]
     labeled_items = [(ids, [1] * len(ids)) for ids in rows]
-    batch_size, seed = 4, 4242
+    batch_size, grad_accum, seed = 4, 4, 4242
 
     for epoch in range(3):
         # exactly what _create_labeled_batches._order_indices_for_epoch does
         labeled = _length_grouped_order(
             [len(item[0]) for item in labeled_items],
-            batch_size,
+            _length_grouped_window(batch_size, None, grad_accum),
             _normalize_seed(seed) + epoch,
         )
         # exactly what _create_ordered_text_plan.make_order does
@@ -259,7 +285,7 @@ def test_labeled_and_unlabeled_paths_produce_the_same_order():
 
         unlabeled = _length_grouped_order(
             [_text_row_length(row) for row in rows],
-            batch_size,
+            _length_grouped_window(batch_size, None, grad_accum),
             _normalize_seed(seed) + epoch,
         )
         assert labeled == unlabeled
@@ -290,7 +316,9 @@ def _keep_all_labels(d):
     return {"labels": [list(d["input_ids"][0])]}
 
 
-def _labeled_plan(*, num_batches, num_epochs=None, order="length_grouped"):
+def _labeled_plan(
+    *, num_batches, num_epochs=None, order="length_grouped", grad_accum=None,
+):
     from unsloth_zoo.mlx.trainer import _create_labeled_batches
 
     return _create_labeled_batches(
@@ -306,8 +334,62 @@ def _labeled_plan(*, num_batches, num_epochs=None, order="length_grouped"):
         dataset_order=order,
         num_batches=num_batches,
         num_epochs=num_epochs,
+        grad_accum=grad_accum,
         return_plan=True,
     )
+
+
+def test_labeled_plan_groups_at_the_accumulation_window():
+    """The call site, not just the helper: `_create_labeled_batches` has to
+    fold gradient_accumulation_steps into the window it groups at, or
+    train_on_responses_only groups four times finer than HF for the default
+    config."""
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order, _length_grouped_window, _normalize_seed,
+    )
+
+    # (i % 4) + 2 tokens per row, plus the EOS `_create_labeled_batches` appends.
+    lengths = [3, 4, 5, 6, 3, 4]
+
+    def plan_order(grad_accum):
+        plan = _labeled_plan(
+            num_batches=None, num_epochs=1, grad_accum=grad_accum,
+        )
+        return [i for batch in plan.schedule for i in batch]
+
+    assert plan_order(4) == _length_grouped_order(
+        lengths, _length_grouped_window(1, None, 4), _normalize_seed(1234),
+    )
+    assert plan_order(4) != plan_order(1)
+
+
+def test_both_builders_stream_the_same_rows_at_the_same_window():
+    """Builder level rather than helper level: the labeled and unlabeled plans
+    compute their order independently, so folding accumulation into one and not
+    the other would leave train_on_responses_only masking a different stream
+    than it trains on."""
+    from unsloth_zoo.mlx.utils import _create_ordered_text_plan
+
+    class _PretokenizedTokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+
+    # Same lengths the labeled dataset tokenizes to, already tokenized so this
+    # path needs no chat template.
+    plan = _create_ordered_text_plan(
+        dataset=[{"input_ids": list(range(1, n + 1))} for n in [3, 4, 5, 6, 3, 4]],
+        tokenizer=_PretokenizedTokenizer(),
+        batch_size=1,
+        max_seq_length=16,
+        seed=1234,
+        dataset_order="length_grouped",
+        num_epochs=1,
+        grad_accum=4,
+    )
+    unlabeled = [i for batch in plan.schedule for i in batch]
+    labeled_plan = _labeled_plan(num_batches=None, num_epochs=1, grad_accum=4)
+    labeled = [i for batch in labeled_plan.schedule for i in batch]
+    assert unlabeled == labeled
 
 
 @pytest.mark.parametrize("order", ["length_grouped", "torch_randperm"])
@@ -482,6 +564,34 @@ def test_every_rank_derives_the_identical_global_order():
     lengths = [random.Random(2).randint(1, 900) for _ in range(257)]
     orders = [_length_grouped_order(lengths, 8, 4242) for _ in range(4)]
     assert all(o == orders[0] for o in orders)
+
+
+def test_window_folds_world_size_and_accumulation():
+    from unsloth_zoo.mlx.utils import _length_grouped_window
+
+    assert _length_grouped_window(2, None, 4) == 8
+    assert _length_grouped_window(2, _FakeWorld(0, 4), 4) == 32
+    assert _length_grouped_window(2, _FakeWorld(3, 4), 4) == 32   # rank-invariant
+    # An unknown or zero accumulation factor must not collapse the window to 0.
+    assert _length_grouped_window(2, None, None) == 2
+    assert _length_grouped_window(2, None, 0) == 2
+
+
+def test_window_stays_a_multiple_of_the_consumed_global_batch():
+    """Folding accumulation in must not reintroduce the straddle that grouping
+    at the global batch fixed: the schedule consumes global micro-batches, so
+    the window has to stay a whole number of them."""
+    from unsloth_zoo.mlx.utils import (
+        _distributed_global_batch_size, _length_grouped_window,
+    )
+
+    for world_size in (1, 2, 4):
+        for local_batch in (1, 2, 3, 8):
+            for grad_accum in (1, 2, 4, 16):
+                world = _FakeWorld(0, world_size)
+                global_batch = _distributed_global_batch_size(local_batch, world)
+                window = _length_grouped_window(local_batch, world, grad_accum)
+                assert window % global_batch == 0
 
 
 def test_rank_slices_are_disjoint_and_cover_the_global_batch():

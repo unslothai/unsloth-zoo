@@ -7906,6 +7906,13 @@ class MLXTrainer:
                 # (where it means sequential), as it did before this refactor.
                 if text_dataset_order != "default":
                     batch_kwargs["dataset_order"] = text_dataset_order
+                    # Unconditional: the builder quantizes a fractional epoch
+                    # count to whole accumulation windows as HF does, and
+                    # length_grouped also folds the factor into its grouping
+                    # window -- a max_steps run reaches the second use with no
+                    # num_epochs, so gating this on epochs would group it
+                    # differently from the same config run by epochs.
+                    batch_kwargs["grad_accum"] = args.gradient_accumulation_steps
                     if (
                         args.max_steps <= 0
                         and args.num_train_epochs > 0
@@ -7914,11 +7921,6 @@ class MLXTrainer:
                         )
                     ):
                         batch_kwargs["num_epochs"] = args.num_train_epochs
-                        # The builder quantizes a fractional epoch count to whole
-                        # accumulation windows, as HF does, so it needs the factor.
-                        batch_kwargs["grad_accum"] = (
-                            args.gradient_accumulation_steps
-                        )
                         self._prepared_batches_include_epochs = True
                     batch_kwargs["completion_only_loss"] = text_completion_only_loss
                     batches = _create_ordered_text_plan(**batch_kwargs)
@@ -8097,7 +8099,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False):
+                            return_plan=False, grad_accum=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -8222,14 +8224,16 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             )
             return order
         if dataset_order == "length_grouped":
-            # Same helper, same per-epoch reseed and same global-batch grouping
-            # as the unlabeled plan in `_create_ordered_text_plan`, so
+            # Same helper, same per-epoch reseed and same grouping window as the
+            # unlabeled plan in `_create_ordered_text_plan`, so
             # train_on_responses_only sees the identical stream (pinned by
             # test_mlx_group_by_length.py).
-            from .utils import _length_grouped_order, _normalize_seed
+            from .utils import (
+                _length_grouped_order, _length_grouped_window, _normalize_seed,
+            )
             return _length_grouped_order(
                 [len(item[0]) for item in all_items],
-                global_batch_size,
+                _length_grouped_window(batch_size, comm_group, grad_accum),
                 _normalize_seed(seed) + epoch_idx,
             )
         # legacy default: length-sort once
@@ -8721,6 +8725,7 @@ def train_on_responses_only(
             return_dataset=True,
             comm_group=comm_group,
             return_plan=True,
+            grad_accum=args.gradient_accumulation_steps,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset

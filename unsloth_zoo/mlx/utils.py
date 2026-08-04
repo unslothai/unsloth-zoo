@@ -10907,9 +10907,8 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
     the largest batch run first so an OOM shows up immediately rather than
     minutes in.
 
-    ``batch_size`` must be the batch the schedule actually consumes -- the
-    global micro-batch under DDP, not a rank's local slice -- or a consumed
-    batch straddles two independently sorted mega-batches.
+    ``batch_size`` is the unit the mega-batches are cut at; callers should get
+    it from ``_length_grouped_window`` rather than passing a micro-batch.
 
     With torch installed the permutation is seeded exactly as HF seeds its
     sampler generator, so for a given seed this reproduces CUDA's order; see
@@ -10943,6 +10942,28 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
     )
 
     return [i for megabatch in megabatches for i in megabatch]
+
+
+def _length_grouped_window(local_batch_size, comm_group=None, grad_accum=None):
+    """Batch unit ``_length_grouped_order`` cuts its mega-batches at.
+
+    Two factors, and both are load-bearing:
+
+    - ``grad_accum``, because transformers builds its sampler with
+      ``train_batch_size * gradient_accumulation_steps``
+      (``Trainer._get_train_sampler``). The default config accumulates 4, so
+      dropping the factor gives a different row order and padding profile from
+      CUDA for the stock settings.
+    - the world size, because the plan builders consume the order in global
+      micro-batch chunks and hand each rank its slice, so cutting at a rank's
+      local batch would let a consumed chunk straddle two independently sorted
+      mega-batches.
+
+    The product is a multiple of the global micro-batch either way, so folding
+    accumulation in cannot reintroduce that straddle.
+    """
+    global_batch_size = _distributed_global_batch_size(local_batch_size, comm_group)
+    return global_batch_size * max(1, int(grad_accum or 1))
 
 
 def _create_ordered_text_plan(
@@ -11065,13 +11086,9 @@ def _create_ordered_text_plan(
         if dataset_order == "length_grouped":
             # Reseeded per epoch like torch_randperm, so the mega-batch shuffle
             # differs each pass instead of repeating one grouping forever.
-            # Grouped at the GLOBAL micro-batch: `_finite_row_schedule` below
-            # consumes the order in global-batch chunks and hands each rank its
-            # slice, so cutting mega-batches at the local batch would let a
-            # consumed chunk straddle two independently sorted windows.
             return _length_grouped_order(
                 [_text_row_length(row) for row in tokenized],
-                _distributed_global_batch_size(batch_size, comm_group),
+                _length_grouped_window(batch_size, comm_group, grad_accum),
                 base_seed + epoch,
             )
         if dataset_order not in (None, "sequential"):
