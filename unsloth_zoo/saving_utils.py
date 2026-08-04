@@ -2938,6 +2938,17 @@ def merge_and_overwrite_lora(
                 f"`{save_directory}`. Use `save_method=\"forced_merged_4bit\"` instead."
             )
         if final_model_name is None:
+            # A repo that exists but ships no safetensors also lands here, and
+            # "the name is wrong" would be actively misleading for it.
+            _bin_only = _hub_repo_weights_without_safetensors(model_name, token)
+            if _bin_only is not None:
+                raise RuntimeError(
+                    f"Unsloth: Model {model_name} exists on Hugging Face but ships no "
+                    f"safetensors weights (found {', '.join(sorted(_bin_only)[:4])}), and "
+                    f"the {save_method} merge reads safetensors only. Nothing was written "
+                    f"to `{save_directory}`. Convert the base to safetensors, or point at "
+                    f"a sibling repo that already publishes them."
+                )
             # Never return None: `save_pretrained_merged` would look like it succeeded
             # while creating no output directory, signalled only by a UserWarning.
             raise RuntimeError(
@@ -4742,6 +4753,30 @@ def check_hf_model_exists(model_name, token=None):
     except Exception as e:
         raise _hub_unreachable_error(model_name, e) from e
 pass
+
+def _hub_repo_weights_without_safetensors(model_name, token = None):
+    """Weight files in a repo that exists but ships no safetensors, else None.
+
+    `check_hf_model_exists` answers False both for a repo that is not there and
+    for one that is there in a format the merge cannot read, so callers blame
+    the name for repos like `unsloth/bge-m3`, which is public and ships only
+    `pytorch_model.bin`.
+
+    Diagnosis only: which repos resolve is unchanged, and anything unanswerable
+    returns None so the caller's original message stands.
+    """
+    if not _is_hub_repo_id(model_name): return None
+    try:
+        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+    except Exception:
+        # Absent, gated, or unreachable: all already described by the caller.
+        return None
+    names = [os.path.basename(x["name"]) for x in file_list]
+    if any(n.endswith(".safetensors") for n in names): return None
+    weights = [n for n in names
+               if n.endswith((".bin", ".pt", ".pth", ".h5", ".msgpack", ".gguf"))]
+    return weights or None
+
 
 def check_local_model_exists(model_path):
     """
