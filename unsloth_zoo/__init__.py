@@ -14,9 +14,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.7.7"
+# Keeps PEP 604 annotations (`str | Path`) from being evaluated at def time, which
+# is a TypeError on the 3.9 floor pyproject declares.
+from __future__ import annotations
+
+__version__ = "2026.8.3"
 
 import os
+import platform
+import sys
 import warnings
 import re
 # Stop TOKENIZERS_PARALLELISM warning
@@ -33,8 +39,40 @@ _offline_env = (
     or os.environ.get("HF_DATASETS_OFFLINE", "").strip().lower() in _OFFLINE_TRUE
 )
 
+# hf_transfer's Rust extension cannot complete a download on Windows on ARM:
+# every fetch dies with "an error occurred while downloading using hf_transfer",
+# and the same fetch succeeds once it is off.
+def _detect_windows_on_arm() -> bool:
+    if sys.platform != "win32":
+        return False
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    # An x64 process emulated on ARM64 still reports AMD64 on Python < 3.12,
+    # which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets
+    # the latter for 32-bit processes only, so nothing there names the host.
+    # IsWow64Process2's pNativeMachine does, emulated or not.
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        process, native = ctypes.c_ushort(), ctypes.c_ushort()
+        if kernel32.IsWow64Process2(
+            kernel32.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)
+        ):
+            return native.value == 0xAA64  # IMAGE_FILE_MACHINE_ARM64
+    except Exception:
+        pass  # pre-1709 Windows has no IsWow64Process2; fall back to "not ARM".
+    return False
+
+
+_windows_on_arm = _detect_windows_on_arm()
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
-if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ and not _offline_env:
+if (
+    "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+    and not _offline_env
+    and not _windows_on_arm
+):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 # More stable downloads
@@ -52,37 +90,37 @@ if _offline_env:
         os.environ[_v] = "1"
 del _OFFLINE_TRUE, _offline_env
 
-# Check "429 Too Many Requests" and set HF_XET_HIGH_PERFORMANCE
+# A 429 in hf_xet's own logs means the ACCOUNT, not the machine, is the bottleneck, so it lowers
+# the stream ceiling rather than the memory caps.
 from pathlib import Path
-def has_429_exact_full_read(log_dir: str | Path) -> str:
+def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
     if not log_dir.is_dir():
-        return "1"
+        return False
     for log_file in log_dir.glob("*.log"):
         try:
             if b"429 Too Many Requests" in log_file.read_bytes():
-                return "0"
+                return True
         except OSError:
             continue
-    return "1"
+    return False
 
 # Redirect the HF cache off a read-only default (locked-down machines) so
 # snapshot_download() can write. Runs before any huggingface_hub import.
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
-# _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and
-# returns None entries instead of raising when home is unresolvable; "1"
-# matches the probe's no-logs-found default.
+# Size hf_xet's download buffers from THIS machine's RAM and cores. HF_XET_HIGH_PERFORMANCE=1 (the
+# old default here) is an xet-core preset applied AFTER the environment is read: it raises the
+# reconstruction buffer cap to 64GB and the stream count to 124 and overwrites any explicit
+# HF_XET_RECONSTRUCTION_* cap, which is the source of the multi-GB RSS spikes. apply_xet_env()
+# turns it off and writes RAM-derived caps instead, leaving user-set variables untouched.
+# _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and returns None entries
+# instead of raising when home is unresolvable.
+from .hf_xet_tuning import apply_xet_env
 _, _, xet_cache = _active_caches()
-os.environ.setdefault(
-    "HF_XET_HIGH_PERFORMANCE",
-    has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else "1",
-)
-os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
-os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
-os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "64")
-del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches
+apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
+del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches, apply_xet_env
 
 # More verbose HF Hub info
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":

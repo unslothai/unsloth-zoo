@@ -100,6 +100,10 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 
     Tokenizers may fold surrounding newlines/spaces into one token, so we probe
     variants (e.g. "\\n### User:\\n\\n") to find the stable common core.
+
+    Returns (core, optional_left, optional_right). When no core can be located in
+    the component's own tokenization the result is ([], [], []) - callers must
+    treat an empty core as "no match" rather than as a matchable span.
     """
     right_text = ""
     if   component.endswith (" "): right_text = " "
@@ -152,12 +156,29 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recover optional left/right tokens around the matched core
+    # Recover optional left/right tokens around the matched core. `substring` carries
+    # an appended [0] sentinel, so it need not be a sublist of `original`; track the
+    # match index explicitly rather than letting the loop fall through (which sliced
+    # at the last index, or left `j` unbound on an empty tokenization).
     original = tokenizer(component, add_special_tokens = False).input_ids
+    where = -1
     for j in range(len(original)):
-        if original[j : j + len(substring)] == substring: break
-    optional_left  = original[:j]
-    optional_right = original[j+len(substring):]
+        if original[j : j + len(substring)] == substring:
+            where = j
+            break
+    if where == -1:
+        # The core was never located in the component's own tokenization, so it was
+        # never verified against real tokenizer output. It can be the bare [0]
+        # sentinel, or a real token with that sentinel glued on (Phi-3 gives
+        # [32010, 0] for a marker that tokenizes to [32010]). Returning it either
+        # makes A_first == 0 and matches every <unk>/<pad>/"!" in the corpus, or
+        # matches nothing and masks the whole dataset. Report no core instead, which
+        # both empty-core guards downstream already handle. Only force_match = False
+        # gets here: with force_match = True the core is the component's own
+        # tokenization, so it is always located at index 0.
+        return [], [], []
+    optional_left  = original[:where]
+    optional_right = original[where+len(substring):]
     return substring, optional_left, optional_right
 pass
 
@@ -393,6 +414,23 @@ def train_on_responses_only(
     # Get most common tokens since tokenizers can tokenize stuff differently!
     Q_must, Q_left, Q_right = _find_common_token_ids(instruction_part, tokenizer, force_match)
     A_must, A_left, A_right = _find_common_token_ids(response_part,    tokenizer, force_match)
+
+    # Empty core -> named error instead of IndexError on A_must[0]. Two ways in: an
+    # explicitly-passed marker that tokenizes to nothing, and a marker whose core was
+    # never located in its own tokenization (force_match = False on templates like
+    # Phi-3, which used to mask the whole dataset instead of saying anything).
+    if len(Q_must) == 0 or len(A_must) == 0:
+        _empty = "instruction_part" if len(Q_must) == 0 else "response_part"
+        # force_match = True already resolves the unlocated-core case, so only suggest
+        # it to callers who are not using it.
+        _retry = "" if force_match else ", or try force_match = True"
+        raise ValueError(
+            f"Unsloth: {_empty} could not be resolved to a stable token sequence, so it "
+            "cannot be matched against your dataset - it tokenizes to nothing, or no "
+            "stable core could be recovered from it. Pass a different marker, pass "
+            f"neither to auto-detect both{_retry}."
+        )
+    pass
 
     # Store some temporary stuff
     A_first = A_must[0]
@@ -1002,7 +1040,11 @@ def sft_prepare_dataset(
             else:
                 test_text = None  # chat template handles BOS
         else:
-            test_text = next(iter(dataset))[dataset_text_field][0]
+            # No [0] on a str: that is the first CHARACTER, so startswith(bos_token)
+            # below could never match. Only unwrap when the field really is a list.
+            test_text = next(iter(dataset))[dataset_text_field]
+            if isinstance(test_text, (list, tuple)):
+                test_text = test_text[0] if len(test_text) != 0 else None
 
         chat_template = getattr(processing_class, 'chat_template', '')
         if chat_template == '' and is_vlm:
