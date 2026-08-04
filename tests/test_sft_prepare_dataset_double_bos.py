@@ -17,12 +17,12 @@
 """Double-BOS detection in ``sft_prepare_dataset``.
 
 Detection is ``test_text.startswith(bos_token) or bos_token in chat_template``. Arm B
-needs the BOS as a literal, which Llama-3 style templates never have (they emit
-``{{- bos_token }}``), so arm A is the only detector - and it read ``row[field][0]``,
-the first CHARACTER of a string, which no multi-character BOS can match.
+needs a literal BOS, which Llama-3 templates never have (they emit ``{{- bos_token }}``),
+so arm A is the only live detector - and it read ``row[field][0]``, the first CHARACTER
+of a string, which no multi-character BOS can match.
 
-Assertions read the tokenized output, not stub state: under ``fork`` the map body runs
-in child processes where recorded state is invisible to the parent.
+Assertions read tokenized output, not stub state: under ``fork`` the map body runs in
+child processes whose recorded state is invisible to the parent.
 """
 
 import pytest
@@ -42,9 +42,8 @@ LITERAL_BOS_TEMPLATE = "{{ '" + BOS + "' }}{{ messages }}"
 
 
 class BosStubTokenizer:
-    """Encodes the add_special_tokens decision into its output: one leading BOS id
-    for text that already starts with BOS, one more if the caller asks for specials.
-    A correct caller yields exactly one; the bug yields two."""
+    """Encodes the add_special_tokens decision into its output: one leading BOS id if the
+    text starts with BOS, one more if the caller asks for specials. Correct -> one, bug -> two."""
 
     def __init__(self, bos_token=BOS, chat_template=JINJA_BOS_TEMPLATE):
         self.bos_token = bos_token
@@ -114,7 +113,7 @@ def _leading_bos_count(ids):
 
 
 def test_text_already_starting_with_bos_is_not_double_bos():
-    """The regression: unpatched, arm A never fires and every row gets two BOS ids."""
+    """Unpatched, arm A never fires and every row gets two BOS ids."""
     dataset = Dataset.from_dict({"text": [BOS + "hello world", BOS + "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer())
@@ -152,7 +151,7 @@ def test_literal_bos_in_chat_template_still_detected():
 
 
 def test_list_valued_text_field_is_unwrapped():
-    """A list-valued text field: indexing element 0 is correct there."""
+    """A list-valued field: element 0 really is the text, so unwrapping is correct."""
     dataset = Dataset.from_dict({"text": [[BOS + "hello world"], [BOS + "second row"]]})
 
     rows = _prepare(dataset, BosStubTokenizer())
@@ -164,7 +163,7 @@ def test_list_valued_text_field_is_unwrapped():
 
 
 def test_no_bos_token_on_tokenizer_is_a_noop():
-    """No bos_token (e.g. Qwen2.5): must not crash, no BOS id may appear."""
+    """No bos_token (Qwen2.5): must not crash, no BOS id may appear."""
     dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer(bos_token=None, chat_template="{{ messages }}"))

@@ -110,7 +110,8 @@ jobs:
         # test_find_common_token_ids_no_match pins the no-match contract for
         # chat-marker core recovery (stub tokenizer, no weights).
         # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
-        # mapping (no GPU, no vLLM needed).
+        # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
+        # pins add_special_tokens for text that already carries BOS.
         #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
@@ -119,8 +120,6 @@ jobs:
         # CPU-pure and monkeypatch every Hub entry point, so they cost under two
         # seconds. Left out of a gate they would have been collected but never
         # run: `pytest tests/ --collect-only` above proves only that they import.
-        # no weights). test_sft_prepare_dataset_double_bos pins the add_special_tokens
-        # contract for text that already carries BOS.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
