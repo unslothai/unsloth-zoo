@@ -23,8 +23,8 @@ Asserts the contract:
   - every projection lands in its own vLLM slot, gate_up slot 1 being up_proj (gate and
     up share shapes, so the shape asserts alone cannot catch a mis-pairing);
   - the effective delta each slot carries equals scaling * B @ A;
-  - a vLLM B slot sharing storage with any training tensor is rejected before any copy
-    when the scaling is not 1, including when it aliases a different pair;
+  - a slot sharing storage with a training tensor is rejected before any copy, unless it is
+    that exact tensor with no scaling; a cross-pair alias is rejected even unscaled;
   - independent buffers scale the destination only and never the training weights.
 """
 
@@ -165,6 +165,24 @@ def test_alias_of_a_different_pair_is_also_rejected(vllm_utils):
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
         vllm_utils.load_lora_directly(model)
     assert src_0.max().item() == 3.0
+
+
+def test_unscaled_alias_of_a_different_pair_is_rejected(vllm_utils):
+    # no multiplication, but the copy still overwrites the other pair's training tensor
+    src_0, src_1 = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
+    model = _pairs([src_0, src_1], [torch.zeros(1, 1, 4, 2), src_0], [None, None])
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(model)
+    assert src_0.max().item() == 3.0
+
+
+def test_aliased_A_destination_is_rejected(vllm_utils):
+    src_a, src_b = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
+    model = _pairs([src_b], [torch.zeros(1, 1, 4, 2)], [None],
+                   model_A=[src_a], vllm_A=[src_b])
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(model)
+    assert src_b.max().item() == 5.0
 
 
 def test_aliased_slot_without_scaling_is_allowed(vllm_utils):

@@ -2865,23 +2865,26 @@ def _lora_storage_span(tensor):
 pass
 
 
-def check_vllm_loras_not_aliased(model_loras, vllm_loras_B):
+def check_vllm_loras_not_aliased(model_loras, vllm_pairs):
     # All Unsloth Zoo code licensed under LGPLv3
-    # A vLLM B slot aliasing a training tensor cannot be scaled in place, since the scale
-    # would compound onto the training weights every load. Runs before any copy, so a
-    # failure leaves both sides untouched.
-    spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
-    for vllm_lora_B, s in vllm_loras_B:
-        if s is None or vllm_lora_B.numel() == 0: continue
-        v_ptr, v_start, v_end = _lora_storage_span(vllm_lora_B)
-        for (m_ptr, m_start, m_end), m_device in spans:
-            if m_ptr != v_ptr or m_device != vllm_lora_B.device: continue
+    # Every copy destination must own its memory. Sharing it with a training tensor is safe
+    # only when the destination IS that same tensor and no scaling follows, which makes the
+    # copy a no-op; any other overlap overwrites, or compounds a scale onto, weights the
+    # trainer still needs. Runs before any copy, so a failure leaves both sides untouched.
+    spans = [(_lora_storage_span(t), t.device, t) for t in model_loras if t.numel() != 0]
+    for vllm_lora, model_lora, s in vllm_pairs:
+        if vllm_lora.numel() == 0: continue
+        v_ptr, v_start, v_end = _lora_storage_span(vllm_lora)
+        for (m_ptr, m_start, m_end), m_device, m_tensor in spans:
+            if m_ptr != v_ptr or m_device != vllm_lora.device: continue
             if v_start >= m_end or m_start >= v_end: continue
+            if s is None and m_tensor is model_lora and \
+                (v_start, v_end) == (m_start, m_end): continue
             raise RuntimeError(
-                "Unsloth: a vLLM LoRA B slot shares storage with a training tensor while the "
-                f"effective LoRA scaling is {s} != 1. Scaling in place would corrupt the "
-                "training weights on every load. Give vLLM its own buffer, or use an adapter "
-                "with scaling 1 (LoRA: lora_alpha == r, rsLoRA: lora_alpha == sqrt(r))."
+                "Unsloth: a vLLM LoRA slot shares storage with a training tensor. Loading "
+                f"would overwrite, or scale by {s}, weights the trainer still needs. Give "
+                "vLLM its own buffer, and if the slot is meant to be the training tensor "
+                "itself use scaling 1 (LoRA: lora_alpha == r, rsLoRA: lora_alpha == sqrt(r))."
             )
         pass
     pass
@@ -2896,7 +2899,11 @@ def load_lora_directly(model):
     vllm_loras_A  = model. vllm_loras_A
     vllm_loras_B  = model. vllm_loras_B
 
-    check_vllm_loras_not_aliased(model_loras_A + model_loras_B, vllm_loras_B)
+    check_vllm_loras_not_aliased(
+        model_loras_A + model_loras_B,
+        [(v, m, None) for v, m in zip(vllm_loras_A, model_loras_A)] + \
+        [(v, m, s)    for m, (v, s) in zip(model_loras_B, vllm_loras_B)],
+    )
 
     for model_lora_A, vllm_lora_A in zip(model_loras_A, vllm_loras_A):
         vllm_lora_A.copy_(model_lora_A, non_blocking = True)

@@ -101,12 +101,15 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). Executing them here keeps fixture/source drift visible.
+        # regress silently). test_vllm_direct_lora_loading pins the vLLM direct
+        # hot-load slot mapping and the aliased-slot guard (no GPU, no vLLM).
+        # Executing them here keeps fixture/source drift visible.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_hf_xet_fallback.py \
+            tests/test_vllm_direct_lora_loading.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
