@@ -591,11 +591,32 @@ def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
     unsloth/models/rl.py bakes `from unsloth_zoo.dataset_num_proc import ...`
     into every trainer it generates, so a rename breaks code already written to
     disk in users' unsloth_compiled_cache.
-    """
-    pytest.importorskip("torch")
-    from unsloth_zoo.dataset_num_proc import get_dataset_num_proc
 
-    assert callable(get_dataset_num_proc)
+    Imported for real, in a subprocess, with UNSLOTH_ZOO_DISABLE_GPU_INIT: the
+    package __init__ refuses to load when `unsloth` is not installed, which is
+    the shape of a CPU CI runner that installed only this package's own
+    dependencies. Skipping there would retire the canary exactly where it runs.
+    """
+    import os
+    import subprocess
+
+    environment = dict(os.environ, UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from unsloth_zoo.dataset_num_proc import get_dataset_num_proc\n"
+            "print(get_dataset_num_proc.__module__)",
+        ],
+        capture_output = True,
+        text = True,
+        cwd = str(REPO_ROOT),
+        env = environment,
+    )
+    if result.returncode != 0 and "Pytorch is not installed" in result.stderr:
+        pytest.skip("torch is not installed; the package __init__ cannot load")
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "unsloth_zoo.dataset_num_proc", result.stdout
 
 
 
@@ -924,18 +945,43 @@ def test_the_unaided_reader_never_raises(monkeypatch, dnp):
     assert free is None or (isinstance(free, int) and free >= 0)
 
 
-def test_no_unsloth_zoo_at_all_is_not_a_ceiling(monkeypatch, dnp):
+def _no_hf_xet_tuning(monkeypatch):
+    """Neither the private helpers nor the public readers: no unsloth_zoo at all."""
     import builtins
 
     real_import = builtins.__import__
 
-    def _no_hf_xet(name, *args, **kwargs):
+    def _blocked(name, *args, **kwargs):
         if name == "unsloth_zoo.hf_xet_tuning":
             raise ImportError("older unsloth_zoo")
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _no_hf_xet)
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+
+
+def test_no_unsloth_zoo_and_no_cgroup_is_not_a_ceiling(monkeypatch, dnp, tmp_path):
+    # The cgroup tree is pointed away from the host's on purpose: the unaided
+    # reader needs no unsloth_zoo, so leaving it on the real /sys/fs/cgroup would
+    # make the assertion depend on whether the runner is itself in a limited
+    # container, which is how this test would fail on CI and pass on a laptop.
+    _no_hf_xet_tuning(monkeypatch)
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path / "absent"))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: [])
     assert dnp._cgroup_free_bytes() is None
+    assert dnp._cgroup_cpu_quota() is None
+
+
+def test_no_unsloth_zoo_still_reads_the_cgroup(monkeypatch, dnp, tmp_path):
+    """The point of the unaided reader: the ceiling survives having no zoo to ask."""
+    _no_hf_xet_tuning(monkeypatch)
+    leaf = tmp_path / "scope"
+    leaf.mkdir()
+    (leaf / "memory.max").write_text("8589934592\n")
+    (leaf / "memory.current").write_text("6442450944\n")
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: ["0::/scope"])
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+    # The CPU quota reader has no unaided path, so it stays silent.
     assert dnp._cgroup_cpu_quota() is None
 
 
