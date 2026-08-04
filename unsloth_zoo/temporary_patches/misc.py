@@ -20,6 +20,15 @@ import inspect
 import importlib
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import functools
+# Guarded because tests load this file by path rather than as
+# `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
+# raises "attempted relative import beyond top-level package".
+try:
+    from ..log import logger
+except (ImportError, ValueError):
+    import logging
+    logger = logging.getLogger("unsloth_zoo.log")
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
     patch_function,
@@ -1669,3 +1678,104 @@ def patch_deepseek_v2_moe_alias():
         m.DeepseekV2MoE = m.DeepseekV2Moe
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_trl_entropy_from_logits():
+    """trl logs a token-entropy metric from logits Unsloth does not materialise.
+
+    `SFTTrainer.compute_loss` does, with no flag to turn it off other than
+    `use_liger_kernel`:
+
+        if not self.args.use_liger_kernel:
+            with torch.no_grad():
+                per_token_entropy = entropy_from_logits(outputs.logits)
+
+    A [batch, seq, vocab] float32 tensor is the largest allocation in an SFT
+    step and Unsloth never materialises it, so a diagnostic metric became a
+    hard training failure, in two shapes, both seen live:
+
+      Qwen3_(32B)_A100   NotImplementedError: Unsloth: Logits are empty from
+                         2024.11 onwards ... set UNSLOTH_RETURN_LOGITS=1
+      Spark_TTS_(0_5B)   TypeError: iteration over a 0-d tensor
+                         (trl/trainer/utils.py, per_token_entropies.extend)
+
+    The advice in the first cannot be taken: UNSLOTH_RETURN_LOGITS=1 buys the
+    metric back by giving up the memory saving the user came for. So the metric
+    degrades instead, reporting 0.0 and saying once why, since silently logging
+    a zero would look like a real measurement.
+
+    Patched on `trl.trainer.sft_trainer` as well as `trl.trainer.utils`, which
+    binds the name at import, so patching only the source module would be a
+    no-op for the one caller that matters.
+    """
+    try:
+        import torch
+        import trl.trainer.utils as _utils
+    except Exception:
+        return
+
+    original = getattr(_utils, "entropy_from_logits", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    _warned = [False]
+
+    def _unusable(logits):
+        """Checked on the object, not the exception text. `EmptyLogits.__getattr__`
+        hands back the `raise_logits_error` function for every attribute, so what
+        blows up depends on which attribute this trl touches first: `.split(...)`
+        raises NotImplementedError, `logits.shape[:-1]` subscripts a function and
+        raises TypeError. Keying on either message fixes one trl and misses the
+        other. Matched by name because unsloth_zoo must not import unsloth.
+        """
+        if logits is None:
+            return True
+        if type(logits).__name__ == "EmptyLogits":
+            return True
+        if isinstance(logits, torch.Tensor) and (logits.numel() == 0 or logits.dim() < 2):
+            return True
+        return False
+
+    def _warn_once():
+        if _warned[0]:
+            return
+        _warned[0] = True
+        logger.warning(
+            "Unsloth: your trl version logs a token-entropy metric computed "
+            "from the full logits, which Unsloth does not materialise (that is "
+            "where the memory saving comes from). Entropy will be reported as "
+            "0.0. Set UNSLOTH_RETURN_LOGITS=1 before training if you need the "
+            "real value and can afford the memory."
+        )
+
+    # 0-d so it broadcasts against attention_mask in both of the caller's
+    # branches: sum(0 * mask)/sum(mask) and mean(0) are both 0.0, neither raises.
+    def _no_entropy():
+        return torch.zeros((), dtype = torch.float32)
+
+    @functools.wraps(original)
+    def entropy_from_logits(logits, *args, **kwargs):
+        if _unusable(logits):
+            _warn_once()
+            return _no_entropy()
+        try:
+            return original(logits, *args, **kwargs)
+        except TypeError as e:
+            # Backstop for a shape the check above did not anticipate. Narrow:
+            # anything else from inside entropy_from_logits is a real bug and
+            # must still raise, or this hides it on every single step.
+            if "iteration over a 0-d tensor" not in str(e):
+                raise
+            _warn_once()
+            return _no_entropy()
+
+    entropy_from_logits._unsloth_patched = True
+    for _mod_name in ("trl.trainer.utils", "trl.trainer.sft_trainer"):
+        try:
+            _mod = importlib.import_module(_mod_name)
+        except Exception:
+            continue
+        if getattr(_mod, "entropy_from_logits", None) is original:
+            _mod.entropy_from_logits = entropy_from_logits
+pass
+TEMPORARY_PATCHES.append(patch_trl_entropy_from_logits)
