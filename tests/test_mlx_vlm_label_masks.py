@@ -2262,12 +2262,6 @@ class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
                              for _ in range(v.count("<audio>"))), []) + [11]
                 for v in text]
         width = max(len(r) for r in rows)
-        # A batch carrying audio gets the token cap scoped under `text_kwargs`,
-        # because a flat one reaches some processors' audio extractors and is
-        # read there as a sample budget. Honour it from either place, as a real
-        # processor does.
-        if max_length is None:
-            max_length = (_kwargs.get("text_kwargs") or {}).get("max_length")
         cut = max_length if self.truncates else width
         pad = lambda r, v: r + [v] * (width - len(r))
         out = {
@@ -4664,15 +4658,18 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
 
 
 class _TruncationDivertingAudioProcessor:
-    """A processor that hands its flat keywords to its audio extractor.
+    """A processor that fans its flat keywords out to its audio extractor.
 
-    Gemma 3n does this: `max_length` is a token budget, but it reaches the
-    feature extractor, which reads the same number as a sample budget. A
-    one-second 16 kHz clip under `max_length=512` comes back as zero mel
-    frames while `input_ids` is untouched.
+    This is what transformers' `_merge_kwargs` does: a flat keyword reaches
+    every modality that declares it, and `AudioKwargs` declares `max_length`
+    and `truncation`. Gemma 3n shows the result -- a one-second clip under
+    `max_length=512` comes back as zero mel frames, the waveform cut to 512
+    samples, while `input_ids` is untouched.
 
-    Scoped under `text_kwargs`, the budget stays on the text and the audio
-    survives. This fixture reproduces exactly that asymmetry.
+    An empty `audio_kwargs` is what stops it: a modality present in kwargs
+    stops reading flat keywords. This fixture reproduces exactly that rule,
+    including the part that matters most -- the text side must keep reading
+    its flat keywords, or padding and `add_special_tokens` go with it.
     """
 
     tokenizer = _FakeTokenizer()
@@ -4681,39 +4678,40 @@ class _TruncationDivertingAudioProcessor:
     chat_template = "{{ messages }}"
 
     def __init__(self):
-        self.saw_flat_max_length = None
+        self.text_saw = {}
 
     def __call__(self, text, audio=None, **kwargs):
-        flat_cap = kwargs.get("max_length")
-        scoped = kwargs.get("text_kwargs") or {}
-        self.saw_flat_max_length = flat_cap
-        cap = flat_cap if flat_cap is not None else scoped.get("max_length")
+        # The `_merge_kwargs` rule, both ways round.
+        audio_reads_flat = "audio_kwargs" not in kwargs
+        text_reads_flat = "text_kwargs" not in kwargs
+        self.text_saw = {
+            "max_length": kwargs.get("max_length") if text_reads_flat else None,
+            "padding": kwargs.get("padding") if text_reads_flat else None,
+        }
+        cap = kwargs.get("max_length")
 
         rows = [[101, 10, 11, 0] for _ in text]
-        masks = [[1, 1, 1, 0] for _ in text]
-        clips = len(audio) if audio is not None else 0
-        # The diversion: a flat cap truncates the waveform, a scoped one does
-        # not. 512 samples frame to nothing, which is the (n, 0, 128) the real
-        # processor returns.
-        frames = 0 if flat_cap is not None else 97
         out = {
             "input_ids": np.array(rows, dtype=np.int32),
-            "attention_mask": np.array(masks, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1, 1, 1, 0] for _ in text], dtype=np.int32),
         }
+        clips = len(audio) if audio is not None else 0
         if clips:
+            # The waveform is cut to the cap when the audio side reads it.
+            frames = 0 if (audio_reads_flat and cap is not None) else 97
             out["input_features"] = np.zeros((clips, frames, 128), np.float32)
             out["input_features_mask"] = np.ones((clips, frames), np.int32)
-        assert cap is not None, "the cap must reach the processor somehow"
         return out
 
 
 def test_a_text_cap_does_not_reach_the_audio_extractor():
     """`max_length` is a token budget and must not be read as a sample budget.
 
-    Passed flat, a processor that owns an audio feature extractor may forward
-    it there, and every clip longer than `max_seq_length` samples -- which is
-    every clip, at any realistic cap -- loses its audio. The row still has its
-    placeholders, so what is left is placeholders with nothing behind them.
+    Left flat, it fans out to every modality that declares it, and
+    `AudioKwargs` declares it. Every clip longer than `max_seq_length` samples
+    -- which is every clip, at any realistic cap -- then loses its audio while
+    the row keeps its placeholders, leaving placeholders with nothing behind.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
@@ -4723,22 +4721,37 @@ def test_a_text_cap_does_not_reach_the_audio_extractor():
         all_audio=[[np.zeros(16000, np.float32)]],
     )
 
-    assert processor.saw_flat_max_length is None, (
-        "the text cap was passed flat, where an audio extractor can read it"
-    )
     assert inputs["input_features"].shape[1] > 0, (
         "the clip was truncated to the token budget and framed to nothing"
     )
 
 
-def test_a_text_only_batch_still_gets_the_cap_flat():
-    """The scoping is for batches carrying audio, and only those.
+def test_shielding_the_audio_side_leaves_the_text_side_flat():
+    """The shield goes on the audio modality, never the text one.
 
-    A processor with no audio to divert the keyword into should see the same
-    call it always did, so this cannot change collation for text or images.
+    Putting `text_kwargs` in instead would stop the text modality reading its
+    flat keywords, taking `padding`, `add_special_tokens` and `return_tensors`
+    with the cap -- ragged output and a doubled BOS. So the text side must
+    still see both the cap and its padding flag.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+    assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_a_text_only_batch_is_collated_exactly_as_before():
+    """The shield is for batches carrying audio, and only those.
+
+    A processor with no audio to fan the keyword into should see the call it
+    always did, so this cannot change collation for text or images.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     processor = _TruncationDivertingAudioProcessor()
     mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
-    assert processor.saw_flat_max_length == 512
+    assert processor.text_saw == {"max_length": 512, "padding": True}
