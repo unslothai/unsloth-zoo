@@ -2262,6 +2262,12 @@ class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
                              for _ in range(v.count("<audio>"))), []) + [11]
                 for v in text]
         width = max(len(r) for r in rows)
+        # A batch carrying audio gets the token cap scoped under `text_kwargs`,
+        # because a flat one reaches some processors' audio extractors and is
+        # read there as a sample budget. Honour it from either place, as a real
+        # processor does.
+        if max_length is None:
+            max_length = (_kwargs.get("text_kwargs") or {}).get("max_length")
         cut = max_length if self.truncates else width
         pad = lambda r, v: r + [v] * (width - len(r))
         out = {
@@ -4655,3 +4661,84 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
     ignored = _get_vlm_ignore_token_ids(processor=processor) or []
     for token_id in soft:
         assert token_id in ignored, token_id
+
+
+class _TruncationDivertingAudioProcessor:
+    """A processor that hands its flat keywords to its audio extractor.
+
+    Gemma 3n does this: `max_length` is a token budget, but it reaches the
+    feature extractor, which reads the same number as a sample budget. A
+    one-second 16 kHz clip under `max_length=512` comes back as zero mel
+    frames while `input_ids` is untouched.
+
+    Scoped under `text_kwargs`, the budget stays on the text and the audio
+    survives. This fixture reproduces exactly that asymmetry.
+    """
+
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    feature_extractor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.saw_flat_max_length = None
+
+    def __call__(self, text, audio=None, **kwargs):
+        flat_cap = kwargs.get("max_length")
+        scoped = kwargs.get("text_kwargs") or {}
+        self.saw_flat_max_length = flat_cap
+        cap = flat_cap if flat_cap is not None else scoped.get("max_length")
+
+        rows = [[101, 10, 11, 0] for _ in text]
+        masks = [[1, 1, 1, 0] for _ in text]
+        clips = len(audio) if audio is not None else 0
+        # The diversion: a flat cap truncates the waveform, a scoped one does
+        # not. 512 samples frame to nothing, which is the (n, 0, 128) the real
+        # processor returns.
+        frames = 0 if flat_cap is not None else 97
+        out = {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(masks, dtype=np.int32),
+        }
+        if clips:
+            out["input_features"] = np.zeros((clips, frames, 128), np.float32)
+            out["input_features_mask"] = np.ones((clips, frames), np.int32)
+        assert cap is not None, "the cap must reach the processor somehow"
+        return out
+
+
+def test_a_text_cap_does_not_reach_the_audio_extractor():
+    """`max_length` is a token budget and must not be read as a sample budget.
+
+    Passed flat, a processor that owns an audio feature extractor may forward
+    it there, and every clip longer than `max_seq_length` samples -- which is
+    every clip, at any realistic cap -- loses its audio. The row still has its
+    placeholders, so what is left is placeholders with nothing behind them.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    inputs = mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+
+    assert processor.saw_flat_max_length is None, (
+        "the text cap was passed flat, where an audio extractor can read it"
+    )
+    assert inputs["input_features"].shape[1] > 0, (
+        "the clip was truncated to the token budget and framed to nothing"
+    )
+
+
+def test_a_text_only_batch_still_gets_the_cap_flat():
+    """The scoping is for batches carrying audio, and only those.
+
+    A processor with no audio to divert the keyword into should see the same
+    call it always did, so this cannot change collation for text or images.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
+    assert processor.saw_flat_max_length == 512

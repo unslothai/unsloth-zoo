@@ -7243,9 +7243,32 @@ def _processor_vlm_inputs(
         # caller's processor stays as mlx-vlm made it.
         processor = _audio_repaired_processor(processor)
     if truncation:
-        base_kwargs["truncation"] = True
+        text_truncation = {"truncation": True}
         if max_seq_length is not None:
-            base_kwargs["max_length"] = max_seq_length
+            text_truncation["max_length"] = max_seq_length
+        if audio is None:
+            base_kwargs.update(text_truncation)
+        else:
+            # `max_length` is a token budget, but a processor that owns an audio
+            # feature extractor may hand its flat keywords straight to it, and
+            # the extractor reads the same number as a *sample* budget. Gemma 3n
+            # does: a one-second 16 kHz clip under `max_length=512` comes back
+            # as `input_features` of shape (1, 0, 128) -- the waveform cut to
+            # 512 samples, which is 0.032s and frames to nothing -- while
+            # `input_ids` is untouched. Every clip longer than `max_seq_length`
+            # samples loses its audio that way, which is every clip.
+            #
+            # Scoping it under `text_kwargs` puts the budget where it was meant
+            # to go. Text still truncates at the cap; the audio survives.
+            #
+            # A processor whose signature cannot take `text_kwargs` gets the
+            # flat pair it has always had: it is no worse off than before, and
+            # a processor narrow enough to name its keywords one by one is not
+            # the kind that quietly forwards them to a feature extractor.
+            scoped = _drop_unsupported_processor_kwargs(
+                processor, {"text_kwargs": text_truncation},
+            )
+            base_kwargs.update(scoped or text_truncation)
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
     images = _format_vlm_images_for_processor(all_images, processor=processor)
