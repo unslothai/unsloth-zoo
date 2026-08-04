@@ -70,10 +70,19 @@ def env(monkeypatch):
             sys.modules[parent] = m
             saved.setdefault(parent, None)
     sys.modules["transformers"].utils = sys.modules["transformers.utils"]
-    sys.modules["transformers.utils"].import_utils = iu
+    # `import a.b.c as x` resolves through getattr(a.b, "c"), so this attribute
+    # outlives a sys.modules-only teardown and hands the stub to every later
+    # `import transformers.utils.import_utils as iu` (test_vendor_fla.py:219,
+    # fla_vendor.py:473). Restore it too.
+    utils_mod = sys.modules["transformers.utils"]
+    had_attr = hasattr(utils_mod, "import_utils")
+    saved_attr = getattr(utils_mod, "import_utils", None)
+    utils_mod.import_utils = iu
 
     yield model_mod, iu
 
+    if had_attr: utils_mod.import_utils = saved_attr
+    elif hasattr(utils_mod, "import_utils"): del utils_mod.import_utils
     for k, v in saved.items():
         if v is None: sys.modules.pop(k, None)
         else: sys.modules[k] = v
@@ -121,9 +130,12 @@ def test_no_cuda_is_untouched(env, monkeypatch):
     assert model_mod.is_fast_path_available is True
 
 
-def test_no_mamba_ssm_is_untouched(env):
+def test_no_mamba_ssm_is_untouched(env, monkeypatch):
     model_mod, iu = env
-    sys.modules.pop("mamba_ssm", None)
+    # None in sys.modules makes `import mamba_ssm` raise, so this exercises the
+    # unavailable branch even where the real package is installed; popping the
+    # fake would just import the real one.
+    monkeypatch.setitem(sys.modules, "mamba_ssm", None)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
     assert iu.is_mamba_ssm_available() is True
@@ -142,6 +154,22 @@ def test_non_transformers_modules_are_left_alone(env):
 
 def test_registered_as_a_temporary_patch():
     assert "TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)" in _SRC
+
+
+# Keep last: it checks what the `env` fixture left behind after teardown.
+def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
+    """The stub must not outlive the fixture. `import a.b.c as x` goes through
+    getattr(a.b, "c"), so a leaked attribute is handed to every later
+    `import transformers.utils.import_utils as iu` -- the form used by
+    tests/test_vendor_fla.py:219 and unsloth_zoo/temporary_patches/fla_vendor.py:473."""
+    utils_mod = sys.modules.get("transformers.utils")
+    if utils_mod is None or getattr(utils_mod, "__file__", None) is None:
+        pytest.skip("real transformers.utils was never imported in this session")
+    import importlib
+    real = importlib.import_module("transformers.utils.import_utils")
+    assert getattr(utils_mod, "import_utils", real) is real
+    import transformers.utils.import_utils as reimported
+    assert reimported is real
 
 
 if __name__ == "__main__":
