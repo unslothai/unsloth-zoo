@@ -4946,9 +4946,7 @@ class MLXTrainer:
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
 
-        if preference_kind and (
-            preference_kind == "orpo" or bool(args.reference_free)
-        ):
+        if preference_kind:
             self._ensure_lora_frozen(model)
 
         # Whole run, not just when audio is spotted up front: audio-free

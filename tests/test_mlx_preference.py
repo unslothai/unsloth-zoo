@@ -703,6 +703,102 @@ def test_preference_trainer_runs_through_shared_training_loop(
     assert result["trained_tokens"] > 0
 
 
+def test_referenced_dpo_freezes_accidental_norm_before_reference_validation(
+    monkeypatch, tmp_path,
+):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    class Adapter:
+        def __init__(self):
+            self.lora_a = mx.array([[1.0]])
+            self.lora_b = mx.array([[0.0]])
+            self.scale = 1.0
+
+    class Norm:
+        def __init__(self):
+            self.weight = mx.array([1.0])
+            self.frozen = False
+
+        def freeze(self, keys=None, recurse=False):
+            assert keys == ["weight"] and recurse is False
+            self.frozen = True
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(64, 4)
+            self.proj = nn.Linear(4, 64, bias=False)
+            self.adapter = Adapter()
+            self.norm = Norm()
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, tokens):
+            return self.proj(self.embed(tokens))
+
+        def train(self, mode=True):
+            return self
+
+        @property
+        def state(self):
+            return []
+
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": self.adapter.lora_a,
+                    "lora_b": self.adapter.lora_b,
+                },
+                "norm": {"weight": self.norm.weight},
+            }
+
+        def trainable_parameters(self):
+            parameters = self.parameters()
+            if self.norm.frozen:
+                parameters.pop("norm")
+            return parameters
+
+        def named_modules(self):
+            return [("", self), ("q_proj", self.adapter), ("norm", self.norm)]
+
+    def value_and_grad_with_aux(model, fn):
+        def wrapped(*args):
+            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
+        return wrapped
+
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+    model = Model()
+    trainer = MLXDPOTrainer(
+        model,
+        Tokenizer(),
+        rows(2),
+        args=MLXDPOConfig(
+            max_steps=1,
+            gradient_accumulation_steps=1,
+            per_device_train_batch_size=1,
+            compile=True,
+            gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False,
+            disable_memory_limits=True,
+            max_grad_norm=0.0,
+            max_grad_leaf_norm=0.0,
+            logging_steps=1,
+            output_dir=str(tmp_path),
+        ),
+    )
+    trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5), state={}, update=lambda _model, _grad: None,
+    )
+    trainer.save_model = lambda *_args, **_kwargs: None
+
+    result = trainer.train()
+
+    assert model.norm.frozen is True
+    assert result["train_steps"] == 1
+
+
 def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
     monkeypatch, tmp_path,
 ):
