@@ -10861,6 +10861,60 @@ def _finite_batch_schedule(
                 break
         epoch += 1
     return tuple(schedule), cycle_length
+def _text_row_length(row):
+    """Token count of a text plan row, which is ``ids`` when unlabeled and
+    ``(ids, labels)`` once a prompt/completion boundary is known."""
+    if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
+        return len(row[0])
+    return len(row)
+
+
+def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
+    """HF ``group_by_length`` sample order, mirroring transformers'
+    ``get_length_grouped_indices`` (trainer_pt_utils) step for step:
+
+    - permute all indices with a seeded ``torch.randperm``
+    - cut the permutation into mega-batches of ``mega_batch_mult * batch_size``
+    - sort each mega-batch by descending length
+    - swap the globally longest element into the very first slot
+
+    Grouping similar lengths into a batch is what cuts padding; keeping the
+    grouping *inside* a shuffled mega-batch is what preserves epoch-to-epoch
+    randomness, which a plain global length sort destroys. The final swap makes
+    the largest batch run first so an OOM shows up immediately rather than
+    minutes in.
+
+    ``_torch_randperm_order`` seeds a ``torch.Generator`` exactly as HF seeds
+    its sampler generator, so for a given seed this reproduces CUDA's order.
+    """
+    n = len(lengths)
+    if n == 0:
+        return []
+    # HF: 50, or enough for 4 mega-batches, whichever is smaller; never 0.
+    if mega_batch_mult is None:
+        mega_batch_mult = min(n // (batch_size * 4), 50) if batch_size > 0 else 1
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = _torch_randperm_order(n, seed)
+    megabatch_size = max(1, mega_batch_mult * batch_size)
+    megabatches = [
+        indices[i : i + megabatch_size] for i in range(0, n, megabatch_size)
+    ]
+    megabatches = [
+        sorted(megabatch, key=lambda i: lengths[i], reverse=True)
+        for megabatch in megabatches
+    ]
+
+    # Each mega-batch is sorted descending, so its longest element is at [0];
+    # find the biggest of those and swap it into the very first position.
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = megabatch_maximums.index(max(megabatch_maximums))
+    megabatches[0][0], megabatches[max_idx][0] = (
+        megabatches[max_idx][0], megabatches[0][0],
+    )
+
+    return [i for megabatch in megabatches for i in megabatch]
 
 
 def _create_ordered_text_plan(
@@ -10980,6 +11034,14 @@ def _create_ordered_text_plan(
         base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
             return _torch_randperm_order(len(tokenized), base_seed + epoch)
+        if dataset_order == "length_grouped":
+            # Reseeded per epoch like torch_randperm, so the mega-batch shuffle
+            # differs each pass instead of repeating one grouping forever.
+            return _length_grouped_order(
+                [_text_row_length(row) for row in tokenized],
+                batch_size,
+                base_seed + epoch,
+            )
         if dataset_order not in (None, "sequential"):
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
