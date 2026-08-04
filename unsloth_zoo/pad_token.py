@@ -121,6 +121,27 @@ def _eos_id_set(*values):
     return ids
 
 
+def _text_vocab_size(cfg):
+    """Vocab size that bounds the text tokenizer's ids.
+
+    Composite configs size `vocab_size` for something else (Sesame CSM: 2051, the
+    audio codebook, against a 128256-entry text tokenizer), which rejects a valid
+    declared pad. Prefer an explicitly declared text vocab, else `config.vocab_size`
+    as before, so single-vocab models are untouched.
+    """
+    if cfg is None:
+        return None
+    text_cfg = getattr(cfg, "text_config", None)
+    for source, attr in ((text_cfg, "vocab_size"), (cfg, "text_vocab_size")):
+        if source is None:
+            continue
+        value = getattr(source, attr, None)
+        if type(value) is int and value > 0:
+            return value
+    value = getattr(cfg, "vocab_size", None)
+    return value if type(value) is int else None
+
+
 def _classify_bad_pad(inner, vocab_size):
     """Return a reason string if the current pad_token is bad, else None.
 
@@ -296,7 +317,7 @@ def fix_pad_token(
         return result
 
     cfg = model_config if model_config is not None else getattr(model, "config", None)
-    vocab_size = getattr(cfg, "vocab_size", None)
+    vocab_size = _text_vocab_size(cfg)
     if type(vocab_size) is not int:
         # A malformed (e.g. string) vocab_size must not crash a later `id >= vocab_size`
         # comparison; treat it as unknown and skip range checks.

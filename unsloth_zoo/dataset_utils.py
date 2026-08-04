@@ -713,6 +713,30 @@ def train_on_responses_only(
         return hasattr(collator, "image_processor")
     pass
 
+    def _dataset_is_pretokenized(dataset):
+        """True when rows already carry `input_ids`.
+
+        Separates "the collator rebuilds labels from a processor at collate time"
+        from "text was tokenized up front and the collator only pads", where
+        dataset-level masking is correct. Anything unreadable returns False, so
+        the caller keeps the old strict behaviour.
+        """
+        if dataset is None:
+            return False
+        try:
+            names = getattr(dataset, "column_names", None)
+            if isinstance(names, dict):  # DatasetDict
+                names = [c for v in names.values() for c in (v or [])]
+            if names:
+                return "input_ids" in names
+            # IterableDataset and friends expose no column_names; peek one row.
+            for row in dataset:
+                return isinstance(row, dict) and "input_ids" in row
+        except Exception:
+            return False
+        return False
+    pass
+
     data_collator = getattr(trainer, "data_collator", None)
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
@@ -720,29 +744,44 @@ def train_on_responses_only(
             return trainer  # collator already masks responses; nothing to do
         is_unsloth = any(b.__name__ == "UnslothVisionDataCollator" for b in type(data_collator).__mro__)
         if not is_unsloth:
-            # A processor-style collator we cannot reliably configure: do not return as
-            # if masking were applied (it would leave responses unmasked silently).
-            raise ValueError(
-                "Unsloth: Detected a vision data collator that does not support response-only "
-                "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
-                "instruction_part = ..., response_part = ...) so masking runs at collate time."
+            # A multimodal model fine-tuned on text only still carries a processor
+            # as its `tokenizer`, so a plain text collator (e.g.
+            # DataCollatorForSeq2Seq) trips `_is_vision_collator` even though it
+            # never rebuilds labels from images. Discriminate on the data: rows
+            # that already hold `input_ids` were tokenized up front, so the text
+            # path below is correct.
+            if not _dataset_is_pretokenized(getattr(trainer, "train_dataset", None)):
+                # A processor-style collator we cannot reliably configure: do not return as
+                # if masking were applied (it would leave responses unmasked silently).
+                raise ValueError(
+                    "Unsloth: Detected a vision data collator that does not support response-only "
+                    "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+                    "instruction_part = ..., response_part = ...) so masking runs at collate time."
+                )
+            # Fall through to the dataset-level text path below; configuring a
+            # collator we do not own would silently do nothing.
+            print(
+                f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
+                "dataset is already tokenized, so response-only masking is applied at "
+                "the dataset level (image handling is untouched)."
             )
-        # If the collator's tokenizer already carries the parts, let the nested call
-        # read them; passing them explicitly would hit the "already set" guard.
-        coll_proc = getattr(data_collator, "processor", tokenizer)
-        coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
-        parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
-            dict(instruction_part = instruction_part, response_part = response_part)
-        data_collator.train_on_responses_only = train_on_responses_only(
-            None,
-            force_match        = force_match,
-            tokenizer          = coll_proc,
-            return_function    = True,
-            last_response_only = last_response_only,
-            **parts,
-        )
-        print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
-        return trainer
+        else:
+            # If the collator's tokenizer already carries the parts, let the nested call
+            # read them; passing them explicitly would hit the "already set" guard.
+            coll_proc = getattr(data_collator, "processor", tokenizer)
+            coll_tok = coll_proc.tokenizer if hasattr(coll_proc, "tokenizer") else coll_proc
+            parts = {} if hasattr(coll_tok, "_unsloth_input_part") else \
+                dict(instruction_part = instruction_part, response_part = response_part)
+            data_collator.train_on_responses_only = train_on_responses_only(
+                None,
+                force_match        = force_match,
+                tokenizer          = coll_proc,
+                return_function    = True,
+                last_response_only = last_response_only,
+                **parts,
+            )
+            print(f"Unsloth: Enabled response-only masking on your {type(data_collator).__name__} (image handling kept intact).")
+            return trainer
     pass
 
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
@@ -780,8 +819,9 @@ def train_on_responses_only(
         pass
     pass
 
-    # Edit data collator to DataCollatorForSeq2Seq (vision collators were handled
-    # earlier and returned, so trainer.data_collator here is a text collator).
+    # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
+    # from a processor were handled earlier and returned, so what is left here
+    # only pads already-tokenized text.
     from transformers import DataCollatorForSeq2Seq
     packing_enabled = getattr(trainer.args, "packing", False)
     if (

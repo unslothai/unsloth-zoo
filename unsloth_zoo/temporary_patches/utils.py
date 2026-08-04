@@ -260,6 +260,50 @@ del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
 
+# A torchao built for a newer torch imports symbols straight out of torch
+# (`from torch.nn.functional import ScalingType`). On an older pinned torch the
+# symbol is absent, and the ImportError arrives here naming neither package.
+_TORCHAO_TORCH_SYMBOLS = ("ScalingType", "ScalingGranularity", "Float8Tensor")
+
+
+def _torchao_is_newer_than_torch(message):
+    """Does this ImportError look like torchao reaching into a torch that lacks
+    the symbol?
+
+    Narrow on purpose: the symbol must be one torchao pulls from torch and the
+    failing module must be a torch one, so unrelated errors keep their own text.
+    """
+    try:
+        message = str(message)
+    except Exception:                                    # noqa: BLE001
+        return False
+    if "cannot import name" not in message:
+        return False
+    if "torch" not in message:
+        return False
+    return any(sym in message for sym in _TORCHAO_TORCH_SYMBOLS)
+
+
+def _torchao_torch_mismatch_message(message):
+    """Name both versions, because the raw error names neither."""
+    def _ver(mod):
+        try:
+            import importlib.metadata as _md
+            return _md.version(mod)
+        except Exception:                                # noqa: BLE001
+            return "unknown"
+    torch_v, ao_v = _ver("torch"), _ver("torchao")
+    return (
+        f"***** Unsloth: torchao {ao_v} was built for a newer torch than the "
+        f"torch {torch_v} you have installed, so importing it fails with:\n"
+        f"    {message}\n"
+        f"Install a torchao that matches your torch, e.g.\n"
+        f"    pip install --upgrade --force-reinstall --no-cache-dir "
+        f"\"torchao<0.18\"\n"
+        f"or upgrade torch instead. Then restart your runtime/kernel. *****"
+    )
+
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -280,6 +324,8 @@ except ImportError as e:
             f"***** Your Pillow (PIL) version is incompatible with torchvision. "
             f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
         )
+    elif _torchao_is_newer_than_torch(e):
+        raise RuntimeError(_torchao_torch_mismatch_message(e)) from None
     elif "Unpack" not in e:
         raise Exception(e)
     raise RuntimeError(
