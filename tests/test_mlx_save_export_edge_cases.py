@@ -1427,6 +1427,69 @@ def test_gguf_explicit_first_conversion_beats_the_f32_promotion(
     assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f32", "q4_k_m"]
 
 
+def _shard_the_intermediate(monkeypatch, calls, n_shards=3, return_files=True):
+    """convert_hf_to_gguf writes SHARD_NAME_FORMAT files instead of the plain
+    name once the intermediate crosses --split-max-size."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    def fake_convert_to_gguf(**kwargs):
+        calls["convert_kwargs"] = kwargs
+        calls["convert_count"] = calls.get("convert_count", 0) + 1
+        stem = f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}"
+        files = []
+        for index in range(1, n_shards + 1):
+            path = Path(f"{stem}-{index:05d}-of-{n_shards:05d}.gguf")
+            path.write_bytes(b"GGUF-shard")
+            files.append(str(path))
+        return (files, False) if return_files else None
+
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", fake_convert_to_gguf)
+
+
+def test_gguf_quantizes_from_a_sharded_intermediate(monkeypatch, tmp_path):
+    """A sharded intermediate never creates `{base}.F32.gguf`, so passing that
+    name to llama-quantize fed it a path that does not exist."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.F32-00001-of-00003.gguf")
+    ]
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    # f32 was requested, so its shards are the export and must survive.
+    assert len(list(out.glob("EdgeModel.F32-*.gguf"))) == 3
+
+
+def test_gguf_sharded_scratch_intermediate_is_removed_whole(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls, n_shards=2)
+    out = tmp_path / "out"
+    _export(mutils, out, ["q4_k_m", "q8_0"])
+
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.BF16-00001-of-00002.gguf")
+    ] * 2
+    assert list(out.glob("EdgeModel.BF16*.gguf")) == []
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    assert (out / "EdgeModel.Q8_0.gguf").exists()
+
+
+def test_gguf_shards_resolved_from_disk_without_a_return_value(monkeypatch, tmp_path):
+    """The pre-existing contract is the files on disk, not the return value."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls, n_shards=2, return_files=False)
+    out = tmp_path / "out"
+    _export(mutils, out, "q4_k_m")
+
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.BF16-00001-of-00002.gguf")
+    ]
+    assert list(out.glob("EdgeModel.BF16*.gguf")) == []
+
+
 def test_mlx_model_method_forwards_a_quant_list(monkeypatch, tmp_path):
     """The user-facing hop: model.save_pretrained_gguf(...) in loader.py."""
     import unsloth_zoo.mlx.loader as loader

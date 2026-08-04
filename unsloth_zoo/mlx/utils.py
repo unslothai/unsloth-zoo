@@ -14611,6 +14611,44 @@ def _normalize_gguf_quantization_methods(quantization_method):
     return list(dict.fromkeys(resolved)), requested_as_sequence
 
 
+# llama.cpp SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf".
+_GGUF_SHARD_SUFFIX = r"-\d{5}-of-\d{5}\.gguf$"
+
+
+def _resolve_gguf_intermediate(produced_files, base_gguf):
+    """Files convert_hf_to_gguf actually wrote for the intermediate ``base_gguf``.
+
+    ``{output_base}.{DTYPE}.gguf`` is only one of the two shapes it emits: an
+    intermediate over ``--split-max-size`` (50GB by default) is written as
+    ``...-00001-of-000NN.gguf`` shards and that plain name is never created
+    (``convert_to_gguf``, ``unsloth_zoo/llama_cpp.py``). Assuming the unsplit
+    name handed llama-quantize a path that does not exist.
+
+    Prefers the paths ``convert_to_gguf`` returned, since those are where the
+    files really landed; falls back to scanning the output directory. Returns
+    the shards in index order, a single-element list, or ``[]``.
+    """
+    import re
+
+    name = os.path.basename(base_gguf)
+    shard_pattern = re.compile(re.escape(name[: -len(".gguf")]) + _GGUF_SHARD_SUFFIX)
+
+    paths = []
+    if isinstance(produced_files, (list, tuple)):
+        paths = [str(f) for f in produced_files]
+    if not paths:
+        directory = os.path.dirname(base_gguf) or "."
+        try:
+            paths = [os.path.join(directory, f) for f in os.listdir(directory)]
+        except OSError:
+            paths = []
+
+    exact = [p for p in paths if os.path.basename(p) == name]
+    if exact:
+        return exact[:1]
+    return sorted(p for p in paths if shard_pattern.search(os.path.basename(p)))
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -14851,7 +14889,7 @@ def save_pretrained_gguf(
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
         try:
-            convert_to_gguf(**kwargs)
+            converted = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
@@ -14863,6 +14901,19 @@ def save_pretrained_gguf(
         # The merge and convert above are the expensive steps and already ran
         # once, so extra targets only cost their own llama-quantize pass.
         base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+        # convert_to_gguf returns (output_files, is_vlm) and shards anything over
+        # --split-max-size, so base_gguf is not always the file that was written.
+        # The f32 promotion above makes that reachable at ~13B, where a bf16
+        # intermediate would have stayed under the 50GB default.
+        intermediate_files = _resolve_gguf_intermediate(
+            converted[0] if isinstance(converted, tuple) else converted,
+            base_gguf,
+        )
+        # The first shard is enough: llama-quantize's loader reads split.count
+        # off it and pulls the rest in itself (llama.cpp
+        # src/llama-model-loader.cpp, llama_get_list_splits), and its output is
+        # unsplit because --keep-split is not passed.
+        quantize_input = intermediate_files[0] if intermediate_files else base_gguf
         # Pre-existing SCALAR-ONLY contract: a lone full-precision string is
         # satisfied by whatever convert_hf_to_gguf emitted, with no llama-quantize
         # pass, even when an explicit first_conversion names a different dtype.
@@ -14894,7 +14945,7 @@ def save_pretrained_gguf(
 
             print(f"Unsloth: Quantizing to {quant_type}...")
             quantize_gguf(
-                input_gguf=base_gguf,
+                input_gguf=quantize_input,
                 output_gguf=final_gguf,
                 quant_type=quant_type,
                 quantizer_location=quantizer,
@@ -14907,9 +14958,16 @@ def save_pretrained_gguf(
         # nothing was quantized it IS the export, so it always stays - including
         # a full-precision target reached through an explicit first_conversion.
         if quantized_any and first_conversion not in quant_types:
-            if os.path.exists(base_gguf):
-                os.remove(base_gguf)
-                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
+            removed = []
+            for path in intermediate_files or [base_gguf]:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed.append(Path(path).name)
+            if removed:
+                print(
+                    f"Unsloth: Removed intermediate {removed[0]}"
+                    + (f" (+{len(removed) - 1} shards)" if len(removed) > 1 else "")
+                )
 
     # List produced files
     gguf_files = sorted(save_directory.glob("*.gguf"))
