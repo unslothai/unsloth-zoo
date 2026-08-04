@@ -2346,6 +2346,48 @@ def _find_bitsandbytes_quantization(config, _path = "config.json"):
     return None
 
 
+def _converter_was_oom_killed(exc):
+    """Did the kernel kill the converter, rather than it failing on its own?
+
+    The converter holds tensors in host RAM, so a large model on a small VM is
+    OOM-killed and subprocess reports only SIGKILL, naming no resource.
+    """
+    if getattr(exc, "returncode", None) in (-9, 137):
+        return True
+    return "sigkill" in f"{exc}".lower()
+
+
+def _retry_with_temp_file(command):
+    """The same command spooling tensors to disk instead of holding them in RAM.
+
+    `--use-temp-file` is llama.cpp's own answer to this ("helpful when running
+    out of memory, process killed"), but it refuses to run alongside splitting:
+
+        Error: Cannot use temp file when splitting
+
+    and `--split-max-size` is always passed, so the flag has to arrive with
+    splitting disabled. Returns None when the command already has it, so the
+    retry cannot loop.
+    """
+    if "--use-temp-file" in command:
+        return None
+    out = []
+    drop_value = False
+    for token in command:
+        if drop_value:
+            drop_value = False
+            # Only its value. A flag here means the previous one had none, and
+            # eating it would silently drop an unrelated option.
+            if not str(token).startswith("--"):
+                continue
+        if token in ("--split-max-size", "--split-max-tensors"):
+            drop_value = True
+            continue
+        out.append(token)
+    # The trailing model path must stay last.
+    return out[:-1] + ["--use-temp-file"] + out[-1:]
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2564,6 +2606,7 @@ def convert_to_gguf(
         # Run the converter; self-heal and retry once if the env (not the model)
         # is broken. No cost on the happy path.
         attempted_repair = False
+        attempted_temp_file = False
         repair_note = ""
         optional_failed = False
         while True:
@@ -2597,6 +2640,23 @@ def convert_to_gguf(
                         repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                # OOM-killed: retry once spooling to disk. Disk is the one
+                # resource these machines have (155GB free on the Colab VM
+                # where Gemma3N_(4B)-Audio dies), and this is what the flag is
+                # for. Only for a kill, so a converter that failed on its own
+                # is not quietly run twice.
+                if not attempted_temp_file and _converter_was_oom_killed(e):
+                    retry = _retry_with_temp_file(command)
+                    if retry is not None:
+                        attempted_temp_file = True
+                        print(
+                            "Unsloth: The GGUF converter ran out of host RAM "
+                            "and was killed. Retrying with --use-temp-file, "
+                            "which spools tensors to disk instead."
+                        )
+                        command = retry
+                        continue
 
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
