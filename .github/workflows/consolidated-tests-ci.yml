@@ -129,6 +129,9 @@ jobs:
             tests/test_gated_and_offline_config_classification.py \
             -v
 
+      - name: pytest tests/test_fused_dft_loss.py (HARD GATE)
+        run: python -m pytest tests/test_fused_dft_loss.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
