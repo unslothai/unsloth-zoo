@@ -1002,6 +1002,9 @@ class _FakeProc:
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
         self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
         self._rec["main_file"] = getattr(sys.modules.get("__main__"), "__file__", None)
+        # What the child would actually inherit: hf_xet reads these natively at import, so the
+        # spawn window is the only moment they can be set.
+        self._rec["xet"] = {k: v for k, v in os.environ.items() if k.startswith("HF_XET_")}
 
     def is_alive(self):
         return False
@@ -1066,6 +1069,63 @@ def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
     )
     # On the Xet-first attempt, do not force-disable Xet for the child.
     assert rec["disable_xet"] is None
+
+
+def _spawn_xet_env(monkeypatch) -> dict:
+    """Run one Xet-first attempt against a fake spawn and return the child's HF_XET_* env."""
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    return rec["xet"]
+
+
+def test_child_keeps_a_user_set_high_performance_flag(monkeypatch):
+    """The download child is the only process that matters here, so standing our sizing down for a
+    user who asked for high-performance mode has to hold on this path too. Forcing the flag back to
+    0 and re-adding the caps is the behaviour that cost a 192-core host 2.55x."""
+    from unsloth_zoo.hf_xet_tuning import _CAPS_VOIDED_BY_HIGH_PERFORMANCE
+
+    for var in ("HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS", "UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE"):
+        monkeypatch.delenv(var, raising = False)
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "1"
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        assert key not in child, key
+    # The settings the preset does not touch are still tuned for the child.
+    assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"
+
+
+def test_child_is_capped_when_nothing_asked_otherwise(monkeypatch):
+    """The default path is unchanged: no flag means the caps go to the child and the preset that
+    would void them is turned off."""
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert child["HF_XET_HP"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
+
+
+def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
+    """The escape hatch survives: someone who wants a machine bounded regardless still gets the
+    caps, which only mean anything once the preset is off."""
+    monkeypatch.delenv("HF_XET_HP", raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+    monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
 
 
 class _EmptyQueue:

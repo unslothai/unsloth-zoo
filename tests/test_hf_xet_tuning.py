@@ -114,6 +114,29 @@ def test_free_disk_is_measured_for_the_cache_not_the_cwd(monkeypatch, tmp_path):
     assert free > 0 and source in {str(p) for p in (tmp_path, *tmp_path.parents)}
 
 
+def test_cache_root_follows_hubs_full_precedence(monkeypatch, tmp_path):
+    """A cache moved with XDG_CACHE_HOME or the legacy HUGGINGFACE_HUB_CACHE lives on a different
+    filesystem from ``~``, so measuring the home directory's free space sizes the buffer from a
+    disk the download never writes to."""
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(var, raising = False)
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert tuning.hf_cache_root() == tmp_path / "xdg" / "huggingface" / "hub"
+
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "legacy"))
+    assert tuning.hf_cache_root() == tmp_path / "legacy"
+
+    # HF_HOME names the home, not the hub cache: Hub appends "hub" to it.
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
+    assert tuning.hf_cache_root() == tmp_path / "home" / "hub"
+
+    # HF_HUB_CACHE is still the most specific and wins over all of them.
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "explicit"))
+    assert tuning.hf_cache_root() == tmp_path / "explicit"
+
+
 def test_worst_case_buffer_stays_under_the_limit():
     """size + files*perfile is what hf_xet can hold, so it must not exceed the budget. The stock
     defaults (2GB + 8*512MB, capped at 8GB) are exactly how an 8GB spike happens."""
@@ -534,3 +557,30 @@ def test_a_machine_that_can_hold_xet_cores_own_buffer_gets_it(ram_gb, cpus):
     # ...so a machine with room for stock on both counts is never handed less than stock.
     if limit // 2 >= stock and ram_gb * GB / 6 >= stock:
         assert size >= stock, f"{ram_gb}GB undercut stock: {size}"
+
+
+def test_a_small_container_with_many_cores_still_fits_a_third_of_its_ram():
+    """The budget floor is absolute, so on a 2 GB machine it is half the RAM, and letting cores
+    alone set the file count put 973 MB in flight there. The proportional promise has to win."""
+    for cpus in (2, 8, 64):
+        env = tuning.xet_env_overrides(_profile(2, cpus))
+        worst = (
+            int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
+            + int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"])
+            * int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"])
+        )
+        assert worst <= 2 * GB / 3, f"2GB/{cpus} cores: {worst} in flight"
+
+
+def test_the_flag_is_read_the_way_xet_core_reads_it():
+    """xet-core checks HF_XET_HIGH_PERFORMANCE and only falls back to the HF_XET_HP alias when the
+    first is unset (configuration_utils.rs get_high_performance_flag), so an explicit "0" masks the
+    alias. Standing our sizing down over an alias xet-core is ignoring would leave the machine on
+    xet-core's stock constants instead of the ones we sized for it."""
+    masked = {"HF_XET_HIGH_PERFORMANCE": "0", "HF_XET_HP": "1"}
+    tuning.apply_xet_env(masked, profile = _profile(16))
+    assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" in masked, "sizing stood down for nothing"
+
+    alias_only = {"HF_XET_HP": "1"}
+    tuning.apply_xet_env(alias_only, profile = _profile(16))
+    assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" not in alias_only

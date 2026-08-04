@@ -247,12 +247,24 @@ def _sysconf_memory() -> Optional[int]:
 
 
 def hf_cache_root() -> Path:
-    """Where downloads land, in the same precedence huggingface_hub itself uses."""
-    for var in ("HF_HUB_CACHE", "HF_HOME"):
-        value = os.environ.get(var)
-        if value:
-            return Path(value).expanduser()
-    return Path.home() / ".cache" / "huggingface"
+    """Where downloads land, in the same precedence huggingface_hub itself uses.
+
+    ``hf_cache._active_caches`` already mirrors that precedence -- ``HF_HUB_CACHE``, the legacy
+    ``HUGGINGFACE_HUB_CACHE``, then ``HF_HOME/hub``, then ``XDG_CACHE_HOME/huggingface/hub`` -- and
+    resolving anything less measures a filesystem the download may never touch: with
+    ``XDG_CACHE_HOME`` or ``HUGGINGFACE_HUB_CACHE`` pointed at a data volume, the free space of the
+    home directory decides the buffer instead.
+    """
+    try:
+        from .hf_cache import _active_caches
+
+        hub_cache = _active_caches()[1]
+        if hub_cache is not None:
+            return hub_cache
+        return Path.home() / ".cache" / "huggingface" / "hub"
+    except Exception:  # noqa: BLE001 - a cache we cannot resolve must not stop a download
+        # Home may be unresolvable on a locked-down machine; the caller walks up from here anyway.
+        return Path(".")
 
 
 def _free_disk() -> "tuple[int, str]":
@@ -380,7 +392,10 @@ def xet_env_overrides(
     cpus = profile.cpu_count
     # size + max_files * perfile is what hf_xet can hold, so the count comes from the budget as
     # well as from cores: three numbers describing one allocation, not three that overshoot.
-    affordable = max(2, (limit - size) // perfile)
+    # The budget floor is absolute, so on a small machine it can exceed the proportional bound: a
+    # 2 GB container gets the 1 GB floor, and cores alone would then put 973 MB in flight, half its
+    # RAM. Bound the count by whichever is smaller so the third-of-RAM promise holds there too.
+    affordable = max(2, (min(limit, total // 3) - size) // perfile)
     max_files = _clamp(min(cpus, affordable), 2, _MAX_CONCURRENT_FILES)
     # A stream holds a 64 MiB xorb, so streams past the budget's xorb slots only queue behind the
     # semaphore. Both bounds matter: a 64-core container with 8 GB opened 124 under cores alone.
@@ -476,7 +491,11 @@ def apply_xet_env(
     # A user who turned high-performance mode on keeps it, and keeps the headroom it implies:
     # leaving our caps in place alongside it would be the worst of both, since xet-core would void
     # the limit but still honour the smaller per-file and concurrency numbers.
-    user_wants_hp = any(_is_true(target.get(var)) for var in XET_HIGH_PERFORMANCE_VARS)
+    # Read the flag the way xet-core reads it (configuration_utils.rs get_high_performance_flag):
+    # HF_XET_HIGH_PERFORMANCE wins if it is SET AT ALL, and only then does the HF_XET_HP alias get a
+    # look. Taking any-of instead would stand our sizing down over an alias xet-core is ignoring.
+    primary, alias = XET_HIGH_PERFORMANCE_VARS
+    user_wants_hp = _is_true(target[primary]) if primary in target else _is_true(target.get(alias))
     forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
     # Only one of these may hold: either the user's flag wins and our sizing stands down, or the
     # caps win and the flag has to be turned off, because xet-core reads it last and would void

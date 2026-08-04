@@ -1238,20 +1238,15 @@ def _run_download_attempt(
         # hf_xet reads its config natively at import, so the buffer caps must be in the environment
         # BEFORE the child starts; setting them inside the child is too late.
         try:
-            from .hf_xet_tuning import xet_env_overrides
+            from .hf_xet_tuning import apply_xet_env
 
-            for key, value in xet_env_overrides().items():
-                # An explicit user setting still wins; only fill what is unset.
-                if key not in os.environ:
-                    child_env[key] = value
-            # High-performance mode is a preset applied after the environment is read, so it would
-            # override the caps above rather than merge with them.
-            from .hf_xet_tuning import XET_HIGH_PERFORMANCE_VARS
-
-            if not _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
-                for var in XET_HIGH_PERFORMANCE_VARS:
-                    if _is_true(os.environ.get(var)):
-                        child_env[var] = "0"
+            # Decide against a COPY of the real environment so the child is tuned exactly the way
+            # this process was at import: setdefault semantics keep every explicit user setting, and
+            # a user-set HF_XET_HIGH_PERFORMANCE stands our sizing down here too instead of being
+            # forced back to 0 for the one path that does the downloading. apply_xet_env returns
+            # only what it wrote, which is precisely what the child needs on top of what it
+            # inherits. UNSLOTH_XET_FORCE_CAPS=1 still caps the machine regardless.
+            child_env.update(apply_xet_env(dict(os.environ), fail_fast = True))
         except Exception as e:
             logger.debug("Could not compute Xet tuning env: %s", e)
     with _SPAWN_ENV_LOCK:
