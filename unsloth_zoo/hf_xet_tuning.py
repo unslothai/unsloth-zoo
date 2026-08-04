@@ -80,6 +80,9 @@ _MAX_STREAMS = 124
 _MAX_CONCURRENT_FILES = 24
 # xet-core's xorb size: the unit a single download stream has outstanding at any moment.
 _XORB_BYTES = 64 * 1024 * 1024
+# xet-core's own default prefetch floor (config/groups/reconstruction.rs, min_prefetch_buffer).
+# Sizing DOWN from a default is a cap; sizing below it for no reason is just a slower download.
+_STOCK_PREFETCH_BUFFER = 1 * _GB
 
 # Below this much usable RAM, callers prefer HTTP over Xet (see hf_xet_health).
 MIN_XET_RAM_BYTES = 4 * _GB
@@ -368,6 +371,10 @@ def xet_env_overrides(
     # balanced: a quarter of the budget as the shared buffer, a thirty-second per file.
     size = max(limit // 4, 256 * _MB)
     perfile = max(limit // 32, 128 * _MB)
+    # The prefetch floor is the one knob where our old arithmetic went BELOW xet-core's own default
+    # (1 GB) on every machine, which is not a cap, just a smaller transfer. Approach the default
+    # from below and never exceed it: only a machine whose entire budget is under 4 GB gets less.
+    prefetch = _clamp(limit // 4, 128 * _MB, _STOCK_PREFETCH_BUFFER)
 
     cpus = profile.cpu_count
     # More files or streams in flight than the machine has cores buys nothing -- and neither does
@@ -392,7 +399,7 @@ def xet_env_overrides(
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(limit),
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE": str(size),
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE": str(perfile),
-        "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER": str(min(size, 512 * _MB)),
+        "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER": str(prefetch),
         "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS": str(max_files),
         # ac_* is the adaptive-concurrency band; the initial value stays under the ceiling so a slow
         # link ramps up instead of opening 16 streams into a stall.

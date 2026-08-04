@@ -440,3 +440,76 @@ def test_only_the_big_hosts_get_the_big_numbers():
                ["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 8 * GB
     }
     assert big == {"A100 node", "8xH100 node"}
+
+
+# Every HF_XET_* name xet-core 1.5.x actually reads, filtered to the groups we touch. Regenerate
+# with:  grep -rhno "HF_XET_[A-Z_]\+" <xet-core>/xet_runtime --include=*.rs | cut -d: -f2- | sort -u
+# We used to set HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY, which xet-core has never had a variable of
+# that name for (the real one is HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE, default true): a silent
+# no-op that read, in review and in the logs, exactly like a setting that was being honoured.
+XET_CORE_VARS = frozenset({
+    "HF_XET_CACHE",
+    "HF_XET_CHUNK_CACHE_SIZE_BYTES",
+    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_CONNECT_TIMEOUT",
+    "HF_XET_CLIENT_READ_TIMEOUT",
+    "HF_XET_CLIENT_RETRY_BASE_DELAY",
+    "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS",
+    "HF_XET_CLIENT_RETRY_MAX_DURATION",
+    "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
+    "HF_XET_HIGH_PERFORMANCE",
+    "HF_XET_HP",
+    "HF_XET_LOG_DEST",
+    "HF_XET_LOG_FILE",
+    "HF_XET_LOG_FORMAT",
+    "HF_XET_LOG_PREFIX",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE",
+    "HF_XET_RECONSTRUCTION_MAX_RECONSTRUCTION_FETCH_SIZE",
+    "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
+    "HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE",
+    "HF_XET_RECONSTRUCTION_TARGET_BLOCK_COMPLETION_TIME",
+    "HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE",
+    "HF_XET_SYSTEM_MONITOR_ENABLED",
+    "HF_XET_SYSTEM_MONITOR_LOG_PATH",
+    "HF_XET_SYSTEM_MONITOR_SAMPLE_INTERVAL",
+})
+
+
+def test_we_only_set_variables_xet_core_reads(tmp_path):
+    emitted = set(tuning.xet_env_overrides(_profile(16))) | set(tuning.xet_log_env(tmp_path, diagnostics = True))
+    unknown = emitted - XET_CORE_VARS
+    assert not unknown, f"not read by xet-core: {sorted(unknown)}"
+
+
+def test_the_prefetch_floor_never_undercuts_xet_cores_own(tmp_path):
+    """Sizing DOWN from a default is a cap; sizing below it for no reason is just a slower
+    download. Only a machine whose whole budget is smaller than the 1 GB default gets less."""
+    for ram_gb, cpus in ((8, 4), (16, 8), (32, 16), (64, 32), (2048, 192)):
+        env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
+        prefetch = int(env["HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER"])
+        limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
+        assert prefetch <= tuning._STOCK_PREFETCH_BUFFER, f"{ram_gb}GB raised it to {prefetch}"
+        assert prefetch <= limit, f"{ram_gb}GB: {prefetch} prefetch inside a {limit} budget"
+        if limit >= 4 * GB:
+            assert prefetch == tuning._STOCK_PREFETCH_BUFFER, f"{ram_gb}GB undercut it: {prefetch}"
+
+
+def test_no_module_sets_a_variable_xet_core_does_not_read():
+    """The dead variable was set from unsloth_zoo/__init__.py at import time, not from here, so a
+    check confined to this module would have missed it. Scan the package instead."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(tuning.__file__).parent
+    unknown: dict[str, set] = {}
+    for path in root.rglob("*.py"):
+        # Only quoted names: a variable is only ever read or written as a string literal, so this
+        # skips prose ("any explicit HF_XET_RECONSTRUCTION_* cap") without needing to parse it.
+        for name in re.findall(r"[\"'](HF_XET_[A-Z_]+)[\"']", path.read_text(errors = "ignore")):
+            if name not in XET_CORE_VARS:
+                unknown.setdefault(name, set()).add(path.relative_to(root).as_posix())
+    assert not unknown, f"names xet-core does not read: { {k: sorted(v) for k, v in unknown.items()} }"

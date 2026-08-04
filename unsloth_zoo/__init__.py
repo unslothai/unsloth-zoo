@@ -82,7 +82,6 @@ redirect_hf_cache_if_readonly()
 from .hf_xet_tuning import apply_xet_env
 _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
-os.environ.setdefault("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", "0")
 del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches, apply_xet_env
 
 # More verbose HF Hub info
