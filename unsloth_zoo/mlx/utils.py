@@ -12435,6 +12435,59 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+# GGUF types convert_hf_to_gguf emits directly; everything else is reached by
+# running llama-quantize over one of these as the intermediate.
+_GGUF_FULL_PRECISION_TYPES = ("bf16", "f16", "f32")
+
+# Friendly aliases accepted for CUDA parity (unsloth/save.py). "not_quantized"
+# is bf16 here rather than the CUDA model_dtype switch: Apple Silicon always
+# supports bf16, which is why model_dtype is hardcoded below.
+_GGUF_QUANT_ALIASES = {
+    "not_quantized": "bf16",
+    "fast_quantized": "q8_0",
+    "quantized": "q4_k_m",
+    None: "q8_0",
+}
+
+
+def _normalize_gguf_quantization_methods(quantization_method):
+    """Resolve ``quantization_method`` to an ordered list of llama.cpp types.
+
+    Mirrors the CUDA path (``unsloth/save.py``), which accepts a list so one
+    merge+convert can produce several GGUFs. Deduplicates while preserving
+    order: repeats would otherwise re-run llama-quantize onto an identical
+    output path, since filenames are derived from the quant type alone.
+    """
+    if isinstance(quantization_method, (list, tuple)):
+        methods = list(quantization_method)
+    elif isinstance(quantization_method, str) or quantization_method is None:
+        methods = [quantization_method]
+    else:
+        raise TypeError(
+            "Unsloth: quantization_method must be a string, or a list/tuple "
+            f"of strings - got {type(quantization_method).__name__}."
+        )
+
+    if not methods:
+        raise ValueError(
+            "Unsloth: quantization_method was an empty list; pass at least "
+            "one quantization type."
+        )
+
+    resolved = []
+    for method in methods:
+        if not (isinstance(method, str) or method is None):
+            raise TypeError(
+                "Unsloth: every quantization_method entry must be a string - "
+                f"got {type(method).__name__}."
+            )
+        # Alias lookup is exact (matching CUDA); unknown names pass through to
+        # llama-quantize, which reports the supported ftypes on failure.
+        resolved.append(_GGUF_QUANT_ALIASES.get(method, method))
+
+    return list(dict.fromkeys(resolved))
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -12461,6 +12514,8 @@ def save_pretrained_gguf(
             "quantized" - q4_k_m (small, fast inference)
             Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
             q6_k, q8_0, f16, bf16, f32, etc.
+            May also be a list/tuple to emit several GGUFs from a single
+            merge+convert, e.g. ``["q4_k_m", "q8_0"]`` (CUDA parity).
         first_conversion: Optional override for the intermediate GGUF
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
@@ -12478,22 +12533,18 @@ def save_pretrained_gguf(
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
-    # Map friendly names to llama.cpp quant types
-    quant_map = {
-        "not_quantized": "bf16",
-        "fast_quantized": "q8_0",
-        "quantized": "q4_k_m",
-        None: "q8_0",
-    }
-    quant_type = quant_map.get(quantization_method, quantization_method)
+    quant_types = _normalize_gguf_quantization_methods(quantization_method)
 
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
 
-    # Determine first_conversion (intermediate GGUF format before quantizing)
+    # Determine first_conversion (the single intermediate every requested quant
+    # is produced from). Only a lone full-precision target can be emitted by
+    # convert_hf_to_gguf directly; any k-quant/q8_0 in the set - even alongside
+    # a full-precision one - needs a bf16 intermediate for llama-quantize.
     if first_conversion is None:
-        if quant_type in ("bf16", "f16", "f32"):
-            first_conversion = quant_type
+        if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+            first_conversion = quant_types[0]
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
@@ -12644,10 +12695,27 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
-        # Step 6: Quantize if the target quant differs from first_conversion
-        if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
+        # Step 6: Quantize every requested target off the shared intermediate.
+        # The merge and convert above are the expensive steps and already ran
+        # once, so extra targets only cost their own llama-quantize pass.
+        base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+        # Pre-existing single-target contract: a lone full-precision request is
+        # satisfied by whatever convert_hf_to_gguf emitted, with no llama-quantize
+        # pass, even when an explicit first_conversion names a different dtype.
+        # Kept as-is; only the list form follows the CUDA rule below.
+        legacy_single_full_precision = (
+            len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES
+        )
+        quantized_any = False
+        for quant_type in quant_types:
+            # CUDA rule (unsloth/save.py:1528): everything that is not the
+            # intermediate itself gets a llama-quantize pass. Full-precision
+            # targets are NOT exempt - llama-quantize emits f16/bf16/f32 too, and
+            # skipping them would silently drop e.g. the f16 in ["f16","q4_k_m"].
+            if quant_type == first_conversion or legacy_single_full_precision:
+                # Already produced by convert_hf_to_gguf as the intermediate.
+                continue
             quantizer = quantizer_location
-            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
             print(f"Unsloth: Quantizing to {quant_type}...")
@@ -12658,8 +12726,14 @@ def save_pretrained_gguf(
                 quantizer_location=quantizer,
                 print_output=True,
             )
-            # Remove intermediate bf16 gguf to save space
-            if os.path.exists(base_gguf) and base_gguf != final_gguf:
+            quantized_any = True
+
+        # The intermediate is scratch only once something was quantized off it
+        # and it is not itself a requested type (e.g. ["bf16", "q4_k_m"]). When
+        # nothing was quantized it IS the export, so it always stays - including
+        # a full-precision target reached through an explicit first_conversion.
+        if quantized_any and first_conversion not in quant_types:
+            if os.path.exists(base_gguf):
                 os.remove(base_gguf)
                 print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
 
@@ -12833,7 +12907,9 @@ def push_to_hub_gguf(
         tokenizer: Tokenizer.
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
-        quantization_method: GGUF quantization type.
+        quantization_method: GGUF quantization type, or a list/tuple of types
+            to upload several GGUFs from one merge+convert. Every produced
+            *.gguf in save_directory is uploaded.
         token: HuggingFace token.
         private: Whether repo should be private.
         first_conversion: Optional intermediate GGUF dtype passed through to
