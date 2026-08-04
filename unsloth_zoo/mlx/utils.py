@@ -5629,10 +5629,12 @@ class _AudioVersions(NamedTuple):
 # with `tests/gemma4_audio_version_probe.py` rather than reasoning about it.
 #
 # Measured end to end on Apple Silicon (macos-14) against
-# mlx-community/gemma-4-e2b-it-4bit @ 2387675275, on every version in and
-# either side of the range: model loads, placeholder counts equal the positions
-# the audio tower emits at 0.5s/1.0s/2.0s/3.7s, and two different clips give
-# two different losses. 0.6.1 red, 0.6.2 green, 0.6.3 and 0.6.4 green.
+# mlx-community/gemma-4-e2b-it-4bit @ 2387675275, on 0.4.4 through 0.6.4:
+# model loads, a clip's placeholder count equals the valid positions
+# `audio_tower` actually returns for it at 0.5s/1.0s/2.0s/3.7s, and two
+# different clips give two different losses. 0.6.1 red, 0.6.2 green, 0.6.3 and
+# 0.6.4 green. The ceiling above is a dependency fact, not a measurement:
+# 0.6.5+ cannot be installed beside this package at all, so it was never run.
 #
 # 0.6.4 is included deliberately. Raw mlx-vlm 0.6.4 does fail to load these
 # weights -- #1498 made sanitize unconditional, so pre-converted MLX

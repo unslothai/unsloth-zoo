@@ -36,8 +36,12 @@ on:
     types: [labeled]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a label-triggered run. Concurrency is claimed when a run is
+  # queued, before the job-level `if` is evaluated, so labelling the PR with
+  # anything else (this repo's own `mlx`, say) would queue a run in this group
+  # that skips every job and cancels a seven-job macOS matrix mid-flight.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -105,6 +109,10 @@ jobs:
         # the torchvision backend and therefore fails without it; zoo resolves
         # the mlx-vlm processor class directly and does not. Stage 0 records
         # that difference rather than the job papering over it.
-        run: |
-          python tests/gemma4_audio_version_probe.py \
-            --model "${{ inputs.model || 'mlx-community/gemma-4-e2b-it-4bit' }}"
+        #
+        # The checkpoint arrives through env, not interpolated into the script:
+        # it is the one free-text value here, and everything else in this file
+        # is a static matrix entry.
+        env:
+          MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e2b-it-4bit' }}
+        run: python tests/gemma4_audio_version_probe.py --model "$MODEL"

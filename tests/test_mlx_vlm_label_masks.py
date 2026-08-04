@@ -2730,9 +2730,14 @@ def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
         installed, admitted):
     """The boundary, measured rather than argued.
 
-    Every row was run end to end on macos-14 against
-    mlx-community/gemma-4-e2b-it-4bit: model load, placeholder counts against
-    the audio tower, and two clips giving two losses. 0.6.1 red, 0.6.2 green.
+    Every released row from 0.4.4 to 0.6.4 was run end to end on macos-14
+    against mlx-community/gemma-4-e2b-it-4bit: model load, placeholder counts
+    against what the audio tower returns, and two clips giving two losses.
+    0.6.1 red, 0.6.2 green.
+
+    The other rows are policy, not measurement. 0.6.5 cannot be installed
+    beside this package (it needs transformers>=5.14, capped at 5.5.0), and
+    mlx-vlm has published no post-release or prerelease to run.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
@@ -2811,7 +2816,9 @@ def test_only_a_published_final_release_is_inside_the_window():
     for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
                         "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor either side of the window, both of which were measured red.
+    # Nor either side of the window. 0.6.1 was measured red; 0.6.5 is refused
+    # because it cannot be installed here, not because it was tried and failed
+    # -- upstream in fact fixed the 0.6.4 sanitize regression there.
     assert gemma4.admits("0.6.1") is False
     assert gemma4.admits("0.6.5") is False
 

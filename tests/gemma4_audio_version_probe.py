@@ -100,9 +100,17 @@ def load_upstream(path):
         try:
             fn(path)
             notes.append(f"{what} ok")
+            results[f"0_mlx_vlm_alone_loads.{what}"] = {"ok": True}
         except Exception as exc:
-            notes.append(f"{what} {type(exc).__name__}: "
-                         f"{str(exc).strip().splitlines()[0][:120]}")
+            first = str(exc).strip().splitlines()[0][:120]
+            notes.append(f"{what} {type(exc).__name__}: {first}")
+            # Recorded as a failed subcheck, not only inside the human-readable
+            # string. Whoever reads the JSON should not have to parse prose to
+            # see that upstream could not load this; the stage stays out of the
+            # verdict either way.
+            results[f"0_mlx_vlm_alone_loads.{what}"] = {
+                "ok": False, "error": f"{type(exc).__name__}: {first}",
+            }
     return "; ".join(notes)
 
 
@@ -133,18 +141,51 @@ def check_alignment(_repo):
     zoo derives the count from the installed extractor precisely because the
     framing arithmetic changed in 0.5.0; this checks the derivation still
     agrees with what the tower emits on this version.
+
+    "What the tower emits" has to come from the tower. Deriving it from
+    `_gemma4_audio_encoder_positions` instead would re-run the arithmetic
+    `_gemma4_audio_placeholder_count` already ran, and assert a number against
+    itself -- green on any release, including one whose subsampling changed
+    underneath it, which is the whole failure this stage exists to catch. So
+    the clip goes through `audio_tower` and the count comes off the mask it
+    returns.
     """
+    import mlx.core as mx
     import numpy as np
 
     from unsloth_zoo.mlx.utils import (
-        _gemma4_audio_encoder_positions, _gemma4_audio_frame_mask,
-        _gemma4_audio_placeholder_count,
+        _gemma4_audio_frame_mask, _gemma4_audio_placeholder_count,
     )
 
     processor = _PROCESSOR
     extractor = getattr(processor, "feature_extractor", None)
     if extractor is None:
         raise AssertionError("processor exposes no feature_extractor")
+    tower = getattr(_MODEL, "audio_tower", None)
+    if tower is None:
+        raise AssertionError("no audio_tower to measure against")
+
+    def tower_positions(wav):
+        """Run the encoder and count the positions it reports as real."""
+        features = extractor(
+            [np.asarray(wav, dtype=np.float32)],
+            sampling_rate=RATE,
+            return_attention_mask=True,
+        )
+        mel = mx.array(np.asarray(features["input_features"], dtype=np.float32))
+        raw_mask = features.get("input_features_mask")
+        if raw_mask is None:
+            valid = np.ones(mel.shape[:2], dtype=bool)
+        else:
+            valid = np.asarray(raw_mask).astype(bool)
+        # The tower takes a PADDING mask, not a validity one: gemma4.py builds
+        # it as `~input_features_mask` before calling. It returns a mask in the
+        # same polarity, and zeroes the encodings wherever it is True. So feed
+        # the inverse and count the False positions back.
+        encodings, out_mask = tower(mel, mx.array(~valid))
+        mx.eval(encodings, out_mask)
+        emitted = int((~np.asarray(out_mask)[0].astype(bool)).sum())
+        return emitted, int(encodings.shape[1])
 
     rows = []
     for secs in DURATIONS:
@@ -159,13 +200,13 @@ def check_alignment(_repo):
         except Exception as exc:
             native_count = f"n/a ({type(exc).__name__})"
         frames = int(np.asarray(_gemma4_audio_frame_mask(extractor, wav, RATE)).sum())
-        emitted = int(_gemma4_audio_encoder_positions(
-            _gemma4_audio_frame_mask(extractor, wav, RATE)))
+        emitted, width = tower_positions(wav)
         if counted != emitted:
             raise AssertionError(
                 f"{secs}s: zoo counts {counted} placeholders, tower emits "
-                f"{emitted}")
-        rows.append(f"{secs}s: frames={frames} placeholders={counted}"
+                f"{emitted} valid of {width}")
+        rows.append(f"{secs}s: frames={frames} placeholders={counted} "
+                    f"tower={emitted}/{width}"
                     + (f" native={native_count}" if native_count is not None else ""))
     return "; ".join(rows)
 
@@ -276,6 +317,7 @@ def main():
     print("PROBE_RESULT " + json.dumps(
         {"mlx_vlm": version, "transformers": transformers.__version__,
          "model": args.model, "stages": results}), flush=True)
+    # Stage 0 and its subchecks are diagnostic; they never gate the exit code.
     verdict = {k: v for k, v in results.items() if not k.startswith("0_")}
     sys.exit(0 if all(r["ok"] for r in verdict.values()) else 1)
 
