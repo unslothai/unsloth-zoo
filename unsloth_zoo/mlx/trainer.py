@@ -835,13 +835,114 @@ def _normalize_mlx_scheduler_type(name):
         name = name.value
     sched_type = str(name or "linear").strip().lower()
     sched_type = sched_type.rsplit(".", 1)[-1].replace("-", "_")
+    sched_type = _MLX_LR_SCHEDULER_ALIASES.get(sched_type, sched_type)
     if sched_type not in SUPPORTED_MLX_LR_SCHEDULERS:
-        supported = ", ".join(SUPPORTED_MLX_LR_SCHEDULERS)
+        supported = ", ".join(
+            SUPPORTED_MLX_LR_SCHEDULERS + tuple(_MLX_LR_SCHEDULER_ALIASES)
+        )
         raise ValueError(
             f"Unsloth: Unsupported MLX lr_scheduler_type {name!r}. "
             f"Supported schedulers: {supported}."
         )
     return sched_type
+
+
+def _mlx_scheduler_kwargs(args):
+    """Return HF `lr_scheduler_kwargs` as a plain dict.
+
+    transformers.Trainer forwards `TrainingArguments.lr_scheduler_kwargs`
+    straight into `get_scheduler(..., scheduler_specific_kwargs=...)`
+    (transformers/trainer.py:1857), and that is where a ported SFTConfig /
+    TrainingArguments carries `num_cycles`, `power`, `lr_end`, `min_lr`,
+    `min_lr_rate`, `timescale` and the WSD decay steps -- not as top-level
+    attributes. `MLXTrainer` does not type-check `args`, so a raw HF config
+    reaches `_build_schedule` and these knobs must be read from there too.
+    """
+    raw = getattr(args, "lr_scheduler_kwargs", None)
+    if raw is None:
+        raw = getattr(args, "scheduler_specific_kwargs", None)
+    if isinstance(raw, str):
+        # TrainingArguments types this `Optional[Union[dict, str]]`; the CLI
+        # form is a JSON object.
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+# HF scheduler names this MLX port serves through an existing schedule. The
+# min-LR cosine is the plain cosine with `min_lr_rate` applied: HF's
+# get_cosine_with_min_lr_schedule_with_warmup reuses
+# _get_cosine_schedule_with_warmup_lr_lambda (transformers/optimization.py:335,
+# :324), which is the same warmup ramp, the same progress definition and the
+# same 0.5*(1 + cos(pi*num_cycles*2*p)) factor this port implements.
+#
+# `cosine_warmup_with_min_lr` is deliberately NOT aliased: HF routes it to
+# get_cosine_with_min_lr_schedule_with_warmup_lr_rate, whose lambda uses a
+# different, off-by-one warmup ramp and progress definition
+# ((step + 1)/warmup and (step - warmup + 1)/(total - warmup),
+# transformers/optimization.py:400-406), so mapping it here would silently
+# train a different curve.
+_MLX_LR_SCHEDULER_ALIASES = {
+    "cosine_with_min_lr": "cosine",
+}
+
+# HF's per-scheduler `num_cycles` default. Not one value: it is 1 for the hard
+# restart schedule (optimization.py:187) but 0.5 for the cosine family
+# (optimization.py:339) and for WSD (optimization.py:515).
+_HF_DEFAULT_NUM_CYCLES = {
+    "cosine": 0.5,
+    "cosine_with_restarts": 1.0,
+    "warmup_stable_decay": 0.5,
+}
+
+# Scheduler kwargs each HF schedule accepts, and the subset this port
+# implements. Anything a user sets that lands outside the implemented set is
+# rejected rather than silently dropped -- HF itself raises TypeError for
+# mismatched scheduler kwargs (see get_scheduler's docstring,
+# transformers/optimization.py:615-617).
+_MLX_SCHEDULER_SUPPORTED_KWARGS = {
+    "linear": frozenset(),
+    "cosine": frozenset({"num_cycles", "min_lr", "min_lr_rate"}),
+    "cosine_with_restarts": frozenset({"num_cycles"}),
+    "polynomial": frozenset({"lr_end", "power"}),
+    "constant": frozenset(),
+    "constant_with_warmup": frozenset(),
+    "inverse_sqrt": frozenset({"timescale"}),
+    "warmup_stable_decay": frozenset(
+        {"num_decay_steps", "num_stable_steps", "min_lr_ratio", "num_cycles"}
+    ),
+}
+
+# Accepted by the corresponding HF schedule but not implemented here. Named
+# explicitly so the error can say "not supported" instead of "unknown".
+_MLX_SCHEDULER_UNIMPLEMENTED_KWARGS = {
+    "warmup_stable_decay": frozenset({"warmup_type", "decay_type"}),
+}
+
+# Resume bookkeeping rather than a curve knob; HF accepts it on every schedule.
+_MLX_SCHEDULER_IGNORED_KWARGS = frozenset({"last_epoch"})
+
+
+def _validate_mlx_scheduler_kwargs(sched_type, sched_kwargs):
+    """Reject scheduler kwargs this port would otherwise silently ignore."""
+    supported = _MLX_SCHEDULER_SUPPORTED_KWARGS.get(sched_type, frozenset())
+    unimplemented = _MLX_SCHEDULER_UNIMPLEMENTED_KWARGS.get(sched_type, frozenset())
+    for key in sorted(sched_kwargs):
+        if key in supported or key in _MLX_SCHEDULER_IGNORED_KWARGS:
+            continue
+        if key in unimplemented:
+            raise ValueError(
+                f"Unsloth: lr_scheduler_kwargs[{key!r}] is not supported on MLX "
+                f"for lr_scheduler_type={sched_type!r}. Supported keys: "
+                f"{', '.join(sorted(supported)) or 'none'}."
+            )
+        raise ValueError(
+            f"Unsloth: unknown lr_scheduler_kwargs[{key!r}] for "
+            f"lr_scheduler_type={sched_type!r}. Supported keys: "
+            f"{', '.join(sorted(supported)) or 'none'}."
+        )
 
 
 def _resolve_mlx_grad_clipping(args):
@@ -3418,15 +3519,102 @@ class MLXTrainer:
         # helper (rounds up via math.ceil). Keep only the extra schedule
         # parameters the additional scheduler types need.
         warmup = self._resolve_warmup_steps(total_steps)
-        min_lr_rate = float(getattr(self.args, "lr_scheduler_min_lr_rate", 0.0) or 0.0)
-        # HF parity: an explicit 0.0 is a meaningful value (WSD zero decay
-        # fraction / cosine_with_restarts zero cycles), so only a missing/None
-        # value falls back to the 1.0 default -- never an `or 1.0` truthiness cast.
-        num_cycles_attr = getattr(self.args, "lr_scheduler_num_cycles", 1.0)
-        num_cycles = float(1.0 if num_cycles_attr is None else num_cycles_attr)
-        power_attr = getattr(self.args, "lr_scheduler_power", 1.0)
-        power = float(1.0 if power_attr is None else power_attr)
-        sched_type = _normalize_mlx_scheduler_type(self.args.lr_scheduler_type)
+        requested_type = self.args.lr_scheduler_type
+        sched_type = _normalize_mlx_scheduler_type(requested_type)
+
+        # HF parity: scheduler knobs ride in `lr_scheduler_kwargs` on a ported
+        # TrainingArguments/SFTConfig, and in the top-level MLX attributes on an
+        # MLXTrainingConfig. Read both, HF's dict first, and reject anything we
+        # would otherwise drop on the floor.
+        sched_kwargs = _mlx_scheduler_kwargs(self.args)
+        _validate_mlx_scheduler_kwargs(sched_type, sched_kwargs)
+
+        def knob(hf_name, attr_name, default):
+            """`lr_scheduler_kwargs` wins, then the MLX attribute, then HF's default.
+
+            An explicit 0.0 is a meaningful value at every level (zero restart
+            cycles, zero decay power), so only a missing/None value falls
+            through -- never an `or <default>` truthiness cast.
+            """
+            value = sched_kwargs.get(hf_name)
+            if value is None and attr_name is not None:
+                value = getattr(self.args, attr_name, None)
+            return default if value is None else value
+
+        power = float(knob("power", "lr_scheduler_power", 1.0))
+        num_cycles = float(
+            knob(
+                "num_cycles",
+                "lr_scheduler_num_cycles",
+                _HF_DEFAULT_NUM_CYCLES.get(sched_type, 0.5),
+            )
+        )
+
+        # HF's polynomial schedule decays toward `lr_end`, default 1e-7
+        # (transformers/optimization.py:241), which is the same floor this port
+        # expresses as a rate: HF's factor is
+        # ((lr - lr_end)*(1 - p)**power + lr_end)/lr == (1 - r)*(1 - p)**power + r
+        # for r = lr_end/lr, exactly the shared rescale below. So the HF default
+        # is r = lr_end/lr rather than 0.
+        min_lr = sched_kwargs.get("min_lr")
+        min_lr_rate_kwarg = sched_kwargs.get("min_lr_rate")
+        if sched_type == "warmup_stable_decay" and min_lr_rate_kwarg is None:
+            # HF names WSD's floor `min_lr_ratio` (optimization.py:514).
+            min_lr_rate_kwarg = sched_kwargs.get("min_lr_ratio")
+        if min_lr is not None and min_lr_rate_kwarg is not None:
+            # Mirrors get_cosine_with_min_lr_schedule_with_warmup
+            # (transformers/optimization.py:370-371).
+            raise ValueError(
+                "Unsloth: only one of lr_scheduler_kwargs['min_lr'] or "
+                "['min_lr_rate'] may be set."
+            )
+        if sched_type == "polynomial":
+            lr_end = float(knob("lr_end", None, 1e-7))
+            if lr and lr_end >= float(lr):
+                # Mirrors get_polynomial_decay_schedule_with_warmup
+                # (transformers/optimization.py:272-273).
+                raise ValueError(
+                    f"Unsloth: lr_scheduler_kwargs['lr_end'] ({lr_end}) must be "
+                    f"smaller than learning_rate ({lr})."
+                )
+            default_min_lr_rate = (lr_end / float(lr)) if lr else 0.0
+        else:
+            default_min_lr_rate = 0.0
+        if min_lr is not None:
+            # HF converts an absolute floor to a rate the same way
+            # (transformers/optimization.py:372-373).
+            min_lr_rate = (float(min_lr) / float(lr)) if lr else 0.0
+        else:
+            min_lr_rate = float(
+                knob("min_lr_rate", "lr_scheduler_min_lr_rate", default_min_lr_rate)
+                if min_lr_rate_kwarg is None
+                else min_lr_rate_kwarg
+            )
+
+        # WSD's decay window. HF takes it as an explicit step count
+        # (`num_decay_steps`, a required argument of get_wsd_schedule) with an
+        # optional `num_stable_steps`; express both as a fraction of the
+        # post-warmup window. With neither set, decay spans the whole window.
+        decay_window = max(total_steps - warmup, 1)
+        wsd_decay_frac = 1.0
+        wsd_stable_frac = 0.0
+        if sched_type == "warmup_stable_decay":
+            num_decay_steps = sched_kwargs.get("num_decay_steps")
+            num_stable_steps = sched_kwargs.get("num_stable_steps")
+            if num_stable_steps is not None:
+                wsd_stable_frac = min(
+                    max(float(num_stable_steps) / decay_window, 0.0), 1.0
+                )
+                wsd_decay_frac = (
+                    min(max(float(num_decay_steps) / decay_window, 0.0), 1.0)
+                    if num_decay_steps is not None
+                    else max(1.0 - wsd_stable_frac, 0.0)
+                )
+            elif num_decay_steps is not None:
+                wsd_decay_frac = min(
+                    max(float(num_decay_steps) / decay_window, 0.0), 1.0
+                )
+                wsd_stable_frac = max(1.0 - wsd_decay_frac, 0.0)
 
         if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
             return lr
@@ -3460,9 +3648,16 @@ class MLXTrainer:
 
             progress = decay_progress(step)
             if sched_type == "cosine":
-                # progress in [0, 1] -> cosine from 1 to 0
+                # HF parity: 0.5 * (1 + cos(pi * num_cycles * 2 * progress)),
+                # which at the default num_cycles=0.5 is the half cosine falling
+                # from 1 to 0 (transformers/optimization.py:330).
                 decay = mx.array(0.5, dtype=mx.float32) * (
-                    mx.array(1.0, dtype=mx.float32) + mx.cos(mx.array(math.pi) * progress)
+                    mx.array(1.0, dtype=mx.float32)
+                    + mx.cos(
+                        mx.array(math.pi)
+                        * mx.array(num_cycles * 2.0, dtype=mx.float32)
+                        * progress
+                    )
                 )
             elif sched_type == "cosine_with_restarts":
                 # HF parity: 0.5 * (1 + cos(pi * ((num_cycles * progress) mod 1)))
@@ -3491,7 +3686,8 @@ class MLXTrainer:
                 # decay = 1 / sqrt((step + shift) / timescale) with
                 # shift = timescale - warmup; post_warmup_step ==
                 # warmup + progress * (total - warmup) == step.
-                timescale = warmup if warmup > 0 else 10000
+                timescale = knob("timescale", None, warmup if warmup > 0 else 10000)
+                timescale = max(float(timescale), 1e-8)
                 shift = timescale - warmup
                 post = mx.array(warmup, dtype=mx.float32) + progress * mx.array(
                     max(total_steps - warmup, 1), dtype=mx.float32
@@ -3505,32 +3701,33 @@ class MLXTrainer:
                 )
                 decay = mx.array(1.0, dtype=mx.float32) / mx.sqrt(arg)
             elif sched_type == "warmup_stable_decay":
-                # HF parity: constant until decay_start = 1 - lr_scheduler_num_cycles
-                # of the decay window, then cosine-decay through the remainder.
-                # We reuse num_cycles as the "decay fraction" (HF
-                # get_wsd_schedule uses num_decay_steps; expressed here as a
-                # fraction of the post-warmup window).
-                decay_frac = mx.array(
-                    min(max(num_cycles, 0.0), 1.0), dtype=mx.float32
-                )
-                stable_end = mx.array(1.0, dtype=mx.float32) - decay_frac
+                # HF get_wsd_schedule: hold at 1.0 for num_stable_steps, then
+                # decay over num_decay_steps, then sit at the floor
+                # (transformers/optimization.py:490-503). Both step counts are
+                # carried here as fractions of the post-warmup window.
+                # `num_cycles` keeps HF's meaning -- the cosine wave count,
+                # default 0.5 -- and is NOT the decay window.
+                decay_frac = mx.array(wsd_decay_frac, dtype=mx.float32)
+                stable_end = mx.array(wsd_stable_frac, dtype=mx.float32)
                 in_stable = progress < stable_end
-                # Progress through the final decay_frac of the window, in [0, 1].
-                decay_progress_local = mx.maximum(
+                # Progress through the decay window, in [0, 1].
+                decay_progress_local = mx.clip(
                     (progress - stable_end) / mx.maximum(
                         decay_frac, mx.array(1e-8, dtype=mx.float32),
                     ),
                     mx.array(0.0, dtype=mx.float32),
+                    mx.array(1.0, dtype=mx.float32),
                 )
-                # HF get_wsd_schedule defaults decay_type="cosine", num_cycles=0.5,
-                # so the decay factor is 0.5 * (1 + cos(pi * num_cycles * 2 * p)),
-                # which for num_cycles=0.5 reduces to the half cosine
-                # 0.5 * (1 + cos(pi * p)) falling from 1 to 0 over the decay window.
-                # Match that shape (not a linear falloff) so ported WSD recipes
-                # follow HF's default LR trajectory.
+                # HF's decay_type default is "cosine":
+                # 0.5 * (1 + cos(pi * num_cycles * 2 * p))
+                # (transformers/optimization.py:498).
                 decay_phase = mx.array(0.5, dtype=mx.float32) * (
                     mx.array(1.0, dtype=mx.float32)
-                    + mx.cos(mx.array(math.pi) * decay_progress_local)
+                    + mx.cos(
+                        mx.array(math.pi)
+                        * mx.array(num_cycles * 2.0, dtype=mx.float32)
+                        * decay_progress_local
+                    )
                 )
                 decay = mx.where(
                     in_stable,
