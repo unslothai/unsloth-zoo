@@ -20,6 +20,8 @@ from __future__ import annotations
 import pytest
 
 pytest.importorskip("transformers")
+pytest.importorskip("transformers.models.qwen3_5.configuration_qwen3_5")
+pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
 
 import torch  # noqa: E402
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
