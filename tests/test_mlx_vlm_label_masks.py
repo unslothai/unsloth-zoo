@@ -2719,9 +2719,7 @@ def test_qualified_families_carry_their_probed_requirements():
     ("0.6.1", False),        # last release before #1301
     ("0.6.2", True),         # #1301: KV-shared layers stop building k/v proj
     ("0.6.3", True),
-    ("0.6.4", True),         # raw mlx-vlm double transposes the audio convs
-                             # here; loader.py's _ensure_audio_conv_sanitize
-                             # (PR 879) undoes it, so the family still works
+    ("0.6.4", True),         # double conv transpose, undone by loader.py (PR 879)
     ("0.6.5", False),        # needs transformers>=5.14, capped at 5.5.0
     ("0.6.2.post1", False),  # post-releases and prereleases were not probed
     ("0.6.2rc1", False),
@@ -2816,9 +2814,8 @@ def test_only_a_published_final_release_is_inside_the_window():
     for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
                         "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor either side of the window. 0.6.1 was measured red; 0.6.5 is refused
-    # because it cannot be installed here, not because it was tried and failed
-    # -- upstream in fact fixed the 0.6.4 sanitize regression there.
+    # Nor either side. 0.6.1 measured red; 0.6.5 is refused for being
+    # uninstallable here, not for failing.
     assert gemma4.admits("0.6.1") is False
     assert gemma4.admits("0.6.5") is False
 
@@ -2838,9 +2835,8 @@ def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
         mlx_utils._check_audio_family_gate(unified())
     message = str(excinfo.value)
     assert "gemma4_unified" in message and "'gemma4'" in message
-    # Read the window off the table rather than hardcoding it: the point is
-    # that the refusal names whatever gemma4 is currently qualified for, and
-    # that window moves when it is re-probed.
+    # Read the window off the table: the refusal must name whatever gemma4 is
+    # currently qualified for, and that moves when it is re-probed.
     window = str(mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"])
     assert window in message, "the version to pin is not named"
 

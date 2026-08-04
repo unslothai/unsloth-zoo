@@ -120,10 +120,7 @@ def load_upstream(path):
         except Exception as exc:
             first = str(exc).strip().splitlines()[0][:120]
             notes.append(f"{what} {type(exc).__name__}: {first}")
-            # Recorded as a failed subcheck, not only inside the human-readable
-            # string. Whoever reads the JSON should not have to parse prose to
-            # see that upstream could not load this; the stage stays out of the
-            # verdict either way.
+            # A failed subcheck too, so the JSON says so without parsing prose.
             results[f"0_mlx_vlm_alone_loads.{what}"] = {
                 "ok": False, "error": f"{type(exc).__name__}: {first}",
             }
@@ -194,10 +191,9 @@ def check_alignment(_repo):
             valid = np.ones(mel.shape[:2], dtype=bool)
         else:
             valid = np.asarray(raw_mask).astype(bool)
-        # The tower takes a PADDING mask, not a validity one: gemma4.py builds
-        # it as `~input_features_mask` before calling. It returns a mask in the
-        # same polarity, and zeroes the encodings wherever it is True. So feed
-        # the inverse and count the False positions back.
+        # The tower takes a PADDING mask, not a validity one: gemma4.py passes
+        # `~input_features_mask` and gets a mask back in the same polarity. So
+        # feed the inverse and count the False positions.
         encodings, out_mask = tower(mel, mx.array(~valid))
         mx.eval(encodings, out_mask)
         emitted = int((~np.asarray(out_mask)[0].astype(bool)).sum())
@@ -207,9 +203,7 @@ def check_alignment(_repo):
     for secs in DURATIONS:
         wav = tone(secs, 440.0)
         counted = _gemma4_audio_placeholder_count(processor, wav, RATE)
-        # What the processor itself would emit, unpatched. Recorded for the
-        # report, never asserted on: it is mlx-vlm's own count, and the whole
-        # reason zoo derives its own is that this one runs high.
+        # mlx-vlm's own count: reported, never asserted on, since it runs high.
         native = getattr(processor, "_compute_audio_num_tokens", None)
         try:
             native_count = None if native is None else int(native(wav, RATE))
@@ -252,8 +246,8 @@ def check_loss(_repo):
     try:
         losses = []
         for hz in (440.0, 1760.0):
-            # The decoded-column shape, which is what datasets.Audio yields
-            # and the only audio value collation accepts.
+            # The decoded-column shape datasets.Audio yields, the only one
+            # collation accepts.
             clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
             messages = [{"role": "user", "content": [
                 {"type": "audio", "audio": clip},
@@ -262,8 +256,7 @@ def check_loss(_repo):
             from unsloth_zoo.mlx.utils import (
                 _collate_vlm_batch, _finalize_vlm_batch,
             )
-            # Collation stages on the host; finalizing is the single point that
-            # converts a staged batch to MLX, exactly as the trainer does it.
+            # Collate on the host, then finalize to MLX, as the trainer does.
             staged = _collate_vlm_batch(
                 [{"messages": messages}], processor, 512, None)
             batch = _finalize_vlm_batch(staged)
@@ -295,9 +288,7 @@ def main():
           f"transformers {transformers.__version__}, {args.model} ===",
           flush=True)
 
-    # Open the gate for whatever is installed. The point of this probe is to
-    # find out what happens behind it; leaving it shut would only re-measure
-    # the refusal that prompted the question.
+    # Open the gate for whatever is installed: the question is what is behind it.
     from unsloth_zoo.mlx import utils as U
     U._AUDIO_QUALIFIED_FAMILIES = dict(
         U._AUDIO_QUALIFIED_FAMILIES,
@@ -305,9 +296,8 @@ def main():
     )
     U._AUDIO_MIN_TRANSFORMERS = {}
 
-    # Stage 0 is diagnostic and never gates anything. Everything after it
-    # depends on zoo having loaded the model, and is skipped rather than
-    # errored when it has not, so a skip never reads as a measurement.
+    # Stage 0 never gates. Later stages need zoo's load, so they skip rather
+    # than error when it fails.
     path = resolve(args.model)
     load_upstream(path)
     ok_zoo = load_via_zoo(path)
@@ -333,7 +323,7 @@ def main():
     print("PROBE_RESULT " + json.dumps(
         {"mlx_vlm": version, "transformers": transformers.__version__,
          "model": args.model, "stages": results}), flush=True)
-    # Stage 0 and its subchecks are diagnostic; they never gate the exit code.
+    # Stage 0 and its subchecks are diagnostic and never gate the exit code.
     verdict = {k: v for k, v in results.items() if not k.startswith("0_")}
     sys.exit(0 if all(r["ok"] for r in verdict.values()) else 1)
 
