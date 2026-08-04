@@ -2858,10 +2858,13 @@ pass
 
 def _lora_storage_span(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Byte range, so partial overlaps are caught and not just equal starts
+    # Byte range the tensor really touches, so partial overlaps are caught and not just equal
+    # starts. Walks the strides: a view like base[::2] spans twice numel() * element_size().
     storage = tensor.untyped_storage()
     start = storage.data_ptr() + tensor.storage_offset() * tensor.element_size()
-    return storage.data_ptr(), start, start + tensor.numel() * tensor.element_size()
+    if tensor.numel() == 0: return storage.data_ptr(), start, start
+    last = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    return storage.data_ptr(), start, start + (last + 1) * tensor.element_size()
 pass
 
 

@@ -182,6 +182,15 @@ def test_aliased_A_destination_is_rejected():
     assert src_b.max().item() == 5.0
 
 
+def test_strided_view_alias_is_rejected():
+    # base[::2] touches twice the bytes numel() implies, so a naive span misses this overlap
+    base = torch.arange(8, dtype=torch.float32)
+    model = _pairs([base[0:8:2]], [base[4:8]], [None])
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(model)
+    assert torch.equal(base, torch.arange(8, dtype=torch.float32))
+
+
 def test_aliased_slot_without_scaling_is_allowed():
     shared = torch.full((4, 2), 3.0)
     vllm_utils.load_lora_directly(_pairs([shared], [shared], [None]))
