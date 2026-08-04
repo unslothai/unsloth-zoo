@@ -816,6 +816,36 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+def _resolve_adam_epsilon(value):
+    """HF's ``adam_epsilon`` as a float, rejecting what PyTorch rejects.
+
+    ``torch/optim/adam.py:60-61`` refuses ``not 0.0 <= eps`` (which also catches
+    NaN, since every comparison with NaN is False), so on CUDA a negative or NaN
+    epsilon stops the run with a clear error. MLX validates nothing --
+    ``mlx/optimizers/optimizers.py:493-504`` stores ``eps`` and adds it straight
+    into the update denominator -- so without this the same config trains to
+    garbage on Metal instead: a negative epsilon can cancel ``sqrt(v)`` and flip
+    the update's sign, and a NaN one poisons every parameter on the first step.
+
+    Numeric strings are accepted because configs round-trip through JSON in
+    Unsloth Studio; anything float() cannot read is named rather than surfacing
+    as a bare "could not convert string to float".
+    """
+    try:
+        epsilon = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be a number, got {value!r}."
+        ) from None
+    if not 0.0 <= epsilon:
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be >= 0, got {value!r}. "
+            "PyTorch rejects the same values (torch/optim/adam.py:60), but MLX "
+            "would accept it and produce NaN or sign-flipped updates."
+        )
+    return epsilon
+
+
 _part_is_norm = _mlx_norm_path_part_is_norm
 _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
@@ -3483,7 +3513,7 @@ class MLXTrainer:
         # builds one adam_kwargs holding betas + eps and applies it only to the
         # Adam-family branches (transformers/trainer.py:1397-1400).
         if adam_epsilon is not None:
-            adam_kwargs["eps"] = float(adam_epsilon)
+            adam_kwargs["eps"] = _resolve_adam_epsilon(adam_epsilon)
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":

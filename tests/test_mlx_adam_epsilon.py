@@ -213,6 +213,44 @@ def test_adafactor_does_not_receive_the_scalar_epsilon(monkeypatch):
     assert "eps" not in kwargs
 
 
+@pytest.mark.parametrize("bad", [-1e-8, -1.0, float("nan"), "not-a-number"])
+def test_epsilon_values_pytorch_rejects_are_rejected_here(bad):
+    """MLX validates nothing and adds eps straight into the denominator, so a
+    negative epsilon can flip an update's sign and a NaN one poisons every
+    parameter -- silently, where the identical CUDA config stops with an error.
+    The accepted set is torch's: `not 0.0 <= eps` (torch/optim/adam.py:60-61),
+    which rejects NaN because every NaN comparison is False."""
+    with pytest.raises(ValueError, match="adam_epsilon"):
+        _trainer(optim="adamw", adam_epsilon=bad)._build_optimizer(total_steps=4)
+
+
+@pytest.mark.parametrize("good", [0.0, 1e-8, 1e-30, float("inf"), "1e-6"])
+def test_epsilon_values_pytorch_accepts_are_accepted_here(monkeypatch, good):
+    """Zero and inf both satisfy torch's `0.0 <= eps`, so neither may be
+    rejected here. Numeric strings survive a JSON round trip of the config."""
+    _name, kwargs = _forwarded(monkeypatch, "adamw", adam_epsilon=good)
+    assert kwargs["eps"] == pytest.approx(float(good))
+
+
+def test_the_epsilon_guard_covers_non_mlx_config_objects():
+    """_build_optimizer reads adam_epsilon off self.args with getattr, so the
+    check has to live there rather than in MLXTrainingConfig.__init__: an HF
+    TrainingArguments or a bare namespace reaches the same line."""
+    import types
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = types.SimpleNamespace(trainable_parameters=lambda: {})
+    trainer._distributed_is_main_process = True
+    defaults = MLXTrainingConfig()
+    trainer.args = types.SimpleNamespace(
+        **{**vars(defaults), "optim": "adamw", "adam_epsilon": -1.0}
+    )
+    with pytest.raises(ValueError, match="adam_epsilon"):
+        trainer._build_optimizer(total_steps=4)
+
+
 def test_appended_field_stays_an_exact_suffix():
     """MLXTrainingConfig binds positional args by field order, so a new field
     must be appended last and keep _MLX_CONFIG_OPTIONAL_COPY_FIELDS a suffix of
