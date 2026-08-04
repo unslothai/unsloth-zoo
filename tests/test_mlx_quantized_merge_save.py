@@ -199,3 +199,44 @@ def test_quantize_for_save_does_not_inherit_a_stale_grid():
     assert quantization["group_size"] == 64, quantization
     assert quantization["bits"] == 4, quantization
     assert quantization["mode"] == "affine", quantization
+
+
+def test_quantize_for_save_casts_to_the_config_dtype():
+    """full_finetuning trains in float32; the checkpoint must not stay there.
+
+    mlx-lm's own conversion casts every floating parameter to the config dtype
+    before quantizing, so a float32-trained model and a float16-trained one
+    produce the same artifact. Without the cast the "4-bit" checkpoint carries
+    float32 scales, biases, embeddings and norms.
+    """
+    model = _tiny_llama(mx.float32)
+    model._config = _tiny_llama_config(torch_dtype="float16")
+
+    _quantize_merged_model_for_save(model)
+
+    scales = [
+        (path, module.scales.dtype)
+        for path, module in model.named_modules()
+        if isinstance(module, nn.QuantizedLinear)
+    ]
+    assert scales, "nothing was quantized"
+    assert all(dtype == mx.float16 for _, dtype in scales), scales
+    # The modules the predicate deliberately skips must be cast too, or they
+    # dominate the artifact.
+    assert model.model.embed_tokens.weight.dtype == mx.float16
+    assert model.model.norm.weight.dtype == mx.float16
+
+
+def test_quantize_for_save_leaves_dtype_alone_when_config_says_nothing():
+    """No usable dtype in the config is mlx-lm's "do not cast" signal.
+
+    Guards the fix against over-reach: it must not invent a dtype mlx-lm would
+    not itself have picked.
+    """
+    model = _tiny_llama(mx.float32)
+    model._config = _tiny_llama_config()
+    model._config.pop("torch_dtype")
+
+    _quantize_merged_model_for_save(model)
+
+    assert model.model.norm.weight.dtype == mx.float32

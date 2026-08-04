@@ -98,10 +98,51 @@ def test_merged_4bit_quantizes_a_full_finetuned_model():
     quantization, weight_bytes = _saved_artifact(model, tokenizer, "merged_4bit")
 
     assert quantization == {"group_size": 64, "bits": 4, "mode": "affine"}
-    # full_finetuning trains in float32, so the skipped modules (embed_tokens /
-    # lm_head) stay fp32 and the artifact is larger than the fp16-LoRA case --
-    # still far below the ~1976MB it used to write.
-    assert weight_bytes < 1200e6, f"weights still {weight_bytes / 1e6:.1f}MB"
+    # full_finetuning trains in float32, but the checkpoint dtype comes from the
+    # config (bfloat16 here), the same as mlx-lm's own conversion. The training
+    # dtype must not leak into the artifact, so hold this to the same bound as
+    # the 16-bit LoRA case rather than to a looser float32-tolerant one.
+    assert weight_bytes < 700e6, f"weights still {weight_bytes / 1e6:.1f}MB"
+
+
+def test_full_finetuned_and_lora_merges_agree_on_size():
+    """The training dtype must not change the artifact.
+
+    A float32 full-finetune and a 16-bit LoRA run over the same base produce
+    the same tensors at the same grid, so a size gap between them means a
+    training-time dtype leaked into the saved checkpoint.
+    """
+    lora_model, tokenizer = _load_and_adapt(
+        FP_MODEL, load_in_16bit=True, load_in_4bit=False)
+    _, lora_bytes = _saved_artifact(lora_model, tokenizer, "merged_4bit")
+    del lora_model
+
+    ft_model, ft_tokenizer = _load_and_adapt(FP_MODEL, full_finetuning=True)
+    _, ft_bytes = _saved_artifact(ft_model, ft_tokenizer, "merged_4bit")
+
+    assert abs(ft_bytes - lora_bytes) < 0.02 * lora_bytes, (
+        f"full_finetuning wrote {ft_bytes / 1e6:.1f}MB vs "
+        f"{lora_bytes / 1e6:.1f}MB for the 16-bit LoRA merge"
+    )
+
+
+def test_merged_4bit_artifact_has_no_float32_tensors():
+    """float32 scales/biases/embeddings in a '4-bit' checkpoint are the tell.
+
+    Packed 4-bit weights are stored as uint32, so this checks the float dtype
+    specifically rather than "32 appears in the name".
+    """
+    model, tokenizer = _load_and_adapt(FP_MODEL, full_finetuning=True)
+    with tempfile.TemporaryDirectory() as directory:
+        model.save_pretrained_merged(directory, tokenizer, save_method="merged_4bit")
+        float32 = []
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith(".safetensors"):
+                continue
+            for key, value in mx.load(os.path.join(directory, name)).items():
+                if value.dtype == mx.float32:
+                    float32.append(key)
+    assert not float32, f"float32 tensors in a 4-bit artifact: {float32[:8]}"
 
 
 def test_quantized_save_reloads_and_runs():

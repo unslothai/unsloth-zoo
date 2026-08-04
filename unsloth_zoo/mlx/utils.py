@@ -14051,6 +14051,69 @@ _MERGED_SAVE_QUANT_GROUP_SIZE = 64
 _MERGED_SAVE_QUANT_MODE = "affine"
 
 
+def _merged_save_cast_dtypes():
+    """The dtypes mlx-lm is willing to write a converted checkpoint in."""
+    try:
+        from mlx_lm.convert import MODEL_CONVERSION_DTYPES
+        return tuple(MODEL_CONVERSION_DTYPES)
+    except Exception:
+        return ("float16", "bfloat16", "float32")
+
+
+def _merged_save_cast_dtype(config):
+    """Resolve the checkpoint dtype the way ``mlx_lm.convert`` resolves it.
+
+    mlx-lm reads ``torch_dtype`` and falls back to ``text_config.dtype``.
+    transformers >= 4.56 writes the key as plain ``dtype``, which mlx-lm does
+    not look at yet, so accept both spellings — otherwise a model from a
+    modern repo silently gets no cast at all.
+    """
+    if not isinstance(config, dict):
+        return None
+    candidates = [config.get("torch_dtype"), config.get("dtype")]
+    for nested_key in ("text_config", "thinker_config"):
+        nested = config.get(nested_key)
+        if isinstance(nested, dict):
+            candidates += [nested.get("torch_dtype"), nested.get("dtype")]
+    allowed = _merged_save_cast_dtypes()
+    for name in candidates:
+        if isinstance(name, str) and name in allowed:
+            return getattr(mx, name, None)
+    return None
+
+
+def _cast_merged_model_to_config_dtype(model, config):
+    """Normalize floating parameters to the config dtype before quantizing.
+
+    ``mlx_lm.convert`` casts every floating parameter to the config dtype
+    *before* calling ``quantize_model`` (its ``set_dtype`` pass runs ahead of
+    the quantize step). Skipping that leaves whatever dtype training happened
+    to use. ``full_finetuning=True`` runs in float32 by design, so without this
+    a "4-bit" checkpoint is written with float32 scales, biases, embeddings,
+    ``lm_head`` and norms — measurably larger than the same model saved from a
+    16-bit LoRA run, for weights that are supposed to be identical.
+
+    ``cast_predicate`` is honored because some mlx-lm architectures expose it
+    to keep specific parameters out of the cast.
+    """
+    from mlx.utils import tree_map_with_path
+
+    dtype = _merged_save_cast_dtype(config)
+    if dtype is None:
+        return model
+    cast_predicate = getattr(model, "cast_predicate", None)
+
+    def _set_dtype(key, value):
+        if cast_predicate is not None and not cast_predicate(key):
+            return value
+        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != dtype:
+            return value.astype(dtype)
+        return value
+
+    model.update(tree_map_with_path(_set_dtype, model.parameters()))
+    return model
+
+
 def _quantize_merged_model_for_save(model):
     """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
 
@@ -14087,6 +14150,7 @@ def _quantize_merged_model_for_save(model):
     # the checkpoint advertises a grid its tensors do not use. mlx_lm.convert
     # pops both keys on the mirror-image dequantize path for the same reason.
     config = _strip_mlx_quantization_metadata(config)
+    model = _cast_merged_model_to_config_dtype(model, config)
     model, updated_config = quantize_model(
         model,
         config,
