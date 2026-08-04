@@ -243,5 +243,23 @@ def test_state_reports_each_label():
     assert U.eager_fallback_state() == {"A.f": True, "B.f": False}
 
 
+def test_the_recovery_hook_is_importable_from_the_package():
+    """unsloth calls this from its activation-checkpoint retry path, through
+    the `unsloth_zoo.temporary_patches` facade rather than the submodule."""
+    from unsloth_zoo.temporary_patches import (
+        eager_fallback_state,
+        force_eager_fallback,
+    )
+    assert force_eager_fallback is U.force_eager_fallback
+    assert eager_fallback_state is U.eager_fallback_state
+
+
+def test_the_recovery_hook_is_declared_public():
+    """`from ... import *` honours __all__, so a name missing from it is not
+    public however it is re-exported."""
+    assert "force_eager_fallback" in U.__all__
+    assert "eager_fallback_state" in U.__all__
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

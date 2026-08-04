@@ -58,6 +58,16 @@ _LIMIT_ERROR = next(
     None,
 )
 
+# Dynamo renamed its cache-limit knobs in torch 2.7. 2.4 to 2.6, all inside the
+# same declared range, only have the cache_size_limit spelling, and
+# `config.patch` looks each key up and raises on one the installed torch does
+# not define.
+_LIMIT_KEYS = (
+    ("recompile_limit", "accumulated_recompile_limit")
+    if hasattr(torch._dynamo.config, "recompile_limit")
+    else ("cache_size_limit", "accumulated_cache_size_limit")
+)
+
 pytestmark = pytest.mark.skipif(
     _LIMIT_ERROR is None,
     reason = "this torch exposes no Dynamo recompile-limit exception",
@@ -225,6 +235,34 @@ def test_no_version_specific_dynamo_name_is_imported_at_module_level():
         assert f"import {name}" not in src, f"{name} must be looked up with getattr"
 
 
+def test_the_dynamo_limit_keys_exist_on_this_torch():
+    """A hardcoded spelling turns the cache-exhaustion test below into an
+    error on torch 2.4 to 2.6 rather than a run of it."""
+    for key in _LIMIT_KEYS:
+        assert hasattr(torch._dynamo.config, key), key
+
+
+@pytest.mark.parametrize("message", [
+    "cache_size_limit reached",
+    "accumulated_cache_size_limit reached",
+    "recompile_limit reached",
+])
+def test_cache_exhaustion_reported_as_a_bare_unsupported_falls_back(message):
+    """torch 2.4 has no cache-limit exception class: `convert_frame` ends that
+    branch in `unimplemented(f"{limit_type} reached")`, so exhaustion arrives
+    as a plain `Unsupported` and re-raising it ends the run instead of slowing
+    it. 2.5 and 2.6 reach the same `unimplemented` with
+    skip_code_recursive_on_cache_limit_hit off."""
+    from torch._dynamo.exc import Unsupported
+    c, e, calls = _pair(Unsupported(message))
+    w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
+    assert w(3) == 6
+    assert calls == {"c": 1, "e": 1}
+    # And it latches, like every other fallback reason.
+    assert w(3) == 6
+    assert calls["c"] == 1
+
+
 def test_error_tuple_is_non_empty_on_this_torch():
     errs = _recompile_limit_errors()
     assert _LIMIT_ERROR in errs
@@ -263,8 +301,7 @@ def test_real_cache_exhaustion_completes_with_correct_numerics():
         return x * self.k + 0.0
 
     torch._dynamo.reset()
-    with torch._dynamo.config.patch(recompile_limit = 2,
-                                    accumulated_recompile_limit = 2):
+    with torch._dynamo.config.patch({key: 2 for key in _LIMIT_KEYS}):
         assert patch_function(M, "forward", forward,
                               fullgraph = True, force = True)
         got = [M(k)(torch.tensor([1.0, 2.0])).tolist() for k in range(8)]

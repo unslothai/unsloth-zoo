@@ -36,6 +36,8 @@ __all__ = [
     "ProcessorMixin",
     "_get_unique_storage_name",
     "dedent",
+    "eager_fallback_state",
+    "force_eager_fallback",
 ]
 import functools
 import inspect
@@ -694,6 +696,27 @@ def _disabled_hook_graph_break_error():
     return ()
 
 
+def _is_recompile_limit_unsupported(exc):
+    """Cache exhaustion reported as a plain graph break.
+
+    torch 2.4 has no exception class for it: `convert_frame` ends the
+    cache-limit branch in `unimplemented(f"{limit_type} reached")`, which
+    raises `Unsupported`, so `_recompile_limit_errors()` is empty there and
+    the message is all that is left to match on. 2.5 added `CacheLimitExceeded`
+    and 2.6 `RecompileLimitExceeded`, but both still fall through to the same
+    `unimplemented` when `skip_code_recursive_on_cache_limit_hit` is off.
+
+    `limit_type` is `cache_size_limit` or `accumulated_cache_size_limit`,
+    renamed to `recompile_limit` / `accumulated_recompile_limit` in torch 2.7.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return ("cache_size_limit reached" in text
+            or "recompile_limit reached" in text)
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -765,8 +788,17 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             )
             return eager_func(*args, **kwargs)
         except graph_break_errors as e:
-            # Only our own `torch.compiler.disable` hook. Anything else is a
-            # real graph break and must keep raising.
+            # Cache exhaustion on a torch that has no exception class for it
+            # (2.4), then our own `torch.compiler.disable` hook. Anything else
+            # is a real graph break and must keep raising.
+            if _is_recompile_limit_unsupported(e):
+                state["eager"] = True
+                _warn(
+                    f"Unsloth: torch.compile ran out of recompilation cache "
+                    f"for {label}; running it eagerly from here. Training is "
+                    f"unaffected apart from speed. ({type(e).__name__})"
+                )
+                return eager_func(*args, **kwargs)
             if not _is_our_own_disabled_hook(e):
                 raise
             state["eager"] = True
