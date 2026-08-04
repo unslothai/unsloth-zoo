@@ -5615,12 +5615,34 @@ class _AudioVersions(NamedTuple):
 # processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
 # 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
 #
-# Gemma 4 stays at 0.4.4: its processor changed in 0.5.0, upstream reports it
-# failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526), and 0.6.3
-# added a separate `gemma4_unified` family. Re-probing needs Apple hardware.
+# Gemma 4 starts at 0.6.2, not at the 0.4.4 the others do, because below that
+# mlx-vlm cannot load the checkpoint at all. Layers in E2B's KV-shared range
+# reuse an earlier layer's K/V and ship no k_proj/v_proj/k_norm of their own;
+# mlx-vlm built those modules for every layer regardless until 0.6.2
+# (Blaizzy/mlx-vlm#1301), so loading died on 60 missing tensors. Nothing to do
+# with audio, and it is why the 0.4.4 entry this replaces admitted a version
+# that could not open the file.
+#
+# 0.4.4 was right when it was written: the export before 2026-07-06 shipped
+# those projections and loads there. The checkpoint was re-uploaded, and a key
+# on the library alone cannot express a fact about the artefact. Re-measure
+# with `tests/gemma4_audio_version_probe.py` rather than reasoning about it.
+#
+# Measured end to end on Apple Silicon (macos-14) against
+# mlx-community/gemma-4-e2b-it-4bit @ 2387675275, on every version in and
+# either side of the range: model loads, placeholder counts equal the positions
+# the audio tower emits at 0.5s/1.0s/2.0s/3.7s, and two different clips give
+# two different losses. 0.6.1 red, 0.6.2 green, 0.6.3 and 0.6.4 green.
+#
+# 0.6.4 is included deliberately. Raw mlx-vlm 0.6.4 does fail to load these
+# weights -- #1498 made sanitize unconditional, so pre-converted MLX
+# checkpoints get the conv transpose applied twice -- but `loader.py`'s
+# `_ensure_audio_conv_sanitize` (PR 879) already undoes it, and upstream fixed
+# it in 0.6.5 (#1523). The ceiling stays 0.6.4 for the same reason as the other
+# families: 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
-    "gemma4": _AudioVersions("0.4.4", "0.4.4"),
+    "gemma4": _AudioVersions("0.6.2", "0.6.4"),
     "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
@@ -5631,6 +5653,11 @@ _AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
 # differently, so they are refused rather than assumed compatible.
+#
+# Belt and braces since gemma4's floor moved to 0.6.2: every mlx-vlm in that
+# range already requires transformers>=5.5.0, so a resolver that was allowed to
+# do its job cannot land below this. Kept for the environment that was
+# hand-assembled instead, where the two were installed in separate passes.
 _AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
 
 _AUDIO_CAST_HINT = (
