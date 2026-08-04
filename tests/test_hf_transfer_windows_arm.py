@@ -13,16 +13,19 @@ a ``windows-11-arm`` runner, where disabling it took the same GGUF load from a
 ``sys.platform`` cannot be faked in a child that then imports the package (the
 stdlib reaches for ``_winapi``), which is why the sibling Windows branch in
 ``test_alloc_conf_platform_matrix`` is covered by source inspection rather than
-by a real import. These tests go one step further than a string match: the two
-source statements are extracted by AST and **executed** against a fake platform,
-so the branch logic itself is exercised on every matrix entry.
+by a real import. These tests go one step further than a string match: the
+detector, its assignment and the enablement block are extracted by AST and
+**executed** against a fake platform, with a fake ``ctypes`` swapped into
+``sys.modules`` so the IsWow64Process2 branch can be driven from Linux.
 """
 
 from __future__ import annotations
 
 import ast
 import os
+import sys
 import types
+from unittest import mock
 
 import pytest
 
@@ -33,9 +36,11 @@ _TREE = ast.parse(_SOURCE)
 
 
 def _statements():
-    """The ``_windows_on_arm`` assignment and the enablement ``if``, in order."""
-    assign = enable = None
+    """The detector, the ``_windows_on_arm`` assignment and the enablement ``if``."""
+    detect = assign = enable = None
     for node in _TREE.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_detect_windows_on_arm":
+            detect = node
         if (
             isinstance(node, ast.Assign)
             and any(
@@ -46,14 +51,39 @@ def _statements():
             assign = node
         if isinstance(node, ast.If) and "HF_HUB_ENABLE_HF_TRANSFER" in ast.dump(node):
             enable = node
+    assert detect is not None, "_detect_windows_on_arm not found in __init__.py"
     assert assign is not None, "_windows_on_arm assignment not found in __init__.py"
     assert enable is not None, "the hf_transfer enablement block not found"
-    return assign, enable
+    return detect, assign, enable
 
 
-def _resolve(*, platform_name, machine, environ, offline = False):
-    """Execute the two statements against a fake platform and return the env."""
-    assign, enable = _statements()
+def _fake_ctypes(*, native_machine = None, call_fails = False, api_absent = False):
+    """Stand in for ctypes so the IsWow64Process2 path can be driven on Linux."""
+    mod = types.ModuleType("ctypes")
+
+    class _UShort:
+        def __init__(self, value = 0):
+            self.value = value
+
+    def _is_wow64_process2(_handle, _process, native):
+        if call_fails:
+            return 0
+        native.value = native_machine
+        return 1
+
+    kernel32 = types.SimpleNamespace(GetCurrentProcess = lambda: 1)
+    if not api_absent:
+        kernel32.IsWow64Process2 = _is_wow64_process2
+
+    mod.c_ushort = _UShort
+    mod.byref = lambda obj: obj
+    mod.windll = types.SimpleNamespace(kernel32 = kernel32)
+    return mod
+
+
+def _resolve(*, platform_name, machine, environ, offline = False, ctypes_module = None):
+    """Execute the three statements against a fake platform and return the env."""
+    detect, assign, enable = _statements()
     env = dict(environ)
     namespace = {
         "sys": types.SimpleNamespace(platform = platform_name),
@@ -61,7 +91,15 @@ def _resolve(*, platform_name, machine, environ, offline = False):
         "os": types.SimpleNamespace(environ = env),
         "_offline_env": offline,
     }
-    exec(compile(ast.Module(body = [assign, enable], type_ignores = []), _INIT, "exec"), namespace)
+    body = [detect, assign, enable]
+    code = compile(ast.Module(body = body, type_ignores = []), _INIT, "exec")
+    # The detector does `import ctypes` at call time, so swapping sys.modules is
+    # what lets a Linux box drive the Windows branch.
+    patched = {"ctypes": ctypes_module} if ctypes_module is not None else {}
+    with mock.patch.dict(sys.modules, patched):
+        if ctypes_module is None:
+            sys.modules.pop("ctypes", None)
+        exec(code, namespace)
     return env
 
 
@@ -70,21 +108,82 @@ class TestWindowsOnArm:
         env = _resolve(platform_name = "win32", machine = "ARM64", environ = {})
         assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
 
-    def test_an_emulated_process_is_caught_because_machine_unmasks_it(self):
-        # platform.machine() reports the native CPU even under emulation: it
-        # prefers PROCESSOR_ARCHITEW6432 on every supported Python, and asks WMI
-        # before the env vars on 3.12+. So the guard needs no second check, and
-        # PROCESSOR_ARCHITEW6432 being present changes nothing here.
-        env = _resolve(
-            platform_name = "win32",
-            machine = "ARM64",
-            environ = {"PROCESSOR_ARCHITEW6432": "ARM64"},
-        )
-        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
-
     def test_aarch64_spelling_is_caught_too(self):
         env = _resolve(platform_name = "win32", machine = "aarch64", environ = {})
         assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+
+
+class TestEmulatedX64:
+    """An x64 Python emulated on ARM64 reports AMD64 on Python < 3.12, which reads
+    only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets the latter for
+    32-bit processes only, so nothing in the env names the host. This is the
+    configuration anyone who installs the default python.org amd64 build on a
+    Windows ARM device lands in, and machine() alone leaves it broken."""
+
+    _ARM64 = 0xAA64  # IMAGE_FILE_MACHINE_ARM64
+    _AMD64 = 0x8664  # IMAGE_FILE_MACHINE_AMD64
+
+    def test_native_machine_arm64_is_caught_despite_machine_saying_amd64(self):
+        env = _resolve(
+            platform_name = "win32",
+            machine = "AMD64",
+            environ = {},
+            ctypes_module = _fake_ctypes(native_machine = self._ARM64),
+        )
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+
+    def test_a_real_x64_host_still_gets_hf_transfer(self):
+        env = _resolve(
+            platform_name = "win32",
+            machine = "AMD64",
+            environ = {},
+            ctypes_module = _fake_ctypes(native_machine = self._AMD64),
+        )
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+
+    def test_a_failed_call_falls_back_to_todays_behaviour(self):
+        env = _resolve(
+            platform_name = "win32",
+            machine = "AMD64",
+            environ = {},
+            ctypes_module = _fake_ctypes(call_fails = True),
+        )
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+
+    def test_windows_without_the_api_does_not_raise(self):
+        # IsWow64Process2 is Windows 10 1709+; older hosts must not blow up at
+        # import, they just keep today's behaviour.
+        env = _resolve(
+            platform_name = "win32",
+            machine = "AMD64",
+            environ = {},
+            ctypes_module = _fake_ctypes(api_absent = True),
+        )
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+
+    def test_no_ctypes_at_all_does_not_raise(self):
+        env = _resolve(platform_name = "win32", machine = "AMD64", environ = {})
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+
+    def test_a_native_arm64_host_never_reaches_the_api(self):
+        # machine() already answers, so the ctypes path is not consulted; a
+        # fake that would report AMD64 must not flip the verdict.
+        env = _resolve(
+            platform_name = "win32",
+            machine = "ARM64",
+            environ = {},
+            ctypes_module = _fake_ctypes(native_machine = self._AMD64),
+        )
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+
+    def test_linux_never_touches_the_windows_api(self):
+        env = _resolve(
+            platform_name = "linux",
+            machine = "x86_64",
+            environ = {},
+            ctypes_module = _fake_ctypes(native_machine = self._ARM64),
+        )
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
 
 class TestEveryOtherPlatformIsUnchanged:
@@ -144,7 +243,7 @@ class TestWiring:
         # Executing the statements in isolation proves the logic; this pins that
         # the block in the file is the one the guard feeds, so the two cannot
         # drift apart.
-        _, enable = _statements()
+        _, _, enable = _statements()
         assert "_windows_on_arm" in ast.dump(enable.test)
         assert "_offline_env" in ast.dump(enable.test)
 
@@ -153,9 +252,9 @@ class TestWiring:
         # hundred. Without this, appending one os.environ[...] = "1" anywhere
         # below leaves all of the above green while Windows on ARM is broken
         # again: a test that passes for the wrong reason.
-        assign, enable = _statements()
+        detect, assign, enable = _statements()
         for node in _TREE.body:
-            if node is assign or node is enable:
+            if node in (detect, assign, enable):
                 continue
             assert "HF_HUB_ENABLE_HF_TRANSFER" not in ast.dump(node), (
                 f"line {node.lineno} of __init__.py also writes the variable"
@@ -164,5 +263,5 @@ class TestWiring:
     def test_the_guard_is_defined_above_the_block_that_reads_it(self):
         # _statements() collects by node type, not source order, so it would
         # happily execute an assignment that really sits below its use.
-        assign, enable = _statements()
-        assert assign.lineno < enable.lineno
+        detect, assign, enable = _statements()
+        assert detect.lineno < assign.lineno < enable.lineno

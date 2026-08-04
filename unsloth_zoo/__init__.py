@@ -37,13 +37,31 @@ _offline_env = (
 
 # hf_transfer's Rust extension cannot complete a download on Windows on ARM:
 # every fetch dies with "an error occurred while downloading using hf_transfer",
-# and the same fetch succeeds once it is off. machine() already unmasks the
-# native CPU (it prefers PROCESSOR_ARCHITEW6432, and asks WMI first on 3.12+),
-# so emulation does not need a second check here.
-_windows_on_arm = sys.platform == "win32" and platform.machine().lower() in (
-    "arm64",
-    "aarch64",
-)
+# and the same fetch succeeds once it is off.
+def _detect_windows_on_arm() -> bool:
+    if sys.platform != "win32":
+        return False
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    # An x64 process emulated on ARM64 still reports AMD64 on Python < 3.12,
+    # which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432 -- and Windows sets
+    # the latter for 32-bit processes only, so nothing there names the host.
+    # IsWow64Process2's pNativeMachine does, emulated or not.
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        process, native = ctypes.c_ushort(), ctypes.c_ushort()
+        if kernel32.IsWow64Process2(
+            kernel32.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(native)
+        ):
+            return native.value == 0xAA64  # IMAGE_FILE_MACHINE_ARM64
+    except Exception:
+        pass  # pre-1709 Windows has no IsWow64Process2; fall back to "not ARM".
+    return False
+
+
+_windows_on_arm = _detect_windows_on_arm()
 
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
