@@ -2729,6 +2729,38 @@ def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
     assert window.admits(installed) is admitted, installed
 
 
+@pytest.mark.parametrize("installed,allowed", [
+    ("0.4.3", False),
+    ("0.4.4", True),
+    ("0.4.4.post1", True),
+    ("0.5.0", True),
+    ("0.6.4", True),
+    ("0.6.5", False),
+    ("0.6.9", False),
+])
+def test_the_gate_itself_honours_the_range_not_just_the_range_object(
+        monkeypatch, installed, allowed):
+    """Drives `_check_audio_family_gate`, not `_AudioVersions.admits`.
+
+    Asserting the range object alone would pass just as happily with the gate
+    still comparing strings, which is the whole defect. Whether an audio row
+    trains or is refused is decided here.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
+    monkeypatch.setattr(mlx_utils, "_installed_mlx_vlm_version",
+                        lambda: installed)
+    gemma3n_like = type("Proc", (), {})
+    gemma3n_like.__module__ = "mlx_vlm.models.gemma3n.processing_gemma3n"
+
+    if allowed:
+        assert mlx_utils._check_audio_family_gate(gemma3n_like()) == "gemma3n"
+    else:
+        with pytest.raises(NotImplementedError, match="only been verified"):
+            mlx_utils._check_audio_family_gate(gemma3n_like())
+
+
 def test_a_family_pinned_to_one_version_still_takes_its_post_release():
     """Gemma 4's window is a single version, and `0.4.4.post1` is that version
     repackaged. Refusing it was part of what made the feature unreachable."""
