@@ -5627,7 +5627,9 @@ class MLXTrainer:
             # optimizers build per-parameter state lazily at the first update —
             # two cache entries for one signature. Initialize before compile
             # setup consumes this list, then refresh the captured entry, which
-            # an initializer may have replaced rather than filled.
+            # an initializer may have replaced rather than filled. Safe over a
+            # resumed checkpoint: MLX initializes only per-parameter state that
+            # is still empty, so restored moments and step count survive.
             try:
                 optimizer.init(model.trainable_parameters())
                 state[1] = optimizer.state
