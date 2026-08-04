@@ -1748,16 +1748,38 @@ def patch_trl_entropy_from_logits():
             "real value and can afford the memory."
         )
 
+    def _metric_device(logits):
+        """Device trl will gather this scalar on.
+
+        trl hands the result straight to `accelerator.gather_for_metrics`, whose
+        distributed path allocates on `PartialState().device` and calls NCCL,
+        which rejects a CPU tensor ("Tensors must be CUDA and dense"). The
+        masked branch is rescued by multiplying with a device-resident
+        attention_mask, but the padding-free branch is a bare mean(), so a
+        multi-GPU run would swap one crash for another. Asked of accelerate
+        rather than guessed, and only once it is already initialised, so a
+        single-process run keeps the CPU scalar accelerate leaves alone.
+        """
+        if isinstance(logits, torch.Tensor):
+            return logits.device
+        try:
+            from accelerate.state import PartialState
+            if PartialState._shared_state:
+                return PartialState().device
+        except Exception:
+            pass
+        return None
+
     # 0-d so it broadcasts against attention_mask in both of the caller's
     # branches: sum(0 * mask)/sum(mask) and mean(0) are both 0.0, neither raises.
-    def _no_entropy():
-        return torch.zeros((), dtype = torch.float32)
+    def _no_entropy(logits = None):
+        return torch.zeros((), dtype = torch.float32, device = _metric_device(logits))
 
     @functools.wraps(original)
     def entropy_from_logits(logits, *args, **kwargs):
         if _unusable(logits):
             _warn_once()
-            return _no_entropy()
+            return _no_entropy(logits)
         try:
             return original(logits, *args, **kwargs)
         except TypeError as e:
@@ -1767,7 +1789,7 @@ def patch_trl_entropy_from_logits():
             if "iteration over a 0-d tensor" not in str(e):
                 raise
             _warn_once()
-            return _no_entropy()
+            return _no_entropy(logits)
 
     entropy_from_logits._unsloth_patched = True
     for _mod_name in ("trl.trainer.utils", "trl.trainer.sft_trainer"):

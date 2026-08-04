@@ -112,6 +112,43 @@ def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
     assert float(torch.mean(e)) == 0.0
 
 
+# ---- and survives the gather trl does next -------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
+def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
+    """trl passes this straight to `accelerator.gather_for_metrics`, whose
+    distributed path allocates on PartialState().device and calls NCCL, which
+    rejects a CPU tensor with "Tensors must be CUDA and dense". The masked
+    branch is rescued by multiplying with a device-resident mask, but the
+    padding-free branch (trl's default packing_strategy is "bfd", so plain
+    packing=True reaches it) is a bare mean(), so a CPU scalar would swap one
+    multi-GPU crash for another."""
+    trl_utils, _, _ = patched
+    state = pytest.importorskip("accelerate.state")
+    monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))
+    e = trl_utils.entropy_from_logits(EmptyLogits())
+    assert e.device.type == "cuda"
+    assert torch.mean(e).device.type == "cuda"
+    mask = torch.ones(2, 5, device = "cuda")
+    assert (torch.sum(e * mask) / mask.sum()).device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
+def test_the_fallback_follows_the_logits_device(patched):
+    trl_utils, _, _ = patched
+    empty = torch.empty(0, 7, device = "cuda")
+    assert trl_utils.entropy_from_logits(empty).device == empty.device
+
+
+def test_the_fallback_stays_on_cpu_for_a_cpu_run(patched, monkeypatch):
+    """A CPU-only run must not be handed a device it never allocates on, so the
+    device is read off accelerate rather than guessed from torch.cuda."""
+    trl_utils, _, _ = patched
+    state = pytest.importorskip("accelerate.state")
+    monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
+    assert trl_utils.entropy_from_logits(EmptyLogits()).device.type == "cpu"
+
+
 # ---- and does not quietly break the metric for everyone else -------------
 
 def test_real_logits_are_untouched(patched):
