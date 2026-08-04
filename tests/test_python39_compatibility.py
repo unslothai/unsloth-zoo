@@ -89,7 +89,8 @@ def evaluated_annotations(tree):
 
     Variable annotations are evaluated at module and class scope only; inside a
     function body they are never evaluated, so flagging those is a false positive.
-    Signature annotations are evaluated wherever their ``def`` is.
+    A class body nested in a function is still class scope, so it goes back to
+    being evaluated. Signature annotations are evaluated wherever their ``def`` is.
     """
     out = []
 
@@ -99,27 +100,73 @@ def evaluated_annotations(tree):
                 out.append(child.annotation)
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 out.extend(signature_annotations(child))
-            nested = isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-            walk(child, in_function or nested)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                walk(child, True)
+            elif isinstance(child, ast.ClassDef):
+                walk(child, False)
+            else:
+                walk(child, in_function)
 
     walk(tree, False)
     return out
 
 
-def looks_like_a_type(node):
-    """Conservative: enough for ``str | Path``, not enough for ``re.A | re.M``.
+# A `|` between these is a union, not arithmetic: builtin types, `None`, and whatever
+# the module pulled in from typing.
+TYPE_ANCHORS = frozenset({
+    "str", "int", "float", "bool", "bytes", "bytearray", "complex", "object", "type",
+    "list", "dict", "tuple", "set", "frozenset",
+})
+TYPING_MODULES = frozenset({"typing", "typing_extensions", "collections.abc"})
 
-    Flag constants are ALL_CAPS by convention, so requiring a non-caps name keeps
-    bitwise arithmetic (``re.DOTALL | re.MULTILINE``, ``os.W_OK | os.X_OK``) out.
+
+def typing_names(tree):
+    """Names this module bound with ``from typing import X`` and friends."""
+    return {alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module in TYPING_MODULES
+            for alias in node.names}
+
+
+def union_operands(node):
+    """Operands of an ``A | B | C`` chain, or None if any part is not name-shaped.
+
+    ``str``, ``os.PathLike``, ``List[int]``, ``None`` and a ``"ForwardRef"`` string
+    are name-shaped; a call, a set/dict/list display or a number is not.
     """
-    if isinstance(node, ast.Constant):
-        return node.value is None
-    if isinstance(node, ast.Subscript):
-        return looks_like_a_type(node.value)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return looks_like_a_type(node.left) and looks_like_a_type(node.right)
-    name = getattr(node, "id", None) or getattr(node, "attr", None)
-    return bool(name) and not name.isupper()
+        left, right = union_operands(node.left), union_operands(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.Subscript):
+        return union_operands(node.value)
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return [node]
+    if isinstance(node, ast.Constant) and (node.value is None
+                                           or isinstance(node.value, str)):
+        return [node]
+    return None
+
+
+def looks_like_a_type_alias(node, known_typing_names):
+    """``PathLike = str | Path`` yes; ``defaults | extra`` and ``re.A | re.M`` no.
+
+    Every operand must be name-shaped and at least one must be a recognisable type.
+    Without that anchor a ``|`` between plain names is far more likely to be a dict
+    merge (PEP 584, valid on 3.9), a set union or flag arithmetic, and failing the
+    gate on those would block code that runs perfectly well on the floor.
+    """
+    operands = union_operands(node)
+    if not operands:
+        return False
+    for operand in operands:
+        if isinstance(operand, ast.Constant):
+            if operand.value is None:
+                return True
+            continue  # a bare string is a forward reference, never an anchor alone
+        name = operand.id if isinstance(operand, ast.Name) else operand.attr
+        if name in TYPE_ANCHORS or name in known_typing_names:
+            return True
+    return False
 
 
 def evaluated_values(tree):
@@ -171,6 +218,7 @@ def test_no_pep604_unions_are_evaluated_on_the_declared_floor():
     for path in scoped_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         where = path.relative_to(REPO_ROOT)
+        known_typing_names = typing_names(tree)
         # The future import defers annotations only; an assigned value still runs.
         deferred = has_future_annotations(tree)
         for expression in ([] if deferred else evaluated_annotations(tree)):
@@ -181,7 +229,7 @@ def test_no_pep604_unions_are_evaluated_on_the_declared_floor():
         for expression in evaluated_values(tree):
             for inner in ast.walk(expression):
                 if (isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr)
-                        and looks_like_a_type(inner)):
+                        and looks_like_a_type_alias(inner, known_typing_names)):
                     offenders.append(
                         f"{where}:{inner.lineno}: {ast.unparse(inner)} (type alias)")
     assert not offenders, (
@@ -231,6 +279,44 @@ def test_vendored_fla_stays_gated_below_310():
         "no `if sys.version_info < (3, 10): return False` controls "
         "_torch_triton_cuda_supported, so the vendored FLA kernels can now be injected "
         "on the floor - restore the guard or bring _vendored/fla into in_scope()"
+    )
+
+
+def strict_patch_calls(tree):
+    """``patch_function(...)`` calls that keep the default ``match_level="strict"``."""
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name != "patch_function":
+            continue
+        if not any(kw.arg == "match_level" for kw in node.keywords):
+            out.append(node)
+    return out
+
+
+def test_modules_with_strict_patches_do_not_defer_annotations():
+    """Deferring annotations is not a safe way to reach the floor in a patching module.
+
+    ``can_safely_patch`` compares ``inspect.signature(...).annotation`` objects directly,
+    with no ``get_type_hints``, so under the default strict match level a stringified
+    annotation never equals the live upstream one. ``patch_function`` then declines the
+    patch and only logs it, which is silent in normal use. Reach the floor with
+    ``typing.Optional`` / ``typing.Union`` in these modules instead.
+    """
+    offenders = []
+    for path in scoped_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if not has_future_annotations(tree):
+            continue
+        for call in strict_patch_calls(tree):
+            offenders.append(f"{path.relative_to(REPO_ROOT)}:{call.lineno}")
+    assert not offenders, (
+        "`from __future__ import annotations` in a module that calls patch_function at "
+        "the default strict match level; the patch will be silently skipped. Use "
+        "typing.Optional / typing.Union for the annotations instead:\n  "
+        + "\n  ".join(sorted(set(offenders)))
     )
 
 
