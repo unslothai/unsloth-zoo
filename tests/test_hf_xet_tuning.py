@@ -712,6 +712,10 @@ def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, t
     for directory in (roomy, tight):
         directory.mkdir()
     _two_volumes(monkeypatch, str(roomy), str(tight))
+    # Pin the cores too: on a 1-2 CPU runner the ceiling is already the floor of 4, so halving it
+    # would be indistinguishable from not halving it and the test would prove nothing.
+    monkeypatch.setattr(_os, "sched_getaffinity", lambda _pid: set(range(16)))
+    monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: None)
 
     fake_env = {"HF_HUB_CACHE": str(roomy / "hub")}
     monkeypatch.setattr(_os, "environ", fake_env)

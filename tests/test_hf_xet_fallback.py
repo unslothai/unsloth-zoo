@@ -5004,3 +5004,70 @@ def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch
     )
     assert int(rec["xet"][key]) == 1 * GB
     assert os.environ[key] == str(64 * GB)  # the parent's own environment is untouched
+
+
+def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monkeypatch, tmp_path):
+    """The spawn window puts the child's ``HF_XET_*`` into the parent environment for the duration of
+    ``proc.start()``. Sizing from a copy taken outside the lock can catch that overlay, and since
+    those values are not the ones we seeded they read as explicit user settings, so setdefault keeps
+    them and this child is left with the import-time sizing instead of its own destination's."""
+    import collections
+    import shutil
+    import threading
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        return usage(9000 * GB, 1000 * GB, 8000 * GB)
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    holding = threading.Event()
+    done = threading.Event()
+
+    def _other_spawn():
+        # Exactly what the spawn window does: another child's numbers, briefly, in our environment.
+        with xf._SPAWN_ENV_LOCK:
+            os.environ[key] = str(7 * GB)
+            holding.set()
+            done.wait(5.0)
+            os.environ[key] = str(64 * GB)
+
+    peer = threading.Thread(target = _other_spawn, daemon = True)
+    peer.start()
+    assert holding.wait(5.0), "the peer never took the spawn lock"
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    waiter = threading.Timer(0.4, done.set)
+    waiter.start()
+    try:
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+    finally:
+        waiter.cancel()
+        done.set()
+        peer.join(5.0)
+    assert int(rec["xet"][key]) == 1 * GB, "the child was sized from the peer's overlay"
