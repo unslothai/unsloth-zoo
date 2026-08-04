@@ -479,6 +479,7 @@ def xet_log_env(log_dir: "str | Path", *, diagnostics: bool = False) -> dict[str
 
 
 _SEEDED_INTO_ENVIRON: dict[str, str] = {}
+_SEEDED_THROTTLED = False
 
 
 def apply_xet_env(
@@ -540,10 +541,12 @@ def apply_xet_env(
         if force or key not in target or key in overwritable:
             target[key] = value
             written[key] = value
-    # Remember what WE put in the real environment, so a later resize can tell our own numbers from
-    # a user's and redo only ours.
+    # Remember what WE put in the real environment, and on what terms, so a later resize can tell
+    # our own numbers from a user's, redo only ours, and redo them the same way.
     if target is os.environ:
+        global _SEEDED_THROTTLED
         _SEEDED_INTO_ENVIRON.update(written)
+        _SEEDED_THROTTLED = throttled
     return written
 
 
@@ -552,6 +555,7 @@ def resize_for_cache_dir(
     cache_dir: "Optional[str | Path]",
     *,
     fail_fast: bool = True,
+    throttled: "Optional[bool]" = None,
 ) -> dict[str, str]:
     """Re-size *env* for *cache_dir*, recomputing the values this process seeded and no others.
 
@@ -561,11 +565,17 @@ def resize_for_cache_dir(
     which is exactly what *cache_dir* is there to correct. Dropping our own seeded values first
     makes the recompute bite. A value we never wrote, or one something else has changed since, is
     left alone, so an explicit user setting still wins.
+
+    *throttled* defaults to whatever the seeding call used, so a halved stream ceiling asked for by
+    a logged 429 survives the recompute; the whole point of that reduction is that it reaches the
+    process doing the downloading.
     """
+    if throttled is None:
+        throttled = _SEEDED_THROTTLED
     for key, value in _SEEDED_INTO_ENVIRON.items():
         if env.get(key) == value:
             env.pop(key, None)
-    return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir)
+    return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir, throttled = throttled)
 
 
 _LOG_ERROR_RE = re.compile(r'"level"\s*:\s*"(ERROR|WARN)"', re.IGNORECASE)

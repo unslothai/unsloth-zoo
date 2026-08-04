@@ -698,3 +698,32 @@ def test_a_process_already_sized_at_import_still_resizes_for_its_destination(mon
         user_env, tight / "hub",
     )
     assert user_env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"] == "16000000000"
+
+
+def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, tmp_path):
+    """``unsloth_zoo/__init__`` seeds the halved stream ceiling when the Xet logs show a 429. The
+    resize drops what that call wrote, so recomputing on the default terms would hand the child the
+    full ceiling exactly when the account asked for fewer streams."""
+    import os as _os
+
+    key = "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    _two_volumes(monkeypatch, str(roomy), str(tight))
+
+    fake_env = {"HF_HUB_CACHE": str(roomy / "hub")}
+    monkeypatch.setattr(_os, "environ", fake_env)
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    monkeypatch.setattr(tuning, "_SEEDED_THROTTLED", False, raising = False)
+
+    tuning.apply_xet_env(throttled = True)  # what import does after finding a 429
+    throttled_streams = int(fake_env[key])
+    assert throttled_streams == max(4, int(tuning.xet_env_overrides()[key]) // 2)
+
+    resized = tuning.resize_for_cache_dir(dict(fake_env), roomy / "hub")
+    assert int(resized[key]) == throttled_streams, "the 429 reduction has to reach the downloader"
+    # Still overridable, for a caller that knows the throttle has lifted.
+    assert int(tuning.resize_for_cache_dir(dict(fake_env), roomy / "hub", throttled = False)[key]) \
+        > throttled_streams
