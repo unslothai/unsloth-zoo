@@ -612,3 +612,52 @@ def test_free_disk_reports_unknown_when_it_cannot_measure(monkeypatch):
 
     monkeypatch.setattr(shutil, "disk_usage", _boom)
     assert tuning._free_disk() == (0, "unknown")
+
+
+def _two_volumes(monkeypatch, roomy: str, tight: str) -> None:
+    """Pretend *roomy* and *tight* are separate filesystems, and fix RAM so only the disk moves."""
+    import collections
+    import shutil
+
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(tight):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(roomy):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+
+
+def test_an_explicit_cache_dir_is_the_disk_that_gets_measured(monkeypatch, tmp_path):
+    """``cache_dir=`` beats every cache environment variable in huggingface_hub
+    (``file_download.py``: ``if cache_dir is None: cache_dir = constants.HF_HUB_CACHE``), so a
+    caller who names one has named the volume the bytes land on. Sizing off the global cache
+    instead promises a 64 GB buffer to a full target disk, and throttles a roomy target to the
+    floor because an unrelated default cache is full."""
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    _two_volumes(monkeypatch, str(roomy), str(tight))
+
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    # A full target volume is not sized from the roomy default cache.
+    assert tuning.hf_cache_root(tight / "hub") == tight / "hub"
+    profile = tuning.system_profile(tight / "hub")
+    assert profile.free_disk_bytes == 0 and profile.disk_source.startswith(str(tight))
+    env = tuning.xet_env_overrides(cache_dir = tight / "hub")
+    assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+
+    # And the reverse: a full default cache does not throttle a download aimed elsewhere.
+    monkeypatch.setenv("HF_HUB_CACHE", str(tight / "hub"))
+    applied: dict = {}
+    tuning.apply_xet_env(applied, cache_dir = str(roomy / "hub"))
+    assert int(applied["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
+    # No cache_dir: unchanged behaviour, the environment still decides.
+    assert int(tuning.xet_env_overrides()["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB

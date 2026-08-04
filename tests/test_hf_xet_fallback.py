@@ -1128,6 +1128,58 @@ def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
     assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
 
 
+def test_the_child_is_sized_for_the_cache_dir_it_was_given(monkeypatch, tmp_path):
+    """``cache_dir`` is what huggingface_hub uses (``file_download.py``: ``if cache_dir is None:
+    cache_dir = constants.HF_HUB_CACHE``), so it, not the process's HF_HUB_CACHE, is the volume the
+    child writes to. Sizing from the global cache hands a nearly full target disk the whole budget,
+    and clamps a roomy target to the floor whenever an unrelated default cache is full."""
+    import collections
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    def _child(cache_dir, hub_cache) -> dict:
+        monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+        rec: dict = {}
+        monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(cache_dir)}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+        return rec["xet"]
+
+    # Full target volume, roomy default cache: the clamp still bites.
+    child = _child(tight / "hub", roomy / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+    # Roomy target volume, full default cache: the download is not throttled for it.
+    child = _child(roomy / "hub", tight / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
+
+
 class _EmptyQueue:
     def get(self, timeout = None):
         import queue as _queue

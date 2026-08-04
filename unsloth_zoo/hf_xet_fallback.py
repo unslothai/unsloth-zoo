@@ -1107,8 +1107,9 @@ def _download_child_entry(
             from unsloth_zoo.hf_xet_tuning import apply_xet_env
 
             # A supervised child, so the shortened Xet timeouts belong here: a failure surfaces to
-            # the ladder instead of being retried for ~6 minutes.
-            apply_xet_env(fail_fast = True)
+            # the ladder instead of being retried for ~6 minutes. cache_dir sizes the child against
+            # the volume it downloads to, matching what the parent sized against.
+            apply_xet_env(fail_fast = True, cache_dir = params.get("cache_dir"))
         except Exception as e:
             logger.debug("Could not apply Xet tuning in child: %s", e)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -1246,7 +1247,11 @@ def _run_download_attempt(
             # forced back to 0 for the one path that does the downloading. apply_xet_env returns
             # only what it wrote, which is precisely what the child needs on top of what it
             # inherits. UNSLOTH_XET_FORCE_CAPS=1 still caps the machine regardless.
-            child_env.update(apply_xet_env(dict(os.environ), fail_fast = True))
+            # huggingface_hub honours cache_dir over HF_HUB_CACHE, so pass it: the disk clamp then
+            # reads the child's real destination, not whichever cache our environment names.
+            child_env.update(apply_xet_env(
+                dict(os.environ), fail_fast = True, cache_dir = params.get("cache_dir"),
+            ))
         except Exception as e:
             logger.debug("Could not compute Xet tuning env: %s", e)
     with _SPAWN_ENV_LOCK:

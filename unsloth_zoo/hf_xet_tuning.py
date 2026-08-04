@@ -246,7 +246,7 @@ def _sysconf_memory() -> Optional[int]:
         return None
 
 
-def hf_cache_root() -> Path:
+def hf_cache_root(cache_dir: "Optional[str | Path]" = None) -> Path:
     """Where downloads land, in the same precedence huggingface_hub itself uses.
 
     ``hf_cache._active_caches`` already mirrors that precedence -- ``HF_HUB_CACHE``, the legacy
@@ -254,7 +254,15 @@ def hf_cache_root() -> Path:
     resolving anything less measures a filesystem the download may never touch: with
     ``XDG_CACHE_HOME`` or ``HUGGINGFACE_HUB_CACHE`` pointed at a data volume, the free space of the
     home directory decides the buffer instead.
+
+    *cache_dir* wins over all of them: ``hf_hub_download`` only consults the variables when it is
+    None, so a caller that names one has named the volume the bytes land on.
     """
+    if cache_dir is not None:
+        try:
+            return Path(os.path.expanduser(os.fspath(cache_dir)))
+        except (TypeError, ValueError):
+            pass
     try:
         from .hf_cache import _active_caches
 
@@ -267,11 +275,11 @@ def hf_cache_root() -> Path:
         return Path(".")
 
 
-def _free_disk() -> "tuple[int, str]":
+def _free_disk(cache_dir: "Optional[str | Path]" = None) -> "tuple[int, str]":
     """Free bytes on the filesystem holding the HF cache, walking up to the first path that exists."""
     import shutil
 
-    candidate = hf_cache_root()
+    candidate = hf_cache_root(cache_dir)
     for path in (candidate, *candidate.parents):
         try:
             return int(shutil.disk_usage(path).free), str(path)
@@ -280,8 +288,10 @@ def _free_disk() -> "tuple[int, str]":
     return 0, "unknown"
 
 
-def system_profile() -> SystemProfile:
-    """Usable RAM and cores for THIS process, preferring a cgroup limit over the host's totals."""
+def system_profile(cache_dir: "Optional[str | Path]" = None) -> SystemProfile:
+    """Usable RAM and cores for THIS process, preferring a cgroup limit over the host's totals.
+
+    *cache_dir* is the download's real destination, so the disk reading follows the bytes."""
     host_total, host_available = _psutil_memory()
     if host_total is None:
         host_total = _sysconf_memory()
@@ -296,7 +306,7 @@ def system_profile() -> SystemProfile:
         total = host_total or 0
         available = host_available if host_available is not None else total
 
-    free_disk, disk_source = _free_disk()
+    free_disk, disk_source = _free_disk(cache_dir)
 
     try:
         cpus = len(os.sched_getaffinity(0))  # respects taskset / CPU pinning
@@ -351,6 +361,7 @@ def xet_env_overrides(
     *,
     throttled: bool = False,
     fail_fast: bool = True,
+    cache_dir: "Optional[str | Path]" = None,
 ) -> dict[str, str]:
     """RAM/CPU/disk-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
 
@@ -362,8 +373,11 @@ def xet_env_overrides(
     account rather than the machine is the limiting factor. *fail_fast* keeps the shortened Xet
     timeouts, which only suit callers whose failure our Xet -> HTTP ladder can act on. Unknown total
     RAM (0) reads as small: guessing low costs throughput, guessing high costs an OOM.
+
+    *cache_dir* points the disk clamp at the volume the bytes land on. Ignored when *profile* is
+    supplied, which already carries its own disk reading.
     """
-    profile = profile or system_profile()
+    profile = profile or system_profile(cache_dir)
     # Unknown RAM reads as small: guessing low costs throughput, guessing high costs an OOM.
     total = profile.total_ram_bytes or 8 * _GB
     limit = _clamp(total // _RAM_FRACTION, _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
@@ -470,6 +484,7 @@ def apply_xet_env(
     throttled: bool = False,
     force: bool = False,
     fail_fast: bool = False,
+    cache_dir: "Optional[str | Path]" = None,
 ) -> dict[str, str]:
     """Apply the overrides to *env* (default: ``os.environ``) and return only what was written.
 
@@ -488,9 +503,14 @@ def apply_xet_env(
     defaults to False here, unlike ``xet_env_overrides``, because this runs at import: the shortened
     timeouts would otherwise apply to every direct ``huggingface_hub`` download and upload in the
     process, none of which our ladder supervises. Supervised children pass ``fail_fast = True``.
+
+    *cache_dir* is the destination the sized process will pass huggingface_hub; naming it keeps the
+    disk clamp off an unrelated filesystem in both directions.
     """
     target = os.environ if env is None else env
-    overrides = xet_env_overrides(profile, throttled = throttled, fail_fast = fail_fast)
+    overrides = xet_env_overrides(
+        profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
+    )
 
     # A user who turned high-performance mode on keeps it, and keeps the headroom it implies:
     # leaving our caps in place alongside it would be the worst of both, since xet-core would void
