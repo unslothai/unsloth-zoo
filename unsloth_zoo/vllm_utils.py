@@ -2858,7 +2858,7 @@ pass
 
 def _lora_storage_span(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Byte range of the storage, so partial overlaps are seen and not just equal starts
+    # Byte range, so partial overlaps are caught and not just equal starts
     storage = tensor.untyped_storage()
     start = storage.data_ptr() + tensor.storage_offset() * tensor.element_size()
     return storage.data_ptr(), start, start + tensor.numel() * tensor.element_size()
@@ -2867,10 +2867,9 @@ pass
 
 def check_vllm_loras_not_aliased(model_loras, vllm_loras_B):
     # All Unsloth Zoo code licensed under LGPLv3
-    # A vLLM B slot sharing storage with a training tensor cannot be scaled in place, since
-    # that memory would have to hold both B and s*B, so the scale compounds onto the training
-    # weights on every load. Checked against every training tensor before anything is copied,
-    # so a failure leaves both sides untouched.
+    # A vLLM B slot aliasing a training tensor cannot be scaled in place, since the scale
+    # would compound onto the training weights every load. Runs before any copy, so a
+    # failure leaves both sides untouched.
     spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
     for vllm_lora_B, s in vllm_loras_B:
         if s is None or vllm_lora_B.numel() == 0: continue

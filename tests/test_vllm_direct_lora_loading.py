@@ -24,7 +24,7 @@ import torch
 def vllm_utils():
     try:
         import unsloth_zoo.vllm_utils as m
-    except Exception as e:  # no GPU / accelerator on this host
+    except Exception as e:  # no GPU on this host
         pytest.skip(f"unsloth_zoo.vllm_utils unavailable: {e}")
     return m
 
@@ -128,9 +128,8 @@ def test_every_projection_reaches_its_own_slot(vllm_utils):
             lora_a = module.lora_A.default.weight
             lora_b = module.lora_B.default.weight
             assert torch.equal(slot_a.squeeze(0).squeeze(0), lora_a), name
-            # vLLM folds the scaling into B, so the slot holds scaling * B
+            # vLLM folds scaling into B, so the slot holds scaling * B and applies scaling * B @ A
             assert torch.allclose(slot_b.squeeze(0).squeeze(0), SCALING[name] * lora_b), name
-            # and therefore applies exactly scaling * B @ A to the base weight
             delta = slot_b.squeeze(0).squeeze(0) @ slot_a.squeeze(0).squeeze(0)
             assert torch.allclose(delta, SCALING[name] * (lora_b @ lora_a), atol=1e-5), name
 
