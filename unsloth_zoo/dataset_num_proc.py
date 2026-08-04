@@ -126,6 +126,19 @@ def _unpinned_default_start_method(module) -> Optional[str]:
     return methods[0] if methods else None
 
 
+def _module_start_method(module_name: str) -> Optional[str]:
+    """One module's start method. Raises if the module cannot be read at all.
+
+    Observing must not mutate: ``get_start_method(allow_none = False)`` pins
+    ``_actual_context``, which would make a later ``set_start_method()`` raise.
+    """
+    module = __import__(module_name)
+    method = module.get_start_method(allow_none = True)
+    if method is None:
+        method = _unpinned_default_start_method(module)
+    return method
+
+
 def multiprocessing_start_method() -> Optional[str]:
     """Return the start method ``datasets`` will actually use, or None.
 
@@ -133,17 +146,10 @@ def multiprocessing_start_method() -> Optional[str]:
     ``multiprocess`` -- not stdlib ``multiprocessing`` -- decides how
     ``Dataset.map(num_proc = ...)`` spawns workers. Falls back to the stdlib
     module, then to None (the caller then treats forking as unavailable).
-
-    Observing must not mutate: ``get_start_method(allow_none = False)`` pins
-    ``_actual_context``, which would make a later ``set_start_method()`` raise.
     """
     for module_name in ("multiprocess", "multiprocessing"):
         try:
-            module = __import__(module_name)
-            method = module.get_start_method(allow_none = True)
-            if method is None:
-                method = _unpinned_default_start_method(module)
-            return method
+            return _module_start_method(module_name)
         except Exception:
             continue
     return None
@@ -171,12 +177,89 @@ def _workers_unusable_reason() -> Optional[str]:
     return None
 
 
-def _affordable_workers() -> Optional[int]:
-    """How many workers free RAM can cover, or None when it cannot be read."""
+def _cgroup_limits() -> "tuple[Optional[int], Optional[float]]":
+    """This process's cgroup memory ceiling in bytes and CPU ceiling in cores.
+
+    ``(None, None)`` off Linux or outside a container. Reuses the readers in
+    ``hf_xet_tuning`` rather than parsing ``/sys/fs/cgroup`` again: they already
+    handle v1 against v2, the ``/proc/self/cgroup`` path walk and the "unlimited"
+    sentinels. Imported lazily, so this module still loads on its own.
+    """
+    try:
+        from unsloth_zoo.hf_xet_tuning import cgroup_cpu_limit, cgroup_memory_limit
+        return cgroup_memory_limit(), cgroup_cpu_limit()
+    except Exception:
+        return None, None
+
+
+def _cgroup_memory_used() -> Optional[int]:
+    """Bytes this cgroup is already using, or None when that cannot be read.
+
+    Only the well-known roots: runc bind-mounts the container's own cgroup there,
+    which is the case this exists for. Without it the whole limit would look free
+    on a container that has already spent most of it.
+    """
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path, "r") as handle:
+                return int(handle.readline().strip())
+        except Exception:
+            continue
+    return None
+
+
+def _available_memory_gb() -> Optional[float]:
+    """Free RAM this process may actually use, or None when it cannot be read.
+
+    ``psutil.virtual_memory().available`` reports the HOST inside a container, so
+    a 2GB pod on a 512GB box read as having room for the full worker set and got
+    OOM-killed -- the exact failure the memory ceiling exists to prevent.
+    """
     try:
         import psutil
         available_gb = psutil.virtual_memory().available / (1024**3)
     except Exception:
+        return None
+
+    limit, _ = _cgroup_limits()
+    if limit is not None:
+        used = _cgroup_memory_used()
+        free = limit - used if used is not None else limit
+        available_gb = min(available_gb, max(free, 0) / (1024**3))
+    return available_gb
+
+
+def _usable_cpus() -> Optional[int]:
+    """CPUs this process may actually run on, or None when that cannot be read.
+
+    ``cpu_count()`` is the host's, so under ``taskset``, Slurm pinning or a
+    Kubernetes CPU quota a one-core job would auto-size workers that then contend
+    for that one core, making tokenization slower than doing it in-process.
+    """
+    try:
+        import psutil
+        cpus = psutil.cpu_count()
+    except Exception:
+        cpus = os.cpu_count()
+    if not cpus:
+        return None
+
+    try:
+        cpus = min(cpus, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass  # not Linux, or the call is unavailable: the host count stands
+
+    _, quota = _cgroup_limits()
+    if quota is not None and quota > 0:
+        # A fractional quota still binds: Kubernetes "cpu: 500m" is 0.5 cores.
+        cpus = min(cpus, max(1, int(quota)))
+    return cpus
+
+
+def _affordable_workers() -> Optional[int]:
+    """How many workers free RAM can cover, or None when it cannot be read."""
+    available_gb = _available_memory_gb()
+    if available_gb is None:
         return None
     budget_gb = available_gb * MEMORY_BUDGET_FRACTION
     return int(budget_gb / WORKER_MEMORY_BUDGET_GB)
@@ -218,13 +301,19 @@ def _clamp_by_memory(num_proc: int) -> Optional[int]:
 def _auto_num_proc() -> Optional[int]:
     """Worker count to use when the caller did not ask for a specific one."""
     try:
-        import psutil
-        cpu_count = psutil.cpu_count() or 1
+        import psutil  # noqa: F401  the memory clamp below needs it to mean anything
     except Exception:
-        # No psutil means no CPU reading; stay conservative.
+        # No psutil means no memory reading; stay conservative.
         return None
 
-    return _clamp_by_memory(min(max(cpu_count // 2, 2), AUTO_NUM_PROC_CAP))
+    cpus = _usable_cpus()
+    if cpus is None:
+        return None
+    if cpus <= 1:
+        # Workers would only contend for the single core they are pinned to.
+        return None
+
+    return _clamp_by_memory(min(max(cpus // 2, 2), AUTO_NUM_PROC_CAP))
 
 
 def _serial(serial_as_none: bool) -> Optional[int]:
@@ -408,6 +497,40 @@ def _largest_split_rows(trainer) -> Optional[int]:
     return largest if measured else None
 
 
+def _zoo_auto_sizer_forks() -> bool:
+    """Whether ``train_on_responses_only`` would pick workers for a bare ``None``.
+
+    Its auto path asks stdlib ``multiprocessing``, not ``multiprocess`` -- the
+    split this whole module is about. Where the two disagree, ``None`` is not
+    "serial" to it, it is "size it for me", and ``datasets`` then builds that pool
+    on the non-fork ``multiprocess`` context.
+    """
+    try:
+        return _module_start_method("multiprocessing") == "fork"
+    except Exception:
+        return False
+
+
+def _serial_for_the_zoo(value: Optional[int]) -> Optional[int]:
+    """Re-encode a serial ``None`` for a reader that decides on the other module.
+
+    ``None`` only means "no workers" to ``train_on_responses_only`` while its own
+    check refuses them too. When it would not, ``1`` is the smallest request it
+    honours verbatim: still a ``Pool(1)`` on ``datasets`` >= 4.1, but one child
+    instead of the ``cpu_count + 4`` its auto path would have chosen.
+    """
+    if value is not None or not _zoo_auto_sizer_forks():
+        return value
+    _warn_once(
+        "start_method_split",
+        "'multiprocess' and 'multiprocessing' disagree about the start method "
+        f"({multiprocessing_start_method()!r} against 'fork'), so "
+        "train_on_responses_only is being held to one worker rather than left to "
+        f"size itself. Set {NUM_PROC_ENV_VAR} to override.",
+    )
+    return 1
+
+
 def resolve_responses_only_num_proc(trainer, num_proc):
     """Bound the worker count ``train_on_responses_only`` hands to ``map()``.
 
@@ -424,7 +547,8 @@ def resolve_responses_only_num_proc(trainer, num_proc):
       against. Under spawn the trade flips -- each ``Pool(1)`` child re-imports
       the user's ``__main__`` (#3211 / #3397), while ``None`` is safe because its
       auto path vetoes non-fork itself. That is exactly what
-      ``serial_as_none = False`` encodes, so defer to it.
+      ``serial_as_none = False`` encodes, so defer to it -- then re-check with
+      ``_serial_for_the_zoo``, since that veto reads the other module.
     * **An explicit count disables its per-split small-split guard.** A small
       eval split alongside a large train split then picks up workers it would not
       have had: worth it only when a split is big enough to have been
@@ -436,7 +560,7 @@ def resolve_responses_only_num_proc(trainer, num_proc):
 
     if not was_auto:
         # Explicit counts already bypass the small-split guard.
-        return get_dataset_num_proc(num_proc, serial_as_none = False)
+        return _serial_for_the_zoo(get_dataset_num_proc(num_proc, serial_as_none = False))
 
     rows = _largest_split_rows(trainer)
     if rows is None or rows < ZOO_MIN_ROWS_FOR_MULTIPROC:
@@ -445,7 +569,9 @@ def resolve_responses_only_num_proc(trainer, num_proc):
         if env_set and env_value is not None:
             return env_value
         # Otherwise it would have gone in-process anyway, and its guard yields
-        # None, which is more in-process than the 1 expressible here.
+        # None, which is more in-process than the 1 expressible here. Safe whatever
+        # the start method: every split here is under the threshold, so its own
+        # per-split guard serialises them all.
         return num_proc
 
-    return get_dataset_num_proc(None, serial_as_none = False)
+    return _serial_for_the_zoo(get_dataset_num_proc(None, serial_as_none = False))
