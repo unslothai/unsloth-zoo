@@ -3548,7 +3548,13 @@ class MLXTrainer:
             optimizer = optim.Adamax(learning_rate=initial_lr, **adam_kwargs)
         elif opt_name == "adagrad":
             self._coupled_weight_decay = float(wd or 0.0)
-            optimizer = optim.Adagrad(learning_rate=initial_lr)
+            # HF Trainer builds `optim="adagrad"` as torch.optim.Adagrad(lr=...)
+            # with no eps override, so the recipe's epsilon is torch's default
+            # 1e-10, not MLX's 1e-8. Adagrad's step is bounded by lr either way
+            # (sqrt(v) >= |g| since v accumulates g^2), so pinning the smaller
+            # torch epsilon cannot destabilize the update, it only stops small
+            # gradients from being damped ~100x harder than on the torch backend.
+            optimizer = optim.Adagrad(learning_rate=initial_lr, eps=1e-10)
         elif opt_name == "adadelta":
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.AdaDelta(learning_rate=initial_lr)
