@@ -43,15 +43,17 @@ def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.Sy
 @pytest.mark.parametrize(
     "ram_gb, cpus, limit, size, perfile, files, streams",
     [
-        # An eighth of RAM is the budget, a quarter of that is the shared buffer and a
-        # thirty-second is a per-file buffer, so the numbers describe ONE allocation. The floors
-        # (256MB / 128MB) are what keep a small machine's buffers usable.
-        (8, 4, 1 * GB, 256 * MB, 128 * MB, 4, 8),
+        # An eighth of RAM is the budget and a thirty-second is a per-file buffer, so the numbers
+        # describe ONE allocation. The shared buffer is the exception: it reaches for xet-core's
+        # own 2 GB default and only falls short where half the budget or a sixth of RAM says it
+        # must, because a quarter of the budget measured 0.73x on an 8 GB laptop.
+        (8, 4, 1 * GB, 500 * MB, 128 * MB, 3, 8),
         # No cliffs: 12 GB sits between the old table's 8 and 16 GB rows and gets a budget to match,
         # where the old step function gave it the 8 GB row's.
-        (12, 4, 1500 * MB, 375 * MB, 128 * MB, 4, 8),
-        (16, 8, 2 * GB, 500 * MB, 128 * MB, 8, 16),
-        (32, 16, 4 * GB, 1 * GB, 128 * MB, 16, 32),
+        (12, 4, 1500 * MB, 750 * MB, 128 * MB, 4, 8),
+        (16, 8, 2 * GB, 1 * GB, 128 * MB, 7, 16),
+        # 32 GB is the first machine that can hold xet-core's stock buffer outright.
+        (32, 16, 4 * GB, 2 * GB, 128 * MB, 15, 32),
         # A big host is bounded by a budget proportional to what it has, not by a laptop's. Holding
         # a 2 TB server to the old flat 4 GB row cost 30% against xet-core's own defaults.
         (128, 64, 16 * GB, 4 * GB, 500 * MB, 24, 124),
@@ -61,7 +63,7 @@ def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.Sy
         # ...and so does the budget. A 64-core container with 8 GB (CI, or a cgroup-limited pod)
         # cannot use 64 file buffers or 128 streams out of a 1 GB budget, and opening them anyway is
         # how a small machine on a thin link ends up worse off than with no tuning at all.
-        (8, 64, 1 * GB, 256 * MB, 128 * MB, 5, 14),
+        (8, 64, 1 * GB, 500 * MB, 128 * MB, 3, 14),
     ],
 )
 def test_knobs_scale_with_the_machine(ram_gb, cpus, limit, size, perfile, files, streams):
@@ -421,12 +423,13 @@ def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
 
 
 def test_the_smallest_devices_get_the_smallest_numbers():
-    """The floors are the whole safety story on a 2 GB VM or a fractional-core pod: one shared
-    buffer, two files, four streams. Anything larger there is worse than not tuning at all."""
+    """A 2 GB VM and a fractional-core pod get the smallest allocation we hand out: two files, four
+    streams, and a shared buffer bounded by a sixth of RAM rather than by xet-core's default, which
+    on a 2 GB machine would be the whole machine."""
     for name, ram_gb, cpus, disk_gb in DEVICES[:2]:
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
         assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB, name
-        assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"]) == 256 * MB, name
+        assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"]) <= ram_gb * GB / 6, name
         assert int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == 2, name
         assert int(env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == 4, name
 
@@ -513,3 +516,21 @@ def test_no_module_sets_a_variable_xet_core_does_not_read():
             if name not in XET_CORE_VARS:
                 unknown.setdefault(name, set()).add(path.relative_to(root).as_posix())
     assert not unknown, f"names xet-core does not read: { {k: sorted(v) for k, v in unknown.items()} }"
+
+
+@pytest.mark.parametrize("ram_gb, cpus", [(8, 8), (12.7, 2), (16, 4), (32, 16), (64, 32), (2048, 192)])
+def test_a_machine_that_can_hold_xet_cores_own_buffer_gets_it(ram_gb, cpus):
+    """The rule the small-device regression came down to. Our sizing exists to CAP a machine that
+    needs capping; handing one less than it would have had by doing nothing is not a cap, it is
+    just a slower download. Measured: a quarter of the budget on an 8 GB laptop ran at 0.73x of
+    what shipped before, and restoring this one value took it to 1.45x."""
+    env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
+    size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
+    limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
+    stock = tuning._STOCK_BUFFER_SIZE
+    # Only two things may hold it under stock, and only as far as they reach: half the budget, and
+    # a sixth of RAM. Anything smaller than both of those is a choice, not a constraint.
+    assert size >= min(stock, limit // 2, max(256 * MB, ram_gb * GB / 6)), f"{ram_gb}GB got {size}"
+    # ...so a machine with room for stock on both counts is never handed less than stock.
+    if limit // 2 >= stock and ram_gb * GB / 6 >= stock:
+        assert size >= stock, f"{ram_gb}GB undercut stock: {size}"

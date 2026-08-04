@@ -80,9 +80,10 @@ _MAX_STREAMS = 124
 _MAX_CONCURRENT_FILES = 24
 # xet-core's xorb size: the unit a single download stream has outstanding at any moment.
 _XORB_BYTES = 64 * 1024 * 1024
-# xet-core's own default prefetch floor (config/groups/reconstruction.rs, min_prefetch_buffer).
-# Sizing DOWN from a default is a cap; sizing below it for no reason is just a slower download.
+# xet-core's own defaults (config/groups/reconstruction.rs). Sizing DOWN from a default is a cap;
+# sizing below one for no reason is just a slower download, which is what these two floors prevent.
 _STOCK_PREFETCH_BUFFER = 1 * _GB
+_STOCK_BUFFER_SIZE = 2 * _GB
 
 # Below this much usable RAM, callers prefer HTTP over Xet (see hf_xet_health).
 MIN_XET_RAM_BYTES = 4 * _GB
@@ -367,9 +368,17 @@ def xet_env_overrides(
     if free:
         limit = _clamp(min(limit, free // 4), _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
 
-    # Proportions from the high-performance preset, which is the shape xet-core itself considers
-    # balanced: a quarter of the budget as the shared buffer, a thirty-second per file.
-    size = max(limit // 4, 256 * _MB)
+    # The shared buffer is the ONE knob that moves throughput, measured twice: 2.70x from the
+    # buffer group on a 2 TB host, and 1.45x from this single value on an 8 GB laptop, where a
+    # quarter of the budget (256 MB) ran at 0.73x of what shipped before. So the rule is not a
+    # ratio, it is: never hand a machine less than xet-core's own 2 GB default unless something
+    # forces us to. Two things do. Half the budget, because a shared buffer larger than that
+    # leaves no room for the per-file ones; and a sixth of RAM, which is what keeps the floor from
+    # overriding the memory bound on a 2 GB VM, where stock would be the whole machine.
+    size = min(
+        max(limit // 4, min(_STOCK_BUFFER_SIZE, limit // 2)),
+        max(256 * _MB, (profile.total_ram_bytes or 8 * _GB) // 6),
+    )
     perfile = max(limit // 32, 128 * _MB)
     # The prefetch floor is the one knob where our old arithmetic went BELOW xet-core's own default
     # (1 GB) on every machine, which is not a cap, just a smaller transfer. Approach the default
