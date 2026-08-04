@@ -36,7 +36,7 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-def _trainer(**config_kwargs):
+def _trainer(model=None, **config_kwargs):
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     class DummyModel:
@@ -44,7 +44,7 @@ def _trainer(**config_kwargs):
             return {}
 
     trainer = MLXTrainer.__new__(MLXTrainer)
-    trainer.model = DummyModel()
+    trainer.model = DummyModel() if model is None else model
     trainer.args = MLXTrainingConfig(**config_kwargs)
     # is_main_process is a property over this attribute; the 8-bit branch reads
     # it to decide whether to print its one-line banner.
@@ -68,7 +68,7 @@ _OPTIMIZER_CONSTRUCTORS = {
 }
 
 
-def _forwarded(monkeypatch, optim_name, **config_kwargs):
+def _forwarded(monkeypatch, optim_name, model=None, **config_kwargs):
     """Return ``(constructor_name, kwargs)`` for the optimizer the trainer builds.
 
     Records instead of constructing, so the assertions hold identically under
@@ -95,7 +95,9 @@ def _forwarded(monkeypatch, optim_name, **config_kwargs):
         for constructor in constructors:
             monkeypatch.setattr(target, constructor, _recorder(constructor))
 
-    _trainer(optim=optim_name, **config_kwargs)._build_optimizer(total_steps=4)
+    _trainer(
+        model=model, optim=optim_name, **config_kwargs,
+    )._build_optimizer(total_steps=4)
     assert len(recorded) == 1, f"expected one optimizer, recorded {recorded}"
     name, args, kwargs = recorded[0]
     assert not args, f"{name} was given positional arguments: {args}"
@@ -210,6 +212,47 @@ def test_adafactor_does_not_receive_the_scalar_epsilon(monkeypatch):
     default (1e-30, 1e-3)) with different meaning from HF's scalar, so
     adam_epsilon must not leak into it. The CUDA path scopes it the same way."""
     _name, kwargs = _forwarded(monkeypatch, "adafactor", adam_epsilon=1e-6)
+    assert "eps" not in kwargs
+
+
+def _rank3_model():
+    """A model whose only trainable parameter demotes Adafactor to AdamW."""
+    import types
+
+    parameter = types.SimpleNamespace(ndim=3, shape=(2, 2, 2))
+    return types.SimpleNamespace(
+        trainable_parameters=lambda: {"vision.patch_embed.weight": parameter}
+    )
+
+
+def test_the_adafactor_fallback_carries_the_epsilon(monkeypatch):
+    """rank>2 trainable parameters demote Adafactor to AdamW inside
+    _build_optimizer, and that demoted branch does take adam_kwargs. So the
+    epsilon has to be resolved after the fallback, not before it."""
+    name, kwargs = _forwarded(
+        monkeypatch, "adafactor", model=_rank3_model(), adam_epsilon=1e-6,
+    )
+    assert name == "AdamW"
+    assert kwargs["eps"] == pytest.approx(1e-6)
+
+
+def test_the_adafactor_fallback_rejects_a_bad_epsilon():
+    with pytest.raises(ValueError, match="adam_epsilon"):
+        _trainer(
+            model=_rank3_model(), optim="adafactor", adam_epsilon=-1.0,
+        )._build_optimizer(total_steps=4)
+
+
+@pytest.mark.parametrize("optim_name", ["sgd", "muon", "lion", "adafactor"])
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), "not-a-number"])
+def test_epsilon_free_optimizers_ignore_an_invalid_epsilon(
+    monkeypatch, optim_name, bad,
+):
+    """The guard is scoped to the branches that consume the epsilon. HF never
+    hands adam_epsilon to these, so `optim="sgd", adam_epsilon=-1.0` trains
+    fine on CUDA; rejecting it here would block a config that is valid
+    everywhere else, and the value it complains about is never used."""
+    _name, kwargs = _forwarded(monkeypatch, optim_name, adam_epsilon=bad)
     assert "eps" not in kwargs
 
 

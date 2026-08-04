@@ -59,6 +59,8 @@ SUPPORTED_MLX_OPTIMIZERS = (
     # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
     "adamw_8bit", "adam_8bit",
 )
+# The branches _build_optimizer forwards betas/eps to.
+_MLX_ADAM_FAMILY_OPTIMIZERS = ("adamw", "adam", "adamw_8bit", "adam_8bit")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
@@ -3497,24 +3499,6 @@ class MLXTrainer:
         wd = self.args.weight_decay
         self._manual_weight_decay = 0.0
         self._coupled_weight_decay = 0.0
-        adam_beta1 = getattr(self.args, "adam_beta1", None)
-        adam_beta2 = getattr(self.args, "adam_beta2", None)
-        adam_epsilon = getattr(self.args, "adam_epsilon", None)
-        adam_kwargs = {}
-        if adam_beta1 is not None or adam_beta2 is not None:
-            adam_kwargs["betas"] = (
-                float(0.9 if adam_beta1 is None else adam_beta1),
-                float(0.999 if adam_beta2 is None else adam_beta2),
-            )
-        # Only forwarded when explicitly set, so the MLX default stays in force
-        # otherwise. adam_kwargs reaches the Adam family alone (see below):
-        # Adam/AdamW and the 8-bit QuantizedMomentAdam{,W}, which forward eps
-        # unchanged to those same parents. That is the CUDA scope too -- HF
-        # builds one adam_kwargs holding betas + eps and applies it only to the
-        # Adam-family branches (transformers/trainer.py:1397-1400).
-        if adam_epsilon is not None:
-            adam_kwargs["eps"] = _resolve_adam_epsilon(adam_epsilon)
-
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
             unsupported = self._adafactor_unsupported_parameters(self.model)
@@ -3530,6 +3514,28 @@ class MLXTrainer:
                     f"({preview})."
                 )
                 opt_name = "adamw"
+
+        # Built after the Adafactor fallback above, since that fallback lands on
+        # AdamW and has to carry the betas and epsilon with it. Scoped to the
+        # Adam family -- Adam/AdamW and the 8-bit QuantizedMomentAdam{,W}, which
+        # forward eps unchanged to those same parents -- so an epsilon set
+        # alongside optim="sgd" is ignored rather than validated, matching CUDA:
+        # HF builds one adam_kwargs holding betas + eps and applies it only to
+        # the Adam-family branches (transformers/trainer.py:1397-1400).
+        adam_kwargs = {}
+        if opt_name in _MLX_ADAM_FAMILY_OPTIMIZERS:
+            adam_beta1 = getattr(self.args, "adam_beta1", None)
+            adam_beta2 = getattr(self.args, "adam_beta2", None)
+            adam_epsilon = getattr(self.args, "adam_epsilon", None)
+            if adam_beta1 is not None or adam_beta2 is not None:
+                adam_kwargs["betas"] = (
+                    float(0.9 if adam_beta1 is None else adam_beta1),
+                    float(0.999 if adam_beta2 is None else adam_beta2),
+                )
+            # Only forwarded when explicitly set, so MLX's default stays in
+            # force otherwise.
+            if adam_epsilon is not None:
+                adam_kwargs["eps"] = _resolve_adam_epsilon(adam_epsilon)
 
         if opt_name == "adafactor":
             optimizer = optim.Adafactor(
