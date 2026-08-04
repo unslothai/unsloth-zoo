@@ -1223,3 +1223,20 @@ def test_all_three_consumers_agree_on_an_audio_processor_only_shape():
     with pytest.raises(ValueError, match="sampling_rate"):                     # rate
         collator._extract_audio_for_example(
             {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+
+
+@pytest.mark.parametrize("key", ["audio", "url", "path", "audio_url"])
+def test_array_payload_under_any_key_does_not_trip_numpy_truthiness(key):
+    # A waveform handed to a string-ish key must resolve, not raise
+    # "truth value of an array with more than one element is ambiguous".
+    # On the previous `ele.get("url") or ele.get("path")` chain this held for
+    # `path` (last term, never truth-tested) but raised for `url`.
+    out = extract_audio_info(msgs({"type": "audio", key: CLIP}))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], CLIP)
+
+
+def test_empty_string_key_falls_through_to_the_next_key():
+    # Preserved from the old `or` chain: a blank url must not shadow a real path.
+    out = extract_audio_info(msgs({"type": "audio", "url": "", "path": "/tmp/a.wav"}))
+    assert out == ["/tmp/a.wav"]

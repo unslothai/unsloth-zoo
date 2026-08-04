@@ -643,18 +643,18 @@ _AUDIO_CONTENT_KEYS_TEXT = ", ".join(f"`{k}`" for k in _AUDIO_CONTENT_KEYS[:-1])
 
 
 def _audio_payload_from_content(ele):
-    # "audio" carries an inline payload (array / HF Audio dict), so only a real
-    # None means absent -- an empty array must not fall through to the string keys.
-    value = ele.get("audio")
-    if value is not None:
-        return value
-    # The remaining keys are string sources (local path or URL); feature
-    # extractors accept those directly. Falsy (empty) strings fall through,
-    # matching the previous `ele.get("url") or ele.get("path")` behaviour.
-    for key in _AUDIO_CONTENT_KEYS[1:]:
+    # First usable payload among the accepted keys. Only `is None` counts as
+    # absent -- a bare truthiness test would raise on a numpy waveform
+    # ("truth value of an array with more than one element is ambiguous"),
+    # which the previous `ele.get("url") or ele.get("path")` chain did for any
+    # array passed under a string key.
+    for key in _AUDIO_CONTENT_KEYS:
         value = ele.get(key)
-        if value:
-            return value
+        if value is None: continue
+        # An empty string is not a loadable path or URL: fall through to the
+        # next key, matching the previous chain's behaviour for "" .
+        if isinstance(value, str) and not value: continue
+        return value
     return None
 
 
