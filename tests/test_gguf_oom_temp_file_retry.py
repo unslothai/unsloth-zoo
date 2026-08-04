@@ -29,6 +29,8 @@ sys.path.insert(0, str(ROOT))
 
 from unsloth_zoo.llama_cpp import (  # noqa: E402
     _converter_was_oom_killed,
+    _gguf_output_paths,
+    _remove_gguf_outputs,
     _retry_with_temp_file,
 )
 
@@ -150,6 +152,69 @@ def test_the_dependency_repair_retry_is_independent():
     """Two retries share one loop; one must not consume the other's chance."""
     body = _loop_src()
     assert body.index("attempted_repair") < body.index("attempted_temp_file = True")
+
+
+# ---- clearing what the killed run left behind ------------------------------
+
+def _touch(directory, name, data = b"GGUF"):
+    path = directory / name
+    path.write_bytes(data)
+    return path
+
+
+def test_the_shards_of_a_killed_split_run_are_removed(tmp_path):
+    """GGUFWriter.open_output_file opens every shard with "wb" before a single
+    tensor byte, so a SIGKILL always leaves them. The retry then drops
+    --split-max-size and writes the unsharded name instead, and callers upload
+    every save_directory/*.gguf, so the stubs would ship beside the real file."""
+    out = str(tmp_path / "model.BF16.gguf")
+    shards = [_touch(tmp_path, f"model.BF16-{i:05d}-of-00003.gguf") for i in (1, 2, 3)]
+    _remove_gguf_outputs(out)
+    assert not any(s.exists() for s in shards)
+
+
+def test_a_partial_output_file_is_removed(tmp_path):
+    out = _touch(tmp_path, "model.BF16-mmproj.gguf")
+    _remove_gguf_outputs(str(out))
+    assert not out.exists()
+
+
+def test_unrelated_ggufs_are_left_alone(tmp_path):
+    """Only this run's own name and its shards, never a sibling export."""
+    keep = [_touch(tmp_path, "model.BF16.gguf"),
+            _touch(tmp_path, "other.BF16-00001-of-00002.gguf"),
+            _touch(tmp_path, "model.Q4_K_M.gguf")]
+    _remove_gguf_outputs(str(tmp_path / "model.BF16-mmproj.gguf"))
+    assert all(k.exists() for k in keep)
+
+
+def test_removing_a_missing_output_is_not_an_error(tmp_path):
+    _remove_gguf_outputs(str(tmp_path / "nothing" / "model.gguf"))
+
+
+def test_the_paths_include_the_file_and_its_shards(tmp_path):
+    _touch(tmp_path, "model.BF16-00001-of-00002.gguf")
+    _touch(tmp_path, "model.BF16-00002-of-00002.gguf")
+    got = [Path(p).name for p in _gguf_output_paths(str(tmp_path / "model.BF16.gguf"))]
+    assert got == ["model.BF16.gguf",
+                   "model.BF16-00001-of-00002.gguf",
+                   "model.BF16-00002-of-00002.gguf"]
+
+
+def test_the_retry_clears_the_old_output_first():
+    body = _loop_src()
+    assert body.index("_remove_gguf_outputs(output_file)") < body.index("command = retry")
+
+
+def test_a_failed_projector_is_removed_and_stops_claiming_vlm():
+    """The converter truncates its --outfile at header time, so "a failed
+    optional run wrote no file" was never true: the partial projector, or a good
+    one from an earlier export, sits there and gets uploaded as valid."""
+    src = (ROOT / "unsloth_zoo" / "llama_cpp.py").read_text(encoding="utf-8")
+    i = src.index("if not required:")
+    body = src[i:src.index("if optional_failed:", i)]
+    assert "_remove_gguf_outputs(output_file)" in body
+    assert "is_vlm = False" in body
 
 
 if __name__ == "__main__":

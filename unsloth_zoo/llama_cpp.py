@@ -2388,6 +2388,38 @@ def _retry_with_temp_file(command):
     return out[:-1] + ["--use-temp-file"] + out[-1:]
 
 
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
+    basename_without_gguf = os.path.splitext(output_file)[0]
+    shard_pattern = re.compile(
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+    )
+    parent_dir = os.path.dirname(output_file) or '.'
+    paths = [output_file]
+    try:
+        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                        if shard_pattern.search(f))
+    except OSError:
+        pass
+    return paths
+
+
+def _remove_gguf_outputs(output_file):
+    """Delete what a failed or abandoned conversion left at `output_file`.
+
+    GGUFWriter.open_output_file opens every shard with "wb" before a single
+    tensor byte is written, and neither the converter nor the writer cleans up
+    on failure, so a nonzero exit or a SIGKILL always leaves truncated files
+    behind. Callers enumerate save_directory.glob("*.gguf") and upload every
+    match, so a leftover is reported and published as a valid artifact.
+    """
+    for path in _gguf_output_paths(output_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2655,6 +2687,11 @@ def convert_to_gguf(
                             "and was killed. Retrying with --use-temp-file, "
                             "which spools tensors to disk instead."
                         )
+                        # The retry drops --split-max-size, so it writes
+                        # model.gguf while the killed split run already created
+                        # every model-00001-of-0000N.gguf. Left in place they
+                        # sit beside the good file and get uploaded with it.
+                        _remove_gguf_outputs(output_file)
                         command = retry
                         continue
 
@@ -2681,6 +2718,14 @@ def convert_to_gguf(
                         if line and ("Error" in line or "Exception" in line):
                             reason = line
                             break
+                    # The converter truncates its --outfile at header time,
+                    # before any tensor, so the failed run either left a partial
+                    # projector here or destroyed a good one from an earlier
+                    # export. Callers upload every save_directory/*.gguf, so
+                    # leaving it publishes a broken projector as if it were
+                    # valid, paired with the new text model.
+                    _remove_gguf_outputs(output_file)
+                    is_vlm = False
                     optional_failed = True
                     print(
                         f"Unsloth: Could not convert the {description} to GGUF "
@@ -2691,8 +2736,8 @@ def convert_to_gguf(
                     break
                 raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
 
-        # A failed optional run wrote no file, so validating it would raise
-        # "output file not created" and defeat the point.
+        # The failed optional run's partial output was just removed, so
+        # validating it would raise "output file not created" for nothing.
         if optional_failed:
             continue
 
