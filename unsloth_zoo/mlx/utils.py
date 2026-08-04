@@ -51,8 +51,9 @@ import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from functools import wraps
+from functools import lru_cache, partial, wraps
 from pathlib import Path
+from typing import NamedTuple
 
 
 from .cce import _get_runtime_cce
@@ -665,6 +666,16 @@ def _shared_kv_slot_count(model):
         return 0
     config = getattr(backbone, "config", None)
     if not (_config_get(config, "num_kv_shared_layers") or 0):
+        return 0
+    # mlx-vlm 0.5.0+ threads shared K/V itself, so `_fix_gemma4_kv_sharing`
+    # leaves those backbones alone and they keep the ordinary per-layer cache
+    # contract. These slots are shorter than the layer count by construction
+    # (`first_kv_shared_layer_idx == num_hidden_layers - num_kv_shared_layers`),
+    # so handing them over as `cache` would truncate the zip over layers and
+    # silently drop the shared tail of the stack. Imported here rather than at
+    # module scope: loader imports nothing from this module and vice versa.
+    from .loader import _gemma4_has_native_shared_kv
+    if _gemma4_has_native_shared_kv(backbone):
         return 0
     return getattr(backbone, "first_kv_shared_layer_idx", 0) or 0
 
@@ -1623,6 +1634,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             "audio_token",
             "boi_token",
             "eoi_token",
+            # Gemma 4 wraps every audio run in these, the way boi/eoi wrap an
+            # image run: processing_gemma4.py builds boa_token + placeholders +
+            # eoa_token per clip.
+            "boa_token",
+            "eoa_token",
         ):
             token = getattr(tokenizer, attr, None)
             if token is not None:
@@ -1632,6 +1648,12 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             "image_token_id",
             "video_token_id",
             "audio_token_id",
+            # Delimiters around a media run are generated the same way the run
+            # is, so they are no more a target than the run itself.
+            "audio_start_id",
+            "audio_end_id",
+            "boa_token_id",
+            "eoa_token_id",
         ):
             _append_unique_int(ids, getattr(tokenizer, attr, None))
 
@@ -1646,8 +1668,20 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         "boi_token_id",
         "eoi_token_index",
         "eoi_token_id",
+        # Gemma 4 declares its audio delimiters here (gemma4/config.py).
+        "boa_token_index",
+        "boa_token_id",
+        "eoa_token_index",
+        "eoa_token_id",
     ):
         _append_unique_int(ids, _config_get(config, key, None))
+
+    # The repeated audio placeholder, which the names above do not always reach:
+    # Phi-4 spells it `<|endoftext11|>` and declares it in neither the tokenizer
+    # attributes nor its checkpoint config, so every audio position was a
+    # supervised target. Resolved the same way run counting resolves it.
+    for token_id in _get_vlm_audio_soft_token_ids(processor, config) or ():
+        _append_unique_int(ids, token_id)
 
     if not ids:
         return None
@@ -1657,6 +1691,31 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
 def _get_image_token_ids(model):
     """Backward-compatible wrapper for legacy callers."""
     return _get_vlm_ignore_token_ids(model=model)
+
+
+def _get_vlm_audio_soft_token_ids(processor=None, config=None):
+    """Resolve the repeated audio placeholder ("soft") token IDs.
+
+    Narrower than the loss-masking set in two ways: image placeholders are
+    excluded, and so are the begin/end audio delimiters, which appear once per
+    clip and would corrupt run counting. Families that identify their
+    placeholder only by a config index resolve through a config when one is
+    reachable; when nothing resolves, the caller refuses the row rather than
+    training on an unverifiable audio/text alignment.
+    """
+    ids = []
+    tokenizer = _get_processor_tokenizer(processor)
+    if tokenizer is not None:
+        for tok_str in _AUDIO_SOFT_TOKEN_STRINGS:
+            _append_unique_int(ids, _convert_token_to_id(tokenizer, tok_str))
+        token = getattr(tokenizer, "audio_token", None)
+        if token is not None:
+            _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+        _append_unique_int(ids, getattr(tokenizer, "audio_token_id", None))
+    for source in (config, getattr(processor, "config", None)):
+        for key in ("audio_token_index", "audio_token_id"):
+            _append_unique_int(ids, _config_get(source, key, None))
+    return ids
 
 
 def _normalize_cce_label_dtype(labels):
@@ -1726,6 +1785,9 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         if np.issubdtype(values.dtype, np.floating):
             compare = compare.astype(values.dtype)  # mirror mx scalar narrowing
         mask = mask | np.isin(values, compare)
+    spans = _audio_span_positions_np(inputs, mask.shape)
+    if spans is not None:
+        mask = mask | spans
     attention = inputs.get("attention_mask")
     if attention is not None:
         attention_np = (
@@ -1800,11 +1862,12 @@ class _HostStagedVLMBatch:
     """
 
     __slots__ = ("inputs", "label_mask", "widen_labels_int64", "host_valued",
-                 "ignore_token_ids", "config", "prefinalized", "pc_opaque")
+                 "ignore_token_ids", "config", "prefinalized", "pc_opaque",
+                 "pc_audio")
 
     def __init__(self, inputs, label_mask, host_valued=True,
                  ignore_token_ids=None, config=None, prefinalized=None,
-                 widen_labels_int64=False, pc_opaque=None):
+                 widen_labels_int64=False, pc_opaque=None, pc_audio=None):
         self.inputs = inputs
         self.label_mask = label_mask
         self.host_valued = host_valued
@@ -1813,6 +1876,8 @@ class _HostStagedVLMBatch:
         self.prefinalized = prefinalized
         self.widen_labels_int64 = widen_labels_int64
         self.pc_opaque = pc_opaque
+        # Checked after the deferred combine: the ids only exist once it runs.
+        self.pc_audio = pc_audio
 
 
 def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
@@ -1834,11 +1899,16 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
     if staged.pc_opaque is not None:
         (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
          completion_only_loss) = staged.pc_opaque
+        audio_counts, audio_soft_ids, audio_budget = (
+            staged.pc_audio or (None, None, None)
+        )
         inner = _combine_vlm_prompt_completion_inputs(
             prompt_inputs, completion_inputs, flush_side, pad_id,
             max_seq_length,
             ignore_token_ids=staged.ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
+            audio_budget=audio_budget,
         )
         inner.config = staged.config
         return _finalize_vlm_batch(
@@ -1902,6 +1972,12 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
+    spans = _audio_span_positions_np(batch_dict, labels.shape)
+    if spans is not None:
+        # This path decides labels for processor output the host staging could
+        # not claim, so it owns the span masking too.
+        labels = mx.where(mx.array(spans),
+                          mx.array(ignore_index, dtype=labels.dtype), labels)
     attention_mask = batch_dict.get("attention_mask")
     if attention_mask is not None:
         ignore = mx.array(ignore_index, dtype=labels.dtype)
@@ -2013,7 +2089,39 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         shared_kv = _build_shared_kv_caches(model)
         if shared_kv is not None:
             fwd_kwargs["cache"] = shared_kv
-        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
+        # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
+        # only, and `Model.__call__` sends ids through `get_input_embeddings`,
+        # which does not scale. Handing the model ids therefore trains on text
+        # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
+        # already merges and rescales itself; do the same here so
+        # use_cce={True,False} stay in parity instead of differing by that.
+        scaled_embeds = None
+        if _vlm_embed_scale(model) is not None:
+            embed_result = model.get_input_embeddings(
+                inputs,
+                pixel_values,
+                mask=fwd_kwargs.get("mask"),
+                **{k: v for k, v in fwd_kwargs.items()
+                   if k not in ("mask", "cache")},
+            )
+            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+            # per_layer_inputs and friends: the merge produced them, and
+            # recomputing from ids inside the stack would redo the work.
+            for key, value in embed_kwargs.items():
+                fwd_kwargs.setdefault(key, value)
+        if scaled_embeds is not None:
+            # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
+            # declares -- re-embeds from ids inside `Model.__call__` and drops
+            # a supplied `inputs_embeds`, so the rescale above would be thrown
+            # away on exactly the versions that need it. 0.5.0 onwards honors
+            # it by forwarding straight to the language model; do that here on
+            # every version, which is what `_vlm_cce_forward` already does.
+            output = _get_text_model(model)(
+                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+            )
+        else:
+            output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
@@ -2286,6 +2394,27 @@ def _config_to_mapping(config):
         for key in dir(config)
         if not key.startswith("_") and not callable(getattr(config, key))
     }
+
+
+def _phi4mm_token_ids(config):
+    """Phi-4-multimodal's image and audio token ids.
+
+    Its checkpoint config.json declares neither; mlx-vlm supplies both as
+    dataclass defaults. Training threads the checkpoint mapping rather than the
+    model's config object, so read the defaults off the dataclass instead of
+    restating them here.
+    """
+    image_id = _config_get(config, "image_token_index")
+    audio_id = _config_get(config, "audio_token_index")
+    if image_id is None or audio_id is None:
+        from mlx_vlm.models.phi4mm.config import ModelConfig as _Phi4MMConfig
+
+        fields = _Phi4MMConfig.__dataclass_fields__
+        if image_id is None:
+            image_id = fields["image_token_index"].default
+        if audio_id is None:
+            audio_id = fields["audio_token_index"].default
+    return int(image_id), int(audio_id)
 
 
 def _normalize_grid_thw(grid_thw):
@@ -3005,7 +3134,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     if images_spatial_crop is not None:
         batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:
-        batch_dict["audio_embed_sizes"] = audio_embed_sizes
+        # The model calls .item() on each entry, so hand over an array; the
+        # tuple above is only for this function's span arithmetic.
+        batch_dict["audio_embed_sizes"] = mx.array(list(audio_embed_sizes))
 
     if model_type == "multi_modality":
         input_ids = batch_dict.get("input_ids")
@@ -3084,8 +3215,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         pixel_attention_mask = batch_dict.get("pixel_attention_mask")
         if input_ids is not None:
             input_ids_np = np.asarray(input_ids)
-            image_token_id = int(_config_get(config, "image_token_index"))
-            audio_token_id = int(_config_get(config, "audio_token_index"))
+            image_token_id, audio_token_id = _phi4mm_token_ids(config)
             batch_dict["image_token_positions"] = tuple(
                 tuple(
                     int(pos)
@@ -3121,8 +3251,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
             replacements = []
             image_idx = 0
             audio_idx = 0
-            image_token_id = int(_config_get(config, "image_token_index"))
-            audio_token_id = int(_config_get(config, "audio_token_index"))
+            image_token_id, audio_token_id = _phi4mm_token_ids(config)
             for batch_idx, row in enumerate(input_ids_np):
                 batch_replacements = []
                 for pos in image_positions[batch_idx]:
@@ -3716,11 +3845,19 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        # Gemma 3n's template renders a placeholder for
+                        # "audio" alone, so a part left under an alias carries
+                        # a clip with nothing behind it, and an untyped one
+                        # reaches neither the family gate nor the extractor.
                         if "type" not in clean:
                             if "text" in clean:
                                 clean["type"] = "text"
                             elif "image" in clean:
                                 clean["type"] = "image"
+                            elif any(alias in clean for alias in _AUDIO_PART_TYPES):
+                                clean["type"] = "audio"
+                        elif clean["type"] in _AUDIO_PART_TYPES:
+                            clean["type"] = "audio"
                         parts.append(clean)
                 msg["content"] = parts
             else:
@@ -5426,6 +5563,1290 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
     return []
 
 
+_AUDIO_PART_TYPES = ("audio", "audio_url", "input_audio")
+
+# Repeated placeholders only: begin/end delimiters would corrupt run counting.
+_AUDIO_SOFT_TOKEN_STRINGS = (
+    "<audio_soft_token>",   # Gemma 3n
+    "<|audio|>",            # Gemma 4
+    "<|AUDIO|>",            # Qwen2.5-Omni
+    "<so_embedding>",       # Nemotron Nano Omni
+    # Phi-4-multimodal reuses a spare special token, exposed nowhere else.
+    "<|endoftext11|>",
+)
+
+# Families and the exact mlx-vlm versions their audio path was validated on.
+# Anything else is refused: merge contracts differ per family and mlx-vlm has
+# changed audio preprocessing within its supported span.
+_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
+    "gemma3n": frozenset({"0.4.4"}),
+    "gemma4": frozenset({"0.4.4"}),
+    "phi4mm": frozenset({"0.4.4"}),
+    "minicpmo": frozenset({"0.4.4"}),
+}
+
+# Families probed only on a newer transformers than this package pins, at the
+# version the probes ran on. Older releases expand their audio tokens
+# differently, so they are refused rather than assumed compatible.
+_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
+
+_AUDIO_CAST_HINT = (
+    "Cast the dataset column with "
+    "datasets.Audio(sampling_rate=<processor rate>) so rows decode to samples "
+    "at the rate the model's feature extractor expects."
+)
+
+
+def _audio_family_from_processor(processor):
+    """Identify the audio model family behind a processor.
+
+    Returns a lowercase family key drawn from the processor's defining module
+    (mlx-vlm processors live in ``mlx_vlm.models.<family>.processing_<family>``)
+    with a class-name fallback for wrappers.
+    """
+    module = getattr(type(processor), "__module__", "") or ""
+    for part in module.lower().split("."):
+        if part.startswith("processing_"):
+            return part[len("processing_"):]
+    parts = module.lower().split(".")
+    if "models" in parts:
+        index = parts.index("models")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    name = getattr(type(processor), "__name__", "") or ""
+    return name.lower().replace("processor", "").strip("_")
+
+
+@lru_cache(maxsize=1)
+def _installed_mlx_vlm_version():
+    try:
+        from importlib.metadata import version
+
+        return str(version("mlx-vlm"))
+    except Exception:
+        try:
+            import mlx_vlm
+
+            return str(getattr(mlx_vlm, "__version__", "") or "")
+        except Exception:
+            return ""
+
+
+def _check_audio_transformers_floor(family):
+    """Refuse a family probed only on a newer transformers than is installed."""
+    floor = _AUDIO_MIN_TRANSFORMERS.get(family)
+    if not floor:
+        return
+    try:
+        import transformers
+
+        version = transformers.__version__
+        parts = tuple(int(x) for x in version.split(".")[:2])
+    except Exception:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training for '{family}' requires transformers "
+            f"{floor[0]}.{floor[1]} or newer, and the installed version could "
+            f"not be determined."
+        ) from None
+    if parts < floor:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training for '{family}' was verified on "
+            f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "
+            f"older releases handle its audio token expansion differently. "
+            f"Upgrade transformers to train on audio with this model."
+        )
+
+
+# Gemma 4's audio encoder subsamples time through two stride-2, kernel-3 conv
+# blocks (SubSampleConvProjection), each padding one frame on either side.
+_GEMMA4_AUDIO_SUBSAMPLE_BLOCKS = 2
+
+
+def _gemma4_audio_frame_mask(extractor, waveform, sampling_rate):
+    """The mel frames one clip fills, extracted on its own.
+
+    Alone is the only way to ask: mlx-vlm pads waveforms to the longest in the
+    batch before framing, and 0.4.4 derives the mask by subsampling a
+    sample-level one, so a shorter clip's valid count moves with whatever else
+    it is batched against.
+    """
+    features = extractor(
+        [np.asarray(waveform, dtype=np.float32)],
+        sampling_rate=sampling_rate,
+        return_attention_mask=True,
+    )
+    if "input_features_mask" in features:
+        return np.asarray(features["input_features_mask"])[0].astype(bool)
+    # An extractor that reports no mask leaves the encoder without one too, and
+    # Gemma 4 then treats every frame as real audio.
+    return np.ones(
+        int(np.asarray(features["input_features"]).shape[-2]), dtype=bool,
+    )
+
+
+def _gemma4_audio_encoder_positions(frames):
+    for _ in range(_GEMMA4_AUDIO_SUBSAMPLE_BLOCKS):
+        kept = (len(frames) + 2 - 3) // 2 + 1
+        frames = frames[::2][:kept]
+    return int(frames.sum())
+
+
+def _gemma4_audio_placeholder_count(processor, waveform, sampling_rate):
+    """How many audio placeholders one Gemma 4 clip needs.
+
+    Must equal the number of positions the audio tower emits, or the merge has
+    nothing to put behind the surplus placeholder. mlx-vlm's processor instead
+    counts ``ceil(duration / 40 ms)``: 40 ms is only the nominal frame period,
+    so the count runs one over whenever a duration lands near a frame boundary
+    (3 of 10 real LibriSpeech utterances).
+
+    The frames are read off the installed extractor rather than recomputed from
+    a copy of its framing arithmetic, because that arithmetic changed inside the
+    supported span -- mlx-vlm added the reference's semicausal left-pad in
+    0.5.0, and a formula assuming it predicts a frame 0.4.4 never produces. The
+    extractor's own truncation applies for the same reason: the count has to
+    follow the audio the tower is actually given.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    if extractor is None:
+        raise NotImplementedError(
+            f"Unsloth MLX: {type(processor).__name__} has no audio feature "
+            f"extractor, so the number of audio placeholders a clip needs "
+            f"cannot be determined."
+        )
+    return _gemma4_audio_encoder_positions(
+        _gemma4_audio_frame_mask(extractor, waveform, sampling_rate),
+    )
+
+
+def _trim_gemma4_audio_batch_mask(inputs, clips, processor):
+    """Mask each clip to the frames its own audio fills.
+
+    Batch padding otherwise leaves a shorter clip holding frames that are
+    entirely silence, which the encoder reports as valid positions and the model
+    trains on as speech. Restoring each clip's own mask also puts the valid
+    count back in step with the placeholder run written for it.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    features = inputs.get("input_features")
+    if extractor is None or features is None:
+        return inputs
+    mask = inputs.get("input_features_mask")
+    # An extractor that reports no mask leaves every padded frame looking real,
+    # so the batch needs one written for it rather than left out.
+    shape = np.asarray(features).shape[:2]
+    if mask is not None and np.asarray(mask).shape != shape:
+        # Nothing downstream compares these two, and a mask short of its
+        # features broadcasts over the rows it does not cover.
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} returned an audio mask "
+            f"of shape {tuple(np.asarray(mask).shape)} for features of shape "
+            f"{tuple(np.asarray(features).shape)}, so audio positions cannot "
+            f"be paired with their clips."
+        )
+    if shape[0] != len(clips):
+        # The feature-count check reports this; repairing part of the batch
+        # would hide it behind a plausible-looking mask.
+        return inputs
+    if len(clips) < 2:
+        # One clip is extracted the way it will be used, so nothing was padded
+        # against a neighbour and its mask already covers only its own audio.
+        return inputs
+    trimmed = np.zeros(shape, dtype=bool)
+    default_rate = audio_extractor_sampling_rate(processor)
+    for row, clip in enumerate(clips[:shape[0]]):
+        waveform, rate = clip if isinstance(clip, tuple) else (clip, None)
+        solo = _gemma4_audio_frame_mask(
+            extractor, waveform,
+            rate or getattr(clip, "sampling_rate", None) or default_rate,
+        )
+        keep = min(len(solo), shape[1])
+        trimmed[row, :keep] = solo[:keep]
+    inputs["input_features_mask"] = (
+        trimmed if mask is None else trimmed.astype(np.asarray(mask).dtype)
+    )
+    return inputs
+
+
+def _repair_gemma4_audio_processor(processor):
+    if not callable(getattr(processor, "_compute_audio_num_tokens", None)):
+        raise NotImplementedError(
+            f"Unsloth MLX: {type(processor).__name__} does not expose "
+            f"_compute_audio_num_tokens, so its audio placeholder count cannot "
+            f"be matched to the model's audio encoder. This mlx-vlm release is "
+            f"not usable for Gemma 4 audio training."
+        )
+    # Bound on the instance, not the class: a class-level patch would follow the
+    # processor type into every other use of it in this process. Unlike
+    # __call__, this one is reached through the instance dict.
+    processor._compute_audio_num_tokens = partial(
+        _gemma4_audio_placeholder_count, processor,
+    )
+
+
+_AUDIO_PROCESSOR_REPAIRS = {"gemma4": _repair_gemma4_audio_processor}
+
+_AUDIO_BATCH_MASK_REPAIRS = {"gemma4": _trim_gemma4_audio_batch_mask}
+
+_AUDIO_NO_OWN_HOOK = object()
+
+
+def _audio_count_corrected(processor):
+    hook = getattr(processor, "_compute_audio_num_tokens", None)
+    return (isinstance(hook, partial)
+            and hook.func is _gemma4_audio_placeholder_count)
+
+
+def _audio_repaired_processor(processor):
+    """A processor counting audio placeholders the way its encoder does.
+
+    A copy, because the correction has a second half -- the batch mask -- that
+    can only be applied where the collated batch is held. Correcting the shared
+    processor in place would hand the count alone to anything else using it,
+    including a concurrent collation's own model call, and a corrected count
+    meeting an uncorrected mask misaligns a batch that lined up before.
+    Components are shared by reference, so the copy costs a dict.
+    """
+    repair = _AUDIO_PROCESSOR_REPAIRS.get(
+        _audio_family_from_processor(processor),
+    )
+    if repair is None:
+        return processor
+    corrected = copy.copy(processor)
+    # Only an instance-level hook is ours to put back; pinning an inherited one
+    # would leave a copy of it shadowing the class's own.
+    state = getattr(processor, "__dict__", None) or {}
+    own_hook = state.get("_compute_audio_num_tokens", _AUDIO_NO_OWN_HOOK)
+    repair(corrected)
+    if _audio_count_corrected(processor):
+        # The copy shares state with the processor this run was handed, so the
+        # correction reached it too. Half of it -- the batch mask -- can only
+        # be applied to a batch collated here, and the count alone misaligns a
+        # batch that lined up before, so put back what was there and refuse.
+        if own_hook is _AUDIO_NO_OWN_HOOK:
+            del corrected._compute_audio_num_tokens
+        else:
+            corrected._compute_audio_num_tokens = own_hook
+        raise NotImplementedError(
+            f"Unsloth MLX: copying {type(processor).__name__} does not give an "
+            f"independent object, so its audio placeholder count cannot be "
+            f"corrected without changing the processor this run was handed."
+        )
+    return corrected
+
+
+def _repair_audio_batch(inputs, clips, processor):
+    repair = _AUDIO_BATCH_MASK_REPAIRS.get(
+        _audio_family_from_processor(processor),
+    )
+    # Only on the processor whose count was corrected: the two describe one
+    # contract, so applying either alone puts them back out of step.
+    if not clips or repair is None or not _audio_count_corrected(processor):
+        return inputs
+    return repair(inputs, clips, processor)
+
+
+def _check_audio_family_gate(processor):
+    """Refuse audio rows for families/versions without a verified contract."""
+    family = _audio_family_from_processor(processor)
+    probed = _AUDIO_QUALIFIED_FAMILIES.get(family)
+    installed = _installed_mlx_vlm_version()
+    if probed and installed in probed:
+        _check_audio_transformers_floor(family)
+        return family
+    if not _AUDIO_QUALIFIED_FAMILIES:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio inputs were found in this dataset, but audio "
+            f"training is not enabled for any model family yet (this row uses "
+            f"'{family}'). Remove the audio content to train on the text and "
+            f"image parts of this dataset."
+        )
+    supported = ", ".join(
+        f"{name} (mlx-vlm {', '.join(sorted(versions))})"
+        for name, versions in sorted(_AUDIO_QUALIFIED_FAMILIES.items())
+    )
+    if probed:
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training for '{family}' has only been verified "
+            f"on mlx-vlm {', '.join(sorted(probed))}, but mlx-vlm "
+            f"{installed or 'unknown'} is installed. Pin a verified version to "
+            f"train on audio. Verified: {supported}."
+        )
+    raise NotImplementedError(
+        f"Unsloth MLX: audio training is not supported for '{family}'. "
+        f"Verified families: {supported}."
+    )
+
+
+def audio_extractor_sampling_rate(processor):
+    """The sampling rate this processor's audio feature extractor expects."""
+    for holder in (
+        getattr(processor, "feature_extractor", None),
+        # Some name their audio extractor separately, and only it knows the rate.
+        getattr(processor, "audio_processor", None),
+        processor,
+    ):
+        rate = getattr(holder, "sampling_rate", None)
+        if rate:
+            try:
+                return int(rate)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+class AudioInputCapability(NamedTuple):
+    """Whether a loaded checkpoint can take audio input.
+
+    ``processor_ok`` and ``model_ok`` are the two halves, each ``True``,
+    ``False``, or ``None`` when it was not evaluated. ``capable`` requires both
+    to be ``True``, so a call without a model can refute a checkpoint but never
+    affirm one. ``reason`` names what was observed.
+    """
+
+    capable: bool
+    reason: str
+    processor_ok: "bool | None"
+    model_ok: "bool | None"
+
+
+# Two pitches two octaves apart, long enough for any pinned extractor's
+# framing and short enough that four calls cost a moment.
+_AUDIO_PROBE_TONES = (440.0, 1760.0)
+_AUDIO_PROBE_SECONDS = 0.2
+_AUDIO_PROBE_RATE = 16000
+# Marker-free by contract: which marker a processor needs is prompt-rendering
+# knowledge, so callers supply their own candidates through `texts`.
+_AUDIO_PROBE_TEXT = "Describe the audio."
+
+
+def _audio_probe_tone(rate, hertz):
+    """A fresh mono tone. Fresh matters: a processor keying on buffer identity
+    rather than sample values must not see the same object twice."""
+    count = max(int(rate * _AUDIO_PROBE_SECONDS), 1)
+    time = np.arange(count, dtype=np.float32) / float(rate)
+    return (0.25 * np.sin(2.0 * np.pi * hertz * time)).astype(np.float32)
+
+
+def _audio_probe_fingerprint(value):
+    """A content fingerprint of a processor's output.
+
+    Arrays enter by their bytes, so a field that echoes the call rather than the
+    audio compares equal and cannot be mistaken for evidence.
+    """
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _audio_probe_fingerprint(value[key]))
+            for key in sorted(value, key=str)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_audio_probe_fingerprint(item) for item in value)
+    if type(value) is _MX_ARRAY_TYPE:
+        try:
+            value = np.asarray(value)
+        except Exception:
+            # Only the dtypes numpy has no equivalent for, where float32 is
+            # lossless. Casting everything would collapse large exact integers.
+            value = np.asarray(value.astype(mx.float32))
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            return ("object_array", value.shape, repr(value.tolist()))
+        return ("array", value.shape, str(value.dtype), value.tobytes())
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return _audio_probe_fingerprint(np.asarray(value.detach().cpu()))
+    return ("scalar", repr(value))
+
+
+def _audio_probe_once(processor, text, kwarg, rate, hertz, held):
+    clip = _AudioClip(_audio_probe_tone(rate, hertz), rate)
+    # Held for the probe's lifetime so no later buffer can reuse its address.
+    held.append(clip)
+    payload = _format_vlm_audio_for_processor([[clip]], processor=processor)
+    # Answering "not capable" from a payload-shape refusal would report a
+    # working checkpoint as unusable.
+    return _call_pairing_audio_on_refusal(
+        lambda call_kwargs: processor(**call_kwargs),
+        {"text": [text], kwarg: payload}, kwarg,
+        lambda clips: _audio_payload_as_pairs([clip], processor),
+    )
+
+
+def _audio_probe_processor(processor, texts):
+    """Whether audio content demonstrably reaches this processor's output.
+
+    Per candidate text: a discarded warm-up call absorbs one-time state, then
+    the same tone twice -- which must agree, or the processor cannot repeat
+    itself and its outputs carry no evidence -- then a second tone, which must
+    differ. Both tones share duration, dtype and construction, so sample values
+    are the only input property that separates them: a processor that sizes its
+    output from the clip length, echoes the call, or drops the audio entirely
+    produces identical outputs and is refused.
+    """
+    try:
+        kwarg = _vlm_processor_audio_kwarg(processor)
+    except Exception:
+        return False, "the processor accepts no audio argument"
+    rate = audio_extractor_sampling_rate(processor) or _AUDIO_PROBE_RATE
+    held = []
+    raised = None
+    for text in texts:
+        try:
+            _audio_probe_once(processor, text, kwarg, rate,
+                              _AUDIO_PROBE_TONES[0], held)
+        except Exception:
+            pass  # a warm-up is discarded on any outcome, by design
+        try:
+            first = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[0], held))
+            again = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[0], held))
+            other = _audio_probe_fingerprint(
+                _audio_probe_once(processor, text, kwarg, rate,
+                                  _AUDIO_PROBE_TONES[1], held))
+        except Exception as exc:
+            raised = exc
+            continue
+        if first != again:
+            raised = None
+            continue  # not repeatable: its outputs prove nothing either way
+        if first != other:
+            return True, "audio content changed the processor output"
+    if raised is not None:
+        return False, f"the processor raised on audio ({type(raised).__name__})"
+    return False, (
+        "the processor accepted audio and produced no audio-dependent output"
+    )
+
+
+def _model_carries_audio_modules(model):
+    """Whether the loaded model has audio machinery, by name.
+
+    A name walk rather than a fixed attribute list: the pinned families spell it
+    ``audio_tower``, ``embed_audio``, ``audio_projection_layer``,
+    ``audio_encoder`` and ``audio_projection``, and Phi-4 nests its pair under
+    an intermediate submodule.
+    """
+    walk = getattr(model, "named_modules", None)
+    if walk is None:
+        return False
+    for entry in walk():
+        name = entry[0] if isinstance(entry, tuple) else entry
+        if "audio" in str(name).lower():
+            return True
+    return False
+
+
+def audio_input_capability(model, processor, texts=None):
+    """Whether this loaded checkpoint can take audio input.
+
+    Answered from observed behaviour, per checkpoint: audio content has to
+    change what the processor returns, and the model has to carry audio
+    modules. Two exports of one family can therefore disagree -- a processor
+    whose checkpoint omits the audio half of its preprocessor configuration
+    accepts the argument, drops the audio, and is refused here.
+
+    ``texts`` supplies candidate prompts, as one string or a sequence; a
+    processor that needs a marker only its own template emits will not answer
+    positively without one, and which marker that is belongs to whoever renders
+    prompts, not here. The built-in candidate carries none.
+
+    Never raises: anything unevaluable answers not capable, so this cannot fail
+    a model load. A positive says audio reaches the processor's output and the
+    model has somewhere to put it -- not that features merge correctly, which
+    the per-batch checks continue to guard.
+    """
+    processor_ok = model_ok = None
+    try:
+        if isinstance(texts, str):
+            texts = [texts]
+        candidates = [*(texts or ()), _AUDIO_PROBE_TEXT]
+        processor_ok, reason = _audio_probe_processor(processor, candidates)
+        if model is None:
+            return AudioInputCapability(False, reason, processor_ok, None)
+        model_ok = _model_carries_audio_modules(model)
+        if not model_ok:
+            reason = "the model carries no audio modules"
+        return AudioInputCapability(
+            bool(processor_ok and model_ok), reason, processor_ok, model_ok,
+        )
+    except BaseException as exc:  # totality: a load must never fail on this
+        return AudioInputCapability(
+            False, f"the capability check could not run ({type(exc).__name__})",
+            processor_ok, model_ok,
+        )
+
+
+class _AudioClip(np.ndarray):
+    """A mono waveform that remembers the rate it was decoded at.
+
+    Processors normally take bare waveforms, but some want
+    ``(samples, sampling_rate)`` pairs and do not expose a rate of their own, so
+    the value verified during extraction has to travel with the samples.
+
+    The rate survives views, slicing and copies, which is all collation does to
+    a clip. It does not survive concatenation, stacking, ``np.asarray`` or
+    pickling; anything that grows such a step must pass the rate explicitly
+    rather than expect it to ride along.
+    """
+
+    def __new__(cls, samples, sampling_rate):
+        obj = np.asarray(samples, dtype=np.float32).view(cls)
+        obj.sampling_rate = int(sampling_rate)
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is not None:
+            self.sampling_rate = getattr(obj, "sampling_rate", None)
+
+
+def _audio_samples_to_mono(samples, *, channel_first):
+    """Reduce decoded samples to a 1-D mono waveform.
+
+    ``channel_first`` records the source's documented layout rather than
+    guessing from extents: torchcodec returns ``(channels, samples)``, and a
+    short clip can legitimately have more channels than samples.
+    """
+    array = np.asarray(samples)
+    if array.ndim == 1:
+        return array
+    if array.ndim == 2 and channel_first:
+        # Mirrors the datasets mono accessor.
+        return array.mean(axis=0)
+    raise ValueError(
+        f"Unsloth MLX: expected a mono waveform, got an array of shape "
+        f"{array.shape}. Provide single-channel audio, or let "
+        f"datasets.Audio decode the column so channels are handled for you."
+    )
+
+
+def _normalize_audio_clip(clip, expected_rate):
+    """Coerce one dataset audio value into a mono waveform at ``expected_rate``.
+
+    Accepts decoded ``{"array", "sampling_rate"}`` mappings (datasets 3.x) and
+    decoder objects exposing ``get_all_samples()`` (datasets 4.x). Every form
+    must carry its own sampling rate: without one the waveform's duration is
+    unknowable, and feeding it to an extractor expecting another rate silently
+    changes the features (and, for families whose placeholder budget follows
+    clip duration, the number of placeholders too).
+    Undecoded values -- ``{"path", "bytes"}`` mappings and bare paths or URLs --
+    are refused, since decoding them needs an audio backend this package does
+    not depend on and casting the column solves it at the dataset layer.
+    """
+    if isinstance(clip, (str, os.PathLike)):
+        raise ValueError(
+            f"Unsloth MLX: audio file paths are not decoded during training. "
+            f"{_AUDIO_CAST_HINT}"
+        )
+    if hasattr(clip, "get_all_samples"):
+        # datasets 4.x: rate is fixed at construction, so read once and verify.
+        decoded = clip.get_all_samples()
+        samples = _audio_samples_to_mono(
+            getattr(decoded, "data", decoded), channel_first=True,
+        )
+        rate = getattr(decoded, "sample_rate", None)
+    elif isinstance(clip, dict):
+        if clip.get("array") is not None:
+            samples = _audio_samples_to_mono(clip["array"], channel_first=False)
+            rate = clip.get("sampling_rate")
+        elif "path" in clip or "bytes" in clip:
+            raise ValueError(
+                f"Unsloth MLX: this audio column is undecoded (it carries "
+                f"'path'/'bytes'). {_AUDIO_CAST_HINT}"
+            )
+        else:
+            raise ValueError(
+                f"Unsloth MLX: unrecognized audio value; expected decoded "
+                f"samples with a sampling rate. {_AUDIO_CAST_HINT}"
+            )
+    else:
+        raise ValueError(
+            f"Unsloth MLX: audio values must carry their sampling rate, so a "
+            f"bare {type(clip).__name__} cannot be used. {_AUDIO_CAST_HINT}"
+        )
+
+    if rate is None:
+        raise ValueError(
+            f"Unsloth MLX: this audio value has no sampling rate. "
+            f"{_AUDIO_CAST_HINT}"
+        )
+    if expected_rate is not None and int(rate) != expected_rate:
+        raise ValueError(
+            f"Unsloth MLX: audio is sampled at {int(rate)} Hz but this model's "
+            f"feature extractor expects {expected_rate} Hz, and resampling is "
+            f"not performed during training. {_AUDIO_CAST_HINT}"
+        )
+    return _AudioClip(np.asarray(samples, dtype=np.float32), int(rate))
+
+
+def _vlm_audio_part_state(messages):
+    bare_placeholders = False
+    payloads = []
+    if not isinstance(messages, list):
+        return bare_placeholders, payloads
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in _AUDIO_PART_TYPES:
+                continue
+            payload = None
+            for key in _AUDIO_PART_TYPES:
+                if part.get(key) is not None:
+                    payload = part[key]
+                    break
+            if payload is None:
+                bare_placeholders = True
+            else:
+                payloads.append(payload)
+    return bare_placeholders, payloads
+
+
+def _raw_row_has_audio(item):
+    """Best-effort audio detection on an unvalidated row.
+
+    Runs before a formatting function rewrites the row, so the family gate sees
+    the data the user actually supplied. Shapes it cannot parse are reported as
+    audio-free and left to the normal collation errors.
+    """
+    if isinstance(item, list):
+        # A bare message list is a supported row shape -- _collate_vlm_batch
+        # normalizes one -- so it has to be scanned here too, or a formatter
+        # that drops its clips leaves the gate nothing to refuse.
+        try:
+            return any(_vlm_audio_part_state(_normalize_vlm_messages(item)))
+        except Exception:
+            return False
+    if not isinstance(item, dict):
+        return False
+    if "role" in item and "content" in item:
+        # A single message is a supported row shape too -- `_normalize_mlx_
+        # messages` wraps one as `[item]`. Scanned here because the lookups
+        # below read a row, and `_select_vlm_messages_or_raw` hands such a row
+        # straight back, where the identity guard drops it unscanned.
+        try:
+            if any(_vlm_audio_part_state(_normalize_vlm_messages(item))):
+                return True
+        except Exception:
+            return False
+    for key in ("audio", "audios"):
+        value = item.get(key)
+        if value is not None and (not isinstance(value, list) or value):
+            return True
+    try:
+        for candidate in (item.get("prompt"), item.get("completion"),
+                          _select_vlm_messages_or_raw(item)):
+            if candidate is item or not isinstance(candidate, (list, dict)):
+                continue
+            messages = candidate if isinstance(candidate, list) else [candidate]
+            if any(_vlm_audio_part_state(_normalize_vlm_messages(messages))):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _format_vlm_row_gating_audio(row, formatting_func, processor):
+    """Format one row, gating audio a formatter would otherwise hide.
+
+    Callers that format here go on to collate with no formatter, so the
+    collation gate would have nothing left to refuse.
+    """
+    if formatting_func is None:
+        return row
+    if _raw_row_has_audio(row):
+        _check_audio_family_gate(processor)
+    return formatting_func(row)
+
+
+def _extract_vlm_audio(item, messages, processor):
+    """Collect this row's audio clips as mono waveforms at the model's rate.
+
+    Sources, in order: embedded message audio parts, then top-level ``audio`` /
+    ``audios`` columns. Rows carrying audio are gated to verified families
+    before any decoding work happens.
+    """
+    bare_placeholders, payloads = _vlm_audio_part_state(messages)
+    column = []
+    if isinstance(item, dict):
+        for key in ("audio", "audios"):
+            value = item.get(key)
+            if value is None:
+                continue
+            candidate = value if isinstance(value, list) else [value]
+            if candidate:
+                # An empty column must not shadow a populated alias.
+                column = candidate
+                break
+    if payloads and column:
+        raise ValueError(
+            "Unsloth MLX: this row carries audio both inside its messages and "
+            "in an 'audio'/'audios' column. Keep one source so clips pair with "
+            "their placeholders unambiguously."
+        )
+    if payloads and bare_placeholders:
+        raise ValueError(
+            "Unsloth MLX: this row mixes audio placeholders that carry a clip "
+            "with placeholders that do not. Give every audio placeholder its "
+            "own clip so features pair with the right positions."
+        )
+    clips = list(payloads) or column
+
+    if not clips:
+        if bare_placeholders:
+            raise ValueError(
+                "Unsloth MLX: this row has an audio placeholder but no audio "
+                "data. Provide the clip in the message part or an 'audio' column."
+            )
+        return []
+
+    _check_audio_family_gate(processor)
+    expected_rate = audio_extractor_sampling_rate(processor)
+    return [_normalize_audio_clip(clip, expected_rate) for clip in clips]
+
+
+# Payload keys only: masks and size vectors can survive a dropped payload.
+_AUDIO_FEATURE_PAYLOAD_KEYS = (
+    "input_features", "input_audio_embeds", "audio_features",
+)
+
+
+def _assert_audio_features_present(inputs, expected, processor):
+    """Fail when a row carried clips but the processor returned no audio tensors.
+
+    A processor that accepts ``audio=`` and silently discards it would otherwise
+    stage a placeholder run with nothing behind it, which trains the model on
+    text while the placeholders resolve to whatever the merge invents. Masks and
+    size vectors do not count: only the feature payload itself does, and it must
+    carry one entry per clip so features and placeholder runs stay paired.
+    """
+    if not expected or not isinstance(inputs, Mapping):
+        return
+    for key in _AUDIO_FEATURE_PAYLOAD_KEYS:
+        value = inputs.get(key)
+        if value is None:
+            continue
+        shape = getattr(value, "shape", None)
+        if shape is not None and all(int(dim) for dim in shape):
+            found = int(shape[0])
+        elif isinstance(value, (list, tuple)) and value:
+            found = len(value)
+        else:
+            continue
+        if found != expected:
+            raise ValueError(
+                f"Unsloth MLX: {type(processor).__name__} returned {found} "
+                f"audio feature entr(ies) for {expected} clip(s), so features "
+                f"and placeholder runs cannot be paired."
+            )
+        return
+    raise ValueError(
+        f"Unsloth MLX: {type(processor).__name__} returned no audio features "
+        f"for a batch whose text carries audio placeholders, so those "
+        f"placeholders have nothing behind them. The cause is upstream of this "
+        f"check -- for instance the checkpoint ships no audio feature extractor "
+        f"(look for an audio section in its preprocessor configuration), or a "
+        f"placeholder was rendered for a clip the processor never received. "
+        f"Otherwise train on the text and image parts of this dataset."
+    )
+
+
+def _image_bounds_per_row(inputs):
+    """Per-row image placeholder spans, when the processor states them.
+
+    MiniCPM-V and MiniCPM-o report ``image_bound`` as absolute columns into the
+    layout they padded, offsetting it by each row's leading pad count. The
+    values are coordinates like ``audio_bounds``, not labels that travel with a
+    row, so a repair that moves the tokens invalidates them the same way.
+    """
+    bounds = inputs.get("image_bound") if isinstance(inputs, Mapping) else None
+    if bounds is None:
+        return None
+    rows = []
+    for row in bounds:
+        spans = np.asarray(row).reshape(-1, 2) if np.size(row) else np.empty((0, 2))
+        rows.append([(int(start), int(end)) for start, end in spans])
+    return rows
+
+
+def _audio_bounds_per_row(inputs):
+    """Per-row ``(start, end)`` audio spans, when the processor states them.
+
+    Counting runs of a soft token only verifies alignment when that token means
+    "audio". MiniCPM-o repeats ``<unk>`` between its delimiters, which a real
+    unknown word in the transcript is indistinguishable from, so its runs carry
+    no alignment evidence at all. Processors in that shape report the spans
+    themselves, which is a better starting point than counting runs, though not
+    a trustworthy one: see ``_assert_audio_bounds_intact`` for how a reported
+    span can still be wrong.
+    """
+    bounds = inputs.get("audio_bounds") if isinstance(inputs, Mapping) else None
+    if bounds is None:
+        return None
+    rows = []
+    for row in bounds:
+        spans = np.asarray(row).reshape(-1, 2) if np.size(row) else np.empty((0, 2))
+        rows.append([(int(start), int(end)) for start, end in spans])
+    return rows
+
+
+def _audio_span_positions_np(inputs, shape):
+    """Positions covered by stated audio spans, or None when there are none.
+
+    These hold placeholder tokens, never text to predict, and they cannot be
+    found by token id: the marker is not always an audio-specific token --
+    MiniCPM-o repeats ``<unk>`` -- so an id-based rule either misses the run or
+    masks real unknown words along with it.
+    """
+    bounds = _audio_bounds_per_row(inputs)
+    if not bounds or len(shape) != 2:
+        return None
+    rows, width = int(shape[0]), int(shape[1])
+    positions = np.zeros((rows, width), dtype=bool)
+    # Every caller runs after the collation check, which has already refused
+    # spans that fall outside their row.
+    for row, spans in enumerate(bounds[:rows]):
+        for start, end in spans:
+            positions[row, int(start):int(end)] = True
+    return positions if positions.any() else None
+
+
+def _assert_audio_bounds_intact(rows, ids, attention_mask, audio_counts,
+                                max_seq_length, processor):
+    """Reject rows whose stated audio spans cannot be trusted.
+
+    Read off the processor's own spans: one span per clip, each covering at
+    least one position inside the row's real content so truncation cannot have
+    clipped it, and each naming a placeholder run rather than ordinary text --
+    one token repeated, the same token in every span of the batch.
+    """
+    ids_np = np.asarray(ids)
+    if ids_np.ndim == 1:
+        ids_np = ids_np.reshape(1, -1)
+    if ids_np.ndim != 2:
+        raise ValueError(
+            f"Unsloth MLX: cannot verify audio alignment against input_ids of "
+            f"shape {ids_np.shape}."
+        )
+    mask_np = None if attention_mask is None else np.asarray(attention_mask)
+    if mask_np is not None and mask_np.ndim == 1:
+        mask_np = mask_np.reshape(1, -1)
+    width = int(ids_np.shape[1])
+    if not (len(rows) == len(audio_counts) == int(ids_np.shape[0])):
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} reported audio spans for "
+            f"{len(rows)} row(s) against {len(audio_counts)} dataset row(s) and "
+            f"{ids_np.shape[0]} tokenized row(s), so audio clips cannot be "
+            f"paired with their rows."
+        )
+    total = 0
+    marker = None
+    for index, (spans, expected) in enumerate(zip(rows, audio_counts)):
+        attended = (
+            width if mask_np is None
+            else int(mask_np[index].astype(bool).sum())
+        )
+        # Audio-bearing rows only, as in the run path: a stated-span family
+        # reports bounds for every row, so an audio-free one would be capped too.
+        if expected and max_seq_length and attended > int(max_seq_length):
+            # Padding is not the row's own length, so this counts what the model
+            # attends -- the same quantity the run check caps.
+            raise ValueError(
+                f"Unsloth MLX: row {index} is {attended} tokens but "
+                f"max_seq_length={max_seq_length}; this processor did not apply "
+                f"the truncation it was given, and some divert it to their audio "
+                f"feature extractor instead."
+            )
+        if len(spans) != expected:
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries {expected} audio clip(s) but "
+                f"the processor reported {len(spans)} audio span(s). Every clip "
+                f"needs exactly one placeholder in the rendered text, none may "
+                f"be dropped by truncation, and no extra may be added."
+            )
+        for start, end in spans:
+            if end <= start:
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has an audio span ({start}, "
+                    f"{end}) that does not run forwards, so its clip has no "
+                    f"positions to occupy."
+                )
+            if start < 0 or end > width:
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has an audio span ({start}, "
+                    f"{end}) outside its {width} position(s), so the span names "
+                    f"tokens the row does not have."
+                )
+            # Attended positions, not their count: a left-padded row holds its
+            # content at the top of the range, so comparing against a total
+            # rejects spans that are perfectly placed.
+            if mask_np is not None and not mask_np[index][start:end].astype(bool).all():
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has an audio span ({start}, "
+                    f"{end}) covering padding, so its clip is not aligned with "
+                    f"the tokens the model attends."
+                )
+            # These processors report spans by pairing the n-th opening
+            # delimiter with the n-th closing one, so a delimiter that the
+            # rendered text carries of its own shifts every later pair onto
+            # ordinary tokens. The span still counts, fits and attends, and only
+            # the run it names gives it away: a placeholder run is one token
+            # repeated, and the same token in every span.
+            run = np.unique(ids_np[index][start:end])
+            if run.size != 1 or (marker is not None and run[0] != marker):
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has an audio span ({start}, "
+                    f"{end}) that does not name a placeholder run. The rendered "
+                    f"text most likely carries an audio delimiter of its own, "
+                    f"which shifts the positions the processor reports."
+                )
+            marker = run[0]
+        total += len(spans)
+    return total
+
+
+def _extractor_window_samples(processor):
+    extractor = getattr(processor, "audio_processor", None) or getattr(
+        processor, "feature_extractor", None
+    )
+    samples = getattr(extractor, "n_samples", None)
+    try:
+        return int(samples) if samples is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _audio_delimiter_strings(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if convert is None:
+        return ()
+    found = []
+    for attr in ("audio_start_id", "audio_end_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is None:
+            continue
+        try:
+            token = convert(int(token_id))
+        except Exception:
+            continue
+        if isinstance(token, str) and token:
+            found.append(token)
+    return tuple(found)
+
+
+def _assert_text_carries_no_audio_delimiters(texts, clips, processor):
+    """Reject audio rows whose text already contains the run's delimiters.
+
+    A processor that reports spans finds them by pairing the n-th opening
+    delimiter with the n-th closing one, within a row. A delimiter the text
+    brought itself is indistinguishable from a generated one, so it shifts the
+    pairing onto ordinary tokens, and truncation can drop the generated span and
+    leave the foreign one standing in for it. Nothing downstream can tell the
+    two apart -- the foreign span attends, sits inside the content, holds a
+    repeated marker, and can be any length, including exactly the right one --
+    so the text is refused before the processor ever expands it. The pairing is
+    per row, so a row carrying no clip has no pairing to disturb.
+    """
+    delimiters = _audio_delimiter_strings(processor)
+    if not delimiters:
+        return
+    for index, (text, row) in enumerate(zip(texts or (), clips or ())):
+        if not row or not isinstance(text, str):
+            continue
+        for delimiter in delimiters:
+            if delimiter in text:
+                raise ValueError(
+                    f"Unsloth MLX: row {index} already contains {delimiter}, "
+                    f"which {type(processor).__name__} generates around the "
+                    f"audio it inserts and locates its clips by. Remove it and "
+                    f"mark the audio the way the model's template does."
+                )
+
+
+def _assert_audio_clips_fit_the_extractor(clips, processor):
+    """Reject clips the audio feature extractor would truncate.
+
+    These processors size the placeholder run from the whole waveform while
+    their extractor keeps a fixed window, so a longer clip asks for positions
+    whose audio the model never receives: the merge stops at the shorter side
+    and the tail keeps ordinary text embeddings, which no count, range or run
+    check can see.
+
+    Sizing the run from the waveform also leaves the count one or two above the
+    embeddings on ordinary clips, because the two round their framing
+    differently. That is upstream's own arithmetic, it happens with the whole
+    clip present, and inference merges the same way, so it is not what this
+    rejects -- only a clip whose audio is actually cut.
+    """
+    window = _extractor_window_samples(processor)
+    if not window or not clips:
+        return
+    rate = audio_extractor_sampling_rate(processor)
+    for index, row in enumerate(clips):
+        for clip in row or ():
+            length = int(np.asarray(clip).shape[0])
+            if length <= window:
+                continue
+            seconds = f", {window / rate:.0f}s" if rate else ""
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries a {length}-sample audio clip "
+                f"but {type(processor).__name__} keeps only the first {window} "
+                f"samples of one clip ({window}{seconds}), so the row asks for "
+                f"more audio positions than the model can fill. Split the clip."
+            )
+
+
+def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
+                              truncated=True, clips=None):
+    """Reject rows whose audio placeholder runs did not survive tokenization.
+
+    The processor expands each clip into a run of soft tokens whose length the
+    model matches against its encoder output, so a run that vanished misaligns
+    audio features against text positions. Two conditions are enforced per row:
+    one surviving placeholder run per clip, and a length within
+    ``max_seq_length`` (some processors divert the truncation arguments to their
+    audio feature extractor and leave the text over the cap).
+
+    A run that was *shortened* rather than dropped needs the family's
+    post-subsampling token budget. Families that state a fixed count per clip
+    before the model runs have each of their runs checked against it here.
+
+    Processors that state their spans take a different route, since their run
+    carries no identifying token. Those rows are held to the conditions in
+    ``_assert_audio_bounds_intact`` instead of the two above, and additionally
+    to one the run path has no equivalent of: a clip may not be longer than the
+    window its feature extractor keeps.
+    """
+    ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
+    if ids is None:
+        if not any(audio_counts):
+            return
+        raise ValueError(
+            "Unsloth MLX: the processor returned no input_ids for a batch "
+            "containing audio, so audio/text alignment cannot be verified."
+        )
+    bounds = _audio_bounds_per_row(inputs)
+    if bounds is not None:
+        # Stated spans beat inferred ones, so they are checked instead of the
+        # runs rather than alongside them.
+        total_runs = _assert_audio_bounds_intact(
+            bounds, ids, inputs.get("attention_mask"), audio_counts,
+            max_seq_length if truncated else None, processor,
+        )
+        _assert_audio_features_present(inputs, total_runs, processor)
+        _assert_audio_clips_fit_the_extractor(clips, processor)
+        return
+    soft_ids = _get_vlm_audio_soft_token_ids(processor)
+    if not soft_ids:
+        if not any(audio_counts):
+            return
+        raise ValueError(
+            f"Unsloth MLX: could not resolve the audio placeholder token for "
+            f"{type(processor).__name__}, so audio/text alignment cannot be "
+            f"verified. This model family is not usable for audio training."
+        )
+    total_runs = _assert_audio_runs_intact_ids(
+        ids, inputs.get("attention_mask"), audio_counts, soft_ids,
+        max_seq_length if truncated else None,
+        budget=_audio_fixed_budget(processor),
+    )
+    # Placeholders with nothing behind them misalign the sequence however they
+    # got there -- e.g. a formatter that kept the text but dropped the clip.
+    _assert_audio_features_present(inputs, total_runs, processor)
+
+
+def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
+                                  max_seq_length, budget=None):
+    """Run-integrity check over materialized ids (see the caller's contract).
+
+    Returns the total number of surviving placeholder runs in the batch.
+    """
+    if not soft_ids:
+        return 0
+    total_runs = 0
+    rows = np.asarray(ids)
+    attention_mask = (
+        np.asarray(attention_mask) if attention_mask is not None else None
+    )
+    if rows.ndim == 1:
+        # Some processors emit a single unbatched row; verify it as one.
+        rows = rows[None, :]
+    if attention_mask is not None and attention_mask.ndim == 1:
+        attention_mask = attention_mask[None, :]
+    if rows.ndim != 2:
+        raise ValueError(
+            f"Unsloth MLX: cannot verify audio alignment against input_ids of "
+            f"shape {rows.shape}."
+        )
+    if rows.shape[0] != len(audio_counts):
+        raise ValueError(
+            f"Unsloth MLX: the processor returned {rows.shape[0]} row(s) for "
+            f"{len(audio_counts)} dataset row(s), so audio clips cannot be "
+            f"matched to their rows."
+        )
+    soft_array = np.array(sorted(soft_ids), dtype=rows.dtype)
+    attention = attention_mask
+    for index, expected_clips in enumerate(audio_counts):
+        if index >= rows.shape[0]:
+            continue
+        row = rows[index]
+        valid = (
+            attention[index] > 0 if attention is not None
+            else np.ones(row.shape, dtype=bool)
+        )
+        is_soft = np.isin(row, soft_array) & valid
+        begins = is_soft & ~np.concatenate(([False], is_soft[:-1]))
+        starts = int(begins.sum())
+        total_runs += starts
+        if expected_clips and budget:
+            # Fixed-budget families merge exactly `budget` per clip, so every
+            # run must be that long. Checking the total instead lets a short
+            # run hide behind a long one and pairs a clip with the wrong
+            # positions.
+            ends = is_soft & ~np.concatenate((is_soft[1:], [False]))
+            lengths = (np.flatnonzero(ends) - np.flatnonzero(begins) + 1).tolist()
+            if any(int(length) != budget for length in lengths):
+                raise ValueError(
+                    f"Unsloth MLX: row {index} has audio placeholder run(s) of "
+                    f"length {[int(length) for length in lengths]} but this "
+                    f"model merges {budget} per clip, so its audio cannot be "
+                    f"aligned. Check whether the row was truncated, or whether "
+                    f"its rendered text carries placeholder tokens of its own."
+                )
+        if expected_clips and starts != expected_clips:
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries {expected_clips} audio "
+                f"clip(s) but {starts} placeholder run(s) survived "
+                f"tokenization. Every clip needs its own placeholder in the "
+                f"rendered text, and none may be dropped by truncation."
+            )
+        # Only rows that carry audio, as the two checks above are: the cap is
+        # here so a placeholder run is not cut unnoticed, and an audio-free row
+        # has none to cut. An omni checkpoint resolves soft ids whether or not
+        # the run uses audio, so without this a plain text or image batch wider
+        # than the cap is refused -- which the shape planner states is normal.
+        if max_seq_length is None or not expected_clips:
+            continue
+        if int(valid.sum()) > int(max_seq_length):
+            # Some processors divert the truncation kwargs to their audio
+            # extractor, leaving the text over the cap.
+            raise ValueError(
+                f"Unsloth MLX: row {index} is {int(valid.sum())} tokens but "
+                f"max_seq_length={max_seq_length}; this processor did not apply "
+                f"truncation, so an audio placeholder run could be cut later "
+                f"without being detected. Use a shorter clip or raise "
+                f"max_seq_length."
+            )
+    return total_runs
+
+
+def _vlm_processor_prefers_nested_audio(processor):
+    cls = processor.__class__
+    marker = f"{getattr(cls, '__module__', '')}.{getattr(cls, '__name__', '')}".lower()
+    # A flat list leaves these processors to guess which row owns which clip:
+    # they count audio markers in the rendered text, which a chat template need
+    # not emit, and hand every clip to row 0 when the count comes up short.
+    return any(name in marker for name in ("minicpmo",))
+
+
+def _call_pairing_audio_on_refusal(invoke, kwargs, audio_kwarg, to_pairs):
+    """Call a processor, retrying once as ``(samples, rate)`` pairs.
+
+    Some processors take their audio as pairs and refuse a bare waveform by
+    failing to unpack it. The shape is not discoverable in advance, so it is
+    corrected from the refusal. A processor that refuses the corrected payload
+    too reports its own first refusal rather than the second one; a failure
+    while building the pairs is raised as itself, since it says nothing about
+    what the processor wanted.
+    """
+    try:
+        return invoke(kwargs)
+    except ValueError as error:
+        clips = kwargs.get(audio_kwarg)
+        if not clips or "unpack" not in str(error):
+            raise
+        retried = dict(kwargs)
+        retried[audio_kwarg] = to_pairs(clips)
+        try:
+            return invoke(retried)
+        except Exception:
+            raise error from None
+
+
+def _mlx_vlm_audio_rate(processor):
+    """The rate mlx-vlm assumes this processor's audio is at.
+
+    It resamples a decoded file to ``feature_extractor.sampling_rate`` and
+    falls back to 16 kHz; an array it forwards untouched, so this is the rate
+    the samples are expected to be at rather than one it enforced. Reading the
+    rate from anywhere else risks labelling them with a rate the rest of
+    mlx-vlm never assumed. An extractor that states ``None`` takes the same
+    fallback, since a pair has to carry a number.
+    """
+    extractor = getattr(processor, "feature_extractor", None)
+    return getattr(extractor, "sampling_rate", None) or 16000
+
+
+def _audio_payload_as_pairs(clips, processor):
+    """The ``(samples, rate)`` form processors that reject bare waveforms want.
+
+    A clip carries the rate it was decoded at; the processor's own extractor
+    rate stands in for anything that does not.
+
+    The nested payload a processor like MiniCPM-o is handed keeps its shape: a
+    row is a list of clips, not a clip, so pairing it whole would fuse a row
+    into one 2-D "clip" carrying no rate -- or raise out of numpy when the
+    row's clips differ in length, which reports a payload the processor never
+    saw. Rows are paired clip by clip instead.
+    """
+    default_rate = audio_extractor_sampling_rate(processor)
+
+    def _pair(clip):
+        return (np.asarray(clip),
+                getattr(clip, "sampling_rate", None) or default_rate)
+
+    return [[_pair(clip) for clip in row] if isinstance(row, (list, tuple))
+            else _pair(row)
+            for row in clips]
+
+
+def _format_vlm_audio_for_processor(all_audio, processor=None):
+    """Group per-row clips the way this processor assigns them to rows."""
+    if not all_audio or not any(all_audio):
+        return None
+    if processor is not None and _vlm_processor_prefers_nested_audio(processor):
+        return [list(clips) if clips else [] for clips in all_audio]
+    flattened = []
+    for clips in all_audio:
+        if clips:
+            flattened.extend(clips)
+    return flattened or None
+
+
+def _vlm_processor_audio_kwarg(processor):
+    try:
+        parameters = inspect.signature(processor.__call__).parameters
+    except (TypeError, ValueError):
+        return "audio"
+    if "audio" in parameters:
+        return "audio"
+    if "audios" in parameters:
+        return "audios"
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return "audio"
+    raise ValueError(
+        f"Unsloth MLX: {type(processor).__name__} does not accept audio inputs, "
+        f"but this dataset carries audio."
+    )
+
+
 def _flatten_vlm_images(all_images):
     flattened = []
     for images in all_images:
@@ -5488,9 +6909,20 @@ def _format_vlm_images_for_processor(all_images, processor=None, image_layout=No
 # model forward kwargs so the backbone never sees it.
 
 
+# One array per row, and rows hold different clip and image counts. Stacking
+# them raises, and the generic fallback below then keeps only the first row --
+# which the model indexes per row, so every later row reads row 0's coordinates
+# instead of its own. Converted row by row instead, so the ragged shape survives
+# and the batch still describes itself to the planner.
+_VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
+
+
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
+        if key in _VLM_PER_ROW_MEDIA_KEYS and isinstance(value, (list, tuple)):
+            batch[key] = [mx.array(np.asarray(row)) for row in value]
+            continue
         if isinstance(value, mx.array):
             batch[key] = value
         elif hasattr(value, "shape"):
@@ -5502,7 +6934,19 @@ def _to_mx_vlm_batch(inputs):
                     for x in value
                 ])
             except Exception:
-                batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
+                if key in _AUDIO_FEATURE_PAYLOAD_KEYS and len(value) > 1:
+                    # Clips of unequal duration do not stack, and dropping to
+                    # value[0] would leave one clip behind ids, placeholder runs
+                    # and labels for all of them -- the pairing
+                    # `_assert_audio_features_present` just verified. Kept entry
+                    # by entry so the count survives; ragged audio never reaches
+                    # the compiled path, so there is no signature to hold.
+                    batch[key] = [
+                        x if isinstance(x, mx.array) else mx.array(np.asarray(x))
+                        for x in value
+                    ]
+                else:
+                    batch[key] = mx.array(value[0]) if not isinstance(value[0], mx.array) else value[0]
         else:
             batch[key] = value
 
@@ -5653,7 +7097,8 @@ def _vlm_processor_requests_mm_token_type_ids(processor):
 
 
 def _mlx_vlm_process_inputs_adapter(original):
-    """Apply the exact PyTorch-only retry to mlx-vlm's processor boundary."""
+    """Negotiate mlx-vlm's processor boundary: the Transformers PyTorch-only
+    output contract, and processors that take audio as (samples, rate) pairs."""
 
     if getattr(original, "_unsloth_pytorch_processor_output", False):
         return original
@@ -5679,10 +7124,40 @@ def _mlx_vlm_process_inputs_adapter(original):
             return_tensors=return_tensors,
             **kwargs,
         )
-        return _call_vlm_processor(original, (processor, prompts), call_kwargs)
+        # mlx-vlm sends bare waveforms and refuses tuples, so a processor
+        # wanting pairs cannot be reached from the caller at all. The rate it
+        # assumes is read only when reshaping, since reaching for it on every
+        # request would touch attributes a non-audio processor need not have.
+        def _as_pairs(clips):
+            rate = _mlx_vlm_audio_rate(processor)
+            return [(np.asarray(clip), rate) for clip in clips]
+
+        return _call_pairing_audio_on_refusal(
+            lambda kw: _call_vlm_processor(original, (processor, prompts), kw),
+            call_kwargs, "audio", _as_pairs,
+        )
 
     patched._unsloth_pytorch_processor_output = True
     return patched
+
+
+def _drop_unsupported_processor_kwargs(processor, kwargs):
+    """Remove keyword arguments this processor's ``__call__`` does not take.
+
+    Processors disagree on which collation keywords they accept, and discovering
+    that by exception does not compose: a processor rejecting two of them raises
+    again inside the first retry. Filtering up front handles any number of them,
+    and a processor whose signature absorbs ``**kwargs`` keeps everything (the
+    per-keyword retries below still cover a signature that promises more than it
+    honours).
+    """
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _processor_vlm_inputs(
@@ -5693,6 +7168,7 @@ def _processor_vlm_inputs(
     suffixes=None,
     truncation=True,
     padding_side=None,
+    all_audio=None,
 ):
     base_kwargs = dict(
         text=texts,
@@ -5700,6 +7176,15 @@ def _processor_vlm_inputs(
         return_tensors="np",
         add_special_tokens=False,
     )
+    base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    audio_kwarg = None
+    if audio is not None:
+        audio_kwarg = _vlm_processor_audio_kwarg(processor)
+        base_kwargs[audio_kwarg] = audio
+        # Everything below this line collates through the corrected copy; the
+        # caller's processor stays as mlx-vlm made it.
+        processor = _audio_repaired_processor(processor)
     if truncation:
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
@@ -5720,52 +7205,72 @@ def _processor_vlm_inputs(
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
-    first_error = None
-    for image_layout in image_layouts:
-        proc_kwargs = dict(base_kwargs)
-        if image_layout is not None:
-            proc_kwargs["images"] = _format_vlm_images_for_processor(
-                all_images,
-                processor=processor,
-                image_layout=image_layout,
-            )
-        try:
-            return _call_vlm_processor(processor, (), proc_kwargs)
-        except TypeError as exc:
-            if (
-                "add_special_tokens" in str(exc)
-                and "multiple values" in str(exc)
-                and "add_special_tokens" in proc_kwargs
-            ):
-                proc_kwargs.pop("add_special_tokens", None)
-                try:
-                    return _call_vlm_processor(processor, (), proc_kwargs)
-                except Exception as retry_exc:
-                    if first_error is None:
-                        first_error = retry_exc
-                    if len(image_layouts) == 1:
-                        raise
-                    continue
-            if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
-                proc_kwargs.pop("padding_side", None)
-                try:
-                    return _call_vlm_processor(processor, (), proc_kwargs)
-                except Exception as retry_exc:
-                    if first_error is None:
-                        first_error = retry_exc
-                    if len(image_layouts) == 1:
-                        raise
-                    continue
-            if first_error is None:
-                first_error = exc
-            if len(image_layouts) == 1:
-                raise
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
-            if len(image_layouts) == 1:
-                raise
-    raise first_error
+    def _run_layouts():
+        first_error = None
+        for image_layout in image_layouts:
+            proc_kwargs = dict(base_kwargs)
+            if image_layout is not None:
+                proc_kwargs["images"] = _format_vlm_images_for_processor(
+                    all_images,
+                    processor=processor,
+                    image_layout=image_layout,
+                )
+            try:
+                return _call_vlm_processor(processor, (), proc_kwargs)
+            except TypeError as exc:
+                if (
+                    "add_special_tokens" in str(exc)
+                    # Bound twice, or not accepted: both mean drop and retry.
+                    and ("multiple values" in str(exc)
+                         or "unexpected keyword argument" in str(exc))
+                    and "add_special_tokens" in proc_kwargs
+                ):
+                    proc_kwargs.pop("add_special_tokens", None)
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
+                if "padding_side" in str(exc) and "padding_side" in proc_kwargs:
+                    proc_kwargs.pop("padding_side", None)
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
+                if first_error is None:
+                    first_error = exc
+                if len(image_layouts) == 1:
+                    raise
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                if len(image_layouts) == 1:
+                    raise
+        raise first_error
+
+    if audio_kwarg is None:
+        return _run_layouts()
+
+    def _run_audio_layouts():
+        return _repair_audio_batch(
+            _run_layouts(), base_kwargs[audio_kwarg], processor,
+        )
+
+    def _invoke(kwargs):
+        base_kwargs[audio_kwarg] = kwargs[audio_kwarg]
+        return _run_audio_layouts()
+
+    return _call_pairing_audio_on_refusal(
+        _invoke, {audio_kwarg: audio}, audio_kwarg,
+        lambda clips: _audio_payload_as_pairs(clips, processor),
+    )
 
 
 def _as_numpy_vlm_field(inputs, key):
@@ -5824,7 +7329,8 @@ def _right_pad_vlm_rows(inputs, processor):
         return inputs
     mask = _as_numpy_vlm_field(inputs, "attention_mask")
     # Content-then-padding, so an interior pad counts as much as a leading one.
-    if not mask.size or bool(np.all(mask[:, :-1] >= mask[:, 1:])):
+    moved = np.any(mask[:, :-1] < mask[:, 1:], axis=1)
+    if not moved.any():
         return inputs
     generated = [
         key for key in _VLM_WIDTH_GENERATED_KEYS if inputs.get(key) is not None
@@ -5835,6 +7341,41 @@ def _right_pad_vlm_rows(inputs, processor):
             f"Unsloth MLX: {type(processor).__name__} left-padded this batch "
             f"and supplied its own {', '.join(generated)}, which cannot be "
             f"re-derived for the repaired row order."
+        )
+    bounds = _audio_bounds_per_row(inputs) or ()
+    # Only the rows the repair actually moves lose their coordinates, so a row
+    # that is already content-first keeps valid spans however its neighbours are
+    # padded. Rows with no spans have nothing to invalidate.
+    stale = [
+        index for index, spans in enumerate(bounds)
+        if spans and index < moved.shape[0] and bool(moved[index])
+    ]
+    if stale:
+        # Stated spans are coordinates into the layout the repair replaces, and
+        # nothing re-derives them: they would keep naming pre-repair positions
+        # and put each clip's audio on whatever tokens moved there. Both ends of
+        # a stale span can still be attended, so no later check would catch it.
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} did not put row(s) "
+            f"{stale} content-first despite being asked for right-padded rows, "
+            f"and reports their audio positions as spans, which name the layout "
+            f"the repair replaces."
+        )
+    # Same argument for image spans. `image_bound` is neither width-generated
+    # nor token-aligned -- an (images, 2) grid is not the ids shape -- so the
+    # sidecar relocation leaves it naming pre-repair columns, and the model
+    # would scatter each image's features onto whatever tokens moved there.
+    # Silent: the stale columns stay attended, so nothing downstream objects.
+    image_stale = [
+        index for index, spans in enumerate(_image_bounds_per_row(inputs) or ())
+        if spans and index < moved.shape[0] and bool(moved[index])
+    ]
+    if image_stale:
+        raise ValueError(
+            f"Unsloth MLX: {type(processor).__name__} did not put row(s) "
+            f"{image_stale} content-first despite being asked for right-padded "
+            f"rows, and reports their image positions as spans, which name the "
+            f"layout the repair replaces."
         )
     ids = _as_numpy_vlm_field(inputs, "input_ids")
     extras = _vlm_token_aligned_sidecars(inputs, ids.shape)
@@ -5957,6 +7498,7 @@ def _collate_vlm_prompt_completion_batch(
     prompt_texts = []
     completion_texts = []
     all_images = []
+    all_audio = []
 
     for item in items:
         prompt_raw = item.get("prompt", "")
@@ -5998,6 +7540,16 @@ def _collate_vlm_prompt_completion_batch(
         prompt_texts.append(prompt_text)
         completion_texts.append(completion_text)
         all_images.append(images)
+        # Audio conditions the response, so it belongs to the prompt half;
+        # scanning the completion keeps a misplaced clip from passing the gate.
+        if any(_vlm_audio_part_state(completion_messages or [])):
+            raise ValueError(
+                "Unsloth MLX: audio in the completion half is not supported; "
+                "put the audio in the prompt so it conditions the response."
+            )
+        all_audio.append(
+            _extract_vlm_audio(item, prompt_messages or [], processor)
+        )
 
     prompt_inputs = _processor_vlm_inputs(
         processor,
@@ -6006,6 +7558,31 @@ def _collate_vlm_prompt_completion_batch(
         max_seq_length,
         truncation=False,
         padding_side="left",
+        all_audio=all_audio,
+    )
+    # Untruncated halves: only run presence is checkable until the combine.
+    audio_counts = [len(clips) for clips in all_audio]
+    if any(audio_counts) and _audio_bounds_per_row(prompt_inputs) is not None:
+        # A stated span is an absolute coordinate into the half it was measured
+        # on. The combine concatenates the halves and then flushes and truncates
+        # the joined rows, either of which can carry the prompt's tokens away
+        # from the positions its spans name and put the clip's audio on whatever
+        # lands there. Refused for the whole format rather than relocated, and
+        # for every row rather than the ones that would move: nothing here has
+        # verified a relocation, and this is not the format the family was
+        # qualified on.
+        raise NotImplementedError(
+            f"Unsloth MLX: {type(processor).__name__} reports audio positions as "
+            f"spans, which prompt/completion collation can move the tokens out "
+            f"from under. Use a single `text`/messages column for audio rows "
+            f"with this model."
+        )
+    _assert_audio_runs_intact(
+        prompt_inputs, audio_counts, processor, None, truncated=False,
+    )
+    audio_budget = _audio_fixed_budget(processor)
+    audio_soft_ids = (
+        _get_vlm_audio_soft_token_ids(processor) if any(audio_counts) else None
     )
     completion_inputs = _processor_vlm_inputs(
         processor,
@@ -6033,12 +7610,15 @@ def _collate_vlm_prompt_completion_batch(
             ignore_token_ids=ignore_token_ids,
             pc_opaque=(prompt_inputs, completion_inputs, flush_side, pad_id,
                        max_seq_length, completion_only_loss),
+            pc_audio=(audio_counts, audio_soft_ids, audio_budget),
         )
     return _combine_vlm_prompt_completion_inputs(
         prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
         reject_mlx_valued=reject_mlx_valued,
+        audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
+        audio_budget=audio_budget,
     )
 
 
@@ -6051,6 +7631,9 @@ def _combine_vlm_prompt_completion_inputs(
     ignore_token_ids=None,
     completion_only_loss=None,
     reject_mlx_valued=False,
+    audio_counts=None,
+    audio_soft_ids=None,
+    audio_budget=None,
 ):
     """Concatenate prompt/completion processor outputs into one staged batch.
 
@@ -6087,6 +7670,14 @@ def _combine_vlm_prompt_completion_inputs(
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, "right", pad_id, extras,
     )
+    if audio_counts and any(audio_counts):
+        # Flush + truncate is where a prompt-side run can actually be cut.
+        # With the family's fixed budget, since a run cut short still leaves one
+        # run per clip and only its length gives it away.
+        _assert_audio_runs_intact_ids(
+            input_ids, attention_mask, audio_counts, audio_soft_ids,
+            max_seq_length, budget=audio_budget,
+        )
 
     combined_inputs = dict(prompt_inputs)
     combined_inputs["input_ids"] = input_ids
@@ -6141,13 +7732,20 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     if reject_mlx_valued and any(_contains_mlx_values(item) for item in items):
         # Reject before formatting or the processor touches them off-thread.
         _reject_mlx_valued_vlm("the dataset row")
+    if formatting_func is not None:
+        # Gate the rows as supplied: a formatter must not hide audio.
+        for item in items:
+            if _raw_row_has_audio(item):
+                _check_audio_family_gate(processor)
+                break
     formatted_items = []
     for item in items:
         if formatting_func is not None:
-            item = formatting_func(item)
-            if reject_mlx_valued and _contains_mlx_values(item):
+            formatted = formatting_func(item)
+            if reject_mlx_valued and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_vlm("the formatting function")
+            item = formatted
         formatted_items.append(item)
 
     if (
@@ -6166,13 +7764,18 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
 
     all_texts = []
     all_images = []
+    all_audio = []
     all_suffixes = []
 
     for item in formatted_items:
         raw = _select_vlm_messages_or_raw(item)
         if raw is item:
             text = render_mlx_chat_example(processor, item, is_vlm=True)
-            messages = []
+            # A bare message list still carries media parts.
+            messages = (
+                _normalize_vlm_messages(item if isinstance(item, list) else [item])
+                if isinstance(item, (list, dict)) else []
+            )
         else:
             messages = _normalize_vlm_messages(raw)
             text = _render_vlm_messages(processor, messages)
@@ -6182,18 +7785,26 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                 "Provide messages/conversations, a text field, or a formatting_func."
             )
         images = _extract_vlm_images(item, messages, image_size)
+        audio = _extract_vlm_audio(item, messages, processor)
         all_texts.append(text)
         all_images.append(images)
+        all_audio.append(audio)
         all_suffixes.append(item.get("suffix") if isinstance(item, dict) else None)
 
+    if any(all_audio):
+        _assert_text_carries_no_audio_delimiters(all_texts, all_audio, processor)
     inputs = _right_pad_vlm_rows(
         _processor_vlm_inputs(
             processor, all_texts, all_images, max_seq_length,
             suffixes=all_suffixes,
             padding_side="right",
+            all_audio=all_audio,
         ),
         processor,
     )
+    audio_counts = [len(clips) for clips in all_audio]
+    _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
+                              clips=all_audio)
     if _vlm_inputs_host_valued(inputs) and _vlm_ids_integer_host(inputs):
         label_mask = _stage_vlm_label_mask_np(
             inputs, ignore_token_ids=ignore_token_ids,
@@ -6401,9 +8012,9 @@ def _filter_trainable_vlm_indices(
     # read after them and carry the same reuse-buffer exposure as the planner.
     media_pins = []
     for idx in indices:
-        item = dataset[idx]
-        if formatting_func is not None:
-            item = formatting_func(item)
+        item = _format_vlm_row_gating_audio(
+            dataset[idx], formatting_func, processor,
+        )
         batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
             [item],
             processor,
@@ -6740,6 +8351,252 @@ def _vlm_family_encode_key(key):
     if key_type is tuple:
         return ("seq",) + tuple(_vlm_family_encode_key(item) for item in key)
     return ("unstable_key", _vlm_family_type_tag(key_type))
+
+
+
+def _audio_fixed_budget(processor, config=None):
+    """Placeholders a family emits per clip, when that count is fixed.
+
+    Gemma 3n always merges the same number of positions per clip, padding short
+    clips with learned padding embeddings, so the count is known before the
+    model runs and a row's placeholders can be checked against it.
+
+    A processor that converts clip duration into a token count has no such
+    constant: its ``audio_soft_tokens_per_image`` is an upper bound rather than
+    the per-clip budget (Gemma 4 reports 750 while emitting 25 placeholders for
+    a one-second clip), so the presence of a per-token duration is what rules
+    the check out. Those families are verified against the encoder's own output
+    instead.
+    """
+    if getattr(processor, "audio_ms_per_token", None):
+        return None
+    for source in (config, getattr(processor, "config", None)):
+        value = _config_get(source, "audio_soft_tokens_per_image", None)
+        if value:
+            return int(value)
+    length = getattr(processor, "audio_seq_length", None)
+    if length:
+        return int(length)
+    return None
+
+
+_AUDIO_TOWER_ATTRS = (
+    "audio_tower", "embed_audio", "audio_encoder", "audio_projection",
+    "audio_projection_layer",
+)
+
+
+_AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
+_AUDIO_MERGE_HOLDERS = "_unsloth_audio_merge_holders"
+_AUDIO_MERGE_ORIGINAL = "_unsloth_audio_merge_original"
+# The hold count is read, decided on and written back, which the GIL does not
+# make atomic, so two trainers starting close together could both install a
+# wrapper and the first to finish would restore the original mid-training.
+# Module-level: it is taken twice per run, so contention is irrelevant.
+_AUDIO_MERGE_LOCK = threading.Lock()
+
+# Families whose merge walks a flattened feature block with a running
+# placeholder count, so a padded row's tail is consumed by the next row. Gemma 3n
+# (fixed budget, merges its own padding) and Phi-4 (row by row) must not get it.
+_AUDIO_MERGE_PATCH_FAMILIES = frozenset({"gemma4"})
+
+
+def audio_merge_patch_needed(config):
+    """Whether this model family's audio merge must be corrected for training.
+
+    Matched case-insensitively because mlx-vlm lowercases ``model_type`` before
+    selecting the module: a checkpoint spelling it differently loads the same
+    family and passes the audio gate, so an exact match here would skip the
+    correction for a model that needs it.
+    """
+    model_type = _config_get(config, "model_type")
+    return str(model_type).lower() in _AUDIO_MERGE_PATCH_FAMILIES
+
+
+def _compact_audio_features(embeddings, padding_mask, placeholders_per_row):
+    """Concatenate every clip's valid audio embeddings, in clip order.
+
+    The upstream merge flattens the whole padded feature block and walks it with
+    a running count of placeholder positions, so a short clip's padding is
+    consumed by the placeholders that follow it. Feeding that walk only the
+    valid embeddings, in the order the clips appear, makes the count line up
+    again -- collation emits clips row by row, so clip order is row order.
+
+    The encoder yields one entry per clip while placeholders are counted per
+    text row, and a row may hold several clips or none. Clips are therefore
+    assigned to rows in order and each row must be satisfied exactly: a batch
+    whose totals happen to agree while individual rows do not is still
+    mispaired, and is rejected here rather than trained on.
+
+    ``padding_mask`` marks padded frames (the encoder's own polarity), so valid
+    positions are its complement.
+    """
+    selected = []
+    counts = []
+    for index in range(embeddings.shape[0]):
+        keep = ~np.asarray(padding_mask[index]).astype(bool)
+        counts.append(int(keep.sum()))
+        if counts[-1]:
+            selected.append(embeddings[index][mx.array(np.nonzero(keep)[0])])
+
+    clip = 0
+    for row, wanted in enumerate(int(n) for n in placeholders_per_row):
+        filled = 0
+        while filled < wanted and clip < len(counts):
+            filled += counts[clip]
+            clip += 1
+        if filled != wanted:
+            raise ValueError(
+                f"Unsloth MLX: row {row} has {wanted} audio placeholder(s) but "
+                f"its clips produced {filled} valid audio position(s). Audio "
+                f"and text cannot be paired for this row."
+            )
+    if clip != len(counts):
+        raise ValueError(
+            f"Unsloth MLX: this batch carries {len(counts)} audio clip(s) but "
+            f"only {clip} could be matched to placeholder runs."
+        )
+    if not selected:
+        return embeddings[:0].reshape(0, embeddings.shape[-1])
+    return mx.concatenate(selected, axis=0)
+
+
+def install_audio_merge_patch(model, audio_token_id):
+    """Correct a model's audio merge for the duration of training.
+
+    Bound on the instance rather than the class, so a patch cannot leak into
+    inference on other models of the same type. Installs are counted: two
+    trainers sharing one model both hold a reference, and the correction stays
+    until the last of them releases it. Returns True when a hold was taken, so
+    every caller that gets True must release exactly once.
+    """
+    # Capture, install and record are one transition, so all of it is under the
+    # lock: split, an installer arriving mid-restore captures the outgoing
+    # wrapper as its "original" and the remover overwrites the new one.
+    with _AUDIO_MERGE_LOCK:
+        holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+        if holders:
+            # Another run holds it: take a hold so it outlives whoever
+            # finishes first.
+            setattr(model, _AUDIO_MERGE_HOLDERS, holders + 1)
+            return True
+        original = model.get_input_embeddings
+        had_instance_attr = "get_input_embeddings" in vars(model)
+        audio_keys = ("input_features", "input_features_mask",
+                      "audio_features", "audio_mask")
+
+        def patched(input_ids=None, pixel_values=None, **kwargs):
+            features = kwargs.get("input_features", kwargs.get("audio_features"))
+            valid = kwargs.get("input_features_mask")
+            if features is None or valid is None:
+                return original(input_ids=input_ids, pixel_values=pixel_values, **kwargs)
+            # Model builds text and vision embeddings; audio is merged here.
+            rest = {k: v for k, v in kwargs.items() if k not in audio_keys}
+            result = original(input_ids=input_ids, pixel_values=pixel_values, **rest)
+            embeds = getattr(result, "inputs_embeds", result)
+            encoded, padding = model.audio_tower(features, ~valid)
+            audio_embeds = model.embed_audio(encoded)
+            placeholders = np.asarray(input_ids == audio_token_id).sum(axis=1)
+            source = _compact_audio_features(audio_embeds, padding, placeholders)
+            # Without this cast the merge widens the whole LM input to float32.
+            source = source.astype(embeds.dtype)
+            mask = mx.broadcast_to(
+                mx.expand_dims(input_ids == audio_token_id, -1), embeds.shape,
+            )
+            merged = _masked_scatter_rowwise(embeds, mask, source)
+            if hasattr(result, "inputs_embeds"):
+                result.inputs_embeds = merged
+                return result
+            return merged
+
+        model.get_input_embeddings = patched
+        setattr(model, _AUDIO_MERGE_SENTINEL, True)
+        setattr(model, _AUDIO_MERGE_HOLDERS, 1)
+        # Put back exactly what was there: deleting would discard someone else's
+        # instance-level wrapper.
+        setattr(model, _AUDIO_MERGE_ORIGINAL, original if had_instance_attr else None)
+        return True
+
+
+def remove_audio_merge_patch(model):
+    """Release one hold on the corrected merge, restoring it at the last."""
+    with _AUDIO_MERGE_LOCK:
+        holders = getattr(model, _AUDIO_MERGE_HOLDERS, 0)
+        if holders <= 0:
+            return False
+        if holders > 1:
+            setattr(model, _AUDIO_MERGE_HOLDERS, holders - 1)
+            return False
+        # Last holder: restore inside the lock with the count drop, for the
+        # reason install gives.
+        previous = getattr(model, _AUDIO_MERGE_ORIGINAL, None)
+        if previous is not None:
+            model.get_input_embeddings = previous
+        else:
+            try:
+                del model.get_input_embeddings
+            except AttributeError:
+                pass
+        setattr(model, _AUDIO_MERGE_SENTINEL, False)
+        setattr(model, _AUDIO_MERGE_ORIGINAL, None)
+        setattr(model, _AUDIO_MERGE_HOLDERS, 0)
+        return True
+
+
+def _masked_scatter_rowwise(embeds, mask, source):
+    flat_mask = mask.flatten().astype(mx.int32)
+    indices = mx.cumsum(flat_mask) - 1
+    flat_source = source.flatten()
+    aligned = flat_source[mx.clip(indices, 0, flat_source.size - 1)]
+    return mx.where(flat_mask, aligned, embeds.flatten()).reshape(embeds.shape)
+
+
+def freeze_audio_modules(model):
+    """Freeze the audio tower and its projection.
+
+    Audio towers are inference-only here: their encoders carry fp32 promotions,
+    long cumulative reductions and host-synchronizing guards that make them
+    poor training subjects, and the model-side merge assumes their output is a
+    fixed function of the clip. LoRA runs freeze everything by default, but a
+    full fine-tune would otherwise pull these parameters into the optimizer.
+
+    Returns the names of the modules that were frozen.
+    """
+    frozen = []
+    for attr in _AUDIO_TOWER_ATTRS:
+        for owner in (model, getattr(model, "language_model", None)):
+            module = getattr(owner, attr, None) if owner is not None else None
+            if module is None or not hasattr(module, "freeze"):
+                continue
+            module.freeze(recurse=True)
+            frozen.append(attr)
+            break
+    return frozen
+
+
+def _vlm_batch_carries_audio(batch):
+    """Whether a prepared VLM batch carries audio feature tensors.
+
+    Audio feature extents vary per clip and belong to no padable axis, so a
+    batch carrying them cannot participate in compiled-signature planning.
+    """
+    if not isinstance(batch, Mapping):
+        return False
+    for key in _AUDIO_FEATURE_PAYLOAD_KEYS:
+        value = batch.get(key)
+        if value is None:
+            continue
+        # An empty payload is how some processors report "no audio here":
+        # MiniCPM-o returns audio_features shaped (0, 80, 0) for a text-only
+        # batch, which must not route the run eagerly or abort a strict one.
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            if all(int(dim) for dim in shape):
+                return True
+            continue
+        if not hasattr(value, "__len__") or len(value):
+            return True
+    return False
 
 
 def _vlm_batch_family(batch, symbolic_axes=None):
@@ -7181,6 +9038,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_mru",
         "_descriptors",
+        "_audio_flags",
         "_widths",
         "_padable",
         "_forbidden",
@@ -7231,6 +9089,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._visit_epoch_cache = None
         self._mru = None
         self._descriptors = None
+        self._audio_flags = None
         self._widths = None
         self._padable = None
         self._forbidden = None
@@ -7456,6 +9315,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         widths = []
         padable_flags = []
         forbidden_sets = []
+        audio_flags = []
         with _preserved_preprocessing_rng():
             for index in range(len(self._schedule)):
                 batch = self._build_batch(index)
@@ -7468,12 +9328,15 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 family = _vlm_batch_family(
                     batch, symbolic_axes=axes if padable else None,
                 )
+                carries_audio = _vlm_batch_carries_audio(batch)
                 del batch
+                audio_flags.append(carries_audio)
                 families.append(family)
                 widths.append(width)
                 padable_flags.append(bool(padable))
                 forbidden_sets.append(forbidden)
         self._descriptors = tuple(families)
+        self._audio_flags = tuple(audio_flags)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)
         self._forbidden = tuple(forbidden_sets)
@@ -7486,6 +9349,48 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         eager before surveying anything."""
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         return getattr(tokenizer, "pad_token_id", None)
+
+    def carries_audio_hint(self):
+        """Whether this plan carries audio, without forcing a full survey.
+
+        Uses the survey when one has run, else builds a single batch. Callers
+        that must materialize nothing should survey and ask ``carries_audio``.
+        """
+        if self._audio_flags is not None:
+            return any(self._audio_flags)
+        if not len(self._schedule):
+            return False
+        with _preserved_preprocessing_rng():
+            batch = self._build_batch(0)
+        try:
+            return _vlm_batch_carries_audio(batch)
+        finally:
+            del batch
+
+    def carries_audio_in(self, indices):
+        """Whether any of the named surveyed batches carries audio.
+
+        The whole-plan answer counts batches the schedule drops, and audio
+        confined to that tail would route a run eagerly, or abort strict mode,
+        over a batch no compiled call reaches -- the same reason family
+        admission is restricted to the executed set.
+        """
+        flags = self._audio_flags
+        if flags is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return any(flags[index] for index in indices if 0 <= index < len(flags))
+
+    def carries_audio(self):
+        """Whether any surveyed batch carries audio feature tensors."""
+        if self._audio_flags is None:
+            raise RuntimeError(
+                "Unsloth MLX: VLM batch families have not been surveyed; "
+                "call ensure_descriptors() first."
+            )
+        return any(self._audio_flags)
 
     def batch_family(self, index):
         """Surveyed compile-key family for one scheduled batch."""
@@ -7721,8 +9626,9 @@ def _create_vlm_batch_plan(dataset, processor, config, batch_size, max_seq_lengt
             # dataset that rewrites one shared path per row.
             _pinned_finite_vlm_row(
                 _release_vlm_row_image_handles(
-                    dataset[idx] if formatting_func is None
-                    else formatting_func(dataset[idx])
+                    _format_vlm_row_gating_audio(
+                        dataset[idx], formatting_func, processor,
+                    )
                 ),
                 True if _supervision is None else _supervision[idx],
                 _all_pins=media_pins,

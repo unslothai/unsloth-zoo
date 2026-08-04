@@ -369,6 +369,35 @@ class _MLXTokenizedDatasetView:
         return item
 
 
+class _PeekedBatchStream:
+    """A peeked batch put back in front of its source, cleanup intact.
+
+    ``itertools.chain`` would do the putting back, but it owns no ``close`` and
+    the run's cleanup only closes what it is handed -- so the producer behind a
+    peeked stream, and whatever it holds open, would survive the run that made
+    it. Close is forwarded to the source instead, at whatever point the run
+    ends, including before the first batch is drawn.
+    """
+
+    def __init__(self, source, pending = ()):
+        self._pending = list(pending)
+        self._source = source
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pending:
+            return self._pending.pop(0)
+        return next(self._source)
+
+    def close(self):
+        self._pending.clear()
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            close()
+
+
 def _mlx_stream_declares_infinite(dataset):
     """Recognize explicit/common infinite iterable declarations without probing."""
     dataset = getattr(dataset, "_mlx_source_dataset", dataset)
@@ -490,6 +519,13 @@ def _mlx_declared_iterable_length(dataset):
 
 
 from .utils import (
+    _config_get,
+    _model_carries_audio_modules,
+    _vlm_batch_carries_audio,
+    audio_merge_patch_needed,
+    freeze_audio_modules,
+    install_audio_merge_patch,
+    remove_audio_merge_patch,
     make_cce_loss_fn,
     make_baseline_loss_fn,
     make_vlm_cce_loss_fn,
@@ -1394,6 +1430,7 @@ def _plan_single_process_vlm_shapes(
     compile_policy,
     compile_decision,
     install_plan=True,
+    carries_audio=None,
 ):
     """Plan finite VLM shapes for the single-process compiled path.
 
@@ -1420,6 +1457,21 @@ def _plan_single_process_vlm_shapes(
             f"cannot be enabled "
             f"({getattr(compile_decision, 'reason', 'unqualified')})."
         )
+    if carries_audio:
+        if _effective_compile_mode(compile_policy, compile_decision) == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan audio training: audio "
+                "feature shapes follow clip duration, so every distinct clip "
+                "length would need its own compiled signature. Train audio "
+                "with compile disabled."
+            )
+        print(
+            "Unsloth: audio inputs detected; training runs eagerly because "
+            "audio feature shapes cannot be compiled into fixed signatures."
+        )
+        return None, _shape_guard_report(
+            "eager", "vlm_audio_inputs", cap, lazy_batches=lazy,
+        ), False, None
     if batch_iter is not None:
         return None, _shape_guard_report(
             "not_applicable", "streaming", cap, lazy_batches=False,
@@ -1491,6 +1543,26 @@ def _plan_single_process_vlm_shapes(
         batches.batch_index_for_visit(microstep)
         for microstep in range(total_microsteps)
     })
+    # Scoped to `executed` for the same reason the family admission below is:
+    # a ragged epoch drops its trailing micro-batches, and audio confined to
+    # that tail must not route the whole run eagerly or abort strict mode over
+    # a batch no compiled call reaches.
+    if batches.carries_audio_in(executed):
+        if effective_mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile cannot plan audio training: audio "
+                "feature shapes follow clip duration, so every distinct clip "
+                "length would need its own compiled signature. Train audio "
+                "with compile disabled."
+            )
+        print(
+            "Unsloth: audio inputs detected; training runs eagerly because "
+            "audio feature shapes cannot be compiled into fixed signatures."
+        )
+        return None, _shape_guard_report(
+            "eager", "vlm_audio_inputs", cap, compile_scope,
+            cap_selection="not_applicable",
+        ), False, None
     unplannable = [
         index
         for index in executed
@@ -3144,6 +3216,41 @@ class MLXTrainer:
         return applied
 
     @staticmethod
+    def _peek_stream_carries_audio(batch_iter):
+        """Peek one batch for audio and chain it back, consuming nothing.
+
+        Returns ``(carries_audio, batch_iter)``; streaming plans cannot be
+        surveyed and batches are the only place audio is observable.
+        """
+        if batch_iter is None:
+            return False, batch_iter
+        try:
+            first = next(batch_iter)
+        except StopIteration:
+            # Exhausted, but still the run's to close: the source may hold a
+            # file or a worker open past its last batch.
+            return False, _PeekedBatchStream(batch_iter)
+        payload = first[0] if isinstance(first, tuple) else first
+        return (
+            _vlm_batch_carries_audio(payload),
+            _PeekedBatchStream(batch_iter, (first,)),
+        )
+
+    @staticmethod
+    def _streamed_audio_leaves_the_compiled_path(batch_data, batches):
+        """Whether this streamed batch has to drop the run to eager.
+
+        The stream counterpart to the plan's ``carries_audio_in``: a finite
+        plan is surveyed whole and already routed, but a stream only ever
+        offered the one batch ``_peek_stream_carries_audio`` looked at, so
+        audio appearing later has to be noticed here.
+        """
+        if isinstance(batches, FiniteVLMBatchPlan):
+            return False
+        payload = batch_data[0] if isinstance(batch_data, tuple) else batch_data
+        return _vlm_batch_carries_audio(payload)
+
+    @staticmethod
     def _ensure_lora_frozen(model):
         """Freeze accidentally trainable norm params when LoRA is active.
 
@@ -4254,6 +4361,34 @@ class MLXTrainer:
                 if deferred_check is not None:
                     # Global counts, so an all-masked dataset raises symmetrically.
                     deferred_check()
+                # Strict asks for a guarantee an unsurveyable source cannot
+                # give, so refuse before anything is applied: the per-batch
+                # check in the loop only degrades best-effort runs to eager,
+                # and by the time audio appears the run is partly done.
+                # `batch_iter is not None` is the planner's own test for
+                # unsurveyable, matched so the two cannot drift. Every operand
+                # is rank-invariant, so ranks refuse together with no
+                # collective -- not keyed on the peek, which is per-rank.
+                if (
+                    batch_iter is not None
+                    and _effective_compile_mode(
+                        compile_policy, self._compile_decision,
+                    ) == "strict"
+                    and _model_carries_audio_modules(self.model)
+                ):
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot be honored for a "
+                        "streaming dataset on an audio-capable checkpoint: the "
+                        "source cannot be surveyed, so audio may appear in any "
+                        "later batch and audio feature shapes have no fixed "
+                        "compiled signature. Use a finite dataset, or train "
+                        "with compile disabled or in best-effort mode."
+                    )
+                # No plan to survey: peek one batch, chained back.
+                stream_carries_audio, batch_iter = (
+                    self._peek_stream_carries_audio(batch_iter)
+                )
+                self._stream_carries_audio = stream_carries_audio
                 local_plan_error = None
                 shape_plan = None
                 frontier = None
@@ -4272,6 +4407,7 @@ class MLXTrainer:
                         compile_policy=compile_policy,
                         compile_decision=self._compile_decision,
                         install_plan=False,
+                        carries_audio=stream_carries_audio,
                     )
                 except Exception as exc:
                     local_plan_error = exc
@@ -4444,6 +4580,10 @@ class MLXTrainer:
                 self._setup_report_to_callbacks()
             return self._train_inner()
         finally:
+            # The correction belongs to this run only.
+            if getattr(self, "_audio_merge_patched", False):
+                remove_audio_merge_patch(self.model)
+                self._audio_merge_patched = False
             self._close_active_batch_iterator()
             _handles = getattr(self, "_report_to_handles", (None, None))
             _wb, _tb = _handles
@@ -4713,6 +4853,27 @@ class MLXTrainer:
             ),
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
+
+        # Whole run, not just when audio is spotted up front: audio-free
+        # batches pass straight through, and audio may start in a later row.
+        config = getattr(self.model, "config", None)
+        if self._is_vlm and audio_merge_patch_needed(config):
+            token_id = _config_get(config, "audio_token_id")
+            if token_id is not None and install_audio_merge_patch(
+                self.model, int(token_id),
+            ):
+                self._audio_merge_patched = True
+                print(
+                    "Unsloth: corrected this model's audio merge for training "
+                    "(its own merge misplaces padded rows)."
+                )
+        if self._is_vlm:
+            frozen_audio = freeze_audio_modules(self.model)
+            if frozen_audio:
+                print(
+                    "Unsloth: audio modules kept frozen during training "
+                    f"({', '.join(frozen_audio)})."
+                )
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
@@ -6415,6 +6576,54 @@ class MLXTrainer:
                 )
             elif batch_error is not None:
                 raise batch_error
+
+            # A stream is surveyed only by the one batch the peek looked at, so
+            # audio appearing later must be caught here rather than at the
+            # compiled call, which may or may not raise. Under DDP each rank
+            # shards its own stream, so the verdict is agreed before anyone acts
+            # on it: one rank's audio takes every rank off the compiled path.
+            #
+            # Every operand below must stay rank-invariant, or one rank enters
+            # the collective alone and hangs its peers. It holds today: every
+            # `_use_compile = False` a DDP run reaches is itself driven by a
+            # collective. Do not add a rank-local term here.
+            if _use_compile and self._is_vlm and not isinstance(
+                batches, FiniteVLMBatchPlan,
+            ):
+                _late_audio = self._streamed_audio_leaves_the_compiled_path(
+                    batch_data, batches,
+                )
+                if distributed_world_size > 1:
+                    _late_audio = self._distributed_any_flag(_late_audio)
+            else:
+                _late_audio = False
+            if _late_audio:
+                if not _compile_fallback_allowed():
+                    # Every rank reached the same verdict above, so this raises
+                    # on all of them together rather than stranding peers.
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot plan audio training: "
+                        "audio feature shapes follow clip duration, so every "
+                        "distinct clip length would need its own compiled "
+                        "signature. This stream's first batch carried no audio, "
+                        "so the shape guard could not see it up front. Train "
+                        "audio with compile disabled."
+                    )
+                _main_print(
+                    "Unsloth: audio inputs appeared later in the stream; "
+                    "training continues eagerly because audio feature shapes "
+                    "cannot be compiled into fixed signatures."
+                )
+                if _ddp_compile_local_grad:
+                    # The DDP local-grad path has its own eager step_fn with a
+                    # different signature; mirror its runtime fallback exactly.
+                    step_fn = _ddp_eager_local_step_fn
+                    _ddp_compile_local_grad = False
+                else:
+                    step_fn = _uncompiled_step_fn
+                _use_compile = False
+                _compile_scope = "fallback_eager"
+                _compile_fallback_reason = "audio_inputs"
 
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch is
