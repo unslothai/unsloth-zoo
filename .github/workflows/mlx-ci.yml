@@ -120,3 +120,17 @@ jobs:
         # 8-bit first-moment numerics on Metal: the affine quantizer rounds
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      # The three VLM/shape/batching suites. consolidated-tests-ci.yml runs
+      # these on Linux CPU MLX too; here they meet real Metal and the mlx-vlm
+      # version an Apple Silicon user actually resolves, which is what the
+      # audio family gate is keyed on.
+      - name: tests/test_mlx_shape_guard.py
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: tests/test_mlx_vlm_label_masks.py
+        # Audio collation, label masking and the family/version gate.
+        run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
+
+      - name: tests/test_mlx_batching_and_decay.py
+        run: python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
