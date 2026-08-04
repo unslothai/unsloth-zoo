@@ -121,10 +121,10 @@ jobs:
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
 
-      # The three VLM/shape/batching suites. consolidated-tests-ci.yml runs
-      # these on Linux CPU MLX too; here they meet real Metal and the mlx-vlm
-      # version an Apple Silicon user actually resolves, which is what the
-      # audio family gate is keyed on.
+      # The three VLM/shape/batching suites, also run on Linux CPU MLX by
+      # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm
+      # version an Apple Silicon user resolves, which is what the audio family
+      # gate is keyed on.
       - name: tests/test_mlx_shape_guard.py
         run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
 

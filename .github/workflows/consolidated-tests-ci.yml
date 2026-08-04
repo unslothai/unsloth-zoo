@@ -342,16 +342,14 @@ jobs:
             tests/test_moe_merge_e2e_cpu.py \
             tests/test_merge_e2e_hub_unreachable.py
 
-  # The MLX VLM/shape/batching suites on Linux CPU MLX. mlx publishes manylinux
-  # CPU wheels and mlx-lm/mlx-vlm are py3-none-any, so these run here for no
-  # macOS minutes; mlx-ci.yml runs the same three files against real Metal.
+  # The MLX VLM/shape/batching suites on Linux CPU MLX: mlx ships manylinux CPU
+  # wheels and mlx-lm/mlx-vlm are py3-none-any, so these cost no macOS minutes.
+  # mlx-ci.yml runs the same three files against real Metal.
   #
-  # They were executed by NO job before this: `pytest tests/ --collect-only`
-  # proves only that they import, and it is continue-on-error besides. That is
-  # how the audio family gate reached main with a failing test of its own --
-  # the gate admitted one exact mlx-vlm string while pyproject allows every
-  # later release, so the feature was unreachable on a normal install and
-  # nothing said so.
+  # No job ran them before: `pytest tests/ --collect-only` proves only that they
+  # import, and is continue-on-error besides. That is how the audio family gate
+  # reached main admitting one exact mlx-vlm string while pyproject allows every
+  # later release, leaving the feature unreachable on a normal install.
   mlx-cpu-tests:
     name: MLX suites (Linux CPU MLX)
     runs-on: ubuntu-latest
@@ -372,9 +370,8 @@ jobs:
           cache: 'pip'
 
       - name: Install CPU torch + zoo + CPU MLX
-        # --no-deps unsloth satisfies the find_spec("unsloth") guard at
-        # unsloth_zoo/__init__.py. mlx[cpu] is the Linux runtime; mlx-lm and
-        # mlx-vlm are pure-Python wheels that resolve on any platform.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in
+        # unsloth_zoo/__init__.py; mlx[cpu] is the Linux runtime.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
@@ -385,10 +382,10 @@ jobs:
           pip install pytest==9.0.3
 
       - name: Assert the real MLX runtime is what got installed
-        # All three files importorskip mlx.core, and a module that skips wholesale
-        # still exits 0 -- so without this the job could report green having run
-        # nothing. tests/mlx_simulation/ is the torch-backed shim these suites
-        # must not be measured against.
+        # All three files importorskip mlx.core, and a module that skips
+        # wholesale still exits 0, so without this the job could go green having
+        # run nothing. tests/mlx_simulation/ is the torch-backed shim these
+        # suites must not be measured against.
         run: |
           python - <<'PY'
           import mlx.core as mx
@@ -400,8 +397,8 @@ jobs:
           python -c "import mlx_vlm, mlx_lm; print('mlx-vlm', mlx_vlm.__version__)"
 
       # One pytest process per file: tests/mlx_simulation/ replaces
-      # sys.modules["mlx.core"] process-wide, so a sibling suite that installs
-      # the shim would silently disarm whichever file ran after it.
+      # sys.modules["mlx.core"] process-wide, silently disarming any file that
+      # runs after a suite that installs the shim.
       - name: tests/test_mlx_shape_guard.py
         run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
 

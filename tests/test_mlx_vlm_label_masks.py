@@ -2713,13 +2713,13 @@ def test_qualified_families_carry_their_probed_requirements():
 
 @pytest.mark.parametrize("installed,admitted", [
     ("0.4.3", False),        # below the probed floor
-    ("0.4.4", True),         # the version the probes ran on
-    ("0.4.4.post1", True),   # a packaging-only re-release of that same code
+    ("0.4.4", True),         # the probed version
+    ("0.4.4.post1", True),   # same code, repackaged
     ("0.5.0", True),
-    ("0.6.4", True),         # the ceiling: 0.6.5+ needs transformers>=5.14,
+    ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
     ("0.6.5", False),        # which this package caps at 5.5.0
     ("0.6.9", False),
-    ("", False),             # version unreadable: not evidence of anything
+    ("", False),             # unreadable version: not evidence of anything
     ("not-a-version", False),
 ])
 def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
@@ -2769,7 +2769,7 @@ def test_a_family_pinned_to_one_version_still_takes_its_post_release():
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
     assert gemma4.admits("0.4.4") is True
     assert gemma4.admits("0.4.4.post1") is True
-    # But not the release after it, which is a different processor.
+    # But not the next release, which is a different processor.
     assert gemma4.admits("0.4.5") is False
     assert gemma4.admits("0.5.0") is False
 
@@ -2814,13 +2814,13 @@ def test_the_transformers_floor_reads_a_release_candidate_as_its_release(
         _pin(spelling)
         mlx_utils._check_audio_transformers_floor("gemma4")  # must not raise
 
-    # Genuinely older releases are still refused, and say so.
+    # Genuinely older releases are still refused.
     for spelling in ("4.57.6", "5.4.0"):
         _pin(spelling)
         with pytest.raises(NotImplementedError, match="was verified on"):
             mlx_utils._check_audio_transformers_floor("gemma4")
 
-    # An unreadable version is still refused, and now only that case says so.
+    # Only an unreadable version reports that reason now.
     _pin("not-a-version")
     with pytest.raises(NotImplementedError, match="could not be determined"):
         mlx_utils._check_audio_transformers_floor("gemma4")

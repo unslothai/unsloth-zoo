@@ -5597,9 +5597,8 @@ class _AudioVersions(NamedTuple):
             ceiling = _Version(self.maximum)
             if found < _Version(self.minimum):
                 return False
-            # A post-release carries the same code as the release it follows,
-            # so `0.4.4.post1` is inside a range ending at `0.4.4` even though
-            # it sorts above it.
+            # A post-release is the same code repackaged, so `0.4.4.post1` is
+            # inside a range ending at `0.4.4` though it sorts above it.
             return found <= ceiling or found.base_version == ceiling.base_version
         except Exception:
             # An unparseable version is not evidence of anything.
@@ -5613,17 +5612,15 @@ class _AudioVersions(NamedTuple):
 
 # Families and the mlx-vlm releases their audio path is qualified for.
 #
-# The probes ran on 0.4.4. Three of these families ship a processor that is
-# byte-identical from 0.4.4 through 0.6.9, so the probed code is the code that
-# runs and the range is widened to every release that can be installed beside
-# this package -- mlx-vlm 0.6.5+ requires transformers>=5.14, which pyproject
-# caps at 5.5.0, so 0.6.4 is the real ceiling.
+# The probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a processor that
+# is byte-identical from 0.4.4 through 0.6.9, so the probed code is the code
+# that runs; the ceiling is 0.6.4 only because mlx-vlm 0.6.5+ requires
+# transformers>=5.14, which this package caps at 5.5.0.
 #
-# Gemma 4 is deliberately left at the probed version. Its processor changed in
-# 0.5.0, upstream reports it failing to load at all from 0.6.4
-# (Blaizzy/mlx-vlm#1526, with 0.6.3 good), and 0.6.3 added a separate
-# `gemma4_unified` family. Re-probing it needs a real checkpoint on Apple
-# hardware; until then, refusing is the honest answer.
+# Gemma 4 stays at the probed version: its processor changed in 0.5.0, upstream
+# reports it failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526),
+# and 0.6.3 added a separate `gemma4_unified` family. Re-probing needs a real
+# checkpoint on Apple hardware.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
     "gemma4": _AudioVersions("0.4.4", "0.4.4"),
@@ -5631,8 +5628,7 @@ _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
 
-# Renames upstream gave a family this gate qualified under another name, so the
-# refusal can say which entry the user is actually looking at.
+# Names upstream renamed, so a refusal can point at the qualified entry.
 _AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
 
 # Families probed only on a newer transformers than this package pins, at the
@@ -5691,10 +5687,8 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        # PEP 440 rather than int(split(".")): a release candidate ("5.5rc1")
-        # or a v-prefixed tag would otherwise raise here and be reported as a
-        # version that could not be determined, which is both a refusal of a
-        # perfectly good release and a misleading reason for it.
+        # PEP 440, not int(split(".")): "5.5rc1" or a v-prefixed tag would
+        # raise and be refused as a version that could not be determined.
         parts = _Version(version).release[:2]
     except Exception:
         raise NotImplementedError(
@@ -5910,9 +5904,8 @@ def _check_audio_family_gate(processor):
         return family
     renamed = _AUDIO_FAMILY_RENAMES.get(family)
     if renamed and renamed in _AUDIO_QUALIFIED_FAMILIES:
-        # Upstream renamed a qualified family; the entry under the old name
-        # says nothing about the new one, so say that rather than reporting an
-        # unrecognised family the user cannot act on.
+        # The entry under the old name says nothing about the renamed
+        # implementation, so say that instead of "unrecognised family".
         raise NotImplementedError(
             f"Unsloth MLX: audio training is not supported for '{family}'. "
             f"mlx-vlm {installed or 'unknown'} loads this checkpoint as "
