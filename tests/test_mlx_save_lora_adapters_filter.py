@@ -307,6 +307,38 @@ def test_collect_lora_helper_finds_adapters_after_reload():
     assert set(found.keys()) == {"q_proj.lora_a", "q_proj.lora_b"}, found
 
 
+def test_collect_lora_helper_finds_linear_backed_adapter_factors():
+    from unsloth_zoo.mlx.utils import collect_mlx_lora_adapter_tensors
+
+    class _Factor:
+        def __init__(self, shape):
+            self.weight = torch.zeros(*shape)
+
+    class _LinearBackedLoRA:
+        def __init__(self):
+            self.lora_a = _Factor((8, 4))
+            self.lora_b = _Factor((4, 16))
+
+    adapter = _LinearBackedLoRA()
+
+    class _Model:
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": {"weight": adapter.lora_a.weight},
+                    "lora_b": {"weight": adapter.lora_b.weight},
+                }
+            }
+
+        def named_modules(self):
+            yield "q_proj", adapter
+
+    found = collect_mlx_lora_adapter_tensors(_Model())
+    assert set(found) == {
+        "q_proj.lora_a.weight", "q_proj.lora_b.weight",
+    }
+
+
 def test_ensure_lora_frozen_freezes_norm_when_lora_is_actively_trained():
     # Active LoRA training with an accidentally trainable norm. The
     # module-anchored detector finds q_proj.lora_a/lora_b in the
@@ -1548,3 +1580,51 @@ def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
     assert calls["folder"] == 1
     assert len(calls["large"]) == 1, calls
     assert calls["large"][0]["repo_id"] == "me/adapter"
+
+
+def test_save_lora_adapters_method_ignores_a_fully_unfrozen_tree(tmp_path):
+    # load_adapters() never freezes: every base weight reads trainable, which
+    # is not CPT state, so keep the LoRA-only writer.
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({
+        "q_proj": _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "up_proj": _MockPlainLinear(16, 32),
+    })
+    _mlx_save_lora_adapters(model, tmp_path)
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {"q_proj.lora_a", "q_proj.lora_b"}, sorted(keys)
+
+
+def test_save_lora_adapters_method_raises_when_no_lora_modules(tmp_path):
+    # A base model must still error, not write a whole-model "adapter".
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({"up_proj": _MockPlainLinear(16, 32)})
+    with pytest.raises(ValueError, match="LoRA adapter tensors"):
+        _mlx_save_lora_adapters(model, tmp_path)
+
+
+def test_save_lora_adapters_method_keeps_continued_pretraining_tensors(tmp_path):
+    # Real CPT state: embed_tokens.weight trainable, the rest frozen.
+    from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters
+
+    model = _make_model({
+        "q_proj": _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0)),
+        "embed_tokens": _MockPlainLinear(16, 32),
+    })
+    everything = model.parameters()
+    model.trainable_parameters = lambda: {
+        key: everything[key] for key in (
+            "embed_tokens.weight", "q_proj.lora_a", "q_proj.lora_b",
+        )
+    }
+    _mlx_save_lora_adapters(model, tmp_path)
+
+    from safetensors.torch import load_file
+    keys = set(load_file(str(tmp_path / "adapters.safetensors")).keys())
+    assert keys == {
+        "q_proj.lora_a", "q_proj.lora_b", "embed_tokens.weight",
+    }, sorted(keys)

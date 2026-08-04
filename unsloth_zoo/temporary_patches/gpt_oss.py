@@ -2917,10 +2917,11 @@ def encode_conversations_with_harmony(
 
     assert reasoning_effort in ("low", "medium", "high")
 
-    match reasoning_effort:
-        case "low":     harmony_reasoning = ReasoningEffort.LOW
-        case "medium":  harmony_reasoning = ReasoningEffort.MEDIUM
-        case "high":    harmony_reasoning = ReasoningEffort.HIGH
+    # No else: an unmatched value must leave harmony_reasoning unbound exactly as
+    # `match` did, which is what happens under -O when the assert above is stripped.
+    if   reasoning_effort == "low":    harmony_reasoning = ReasoningEffort.LOW
+    elif reasoning_effort == "medium": harmony_reasoning = ReasoningEffort.MEDIUM
+    elif reasoning_effort == "high":   harmony_reasoning = ReasoningEffort.HIGH
 
     convos = []
 

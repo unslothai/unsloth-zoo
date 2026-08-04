@@ -64,6 +64,9 @@ jobs:
           pip install "torch>=2.4.0,<2.13.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
+          # The vision model used by tests/test_mlx_generate_metal.py loads
+          # remote processor code that imports timm, which .[mlx] does not pull.
+          pip install timm
 
       - name: MLX module import smoke
         run: |
@@ -78,6 +81,10 @@ jobs:
         # on Apple Silicon; on Linux runners it would run against tests/mlx_simulation/ stubs.
         run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
 
+      - name: tests/test_mlx_switch_lora.py
+        # Real-runtime routed LoRA training and adapter lifecycle coverage.
+        run: python -m pytest tests/test_mlx_switch_lora.py -v -rs
+
       - name: tests/test_qwen35_vjp_metal.py
         # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
         run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rs
@@ -87,7 +94,50 @@ jobs:
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
+      - name: tests/test_mlx_generate.py
+        # Batched-generation logic that needs no Metal but does need the mlx-vlm
+        # import: release-protocol handling, prompt-kwarg splitting, stop-string
+        # trimming, the audio fallback contract, and request validation.
+        run: python -m pytest tests/test_mlx_generate.py -v -rs
+
+      - name: tests/test_mlx_generate_metal.py
+        # Batched generation on real models: batched-vs-sequential greedy
+        # equivalence with aligned sampled-token logprobs, memory-limit
+        # restoration, compiled train/generate interplay, and the vision
+        # ordering and stop-string contracts.
+        run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
+
+      - name: tests/test_mlx_cpt_partition_metal.py
+        # CPT partition, target normalization and full-module save routing.
+        run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
+
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
         # epoch step counts, SGD coupled decay, real Qwen2-VL LoRA training.
         run: python -m pytest tests/test_mlx_pr684_full_validation_metal.py -v -rs
+
+      - name: tests/test_mlx_quantized_optimizer_state.py
+        # 8-bit first-moment numerics on Metal: the affine quantizer rounds
+        # differently per backend, so the mlx-cpu job is not a substitute.
+        run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      # The three VLM/shape/batching suites, also run on Linux CPU MLX by
+      # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm
+      # version an Apple Silicon user resolves, which the audio gate is keyed on.
+      - name: tests/test_mlx_shape_guard.py
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: tests/test_mlx_vlm_label_masks.py
+        # Audio collation, label masking and the family/version gate.
+        run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
+
+      - name: tests/test_mlx_batching_and_decay.py
+        # test_compiler_review_guards_are_present is deselected here, not skipped
+        # in the file: it only asserts on unsloth_zoo.compiler source text, so
+        # the Linux job covers it. Importing that module here pulls torch's
+        # flop_counter, which raises "isinstance() arg 2 must be a type"
+        # registering flex-attention formulas against a triton that is not
+        # installable on macOS arm64. A torch problem, not this repo's.
+        run: |
+          python -m pytest tests/test_mlx_batching_and_decay.py -v -rs \
+            --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present

@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 import heapq
 import hashlib
+import operator
 
 
 AUTOMATIC_TEXT_COMPILE_CEILING = 128
@@ -701,11 +702,32 @@ def materialize_text_shape_frontier(
     )
 
 
-def select_text_shape_padding_budget(frontier):
-    """Select the smallest retained snapshot within both policy budgets."""
+def select_text_shape_padding_budget(frontier, *, exact_signature_threshold=None):
+    """Select the smallest retained snapshot within both policy budgets.
+
+    ``exact_signature_threshold`` widens the exact fast-path: raw catalogs at
+    or below it stay exact (raw widths, zero padding). It may only widen the
+    default, since the frontier holds no bounded points below it. VLM
+    schedules pass the automatic ceiling because padding there buys no
+    compile reuse.
+    """
 
     if not isinstance(frontier, TextShapeFrontier):
         raise TypeError("frontier must be a TextShapeFrontier")
+    if exact_signature_threshold is None:
+        exact_threshold = SMALL_EXACT_SIGNATURE_THRESHOLD
+    else:
+        exact_threshold = operator.index(exact_signature_threshold)
+        if not (
+            SMALL_EXACT_SIGNATURE_THRESHOLD
+            <= exact_threshold
+            <= AUTOMATIC_TEXT_COMPILE_CEILING
+        ):
+            raise ValueError(
+                "exact_signature_threshold must be between "
+                f"{SMALL_EXACT_SIGNATURE_THRESHOLD} and "
+                f"{AUTOMATIC_TEXT_COMPILE_CEILING}, got {exact_threshold}"
+            )
     problem = frontier._problem
     if frontier.failure_reason is not None:
         return _eager_plan(
@@ -715,7 +737,7 @@ def select_text_shape_padding_budget(frontier):
             configured_cap=AUTOMATIC_TEXT_COMPILE_CEILING,
             cap_selection="not_applicable",
         )
-    if len(problem.raw_catalog) <= SMALL_EXACT_SIGNATURE_THRESHOLD:
+    if len(problem.raw_catalog) <= exact_threshold:
         return _exact_plan(
             problem,
             len(problem.raw_catalog),
