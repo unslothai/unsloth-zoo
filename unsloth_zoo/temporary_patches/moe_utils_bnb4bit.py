@@ -22,6 +22,10 @@ and quantize those parameters and route the experts forward through the
 standard backend after on-the-fly dequantization.
 """
 
+# patched_convert below annotates with PEP 604 unions, which evaluate when the patch
+# is applied and raise on Python 3.9.
+from __future__ import annotations
+
 from typing import Optional, List, Union
 
 import torch
