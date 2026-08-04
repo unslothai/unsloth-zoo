@@ -591,3 +591,31 @@ def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state
     monkeypatch.setattr(mx.random, "state", state, raising=False)
     found = _probe_vlm_embedding_module(model)
     assert found is model.language_model.model.embed_tokens
+
+
+@metal_only
+@pytest.mark.parametrize("family,embed_scale,expected", [
+    ("gemma3", None, H ** 0.5),           # sqrt(hidden_size), computed inline
+    ("gemma3n", None, H ** 0.5),
+    ("gemma4_unified", 7.0, 7.0),         # scale carried by the backbone
+])
+def test_embed_scale_reads_both_spellings_of_a_family(
+        monkeypatch, family, embed_scale, expected):
+    """A tower arrives as either `<family>` or `<family>_text` depending on the
+    wrapper, and the transformers lookup normalises before asking, so the family
+    sets it falls back to have to answer the same for both."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    # Force the fallback: this is the path that reads the family sets.
+    monkeypatch.setattr(mlx_utils, "_transformers_scales_inside_embedding",
+                        lambda _mt: None)
+    found = []
+    for model_type in (family, f"{family}_text"):
+        model = _tree()
+        backbone = model.language_model.model
+        backbone.config = SimpleNamespace(model_type=model_type, hidden_size=H)
+        if embed_scale is not None:
+            backbone.embed_scale = embed_scale
+        found.append(mlx_utils._neftune_embed_scale(model))
+    assert found[0] == found[1] == pytest.approx(expected), found

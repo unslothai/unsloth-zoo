@@ -656,16 +656,22 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
 
 
 # Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
-# the module returns, without exposing the factor as an attribute.
+# the module returns, without exposing the factor as an attribute. Named by the
+# base the model type normalizes to, since a tower is reachable as either
+# `gemma3` or `gemma3_text` depending on how the wrapper exposes it.
 _MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
-    "gemma", "gemma2", "gemma3_text", "gemma3n_text",
+    "gemma", "gemma2", "gemma3", "gemma3n",
 })
 # Architectures transformers has always scaled inside the embedding, used when
 # the installed transformers cannot be asked because it predates them.
 _SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
-    "gemma3_text", "gemma3n_text", "gemma4_text", "gemma4_unified_text",
-    "minicpm3",
+    "gemma3", "gemma3n", "gemma4", "gemma4_unified", "minicpm3",
 })
+
+
+def _model_type_base(model_type):
+    """The spelling both the family sets and the transformers lookup use."""
+    return str(model_type or "").removesuffix("_text")
 
 
 @lru_cache(maxsize=None)
@@ -684,7 +690,7 @@ def _transformers_scales_inside_embedding(model_type):
     importing would fail on a working MLX setup. Source first, then the compiled
     code, so the answer survives a package shipped without its source.
     """
-    base = str(model_type or "").removesuffix("_text")
+    base = _model_type_base(model_type)
     if not base:
         return None
     try:
@@ -733,17 +739,18 @@ def _neftune_embed_scale(model):
         return None
 
     model_type = str(_first("model_type") or "")
+    base = _model_type_base(model_type)
     scale = getattr(backbone, "embed_scale", None)      # gemma4, gemma4_unified
     if not scale:
         scale = _first("scale_emb")                     # minicpm3, and not a sqrt
-    if not scale and model_type in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+    if not scale and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
         hidden_size = _first("hidden_size")
         scale = float(hidden_size) ** 0.5 if hidden_size else None
     if not scale:
         return None
     inside = _transformers_scales_inside_embedding(model_type)
     if inside is None:
-        inside = model_type in _SCALED_INSIDE_WHEN_UNASKABLE
+        inside = base in _SCALED_INSIDE_WHEN_UNASKABLE
     return float(scale) if inside else None
 
 
