@@ -120,3 +120,24 @@ jobs:
         # 8-bit first-moment numerics on Metal: the affine quantizer rounds
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      # The three VLM/shape/batching suites, also run on Linux CPU MLX by
+      # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm
+      # version an Apple Silicon user resolves, which the audio gate is keyed on.
+      - name: tests/test_mlx_shape_guard.py
+        run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
+
+      - name: tests/test_mlx_vlm_label_masks.py
+        # Audio collation, label masking and the family/version gate.
+        run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
+
+      - name: tests/test_mlx_batching_and_decay.py
+        # test_compiler_review_guards_are_present is deselected here, not skipped
+        # in the file: it only asserts on unsloth_zoo.compiler source text, so
+        # the Linux job covers it. Importing that module here pulls torch's
+        # flop_counter, which raises "isinstance() arg 2 must be a type"
+        # registering flex-attention formulas against a triton that is not
+        # installable on macOS arm64. A torch problem, not this repo's.
+        run: |
+          python -m pytest tests/test_mlx_batching_and_decay.py -v -rs \
+            --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present

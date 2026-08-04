@@ -2295,8 +2295,9 @@ def _qualify(monkeypatch, processor=None, version=None):
     from unsloth_zoo.mlx import utils as mlx_utils
     family = mlx_utils._audio_family_from_processor(
         processor or _FakeGemmaAudioProcessor())
-    monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {family: frozenset(
-        {version or mlx_utils._installed_mlx_vlm_version()})})
+    pinned = version or mlx_utils._installed_mlx_vlm_version()
+    monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES",
+                        {family: mlx_utils._AudioVersions(pinned, pinned)})
 
 
 @pytest.mark.parametrize("gate,message", [
@@ -2692,23 +2693,156 @@ def test_audio_merge_compacts_valid_features_per_row():
 
 
 def test_qualified_families_carry_their_probed_requirements():
+    """The table itself: which families, over which mlx-vlm releases.
+
+    Bounded at both ends, so an unreleased version is refused rather than
+    assumed good. Gemma 4 stays at the version its probes ran on: its processor
+    changed in 0.5.0, upstream reports it failing to load from 0.6.4
+    (Blaizzy/mlx-vlm#1526), and 0.6.3 split off a separate `gemma4_unified`.
+    """
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    gate = mlx_utils._AUDIO_QUALIFIED_FAMILIES
-    # Exact versions: a stray one would enable code no probe ran against.
-    assert gate == {
-        "gemma3n": frozenset({"0.4.4"}),
-        "gemma4": frozenset({"0.4.4"}),
-        "phi4mm": frozenset({"0.4.4"}),
-        "minicpmo": frozenset({"0.4.4"}),
+    versions = mlx_utils._AudioVersions
+    assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
+        "gemma3n": versions("0.4.4", "0.6.4"),
+        "gemma4": versions("0.4.4", "0.4.4"),
+        "phi4mm": versions("0.4.4", "0.6.4"),
+        "minicpmo": versions("0.4.4", "0.6.4"),
     }
-    # Gemma 4 was probed only on a newer transformers; this env pins an older.
-    gemma4_like = type("Proc", (), {})
-    gemma4_like.__module__ = "mlx_vlm.models.gemma4.processing_gemma4"
-    assert mlx_utils._audio_family_from_processor(gemma4_like()) == "gemma4"
-    with pytest.raises(NotImplementedError, match="transformers"):
-        mlx_utils._check_audio_family_gate(gemma4_like())
+
+
+@pytest.mark.parametrize("installed,admitted", [
+    ("0.4.3", False),        # below the probed floor
+    ("0.4.4", True),         # the probed version
+    ("0.5.0", True),
+    ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
+    ("0.6.5", False),        # which this package caps at 5.5.0
+    ("0.6.9", False),
+    ("0.5.0rc1", False),     # prereleases inside the window: never qualified
+    ("0.4.5.dev0", False),
+    ("0.4.4.post1", False),  # nor post-releases or local builds
+    ("0.6.4.post1", False),
+    ("0.4.4+local", False),
+    ("", False),             # unreadable: not evidence of anything
+    ("not-a-version", False),
+])
+def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma3n"]
+    assert window.admits(installed) is admitted, installed
+
+
+@pytest.mark.parametrize("installed,allowed", [
+    ("0.4.3", False),
+    ("0.4.4", True),
+    ("0.4.4.post1", False),
+    ("0.5.0", True),
+    ("0.5.0rc1", False),
+    ("0.6.4", True),
+    ("0.6.5", False),
+    ("0.6.9", False),
+])
+def test_the_gate_itself_honours_the_range_not_just_the_range_object(
+        monkeypatch, installed, allowed):
+    """Drives `_check_audio_family_gate`, not `_AudioVersions.admits`.
+
+    Asserting the range object alone would pass just as happily with the gate
+    still comparing strings, which is the whole defect. Whether an audio row
+    trains or is refused is decided here.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
+    monkeypatch.setattr(mlx_utils, "_installed_mlx_vlm_version",
+                        lambda: installed)
+    gemma3n_like = type("Proc", (), {})
+    gemma3n_like.__module__ = "mlx_vlm.models.gemma3n.processing_gemma3n"
+
+    if allowed:
+        assert mlx_utils._check_audio_family_gate(gemma3n_like()) == "gemma3n"
+    else:
+        with pytest.raises(NotImplementedError, match="only been verified"):
+            mlx_utils._check_audio_family_gate(gemma3n_like())
+
+
+def test_only_a_published_final_release_is_inside_the_window():
+    """The qualification covers published final releases and nothing else.
+
+    A post-release is conventionally the same code repackaged, but nothing
+    enforces that, and a local build carries whatever its builder put there.
+    mlx-vlm has published no prerelease, post-release or local build across 73
+    releases, so admitting them would widen a fail-closed gate for a case that
+    has never happened.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
+    assert gemma4.admits("0.4.4") is True
+    for unqualified in ("0.4.4.post1", "0.4.4.post2", "0.4.4+local",
+                        "0.4.4rc1", "0.4.4.dev0"):
+        assert gemma4.admits(unqualified) is False, unqualified
+    # Nor the next release, which is a different processor.
+    assert gemma4.admits("0.4.5") is False
+    assert gemma4.admits("0.5.0") is False
+
+
+def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
+    """mlx-vlm 0.6.3 added `gemma4_unified` beside `gemma4`, so a gemma 4
+    checkpoint can present under a family key this gate never qualified.
+    Refusing it as simply unrecognised tells the user nothing they can act on;
+    the refusal names the entry they are actually looking for."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    unified = type("Gemma4UnifiedProcessor", (), {})
+    unified.__module__ = "mlx_vlm.models.gemma4_unified.processing_gemma4_unified"
+    assert mlx_utils._audio_family_from_processor(unified()) == "gemma4_unified"
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        mlx_utils._check_audio_family_gate(unified())
+    message = str(excinfo.value)
+    assert "gemma4_unified" in message and "'gemma4'" in message
+    assert "0.4.4" in message, "the version to pin is not named"
+
+
+def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
+        monkeypatch):
+    """`int(x) for x in version.split(".")` raised on any version that is not
+    plain digits, and the catch-all handler reported that as a version it could
+    not determine. So `5.5rc1` was refused with a reason naming the wrong
+    problem, and `v5.5.0` -- a real 5.5 -- was refused outright.
+
+    A prerelease is still refused, because PEP 440 sorts it below the release
+    and the floor exists precisely because older transformers expand audio
+    tokens differently. What changes is that it is refused as the older version
+    it is, rather than as an unreadable one.
+    """
+    import sys
+    import types
+
+    from unsloth_zoo.mlx import utils as mlx_utils
+
     mlx_utils._check_audio_transformers_floor("gemma3n")  # no floor recorded
+
+    def _pin(spelling):
+        fake = types.ModuleType("transformers")
+        fake.__version__ = spelling
+        monkeypatch.setitem(sys.modules, "transformers", fake)
+
+    for spelling in ("5.5.0", "v5.5.0", "5.6.0", "5.5.1"):
+        _pin(spelling)
+        mlx_utils._check_audio_transformers_floor("gemma4")  # must not raise
+
+    # Older releases, and prereleases of the floor, are refused as such.
+    for spelling in ("4.57.6", "5.4.0", "5.5rc1", "5.5.0.dev0"):
+        _pin(spelling)
+        with pytest.raises(NotImplementedError, match="was verified on"):
+            mlx_utils._check_audio_transformers_floor("gemma4")
+
+    # Only an unreadable version reports that reason now.
+    _pin("not-a-version")
+    with pytest.raises(NotImplementedError, match="could not be determined"):
+        mlx_utils._check_audio_transformers_floor("gemma4")
 
 
 class _Gemma4Extractor:
@@ -2924,9 +3058,10 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
 
     monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
+    _here = mlx_utils._installed_mlx_vlm_version()
     monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {
-        "gemma4": frozenset({mlx_utils._installed_mlx_vlm_version()}),
-        "fakegemmaaudio": frozenset({mlx_utils._installed_mlx_vlm_version()}),
+        "gemma4": mlx_utils._AudioVersions(_here, _here),
+        "fakegemmaaudio": mlx_utils._AudioVersions(_here, _here),
     })
     processor = Gemma4Processor(_Gemma4Extractor(True))
     assert mlx_utils._check_audio_family_gate(processor) == "gemma4"

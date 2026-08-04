@@ -1104,11 +1104,12 @@ def _download_child_entry(
         # Defensive: the parent already seeded these around the spawn, but a child launched by any
         # other path must not inherit hf_xet's unbounded multi-GB buffer defaults.
         try:
-            from unsloth_zoo.hf_xet_tuning import apply_xet_env
+            from unsloth_zoo.hf_xet_tuning import resize_for_cache_dir
 
             # A supervised child, so the shortened Xet timeouts belong here: a failure surfaces to
-            # the ladder instead of being retried for ~6 minutes.
-            apply_xet_env(fail_fast = True)
+            # the ladder instead of being retried for ~6 minutes. resize, not apply: our own
+            # import-time sizing is already in this environment and setdefault would keep it.
+            resize_for_cache_dir(os.environ, params.get("cache_dir"))
         except Exception as e:
             logger.debug("Could not apply Xet tuning in child: %s", e)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -1234,27 +1235,27 @@ def _run_download_attempt(
     if disable_xet:
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    else:
-        # hf_xet reads its config natively at import, so the buffer caps must be in the environment
-        # BEFORE the child starts; setting them inside the child is too late.
-        try:
-            from .hf_xet_tuning import xet_env_overrides
-
-            for key, value in xet_env_overrides().items():
-                # An explicit user setting still wins; only fill what is unset.
-                if key not in os.environ:
-                    child_env[key] = value
-            # High-performance mode is a preset applied after the environment is read, so it would
-            # override the caps above rather than merge with them.
-            from .hf_xet_tuning import XET_HIGH_PERFORMANCE_VARS
-
-            if not _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
-                for var in XET_HIGH_PERFORMANCE_VARS:
-                    if _is_true(os.environ.get(var)):
-                        child_env[var] = "0"
-        except Exception as e:
-            logger.debug("Could not compute Xet tuning env: %s", e)
     with _SPAWN_ENV_LOCK:
+        if not disable_xet:
+            # hf_xet reads its config natively at import, so the buffer caps must be in the
+            # environment BEFORE the child starts; setting them inside the child is too late.
+            try:
+                from .hf_xet_tuning import resize_for_cache_dir
+
+                # Decide against a COPY of the real environment so the child is tuned exactly the
+                # way this process was at import: setdefault semantics keep every explicit user
+                # setting, and a user-set HF_XET_HIGH_PERFORMANCE stands our sizing down here too
+                # instead of being forced back to 0 for the one path that does the downloading. The
+                # call returns only what it wrote, which is precisely what the child needs on top of
+                # what it inherits. UNSLOTH_XET_FORCE_CAPS=1 still caps the machine regardless. It
+                # resizes rather than applies because our import-time numbers are already in that
+                # copy and setdefault would keep them: huggingface_hub honours cache_dir over
+                # HF_HUB_CACHE, so the disk clamp has to be redone against the child's destination.
+                # Under the lock, so the copy cannot catch a concurrent spawn's temporary overlay
+                # below and read another child's numbers as this user's own settings.
+                child_env.update(resize_for_cache_dir(dict(os.environ), params.get("cache_dir")))
+            except Exception as e:
+                logger.debug("Could not compute Xet tuning env: %s", e)
         # Cache Hub's transport constants in the PARENT from the REAL env NOW, before the child-only
         # HF_HUB_DISABLE_XET=1 is briefly set below: else a concurrent thread's FIRST `import
         # huggingface_hub` in the spawn window caches the disabled value and routes later in-process

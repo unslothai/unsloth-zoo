@@ -3452,13 +3452,14 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name in ("adamw_8bit", "adam_8bit"):
-            # Print rather than route silently: the old path was a quiet rewrite.
+            # One line, once per process, main process only: _build_optimizer runs
+            # per run and per rank, and this is the default optim in every example.
             from .optimizers_quantized import (
                 QuantizedMomentAdam,
                 QuantizedMomentAdamW,
-                describe_quantized_optimizer,
+                announce_quantized_optimizer,
             )
-            print(describe_quantized_optimizer(opt_name))
+            announce_quantized_optimizer(opt_name, enabled=self.is_main_process)
             if opt_name == "adamw_8bit":
                 self._manual_weight_decay = float(wd or 0.0)
                 optimizer = QuantizedMomentAdamW(

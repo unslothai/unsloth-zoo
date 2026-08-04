@@ -55,6 +55,8 @@ from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
 
+from packaging.version import Version as _Version
+
 
 from .cce import _get_runtime_cce
 from .cce.runtime_cce import _normalize_label_smoothing
@@ -5575,15 +5577,56 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
     "<|endoftext11|>",
 )
 
-# Families and the exact mlx-vlm versions their audio path was validated on.
-# Anything else is refused: merge contracts differ per family and mlx-vlm has
-# changed audio preprocessing within its supported span.
-_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
-    "gemma3n": frozenset({"0.4.4"}),
-    "gemma4": frozenset({"0.4.4"}),
-    "phi4mm": frozenset({"0.4.4"}),
-    "minicpmo": frozenset({"0.4.4"}),
+class _AudioVersions(NamedTuple):
+    """The mlx-vlm releases a family's audio path is qualified for.
+
+    Bounded at both ends on purpose. An unreleased version is refused rather
+    than assumed good, which is the property the whole gate exists for: a wrong
+    "yes" here trains against misaligned features and fails silently, where a
+    wrong "no" only asks someone to pin.
+    """
+
+    minimum: str
+    maximum: str
+
+    def admits(self, installed):
+        if not installed:
+            return False
+        try:
+            found = _Version(installed)
+            # Only published final releases were probed, and mlx-vlm has shipped
+            # no prerelease, post-release or local build in 73 releases.
+            if found.is_prerelease or found.is_postrelease or found.local:
+                return False
+            return _Version(self.minimum) <= found <= _Version(self.maximum)
+        except Exception:
+            # An unparseable version is not evidence; refusing beats raising.
+            return False
+
+    def __str__(self):
+        if self.minimum == self.maximum:
+            return self.minimum
+        return f"{self.minimum} to {self.maximum}"
+
+
+# Families and the mlx-vlm releases their audio path is qualified for.
+#
+# Probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a byte-identical
+# processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
+# 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
+#
+# Gemma 4 stays at 0.4.4: its processor changed in 0.5.0, upstream reports it
+# failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526), and 0.6.3
+# added a separate `gemma4_unified` family. Re-probing needs Apple hardware.
+_AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
+    "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
+    "gemma4": _AudioVersions("0.4.4", "0.4.4"),
+    "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
+    "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
+
+# Names upstream renamed, so a refusal can point at the qualified entry.
+_AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
 
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
@@ -5641,14 +5684,17 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        parts = tuple(int(x) for x in version.split(".")[:2])
+        # PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed
+        # tag. Compared whole, not by `.release`: that reads 5.5rc1 as 5.5, and
+        # PEP 440 sorts the prerelease below 5.5.0.
+        found = _Version(version)
     except Exception:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' requires transformers "
             f"{floor[0]}.{floor[1]} or newer, and the installed version could "
             f"not be determined."
         ) from None
-    if parts < floor:
+    if found < _Version(f"{floor[0]}.{floor[1]}"):
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' was verified on "
             f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "
@@ -5851,9 +5897,20 @@ def _check_audio_family_gate(processor):
     family = _audio_family_from_processor(processor)
     probed = _AUDIO_QUALIFIED_FAMILIES.get(family)
     installed = _installed_mlx_vlm_version()
-    if probed and installed in probed:
+    if probed and probed.admits(installed):
         _check_audio_transformers_floor(family)
         return family
+    renamed = _AUDIO_FAMILY_RENAMES.get(family)
+    if renamed and renamed in _AUDIO_QUALIFIED_FAMILIES:
+        # The old name's entry says nothing about the renamed implementation.
+        raise NotImplementedError(
+            f"Unsloth MLX: audio training is not supported for '{family}'. "
+            f"mlx-vlm {installed or 'unknown'} loads this checkpoint as "
+            f"'{family}', which is a different implementation from the "
+            f"'{renamed}' this package qualified on mlx-vlm "
+            f"{_AUDIO_QUALIFIED_FAMILIES[renamed]}. Pin that version to train "
+            f"on audio with this model."
+        )
     if not _AUDIO_QUALIFIED_FAMILIES:
         raise NotImplementedError(
             f"Unsloth MLX: audio inputs were found in this dataset, but audio "
@@ -5862,13 +5919,13 @@ def _check_audio_family_gate(processor):
             f"image parts of this dataset."
         )
     supported = ", ".join(
-        f"{name} (mlx-vlm {', '.join(sorted(versions))})"
+        f"{name} (mlx-vlm {versions})"
         for name, versions in sorted(_AUDIO_QUALIFIED_FAMILIES.items())
     )
     if probed:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' has only been verified "
-            f"on mlx-vlm {', '.join(sorted(probed))}, but mlx-vlm "
+            f"on mlx-vlm {probed}, but mlx-vlm "
             f"{installed or 'unknown'} is installed. Pin a verified version to "
             f"train on audio. Verified: {supported}."
         )
