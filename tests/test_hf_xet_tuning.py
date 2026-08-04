@@ -36,7 +36,9 @@ def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.Sy
         ram_source = "test",
         cpu_source = "test",
         free_disk_bytes = int(free_disk_gb * GB),
-        disk_source = "test",
+        # 0 GB means "not measured" for the tests that do not care; a REAL zero is a full disk and
+        # gets a source, because the two take different branches.
+        disk_source = "test" if free_disk_gb else "unknown",
     )
 
 
@@ -584,3 +586,29 @@ def test_the_flag_is_read_the_way_xet_core_reads_it():
     alias_only = {"HF_XET_HP": "1"}
     tuning.apply_xet_env(alias_only, profile = _profile(16))
     assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" not in alias_only
+
+
+def test_a_full_disk_is_not_read_as_an_unmeasured_one():
+    """shutil.disk_usage returning exactly zero free bytes is the case the clamp exists for, so it
+    must not share a sentinel with "we could not measure". A full cache filesystem otherwise kept
+    the whole 64 GB budget while one byte free took it to the floor."""
+    full = tuning.SystemProfile(
+        total_ram_bytes = 2048 * GB, available_ram_bytes = 2048 * GB, cpu_count = 192,
+        ram_source = "test", cpu_source = "test", free_disk_bytes = 0, disk_source = "/data",
+    )
+    env = tuning.xet_env_overrides(full)
+    assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+
+    unknown = dataclasses.replace(full, disk_source = "unknown")
+    env = tuning.xet_env_overrides(unknown)
+    assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
+
+
+def test_free_disk_reports_unknown_when_it_cannot_measure(monkeypatch):
+    import shutil
+
+    def _boom(_path):
+        raise OSError("no such filesystem")
+
+    monkeypatch.setattr(shutil, "disk_usage", _boom)
+    assert tuning._free_disk() == (0, "unknown")

@@ -370,8 +370,10 @@ def xet_env_overrides(
 
     # Never size a buffer for a transfer the disk cannot land. A quarter of free space is generous
     # for a buffer and still refuses to promise 64 GB of in-flight data to a disk with 20 GB left.
+    # disk_source, not truthiness: a successful reading of zero free bytes is a full disk, which is
+    # exactly when the clamp should bite, and must not read as "we could not measure".
     free = profile.free_disk_bytes
-    if free:
+    if profile.disk_source != "unknown":
         limit = _clamp(min(limit, free // 4), _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
 
     # The shared buffer is the one knob that moves throughput (2.70x on a 2 TB host; 1.45x from
@@ -480,7 +482,9 @@ def apply_xet_env(
     2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
     Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
 
-    *force* overwrites every variable, for callers building a fresh child environment. *fail_fast*
+    *force* overwrites every variable we would otherwise leave alone. It does not revoke a user-set
+    high-performance flag: that stand-down is our own sizing standing aside, not a default to force
+    through. *fail_fast*
     defaults to False here, unlike ``xet_env_overrides``, because this runs at import: the shortened
     timeouts would otherwise apply to every direct ``huggingface_hub`` download and upload in the
     process, none of which our ladder supervises. Supervised children pass ``fail_fast = True``.
