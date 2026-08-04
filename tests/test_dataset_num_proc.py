@@ -4,10 +4,9 @@
 """Tests for unsloth_zoo.dataset_num_proc.
 
 The module is stdlib-only by design, so it is loaded straight off disk rather
-than through ``import unsloth_zoo``: the worker-count assertions then stay
-meaningful on a host whose torch cannot import, which is the same host most
-likely to be tokenizing on CPU. A canary below pins the stdlib-only property,
-and another checks the module is reachable the normal way too.
+than through ``import unsloth_zoo``: the assertions then stay meaningful on a
+host whose torch cannot import, which is the host most likely to be tokenizing
+on CPU. Canaries below pin that property and the normal import path.
 """
 
 from __future__ import annotations
@@ -19,8 +18,8 @@ from pathlib import Path
 import pytest
 
 try:
-    # Before the dnp fixture spoofs sys.platform: multiprocess picks its concrete
-    # contexts from sys.platform at import time, so a first import under a spoofed
+    # Import before the dnp fixture spoofs sys.platform: multiprocess picks its
+    # concrete contexts from it at import time, so a first import under a spoofed
     # one hands a Windows runner the POSIX fork contexts.
     import multiprocess  # noqa: F401
 except ImportError:
@@ -45,9 +44,8 @@ def dnp(monkeypatch):
     module = _load_module()
     module.reset_warning_state()
     monkeypatch.delenv(module.NUM_PROC_ENV_VAR, raising = False)
-    # Pin the platform: macOS is refused by policy whatever the start method says,
-    # so every assertion expecting a worker count is really about a forking
-    # platform. Platform tests set their own value afterwards, which wins.
+    # Pin the platform: macOS is refused by policy whatever the start method
+    # says. Platform tests set their own value afterwards, which wins.
     monkeypatch.setattr(module.sys, "platform", "linux")
     return module
 
@@ -61,16 +59,15 @@ def _force_start_method(monkeypatch, dnp, method):
 
 @pytest.mark.parametrize("method", ["spawn", "forkserver", None])
 def test_non_fork_start_method_disables_multiprocessing(monkeypatch, dnp, method):
-    # Under spawn/forkserver the child must re-import the dynamically generated
-    # trainer module, which has no importable name, so workers cannot run.
+    # The child would have to re-import the dynamically generated trainer module,
+    # which has no importable name, so workers cannot run.
     _force_start_method(monkeypatch, dnp, method)
     assert dnp.get_dataset_num_proc(8) is None
     assert dnp.get_dataset_num_proc(None) is None
 
 
 def test_non_fork_start_method_warns_once(monkeypatch, dnp, capsys):
-    # Regression for eeffa4c065: an explicit value used to sail through the
-    # guard. It must be vetoed, and the veto must be visible.
+    # Regression for eeffa4c065: an explicit value used to sail through the guard.
     _force_start_method(monkeypatch, dnp, "spawn")
     dnp.get_dataset_num_proc(8)
     dnp.get_dataset_num_proc(8)
@@ -97,13 +94,13 @@ def test_non_positive_and_one_normalise_to_none(monkeypatch, dnp, value):
 def test_serial_as_none_false_preserves_an_explicit_one(monkeypatch, dnp):
     """The config layer must not collapse 1 to None.
 
-    unsloth_zoo.sft_prepare_dataset reads a config ``None`` as "auto-size me",
-    so writing None back for a user who asked for 1 would inflate it.
+    sft_prepare_dataset reads a config ``None`` as "auto-size me", so writing
+    None back for a user who asked for 1 would inflate it.
     """
     _force_start_method(monkeypatch, dnp, "fork")
     assert dnp.get_dataset_num_proc(1, serial_as_none = False) == 1
-    # 0 and negatives are incoherent requests but still mean "not parallel", so
-    # they land on the config serial sentinel (1), not on None.
+    # 0 and negatives are incoherent but still mean "not parallel", so they land
+    # on the config serial sentinel (1), not on None.
     assert dnp.get_dataset_num_proc(0, serial_as_none = False) == 1
     assert dnp.get_dataset_num_proc(-4, serial_as_none = False) == 1
 
@@ -111,8 +108,7 @@ def test_serial_as_none_false_preserves_an_explicit_one(monkeypatch, dnp):
 def test_config_layer_never_returns_none_while_forking_is_available(monkeypatch, dnp):
     """On a fork host no path may write None back to a config.
 
-    None means "auto-size me" downstream, so any route to it -- memory clamp,
-    explicit serial -- would re-inflate.
+    None means "auto-size me" downstream, so any route to it would re-inflate.
     """
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(psutil, "cpu_count", lambda *a, **k: 64)
@@ -134,11 +130,9 @@ def test_config_layer_is_none_not_one_on_a_non_fork_start_method(monkeypatch, dn
     Only SFT gets its map site rewritten (rl_replacements.py); DPO, KTO, CPO,
     ORPO, Reward and PRM pass ``args.dataset_num_proc`` straight into
     ``Dataset.map``, where a ``1`` builds a ``Pool(1)`` whose spawned child
-    re-imports the user's ``__main__`` (#3211 / #3397). Those configs carried
-    ``None`` on spawn hosts before this module; they must still.
-
-    None is safe here precisely because forking is unavailable: every auto-sizer
-    reading the config vetoes on a non-fork start method too.
+    re-imports the user's ``__main__`` (#3211 / #3397). None is safe here
+    precisely because forking is unavailable: every auto-sizer reading the config
+    vetoes on a non-fork start method too.
     """
     _force_start_method(monkeypatch, dnp, method)
     assert dnp.get_dataset_num_proc(desired, serial_as_none = False) is None
@@ -152,7 +146,7 @@ def test_config_layer_env_forced_serial_is_none_on_a_non_fork_start_method(monke
 
 
 def test_layering_config_then_map_site_is_correct(monkeypatch, dnp):
-    """Composing the two layers must land on the right value for each intent."""
+    """Composing the two layers must preserve each intent."""
     _force_start_method(monkeypatch, dnp, "fork")
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(psutil, "cpu_count", lambda *a, **k: 32)
@@ -164,11 +158,11 @@ def test_layering_config_then_map_site_is_correct(monkeypatch, dnp):
     cfg = lambda v: dnp.get_dataset_num_proc(v, serial_as_none = False)  # noqa: E731
     site = dnp.get_dataset_num_proc
 
-    # user asked for serial -> stays serial, never auto-inflated
+    # serial stays serial, never auto-inflated
     assert site(cfg(1)) is None
-    # user asked for a specific count -> honoured end to end
+    # a specific count is honoured end to end
     assert site(cfg(6)) == 6
-    # user asked for nothing -> capped auto, and re-applying is idempotent
+    # nothing asked for -> capped auto, and re-applying is idempotent
     assert cfg(None) == dnp.AUTO_NUM_PROC_CAP
     assert site(cfg(None)) == dnp.AUTO_NUM_PROC_CAP
 
@@ -221,8 +215,7 @@ def test_explicit_value_is_clamped_by_memory(monkeypatch, dnp, capsys):
 
     Studio passes an explicit ``max(1, cpu_count // 4)``, dozens of workers at
     ~680 MB each on a big-core machine, and the old heuristic capped only the
-    auto path -- so an explicit request sailed through however little RAM there
-    was.
+    auto path -- so it sailed through however little RAM there was.
     """
     _force_start_method(monkeypatch, dnp, "fork")
     psutil = pytest.importorskip("psutil")
@@ -287,9 +280,9 @@ def test_env_override_can_force_in_process(monkeypatch, dnp, raw):
 @pytest.mark.parametrize("raw", ["0", "none", "None", "false", "", "1"])
 def test_env_override_in_process_is_encoded_for_the_config_layer(monkeypatch, dnp, raw):
     # Regression: the env override used to return before _serial(), writing None
-    # into the *config*, which unsloth_zoo.sft_prepare_dataset reads as
-    # "auto-size me" -- so the hatch the dead-worker message recommends raised
-    # the worker count instead of removing it. Config serial is 1, never None.
+    # into the *config*, read downstream as "auto-size me" -- so the hatch the
+    # dead-worker message recommends raised the worker count instead of removing
+    # it. Config serial is 1, never None.
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, raw)
     assert dnp.get_dataset_num_proc(16, serial_as_none = False) == 1
@@ -312,9 +305,9 @@ def test_invalid_env_override_is_ignored_with_a_warning(monkeypatch, dnp, capsys
 
 
 def test_start_method_probe_prefers_multiprocess_and_has_no_side_effects(dnp):
-    """datasets does `from multiprocess import Pool`, so `multiprocess` -- not
-    stdlib multiprocessing -- decides how map() spawns. Reading it must also not
-    pin the context, which would make a later set_start_method() raise."""
+    """datasets does `from multiprocess import Pool`, so `multiprocess` decides
+    how map() spawns. Reading it must not pin the context, which would make a
+    later set_start_method() raise."""
     multiprocess = pytest.importorskip("multiprocess")
     import multiprocessing
 
@@ -323,9 +316,8 @@ def test_start_method_probe_prefers_multiprocess_and_has_no_side_effects(dnp):
 
     method = dnp.multiprocessing_start_method()
 
-    # Must name a method this host offers. The private default-context chain has
-    # answered "fork" on Windows, which offers only spawn; believing it would
-    # read Windows as forkable and let workers through.
+    # Must name a method this host offers: the private default-context chain has
+    # answered "fork" on Windows, which offers only spawn.
     assert method in multiprocess.get_all_start_methods()
     assert multiprocess.get_start_method(allow_none = True) == before_mp
     assert multiprocessing.get_start_method(allow_none = True) == before_std
@@ -364,10 +356,9 @@ def test_start_method_probe_prefers_the_real_default_over_list_order(monkeypatch
 
     It copies stdlib ``get_all_start_methods()`` verbatim, darwin branch
     included, while keeping ``fork`` as its ``_default_context`` on every POSIX
-    platform (``#FIXME: spawn`` in multiprocess/context.py). Since ``datasets``
-    pools come from ``multiprocess``, trusting the list would say 'spawn' while
-    ``Dataset.map`` forks -- vetoing every worker and misreporting the start
-    method in the dead-worker diagnostics.
+    platform (``#FIXME: spawn`` in multiprocess/context.py). Trusting the list
+    would say 'spawn' while ``Dataset.map`` forks -- vetoing every worker and
+    misreporting the start method in the dead-worker diagnostics.
     """
     import sys as _sys
 
@@ -392,8 +383,7 @@ def test_macos_stays_in_process_even_though_multiprocess_forks(monkeypatch, dnp,
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: 1000)
     monkeypatch.setattr(dnp.sys, "platform", "darwin")
 
-    # Serial at a map() call site, None -- not 1 -- at the config layer, so no
-    # Pool is built on datasets >= 4.1 either way.
+    # None -- not 1 -- at the config layer too, so no Pool is built either way.
     assert dnp.get_dataset_num_proc(8) is None
     assert dnp.get_dataset_num_proc(8, serial_as_none = False) is None
     assert dnp.get_dataset_num_proc(None) is None
@@ -437,8 +427,8 @@ _DATASETS_MESSAGE = (
 
 
 def test_worker_death_is_reraised_with_context(dnp):
-    # datasets discards the child's exit status, so the original message cannot
-    # distinguish an OOM kill from anything else.
+    # datasets discards the child's exit status, so its message cannot tell an
+    # OOM kill from anything else.
     with pytest.raises(RuntimeError) as caught:
         with dnp.map_failure_diagnostics(8):
             raise RuntimeError(_DATASETS_MESSAGE)
@@ -449,7 +439,7 @@ def test_worker_death_is_reraised_with_context(dnp):
     assert "8GB" in message, "should estimate what those workers cost"
     assert dnp.NUM_PROC_ENV_VAR in message, "must name the escape hatch"
     assert "out-of-memory" in message
-    # The child's traceback must survive for anyone who wants it.
+    # The child's traceback must survive.
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert _DATASETS_MESSAGE in str(caught.value.__cause__)
 
@@ -464,8 +454,7 @@ def test_worker_death_diagnostics_handles_in_process_runs(dnp):
 
 
 def test_unrelated_errors_pass_through_untouched(dnp):
-    # Only the dead-worker message is rewritten, and non-RuntimeError types are
-    # not caught at all.
+    # Only the dead-worker message is rewritten; other types are not caught.
     original = RuntimeError("CUDA out of memory")
     with pytest.raises(RuntimeError) as caught:
         with dnp.map_failure_diagnostics(4):
@@ -490,10 +479,10 @@ def test_the_recovery_advice_does_not_promise_more_than_it_delivers(dnp):
 
     The dead-worker message is the one place a user is told what to do next, so
     it has to be true. On fork, train_on_responses_only over the Zoo's threshold
-    gets ``1`` rather than ``None`` -- deliberately, since a bare None reads as
-    "size it for me" and would inflate to the Zoo's uncapped count -- which
-    ``datasets`` >= 4.1 turns into a Pool(1). Saying "tokenize in-process"
-    flatly was wrong for exactly the large-dataset runs that die.
+    gets ``1`` rather than ``None`` -- deliberately, since a bare None would
+    inflate to the Zoo's uncapped count -- which ``datasets`` >= 4.1 turns into a
+    Pool(1). Saying "tokenize in-process" flatly was wrong for exactly the
+    large-dataset runs that die.
     """
     with pytest.raises(RuntimeError) as excinfo:
         with dnp.map_failure_diagnostics(8):
@@ -506,11 +495,7 @@ def test_the_recovery_advice_does_not_promise_more_than_it_delivers(dnp):
 
 
 def test_the_advice_matches_what_the_resolver_actually_returns(dnp, monkeypatch):
-    """Executed, not just read: drive both branches of the claim above.
-
-    A message asserting a behaviour the resolver does not have would be worse
-    than the vague one it replaced.
-    """
+    """Drive both branches of the claim above, rather than only reading it."""
 
     class _Split:
         def __init__(self, n):
@@ -543,8 +528,7 @@ def test_probe_rejects_a_start_method_the_host_does_not_offer(monkeypatch, dnp):
     """The private default-context chain is not trustworthy on its own.
 
     On a Windows runner it answered "fork" while get_all_start_methods() was
-    ["spawn"]. Believing it read Windows as forkable, so
-    _workers_unusable_reason() returned None and workers were let through --
+    ["spawn"]. Believing it read Windows as forkable and let workers through --
     the spawn re-import loop of #3211 / #3397.
     """
     import sys as _sys
@@ -575,8 +559,7 @@ def test_the_module_imports_nothing_but_the_standard_library():
 
     psutil and multiprocess are read inside functions, behind try/except, so a
     host without them degrades to a conservative answer instead of failing to
-    import. A top-level dependency here would take that away, and would also
-    make importing the policy cost whatever that dependency costs.
+    import. A top-level dependency here would take that away.
     """
     tree = ast.parse(MODULE_PATH.read_text(encoding = "utf-8"))
     top_level = []
@@ -595,8 +578,8 @@ def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
     """The dotted path the generated trainer source imports.
 
     unsloth/models/rl.py bakes `from unsloth_zoo.dataset_num_proc import ...`
-    into every trainer it generates, so a rename here breaks code that is
-    already written to disk in users' unsloth_compiled_cache.
+    into every trainer it generates, so a rename breaks code already written to
+    disk in users' unsloth_compiled_cache.
     """
     pytest.importorskip("torch")
     from unsloth_zoo.dataset_num_proc import get_dataset_num_proc
