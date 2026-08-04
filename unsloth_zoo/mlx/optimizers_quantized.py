@@ -21,8 +21,8 @@ Packing ``m`` to 8 bits cuts that by ``1 - (f*(1/b + 2/G) + (1-f) + 1)/2`` for a
 dtype of ``b`` bytes, group size ``G`` and an eligible byte fraction ``f``.
 Measured end to end on SmolLM2-135M, group_size=64:
 
-    full fine-tune, float32 state   35.9%     LoRA r=64        35.9%
-    full fine-tune, bfloat16 state  23.4%     LoRA r=16/r=32   35.9%
+    full fine-tune, float32 state   35.9%     LoRA r=32/r=64   35.9%
+    full fine-tune, bfloat16 state  23.4%     LoRA r=16        34.6%
 
 Only the first two are the "8-bit vs 32-bit" figure. MLX creates moments with
 ``mx.zeros_like(parameter)``, so a bfloat16 model has bfloat16 moments and the
@@ -35,6 +35,11 @@ silently excluded LoRA_B below rank 64 and held r=16/r=32 to 18.3%. Anything und
 ``MIN_QUANTIZE_SIZE`` elements keeps a full-width moment: those are the norms and
 biases, worth no bytes and the least tolerant of the error. bitsandbytes draws the
 same line at the same threshold (``min_8bit_size``).
+
+That floor is why r=16 lands at 34.6% rather than 35.9%: under grouped-query
+attention the k/v projections are narrow, so their LoRA_B is ``(kv_dim, r)`` and at
+r=16 that is 3072 elements on a 135M model. The figure is therefore model-shape
+dependent below r=32; a square fixture will report the full 35.9% and overstate it.
 
 This shrinks PERSISTENT state, not peak allocation: ``apply_single`` materialises
 a full-width ``m`` per parameter per step, and peak rose 11.7% on Metal and 29.9%
