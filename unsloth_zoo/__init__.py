@@ -14,6 +14,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# Keeps PEP 604 annotations (`str | Path`) from being evaluated at def time, which
+# is a TypeError on the 3.9 floor pyproject declares.
+from __future__ import annotations
+
 __version__ = "2026.8.2"
 
 import os

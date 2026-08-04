@@ -28,6 +28,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 604 annotations below would evaluate at def time and raise on Python 3.9.
+from __future__ import annotations
+
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
