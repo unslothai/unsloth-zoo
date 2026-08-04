@@ -203,3 +203,29 @@ def test_adamax_is_built_with_the_torch_first_moment_bias_correction():
         "_BiasCorrectedAdamax no longer overrides the update, so it is stock "
         "MLX Adamax under a different name"
     )
+
+
+def test_hf_trainer_drops_optim_args_for_rmsprop_too():
+    """Why the RMSprop branch takes no ``optim_args``: HF Trainer's RMSPROP
+    branch sets only ``optimizer_cls``, and ``optim_args`` is merged in by the
+    GaLore/Apollo/GrokAdamW branches alone. ``momentum``/``alpha``/``centered``
+    are dropped on the torch backend as well, and MLX RMSprop's own defaults
+    already equal torch's, so honouring them here would *introduce* a
+    divergence from the recipe rather than remove one."""
+    transformers = pytest.importorskip("transformers")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        args = transformers.TrainingArguments(
+            output_dir=directory,
+            optim="rmsprop",
+            optim_args="momentum=0.9,alpha=0.95,centered=True",
+            report_to=[],
+        )
+        cls, kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(args)
+
+    assert cls is __import__("torch").optim.RMSprop
+    assert set(kwargs) == {"lr"}, (
+        "HF Trainer now forwards optim_args to RMSprop; the MLX branch must "
+        f"parse and apply them instead of relying on defaults ({kwargs})"
+    )
