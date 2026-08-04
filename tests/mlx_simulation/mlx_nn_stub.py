@@ -57,6 +57,7 @@ class Module:
 
     def __init__(self):
         self._mlx_inference_mode = False
+        self._mlx_property_state = set()
 
     def parameters(self):
         """Return a dict of {leaf_path: tensor} for tree_flatten consumption."""
@@ -72,6 +73,44 @@ class Module:
 
     def trainable_parameters(self):
         return self.parameters()
+
+    def __contains__(self, key):
+        """Mirror membership in MLX's dict-backed module state."""
+        if key in self._mlx_property_state:
+            return True
+        value = vars(self).get(key)
+        return isinstance(value, (torch.Tensor, Module, dict, list, tuple))
+
+    def _track_property_state(self, key, value):
+        if isinstance(value, (torch.Tensor, Module, dict, list, tuple)):
+            self._mlx_property_state.add(key)
+        else:
+            self._mlx_property_state.discard(key)
+
+    def children(self):
+        """Return direct child Modules while preserving container structure."""
+        def child_tree(value):
+            if isinstance(value, Module):
+                return value
+            if isinstance(value, dict):
+                return {
+                    key: child_tree(item)
+                    if isinstance(item, (Module, dict, list)) else {}
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [
+                    child_tree(item)
+                    if isinstance(item, (Module, dict, list)) else {}
+                    for item in value
+                ]
+            return {}
+
+        return {
+            name: child_tree(value)
+            for name, value in vars(self).items()
+            if isinstance(value, (Module, dict, list))
+        }
 
     def named_modules(self, prefix=""):
         """Yield (path, module) pairs walking the full Module tree.
@@ -194,6 +233,9 @@ class Linear(Module):
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+        self._mlx_property_state.add("weight")
+        if self.linear.bias is not None:
+            self._mlx_property_state.add("bias")
         self.in_features = in_features
         self.out_features = out_features
 
@@ -204,11 +246,16 @@ class Linear(Module):
     @weight.setter
     def weight(self, value):
         if isinstance(value, torch.Tensor):
+            requires_grad = (
+                self.linear.weight.requires_grad
+                if self.linear.weight is not None else True
+            )
             self.linear.weight = torch.nn.Parameter(
-                value.detach().clone(), requires_grad=self.linear.weight.requires_grad
+                value.detach().clone(), requires_grad=requires_grad
             )
         else:
             self.linear.weight = value
+        self._track_property_state("weight", value)
 
     @property
     def bias(self):
@@ -217,25 +264,25 @@ class Linear(Module):
     @bias.setter
     def bias(self, value):
         if isinstance(value, torch.Tensor):
+            requires_grad = (
+                self.linear.bias.requires_grad
+                if self.linear.bias is not None else True
+            )
             self.linear.bias = torch.nn.Parameter(
-                value.detach().clone(), requires_grad=self.linear.bias.requires_grad
+                value.detach().clone(), requires_grad=requires_grad
             )
         else:
             self.linear.bias = value
+        self._track_property_state("bias", value)
 
     def __call__(self, x):
         return self.linear(x)
-
-    def __contains__(self, key):
-        if key == "bias":
-            return self.linear.bias is not None
-        return False
-
 
 class Embedding(Module):
     def __init__(self, num_embeddings, dims):
         super().__init__()
         self.embedding = torch.nn.Embedding(num_embeddings, dims)
+        self._mlx_property_state.add("weight")
         self.num_embeddings = num_embeddings
         self.dims = dims
 
@@ -246,12 +293,17 @@ class Embedding(Module):
     @weight.setter
     def weight(self, value):
         if isinstance(value, torch.Tensor):
+            requires_grad = (
+                self.embedding.weight.requires_grad
+                if self.embedding.weight is not None else True
+            )
             self.embedding.weight = torch.nn.Parameter(
                 value.detach().clone(),
-                requires_grad=self.embedding.weight.requires_grad,
+                requires_grad=requires_grad,
             )
         else:
             self.embedding.weight = value
+        self._track_property_state("weight", value)
 
     def __call__(self, x):
         return self.embedding(x)
@@ -259,7 +311,6 @@ class Embedding(Module):
     def as_linear(self, x):
         """MLX shortcut for tied lm_head: weight @ x."""
         return F.linear(x, self.embedding.weight)
-
 
 class AvgPool2d(Module):
     def __init__(self, kernel_size, stride=None, padding=0):
@@ -302,9 +353,6 @@ class QuantizedLinear(Module):
         if self.bias is not None:
             out = out + self.bias
         return out
-
-    def __contains__(self, key):
-        return key == "bias" and self.bias is not None
 
 
 class QuantizedEmbedding(Module):

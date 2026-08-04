@@ -59,7 +59,7 @@ _LOCK = threading.Lock()
 
 
 def _close_server():
-    """Terminate the visual-server child so a parent exit (e.g. Studio's teardown) never leaves an
+    """Terminate the visual-server child so a parent exit (e.g. Unsloth's teardown) never leaves an
     orphaned GPU process. Idempotent. The child is also launched with PR_SET_PDEATHSIG (see
     visual_engine) so a hard kill of this process still reaps it."""
     srv = _STATE.pop("server", None)
@@ -138,7 +138,7 @@ def _timings_from_stats(stats):
     """Build a `timings` block from the server STATS summary. Returns (timings, prompt_n, completion_n).
 
     No autoregressive prefill exists, so we emit no prompt tok/s (the old one divided tokens by host
-    tokenize time and showed a meaningless ~14000). We report the diffusion CLI's two rates so Studio
+    tokenize time and showed a meaningless ~14000). We report the diffusion CLI's two rates so Unsloth
     matches the terminal: effective = canvas*blocks/wall (end-to-end, ~hundreds) and in-step parallel =
     canvas*steps/wall (the model's real per-step rate, ~thousands)."""
     def rate(n, ms):
@@ -163,7 +163,7 @@ def _timings_from_stats(stats):
         "predicted_ms": wall_ms,
         "predicted_per_second": par_tps,
         "cache_n": 0,
-        # Diffusion-specific breakdown (Studio shows these in a dedicated tooltip section).
+        # Diffusion-specific breakdown (Unsloth shows these in a dedicated tooltip section).
         "diffusion": True,
         "diffusion_blocks": blocks,
         "diffusion_steps": steps,
@@ -309,7 +309,7 @@ async def chat(req: Request):
         while True:
             kind, payload = await q.get()
             if kind == "frame":
-                # A valid (empty-delta) chunk plus a type tag: Studio routes on the tag, while a
+                # A valid (empty-delta) chunk plus a type tag: Unsloth routes on the tag, while a
                 # strict OpenAI client parses it as a no-op chunk and ignores the extra fields.
                 block, step, total, text = payload
                 yield _sse({**_chunk(cid, created, {}), "type": "diffusion_frame",
@@ -336,7 +336,7 @@ async def chat(req: Request):
                         art = _artifact(frames)
                         if art:
                             yield _sse(_chunk(cid, created, {"content": art}))
-                    # llama-server-style usage+timings chunk (empty choices) so Studio shows the
+                    # llama-server-style usage+timings chunk (empty choices) so Unsloth shows the
                     # stat tooltip plus the diffusion rows (steps, blocks).
                     timings, P, G = _timings_from_stats(stats_box)
                     yield _sse({"id": cid, "object": "chat.completion.chunk", "created": created,
@@ -368,11 +368,15 @@ def main():
     ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
     ap.add_argument("--maxtok", type=int, default=0,
                     help="per-turn context budget; 0 = auto-size the largest that fits VRAM")
+    ap.add_argument("--ngl", type=int, default=None,
+                    help="layers to offload to GPU; omit for all, 0 for CPU-only. Lower this when "
+                         "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
     _STATE["player"] = open(_PLAYER_TEMPLATE).read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
-    _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok)
+    _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
+    print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
     print(f"DiffusionGemma OpenAI shim ready on http://{args.host}:{args.port}  (model={MODEL_ID})",
           flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

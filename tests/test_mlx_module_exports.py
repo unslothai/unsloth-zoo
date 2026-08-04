@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Verify every MLX-using unsloth_zoo module imports under the shim
-and exposes the symbols Studio integrations rely on.
+and exposes the symbols Unsloth integrations rely on.
 
 If a test fails with `_Noop` / NotImplementedError, the failing
 symbol identifies a TODO in mlx_simulation/.
@@ -52,7 +52,7 @@ def test_mlx_module_imports(module_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. Studio backend contract: FastMLXModel and the dynamically-attached save methods
+# 2. Unsloth backend contract: FastMLXModel and the dynamically-attached save methods
 #    must be reachable.
 # ---------------------------------------------------------------------------
 
@@ -84,7 +84,7 @@ def test_full_finetune_dtype_default_matches_torch_bf16():
 
 
 def test_fast_mlx_model_save_helpers_exist():
-    """Studio backend calls model.save_pretrained_merged / save_lora_adapters /
+    """Unsloth backend calls model.save_pretrained_merged / save_lora_adapters /
     push_to_hub_merged on the FastMLXModel INSTANCE returned by
     FastMLXModel.from_pretrained.  The helpers are module-level in
     loader.py and attached via types.MethodType after load.
@@ -106,7 +106,7 @@ def test_trainer_classes():
         MLXTrainer,
         MLXTrainingConfig,
     )
-    # train_on_responses_only is the third symbol Studio backend imports
+    # train_on_responses_only is the third symbol Unsloth backend imports
     import unsloth_zoo.mlx.trainer as mt
     assert hasattr(mt, "train_on_responses_only") or hasattr(mt, "MLXTrainer")
 
@@ -203,6 +203,37 @@ def test_trainer_config_smoke():
         # Required args are fine; we only need the class to be inspectable.
         ok = dataclasses.is_dataclass(MLXTrainingConfig) or True
     assert ok
+
+
+# ---------------------------------------------------------------------------
+# 8. Warm-start contract: the documented from_pretrained behaviour must match
+#    the adapter-reload code. The reload restores the non-adapter tensors a
+#    save_trainable_adapters checkpoint recorded as trainable, so the docstring
+#    must describe that instead of promising an adapter-only trainable set.
+# ---------------------------------------------------------------------------
+
+def test_from_pretrained_documents_restored_non_adapter_trainables():
+    import inspect
+    import unsloth_zoo.mlx.loader as ml
+
+    source = inspect.getsource(ml.FastMLXModel.from_pretrained)
+    assert "_unfreeze_saved_mlx_non_adapter_parameters(" in source, (
+        "adapter reload no longer restores saved non-adapter trainables; "
+        "the from_pretrained docstring must be updated to match"
+    )
+    doc = inspect.getdoc(ml.FastMLXModel.from_pretrained) or ""
+    assert "save_trainable_adapters" in doc, (
+        "from_pretrained restores the non-adapter tensors held by a "
+        "save_trainable_adapters checkpoint, but its docstring never says so"
+    )
+    stale = [
+        phrase for phrase in ("are not re-enabled", "re-specify them")
+        if phrase in doc
+    ]
+    assert not stale, (
+        "from_pretrained docstring still claims saved non-adapter tensors stay "
+        f"frozen on reload: {stale}"
+    )
 
 
 def test_adam_optimizers_enable_bias_correction():

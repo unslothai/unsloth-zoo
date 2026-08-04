@@ -236,7 +236,7 @@ tuner_trainer_module.iterate_batches = _iterate_batches
 sample_utils_module = _pkg("mlx_lm.sample_utils")
 
 
-def _make_sampler(temp=1.0, top_p=1.0, top_k=0, min_tokens_to_keep=1, **kw):
+def _make_sampler(temp=1.0, top_p=1.0, top_k=0, min_p=0.0, min_tokens_to_keep=1, **kw):
     """Build a callable that takes logits and returns a sampled token id."""
     def sampler(logits):
         if temp == 0:

@@ -56,6 +56,17 @@ def _try_get_class(dotted_module: str, class_name: str):
     return getattr(mod, class_name, None)
 
 
+def _bitsandbytes_or_skip():
+    """Import bitsandbytes, skipping when it resolves to the unsloth stub.
+
+    The MLX-on-torch simulation injects a permissive stub, against which pinning
+    the real upstream signature is meaningless, so skip rather than false-DRIFT."""
+    bnb = pytest.importorskip("bitsandbytes")
+    if getattr(bnb, "IS_UNSLOTH_STUB", False):
+        pytest.skip("bitsandbytes is stubbed (MLX simulation active); cannot pin real upstream signature")
+    return bnb
+
+
 def _require_class(dotted_module: str, class_name: str, zoo_file: str):
     """Like ``_try_get_class`` but DRIFT-fail when the parent module
     exists but the class is missing. Skip when parent module is missing
@@ -194,7 +205,7 @@ def _has_var_keyword(func) -> bool:
 def test_bitsandbytes_top_level_Linear4bit_alias():
     """bitsandbytes.py:110 patches top-level ``bitsandbytes.nn.Linear4bit``
     alias; pin presence + .forward method."""
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _bitsandbytes_or_skip()
     top_level = getattr(bnb.nn, "Linear4bit", None)
     inner = getattr(bnb.nn.modules, "Linear4bit", None)
     if top_level is None or inner is None:
@@ -213,7 +224,7 @@ def test_bitsandbytes_top_level_Linear4bit_alias():
 def test_bitsandbytes_Params4bit_class_present():
     """bitsandbytes.py:47-67 reads ``Params4bit`` and conditionally
     deletes ``__torch_function__`` (torch.compile recursion fix)."""
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _bitsandbytes_or_skip()
     p4 = getattr(bnb.nn.modules, "Params4bit", None)
     if p4 is None:
         pytest.fail(
@@ -225,7 +236,7 @@ def test_bitsandbytes_Params4bit_class_present():
 def test_bitsandbytes_fix_4bit_weight_quant_state_from_module_present():
     """bitsandbytes.py:48 / :73 calls
     ``fix_4bit_weight_quant_state_from_module(self)``."""
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _bitsandbytes_or_skip()
     fn = getattr(bnb.nn.modules, "fix_4bit_weight_quant_state_from_module", None)
     if fn is None:
         pytest.fail(
@@ -251,7 +262,7 @@ def test_bitsandbytes_fix_4bit_weight_quant_state_from_module_present():
 
 def test_bitsandbytes_matmul_4bit_present():
     """bitsandbytes.py:106 calls top-level ``bitsandbytes.matmul_4bit(...)``."""
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _bitsandbytes_or_skip()
     if not hasattr(bnb, "matmul_4bit"):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/bitsandbytes.py:106 expects "
@@ -2382,7 +2393,7 @@ def test_bitsandbytes_linear4bit_init_signature():
     ``bitsandbytes.nn.modules.Linear4bit.__init__(input_features,
     output_features, ...)`` (zoo's patched forward dereferences
     self.weight / self.bias)."""
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _bitsandbytes_or_skip()
     cls = getattr(bnb.nn.modules, "Linear4bit", None)
     if cls is None:
         pytest.fail(

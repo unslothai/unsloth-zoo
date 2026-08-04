@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Unsloth Zoo - Utilities for Unsloth
-# mlx_vlm stub — Studio inference + permissive submodules for 40+ VLM archs
+# mlx_vlm stub — Unsloth inference + permissive submodules for 40+ VLM archs
 """
 mlx_vlm — Vision Language Model wrapper.
 
@@ -44,7 +44,7 @@ def generate_step(*args, **kwargs):
 def load(*args, **kwargs):
     raise NotImplementedError(
         "mlx-shim: mlx_vlm.load not implemented; PR-B's tests assert this is "
-        "NOT called by Studio. If you hit this, Studio dispatch is broken."
+        "NOT called by Unsloth. If you hit this, Unsloth dispatch is broken."
     )
 
 
@@ -68,8 +68,19 @@ def _vlm_load_config(*args, **kwargs):
     return {}
 
 
+def _prepare_inputs(*args, **kwargs):
+    return {}
+
+
+def _process_image(image, *args, **kwargs):
+    return image
+
+
 utils_module.skip_multimodal_module = _skip_multimodal_module
 utils_module.load_config = _vlm_load_config
+# The batched vision adapter binds both at construction time.
+utils_module.prepare_inputs = _prepare_inputs
+utils_module.process_image = _process_image
 
 prompt_utils_module = _pkg("mlx_vlm.prompt_utils")
 models_module = _pkg("mlx_vlm.models")
