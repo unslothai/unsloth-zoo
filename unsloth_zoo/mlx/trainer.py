@@ -3670,6 +3670,16 @@ class MLXTrainer:
                         mx.array(math.pi) * cycle_progress
                     )
                 )
+                # HF returns 0 once progress reaches 1 instead of letting the
+                # modulo wrap back to a fresh cycle at full LR
+                # (transformers/optimization.py:181-182). Reachable here: a
+                # ragged final epoch can force one extra optimizer update, so
+                # step can equal total_steps and land exactly on progress == 1.
+                decay = mx.where(
+                    progress >= mx.array(1.0, dtype=mx.float32),
+                    mx.array(0.0, dtype=mx.float32),
+                    decay,
+                )
             elif sched_type == "linear":
                 decay = mx.array(1.0, dtype=mx.float32) - progress
             elif sched_type == "polynomial":

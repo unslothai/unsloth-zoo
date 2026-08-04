@@ -8461,3 +8461,32 @@ def test_cosine_warmup_with_min_lr_is_not_silently_aliased():
     assert _normalize_mlx_scheduler_type("SchedulerType.cosine_with_min_lr") == "cosine"
     with pytest.raises(ValueError, match="cosine_warmup_with_min_lr"):
         _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr")
+
+
+def test_cosine_with_restarts_does_not_wrap_to_full_lr_past_the_end():
+    """HF returns 0 once progress hits 1 rather than starting a fresh cycle
+    (transformers/optimization.py:181-182). A ragged final epoch can force one
+    extra optimizer update, so step == total_steps is reachable and previously
+    snapped the LR back to its peak on that update."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 60
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=0,
+        lr_scheduler_type="cosine_with_restarts",
+        lr_scheduler_num_cycles=3,
+    )
+    schedule = trainer._build_schedule(total)
+    for step in (total - 1, total, total + 1, total + 30, total * 2):
+        expected = lr * (
+            optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+                step, num_warmup_steps=0, num_training_steps=total, num_cycles=3
+            )
+        )
+        assert float(schedule(step)) == pytest.approx(expected, abs=1e-9), step
+    assert float(schedule(total)) == pytest.approx(0.0)
