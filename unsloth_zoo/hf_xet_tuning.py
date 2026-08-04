@@ -60,22 +60,16 @@ XET_HIGH_PERFORMANCE_VARS = ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
-# xet-core's high-performance preset is not a mode, it is a set of ordinary knobs
-# (xet_runtime/src/config/xet_config.rs with_high_performance): a 64 GB buffer limit, 16 GB of
-# buffer, 2 GB per file, 124 streams. So rather than choose between "capped" and "that preset", we
-# write the same knobs scaled to the machine in front of us.
-#
-# One eighth of RAM is the anchor. It reproduces the table this replaces at every point it had
-# (8 GB -> 1 GB, 16 -> 2, 32 -> 4, 128 -> 16, 256 -> 32) and simply keeps going, so a big host gets
-# a big budget and a laptop is unchanged. The ceiling is xet-core's own 64 GB, because past that
-# the preset stops helping and we would only be reserving address space.
+# The high-performance preset is not a mode, just knobs (xet_config.rs with_high_performance:
+# 64 GB limit, 16 GB buffer, 2 GB per file, 124 streams), so we write the same ones scaled to the
+# machine. An eighth of RAM reproduces the table this replaces at every point it defined
+# (8 GB -> 1 GB, 16 -> 2, 32 -> 4, 128 -> 16, 256 -> 32) and keeps going, to xet-core's own 64 GB.
 _RAM_FRACTION = 8
 _MIN_BUFFER_LIMIT = 1 * _GB
 _MAX_BUFFER_LIMIT = 64 * _GB
-# Measured on a 192-core 1996 GiB box against a 20 Gbit/s link: raising the BUFFER group alone is
-# worth 2.41x (6771 -> 16306 Mbit/s), raising the CONCURRENCY group alone is worth nothing (0.92x).
-# So the buffer is the lever, and streams and files exist only to keep it fed -- which is why they
-# follow cores, and why neither is allowed past what the buffer budget can actually hold.
+# Measured on a 192-core / 20 Gbit/s host: the buffer group alone is worth 2.70x, the concurrency
+# group alone nothing (0.92x). Streams and files exist to keep the buffer fed, so they follow cores
+# and never exceed what the budget can hold.
 _MAX_STREAMS = 124
 _MAX_CONCURRENT_FILES = 24
 # xet-core's xorb size: the unit a single download stream has outstanding at any moment.
@@ -368,13 +362,11 @@ def xet_env_overrides(
     if free:
         limit = _clamp(min(limit, free // 4), _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
 
-    # The shared buffer is the ONE knob that moves throughput, measured twice: 2.70x from the
-    # buffer group on a 2 TB host, and 1.45x from this single value on an 8 GB laptop, where a
-    # quarter of the budget (256 MB) ran at 0.73x of what shipped before. So the rule is not a
-    # ratio, it is: never hand a machine less than xet-core's own 2 GB default unless something
-    # forces us to. Two things do. Half the budget, because a shared buffer larger than that
-    # leaves no room for the per-file ones; and a sixth of RAM, which is what keeps the floor from
-    # overriding the memory bound on a 2 GB VM, where stock would be the whole machine.
+    # The shared buffer is the one knob that moves throughput (2.70x on a 2 TB host; 1.45x from
+    # this value alone on an 8 GB laptop, where a quarter of the budget ran at 0.73x). So it is a
+    # floor, not a ratio: reach for xet-core's 2 GB default, held back only by half the budget (a
+    # bigger share leaves no room for per-file buffers) and a sixth of RAM (which keeps the floor
+    # from overriding the memory bound on a 2 GB VM).
     size = min(
         max(limit // 4, min(_STOCK_BUFFER_SIZE, limit // 2)),
         max(256 * _MB, (profile.total_ram_bytes or 8 * _GB) // 6),
@@ -386,16 +378,12 @@ def xet_env_overrides(
     prefetch = _clamp(limit // 4, 128 * _MB, _STOCK_PREFETCH_BUFFER)
 
     cpus = profile.cpu_count
-    # More files or streams in flight than the machine has cores buys nothing -- and neither does
-    # more files than the budget can hold buffers for: size + max_files * perfile is what hf_xet
-    # can have outstanding, so deriving the count from the budget keeps those three numbers
-    # describing ONE allocation instead of three independent ones that overshoot together.
+    # size + max_files * perfile is what hf_xet can hold, so the count comes from the budget as
+    # well as from cores: three numbers describing one allocation, not three that overshoot.
     affordable = max(2, (limit - size) // perfile)
     max_files = _clamp(min(cpus, affordable), 2, _MAX_CONCURRENT_FILES)
-    # Streams follow cores, but a stream holds a 64 MiB xorb while it lands, so more streams than
-    # the budget has xorb slots for only queues work behind the semaphore. Both bounds matter: a
-    # 64-core CI container with 8 GB opened 124 streams under the core rule alone, which is exactly
-    # the "small machine, big numbers" case that hurts a thin link.
+    # A stream holds a 64 MiB xorb, so streams past the budget's xorb slots only queue behind the
+    # semaphore. Both bounds matter: a 64-core container with 8 GB opened 124 under cores alone.
     streams = _clamp(min(cpus * 2, max(4, limit // _XORB_BYTES)), 4, _MAX_STREAMS)
     if throttled:
         streams = max(4, streams // 2)
