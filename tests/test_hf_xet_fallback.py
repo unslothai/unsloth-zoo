@@ -4954,3 +4954,53 @@ def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
         assert "did not start" in calls[0]
     finally:
         stop.set()
+
+
+def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch, tmp_path):
+    """The real parent has already sized itself at import, so its environment carries a buffer limit
+    computed for the global cache. Because the pre-spawn call is setdefault, that stale number would
+    survive into the child unless our own seeded values are dropped first."""
+    import collections
+    import os
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+
+    # Exactly what import leaves behind: the roomy default cache's numbers, in the environment and
+    # recorded as ours.
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot",
+        params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert int(rec["xet"][key]) == 1 * GB
+    assert os.environ[key] == str(64 * GB)  # the parent's own environment is untouched

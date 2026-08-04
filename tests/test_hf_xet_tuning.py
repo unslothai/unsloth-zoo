@@ -661,3 +661,40 @@ def test_an_explicit_cache_dir_is_the_disk_that_gets_measured(monkeypatch, tmp_p
     assert int(applied["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
     # No cache_dir: unchanged behaviour, the environment still decides.
     assert int(tuning.xet_env_overrides()["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+
+
+def test_a_process_already_sized_at_import_still_resizes_for_its_destination(monkeypatch, tmp_path):
+    """``apply_xet_env`` is setdefault and ``unsloth_zoo`` sizes itself at import, so by the time a
+    download names its ``cache_dir`` every sizing key is already in the environment and a second
+    apply writes nothing: the download would run on the global cache's numbers. ``resize_for_cache_dir``
+    drops what we seeded so the recompute lands, and leaves anything we did not write alone."""
+    import os as _os
+
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    _two_volumes(monkeypatch, str(roomy), str(tight))
+
+    fake_env = {"HF_HUB_CACHE": str(roomy / "hub")}
+    monkeypatch.setattr(_os, "environ", fake_env)
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+
+    tuning.apply_xet_env()  # what import does: sizes against the roomy default cache
+    assert int(fake_env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
+
+    # A second apply is a no-op on the seeded keys, which is the bug the resize exists to fix.
+    assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" not in tuning.apply_xet_env(
+        dict(fake_env), cache_dir = tight / "hub",
+    )
+
+    written = tuning.resize_for_cache_dir(dict(fake_env), tight / "hub")
+    assert int(written["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+
+    # A value we never wrote is not ours to recompute.
+    user_env = dict(fake_env)
+    user_env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"] = "16000000000"
+    assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" not in tuning.resize_for_cache_dir(
+        user_env, tight / "hub",
+    )
+    assert user_env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"] == "16000000000"

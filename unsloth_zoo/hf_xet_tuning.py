@@ -48,6 +48,7 @@ __all__ = [
     "xet_env_overrides",
     "xet_log_env",
     "apply_xet_env",
+    "resize_for_cache_dir",
     "scan_xet_log",
     "XET_HIGH_PERFORMANCE_VARS",
 ]
@@ -477,6 +478,9 @@ def xet_log_env(log_dir: "str | Path", *, diagnostics: bool = False) -> dict[str
     return env
 
 
+_SEEDED_INTO_ENVIRON: dict[str, str] = {}
+
+
 def apply_xet_env(
     env: "Optional[dict]" = None,
     *,
@@ -536,7 +540,32 @@ def apply_xet_env(
         if force or key not in target or key in overwritable:
             target[key] = value
             written[key] = value
+    # Remember what WE put in the real environment, so a later resize can tell our own numbers from
+    # a user's and redo only ours.
+    if target is os.environ:
+        _SEEDED_INTO_ENVIRON.update(written)
     return written
+
+
+def resize_for_cache_dir(
+    env: dict,
+    cache_dir: "Optional[str | Path]",
+    *,
+    fail_fast: bool = True,
+) -> dict[str, str]:
+    """Re-size *env* for *cache_dir*, recomputing the values this process seeded and no others.
+
+    ``apply_xet_env`` is setdefault, and ``unsloth_zoo`` sizes itself at import, so by the time a
+    download names its destination every sizing key is already present and a second call writes
+    nothing: the download would run on numbers computed for whichever cache the environment named,
+    which is exactly what *cache_dir* is there to correct. Dropping our own seeded values first
+    makes the recompute bite. A value we never wrote, or one something else has changed since, is
+    left alone, so an explicit user setting still wins.
+    """
+    for key, value in _SEEDED_INTO_ENVIRON.items():
+        if env.get(key) == value:
+            env.pop(key, None)
+    return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir)
 
 
 _LOG_ERROR_RE = re.compile(r'"level"\s*:\s*"(ERROR|WARN)"', re.IGNORECASE)
