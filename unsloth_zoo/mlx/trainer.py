@@ -53,7 +53,11 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 _PAD_MULTIPLE = 32
-SUPPORTED_MLX_OPTIMIZERS = ("adafactor", "adamw", "adam", "sgd", "muon", "lion")
+SUPPORTED_MLX_OPTIMIZERS = (
+    "adafactor", "adamw", "adam", "sgd", "muon", "lion",
+    # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
+    "adamw_8bit", "adam_8bit",
+)
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
@@ -778,8 +782,9 @@ def _normalize_mlx_optimizer_name(name):
         name = name.value
     opt_name = str(name or "adamw").strip().lower()
     opt_name = opt_name.rsplit(".", 1)[-1].replace("-", "_")
+    # "*_8bit" route to a real 8-bit optimizer. "paged_*" / "*_bnb_*" stay
+    # collapsed: they promise CPU offload / a library MLX does not use.
     if opt_name in (
-        "adamw_8bit",
         "paged_adamw_8bit",
         "adamw_bnb_8bit",
         "paged_adamw_32bit",
@@ -3446,6 +3451,28 @@ class MLXTrainer:
                 bias_correction=True,
                 **adam_kwargs,
             )
+        elif opt_name in ("adamw_8bit", "adam_8bit"):
+            # Print rather than route silently: the old path was a quiet rewrite.
+            from .optimizers_quantized import (
+                QuantizedMomentAdam,
+                QuantizedMomentAdamW,
+                describe_quantized_optimizer,
+            )
+            print(describe_quantized_optimizer(opt_name))
+            if opt_name == "adamw_8bit":
+                self._manual_weight_decay = float(wd or 0.0)
+                optimizer = QuantizedMomentAdamW(
+                    learning_rate=initial_lr,
+                    weight_decay=0.0,
+                    bias_correction=True,
+                    **adam_kwargs,
+                )
+            else:
+                optimizer = QuantizedMomentAdam(
+                    learning_rate=initial_lr,
+                    bias_correction=True,
+                    **adam_kwargs,
+                )
         elif opt_name == "sgd":
             # HF/PyTorch SGD couples weight decay into the gradient (and thus
             # momentum/Nesterov), unlike AdamW's decoupled shrink. Apply our
