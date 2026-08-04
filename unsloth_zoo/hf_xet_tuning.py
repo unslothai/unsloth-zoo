@@ -60,21 +60,26 @@ XET_HIGH_PERFORMANCE_VARS = ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
-# (exclusive upper bound on total RAM, buffer_limit, buffer_size, perfile_size, max_concurrent_files)
+# xet-core's high-performance preset is not a mode, it is a set of ordinary knobs
+# (xet_runtime/src/config/xet_config.rs with_high_performance): a 64 GB buffer limit, 16 GB of
+# buffer, 2 GB per file, 124 streams. So rather than choose between "capped" and "that preset", we
+# write the same knobs scaled to the machine in front of us.
 #
-# The table used to stop at 24 GB, so a 2 TB server was held to a 24 GB laptop's 4 GB buffer. That
-# is not a neutral default: measured on a 192-core / 1996 GiB box against a 20 Gbit/s link, the old
-# top tier ran at 4586 Mbit/s where xet-core's own defaults managed 6553 -- capping cost 30% BELOW
-# stock, because the buffer gates how much can be in flight, which gates CPU, which gates the wire.
-# Big machines get tiers that scale; the small ones are unchanged, which is where the cap earns its
-# keep.
-_TIERS = (
-    (12 * _GB,  1 * _GB,  512 * _MB, 128 * _MB,  4),
-    (24 * _GB,  2 * _GB,  768 * _MB, 192 * _MB,  6),
-    (64 * _GB,  4 * _GB,  1 * _GB,   256 * _MB,  8),
-    (256 * _GB, 16 * _GB, 4 * _GB,   512 * _MB, 16),
-    (None,      32 * _GB, 8 * _GB,   1 * _GB,   24),
-)
+# One eighth of RAM is the anchor. It reproduces the table this replaces at every point it had
+# (8 GB -> 1 GB, 16 -> 2, 32 -> 4, 128 -> 16, 256 -> 32) and simply keeps going, so a big host gets
+# a big budget and a laptop is unchanged. The ceiling is xet-core's own 64 GB, because past that
+# the preset stops helping and we would only be reserving address space.
+_RAM_FRACTION = 8
+_MIN_BUFFER_LIMIT = 1 * _GB
+_MAX_BUFFER_LIMIT = 64 * _GB
+# Measured on a 192-core 1996 GiB box against a 20 Gbit/s link: raising the BUFFER group alone is
+# worth 2.41x (6771 -> 16306 Mbit/s), raising the CONCURRENCY group alone is worth nothing (0.92x).
+# So the buffer is the lever, and streams and files exist only to keep it fed -- which is why they
+# follow cores, and why neither is allowed past what the buffer budget can actually hold.
+_MAX_STREAMS = 124
+_MAX_CONCURRENT_FILES = 24
+# xet-core's xorb size: the unit a single download stream has outstanding at any moment.
+_XORB_BYTES = 64 * 1024 * 1024
 
 # Below this much usable RAM, callers prefer HTTP over Xet (see hf_xet_health).
 MIN_XET_RAM_BYTES = 4 * _GB
@@ -216,6 +221,11 @@ class SystemProfile:
     cpu_count: int
     ram_source: str
     cpu_source: str
+    # Free space where the download will land. Sizing a multi-GB buffer for a transfer the disk
+    # cannot hold just wastes RAM, and a nearly full disk is a better predictor of a doomed
+    # download than anything else we can see cheaply.
+    free_disk_bytes: int = 0
+    disk_source: str = "unknown"
 
 
 def _psutil_memory() -> tuple[Optional[int], Optional[int]]:
@@ -238,6 +248,28 @@ def _sysconf_memory() -> Optional[int]:
         return None
 
 
+def hf_cache_root() -> Path:
+    """Where downloads land, in the same precedence huggingface_hub itself uses."""
+    for var in ("HF_HUB_CACHE", "HF_HOME"):
+        value = os.environ.get(var)
+        if value:
+            return Path(value).expanduser()
+    return Path.home() / ".cache" / "huggingface"
+
+
+def _free_disk() -> "tuple[int, str]":
+    """Free bytes on the filesystem holding the HF cache, walking up to the first path that exists."""
+    import shutil
+
+    candidate = hf_cache_root()
+    for path in (candidate, *candidate.parents):
+        try:
+            return int(shutil.disk_usage(path).free), str(path)
+        except OSError:
+            continue
+    return 0, "unknown"
+
+
 def system_profile() -> SystemProfile:
     """Usable RAM and cores for THIS process, preferring a cgroup limit over the host's totals."""
     host_total, host_available = _psutil_memory()
@@ -253,6 +285,8 @@ def system_profile() -> SystemProfile:
     else:
         total = host_total or 0
         available = host_available if host_available is not None else total
+
+    free_disk, disk_source = _free_disk()
 
     try:
         cpus = len(os.sched_getaffinity(0))  # respects taskset / CPU pinning
@@ -273,6 +307,8 @@ def system_profile() -> SystemProfile:
         cpu_count = max(1, int(cpus)),
         ram_source = ram_source,
         cpu_source = cpu_source,
+        free_disk_bytes = free_disk,
+        disk_source = disk_source,
     )
 
 
@@ -306,28 +342,50 @@ def xet_env_overrides(
     throttled: bool = False,
     fail_fast: bool = True,
 ) -> dict[str, str]:
-    """RAM/CPU-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
+    """RAM/CPU/disk-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
+
+    The budget scales continuously with the machine rather than stepping through a table, so a
+    laptop keeps a laptop's buffers and a large host reaches xet-core's own high-performance sizing
+    without the flag that would discard every bound.
 
     *throttled* halves the stream ceiling; set after a logged "429 Too Many Requests", where the
     account rather than the machine is the limiting factor. *fail_fast* keeps the shortened Xet
     timeouts, which only suit callers whose failure our Xet -> HTTP ladder can act on. Unknown total
-    RAM (0) yields the smallest tier: guessing low costs throughput, guessing high costs an OOM.
+    RAM (0) reads as small: guessing low costs throughput, guessing high costs an OOM.
     """
     profile = profile or system_profile()
-    total = profile.total_ram_bytes or _TIERS[0][0] - 1
-    tier = next(t for t in _TIERS if t[0] is None or total < t[0])
-    _, limit, size, perfile, max_files = tier
+    # Unknown RAM reads as small: guessing low costs throughput, guessing high costs an OOM.
+    total = profile.total_ram_bytes or 8 * _GB
+    limit = _clamp(total // _RAM_FRACTION, _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
+
+    # Never size a buffer for a transfer the disk cannot land. A quarter of free space is generous
+    # for a buffer and still refuses to promise 64 GB of in-flight data to a disk with 20 GB left.
+    free = profile.free_disk_bytes
+    if free:
+        limit = _clamp(min(limit, free // 4), _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
+
+    # Proportions from the high-performance preset, which is the shape xet-core itself considers
+    # balanced: a quarter of the budget as the shared buffer, a thirty-second per file.
+    size = max(limit // 4, 256 * _MB)
+    perfile = max(limit // 32, 128 * _MB)
 
     cpus = profile.cpu_count
-    # More files in flight than cores buys nothing and multiplies the per-file buffer.
-    max_files = _clamp(max_files, 2, max(2, cpus))
-    streams = _clamp(cpus * 2, 4, 64)
+    # More files or streams in flight than the machine has cores buys nothing -- and neither does
+    # more files than the budget can hold buffers for: size + max_files * perfile is what hf_xet
+    # can have outstanding, so deriving the count from the budget keeps those three numbers
+    # describing ONE allocation instead of three independent ones that overshoot together.
+    affordable = max(2, (limit - size) // perfile)
+    max_files = _clamp(min(cpus, affordable), 2, _MAX_CONCURRENT_FILES)
+    # Streams follow cores, but a stream holds a 64 MiB xorb while it lands, so more streams than
+    # the budget has xorb slots for only queues work behind the semaphore. Both bounds matter: a
+    # 64-core CI container with 8 GB opened 124 streams under the core rule alone, which is exactly
+    # the "small machine, big numbers" case that hurts a thin link.
+    streams = _clamp(min(cpus * 2, max(4, limit // _XORB_BYTES)), 4, _MAX_STREAMS)
     if throttled:
         streams = max(4, streams // 2)
-
-    # hf_xet grows the buffer to size + max_files * perfile and clamps it at limit; keeping limit at
-    # or above that sum makes it state the true ceiling instead of truncating the other two.
-    limit = max(limit, size + max_files * perfile)
+    # Start well under the ceiling and let xet-core's adaptive concurrency ramp: on a slow or
+    # congested link the ramp is what keeps us from opening every stream into a stall.
+    initial = min(_clamp(cpus, 2, 8), streams)
 
     env = {
         # Memory. The effective buffer is size + max_files * perfile, capped by limit.
@@ -339,7 +397,7 @@ def xet_env_overrides(
         # ac_* is the adaptive-concurrency band; the initial value stays under the ceiling so a slow
         # link ramps up instead of opening 16 streams into a stall.
         "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY": str(streams),
-        "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY": str(_clamp(cpus, 2, 8)),
+        "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY": str(initial),
         "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY": "1",
         # Fail fast so OUR ladder decides instead of hf_xet retrying for ~6 minutes. Bare integers
         # are ignored; the unit suffix is required.

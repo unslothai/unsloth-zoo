@@ -28,46 +28,95 @@ GB = 1_000_000_000
 MB = 1_000_000
 
 
-def _profile(ram_gb: float, cpus: int = 8) -> tuning.SystemProfile:
+def _profile(ram_gb: float, cpus: int = 8, free_disk_gb: float = 0) -> tuning.SystemProfile:
     return tuning.SystemProfile(
         total_ram_bytes = int(ram_gb * GB),
         available_ram_bytes = int(ram_gb * GB),
         cpu_count = cpus,
         ram_source = "test",
         cpu_source = "test",
+        free_disk_bytes = int(free_disk_gb * GB),
+        disk_source = "test",
     )
 
 
 @pytest.mark.parametrize(
-    "ram_gb, limit, size, perfile, files, cpus",
+    "ram_gb, cpus, limit, size, perfile, files, streams",
     [
-        # limit is raised to the worst case (size + files*perfile) where that exceeds the tier's
-        # headline figure, so the three numbers describe one budget.
-        (8, 1024 * MB, 512 * MB, 128 * MB, 4, 8),
-        (11.9, 1024 * MB, 512 * MB, 128 * MB, 4, 8),
-        (16, 2 * GB, 768 * MB, 192 * MB, 6, 8),
-        (32, 4 * GB, 1 * GB, 256 * MB, 8, 8),
-        # A big host is still bounded, but by a budget proportional to what it has. Holding a 2 TB
-        # server to the 32 GB row cost 30% against xet-core's own defaults.
-        (128, 16 * GB, 4 * GB, 512 * MB, 16, 32),
-        (2048, 32 * GB, 8 * GB, 1000 * MB, 24, 192),
-        # ...but never more files in flight than cores, however much RAM there is.
-        (2048, 32 * GB, 8 * GB, 1000 * MB, 8, 8),
+        # An eighth of RAM is the budget, a quarter of that is the shared buffer and a
+        # thirty-second is a per-file buffer, so the numbers describe ONE allocation. The floors
+        # (256MB / 128MB) are what keep a small machine's buffers usable.
+        (8, 4, 1 * GB, 256 * MB, 128 * MB, 4, 8),
+        # No cliffs: 12 GB sits between the old table's 8 and 16 GB rows and gets a budget to match,
+        # where the old step function gave it the 8 GB row's.
+        (12, 4, 1500 * MB, 375 * MB, 128 * MB, 4, 8),
+        (16, 8, 2 * GB, 500 * MB, 128 * MB, 8, 16),
+        (32, 16, 4 * GB, 1 * GB, 128 * MB, 16, 32),
+        # A big host is bounded by a budget proportional to what it has, not by a laptop's. Holding
+        # a 2 TB server to the old flat 4 GB row cost 30% against xet-core's own defaults.
+        (128, 64, 16 * GB, 4 * GB, 500 * MB, 24, 124),
+        (2048, 192, 64 * GB, 16 * GB, 2000 * MB, 24, 124),
+        # Cores bound concurrency independently of RAM: 8 cores on a 2 TB box still gets 8 files.
+        (2048, 8, 64 * GB, 16 * GB, 2000 * MB, 8, 16),
+        # ...and so does the budget. A 64-core container with 8 GB (CI, or a cgroup-limited pod)
+        # cannot use 64 file buffers or 128 streams out of a 1 GB budget, and opening them anyway is
+        # how a small machine on a thin link ends up worse off than with no tuning at all.
+        (8, 64, 1 * GB, 256 * MB, 128 * MB, 5, 14),
     ],
 )
-def test_tier_table(ram_gb, limit, size, perfile, files, cpus):
+def test_knobs_scale_with_the_machine(ram_gb, cpus, limit, size, perfile, files, streams):
     env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == limit
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"]) == size
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"]) == perfile
     assert int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == files
+    assert int(env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == streams
+
+
+def test_a_big_host_lands_on_xet_cores_own_high_performance_numbers():
+    """The point of scaling rather than gating: on the box where HF_XET_HIGH_PERFORMANCE was worth
+    2.55x (16684 vs 6553 Mbit/s), the scaled knobs reach the same buffer sizing that preset uses,
+    without the flag and without discarding the bound on smaller machines. Concurrent FILES is the
+    one number we do not follow: the preset's 100 x 2 GB is 200 GB of per-file buffer against its
+    own 64 GB limit, so most of it can never be allocated."""
+    env = tuning.xet_env_overrides(_profile(2048, cpus = 192))
+    preset = {  # xet_runtime/src/config/xet_config.rs, with_high_performance()
+        "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(64 * GB),
+        "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE": str(16 * GB),
+        "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE": str(2000 * MB),
+        "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY": "124",
+    }
+    for key, value in preset.items():
+        assert env[key] == value, key
+
+
+def test_the_budget_never_promises_more_than_the_disk_can_take():
+    """A 2 TB host with a nearly full disk is not a 2 TB budget: buffering 64 GB of a download that
+    will fail on ENOSPC helps nobody, and the free-space figure is the only signal we have."""
+    roomy = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 8000))
+    tight = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 40))
+    assert int(roomy["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
+    assert int(tight["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 10 * GB
+    # Never below the floor, though: a full disk must not shrink the buffer to nothing, because the
+    # download can still be the one that frees space (a resume, or a cache on another filesystem).
+    full = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 0.5))
+    assert int(full["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+
+
+def test_free_disk_is_measured_for_the_cache_not_the_cwd(monkeypatch, tmp_path):
+    """The cache can sit on a different filesystem from wherever the process happens to be."""
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "not-created-yet" / "hub"))
+    assert tuning.hf_cache_root() == tmp_path / "not-created-yet" / "hub"
+    free, source = tuning._free_disk()
+    # The leaf does not exist, so it walks up to the first parent that does rather than giving up.
+    assert free > 0 and source in {str(p) for p in (tmp_path, *tmp_path.parents)}
 
 
 def test_worst_case_buffer_stays_under_the_limit():
-    """size + files*perfile is what hf_xet can hold, so it must not exceed the tier cap. The stock
+    """size + files*perfile is what hf_xet can hold, so it must not exceed the budget. The stock
     defaults (2GB + 8*512MB, capped at 8GB) are exactly how an 8GB spike happens."""
-    for ram_gb in (4, 8, 16, 32, 64, 512):
-        env = tuning.xet_env_overrides(_profile(ram_gb))
+    for ram_gb, cpus in ((4, 2), (8, 8), (8, 96), (16, 8), (32, 64), (64, 16), (512, 192), (2048, 192)):
+        env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
         worst = (
             int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
             + int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"])
@@ -81,10 +130,10 @@ def test_worst_case_buffer_stays_under_the_limit():
         assert worst <= ram_gb * GB / 3, f"{ram_gb}GB: worst case {worst} is too much of it"
 
 
-def test_unknown_ram_picks_the_smallest_tier():
+def test_unknown_ram_is_read_as_a_small_machine():
     """Guessing low costs throughput; guessing high costs an OOM."""
     env = tuning.xet_env_overrides(_profile(0))
-    assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1024 * MB
+    assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
 
 
 def test_durations_carry_a_unit_suffix():
@@ -110,7 +159,15 @@ def test_cpu_count_bounds_concurrency():
     large = tuning.xet_env_overrides(_profile(32, cpus = 128))
     assert int(small["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == 2
     assert int(small["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == 4
-    assert int(large["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == 64
+    # Two streams per core, but no more than the 4 GB budget has 64 MiB xorb slots for, and never
+    # more files than the budget affords buffers for.
+    assert int(large["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == 59
+    assert int(large["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) <= 24
+    # The ramp always starts at or below the ceiling, whichever bound produced it.
+    for env in (small, large):
+        assert int(env["HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY"]) <= int(
+            env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]
+        )
 
 
 def test_throttled_halves_the_stream_ceiling():
@@ -127,7 +184,7 @@ def test_apply_never_overwrites_a_user_setting():
     tuning.apply_xet_env(env, profile = _profile(16))
     assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"] == "16000000000"
     # ...but the rest is still filled in.
-    assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"] == str(192 * MB)
+    assert env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"] == str(128 * MB)
 
 
 def test_a_user_set_high_performance_flag_is_left_alone():
@@ -167,7 +224,7 @@ def test_force_caps_still_overrides_high_performance(monkeypatch):
 def test_a_large_machine_is_not_held_to_a_laptops_buffer():
     """The table used to flat-line at 24 GB, so a 2 TB server got a 24 GB laptop's 4 GB buffer.
     Measured, that ran 30% BELOW xet-core's own defaults, because the buffer gates how much can be
-    in flight. Each tier must be strictly larger than the one below it."""
+    in flight. The budget must grow with the machine, monotonically and without a cliff."""
     seen = []
     for ram_gb in (8, 16, 32, 128, 512, 2048):
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus = 64))
@@ -175,9 +232,8 @@ def test_a_large_machine_is_not_held_to_a_laptops_buffer():
     for (small_ram, small), (big_ram, big) in zip(seen, seen[1:]):
         assert big >= small, f"{big_ram}GB got {big} but {small_ram}GB got {small}"
     assert seen[-1][1] > seen[2][1], f"a 2TB box still capped like a 32GB one: {seen}"
-    # And the small end is untouched, which is where the cap earns its keep. (1024MB, not 1000MB:
-    # the limit is raised to the tier's own worst case, 512MB + 4*128MB.)
-    assert seen[0][1] == 1024 * MB
+    # And the small end is untouched, which is where the bound earns its keep.
+    assert seen[0][1] == 1 * GB
 
 
 def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
@@ -191,8 +247,8 @@ def test_cgroup_limit_beats_the_host_total(monkeypatch, tmp_path):
     assert profile.ram_source == "cgroup"
     assert profile.cpu_count == 2
     env = tuning.xet_env_overrides(profile)
-    # Smallest tier and only 2 files in flight, so the 1GB limit is already above the worst case
-    # (512MB + 2*128MB) and stands unchanged.
+    # An eighth of 8 GB is the 1 GB floor, and the 2-core quota allows only 2 files in flight, so
+    # the worst case (256MB + 2*128MB) sits well inside it.
     assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
     assert int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == 2
 
@@ -321,3 +377,66 @@ def test_apply_xet_env_does_not_shorten_timeouts_process_wide():
     child: dict[str, str] = {}
     tuning.apply_xet_env(child, profile = _profile(16), fail_fast = True)
     assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"
+
+
+# Real machines Unsloth actually runs on, smallest first. A regression that only shows up on a
+# 2-core Colab or a 0.5-core pod is one nobody here can reproduce, so they are pinned by name.
+DEVICES = [
+    # name,                     RAM GB, cpus, free disk GB
+    ("tiny VM",                      2,    2,     8),
+    ("k8s pod, 0.5 cpu quota",       4,    1,    20),
+    ("MacBook Air M2",               8,    8,   100),
+    ("GitHub CI runner",            16,    4,    14),
+    ("Colab free T4",             12.7,    2,    78),
+    ("Kaggle T4 x2",                29,    4,    57),
+    ("desktop, RTX 4090",           32,   16,   500),
+    ("CI container on a big host",   8,   64,   200),
+    ("Slurm step on a 1TB node",    32,    8,  1000),
+    ("A100 node",                  200,   32,  3000),
+    ("8xH100 node",               2048,  192,  8000),
+]
+
+
+@pytest.mark.parametrize("name, ram_gb, cpus, disk_gb", DEVICES, ids = [d[0] for d in DEVICES])
+def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
+    """One rule per resource, applied to every device we know of. Being generous on a big host is
+    only defensible if the same arithmetic is conservative on a small one, and the small ones are
+    where nobody notices until a user reports an OOM or a stalled download on hotel wifi."""
+    env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
+    limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
+    size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
+    perfile = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"])
+    files = int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"])
+    streams = int(env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"])
+    initial = int(env["HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY"])
+    worst = size + files * perfile
+
+    assert worst <= limit, f"{name}: {worst} in flight against a {limit} budget"
+    assert worst <= ram_gb * GB / 3, f"{name}: {worst} is too much of {ram_gb}GB"
+    assert limit <= max(1 * GB, disk_gb * GB / 4), f"{name}: {limit} buffered onto {disk_gb}GB free"
+    assert 2 <= files <= max(2, cpus), f"{name}: {files} files on {cpus} cores"
+    # A stream holds a xorb; more of them than the budget can hold is queueing, not parallelism.
+    assert 4 <= streams <= max(4, min(cpus * 2, limit // (64 * 1024 * 1024))), f"{name}: {streams}"
+    assert 2 <= initial <= streams, f"{name}: ramp starts at {initial} of {streams}"
+
+
+def test_the_smallest_devices_get_the_smallest_numbers():
+    """The floors are the whole safety story on a 2 GB VM or a fractional-core pod: one shared
+    buffer, two files, four streams. Anything larger there is worse than not tuning at all."""
+    for name, ram_gb, cpus, disk_gb in DEVICES[:2]:
+        env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
+        assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB, name
+        assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"]) == 256 * MB, name
+        assert int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"]) == 2, name
+        assert int(env["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]) == 4, name
+
+
+def test_only_the_big_hosts_get_the_big_numbers():
+    """The converse, and the point of the change: the devices that can afford xet-core's own
+    high-performance sizing are the only ones that get it."""
+    big = {
+        name for name, ram_gb, cpus, disk_gb in DEVICES
+        if int(tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
+               ["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 8 * GB
+    }
+    assert big == {"A100 node", "8xH100 node"}
