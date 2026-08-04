@@ -1052,6 +1052,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    "adam_epsilon",
 )
 
 
@@ -1180,6 +1181,15 @@ class MLXTrainingConfig:
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
     logging_dir: str | None = None
     run_name: str | None = None
+
+    # HF TrainingArguments.adam_epsilon. Declared LAST for the same positional
+    # reason as the fields above, and listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    # so those stay an exact suffix. None means "not requested" and leaves the
+    # MLX optimizer default (1e-8, which is also the HF default) untouched, so
+    # this is a no-op unless it is set. Applies to adam/adamw only, matching the
+    # CUDA path; SGD/Muon/Lion take no epsilon and MLX's Adafactor eps is a
+    # 2-tuple with different meaning, so HF's scalar does not belong there.
+    adam_epsilon: float | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -3401,12 +3411,18 @@ class MLXTrainer:
         self._coupled_weight_decay = 0.0
         adam_beta1 = getattr(self.args, "adam_beta1", None)
         adam_beta2 = getattr(self.args, "adam_beta2", None)
+        adam_epsilon = getattr(self.args, "adam_epsilon", None)
         adam_kwargs = {}
         if adam_beta1 is not None or adam_beta2 is not None:
             adam_kwargs["betas"] = (
                 float(0.9 if adam_beta1 is None else adam_beta1),
                 float(0.999 if adam_beta2 is None else adam_beta2),
             )
+        # Only forwarded when explicitly set, so the MLX default stays in force
+        # otherwise. adam_kwargs reaches Adam/AdamW alone (see below), which is
+        # the same scope as the CUDA path (unsloth/trainer.py:350).
+        if adam_epsilon is not None:
+            adam_kwargs["eps"] = float(adam_epsilon)
 
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
