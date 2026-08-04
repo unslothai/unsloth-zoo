@@ -81,6 +81,8 @@ def test_description_states_what_is_and_is_not_quantized():
     assert "FIRST moment" in message
     assert "group_size=64" in message
     assert "second moment is not quantized" in message
-    assert "multiple of 64" in message
+    # Eligibility counts elements, not axes: the banner must not claim a 2-D rule.
+    assert "4096 elements" in message and "groups of 64" in message
+    assert "2-D" not in message
     # The saving depends on the state dtype, so the banner must not imply one number.
     assert "bfloat16" in message and "peak memory" in message

@@ -227,9 +227,10 @@ def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE
     return (
         f"Unsloth: {optimizer_name} on MLX quantizes the optimizer's FIRST moment "
         f"to 8-bit (group_size={group_size}); the second moment is not quantized "
-        "(affine 8-bit quantization of the second moment diverges). Only 2-D "
-        f"parameters whose last dimension is a multiple of {group_size} are "
-        "quantized; all others keep unquantized moments. Moments follow the "
+        "(affine 8-bit quantization of the second moment diverges). Parameters of "
+        f"at least {MIN_QUANTIZE_SIZE} elements, in a whole number of groups of "
+        f"{group_size}, are quantized; all others keep unquantized moments. "
+        "Moments follow the "
         "parameter dtype, so this saves about 36% of optimizer state in float32 "
         "and about 23% in bfloat16, and it does not lower peak memory."
     )
