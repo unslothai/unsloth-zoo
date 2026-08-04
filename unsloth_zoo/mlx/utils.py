@@ -14076,6 +14076,17 @@ def _quantize_merged_model_for_save(model):
     )
     predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
     config = _get_model_config(model) or {}
+    # This runs only when nothing in the model is quantized, so any quantization
+    # metadata still on the config describes weights that are not there. Left in
+    # place, quantize_model() reads it as "already partially quantized" and
+    # switches to per-layer config output: the result carries per-path entries
+    # but no top-level group_size/bits, and mlx-lm's loader indexes those
+    # unconditionally (`quantization["group_size"]` in its load-time
+    # `_quantize`), so the artifact fails to reload with KeyError. A stale
+    # *populated* grid fails the other way: it is carried through verbatim and
+    # the checkpoint advertises a grid its tensors do not use. mlx_lm.convert
+    # pops both keys on the mirror-image dequantize path for the same reason.
+    config = _strip_mlx_quantization_metadata(config)
     model, updated_config = quantize_model(
         model,
         config,

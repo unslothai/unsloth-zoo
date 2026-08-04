@@ -46,8 +46,13 @@ if not _real_mlx_runtime():
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_map as mlx_tree_map
 
-from unsloth_zoo.mlx.utils import _model_has_quantized_module
+from unsloth_zoo.mlx.utils import (
+    _get_model_config,
+    _model_has_quantized_module,
+    _quantize_merged_model_for_save,
+)
 
 DIMS = 256
 
@@ -112,3 +117,85 @@ def test_switch_linear_experts_are_detected():
     experts = switch_layers.SwitchLinear(DIMS, DIMS, num_experts=2, bias=False)
     experts = experts.to_quantized(group_size=64, bits=4, mode="affine")
     assert _model_has_quantized_module(_Stack(experts))
+
+
+# ---------------------------------------------------------------------------
+# What the quantize step hands to mlx-lm
+#
+# `_quantize_merged_model_for_save` is driven directly on a real (tiny) mlx-lm
+# llama so the config it produces can be checked against mlx-lm's load-time
+# contract without downloading a published checkpoint.
+# ---------------------------------------------------------------------------
+
+def _tiny_llama(dtype):
+    """A real mlx-lm llama, small enough to build in-process."""
+    llama = pytest.importorskip("mlx_lm.models.llama")
+    args = llama.ModelArgs(
+        model_type="llama",
+        hidden_size=128,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=512,
+    )
+    model = llama.Model(args)
+    model.update(mlx_tree_map(lambda v: v.astype(dtype), model.parameters()))
+    return model
+
+
+def _tiny_llama_config(**overrides):
+    config = {
+        "model_type": "llama",
+        "hidden_size": 128,
+        "num_hidden_layers": 2,
+        "intermediate_size": 256,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 512,
+        "torch_dtype": "float16",
+    }
+    config.update(overrides)
+    return config
+
+
+def test_quantize_for_save_emits_a_loadable_top_level_grid():
+    """mlx-lm's loader indexes ``quantization["group_size"]`` unconditionally.
+
+    ``quantize_model`` writes that top-level grid only when the config it is
+    handed has no ``quantization`` key; with one present it emits per-layer
+    entries instead. Nothing is quantized when this branch runs, so inherited
+    metadata is stale by construction and must not flip that switch — the
+    artifact would raise KeyError on reload.
+    """
+    model = _tiny_llama(mx.float16)
+    model._config = _tiny_llama_config(quantization={}, quantization_config={})
+
+    _quantize_merged_model_for_save(model)
+    quantization = _get_model_config(model)["quantization"]
+
+    assert quantization["group_size"] == 64, quantization
+    assert quantization["bits"] == 4, quantization
+    assert quantization["mode"] == "affine", quantization
+    # Per-layer entries are what appear *instead of* the grid.
+    assert not [k for k in quantization if k not in ("group_size", "bits", "mode")], (
+        f"per-layer entries leaked into the saved grid: {quantization}"
+    )
+
+
+def test_quantize_for_save_does_not_inherit_a_stale_grid():
+    """A populated stale grid is carried through verbatim and mislabels the
+    artifact: the tensors are written at 4-bit/64 whatever the config claims."""
+    model = _tiny_llama(mx.float16)
+    model._config = _tiny_llama_config(
+        quantization={"group_size": 32, "bits": 8, "mode": "affine"},
+    )
+
+    _quantize_merged_model_for_save(model)
+    quantization = _get_model_config(model)["quantization"]
+
+    assert quantization["group_size"] == 64, quantization
+    assert quantization["bits"] == 4, quantization
+    assert quantization["mode"] == "affine", quantization
