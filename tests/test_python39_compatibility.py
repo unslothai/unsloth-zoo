@@ -310,6 +310,23 @@ def test_vendored_fla_stays_gated_below_310():
         "on the floor - restore the guard or bring _vendored/fla into in_scope()"
     )
 
+    # The guard only matters if the injection path actually consults it.
+    injectors = [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and any(isinstance(c, ast.Call)
+                         and getattr(c.func, "id", None) == "_inject_vendored_fla"
+                         for c in ast.walk(n))]
+    assert injectors, "nothing calls _inject_vendored_fla; re-point this test"
+    for caller in injectors:
+        consults = any(isinstance(c, ast.Call)
+                       and getattr(c.func, "id", None) == "_torch_triton_cuda_supported"
+                       for c in ast.walk(caller))
+        assert consults, (
+            f"{caller.name} injects the vendored FLA kernels without consulting "
+            "_torch_triton_cuda_supported, so the <3.10 guard no longer gates injection "
+            "and excluding _vendored/fla from this gate is unsound"
+        )
+
 
 def strict_patch_calls(tree):
     """``patch_function(...)`` calls that keep the default ``match_level="strict"``."""
