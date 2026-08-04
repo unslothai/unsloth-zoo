@@ -19,6 +19,7 @@ CPU-pure: pure index math plus torch's RNG. No MLX, no weights, no Metal.
 from __future__ import annotations
 
 import random
+import sys
 
 import pytest
 import torch
@@ -127,6 +128,37 @@ def test_empty_and_single_row_datasets():
     order = _helper()
     assert order([], 4, 1) == []
     assert order([5], 4, 1) == [0]
+
+
+def test_ordering_works_without_torch(monkeypatch):
+    """pyproject excludes torch on darwin/arm64, so a native MLX install has
+    none. group_by_length is a stock HF knob and must not be the one option
+    that needs it: the permutation falls back to the stdlib RNG, and only the
+    shuffle changes -- the grouping still has to hold."""
+    from unsloth_zoo.mlx.utils import _length_grouped_order
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # makes `import torch` fail
+
+    rng = random.Random(12)
+    lengths = [rng.randint(1, 1024) for _ in range(512)]
+    batch_size = 8
+    order = _length_grouped_order(lengths, batch_size, 77)
+
+    assert sorted(order) == list(range(len(lengths)))
+    assert order == _length_grouped_order(lengths, batch_size, 77)
+    assert order != _length_grouped_order(lengths, batch_size, 78)
+
+    def padding_cost(indices):
+        total = 0
+        for i in range(0, len(indices), batch_size):
+            batch = indices[i : i + batch_size]
+            widest = max(lengths[j] for j in batch)
+            total += sum(widest - lengths[j] for j in batch)
+        return total
+
+    plain = list(range(len(lengths)))
+    random.Random(77).shuffle(plain)
+    assert padding_cost(order) < padding_cost(plain) / 4
 
 
 # --- config resolution ---

@@ -10782,6 +10782,29 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _length_grouped_permutation(length, seed):
+    """Seeded permutation backing ``_length_grouped_order``.
+
+    Prefers torch, so a given seed reproduces CUDA's sample order exactly, and
+    falls back to the stdlib RNG when torch is not importable: group_by_length
+    is a stock HF ``TrainingArguments`` knob, but ``unsloth_zoo[mlx]`` does not
+    install torch on Apple Silicon, so routing it through
+    ``_torch_randperm_order`` would make the option unusable on the platform
+    this backend exists for. Only the shuffle differs; the grouping, and so the
+    padding it saves, is the same either way.
+
+    Both branches depend on nothing but the seed, which is what DDP needs --
+    ranks derive the order locally instead of exchanging it.
+    """
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        indices = list(range(length))
+        random.Random(3407 if seed is None else int(seed)).shuffle(indices)
+        return indices
+    return _torch_randperm_order(length, seed)
+
+
 def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
     """Translate fractional epochs into HF-style accumulation windows."""
     accum = max(1, int(grad_accum or 1))
@@ -10884,8 +10907,9 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
     the largest batch run first so an OOM shows up immediately rather than
     minutes in.
 
-    ``_torch_randperm_order`` seeds a ``torch.Generator`` exactly as HF seeds
-    its sampler generator, so for a given seed this reproduces CUDA's order.
+    With torch installed the permutation is seeded exactly as HF seeds its
+    sampler generator, so for a given seed this reproduces CUDA's order; see
+    ``_length_grouped_permutation`` for the torch-free fallback.
     """
     n = len(lengths)
     if n == 0:
@@ -10896,7 +10920,7 @@ def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
         if mega_batch_mult == 0:
             mega_batch_mult = 1
 
-    indices = _torch_randperm_order(n, seed)
+    indices = _length_grouped_permutation(n, seed)
     megabatch_size = max(1, mega_batch_mult * batch_size)
     megabatches = [
         indices[i : i + megabatch_size] for i in range(0, n, megabatch_size)
