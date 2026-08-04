@@ -818,19 +818,110 @@ def test_a_readable_limit_with_no_readable_usage_still_binds(monkeypatch, dnp, t
     assert dnp._cgroup_free_bytes() == 2 * 1024**3
 
 
-def test_missing_cgroup_readers_fall_back_to_the_limit_alone(monkeypatch, dnp):
-    """An older unsloth_zoo has no such private helpers.
-
-    The public limit reader alone can only overstate what is free, never
-    understate it, so the ceiling still binds.
-    """
+def _old_zoo(monkeypatch, memory_limit = None):
+    """An unsloth_zoo predating the private cgroup helpers, with only the public reader."""
     import types
 
     fake = types.ModuleType("unsloth_zoo.hf_xet_tuning")
-    fake.cgroup_memory_limit = lambda: 4 * 1024**3
+    fake.cgroup_memory_limit = lambda: memory_limit
     fake.cgroup_cpu_limit = lambda: None
     monkeypatch.setitem(sys.modules, "unsloth_zoo.hf_xet_tuning", fake)
+    return fake
+
+
+def test_the_unaided_reader_subtracts_usage_too(monkeypatch, dnp, tmp_path):
+    """An older unsloth_zoo must not turn the ceiling back into the raw limit.
+
+    cgroup_memory_limit() alone reports an 8GB cgroup holding 6GB as 8GB free,
+    which is the one case the ceiling exists for: sizing workers off memory that
+    is already spent is how #2693's map() children get OOM-killed.
+    """
+    _old_zoo(monkeypatch, memory_limit = 8 * 1024**3)
+    leaf = tmp_path / "kubepods" / "podabc"
+    leaf.mkdir(parents = True)
+    (leaf / "memory.max").write_text("8589934592\n")
+    (leaf / "memory.current").write_text("6442450944\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: ["0::/kubepods/podabc"])
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+
+
+def test_the_unaided_reader_walks_to_the_binding_ancestor(monkeypatch, dnp, tmp_path):
+    """Same pairing rule as the helper-backed path: the slice's limit binds, with the slice's usage."""
+    _old_zoo(monkeypatch)
+    slice_dir = tmp_path / "user.slice"
+    leaf = slice_dir / "session.scope"
+    leaf.mkdir(parents = True)
+    (slice_dir / "memory.max").write_text("34359738368\n")
+    (slice_dir / "memory.current").write_text("32212254720\n")
+    (leaf / "memory.max").write_text("17179869184\n")
+    (leaf / "memory.current").write_text("1073741824\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: ["0::/user.slice/session.scope"])
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+
+
+def test_the_unaided_reader_handles_cgroup_v1(monkeypatch, dnp, tmp_path):
+    _old_zoo(monkeypatch)
+    leaf = tmp_path / "memory" / "slurm" / "job_1"
+    leaf.mkdir(parents = True)
+    (leaf / "memory.limit_in_bytes").write_text("4294967296\n")
+    (leaf / "memory.usage_in_bytes").write_text("3221225472\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        dnp, "_proc_self_cgroup", lambda: ["7:memory,blkio:/slurm/job_1"],
+    )
+    assert dnp._cgroup_free_bytes() == 1024**3
+
+
+def test_the_unaided_reader_ignores_the_unlimited_sentinels(monkeypatch, dnp, tmp_path):
+    _old_zoo(monkeypatch)
+    v2 = tmp_path / "scope"
+    v2.mkdir()
+    (v2 / "memory.max").write_text("max\n")
+    (v2 / "memory.current").write_text("1073741824\n")
+    v1 = tmp_path / "memory"
+    v1.mkdir()
+    # v1's "unlimited": a near-2^63 sentinel, not a 8-exabyte ceiling.
+    (v1 / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (v1 / "memory.usage_in_bytes").write_text("1073741824\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: ["0::/scope", "7:memory:/"])
+    assert dnp._cgroup_free_bytes() is None
+
+
+def test_the_unaided_reader_is_never_negative(monkeypatch, dnp, tmp_path):
+    _old_zoo(monkeypatch)
+    leaf = tmp_path / "scope"
+    leaf.mkdir()
+    (leaf / "memory.max").write_text("1073741824\n")
+    (leaf / "memory.current").write_text("2147483648\n")
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: ["0::/scope"])
+    assert dnp._cgroup_free_bytes() == 0
+
+
+def test_the_unaided_reader_keeps_the_public_limit_as_a_last_resort(monkeypatch, dnp, tmp_path):
+    """No readable cgroup tree here, but an older zoo may still find one its own way.
+
+    A limit with no usage beside it is still a ceiling, and is a tighter one than
+    psutil's host-wide view inside a container.
+    """
+    _old_zoo(monkeypatch, memory_limit = 4 * 1024**3)
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path / "absent"))
+    monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: [])
     assert dnp._cgroup_free_bytes() == 4 * 1024**3
+
+
+def test_the_unaided_reader_never_raises(monkeypatch, dnp):
+    """It runs on every auto-sizing call under an older zoo, on hosts with no cgroup at all."""
+    _old_zoo(monkeypatch)
+    free = dnp._cgroup_free_bytes_unaided()
+    assert free is None or (isinstance(free, int) and free >= 0)
 
 
 def test_no_unsloth_zoo_at_all_is_not_a_ceiling(monkeypatch, dnp):
