@@ -608,6 +608,40 @@ def _resolve_audio_dict(audio, sampling_rate=None):
     return value
 
 
+# Content-part keys that can carry an audio payload, in priority order.
+#
+# "audio", "url" and "path" mirror transformers' generic chat-template audio
+# loader (processing_utils.py, `for key in ["audio", "url", "path"]` inside
+# ProcessorMixin.apply_chat_template), which is what most audio templates parse.
+#
+# "audio_url" is the Qwen family's spelling: Qwen2AudioProcessor's built-in chat
+# template branches on `'audio' in content or 'audio_url' in content` (see
+# transformers/models/qwen2_audio/processing_qwen2_audio.py, default_chat_template)
+# and the processor's own docstring example uses {"type": "audio", "audio_url": ...};
+# Qwen2.5-Omni and Qwen3-Omni document the same shape. Without it the template
+# renders an <|AUDIO|> placeholder while no clip is collected, so the example
+# either raises here or reaches the model with a token/feature mismatch.
+_AUDIO_CONTENT_KEYS = ("audio", "url", "path", "audio_url")
+_AUDIO_CONTENT_KEYS_TEXT = ", ".join(f"`{k}`" for k in _AUDIO_CONTENT_KEYS[:-1]) + \
+    f" or `{_AUDIO_CONTENT_KEYS[-1]}`"
+
+
+def _audio_payload_from_content(ele):
+    # "audio" carries an inline payload (array / HF Audio dict), so only a real
+    # None means absent -- an empty array must not fall through to the string keys.
+    value = ele.get("audio")
+    if value is not None:
+        return value
+    # The remaining keys are string sources (local path or URL); feature
+    # extractors accept those directly. Falsy (empty) strings fall through,
+    # matching the previous `ele.get("url") or ele.get("path")` behaviour.
+    for key in _AUDIO_CONTENT_KEYS[1:]:
+        value = ele.get(key)
+        if value:
+            return value
+    return None
+
+
 def extract_audio_info(
     conversations: Union[List[Dict], List[List[Dict]]],
     sampling_rate: int = None,
@@ -624,15 +658,13 @@ def extract_audio_info(
                 for ele in content:
                     if not (isinstance(ele, dict) and ele.get("type") == "audio"):
                         continue
-                    audio = ele.get("audio")
-                    # Feature extractors also accept local paths and URLs as strings
-                    if audio is None:
-                        audio = ele.get("url") or ele.get("path")
+                    audio = _audio_payload_from_content(ele)
                     if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
-                            "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
+                            "Unsloth: an audio content part has no "
+                            f"{_AUDIO_CONTENT_KEYS_TEXT} data, "
                             "so the clip cannot be loaded and the example would train as text only."
                         )
                     audio_inputs.append(audio)

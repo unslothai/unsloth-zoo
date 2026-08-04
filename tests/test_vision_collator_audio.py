@@ -113,8 +113,53 @@ def test_inline_url_and_path_resolved():
         assert out == ["/tmp/a.wav"]
 
 
+def test_inline_qwen_audio_url_resolved():
+    # Qwen2-Audio's OWN documented content shape. Its built-in chat template
+    # branches on `'audio' in content or 'audio_url' in content` and renders an
+    # <|AUDIO|> placeholder, so the clip must be collected -- otherwise the
+    # rendered text carries the placeholder with no audio payload behind it.
+    # Source: transformers/models/qwen2_audio/processing_qwen2_audio.py,
+    # Qwen2AudioProcessor.default_chat_template + its __call__ docstring example.
+    url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/glass-breaking-151256.mp3"
+    out = extract_audio_info(msgs({"type": "audio", "audio_url": url}))
+    assert out == [url]
+
+
+def test_audio_url_does_not_shadow_the_generic_keys():
+    # Priority order must stay audio > url > path > audio_url so that the keys
+    # transformers' generic loader uses keep winning.
+    part = {"type": "audio", "url": "/tmp/generic.wav", "audio_url": "/tmp/qwen.wav"}
+    assert extract_audio_info(msgs(part)) == ["/tmp/generic.wav"]
+    part = {"type": "audio", "audio": CLIP, "audio_url": "/tmp/qwen.wav"}
+    assert extract_audio_info(msgs(part))[0] is CLIP
+
+
+def test_qwen_audio_url_template_parity():
+    # Derive the expectation from transformers, not from our own code: every
+    # content shape Qwen2-Audio's template turns into an audio placeholder must
+    # yield exactly one clip from extract_audio_info.
+    transformers = pytest.importorskip("transformers")
+    jinja2 = pytest.importorskip("jinja2")
+    from transformers.models.qwen2_audio.processing_qwen2_audio import Qwen2AudioProcessor
+    template = Qwen2AudioProcessor.default_chat_template
+    if isinstance(template, property):
+        template = template.fget(None)
+    render = jinja2.Environment().from_string(template).render
+    for part in (
+        {"type": "audio", "audio_url": "/tmp/a.wav"},
+        {"type": "audio", "audio": "/tmp/a.wav"},
+    ):
+        conversation = msgs(part)
+        n_placeholders = render(messages=conversation).count("<|AUDIO|>")
+        assert n_placeholders == 1, part
+        assert len(extract_audio_info(conversation)) == n_placeholders, part
+
+
 def test_inline_no_payload_raises():
     with pytest.raises(ValueError, match="cannot be loaded"):
+        extract_audio_info(msgs({"type": "audio"}))
+    # The message names every accepted key, including the Qwen spelling.
+    with pytest.raises(ValueError, match="audio_url"):
         extract_audio_info(msgs({"type": "audio"}))
 
 
