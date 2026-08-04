@@ -185,19 +185,21 @@ def test_new_optimizers_use_coupled_decay_and_leave_adamw_path_alone(optim_name)
     assert adamw_trainer._coupled_weight_decay == pytest.approx(0.0)
 
 
-def test_adamax_and_adadelta_are_not_hf_trainer_optimizers():
-    """Why Adamax keeps MLX's uncorrected first moment instead of emulating
-    torch's ``lr / (1 - beta1**t)``: there is no ``optim='adamax'`` recipe to be
-    compatible with, because HF has no such OptimizerNames member. If upstream
-    ever adds one, that trade-off has to be revisited and this fails."""
-    transformers = pytest.importorskip("transformers")
-    from transformers.training_args import OptimizerNames
+def test_adamax_is_built_with_the_torch_first_moment_bias_correction():
+    """``mlx.optimizers.Adamax`` takes no ``bias_correction`` flag and overrides
+    ``Adam.apply_single`` with the uncorrected update, so pinning it is not a
+    kwarg -- the trainer has to substitute a subclass. Numerics are checked
+    against torch in ``test_mlx_optimizer_defaults.py``; this pins the wiring,
+    which is the part the shim can see."""
+    from unsloth_zoo.mlx.trainer import _BiasCorrectedAdamax
 
-    values = {member.value for member in OptimizerNames}
-    assert "adagrad" in values and "rmsprop" in values, (
-        "sanity: the two names that DO have an HF Trainer branch"
+    _, optimizer = _build("adamax")
+
+    assert isinstance(optimizer, _BiasCorrectedAdamax), (
+        f"optim='adamax' built {type(optimizer).__name__}; stock MLX Adamax "
+        "scales the first update by (1 - beta1), ~10x below torch's"
     )
-    assert not (values & {"adamax", "adadelta"}), (
-        "HF Trainer now exposes adamax/adadelta, so MLX Adamax's missing "
-        "first-moment bias correction is now a real recipe-parity gap"
+    assert "apply_single" in vars(_BiasCorrectedAdamax), (
+        "_BiasCorrectedAdamax no longer overrides the update, so it is stock "
+        "MLX Adamax under a different name"
     )

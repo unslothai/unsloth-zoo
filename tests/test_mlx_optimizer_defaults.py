@@ -29,6 +29,7 @@ package and skips when mlx is absent or shimmed.
 
 import inspect
 
+import numpy as np
 import pytest
 
 _SKIP = "Requires a real mlx runtime (Apple Silicon Metal, or Linux mlx-cpu)"
@@ -109,6 +110,86 @@ def test_remaining_defaults_still_agree_with_torch(
         f"MLX {mlx_class} default {parameter}={mlx_value!r} no longer matches "
         f"torch's {torch_value!r}; _build_optimizer must now pin {parameter} "
         f"explicitly for {optim_name}, the way it already pins Adagrad's eps"
+    )
+
+
+_ADAMAX_LR = 1e-2
+_ADAMAX_BETAS = (0.9, 0.999)
+_ADAMAX_EPS = 1e-8
+
+
+def _adamax_case():
+    initial = np.arange(4, dtype=np.float32).reshape(2, 2) / 4.0
+    base = np.array([[0.3, -0.7], [0.05, 0.9]], dtype=np.float32)
+    return initial, [base * (1 + i) for i in range(5)]
+
+
+def _mlx_adamax_trajectory(cls, initial_weight, gradients):
+    import mlx.nn as nn
+
+    model = nn.Linear(2, 2, bias=False)
+    model.update({"weight": mx.array(initial_weight)})
+    optimizer = cls(
+        learning_rate=_ADAMAX_LR, betas=_ADAMAX_BETAS, eps=_ADAMAX_EPS,
+    )
+    trajectory = []
+    for gradient in gradients:
+        optimizer.update(model, {"weight": mx.array(gradient)})
+        mx.eval(model.parameters(), optimizer.state)
+        trajectory.append(np.array(model.parameters()["weight"], copy=True))
+    return trajectory
+
+
+def _torch_adamax_trajectory(initial_weight, gradients):
+    import torch
+
+    parameter = torch.nn.Parameter(torch.tensor(initial_weight))
+    optimizer = torch.optim.Adamax(
+        [parameter], lr=_ADAMAX_LR, betas=_ADAMAX_BETAS, eps=_ADAMAX_EPS,
+    )
+    trajectory = []
+    for gradient in gradients:
+        parameter.grad = torch.tensor(gradient)
+        optimizer.step()
+        optimizer.zero_grad()
+        trajectory.append(parameter.detach().numpy().copy())
+    return trajectory
+
+
+def test_adamax_tracks_torch_adamax_step_for_step():
+    """MLX Adamax omits torch's ``lr / (1 - beta1**t)`` first-moment correction.
+
+    The trainer builds ``_BiasCorrectedAdamax`` instead, so an
+    ``optim='adamax'`` run has to follow ``torch.optim.Adamax`` from step 1, not
+    merely converge to it. Tolerance is fp32 rounding plus the residual from
+    keeping eps on the denominator rather than inside torch's ``max``, which is
+    bounded by eps.
+    """
+    from unsloth_zoo.mlx.trainer import _BiasCorrectedAdamax
+
+    initial, gradients = _adamax_case()
+    expected = _torch_adamax_trajectory(initial, gradients)
+    got = _mlx_adamax_trajectory(_BiasCorrectedAdamax, initial, gradients)
+
+    for step, (mlx_weight, torch_weight) in enumerate(zip(got, expected), start=1):
+        assert np.abs(mlx_weight - torch_weight).max() < 1e-6, (
+            f"step {step} diverged from torch.optim.Adamax: "
+            f"{mlx_weight} vs {torch_weight}"
+        )
+
+
+def test_plain_mlx_adamax_still_needs_the_correction():
+    """Canary for the test above: it only proves something while stock MLX
+    Adamax actually disagrees with torch. If MLX adds the correction upstream,
+    ``_BiasCorrectedAdamax`` is dead weight and should be dropped."""
+    initial, gradients = _adamax_case()
+    expected = _torch_adamax_trajectory(initial, gradients)
+    got = _mlx_adamax_trajectory(optim.Adamax, initial, gradients)
+
+    ratio = np.abs(got[0] - initial).max() / np.abs(expected[0] - initial).max()
+    assert ratio == pytest.approx(1.0 - _ADAMAX_BETAS[0], rel=1e-4), (
+        "stock MLX Adamax no longer scales its first step by (1 - beta1); "
+        f"ratio to torch is {ratio}, so re-derive _BiasCorrectedAdamax"
     )
 
 

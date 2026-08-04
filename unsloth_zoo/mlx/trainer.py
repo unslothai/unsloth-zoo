@@ -818,6 +818,33 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+class _BiasCorrectedAdamax(optim.Adamax):
+    """Adamax with the first-moment bias correction torch applies.
+
+    ``mlx.optimizers.Adamax`` hardcodes the correction off: it overrides
+    ``Adam.apply_single`` and takes no ``bias_correction`` flag, so its first
+    update is scaled by ``1 - beta1`` -- ~10x too small at the default
+    ``beta1=0.9``, tapering off over the warmup. ``torch.optim.Adamax`` and
+    Algorithm 2 of the Adam paper both divide the step by ``1 - beta1**t``, and
+    the trainer already pins ``bias_correction=True`` on every other
+    Adam-family optimizer it builds.
+
+    Only the correction is added; the eps stays on the denominator where MLX
+    (and the paper) put it rather than inside torch's ``max``, which differs by
+    at most ``eps`` in absolute terms.
+    """
+
+    def apply_single(self, gradient, parameter, state):
+        lr = self.learning_rate.astype(gradient.dtype)
+        b1, b2 = self.betas
+        m = b1 * state["m"] + (1 - b1) * gradient
+        v = mx.maximum(b2 * state["v"], mx.abs(gradient))
+        state["m"] = m
+        state["v"] = v
+        clr = (lr / (1 - b1 ** self.step)).astype(gradient.dtype)
+        return parameter - clr * m / (v + self.eps)
+
+
 _part_is_norm = _mlx_norm_path_part_is_norm
 _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
@@ -3545,7 +3572,9 @@ class MLXTrainer:
             optimizer = optim.RMSprop(learning_rate=initial_lr)
         elif opt_name == "adamax":
             self._coupled_weight_decay = float(wd or 0.0)
-            optimizer = optim.Adamax(learning_rate=initial_lr, **adam_kwargs)
+            optimizer = _BiasCorrectedAdamax(
+                learning_rate=initial_lr, **adam_kwargs
+            )
         elif opt_name == "adagrad":
             self._coupled_weight_decay = float(wd or 0.0)
             # HF Trainer builds `optim="adagrad"` as torch.optim.Adagrad(lr=...)
