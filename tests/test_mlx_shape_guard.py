@@ -23,6 +23,7 @@ from unsloth_zoo.mlx.shape_guard import (
     resolve_compile_max_variants,
     select_text_shape_padding_budget,
     stream_exact_ceiling,
+    stream_phase_count,
 )
 
 
@@ -509,7 +510,32 @@ def test_stream_grid_anchor_and_report_contract():
     wide = StreamShapeGrid(anchor=4096)
     assert [stream_exact_ceiling(g, c) for g, c in (
         (wide, 128), (wide, 64), (StreamShapeGrid(), 64), (wide, 60),
-    )] == [SMALL_EXACT_SIGNATURE_THRESHOLD, 4, 16, None]
+    )] == [SMALL_EXACT_SIGNATURE_THRESHOLD, 3, 16, None]
+    # The allowance must leave room for the grid it precedes. Two ways to get
+    # this wrong: ignoring that accumulation makes one endpoint cost a
+    # signature per phase, and forgetting that an allowance of N admits N + 1
+    # signatures because it holds while the count is at or below N.
+    # Pin the helper across the range, or one returning 2 for every
+    # accumulation above one would satisfy every other assertion here.
+    assert [stream_phase_count(FULL_STEP_SCOPE, n) for n in (1, 2, 3, 4, 8)] == [
+        1, 2, 3, 3, 3,
+    ]
+    for cap in (64, 128, 256):
+        for anchor in (2048, 4096, 16384):
+            grid = StreamShapeGrid(anchor=anchor)
+            for phases in (1, 2, 3):
+                for in_flight in (0, 2):
+                    ceiling = stream_exact_ceiling(grid, cap, phases, in_flight)
+                    if ceiling is None:
+                        continue
+                    admitted = ceiling + 1 + in_flight
+                    assert admitted + grid.endpoint_count * phases <= cap, (
+                        cap, anchor, phases, in_flight, ceiling,
+                    )
+    # Returning None everywhere would satisfy that invariant vacuously, so pin
+    # that the allowance survives where there is genuinely room for it.
+    assert stream_exact_ceiling(wide, 128, 2) > 0
+    assert stream_exact_ceiling(wide, 128, 1, 4) == SMALL_EXACT_SIGNATURE_THRESHOLD
     assert "at most 32 signatures" in describe_stream_shape_grid(wide, 128, 32)
     assert "stay exact" not in describe_stream_shape_grid(wide, 128, None)
 

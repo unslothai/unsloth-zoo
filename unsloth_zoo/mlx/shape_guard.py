@@ -237,7 +237,20 @@ class StreamShapeGrid:
         return len(self._endpoints)
 
 
-def stream_exact_ceiling(grid, cap):
+def stream_phase_count(compile_scope, gradient_accumulation_steps):
+    """Distinct compiled argument structures one width can produce.
+
+    The signature carries the accumulation micro-step's phase, so a single
+    endpoint backs this many cache entries rather than one.
+    """
+    steps = operator.index(gradient_accumulation_steps)
+    return len({
+        phase_for_microstep(compile_scope, steps, index)
+        for index in range(max(1, steps))
+    })
+
+
+def stream_exact_ceiling(grid, cap, phases_per_endpoint=1, in_flight=0):
     """Signatures a stream may compile before widths widen onto the grid.
 
     Staging precedes admission, so the batch introducing the signature past
@@ -264,10 +277,18 @@ def stream_exact_ceiling(grid, cap):
     unguarded run would when this returns a positive allowance.
     """
     cap = int(cap)
+    phases = max(1, operator.index(phases_per_endpoint))
     ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)
     endpoints = grid.endpoint_count
     if endpoints is not None:
-        ceiling = min(ceiling, cap - endpoints)
+        # Every endpoint costs one signature per phase, so reserving one slot
+        # each would let the allowance push a grid that fits over the cap. Two
+        # slots go beyond the allowance's own value: the crossing batch, since
+        # the allowance holds while the count is at or below it, and whatever a
+        # prefetch producer already staged before the consumer saw the release.
+        ceiling = min(
+        ceiling, cap - endpoints * phases - 1 - max(0, operator.index(in_flight)),
+    )
     return ceiling if ceiling > 0 else None
 
 
@@ -999,6 +1020,7 @@ __all__ = (
     "StreamShapeGuardReport",
     "describe_stream_shape_grid",
     "stream_exact_ceiling",
+    "stream_phase_count",
     "TextShapeEvent",
     "TextShapeFrontier",
     "TextShapeGuardReport",

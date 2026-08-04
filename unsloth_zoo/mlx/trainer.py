@@ -602,6 +602,7 @@ from .shape_guard import (
     build_text_shape_frontier,
     describe_stream_shape_grid,
     stream_exact_ceiling,
+    stream_phase_count,
     materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
@@ -1457,11 +1458,19 @@ class _StreamWidthPolicy:
         self.observed = None
         self.gate_released = False
 
-    def arm(self, registry):
+    def arm(self, registry, phases_per_endpoint=1, in_flight=0):
         """Arm against the set the cap binds on, so the exact allowance and
-        the bound it protects are counted in the same units."""
+        the bound it protects are counted in the same units.
+
+        ``phases_per_endpoint`` is how many compiled signatures one width
+        costs, which gradient accumulation raises above one. ``in_flight`` is
+        how many batches a prefetch producer may have staged exact before the
+        consumer reaches the release.
+        """
         self.observed = registry.observed
-        self.exact_ceiling = stream_exact_ceiling(self.grid, registry.cap)
+        self.exact_ceiling = stream_exact_ceiling(
+            self.grid, registry.cap, phases_per_endpoint, in_flight,
+        )
         self.armed = True
 
     @property
@@ -6804,7 +6813,16 @@ class MLXTrainer:
             _stream_registry = _StreamSignatureRegistry(
                 resolve_compile_max_variants(args.compile_max_variants),
             )
-            _stream_policy.arm(_stream_registry)
+            _stream_policy.arm(
+                _stream_registry,
+                stream_phase_count(_compile_scope, grad_accum),
+                # Effective, not configured: DDP and non-lazy sources turn
+                # prefetch off, and reserving for a producer that will never
+                # run costs the allowance for nothing.
+                getattr(args, "streaming_prefetch_batches", 0)
+                if (getattr(self, "_mlx_prefetch_control", None)
+                    and self._mlx_prefetch_control.get("eligible")) else 0,
+            )
             # A later fallback rewrites _compile_scope, which would make the
             # report describe a callable that compiled none of these.
             _stream_scope = _compile_scope
