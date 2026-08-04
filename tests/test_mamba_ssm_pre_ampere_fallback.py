@@ -74,6 +74,24 @@ def env(monkeypatch):
     model_mod.mamba_split_conv1d_scan_combined = lambda *a, **k: None
     sys.modules[MODEL_MOD] = model_mod
 
+    # transformers 5 also resolves these from the Hub, through
+    # integrations.hub_kernels.lazy_load_kernel, which asks no predicate.
+    hk = types.ModuleType("transformers.integrations.hub_kernels")
+    hk._HUB_KERNEL_MAPPING = {
+        "causal-conv1d": {"repo_id": "kernels-community/causal-conv1d"},
+        "mamba-ssm": {"repo_id": "kernels-community/mamba-ssm"},
+        "falcon_mamba-ssm": {"repo_id": "kernels-community/mamba-ssm"},
+        "deep-gemm": {"repo_id": "kernels-community/deep-gemm"},
+    }
+    hk._KERNEL_MODULE_MAPPING = {"mamba-ssm": types.ModuleType("already_loaded")}
+    for name in ("transformers.integrations", "transformers.integrations.hub_kernels"):
+        saved[name] = sys.modules.get(name)
+    integrations = types.ModuleType("transformers.integrations")
+    integrations.__path__ = []
+    integrations.hub_kernels = hk
+    sys.modules["transformers.integrations"] = integrations
+    sys.modules["transformers.integrations.hub_kernels"] = hk
+
     iu = types.ModuleType("transformers.utils.import_utils")
     iu.is_mamba_ssm_available = lambda: True
     iu.is_mamba_2_ssm_available = lambda: True
@@ -95,7 +113,7 @@ def env(monkeypatch):
     saved_attr = getattr(utils_mod, "import_utils", None)
     utils_mod.import_utils = iu
 
-    yield model_mod, iu
+    yield model_mod, iu, hk
 
     if had_attr: utils_mod.import_utils = saved_attr
     elif hasattr(utils_mod, "import_utils"): del utils_mod.import_utils
@@ -104,8 +122,21 @@ def env(monkeypatch):
         else: sys.modules[k] = v
 
 
+def _no_local_wheel():
+    """Make `import mamba_ssm` raise, for the not-installed branch.
+
+    None in sys.modules does that even where the real package is installed,
+    which popping the fake would not. Assigned rather than
+    `monkeypatch.setitem`: monkeypatch undoes after the `env` teardown and
+    would put the fake back, and a `types.ModuleType` has `__spec__` None, so
+    a leaked one makes every later `importlib.util.find_spec("mamba_ssm")`
+    raise ValueError. `env` owns the key and restores it.
+    """
+    sys.modules["mamba_ssm"] = None
+
+
 def test_pre_ampere_disables_fast_path(env):
-    model_mod, iu = env
+    model_mod, iu, _hk = env
     assert patch() is True
     assert model_mod.is_fast_path_available is False
     assert model_mod.selective_state_update is None
@@ -117,7 +148,7 @@ def test_pre_ampere_disables_fast_path(env):
 
 
 def test_ampere_keeps_fast_path(env, monkeypatch):
-    model_mod, iu = env
+    model_mod, iu, _hk = env
     monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0)), raising = False)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
@@ -125,14 +156,14 @@ def test_ampere_keeps_fast_path(env, monkeypatch):
 
 
 def test_hopper_keeps_fast_path(env, monkeypatch):
-    model_mod, _ = env
+    model_mod, _, _hk = env
     monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (9, 0)), raising = False)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
 
 
 def test_rocm_is_untouched(env, monkeypatch):
-    model_mod, iu = env
+    model_mod, iu, _hk = env
     monkeypatch.setattr(torch.version, "hip", "6.2.0", raising = False)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
@@ -140,21 +171,55 @@ def test_rocm_is_untouched(env, monkeypatch):
 
 
 def test_no_cuda_is_untouched(env, monkeypatch):
-    model_mod, _ = env
+    model_mod, _, _hk = env
     monkeypatch.setattr(torch, "cuda", _FakeCuda(available = False), raising = False)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
 
 
-def test_no_mamba_ssm_is_untouched(env, monkeypatch):
-    model_mod, iu = env
-    # None in sys.modules makes `import mamba_ssm` raise, so this exercises the
-    # unavailable branch even where the real package is installed; popping the
-    # fake would just import the real one.
-    monkeypatch.setitem(sys.modules, "mamba_ssm", None)
+def test_no_mamba_ssm_is_untouched(env):
+    model_mod, iu, _hk = env
+    _no_local_wheel()
     assert patch() is None
     assert model_mod.is_fast_path_available is True
     assert iu.is_mamba_ssm_available() is True
+
+
+# ---- transformers 5's Hub kernels ----------------------------------------
+#
+# lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels`
+# package is installed. It needs no local wheel and never calls
+# is_mamba_ssm_available, so the predicates above cannot reach it.
+
+def test_pre_ampere_unregisters_the_hub_kernels(env):
+    _model_mod, _iu, hk = env
+    patch()
+    for name in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+        assert name not in hk._HUB_KERNEL_MAPPING
+        # A module already resolved into the cache must stop being handed out.
+        assert hk._KERNEL_MODULE_MAPPING[name] is None
+
+
+def test_unrelated_hub_kernels_are_left_registered(env):
+    _model_mod, _iu, hk = env
+    patch()
+    assert "deep-gemm" in hk._HUB_KERNEL_MAPPING
+
+
+def test_hub_kernels_go_even_without_the_local_wheel(env):
+    """The Hub path is the one that reaches a pre-Ampere GPU with no wheel
+    installed, so unregistering has to precede the mamba_ssm import."""
+    _model_mod, _iu, hk = env
+    _no_local_wheel()
+    assert patch() is None
+    assert "mamba-ssm" not in hk._HUB_KERNEL_MAPPING
+
+
+def test_ampere_keeps_the_hub_kernels(env, monkeypatch):
+    _model_mod, _iu, hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0)), raising = False)
+    assert patch() is None
+    assert "mamba-ssm" in hk._HUB_KERNEL_MAPPING
 
 
 def test_non_transformers_modules_are_left_alone(env):

@@ -155,6 +155,48 @@ def test_missing_original_max_still_strips_the_bad_value():
     assert "attention_factor" not in cfg.rope_scaling
 
 
+# ---- every call shape transformers uses -----------------------------------
+
+def test_device_stays_optional_for_a_transformers_5_original():
+    """transformers 5 gives every parameter but `config` a default, and
+    `PreTrainedModel._init_weights` calls `rope_fn(module.config)` with the
+    config alone (modeling_utils.py, the RotaryEmbedding branch). Naming
+    `device` in the wrapper would make every LongRoPE model fail to load with
+    a missing-argument TypeError before a single weight is read."""
+    seen = {}
+
+    def original(config, device = None, seq_len = None, layer_type = None):
+        seen["device"], seen["layer_type"] = device, layer_type
+        return "inv_freq", config.rope_scaling.get("attention_factor", 1.0)
+
+    R._compute_longrope_parameters = original
+    R.ROPE_INIT_FUNCTIONS["longrope"] = original
+    patch_longrope_impossible_attention_factor()
+
+    cfg = _cfg(attention_factor = 32.0)
+    assert R.ROPE_INIT_FUNCTIONS["longrope"](cfg)[1] == 1.0
+    assert seen == {"device": None, "layer_type": None}
+    assert "attention_factor" not in cfg.rope_scaling
+
+
+def test_the_other_arguments_are_forwarded_untouched():
+    """`rope_init_fn(config, device, seq_len = ..., layer_type = ...)` is how
+    transformers 5 reinitializes a rotary embedding."""
+    seen = {}
+
+    def original(config, device = None, seq_len = None, layer_type = None):
+        seen.update(device = device, seq_len = seq_len, layer_type = layer_type)
+        return "inv_freq", 1.0
+
+    R._compute_longrope_parameters = original
+    R.ROPE_INIT_FUNCTIONS["longrope"] = original
+    patch_longrope_impossible_attention_factor()
+
+    R.ROPE_INIT_FUNCTIONS["longrope"](
+        _cfg(), "cpu", seq_len = 8, layer_type = "full_attention")
+    assert seen == {"device": "cpu", "seq_len": 8, "layer_type": "full_attention"}
+
+
 def test_other_rope_types_are_untouched():
     assert "linear" in R.ROPE_INIT_FUNCTIONS
     assert not getattr(R.ROPE_INIT_FUNCTIONS["linear"], "_unsloth_patched", False)

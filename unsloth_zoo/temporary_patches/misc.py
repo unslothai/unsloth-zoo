@@ -1057,10 +1057,26 @@ def patch_mamba_ssm_pre_ampere_fallback():
     if (major, minor) >= (8, 0):
         return  # Ampere or newer; the fast path is fine
 
+    # 0. transformers 5 can also fetch these kernels from the Hub, through
+    #    `lazy_load_kernel`, which needs no local wheel and never consults the
+    #    predicates below. Drop the registry entries so it returns None and the
+    #    fast path stays unavailable. Before the local-wheel check, since the
+    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+            # An already-resolved module has to go too. None is enough:
+            # lazy_load_kernel only short-circuits on a real module object.
+            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+    except Exception:
+        pass
+    pass
+
     try:
         import mamba_ssm  # noqa: F401
     except Exception:
-        return  # Not installed, so nothing routes into it anyway
+        return  # Not installed locally, and the Hub entries are already gone
 
     import sys
 
@@ -1883,14 +1899,18 @@ def patch_longrope_impossible_attention_factor():
             + ". Ignoring it so attention is scaled correctly."
         )
 
+    # Everything but `config` is forwarded untouched: on transformers 5 every
+    # other parameter has a default and `_init_weights` calls the rope init as
+    # `rope_fn(module.config)`, so naming `device` here would make every
+    # LongRoPE model fail to load with a missing-argument TypeError.
     @functools.wraps(original)
-    def _compute_longrope_parameters(config, device, seq_len = None, **kwargs):
+    def _compute_longrope_parameters(config, *args, **kwargs):
         try:
             _sanitise(config)
         except Exception:
             # Never let the guard itself break a model that would have loaded.
             pass
-        return original(config, device, seq_len = seq_len, **kwargs)
+        return original(config, *args, **kwargs)
 
     _compute_longrope_parameters._unsloth_patched = True
     try:
