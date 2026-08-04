@@ -363,9 +363,11 @@ def test_order_reshuffles_across_epochs():
 
 
 def test_eval_batches_are_never_length_grouped():
-    """HF installs the length-grouped sampler on the train dataloader only.
-    Regrouping eval as well (and reshuffling it per epoch) would move metrics
-    around underneath the user for a knob that is about training throughput.
+    """A deliberate divergence: transformers length-groups eval too
+    (``Trainer._get_eval_sampler``). `_evaluate` accumulates ``loss * ntoks``
+    and divides by the total, so eval metrics do not depend on how rows are
+    grouped -- regrouping eval would only save padding on the eval pass, and
+    this knob is about training throughput.
     """
     from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
 

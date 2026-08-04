@@ -1109,10 +1109,13 @@ def _resolve_text_dataset_order(args, *, for_training=True):
     once here is what keeps those paths from drifting apart -- they must agree
     or `train_on_responses_only` masks a different stream than it trains on.
 
-    ``for_training=False`` is the evaluation contract: HF installs its
-    length-grouped sampler on the train dataloader only and evaluates in
-    dataset order, so eval batches stay comparable run to run instead of being
-    regrouped (and per-epoch reshuffled) underneath the metrics.
+    ``for_training=False`` is the evaluation contract: eval keeps dataset
+    order. This diverges from transformers, which does length-group eval as
+    well (``Trainer._get_eval_sampler``, at ``eval_batch_size`` and without the
+    accumulation factor). The metric is unaffected either way -- ``_evaluate``
+    accumulates ``loss * ntoks`` and divides by the total, a token-weighted
+    mean that does not depend on how rows are grouped -- so grouping eval would
+    only buy padding on the eval pass, which is not what the knob is for.
 
     Returns one of ``"sequential"``, ``"length_grouped"``, ``"torch_randperm"``
     or the caller's ``dataset_order`` (``"default"``/``None`` meaning "no
