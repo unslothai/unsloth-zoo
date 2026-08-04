@@ -48,6 +48,7 @@ __all__ = [
     "xet_env_overrides",
     "xet_log_env",
     "apply_xet_env",
+    "resize_for_cache_dir",
     "scan_xet_log",
     "XET_HIGH_PERFORMANCE_VARS",
 ]
@@ -60,12 +61,24 @@ XET_HIGH_PERFORMANCE_VARS = ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
-# (exclusive upper bound on total RAM, buffer_limit, buffer_size, perfile_size, max_concurrent_files)
-_TIERS = (
-    (12 * _GB, 1 * _GB, 512 * _MB, 128 * _MB, 4),
-    (24 * _GB, 2 * _GB, 768 * _MB, 192 * _MB, 6),
-    (None,     4 * _GB, 1 * _GB,   256 * _MB, 8),
-)
+# The high-performance preset is not a mode, just knobs (xet_config.rs with_high_performance:
+# 64 GB limit, 16 GB buffer, 2 GB per file, 124 streams), so we write the same ones scaled to the
+# machine. An eighth of RAM reproduces the table this replaces at every point it defined
+# (8 GB -> 1 GB, 16 -> 2, 32 -> 4, 128 -> 16, 256 -> 32) and keeps going, to xet-core's own 64 GB.
+_RAM_FRACTION = 8
+_MIN_BUFFER_LIMIT = 1 * _GB
+_MAX_BUFFER_LIMIT = 64 * _GB
+# Measured on a 192-core / 20 Gbit/s host: the buffer group alone is worth 2.70x, the concurrency
+# group alone nothing (0.92x). Streams and files exist to keep the buffer fed, so they follow cores
+# and never exceed what the budget can hold.
+_MAX_STREAMS = 124
+_MAX_CONCURRENT_FILES = 24
+# xet-core's xorb size: the unit a single download stream has outstanding at any moment.
+_XORB_BYTES = 64 * 1024 * 1024
+# xet-core's own defaults (config/groups/reconstruction.rs). Sizing DOWN from a default is a cap;
+# sizing below one for no reason is just a slower download, which is what these two floors prevent.
+_STOCK_PREFETCH_BUFFER = 1 * _GB
+_STOCK_BUFFER_SIZE = 2 * _GB
 
 # Below this much usable RAM, callers prefer HTTP over Xet (see hf_xet_health).
 MIN_XET_RAM_BYTES = 4 * _GB
@@ -207,6 +220,11 @@ class SystemProfile:
     cpu_count: int
     ram_source: str
     cpu_source: str
+    # Free space where the download will land. Sizing a multi-GB buffer for a transfer the disk
+    # cannot hold just wastes RAM, and a nearly full disk is a better predictor of a doomed
+    # download than anything else we can see cheaply.
+    free_disk_bytes: int = 0
+    disk_source: str = "unknown"
 
 
 def _psutil_memory() -> tuple[Optional[int], Optional[int]]:
@@ -229,8 +247,52 @@ def _sysconf_memory() -> Optional[int]:
         return None
 
 
-def system_profile() -> SystemProfile:
-    """Usable RAM and cores for THIS process, preferring a cgroup limit over the host's totals."""
+def hf_cache_root(cache_dir: "Optional[str | Path]" = None) -> Path:
+    """Where downloads land, in the same precedence huggingface_hub itself uses.
+
+    ``hf_cache._active_caches`` already mirrors that precedence -- ``HF_HUB_CACHE``, the legacy
+    ``HUGGINGFACE_HUB_CACHE``, then ``HF_HOME/hub``, then ``XDG_CACHE_HOME/huggingface/hub`` -- and
+    resolving anything less measures a filesystem the download may never touch: with
+    ``XDG_CACHE_HOME`` or ``HUGGINGFACE_HUB_CACHE`` pointed at a data volume, the free space of the
+    home directory decides the buffer instead.
+
+    *cache_dir* wins over all of them: ``hf_hub_download`` only consults the variables when it is
+    None, so a caller that names one has named the volume the bytes land on.
+    """
+    if cache_dir is not None:
+        try:
+            return Path(os.path.expanduser(os.fspath(cache_dir)))
+        except (TypeError, ValueError):
+            pass
+    try:
+        from .hf_cache import _active_caches
+
+        hub_cache = _active_caches()[1]
+        if hub_cache is not None:
+            return hub_cache
+        return Path.home() / ".cache" / "huggingface" / "hub"
+    except Exception:  # noqa: BLE001 - a cache we cannot resolve must not stop a download
+        # Home may be unresolvable on a locked-down machine; the caller walks up from here anyway.
+        return Path(".")
+
+
+def _free_disk(cache_dir: "Optional[str | Path]" = None) -> "tuple[int, str]":
+    """Free bytes on the filesystem holding the HF cache, walking up to the first path that exists."""
+    import shutil
+
+    candidate = hf_cache_root(cache_dir)
+    for path in (candidate, *candidate.parents):
+        try:
+            return int(shutil.disk_usage(path).free), str(path)
+        except OSError:
+            continue
+    return 0, "unknown"
+
+
+def system_profile(cache_dir: "Optional[str | Path]" = None) -> SystemProfile:
+    """Usable RAM and cores for THIS process, preferring a cgroup limit over the host's totals.
+
+    *cache_dir* is the download's real destination, so the disk reading follows the bytes."""
     host_total, host_available = _psutil_memory()
     if host_total is None:
         host_total = _sysconf_memory()
@@ -244,6 +306,8 @@ def system_profile() -> SystemProfile:
     else:
         total = host_total or 0
         available = host_available if host_available is not None else total
+
+    free_disk, disk_source = _free_disk(cache_dir)
 
     try:
         cpus = len(os.sched_getaffinity(0))  # respects taskset / CPU pinning
@@ -264,6 +328,8 @@ def system_profile() -> SystemProfile:
         cpu_count = max(1, int(cpus)),
         ram_source = ram_source,
         cpu_source = cpu_source,
+        free_disk_bytes = free_disk,
+        disk_source = disk_source,
     )
 
 
@@ -272,6 +338,17 @@ def _clamp(value: int, low: int, high: int) -> int:
 
 
 # Shortened Xet client timeouts: safe in a download child we supervise, wrong process-wide.
+# Sizing knobs that exist only to bound memory. When the user has asked for high-performance mode
+# they have opted out of that bound, and applying these anyway would shrink the transfer while
+# xet-core ignores the limit -- slower than either choice made cleanly.
+_CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE",
+    "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
+    "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
+    "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
+)
+
 _FAIL_FAST_KEYS = (
     "HF_XET_CLIENT_READ_TIMEOUT",
     "HF_XET_CLIENT_CONNECT_TIMEOUT",
@@ -285,41 +362,78 @@ def xet_env_overrides(
     *,
     throttled: bool = False,
     fail_fast: bool = True,
+    cache_dir: "Optional[str | Path]" = None,
 ) -> dict[str, str]:
-    """RAM/CPU-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
+    """RAM/CPU/disk-derived ``HF_XET_*`` settings. Pure: returns a dict, touches no environment.
+
+    The budget scales continuously with the machine rather than stepping through a table, so a
+    laptop keeps a laptop's buffers and a large host reaches xet-core's own high-performance sizing
+    without the flag that would discard every bound.
 
     *throttled* halves the stream ceiling; set after a logged "429 Too Many Requests", where the
     account rather than the machine is the limiting factor. *fail_fast* keeps the shortened Xet
     timeouts, which only suit callers whose failure our Xet -> HTTP ladder can act on. Unknown total
-    RAM (0) yields the smallest tier: guessing low costs throughput, guessing high costs an OOM.
+    RAM (0) reads as small: guessing low costs throughput, guessing high costs an OOM.
+
+    *cache_dir* points the disk clamp at the volume the bytes land on. Ignored when *profile* is
+    supplied, which already carries its own disk reading.
     """
-    profile = profile or system_profile()
-    total = profile.total_ram_bytes or _TIERS[0][0] - 1
-    tier = next(t for t in _TIERS if t[0] is None or total < t[0])
-    _, limit, size, perfile, max_files = tier
+    profile = profile or system_profile(cache_dir)
+    # Unknown RAM reads as small: guessing low costs throughput, guessing high costs an OOM.
+    total = profile.total_ram_bytes or 8 * _GB
+    limit = _clamp(total // _RAM_FRACTION, _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
+
+    # Never size a buffer for a transfer the disk cannot land. A quarter of free space is generous
+    # for a buffer and still refuses to promise 64 GB of in-flight data to a disk with 20 GB left.
+    # disk_source, not truthiness: a successful reading of zero free bytes is a full disk, which is
+    # exactly when the clamp should bite, and must not read as "we could not measure".
+    free = profile.free_disk_bytes
+    if profile.disk_source != "unknown":
+        limit = _clamp(min(limit, free // 4), _MIN_BUFFER_LIMIT, _MAX_BUFFER_LIMIT)
+
+    # The shared buffer is the one knob that moves throughput (2.70x on a 2 TB host; 1.45x from
+    # this value alone on an 8 GB laptop, where a quarter of the budget ran at 0.73x). So it is a
+    # floor, not a ratio: reach for xet-core's 2 GB default, held back only by half the budget (a
+    # bigger share leaves no room for per-file buffers) and a sixth of RAM (which keeps the floor
+    # from overriding the memory bound on a 2 GB VM).
+    size = min(
+        max(limit // 4, min(_STOCK_BUFFER_SIZE, limit // 2)),
+        max(256 * _MB, (profile.total_ram_bytes or 8 * _GB) // 6),
+    )
+    perfile = max(limit // 32, 128 * _MB)
+    # The prefetch floor is the one knob where our old arithmetic went BELOW xet-core's own default
+    # (1 GB) on every machine, which is not a cap, just a smaller transfer. Approach the default
+    # from below and never exceed it: only a machine whose entire budget is under 4 GB gets less.
+    prefetch = _clamp(limit // 4, 128 * _MB, _STOCK_PREFETCH_BUFFER)
 
     cpus = profile.cpu_count
-    # More files in flight than cores buys nothing and multiplies the per-file buffer.
-    max_files = _clamp(max_files, 2, max(2, cpus))
-    streams = _clamp(cpus * 2, 4, 64)
+    # size + max_files * perfile is what hf_xet can hold, so the count comes from the budget as
+    # well as from cores: three numbers describing one allocation, not three that overshoot.
+    # The budget floor is absolute, so on a small machine it can exceed the proportional bound: a
+    # 2 GB container gets the 1 GB floor, and cores alone would then put 973 MB in flight, half its
+    # RAM. Bound the count by whichever is smaller so the third-of-RAM promise holds there too.
+    affordable = max(2, (min(limit, total // 3) - size) // perfile)
+    max_files = _clamp(min(cpus, affordable), 2, _MAX_CONCURRENT_FILES)
+    # A stream holds a 64 MiB xorb, so streams past the budget's xorb slots only queue behind the
+    # semaphore. Both bounds matter: a 64-core container with 8 GB opened 124 under cores alone.
+    streams = _clamp(min(cpus * 2, max(4, limit // _XORB_BYTES)), 4, _MAX_STREAMS)
     if throttled:
         streams = max(4, streams // 2)
-
-    # hf_xet grows the buffer to size + max_files * perfile and clamps it at limit; keeping limit at
-    # or above that sum makes it state the true ceiling instead of truncating the other two.
-    limit = max(limit, size + max_files * perfile)
+    # Start well under the ceiling and let xet-core's adaptive concurrency ramp: on a slow or
+    # congested link the ramp is what keeps us from opening every stream into a stall.
+    initial = min(_clamp(cpus, 2, 8), streams)
 
     env = {
         # Memory. The effective buffer is size + max_files * perfile, capped by limit.
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(limit),
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE": str(size),
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE": str(perfile),
-        "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER": str(min(size, 512 * _MB)),
+        "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER": str(prefetch),
         "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS": str(max_files),
         # ac_* is the adaptive-concurrency band; the initial value stays under the ceiling so a slow
         # link ramps up instead of opening 16 streams into a stall.
         "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY": str(streams),
-        "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY": str(_clamp(cpus, 2, 8)),
+        "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY": str(initial),
         "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY": "1",
         # Fail fast so OUR ladder decides instead of hf_xet retrying for ~6 minutes. Bare integers
         # are ignored; the unit suffix is required.
@@ -364,6 +478,10 @@ def xet_log_env(log_dir: "str | Path", *, diagnostics: bool = False) -> dict[str
     return env
 
 
+_SEEDED_INTO_ENVIRON: dict[str, str] = {}
+_SEEDED_THROTTLED = False
+
+
 def apply_xet_env(
     env: "Optional[dict]" = None,
     *,
@@ -371,33 +489,93 @@ def apply_xet_env(
     throttled: bool = False,
     force: bool = False,
     fail_fast: bool = False,
+    cache_dir: "Optional[str | Path]" = None,
 ) -> dict[str, str]:
     """Apply the overrides to *env* (default: ``os.environ``) and return only what was written.
 
     ``setdefault`` semantics: a user-set variable is left alone, so a shell's
-    ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins. High-performance mode is the
-    exception -- being applied AFTER the environment is read, an enabled ``HF_XET_HIGH_PERFORMANCE``
-    discards every cap above rather than competing with it, so it is turned off even when already
-    set; ``UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE=1`` keeps it (and drops the caps it would have voided).
+    ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins -- and that now includes
+    ``HF_XET_HIGH_PERFORMANCE``. Enabling it is a deliberate act by someone who knows their machine,
+    and since xet-core applies it AFTER reading the environment it voids the caps rather than
+    competing with them, so the honest response is to stand down: we drop the caps it would have
+    discarded and leave the flag alone. Measured on a 192-core / 1996 GiB box, overriding it cost
+    2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
+    Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
 
-    *force* overwrites every variable, for callers building a fresh child environment. *fail_fast*
+    *force* overwrites every variable we would otherwise leave alone. It does not revoke a user-set
+    high-performance flag: that stand-down is our own sizing standing aside, not a default to force
+    through. *fail_fast*
     defaults to False here, unlike ``xet_env_overrides``, because this runs at import: the shortened
     timeouts would otherwise apply to every direct ``huggingface_hub`` download and upload in the
     process, none of which our ladder supervises. Supervised children pass ``fail_fast = True``.
+
+    *cache_dir* is the destination the sized process will pass huggingface_hub; naming it keeps the
+    disk clamp off an unrelated filesystem in both directions.
     """
     target = os.environ if env is None else env
-    overrides = xet_env_overrides(profile, throttled = throttled, fail_fast = fail_fast)
+    overrides = xet_env_overrides(
+        profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
+    )
 
-    if _is_true(os.environ.get("UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE")):
-        for var in XET_HIGH_PERFORMANCE_VARS:
+    # A user who turned high-performance mode on keeps it, and keeps the headroom it implies:
+    # leaving our caps in place alongside it would be the worst of both, since xet-core would void
+    # the limit but still honour the smaller per-file and concurrency numbers.
+    # Read the flag the way xet-core reads it (configuration_utils.rs get_high_performance_flag):
+    # HF_XET_HIGH_PERFORMANCE wins if it is SET AT ALL, and only then does the HF_XET_HP alias get a
+    # look. Taking any-of instead would stand our sizing down over an alias xet-core is ignoring.
+    primary, alias = XET_HIGH_PERFORMANCE_VARS
+    user_wants_hp = _is_true(target[primary]) if primary in target else _is_true(target.get(alias))
+    forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
+    # Only one of these may hold: either the user's flag wins and our sizing stands down, or the
+    # caps win and the flag has to be turned off, because xet-core reads it last and would void
+    # them. Overwritable is the set we are allowed to write over an existing value.
+    overwritable: tuple = ()
+    if user_wants_hp and not forcing_caps:
+        for var in (*XET_HIGH_PERFORMANCE_VARS, *_CAPS_VOIDED_BY_HIGH_PERFORMANCE):
             overrides.pop(var, None)
+    elif forcing_caps:
+        overwritable = XET_HIGH_PERFORMANCE_VARS
 
     written: dict[str, str] = {}
     for key, value in overrides.items():
-        if force or key not in target or (key in XET_HIGH_PERFORMANCE_VARS and _is_true(target.get(key))):
+        if force or key not in target or key in overwritable:
             target[key] = value
             written[key] = value
+    # Remember what WE put in the real environment, and on what terms, so a later resize can tell
+    # our own numbers from a user's, redo only ours, and redo them the same way.
+    if target is os.environ:
+        global _SEEDED_THROTTLED
+        _SEEDED_INTO_ENVIRON.update(written)
+        _SEEDED_THROTTLED = throttled
     return written
+
+
+def resize_for_cache_dir(
+    env: dict,
+    cache_dir: "Optional[str | Path]",
+    *,
+    fail_fast: bool = True,
+    throttled: "Optional[bool]" = None,
+) -> dict[str, str]:
+    """Re-size *env* for *cache_dir*, recomputing the values this process seeded and no others.
+
+    ``apply_xet_env`` is setdefault, and ``unsloth_zoo`` sizes itself at import, so by the time a
+    download names its destination every sizing key is already present and a second call writes
+    nothing: the download would run on numbers computed for whichever cache the environment named,
+    which is exactly what *cache_dir* is there to correct. Dropping our own seeded values first
+    makes the recompute bite. A value we never wrote, or one something else has changed since, is
+    left alone, so an explicit user setting still wins.
+
+    *throttled* defaults to whatever the seeding call used, so a halved stream ceiling asked for by
+    a logged 429 survives the recompute; the whole point of that reduction is that it reaches the
+    process doing the downloading.
+    """
+    if throttled is None:
+        throttled = _SEEDED_THROTTLED
+    for key, value in _SEEDED_INTO_ENVIRON.items():
+        if env.get(key) == value:
+            env.pop(key, None)
+    return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir, throttled = throttled)
 
 
 _LOG_ERROR_RE = re.compile(r'"level"\s*:\s*"(ERROR|WARN)"', re.IGNORECASE)
