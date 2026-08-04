@@ -170,18 +170,30 @@ def looks_like_a_type_alias(node, known_typing_names):
 
 
 def evaluated_values(tree):
-    """Assigned values at module and class scope, which run on import.
+    """Expressions that run at import, at module or class scope.
 
     Type aliases are the case that matters: ``PathLike = str | Path`` raises below
-    3.10 and, unlike an annotation, the future import does not defer it.
+    3.10 and, unlike an annotation, the future import does not defer it. Decorator
+    expressions and parameter defaults are evaluated the same way, so they belong
+    here too. Control flow is descended into (a branch that runs, runs) but function
+    bodies are not, since those only execute when called.
     """
     out = []
+    scoped = (ast.If, ast.Try, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor,
+              ast.While, ast.ExceptHandler, ast.ClassDef)
 
     def walk(node):
         for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.extend(child.decorator_list)
+                out.extend(d for d in child.args.defaults if d is not None)
+                out.extend(d for d in child.args.kw_defaults if d is not None)
+                continue  # the body only runs when called
+            if isinstance(child, ast.ClassDef):
+                out.extend(child.decorator_list)
             if isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None:
                 out.append(child.value)
-            if isinstance(child, ast.ClassDef):
+            if isinstance(child, scoped):
                 walk(child)
 
     walk(tree)
@@ -208,6 +220,23 @@ def test_every_module_parses_on_the_declared_floor():
         f"{floor[0]}.{floor[1]}; either rewrite it or raise requires-python:\n  "
         + "\n  ".join(broken)
     )
+
+
+def test_every_module_compiles():
+    """``ast.parse`` accepts things ``compile`` rejects, and only compile runs on import.
+
+    A misplaced ``from __future__ import annotations`` is the case that bites here: it
+    parses, it makes ``has_future_annotations`` suppress the union check, and it still
+    raises SyntaxError on import.
+    """
+    broken = []
+    for path in scoped_files():
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec",
+                    dont_inherit=True)
+        except SyntaxError as error:
+            broken.append(f"{path.relative_to(REPO_ROOT)}:{error.lineno}: {error.msg}")
+    assert not broken, "these modules do not compile:\n  " + "\n  ".join(broken)
 
 
 def test_no_pep604_unions_are_evaluated_on_the_declared_floor():
