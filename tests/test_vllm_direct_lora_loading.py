@@ -37,8 +37,8 @@ import pytest
 import torch
 
 
-# Imported at module level on purpose: this file is a CI hard gate and needs neither a GPU nor
-# vLLM (tests/conftest.py handles the device-type probe), so an import failure is a regression
+# Imported at module level on purpose: this file is a CI hard gate needing neither a GPU nor
+# vLLM (tests/conftest.py handles the device probe), so an import failure is a regression
 # and must fail the gate instead of skipping it.
 import unsloth_zoo.vllm_utils as vllm_utils
 
@@ -142,7 +142,7 @@ def test_every_projection_reaches_its_own_slot():
             lora_a = module.lora_A.default.weight
             lora_b = module.lora_B.default.weight
             assert torch.equal(slot_a.squeeze(0).squeeze(0), lora_a), name
-            # vLLM folds scaling into B, so the slot holds scaling * B and applies scaling * B @ A
+            # vLLM folds scaling into B, so the slot holds scaling * B
             assert torch.allclose(slot_b.squeeze(0).squeeze(0), SCALING[name] * lora_b), name
             delta = slot_b.squeeze(0).squeeze(0) @ slot_a.squeeze(0).squeeze(0)
             assert torch.allclose(delta, SCALING[name] * (lora_b @ lora_a), atol=1e-5), name
@@ -166,7 +166,7 @@ def test_alias_of_a_different_pair_is_also_rejected():
 
 
 def test_unscaled_alias_of_a_different_pair_is_rejected():
-    # no multiplication, but the copy still overwrites the other pair's training tensor
+    # unscaled, but the copy still overwrites the other pair's training tensor
     src_0, src_1 = torch.full((4, 2), 3.0), torch.full((4, 2), 5.0)
     model = _pairs([src_0, src_1], [torch.zeros(1, 1, 4, 2), src_0], [None, None])
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
@@ -193,8 +193,7 @@ def test_strided_view_alias_is_rejected():
 
 
 def test_alias_through_a_separate_storage_wrapper_is_rejected():
-    # a wrapper over part of the same allocation carries its own storage base, so only the
-    # absolute ranges show the overlap
+    # same allocation, different storage base, so only the absolute ranges show the overlap
     buf = numpy.arange(12, dtype=numpy.float32)
     training = torch.from_numpy(buf)[0:8]
     dest = torch.frombuffer(memoryview(buf)[4:], dtype=torch.float32)
@@ -204,8 +203,7 @@ def test_alias_through_a_separate_storage_wrapper_is_rejected():
 
 
 def test_reshaped_view_of_its_own_source_is_rejected():
-    # spans match but the objects differ, so copy_ would trip on the overlap instead of
-    # being the no-op the exemption assumes
+    # spans match but the objects differ, so copy_ trips instead of being the exemption's no-op
     src = torch.full((4, 2), 3.0)
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
         vllm_utils.load_lora_directly(_pairs([src], [src.unsqueeze(0).unsqueeze(0)], [None]))

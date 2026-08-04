@@ -2858,9 +2858,8 @@ pass
 
 def _lora_storage_span(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Absolute byte range the tensor really touches. Walks the strides, since a view like
-    # base[::2] spans twice numel() * element_size(), and stays absolute so tensors wrapping
-    # one allocation through different storages remain comparable.
+    # Absolute byte range touched. Stride-walked, since base[::2] spans twice
+    # numel() * element_size(); absolute, so different storages over one allocation compare.
     start = tensor.untyped_storage().data_ptr() + \
         tensor.storage_offset() * tensor.element_size()
     if tensor.numel() == 0: return start, start
@@ -2871,10 +2870,9 @@ pass
 
 def check_vllm_loras_not_aliased(model_loras, vllm_pairs):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Every copy destination must own its memory. Sharing it with a training tensor is safe
-    # only when the destination IS that tensor and no scaling follows, which makes the copy a
-    # total no-op; any other overlap overwrites the trainer's weights, compounds a scale onto
-    # them, or trips copy_. Runs before any copy, so a failure leaves both sides untouched.
+    # Every copy destination must own its memory: overlap with a training tensor overwrites or
+    # rescales the trainer's weights, or trips copy_. Only true tensor identity with no scaling
+    # is exempt, as the copy is then a total no-op. Runs before any copy, so a failure leaves both sides untouched.
     spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
     for vllm_lora, model_lora, s in vllm_pairs:
         if vllm_lora.numel() == 0: continue
