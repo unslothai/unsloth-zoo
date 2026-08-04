@@ -1441,9 +1441,11 @@ class _StreamWidthPolicy:
 
     An armed policy still declines while the run has compiled no more than
     ``exact_ceiling`` signatures, so a stream whose diversity never justifies
-    a grid pays no padding. Declining is per batch rather than a disarm
-    because the prefetch seams pick their finalizer once from ``armed``: a
-    policy armed later than that would never widen at all.
+    a grid pays no padding. Declining is per batch rather than a disarm so
+    that nothing has to be re-decided when it changes: every seam reads this
+    object when it stages, including the prefetch finalizers, which select on
+    the policy's presence rather than on ``armed`` precisely because their
+    generator body runs before arming.
     """
 
     __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
