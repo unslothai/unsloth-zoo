@@ -8125,3 +8125,116 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+# MLXTrainingConfig's positional field order on this PR's merge target, read out
+# of `git show unslothai/main:unsloth_zoo/mlx/trainer.py` rather than re-derived
+# from the current dataclass, so this list cannot drift to match a later mistake.
+_MAIN_MLX_CONFIG_POSITIONAL_FIELDS = (
+    "per_device_train_batch_size", "gradient_accumulation_steps", "max_steps",
+    "num_train_epochs", "warmup_steps", "warmup_ratio", "learning_rate",
+    "lr_scheduler_type", "optim", "weight_decay", "adam_beta1", "adam_beta2",
+    "max_grad_norm", "max_grad_value", "max_grad_leaf_norm", "seed",
+    "lora_plus_ratio", "embedding_learning_rate", "logging_steps", "output_dir",
+    "report_to", "save_steps", "save_total_limit", "eval_steps",
+    "load_best_model_at_end", "metric_for_best_model", "greater_is_better",
+    "early_stopping_patience", "neftune_noise_alpha", "dataset_text_field",
+    "max_seq_length", "packing", "dataset_num_proc", "chat_template", "use_cce",
+    "compile", "compile_mode", "compile_max_variants", "compile_arch_overrides",
+    "compile_backend_overrides", "patch_mode", "compile_auto_tune",
+    "compile_trace", "gradient_checkpointing", "streaming", "dataset_order",
+    "preserve_dataset_order", "memory_limit_gb", "cache_limit_gb",
+    "wired_limit_gb", "disable_memory_limits", "cast_norm_output_to_input_dtype",
+    "append_eos", "train_on_completions", "completion_only_loss",
+    "assistant_only_loss", "assistant_token_id", "vlm_chat_template",
+    "per_device_eval_batch_size", "image_size", "label_smoothing_factor",
+    "report_grad_norm", "max_eval_batches",
+    "streaming_text_length_window_batches", "streaming_prefetch_batches",
+    "logging_dir", "run_name",
+)
+
+# The slot `lr_scheduler_type` has occupied since before this PR. Taken from the
+# merge base (`git show acdf0c83:unsloth_zoo/mlx/trainer.py`); unchanged on main.
+_PRE_PR_LR_SCHEDULER_TYPE_INDEX = 7
+
+
+def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
+    """New scheduler knobs must be append-only in MLXTrainingConfig.
+
+    MLXTrainingConfig.__init__ binds *args to fields in declaration order, so
+    inserting a field mid-dataclass silently re-targets every later positional
+    slot. Declaring these knobs next to lr_scheduler_type moved it from index 7
+    to index 10, so an existing 8-positional call stored "cosine" in
+    lr_scheduler_min_lr_rate and _build_schedule died on float("cosine").
+    """
+    import dataclasses
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS,
+    )
+
+    current = [f.name for f in dataclasses.fields(MLXTrainingConfig) if f.init]
+
+    # 1. This PR is append-only: main's field order is an exact prefix, so no
+    #    existing positional slot moves.
+    assert tuple(current[: len(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS)]) == (
+        _MAIN_MLX_CONFIG_POSITIONAL_FIELDS
+    )
+    assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) == {
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+    }
+
+    # 2. lr_scheduler_type keeps the slot it has held since before this PR.
+    assert current.index("lr_scheduler_type") == _PRE_PR_LR_SCHEDULER_TYPE_INDEX
+
+    # 3. The new knobs are listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS and that
+    #    tuple stays an exact suffix of the declaration order (main's invariant).
+    for name in (
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+    ):
+        assert name in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert tuple(current[-len(_MLX_CONFIG_OPTIONAL_COPY_FIELDS):]) == tuple(
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    )
+
+    # 4. The exact reported scenario: an 8-slot positional call whose last value
+    #    is the scheduler name must still land on lr_scheduler_type.
+    eight = MLXTrainingConfig(2, 4, 60, -1, 5, 0.0, 3e-4, "cosine")
+    assert eight.lr_scheduler_type == "cosine"
+    assert eight.lr_scheduler_min_lr_rate is None
+
+    # 5. A full positional dump from a current-main install round-trips by name.
+    defaults = MLXTrainingConfig()
+    dump = [getattr(defaults, name) for name in _MAIN_MLX_CONFIG_POSITIONAL_FIELDS]
+    sentinels = {
+        "lr_scheduler_type": "cosine",
+        "learning_rate": 3e-4,
+        "image_size": (128, 256),
+        "optim": "sgd",
+        "seed": 1234,
+        "run_name": "legacy-run",
+    }
+    for name, value in sentinels.items():
+        dump[_MAIN_MLX_CONFIG_POSITIONAL_FIELDS.index(name)] = value
+    positional = MLXTrainingConfig(*dump)
+    for name, value in sentinels.items():
+        assert getattr(positional, name) == value, name
+    assert positional.lr_scheduler_num_cycles is None
+    assert positional.lr_scheduler_power is None
+
+    # 6. The schedule builds instead of raising float("cosine").
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = positional
+    values = [float(trainer._build_schedule(total_steps=8)(s)) for s in range(8)]
+    assert values[0] == pytest.approx(0.0)  # warmup_steps default 5
+    assert max(values) == pytest.approx(3e-4, rel=1e-6)
+
+    # 7. Legacy keyword construction is unaffected either way.
+    assert MLXTrainingConfig(
+        learning_rate=3e-4, lr_scheduler_type="cosine"
+    ).lr_scheduler_type == "cosine"

@@ -1076,6 +1076,9 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    "lr_scheduler_min_lr_rate",
+    "lr_scheduler_num_cycles",
+    "lr_scheduler_power",
 )
 
 
@@ -1091,13 +1094,6 @@ class MLXTrainingConfig:
     warmup_steps: int = 5
     warmup_ratio: float = 0.0
     learning_rate: float = 2e-4
-    # Floor LR as a fraction of peak (cosine/polynomial/warmup_stable_decay).
-    # 0.0 means decay all the way to 0 (matches HF default).
-    lr_scheduler_min_lr_rate: float = 0.0
-    # Number of cosine cycles (cosine_with_restarts only). HF parity.
-    lr_scheduler_num_cycles: float = 1.0
-    # Polynomial decay power (polynomial only). HF parity.
-    lr_scheduler_power: float = 1.0
     lr_scheduler_type: str = "linear"  # see SUPPORTED_MLX_LR_SCHEDULERS
 
     # Optimization
@@ -1211,6 +1207,20 @@ class MLXTrainingConfig:
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
     logging_dir: str | None = None
     run_name: str | None = None
+
+    # Extra HF scheduler knobs, declared LAST for the same reason as the fields
+    # above: the initializer binds positional args by field order, so inserting
+    # them next to lr_scheduler_type would shift the positional slot of every
+    # field after it (a pre-PR positional config would land its scheduler name
+    # in lr_scheduler_min_lr_rate). Also listed in
+    # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
+    # None means "use HF's default for the selected scheduler" -- resolved in
+    # _build_schedule, since the HF defaults are scheduler-specific (e.g.
+    # num_cycles is 1 for cosine_with_restarts but 0.5 for cosine / WSD, and
+    # the polynomial floor defaults to lr_end=1e-7 rather than 0).
+    lr_scheduler_min_lr_rate: float | None = None
+    lr_scheduler_num_cycles: float | None = None
+    lr_scheduler_power: float | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
