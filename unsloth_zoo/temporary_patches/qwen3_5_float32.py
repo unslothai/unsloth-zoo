@@ -69,6 +69,38 @@ def _unsloth_get_linear_weight_dtype(module):
     return None
 
 
+def _unsloth_weight_dtype(linear):
+    """Return a safe compute dtype for a single Linear's weight, or None.
+
+    Mirrors the guard in ``_unsloth_get_linear_weight_dtype`` so we do not
+    cast activations to a packed quantized storage dtype or to fp8.
+    """
+    if linear is None:
+        return None
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return None
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return None
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return None
+    if getattr(dtype, "itemsize", 2) < 2:
+        return None
+    return dtype
+
+
+def _unsloth_is_default_causal_lm_loss(loss_function):
+    """True when the configured loss is the standard HF causal-LM objective.
+
+    Custom loss functions should fall back to the logits + loss_function path
+    rather than being silently replaced by the fused CE kernel.
+    """
+    name = getattr(loss_function, "__name__", "")
+    return name in ("ForCausalLMLoss",)
+
+
 def _unsloth_cast_position_embeddings(position_embeddings, dtype):
     """Cast a (cos, sin) tuple to dtype when necessary."""
     if position_embeddings is None:
@@ -332,9 +364,10 @@ def patch_Qwen3_5ForCausalLM_dtype():
                 attentions=outputs.attentions,
             )
 
-        target_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", None)
+        target_dtype = _unsloth_weight_dtype(self.lm_head)
 
-        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS:
+        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS \
+                and _unsloth_is_default_causal_lm_loss(self.loss_function):
             # Training path: keep the fused lm-head / cross-entropy path and
             # only inject the dtype alignment at the hidden-state boundary.
             if target_dtype is not None and lm_input.dtype != target_dtype:
@@ -342,8 +375,8 @@ def patch_Qwen3_5ForCausalLM_dtype():
             loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.vocab_size, **kwargs)
             logits = EMPTY_LOGITS
         else:
-            # Inference path (or explicit logits opt-in): materialise logits,
-            # but align them first.
+            # Inference path (or explicit logits opt-in / custom loss):
+            # materialise logits, but align them first.
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
             logits = self.lm_head(lm_input)
@@ -427,9 +460,10 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
                 rope_deltas=outputs.rope_deltas,
             )
 
-        target_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", None)
+        target_dtype = _unsloth_weight_dtype(self.lm_head)
 
-        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS:
+        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS \
+                and _unsloth_is_default_causal_lm_loss(self.loss_function):
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
             loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.text_config.vocab_size, **kwargs)
