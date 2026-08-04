@@ -5594,14 +5594,17 @@ class _AudioVersions(NamedTuple):
             return False
         try:
             found = _Version(installed)
-            ceiling = _Version(self.maximum)
-            if found < _Version(self.minimum):
+            # Only published final releases were qualified. mlx-vlm has
+            # published no prerelease, post-release or local build in 73
+            # releases, so none of these is a version anyone was probed
+            # against, and each can carry code the probes never saw -- a local
+            # build most of all.
+            if found.is_prerelease or found.is_postrelease or found.local:
                 return False
-            # A post-release is the same code repackaged, so `0.4.4.post1` is
-            # inside a range ending at `0.4.4` though it sorts above it.
-            return found <= ceiling or found.base_version == ceiling.base_version
+            return _Version(self.minimum) <= found <= _Version(self.maximum)
         except Exception:
-            # An unparseable version is not evidence of anything.
+            # Neither an unparseable installed version nor an unparseable bound
+            # is evidence of anything. Refusing beats raising out of collation.
             return False
 
     def __str__(self):
@@ -5689,14 +5692,16 @@ def _check_audio_transformers_floor(family):
         version = transformers.__version__
         # PEP 440, not int(split(".")): "5.5rc1" or a v-prefixed tag would
         # raise and be refused as a version that could not be determined.
-        parts = _Version(version).release[:2]
+        # Compared whole rather than by `.release`, which would read 5.5rc1 as
+        # 5.5 and admit a prerelease of the floor -- PEP 440 sorts it below.
+        found = _Version(version)
     except Exception:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' requires transformers "
             f"{floor[0]}.{floor[1]} or newer, and the installed version could "
             f"not be determined."
         ) from None
-    if parts < floor:
+    if found < _Version(f"{floor[0]}.{floor[1]}"):
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' was verified on "
             f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "

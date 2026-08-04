@@ -2714,11 +2714,15 @@ def test_qualified_families_carry_their_probed_requirements():
 @pytest.mark.parametrize("installed,admitted", [
     ("0.4.3", False),        # below the probed floor
     ("0.4.4", True),         # the probed version
-    ("0.4.4.post1", True),   # same code, repackaged
     ("0.5.0", True),
     ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
     ("0.6.5", False),        # which this package caps at 5.5.0
     ("0.6.9", False),
+    ("0.5.0rc1", False),     # prerelease inside the window: never qualified
+    ("0.4.5.dev0", False),
+    ("0.4.4.post1", False),  # nor a post-release or a local build of one
+    ("0.6.4.post1", False),
+    ("0.4.4+local", False),
     ("", False),             # unreadable version: not evidence of anything
     ("not-a-version", False),
 ])
@@ -2732,8 +2736,9 @@ def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
 @pytest.mark.parametrize("installed,allowed", [
     ("0.4.3", False),
     ("0.4.4", True),
-    ("0.4.4.post1", True),
+    ("0.4.4.post1", False),
     ("0.5.0", True),
+    ("0.5.0rc1", False),
     ("0.6.4", True),
     ("0.6.5", False),
     ("0.6.9", False),
@@ -2761,15 +2766,23 @@ def test_the_gate_itself_honours_the_range_not_just_the_range_object(
             mlx_utils._check_audio_family_gate(gemma3n_like())
 
 
-def test_a_family_pinned_to_one_version_still_takes_its_post_release():
-    """Gemma 4's window is a single version, and `0.4.4.post1` is that version
-    repackaged. Refusing it was part of what made the feature unreachable."""
+def test_only_a_published_final_release_is_inside_the_window():
+    """The qualification covers published final releases and nothing else.
+
+    A post-release is conventionally the same code repackaged, but nothing
+    enforces that, and a local build carries whatever its builder put there.
+    mlx-vlm has published no prerelease, post-release or local build across 73
+    releases, so admitting them would widen a fail-closed gate for a case that
+    has never happened.
+    """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
     assert gemma4.admits("0.4.4") is True
-    assert gemma4.admits("0.4.4.post1") is True
-    # But not the next release, which is a different processor.
+    for unqualified in ("0.4.4.post1", "0.4.4.post2", "0.4.4+local",
+                        "0.4.4rc1", "0.4.4.dev0"):
+        assert gemma4.admits(unqualified) is False, unqualified
+    # Nor the next release, which is a different processor.
     assert gemma4.admits("0.4.5") is False
     assert gemma4.admits("0.5.0") is False
 
@@ -2792,12 +2805,18 @@ def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
     assert "0.4.4" in message, "the version to pin is not named"
 
 
-def test_the_transformers_floor_reads_a_release_candidate_as_its_release(
+def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
         monkeypatch):
     """`int(x) for x in version.split(".")` raised on any version that is not
-    plain digits, and the handler reported that as a version it could not
-    determine -- so transformers 5.5rc1 was refused, with a reason that named
-    the wrong problem."""
+    plain digits, and the catch-all handler reported that as a version it could
+    not determine. So `5.5rc1` was refused with a reason naming the wrong
+    problem, and `v5.5.0` -- a real 5.5 -- was refused outright.
+
+    A prerelease is still refused, because PEP 440 sorts it below the release
+    and the floor exists precisely because older transformers expand audio
+    tokens differently. What changes is that it is refused as the older version
+    it is, rather than as an unreadable one.
+    """
     import sys
     import types
 
@@ -2810,12 +2829,12 @@ def test_the_transformers_floor_reads_a_release_candidate_as_its_release(
         fake.__version__ = spelling
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
-    for spelling in ("5.5.0", "5.5rc1", "v5.5.0", "5.5.0.dev0", "5.6.0"):
+    for spelling in ("5.5.0", "v5.5.0", "5.6.0", "5.5.1"):
         _pin(spelling)
         mlx_utils._check_audio_transformers_floor("gemma4")  # must not raise
 
-    # Genuinely older releases are still refused.
-    for spelling in ("4.57.6", "5.4.0"):
+    # Older releases, and prereleases of the floor, are refused as such.
+    for spelling in ("4.57.6", "5.4.0", "5.5rc1", "5.5.0.dev0"):
         _pin(spelling)
         with pytest.raises(NotImplementedError, match="was verified on"):
             mlx_utils._check_audio_transformers_floor("gemma4")
