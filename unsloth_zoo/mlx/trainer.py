@@ -1197,13 +1197,17 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # HF TrainingArguments.adam_epsilon. Declared LAST for the same positional
-    # reason as the fields above, and listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
-    # so those stay an exact suffix. None means "not requested" and leaves the
-    # MLX optimizer default (1e-8, which is also the HF default) untouched, so
-    # this is a no-op unless it is set. Applies to adam/adamw only, matching the
-    # CUDA path; SGD/Muon/Lion take no epsilon and MLX's Adafactor eps is a
-    # 2-tuple with different meaning, so HF's scalar does not belong there.
+    # HF TrainingArguments.adam_epsilon (transformers/training_args.py:919,
+    # default 1e-8). Declared LAST for the same positional reason as the fields
+    # above, and listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS so those stay an
+    # exact suffix of the positional fields. None means "not requested" and
+    # leaves the MLX optimizer default (1e-8, mlx/optimizers/optimizers.py:497
+    # and :568 -- the same value HF defaults to) untouched, so this is a no-op
+    # unless it is set. Applies to the Adam family only, matching the CUDA path:
+    # adam / adamw and their 8-bit quantized counterparts, which take the same
+    # scalar eps and hand it to the stock MLX parent. SGD/Muon/Lion take no
+    # epsilon at all, and MLX's Adafactor eps is a 2-tuple with different
+    # meaning (optimizers.py:744), so HF's scalar does not belong there.
     adam_epsilon: float | None = None
 
     def __init__(self, *args, **kwargs):
@@ -3473,8 +3477,11 @@ class MLXTrainer:
                 float(0.999 if adam_beta2 is None else adam_beta2),
             )
         # Only forwarded when explicitly set, so the MLX default stays in force
-        # otherwise. adam_kwargs reaches Adam/AdamW alone (see below), which is
-        # the same scope as the CUDA path (unsloth/trainer.py:350).
+        # otherwise. adam_kwargs reaches the Adam family alone (see below):
+        # Adam/AdamW and the 8-bit QuantizedMomentAdam{,W}, which forward eps
+        # unchanged to those same parents. That is the CUDA scope too -- HF
+        # builds one adam_kwargs holding betas + eps and applies it only to the
+        # Adam-family branches (transformers/trainer.py:1397-1400).
         if adam_epsilon is not None:
             adam_kwargs["eps"] = float(adam_epsilon)
 
