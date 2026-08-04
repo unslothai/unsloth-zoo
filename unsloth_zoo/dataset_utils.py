@@ -1040,12 +1040,8 @@ def sft_prepare_dataset(
             else:
                 test_text = None  # chat template handles BOS
         else:
-            # A row's text field is a plain string, so do NOT index [0] here: that
-            # takes the first CHARACTER, and the BOS check below (which needs
-            # test_text.startswith(bos_token)) can then never be true for a
-            # multi-character BOS. The [0] is correct one branch up, where
-            # formatting_func returns a LIST of strings. Some datasets do store the
-            # field as a list of strings, so unwrap those.
+            # No [0] on a str: that is the first CHARACTER, so startswith(bos_token)
+            # below could never match. Only unwrap when the field really is a list.
             test_text = next(iter(dataset))[dataset_text_field]
             if isinstance(test_text, (list, tuple)):
                 test_text = test_text[0] if len(test_text) != 0 else None

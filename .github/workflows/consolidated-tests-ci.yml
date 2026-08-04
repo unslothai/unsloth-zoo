@@ -119,9 +119,8 @@ jobs:
         # CPU-pure and monkeypatch every Hub entry point, so they cost under two
         # seconds. Left out of a gate they would have been collected but never
         # run: `pytest tests/ --collect-only` above proves only that they import.
-        # no weights). test_sft_prepare_dataset_double_bos pins the
-        # add_special_tokens contract for text that already carries BOS (stub
-        # tokenizer, no weights). Executing them here keeps fixture/source drift visible.
+        # no weights). test_sft_prepare_dataset_double_bos pins the add_special_tokens
+        # contract for text that already carries BOS.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \

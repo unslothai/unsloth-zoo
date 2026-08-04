@@ -16,26 +16,13 @@
 
 """Double-BOS detection in ``sft_prepare_dataset``.
 
-``sft_prepare_dataset`` decides whether to pass ``add_special_tokens=False`` to the
-tokenizer so a dataset whose text ALREADY carries the BOS token does not get a
-second one prepended. Detection has two arms:
+Detection is ``test_text.startswith(bos_token) or bos_token in chat_template``. Arm B
+needs the BOS as a literal, which Llama-3 style templates never have (they emit
+``{{- bos_token }}``), so arm A is the only detector - and it read ``row[field][0]``,
+the first CHARACTER of a string, which no multi-character BOS can match.
 
-    (test_text is not None and test_text.startswith(bos_token)) or bos_token in chat_template
-
-Arm B only fires when the chat template contains the BOS token *as a literal*. The
-Llama-3 family emits it via the Jinja variable ``{{- bos_token }}``, so the literal
-is absent and arm A is the only detector. Arm A read ``row[field][0]``, which indexes
-a plain string and yields its first CHARACTER, so ``startswith(bos_token)`` could
-never be true for any multi-character BOS.
-
-These tests assert on the TOKENIZED OUTPUT rather than on a flag recorded by the
-stub. ``sft_prepare_dataset`` hands ``num_proc`` to ``Dataset.map`` whenever the
-multiprocessing start method is ``fork`` (Linux), so the map body runs in child
-processes and any state a stub records there is invisible to the parent. Reading
-the returned dataset is what crosses that boundary - and doubled BOS ids in the
-tokenized rows are the user-visible harm anyway.
-
-CPU-pure and offline: the tokenizer/processor is a local stub, no weights are loaded.
+Assertions read the tokenized output, not stub state: under ``fork`` the map body runs
+in child processes where recorded state is invisible to the parent.
 """
 
 import pytest
@@ -48,21 +35,16 @@ BOS = "<|begin_of_text|>"
 BOS_ID = 128000
 CONTENT_IDS = [10, 11, 12]
 
-# Mirrors the Llama-3 chat template: BOS is emitted through a Jinja variable, so the
-# literal token string never appears in the template source and arm B cannot fire.
+# BOS via a Jinja variable, so the literal is absent and arm B cannot fire.
 JINJA_BOS_TEMPLATE = "{{- bos_token }}\n{%- for m in messages %}{{ m['content'] }}{%- endfor %}"
-# A template that does carry the literal, which arm B is supposed to catch.
+# Carries the literal, which arm B is supposed to catch.
 LITERAL_BOS_TEMPLATE = "{{ '" + BOS + "' }}{{ messages }}"
 
 
 class BosStubTokenizer:
-    """Encodes the add_special_tokens decision into its OUTPUT.
-
-    A leading BOS id appears once for a text that already starts with the BOS
-    string, and once more when the caller asks for special tokens. A correct
-    caller therefore yields exactly one leading BOS id in every case; the bug
-    yields two.
-    """
+    """Encodes the add_special_tokens decision into its output: one leading BOS id
+    for text that already starts with BOS, one more if the caller asks for specials.
+    A correct caller yields exactly one; the bug yields two."""
 
     def __init__(self, bos_token=BOS, chat_template=JINJA_BOS_TEMPLATE):
         self.bos_token = bos_token
@@ -80,9 +62,7 @@ class BosStubTokenizer:
             texts = [texts]
         rows = []
         for text in texts:
-            # A list-valued text column arrives here as a list of lists under
-            # batched=True. Mirror the unwrap the caller does for its BOS probe so
-            # this stub can still tokenize that shape.
+            # list-valued column arrives as a list of lists under batched=True
             if isinstance(text, (list, tuple)):
                 text = text[0] if len(text) != 0 else ""
             ids = list(CONTENT_IDS)
@@ -102,8 +82,7 @@ class Args:
 
 
 class DummyTrainer:
-    """Stands in for SFTTrainer: sft_prepare_dataset only reads .model and sets
-    .data_collator."""
+    """Stands in for SFTTrainer: only .model is read and .data_collator is set."""
 
     def __init__(self):
         self.model = None
@@ -135,8 +114,7 @@ def _leading_bos_count(ids):
 
 
 def test_text_already_starting_with_bos_is_not_double_bos():
-    """The regression: text that already carries BOS must not be given a second
-    one. Unpatched, arm A never fires and every row starts with two BOS ids."""
+    """The regression: unpatched, arm A never fires and every row gets two BOS ids."""
     dataset = Dataset.from_dict({"text": [BOS + "hello world", BOS + "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer())
@@ -149,8 +127,7 @@ def test_text_already_starting_with_bos_is_not_double_bos():
 
 
 def test_text_without_bos_still_gets_exactly_one():
-    """Guard the other direction: a dataset with no leading BOS must still have one
-    added by the tokenizer."""
+    """The other direction: text with no BOS must still get one."""
     dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer())
@@ -162,12 +139,8 @@ def test_text_without_bos_still_gets_exactly_one():
 
 
 def test_literal_bos_in_chat_template_still_detected():
-    """Arm B must keep working: a template holding the literal BOS disables
-    add_special_tokens on its own.
-
-    The text deliberately carries NO BOS, so arm A cannot fire and the template literal is
-    the only thing that can suppress the extra token. With BOS-carrying text here instead,
-    arm A alone satisfies the assertion and the test passes even with arm B deleted."""
+    """Arm B alone. The text carries NO BOS so arm A cannot fire; with BOS-carrying
+    text here the test would pass even with arm B deleted."""
     dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer(chat_template=LITERAL_BOS_TEMPLATE))
@@ -179,8 +152,7 @@ def test_literal_bos_in_chat_template_still_detected():
 
 
 def test_list_valued_text_field_is_unwrapped():
-    """Some datasets store the text field as a list of strings. Indexing element 0
-    is correct there, and detection must still fire."""
+    """A list-valued text field: indexing element 0 is correct there."""
     dataset = Dataset.from_dict({"text": [[BOS + "hello world"], [BOS + "second row"]]})
 
     rows = _prepare(dataset, BosStubTokenizer())
@@ -192,8 +164,7 @@ def test_list_valued_text_field_is_unwrapped():
 
 
 def test_no_bos_token_on_tokenizer_is_a_noop():
-    """A tokenizer without a BOS token (e.g. Qwen2.5) must not crash, and no BOS id
-    may appear."""
+    """No bos_token (e.g. Qwen2.5): must not crash, no BOS id may appear."""
     dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer(bos_token=None, chat_template="{{ messages }}"))
