@@ -1013,29 +1013,54 @@ class UnslothVisionDataCollator:
 
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        try:
+        #
+        # Probe with the modality this processor actually has: an audio-only
+        # processor's chat template need not understand an {"type": "image"}
+        # part, and probing it with one can fail construction for a model the
+        # collator can otherwise serve.
+        modality_part = {"type": "image"} if \
+            getattr(processor, "image_processor", None) is not None else {"type": "audio"}
+        def _probe(user_content, assistant_content):
             processor.apply_chat_template([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Hello!"}]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "How can I help you?"}]}
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content},
             ])
+        list_user = [modality_part, {"type": "text", "text": "Hello!"}]
+        try:
+            _probe(list_user, [{"type": "text", "text": "How can I help you?"}])
             self.assistant_single_content = False
         except TypeError:
             try:
-                processor.apply_chat_template([
-                    {"role": "user", "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Hello!"}]},
-                    {"role": "assistant", "content": "How can I help you?"}
-                ])
+                _probe(list_user, "How can I help you?")
                 self.assistant_single_content = True
                 print(
                     f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
                     "text field for assistant roles!\n"\
                     "We will auto fix the data collator to support it!"
                 )
+            except TypeError as list_content_error:
+                # Some speech chat templates concatenate message["content"]
+                # straight into the prompt ('...' + message['content'] + '...'),
+                # so they accept only plain strings for EVERY role and raise
+                # "can only concatenate str (not list) to str" on both probes
+                # above -- Granite-Speech is one. The collator normalises all
+                # message content INTO content parts
+                # (_validate_and_normalize_first_message), so such a template
+                # cannot be rendered here at all. Say so at construction rather
+                # than letting it fail on the first batch, matching how an
+                # audio processor with no `audio=` argument is handled.
+                try:
+                    _probe("Hello!", "How can I help you?")
+                except Exception:
+                    _raise_chat_template_error(list_content_error, processor, model)
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator does not yet support "
+                    f"{type(processor).__name__}: its chat template accepts only "
+                    "plain-string message content, while the collator renders "
+                    "messages as content parts ([{'type': 'text', ...}]). "
+                    "Tokenize with processor.apply_chat_template(..., tokenize=True) "
+                    "and pass audio through the processor directly instead."
+                ) from list_content_error
             except Exception as e:
                 _raise_chat_template_error(e, processor, model)
         except Exception as e:

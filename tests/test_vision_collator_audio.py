@@ -1240,3 +1240,89 @@ def test_empty_string_key_falls_through_to_the_next_key():
     # Preserved from the old `or` chain: a blank url must not shadow a real path.
     out = extract_audio_info(msgs({"type": "audio", "url": "", "path": "/tmp/a.wav"}))
     assert out == ["/tmp/a.wav"]
+
+
+# ---------------------------------------------------------------------------
+# The assistant-content probe must match the processor's modality.
+#
+# __init__ decides assistant_single_content by rendering a fixed conversation
+# that hard-coded a {"type": "image"} part. Now that audio-only processors are
+# admitted, an audio chat template that validates content types can reject that
+# probe and block construction for a model the collator can otherwise serve.
+# ---------------------------------------------------------------------------
+
+class _ModalityStrictProcessor:
+    # Accepts only the modality it declares; records what it was probed with.
+    def __init__(self, accepts, image=False):
+        self.tokenizer = _FakeTokenizer()
+        self.accepts = accepts
+        self.probed_types = []
+        if image: self.image_processor = object()
+        else: self.feature_extractor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list): continue
+            for part in content:
+                kind = part.get("type")
+                if kind == "text": continue
+                self.probed_types.append(kind)
+                if kind != self.accepts:
+                    raise ValueError(f"unsupported content type {kind!r}")
+        return "rendered"
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_audio_only_processor_is_probed_with_an_audio_part():
+    proc = _ModalityStrictProcessor(accepts="audio")
+    UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert proc.probed_types and set(proc.probed_types) == {"audio"}, proc.probed_types
+
+
+def test_image_processor_is_still_probed_with_an_image_part():
+    # Backward compatibility: the vision path's probe must not change.
+    proc = _ModalityStrictProcessor(accepts="image", image=True)
+    UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert proc.probed_types and set(proc.probed_types) == {"image"}, proc.probed_types
+
+
+class _StringContentOnlyProcessor:
+    # Granite-Speech shape: the chat template concatenates message["content"]
+    # into the prompt, so any list content raises TypeError for every role.
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        out = ""
+        for m in messages:
+            out = out + "<|role|>" + m["content"]   # TypeError on a list
+        return out
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_string_only_chat_template_rejected_with_an_actionable_message():
+    # Previously this surfaced as RuntimeError("can only concatenate str (not
+    # \"list\") to str") from the generic chat-template handler, with no
+    # indication of what to do. Reject at construction like the no-audio-kwarg
+    # case does, naming the processor and the reason.
+    with pytest.raises(TypeError, match="plain-string message content"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_StringContentOnlyProcessor())
+
+
+def test_broken_chat_template_still_raises_the_generic_error():
+    # A template that fails on plain strings too is a genuinely broken template,
+    # not a string-only one: keep routing it to _raise_chat_template_error.
+    class _Broken(_StringContentOnlyProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            if any(isinstance(m["content"], list) for m in messages):
+                raise TypeError("can only concatenate str (not \"list\") to str")
+            raise RuntimeError("template is broken")
+    with pytest.raises(Exception) as info:
+        UnslothVisionDataCollator(model=_stub_model(), processor=_Broken())
+    assert "plain-string message content" not in str(info.value)
