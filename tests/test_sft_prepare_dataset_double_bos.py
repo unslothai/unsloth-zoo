@@ -163,13 +163,17 @@ def test_text_without_bos_still_gets_exactly_one():
 
 def test_literal_bos_in_chat_template_still_detected():
     """Arm B must keep working: a template holding the literal BOS disables
-    add_special_tokens, so BOS-carrying text is still not doubled."""
-    dataset = Dataset.from_dict({"text": [BOS + "hello world", BOS + "second row"]})
+    add_special_tokens on its own.
+
+    The text deliberately carries NO BOS, so arm A cannot fire and the template literal is
+    the only thing that can suppress the extra token. With BOS-carrying text here instead,
+    arm A alone satisfies the assertion and the test passes even with arm B deleted."""
+    dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer(chat_template=LITERAL_BOS_TEMPLATE))
 
     for ids in rows:
-        assert _leading_bos_count(ids) == 1, (
+        assert _leading_bos_count(ids) == 0, (
             f"literal BOS in the chat template no longer suppresses the extra BOS: {ids}"
         )
 
