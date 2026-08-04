@@ -109,6 +109,8 @@ jobs:
         # in the mlx-cpu job below and on the Apple Silicon job).
         # test_find_common_token_ids_no_match pins the no-match contract for
         # chat-marker core recovery (stub tokenizer, no weights).
+        # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
+        # mapping (no GPU, no vLLM needed).
         #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
@@ -134,6 +136,7 @@ jobs:
             tests/test_local_4bit_merge_offline_resolution.py \
             tests/test_gated_and_offline_config_classification.py \
             tests/test_find_common_token_ids_no_match.py \
+            tests/test_vllm_direct_lora_loading.py \
             -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
