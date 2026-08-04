@@ -109,3 +109,18 @@ def test_qwen3_5_for_causal_lm_dtype_mismatch_fixed(monkeypatch):
     tuple_outputs = model(input_ids, use_cache=False, return_dict=False)
     assert isinstance(tuple_outputs, tuple)
     assert tuple_outputs[0].shape == (2, 4, config.vocab_size)
+
+
+def test_qwen3_5_for_causal_lm_respects_output_hidden_states_config(monkeypatch):
+    """`config.output_hidden_states=True` must propagate even without the kwarg."""
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    _apply_temporary_patches()
+
+    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
+    config.output_hidden_states = True
+    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+
+    outputs = model(input_ids, use_cache=False)
+    assert outputs.logits.shape == (2, 4, config.vocab_size)
+    assert outputs.hidden_states is not None

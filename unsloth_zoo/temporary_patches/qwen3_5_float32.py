@@ -302,9 +302,12 @@ def patch_Qwen3_5ForCausalLM_dtype():
         logits_to_keep=0,
         **kwargs,
     ):
-        output_attentions = kwargs.pop("output_attentions", None)
-        output_hidden_states = kwargs.pop("output_hidden_states", None)
+        RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
+        # Always work with ModelOutput internally; @can_return_tuple preserves
+        # the public tuple/return_dict contract.
+        kwargs["return_dict"] = True
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -312,9 +315,6 @@ def patch_Qwen3_5ForCausalLM_dtype():
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
             **kwargs,
         )
 
@@ -322,9 +322,19 @@ def patch_Qwen3_5ForCausalLM_dtype():
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         lm_input = hidden_states[:, slice_indices, :]
 
+        if RETURN_HIDDEN_STATES:
+            # GRPO path: downstream rl_replacements applies lm_head selectively.
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=lm_input,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
         target_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", None)
 
-        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None:
+        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS:
             # Training path: keep the fused lm-head / cross-entropy path and
             # only inject the dtype alignment at the hidden-state boundary.
             if target_dtype is not None and lm_input.dtype != target_dtype:
@@ -332,7 +342,8 @@ def patch_Qwen3_5ForCausalLM_dtype():
             loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.vocab_size, **kwargs)
             logits = EMPTY_LOGITS
         else:
-            # Inference path: materialise logits, but align them first.
+            # Inference path (or explicit logits opt-in): materialise logits,
+            # but align them first.
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
             logits = self.lm_head(lm_input)
@@ -384,9 +395,10 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
         logits_to_keep=0,
         **kwargs,
     ):
-        output_attentions = kwargs.pop("output_attentions", None)
-        output_hidden_states = kwargs.pop("output_hidden_states", None)
+        RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
+        kwargs["return_dict"] = True
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -398,9 +410,6 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
             **kwargs,
         )
 
@@ -408,9 +417,19 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         lm_input = hidden_states[:, slice_indices, :]
 
+        if RETURN_HIDDEN_STATES:
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=lm_input,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                rope_deltas=outputs.rope_deltas,
+            )
+
         target_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", None)
 
-        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None:
+        if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS:
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
             loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.text_config.vocab_size, **kwargs)
