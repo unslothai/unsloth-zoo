@@ -13,7 +13,8 @@ The ordering helper is a step-for-step port of transformers'
 transcribes that function and asserts equality over randomized inputs, so the
 port is pinned to the real algorithm rather than to my reading of it.
 
-CPU-pure: pure index math plus torch's RNG. No MLX, no weights, no Metal.
+CPU-pure: index math, the labeled plan builder under the simulation shim, and
+no weights or Metal.
 """
 
 from __future__ import annotations
@@ -262,6 +263,85 @@ def test_labeled_and_unlabeled_paths_produce_the_same_order():
             _normalize_seed(seed) + epoch,
         )
         assert labeled == unlabeled
+
+
+class _SpaceTokenizer:
+    """Whitespace tokenizer; the text of a row is its token ids."""
+
+    pad_token_id = 0
+    eos_token_id = 99
+    unk_token_id = -1
+
+    def __call__(self, texts, **_kwargs):
+        if isinstance(texts, str):
+            return {"input_ids": self.encode(texts)}
+        return {"input_ids": [self.encode(text) for text in texts]}
+
+    def encode(self, text):
+        return [int(part) for part in str(text).split()]
+
+    def convert_tokens_to_ids(self, token):
+        if isinstance(token, list):
+            return [self.convert_tokens_to_ids(t) for t in token]
+        return self.unk_token_id
+
+
+def _keep_all_labels(d):
+    return {"labels": [list(d["input_ids"][0])]}
+
+
+def _labeled_plan(*, num_batches, num_epochs=None, order="length_grouped"):
+    from unsloth_zoo.mlx.trainer import _create_labeled_batches
+
+    return _create_labeled_batches(
+        dataset=[
+            {"text": " ".join(str(10 + j) for j in range((i % 4) + 2))}
+            for i in range(6)
+        ],
+        tokenizer=_SpaceTokenizer(),
+        mask_fn=_keep_all_labels,
+        batch_size=1,
+        max_seq_length=16,
+        seed=1234,
+        dataset_order=order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        return_plan=True,
+    )
+
+
+@pytest.mark.parametrize("order", ["length_grouped", "torch_randperm"])
+def test_max_steps_run_reseeds_every_pass_it_consumes(order):
+    """max_steps>0 gives the labeled builder num_epochs=None plus a num_batches
+    horizon spanning several passes, and the trainer serves it by cycling the
+    plan. Materializing only epoch 0 replays one order for the whole run, while
+    `_create_ordered_text_plan` expands to num_batches and reseeds -- the two
+    text paths have to stream the same rows.
+    """
+    plan = _labeled_plan(num_batches=18, order=order)
+    schedule = [list(batch) for batch in plan.schedule]
+    assert len(schedule) == 18
+    assert plan.cycle_length == 6
+
+    passes = [schedule[0:6], schedule[6:12], schedule[12:18]]
+    for one_pass in passes:
+        assert sorted(i for batch in one_pass for i in batch) == list(range(6))
+    assert passes[0] != passes[1]
+    assert passes[1] != passes[2]
+
+
+def test_max_steps_run_still_truncates_to_the_step_budget():
+    """Expansion only fills a horizon; it must never overshoot it, nor build a
+    second pass for a run that does not reach one."""
+    assert len(_labeled_plan(num_batches=4).schedule) == 4
+    assert len(_labeled_plan(num_batches=15).schedule) == 15
+
+
+def test_sequential_order_is_not_expanded():
+    """Nothing to reseed: every pass would be byte-identical, so the plan stays
+    one block and the trainer cycles it exactly as before."""
+    plan = _labeled_plan(num_batches=18, order="sequential")
+    assert len(plan.schedule) == 6
 
 
 def test_row_length_handles_labeled_and_unlabeled_shapes():

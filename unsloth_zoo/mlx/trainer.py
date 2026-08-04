@@ -8220,6 +8220,18 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     _n_epochs_materialize = (
         max(1, int(num_epochs)) if num_epochs is not None else 1
     )
+    # A max_steps run arrives with num_epochs=None and a num_batches horizon
+    # that can span several dataset passes, which the trainer serves by cycling
+    # this plan. For the orders that reseed, one materialized block would
+    # replay epoch 0 forever instead of reshuffling per pass -- the unlabeled
+    # `_create_ordered_text_plan` expands to num_batches, and the two paths
+    # must stream the same rows.
+    _expand_to_num_batches = (
+        num_epochs is None
+        and num_batches is not None
+        and not preserve_dataset_order
+        and dataset_order in ("torch_randperm", "length_grouped")
+    )
     from .utils import _finite_text_pad_width, _normalize_seed
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
@@ -8228,7 +8240,8 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     schedule = []
     widths = []
     cycle_length = None
-    for epoch_idx in range(_n_epochs_materialize):
+    epoch_idx = 0
+    while True:
         epoch_order = _order_indices_for_epoch(epoch_idx)
         epoch_schedule = []
         for start in range(0, len(epoch_order), global_batch_size):
@@ -8264,6 +8277,15 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # One dataset pass == this epoch's micro-batch count (pre-truncation).
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
+
+        epoch_idx += 1
+        if not epoch_schedule:
+            break
+        if epoch_idx < _n_epochs_materialize:
+            continue
+        if _expand_to_num_batches and len(schedule) < num_batches:
+            continue
+        break
 
     # Limit if needed
     if num_batches is not None and len(schedule) > num_batches:
