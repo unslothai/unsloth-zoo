@@ -70,12 +70,14 @@ class TestWindowsOnArm:
         env = _resolve(platform_name = "win32", machine = "ARM64", environ = {})
         assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
 
-    def test_emulated_x64_python_on_an_arm_machine_is_caught(self):
-        # An x64 Python under emulation reports AMD64; the machine is still ARM,
-        # and Windows advertises that through PROCESSOR_ARCHITEW6432.
+    def test_an_emulated_process_is_caught_because_machine_unmasks_it(self):
+        # platform.machine() reports the native CPU even under emulation: it
+        # prefers PROCESSOR_ARCHITEW6432 on every supported Python, and asks WMI
+        # before the env vars on 3.12+. So the guard needs no second check, and
+        # PROCESSOR_ARCHITEW6432 being present changes nothing here.
         env = _resolve(
             platform_name = "win32",
-            machine = "AMD64",
+            machine = "ARM64",
             environ = {"PROCESSOR_ARCHITEW6432": "ARM64"},
         )
         assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
@@ -100,13 +102,13 @@ class TestEveryOtherPlatformIsUnchanged:
         env = _resolve(platform_name = platform_name, machine = machine, environ = {})
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
-    def test_x64_windows_is_not_caught_by_a_stale_architew6432(self):
-        # The var is only meaningful for an emulated process; on a real x64 box
-        # it is absent, so an x64/x64 pairing must stay enabled.
+    def test_x64_windows_stays_enabled_whatever_the_env_says(self):
+        # machine() is the only signal; a leftover PROCESSOR_ARCHITEW6432 must
+        # not drag an x64 box into the guard.
         env = _resolve(
             platform_name = "win32",
             machine = "AMD64",
-            environ = {"PROCESSOR_ARCHITEW6432": "AMD64"},
+            environ = {"PROCESSOR_ARCHITEW6432": "ARM64"},
         )
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
@@ -145,3 +147,22 @@ class TestWiring:
         _, enable = _statements()
         assert "_windows_on_arm" in ast.dump(enable.test)
         assert "_offline_env" in ast.dump(enable.test)
+
+    def test_no_later_statement_re_enables_the_variable(self):
+        # Executing two statements in isolation says nothing about the other few
+        # hundred. Without this, appending one os.environ[...] = "1" anywhere
+        # below leaves all of the above green while Windows on ARM is broken
+        # again: a test that passes for the wrong reason.
+        assign, enable = _statements()
+        for node in _TREE.body:
+            if node is assign or node is enable:
+                continue
+            assert "HF_HUB_ENABLE_HF_TRANSFER" not in ast.dump(node), (
+                f"line {node.lineno} of __init__.py also writes the variable"
+            )
+
+    def test_the_guard_is_defined_above_the_block_that_reads_it(self):
+        # _statements() collects by node type, not source order, so it would
+        # happily execute an assignment that really sits below its use.
+        assign, enable = _statements()
+        assert assign.lineno < enable.lineno

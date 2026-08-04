@@ -37,11 +37,12 @@ _offline_env = (
 
 # hf_transfer's Rust extension cannot complete a download on Windows on ARM:
 # every fetch dies with "an error occurred while downloading using hf_transfer",
-# and the same fetch succeeds once it is off. PROCESSOR_ARCHITEW6432 covers an
-# x64 Python emulated on the same machine, where machine() reports AMD64.
-_windows_on_arm = sys.platform == "win32" and (
-    platform.machine().lower() in ("arm64", "aarch64")
-    or os.environ.get("PROCESSOR_ARCHITEW6432", "").strip().lower() == "arm64"
+# and the same fetch succeeds once it is off. machine() already unmasks the
+# native CPU (it prefers PROCESSOR_ARCHITEW6432, and asks WMI first on 3.12+),
+# so emulation does not need a second check here.
+_windows_on_arm = sys.platform == "win32" and platform.machine().lower() in (
+    "arm64",
+    "aarch64",
 )
 
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
