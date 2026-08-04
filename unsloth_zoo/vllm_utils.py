@@ -2858,31 +2858,31 @@ pass
 
 def _lora_storage_span(tensor):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Byte range the tensor really touches, so partial overlaps are caught and not just equal
-    # starts. Walks the strides: a view like base[::2] spans twice numel() * element_size().
-    storage = tensor.untyped_storage()
-    start = storage.data_ptr() + tensor.storage_offset() * tensor.element_size()
-    if tensor.numel() == 0: return storage.data_ptr(), start, start
+    # Absolute byte range the tensor really touches. Walks the strides, since a view like
+    # base[::2] spans twice numel() * element_size(), and stays absolute so tensors wrapping
+    # one allocation through different storages remain comparable.
+    start = tensor.untyped_storage().data_ptr() + \
+        tensor.storage_offset() * tensor.element_size()
+    if tensor.numel() == 0: return start, start
     last = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
-    return storage.data_ptr(), start, start + (last + 1) * tensor.element_size()
+    return start, start + (last + 1) * tensor.element_size()
 pass
 
 
 def check_vllm_loras_not_aliased(model_loras, vllm_pairs):
     # All Unsloth Zoo code licensed under LGPLv3
     # Every copy destination must own its memory. Sharing it with a training tensor is safe
-    # only when the destination IS that same tensor and no scaling follows, which makes the
-    # copy a no-op; any other overlap overwrites, or compounds a scale onto, weights the
-    # trainer still needs. Runs before any copy, so a failure leaves both sides untouched.
-    spans = [(_lora_storage_span(t), t.device, t) for t in model_loras if t.numel() != 0]
+    # only when the destination IS that tensor and no scaling follows, which makes the copy a
+    # total no-op; any other overlap overwrites the trainer's weights, compounds a scale onto
+    # them, or trips copy_. Runs before any copy, so a failure leaves both sides untouched.
+    spans = [(_lora_storage_span(t), t.device) for t in model_loras if t.numel() != 0]
     for vllm_lora, model_lora, s in vllm_pairs:
         if vllm_lora.numel() == 0: continue
-        v_ptr, v_start, v_end = _lora_storage_span(vllm_lora)
-        for (m_ptr, m_start, m_end), m_device, m_tensor in spans:
-            if m_ptr != v_ptr or m_device != vllm_lora.device: continue
+        if s is None and vllm_lora is model_lora: continue
+        v_start, v_end = _lora_storage_span(vllm_lora)
+        for (m_start, m_end), m_device in spans:
+            if m_device != vllm_lora.device: continue
             if v_start >= m_end or m_start >= v_end: continue
-            if s is None and m_tensor is model_lora and \
-                (v_start, v_end) == (m_start, m_end): continue
             raise RuntimeError(
                 "Unsloth: a vLLM LoRA slot shares storage with a training tensor. Loading "
                 f"would overwrite, or scale by {s}, weights the trainer still needs. Give "

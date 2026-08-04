@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import types
 
+import numpy
 import pytest
 import torch
 
@@ -189,6 +190,25 @@ def test_strided_view_alias_is_rejected():
     with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
         vllm_utils.load_lora_directly(model)
     assert torch.equal(base, torch.arange(8, dtype=torch.float32))
+
+
+def test_alias_through_a_separate_storage_wrapper_is_rejected():
+    # a wrapper over part of the same allocation carries its own storage base, so only the
+    # absolute ranges show the overlap
+    buf = numpy.arange(12, dtype=numpy.float32)
+    training = torch.from_numpy(buf)[0:8]
+    dest = torch.frombuffer(memoryview(buf)[4:], dtype=torch.float32)
+    assert training.untyped_storage().data_ptr() != dest.untyped_storage().data_ptr()
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(_pairs([training], [dest], [None]))
+
+
+def test_reshaped_view_of_its_own_source_is_rejected():
+    # spans match but the objects differ, so copy_ would trip on the overlap instead of
+    # being the no-op the exemption assumes
+    src = torch.full((4, 2), 3.0)
+    with pytest.raises(RuntimeError, match="shares storage with a training tensor"):
+        vllm_utils.load_lora_directly(_pairs([src], [src.unsqueeze(0).unsqueeze(0)], [None]))
 
 
 def test_aliased_slot_without_scaling_is_allowed():
