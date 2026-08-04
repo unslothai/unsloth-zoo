@@ -1823,8 +1823,14 @@ def _baseline_scale_model(model_type, hidden_size=16):
     `Model.__call__` sends ids through `get_input_embeddings`, which embeds
     without the sqrt(hidden_size) factor the language stack applies on the ids
     path; the stack then takes the `inputs_embeds` branch and never applies it.
-    Recording what the forward receives is the only way to see which route the
-    loss backend took.
+    Recording what the language model receives is the only way to see which
+    route the loss backend took.
+
+    The outer `__call__` here is mlx-vlm 0.4.4's -- the floor this package
+    declares -- which re-embeds from ids and discards a supplied
+    `inputs_embeds`. 0.5.0 onwards forwards it straight to the language model
+    instead. Modelling the older one is what makes the rescale observable:
+    routed through this outer call the factor is silently dropped.
     """
     from types import SimpleNamespace
 
@@ -1836,8 +1842,18 @@ def _baseline_scale_model(model_type, hidden_size=16):
         def embed_tokens(self, ids):
             return mx_.ones((*ids.shape, hidden_size), dtype=mx_.float32)
 
+    class _LanguageModel:
+        model = _Backbone()
+
+        def __call__(self, inputs=None, inputs_embeds=None, **kwargs):
+            seen["forwarded"] = inputs_embeds
+            seen["kwargs"] = kwargs
+            width = (inputs_embeds if inputs_embeds is not None else inputs).shape[1]
+            return SimpleNamespace(
+                logits=mx_.zeros((1, width, 8), dtype=mx_.float32))
+
     class _Model:
-        language_model = SimpleNamespace(model=_Backbone())
+        language_model = _LanguageModel()
         config = SimpleNamespace(model_type=model_type)
 
         def get_input_embeddings(self, inputs, pixel_values=None, **_kwargs):
@@ -1846,9 +1862,13 @@ def _baseline_scale_model(model_type, hidden_size=16):
                 inputs_embeds=_Backbone().embed_tokens(inputs))
 
         def __call__(self, inputs, pixel_values=None, **kwargs):
-            seen["kwargs"] = kwargs
-            width = inputs.shape[1]
-            return mx_.zeros((inputs.shape[0], width, 8), dtype=mx_.float32)
+            seen["outer"] = kwargs
+            # 0.4.4: whatever it was handed, it embeds again from the ids.
+            # Embedded here rather than via `get_input_embeddings` so `merged`
+            # stays a marker of the loss backend's own merge.
+            return self.language_model(
+                inputs, inputs_embeds=_Backbone().embed_tokens(inputs),
+            )
 
     return _Model(), seen, hidden_size ** 0.5
 
@@ -1875,13 +1895,25 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
         "labels": ids,
     })
 
-    embeds = seen.get("kwargs", {}).get("inputs_embeds")
     if not rescaled:
-        # Every other family keeps the untouched ids path.
-        assert embeds is None and "merged" not in seen
+        # Every other family keeps the untouched ids path: the outer model is
+        # entered, and it is the one that embeds.
+        assert "outer" in seen and "merged" not in seen
+        assert seen["forwarded"] is not None
+        assert np.asarray(seen["forwarded"])[0][0][0] == pytest.approx(1.0)
         return
-    assert embeds is not None, "the forward still received bare ids"
+
+    assert seen.get("merged"), "the loss backend never merged"
+    embeds = seen.get("forwarded")
+    assert embeds is not None, "the language model still received bare ids"
+    # The scale has to survive all the way to the language model. Routed
+    # through `Model.__call__` on mlx-vlm 0.4.4 it does not: that call embeds
+    # again from the ids and the factor arrives as a plain 1.0.
     assert np.asarray(embeds)[0][0][0] == pytest.approx(scale)
+    assert "outer" not in seen, (
+        "the rescaled embeddings went through Model.__call__, which drops them "
+        "on every mlx-vlm up to the declared floor"
+    )
 
 
 # --- paligemma: a prefix-LM mask, not a padding outer product ---------------
@@ -3310,6 +3342,45 @@ def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
         {"role": "assistant", "content": "ok"}]}
     with pytest.raises(NotImplementedError):
         _format_vlm_row_gating_audio(messages, strip_audio, _FakeGemmaAudioProcessor())
+
+
+def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
+    """The single-message form of the row above, and the same hazard.
+
+    `_normalize_mlx_messages` wraps a `role`/`content` dict as one message, so
+    it is a supported row. The scan reached it through
+    `_select_vlm_messages_or_raw`, which hands such a row straight back, where
+    the `candidate is item` guard dropped it unscanned -- leaving the gate
+    uncalled and a formatter free to discard the user's clip in silence.
+    """
+    from unsloth_zoo.mlx.utils import (
+        _format_vlm_row_gating_audio, _normalize_vlm_messages,
+        _raw_row_has_audio,
+    )
+
+    clip = {"array": np.zeros(16, np.float32), "sampling_rate": 16000}
+    row = {"role": "user", "content": [{"type": "audio", "audio": clip},
+                                       {"type": "text", "text": "transcribe"}]}
+
+    # Supported: collation turns this row into exactly one message.
+    assert len(_normalize_vlm_messages(row)) == 1
+    assert _raw_row_has_audio(row) is True
+
+    # A message dict carrying no audio must not be gated.
+    assert _raw_row_has_audio(
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+    ) is False
+
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    monkeypatch.setattr(
+        mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {"other": frozenset({"0.0.0"})},
+    )
+    strip_audio = lambda _row: {"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "transcribe"}]}]}
+    with pytest.raises(NotImplementedError):
+        _format_vlm_row_gating_audio(
+            row, strip_audio, _FakeGemmaAudioProcessor())
 
 
 def test_gemma4_audio_delimiters_are_not_targets():

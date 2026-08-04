@@ -2095,6 +2095,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
         # already merges and rescales itself; do the same here so
         # use_cce={True,False} stay in parity instead of differing by that.
+        scaled_embeds = None
         if _vlm_embed_scale(model) is not None:
             embed_result = model.get_input_embeddings(
                 inputs,
@@ -2104,14 +2105,23 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                    if k not in ("mask", "cache")},
             )
             merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
-            fwd_kwargs["inputs_embeds"] = _apply_vlm_embed_scale(
-                model, inputs, merged_embeds,
-            )
+            scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
             # per_layer_inputs and friends: the merge produced them, and
             # recomputing from ids inside the stack would redo the work.
             for key, value in embed_kwargs.items():
                 fwd_kwargs.setdefault(key, value)
-        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
+        if scaled_embeds is not None:
+            # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
+            # declares -- re-embeds from ids inside `Model.__call__` and drops
+            # a supplied `inputs_embeds`, so the rescale above would be thrown
+            # away on exactly the versions that need it. 0.5.0 onwards honors
+            # it by forwarding straight to the language model; do that here on
+            # every version, which is what `_vlm_cce_forward` already does.
+            output = _get_text_model(model)(
+                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+            )
+        else:
+            output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
@@ -6215,6 +6225,16 @@ def _raw_row_has_audio(item):
             return False
     if not isinstance(item, dict):
         return False
+    if "role" in item and "content" in item:
+        # A single message is a supported row shape too -- `_normalize_mlx_
+        # messages` wraps one as `[item]`. Scanned here because the lookups
+        # below read a row, and `_select_vlm_messages_or_raw` hands such a row
+        # straight back, where the identity guard drops it unscanned.
+        try:
+            if any(_vlm_audio_part_state(_normalize_vlm_messages(item))):
+                return True
+        except Exception:
+            return False
     for key in ("audio", "audios"):
         value = item.get(key)
         if value is not None and (not isinstance(value, list) or value):
