@@ -79,12 +79,15 @@ __all__ = [
     "SUPPORTED_GROUP_SIZES",
     "unpack_quantized_moments",
     "state_has_quantized_moments",
+    "announce_quantized_optimizer",
 ]
 
 DEFAULT_GROUP_SIZE = 64
 DEFAULT_BITS = 8
 # mx.quantize's supported group sizes; all three are exercised by the test suite.
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
+# Names already announced in this process; see announce_quantized_optimizer.
+_ANNOUNCED = set()
 
 
 def _as_int(value, name):
@@ -197,17 +200,30 @@ class QuantizedMomentAdamW(_QuantizedFirstMomentMixin, optim.AdamW):
 
 
 def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE):
-    """What an 8-bit request actually gets. The old behaviour rewrote
-    ``adamw_8bit`` to ``adamw`` silently; a quieter surprise would be no better."""
+    """One line. The only thing a user cannot infer from the name is that this
+    quantizes ONE moment, where bitsandbytes' ``adamw_8bit`` quantizes both.
+    Eligibility, dtype and memory behaviour live in this module's docstring; they
+    are reference material and do not belong in stdout on every run."""
     return (
-        f"Unsloth: {optimizer_name} on MLX quantizes the optimizer's FIRST moment "
-        f"to 8-bit (group_size={group_size}); the second moment is not quantized "
-        "(affine 8-bit quantization of the second moment diverges). Only 2-D "
-        f"parameters whose last dimension is a multiple of {group_size} are "
-        "quantized; all others keep unquantized moments. Moments follow the "
-        "parameter dtype, so this saves about 36% of optimizer state in float32 "
-        "and about 23% in bfloat16, and it does not lower peak memory."
+        f"Unsloth: {optimizer_name} on MLX quantizes Adam's first moment to 8-bit "
+        f"(group_size={group_size}); the second moment is unquantized."
     )
+
+
+def announce_quantized_optimizer(
+    optimizer_name, group_size = DEFAULT_GROUP_SIZE, enabled = True,
+):
+    """Print the routing line at most once per process. Returns whether it printed.
+
+    ``_build_optimizer`` runs per training run and per rank, so an unguarded print
+    put five wrapped lines on screen for every rank and every re-run of a notebook
+    cell, for what is the default optimizer in every Unsloth example.
+    """
+    if not enabled or optimizer_name in _ANNOUNCED:
+        return False
+    _ANNOUNCED.add(optimizer_name)
+    print(describe_quantized_optimizer(optimizer_name, group_size))
+    return True
 
 
 def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFAULT_BITS):
