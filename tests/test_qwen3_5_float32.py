@@ -151,6 +151,29 @@ def test_qwen3_5_for_causal_lm_custom_loss_does_not_receive_return_dict(monkeypa
     assert "return_dict" not in received_kwargs
 
 
+def test_qwen3_5_for_causal_lm_honors_accepts_loss_kwargs(monkeypatch):
+    """Respect accepts_loss_kwargs=False by not passing extra kwargs to loss."""
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    _apply_temporary_patches()
+
+    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
+    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
+    received_kwargs = {}
+
+    def custom_loss(*, logits, labels, vocab_size, **kwargs):
+        received_kwargs.update(kwargs)
+        return torch.tensor(0.0, dtype=logits.dtype)
+
+    model.loss_function = custom_loss
+    model.accepts_loss_kwargs = False
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    labels = input_ids.clone()
+    out = model(input_ids, labels=labels, use_cache=False, num_items_in_batch=8)
+    assert out.loss is not None
+    assert "num_items_in_batch" not in received_kwargs
+
+
 @pytest.mark.parametrize("name", ["ForCausalLMLoss", "UnslothForCausalLMLoss"])
 def test_default_causal_lm_loss_accepted(name):
     """The default (and Unsloth-patched) loss names must take the fused path."""
