@@ -731,3 +731,80 @@ def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, t
     # Still overridable, for a caller that knows the throttle has lifted.
     assert int(tuning.resize_for_cache_dir(dict(fake_env), roomy / "hub", throttled = False)[key]) \
         > throttled_streams
+
+
+# A fresh cloud VM: nothing in the environment, and no Xet logs to have learned from. Colab and
+# Kaggle look like this on EVERY run, which is what made the old heuristic fail there forever.
+CLOUD_VMS = [
+    # name,                RAM GB, cpus, free disk GB
+    ("Colab standard",       13.6,    2,   78),
+    ("Colab high-RAM",       51.0,    8,  225),
+    ("Kaggle T4 x2",         33.7,    4, 1100),
+    ("Kaggle CPU",           30.0,    4,   20),
+    ("SageMaker Studio Lab", 16.0,    4,   15),
+    ("Paperspace free",      30.0,    8,   50),
+]
+
+# xet-core's high-performance preset (xet_runtime/src/config/xet_config.rs: with_high_performance
+# is applied AFTER the environment, so it VOIDS whatever we set).
+_HIGH_PERFORMANCE_CEILING = 64 * GB
+
+
+@pytest.mark.parametrize("name, ram_gb, cpus, disk_gb", CLOUD_VMS,
+                         ids = [d[0] for d in CLOUD_VMS])
+def test_a_fresh_cloud_vm_is_never_put_into_high_performance_mode(
+        name, ram_gb, cpus, disk_gb, monkeypatch):
+    """The 2026.6.7 regression, pinned: high-performance mode was enabled whenever the local Xet
+    logs held no prior 429. A fresh VM's logs are ALWAYS empty, so every Colab and Kaggle session
+    started with xet-core's 64GB ceiling; a 29.5GB download was OOM-killed on Colab at 11.32GB RSS
+    against 13.61GB of RAM. The flag is what matters rather than our own numbers, because
+    with_high_performance() is applied after the environment and discards them."""
+    for var in (*tuning.XET_HIGH_PERFORMANCE_VARS, "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    env: dict = {}
+    tuning.apply_xet_env(env, profile = _profile(ram_gb, cpus, disk_gb))
+
+    for var in tuning.XET_HIGH_PERFORMANCE_VARS:
+        assert not tuning._is_true(env.get(var)), (
+            f"{name}: {var}={env.get(var)!r} hands this VM a "
+            f"{_HIGH_PERFORMANCE_CEILING // GB}GB ceiling on {ram_gb}GB of RAM"
+        )
+
+
+@pytest.mark.parametrize("name, ram_gb, cpus, disk_gb", CLOUD_VMS,
+                         ids = [d[0] for d in CLOUD_VMS])
+def test_a_fresh_cloud_vm_keeps_its_buffers_inside_its_own_ram(
+        name, ram_gb, cpus, disk_gb, monkeypatch):
+    """The consequence the flag test cannot see on its own: whatever route the sizing takes, what
+    hf_xet can hold at once has to stay a modest share of the machine. A quarter is the line --
+    measured peak RSS on Colab was 1.3GB of 13.6GB (10%) once sized, against 11.3GB (83%) before."""
+    for var in (*tuning.XET_HIGH_PERFORMANCE_VARS, "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    env: dict = {}
+    tuning.apply_xet_env(env, profile = _profile(ram_gb, cpus, disk_gb))
+
+    in_flight = (int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
+                 + int(env["HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS"])
+                 * int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"]))
+    budget = ram_gb * GB / 4
+    assert in_flight <= budget, (
+        f"{name}: {in_flight / GB:.2f}GB in flight on a {ram_gb}GB VM "
+        f"({100 * in_flight / (ram_gb * GB):.0f}% of RAM, limit 25%)"
+    )
+
+
+def test_an_empty_xet_log_directory_is_not_read_as_permission_to_go_fast():
+    """The exact inversion that shipped: "no 429 in the logs" was treated as "this machine can take
+    high performance", when on a VM created seconds ago it only means nothing has been tried yet.
+    Absence of evidence has to resolve to the conservative branch."""
+    quiet: dict = {}
+    tuning.apply_xet_env(quiet, profile = _profile(13.6, 2, 78))
+    throttled: dict = {}
+    tuning.apply_xet_env(throttled, profile = _profile(13.6, 2, 78), throttled = True)
+
+    for env, label in ((quiet, "no 429s logged"), (throttled, "a 429 was logged")):
+        for var in tuning.XET_HIGH_PERFORMANCE_VARS:
+            assert not tuning._is_true(env.get(var)), f"{label}: {var} enabled"
+    # A logged 429 may fetch less hard, but a quiet log never fetches HARDER than one.
+    assert (int(throttled["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"])
+            <= int(quiet["HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY"]))
