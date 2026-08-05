@@ -1081,3 +1081,62 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         )
     )
     assert len(set(planned_widths)) <= len(set(unplanned_widths)) + 1
+
+
+@metal_only
+def test_preference_generate_during_eval_samples_through_the_real_engine(tmp_path):
+    """A referenced DPO run samples held-out prompts and keeps training.
+
+    Only a real model reaches the backend's capability probe and streaming
+    detokenizer, so this is the one place the wiring runs unmocked.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    def pairs(count):
+        return [
+            {
+                "prompt": f"### Question: what is {i} plus {i}?\n### Answer:",
+                "chosen": f" {2 * i}.",
+                "rejected": f" {2 * i + 3}.",
+            }
+            for i in range(count)
+        ]
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    trainer = MLXDPOTrainer(
+        model=model, tokenizer=tokenizer,
+        train_dataset=pairs(8), eval_dataset=pairs(3),
+        args=MLXDPOConfig(
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            max_steps=2,
+            warmup_steps=0,
+            learning_rate=5e-6,
+            logging_steps=1,
+            output_dir=str(tmp_path),
+            report_to="none",
+            max_seq_length=256,
+            seed=3407,
+            beta=0.1,
+            eval_steps=1,
+            generate_during_eval=True,
+            num_generation_prompts=2,
+            generation_max_tokens=8,
+        ),
+    )
+    result = trainer.train()
+
+    samples = trainer.last_generation_samples
+    assert len(samples) == 2
+    for sample in samples:
+        assert sample["prompt"].startswith("### Question:")
+        # Batched decoding is not batch-invariant, so only presence is asserted.
+        assert isinstance(sample["policy"], str) and sample["policy"]
+        assert isinstance(sample["reference"], str) and sample["reference"]
+
+    assert result["train_steps"] == 2, "training continues past the sampling pass"
+    assert all(
+        module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
+    ), "the reference sample restored every adapter scale"
