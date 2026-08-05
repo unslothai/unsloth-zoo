@@ -214,6 +214,146 @@ def test_the_mixer_wrapper_is_applied_once(env):
         else: sys.modules[mod_name] = saved
 
 
+def _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk):
+    """transformers >= 5.3's shape, where the module flag does not exist yet.
+
+    5.3 moved the kernel resolution into the mixer's `__init__`, so the module
+    carries no `is_fast_path_available` at all until a mixer has been built
+    (`global is_fast_path_available`, models/zamba/modeling_zamba.py:257 in
+    5.5.0) and `forward` recomputes it as a local (line 449). Verified against
+    the real 5.5.0 wheel: right after
+    `import transformers.models.zamba.modeling_zamba`,
+    `"is_fast_path_available" in module.__dict__` is False.
+
+    Availability is read back from `_HUB_KERNEL_MAPPING` the way
+    `lazy_load_kernel` does, so unregistering the Hub kernels is what makes the
+    fast path unavailable here, exactly as on a real 5.5 install.
+    """
+    mod = types.ModuleType(mod_name)
+
+    def _kernels_available():
+        return "mamba-ssm" in hk._HUB_KERNEL_MAPPING
+
+    class Mixer:
+        def __init__(self):
+            self.use_fast_kernels = True                  # config.use_mamba_kernels
+            setattr(self, weight_attr,
+                    types.SimpleNamespace(device = types.SimpleNamespace(type = "cuda")))
+            mod.is_fast_path_available = _kernels_available()
+
+        def forward(self, *args, **kwargs):
+            is_fast_path_available = _kernels_available()  # a local, as in 5.5
+            if self.use_fast_kernels:
+                if not is_fast_path_available:
+                    raise ValueError("Fast Mamba kernels are not available.")
+                return "FAST PATH"
+            return "SLOW PATH"
+
+    Mixer.__name__ = cls_name
+    setattr(mod, cls_name, Mixer)
+    sys.modules[mod_name] = mod
+    return mod, Mixer
+
+
+@pytest.mark.parametrize("mod_name, cls_name, weight_attr", [
+    ("transformers.models.jamba.modeling_jamba", "JambaMambaMixer", "x_proj"),
+    ("transformers.models.zamba.modeling_zamba", "ZambaMambaMixer", "x_proj_weight"),
+])
+def test_the_mixer_is_wrapped_before_any_mixer_exists(
+    env, mod_name, cls_name, weight_attr,
+):
+    """The wrapper must not hang off the module's `is_fast_path_available`.
+
+    On transformers >= 5.3 that name is absent from the module dict until a
+    mixer has been constructed, and on 4.x the predicate flip in step 1 has
+    already made it False by the time the modeling module is imported. Gating
+    the wrapper on it left the mixer unwrapped in both orderings, and the guard
+    then handed back `ValueError: Fast Mamba kernels are not available` instead
+    of the slow path. Reproduced on real transformers 5.5.0 and 4.57.6.
+    """
+    _model_mod, _iu, hk = env
+    saved = sys.modules.get(mod_name)
+    mod, Mixer = _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk)
+    try:
+        assert "is_fast_path_available" not in mod.__dict__, "the 5.3+ shape"
+        patch()
+        assert Mixer.__dict__.get("_unsloth_slow_only", False) is True
+        mixer = Mixer()
+        assert mod.is_fast_path_available is False, "step 0 removed the kernels"
+        assert mixer.forward() == "SLOW PATH"
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_the_mixer_is_wrapped_without_a_local_mamba_ssm_wheel(env):
+    """Unregistering the Hub kernels is on its own enough to make Zamba raise,
+    so the wrapper has to be installed before the local-wheel early return."""
+    _model_mod, _iu, hk = env
+    mod_name = "transformers.models.zamba.modeling_zamba"
+    saved = sys.modules.get(mod_name)
+    mod, Mixer = _lazy_flag_mixer_module(
+        mod_name, "ZambaMambaMixer", "x_proj_weight", hk)
+    try:
+        _no_local_wheel()
+        assert patch() is None
+        assert Mixer().forward() == "SLOW PATH"
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_the_lazy_flag_wrapper_is_applied_once(env):
+    _model_mod, _iu, hk = env
+    mod_name = "transformers.models.zamba.modeling_zamba"
+    saved = sys.modules.get(mod_name)
+    _mod, Mixer = _lazy_flag_mixer_module(
+        mod_name, "ZambaMambaMixer", "x_proj_weight", hk)
+    try:
+        patch()
+        first = Mixer.forward
+        patch()
+        assert Mixer.forward is first, "must not stack on every phase"
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_the_config_flag_is_cleared_for_jamba_5_5(env):
+    """Jamba on 5.5 routes on `self.config.use_mamba_kernels`, not on the
+    instance flag (models/jamba/modeling_jamba.py:462-472), and clears exactly
+    that field on its own fallback."""
+    _model_mod, _iu, _hk = env
+    mod_name = "transformers.models.jamba.modeling_jamba"
+    saved = sys.modules.get(mod_name)
+    mod = types.ModuleType(mod_name)
+
+    class JambaMambaMixer:
+        def __init__(self):
+            self.config = types.SimpleNamespace(use_mamba_kernels = True)
+        def forward(self, *args, **kwargs):
+            return "FAST PATH" if self.config.use_mamba_kernels else "SLOW PATH"
+
+    mod.JambaMambaMixer = JambaMambaMixer
+    sys.modules[mod_name] = mod
+    try:
+        assert JambaMambaMixer().forward() == "FAST PATH"
+        patch()
+        mixer = JambaMambaMixer()
+        assert mixer.forward() == "SLOW PATH"
+        assert mixer.config.use_mamba_kernels is False
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_the_mixer_scan_does_not_walk_sys_modules(env):
+    """The two mixers are reached by direct `sys.modules` lookup, not by another
+    pass over every loaded module, so the extra work is two dict gets."""
+    assert 'sys.modules.get(_name, None)' in _SRC
+    assert _SRC.count("for _name, _mod in list(sys.modules.items()):") == 1
+
+
 def test_alias_modules_are_not_probed_through_getattr():
     """transformers 5 registers ~200 `image_processing_<m>_fast` alias modules
     whose catch-all __getattr__ imports the real image processor. Probing them

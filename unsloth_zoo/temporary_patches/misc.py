@@ -1057,6 +1057,8 @@ def patch_mamba_ssm_pre_ampere_fallback():
     if (major, minor) >= (8, 0):
         return  # Ampere or newer; the fast path is fine
 
+    import sys
+
     # 0. transformers 5 can also fetch these kernels from the Hub, through
     #    `lazy_load_kernel`, which needs no local wheel and never consults the
     #    predicates below. Drop the registry entries so it returns None and the
@@ -1073,12 +1075,62 @@ def patch_mamba_ssm_pre_ampere_fallback():
         pass
     pass
 
+    # 0b. Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
+    #     (True by default) at construction and RAISE inside that branch when the
+    #     fast path is unavailable, so step 0 above and step 1 below turn their
+    #     forward into `ValueError: Fast Mamba kernels are not available` instead
+    #     of the slow path this guard promises. Wrapping the mixer is the only
+    #     thing that clears the instance flag, so it must not hang off the
+    #     module's `is_fast_path_available`:
+    #       - transformers >= 5.3 assigns that name from inside the mixer's
+    #         __init__ (`global is_fast_path_available`,
+    #         models/zamba/modeling_zamba.py:257 on 5.5.0), so it is absent from
+    #         the module dict until a mixer already exists, and 5.5's forward
+    #         recomputes it as a local (line 449) anyway.
+    #       - on 4.x it IS a module global, but step 1 has already made it False
+    #         by the time the modeling module gets imported, so a truthiness gate
+    #         never fired there either.
+    #     Before the local-wheel check: step 0 alone is enough to make the fast
+    #     path unavailable, and therefore enough to trigger the raise.
+    #     `sys.modules.get`, never a getattr scan: transformers 5 registers ~200
+    #     alias modules whose catch-all __getattr__ imports the real object.
+    #     Local, not a module global: the test extracts this function by AST and
+    #     execs it in a bare namespace.
+    _raising_mixers = {
+        "transformers.models.jamba.modeling_jamba" : "JambaMambaMixer",
+        "transformers.models.zamba.modeling_zamba" : "ZambaMambaMixer",
+    }
+    for _name, _cls_name in _raising_mixers.items():
+        _mod = sys.modules.get(_name, None)
+        if _mod is None:
+            continue
+        try:
+            _mixer = _mod.__dict__.get(_cls_name, None)
+            if _mixer is None or _mixer.__dict__.get("_unsloth_slow_only", False):
+                continue
+            def _slow_only(self, *a, __orig = _mixer.forward, **kw):
+                self.use_fast_kernels = False
+                try:
+                    # Jamba on transformers 5.5 reads `self.config.use_mamba_kernels`
+                    # rather than the instance flag, and clears exactly this on its
+                    # own fallback (models/jamba/modeling_jamba.py:470).
+                    _config = getattr(self, "config", None)
+                    if getattr(_config, "use_mamba_kernels", False):
+                        _config.use_mamba_kernels = False
+                except Exception:
+                    pass
+                return __orig(self, *a, **kw)
+            _mixer.forward = _slow_only
+            _mixer._unsloth_slow_only = True
+        except Exception:
+            pass
+        pass
+    pass
+
     try:
         import mamba_ssm  # noqa: F401
     except Exception:
         return  # Not installed locally, and the Hub entries are already gone
-
-    import sys
 
     # 1. Modules imported LATER see the package as unavailable, so their
     #    `is_fast_path_available` evaluates to False at import time.
@@ -1093,17 +1145,8 @@ def patch_mamba_ssm_pre_ampere_fallback():
 
     # 2. Modules ALREADY imported have baked the flag in; flip it directly.
     #    Confined to transformers' own model modules so vLLM's independent
-    #    Triton kernels are left alone.
-    # Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
-    # (True by default) at construction and RAISE inside that branch when the
-    # module flag is False, so clearing the flag alone turns their forward into
-    # `ValueError: Fast Mamba kernels are not available` instead of the slow
-    # path this guard promises. Local, not a module global: the test extracts
-    # this function by AST and execs it in a bare namespace.
-    _raising_mixers = {
-        "transformers.models.jamba.modeling_jamba" : "JambaMambaMixer",
-        "transformers.models.zamba.modeling_zamba" : "ZambaMambaMixer",
-    }
+    #    Triton kernels are left alone. Jamba and Zamba are handled in 0b above,
+    #    which does not depend on the flag being present or truthy.
     _touched = False
     for _name, _mod in list(sys.modules.items()):
         if not _name.startswith("transformers.models.") or _mod is None:
@@ -1117,13 +1160,6 @@ def patch_mamba_ssm_pre_ampere_fallback():
             continue
         try:
             _mod.is_fast_path_available = False
-            _mixer = getattr(_mod, _raising_mixers.get(_name, ""), None)
-            if _mixer is not None and not _mixer.__dict__.get("_unsloth_slow_only", False):
-                def _slow_only(self, *a, __orig = _mixer.forward, **kw):
-                    self.use_fast_kernels = False
-                    return __orig(self, *a, **kw)
-                _mixer.forward = _slow_only
-                _mixer._unsloth_slow_only = True
             for _sym in (
                 "selective_state_update",
                 "mamba_chunk_scan_combined",
