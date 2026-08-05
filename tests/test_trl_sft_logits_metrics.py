@@ -385,9 +385,9 @@ def test_the_1x_shape_keeps_real_metrics():
 def trl_logs_aux(sft):
     """Does the INSTALLED trl log aux_loss once the metric block is skipped?
 
-    0.23.0-0.25.x keep it inside the `use_liger_kernel` branch; 0.29.0 and
-    1.x moved it out (0.29.1 sft_trainer.py:1323), where it logs either way.
-    Asked by running it, so a future move in either direction is picked up.
+    0.23.0-0.25.x keep it inside the `use_liger_kernel` branch; 0.29.0 and 1.x
+    moved it out (0.29.1 sft_trainer.py:1323). Asked by running it, so a future
+    move either way is picked up.
     """
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
@@ -403,8 +403,7 @@ def trl_logs_aux(sft):
         self = _trainer(sft)
         self.aux_loss_enabled = True
         self.args.use_liger_kernel = True
-        # trl's own compute_loss, not the wrapper: the wrapper is what this
-        # answer is for, and it would replay on top of the reading.
+        # trl's own compute_loss: the wrapper would replay on top of the reading.
         inner = getattr(sft.SFTTrainer.compute_loss, "__wrapped__",
                         sft.SFTTrainer.compute_loss)
         with warnings.catch_warnings():
@@ -462,10 +461,9 @@ def test_aux_loss_survives_the_skipped_metric_block(sft, sentinel):
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_aux_loss_is_not_logged_twice(sft, trl_logs_aux, sentinel):
     """trl 1.x logs it outside the branch, so replaying would double-count.
-    Gated on the count rather than on a version number.
-
-    Only stand in for that when the installed trl does not already do it,
-    otherwise the stand-in is a second logger and counts twice by itself.
+    Gated on the count rather than on a version number. Stand in for that only
+    when the installed trl does not already do it, or the stand-in is a second
+    logger and doubles the count by itself.
     """
     self = _run_with_aux(sft, sentinel(), steps = 3,
                          trainer_logs_aux = not trl_logs_aux)
