@@ -16,10 +16,9 @@
 
 """A torchao built for a newer torch must give a readable error.
 
-The ImportError lands in the `Unpack` guard in temporary_patches/utils.py
-and used to fall through to a bare `raise Exception(e)`, naming neither
-torchao nor torch. These cover what the new branch must catch, what it must
-leave alone, and that it cannot itself raise.
+The ImportError lands in the `Unpack` guard in temporary_patches/utils.py, which
+used to fall through to a bare `raise Exception(e)` naming neither package. These
+cover what the new branch must catch, must leave alone, and must not raise on.
 """
 
 import ast
@@ -32,11 +31,8 @@ UTILS = (Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
 def _load_helpers():
-    """Exec just the two helpers.
-
-    Importing the module would run the very import guard under test and,
-    on a healthy install, do nothing interesting -- and on a broken one,
-    raise before a single assertion ran.
+    """Exec just the two helpers: importing the module would run the very guard
+    under test, which on a broken install raises before any assertion runs.
     """
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
     wanted = {"_torchao_is_newer_than_torch", "_torchao_torch_mismatch_message"}
@@ -80,8 +76,7 @@ def test_the_other_torchao_symbols(sym):
 # ---- what it must NOT catch ----------------------------------------------
 
 def test_the_unpack_move_is_left_alone():
-    """It sits directly beside the Unpack branch; swallowing that would
-    hide a different problem with a different fix."""
+    """It sits beside the Unpack branch; swallowing that hides a different bug."""
     assert looks_like(
         "cannot import name 'Unpack' from 'transformers.processing_utils'"
     ) is False
@@ -115,8 +110,7 @@ def test_the_message_names_both_versions():
 
 
 def test_the_message_survives_missing_metadata(monkeypatch):
-    """Version lookup is best-effort; it must not turn a diagnostic into a
-    second exception."""
+    """Version lookup is best-effort: it must not raise a second exception."""
     import importlib.metadata as md
     monkeypatch.setattr(md, "version",
                         lambda *_a, **_k: (_ for _ in ()).throw(Exception("no")))

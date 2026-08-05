@@ -512,8 +512,7 @@ def test_nested_text_config_vocab_size_is_preferred():
 
 
 def test_single_vocab_models_keep_the_old_bound():
-    """No text vocab declared -> behave exactly as before: an out-of-range
-    declared pad is still rejected."""
+    """No text vocab declared -> the old bound, so an out-of-range pad is rejected."""
     tok = FakeTokenizer(
         {"<|eot|>": 10}, pad_token="<|eot|>", eos_token="<|eot|>",
     )

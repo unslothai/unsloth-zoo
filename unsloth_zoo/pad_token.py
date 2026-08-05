@@ -125,9 +125,8 @@ def _text_vocab_size(cfg):
     """Vocab size that bounds the text tokenizer's ids.
 
     Composite configs size `vocab_size` for something else (Sesame CSM: 2051, the
-    audio codebook, against a 128256-entry text tokenizer), which rejects a valid
-    declared pad. Prefer an explicitly declared text vocab, else `config.vocab_size`
-    as before, so single-vocab models are untouched.
+    audio codebook, against a 128256-entry text tokenizer), rejecting a valid
+    declared pad. Prefer a declared text vocab, else `config.vocab_size` as before.
     """
     if cfg is None:
         return None

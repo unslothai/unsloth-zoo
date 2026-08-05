@@ -17,14 +17,10 @@
 """What the pretokenized bypass is allowed to hand to the text path.
 
 The bypass lets a text-only fine-tune of a multimodal model reach dataset-level
-masking instead of being refused. Two things it must not do on the way:
-
-* fire for rows that still carry images, since the text path replaces the
-  collator and the user's image handling would go with it; and
-* leave behind a `DataCollatorForSeq2Seq` that pads through a processor, which
-  has no `.pad`, so the run dies on the first batch.
-
-CPU-pure and offline: everything here is a local stub, no weights are loaded.
+masking instead of being refused. Two things it must not do on the way: fire for
+rows that still carry images (the text path replaces the collator, and the user's
+image handling with it), or leave behind a collator padding through a processor,
+which has no `.pad`, so the run dies on the first batch. CPU-pure and offline.
 """
 
 import re
@@ -126,9 +122,8 @@ def _multimodal_rows():
     "pixel_values", "pixel_values_videos", "image_grid_thw", "input_features",
 ])
 def test_multimodal_rows_are_still_refused(extra_column):
-    """`input_ids` alone does not make a row text-only. The text path swaps the
-    collator for a text one, so firing here would silently drop the user's
-    image handling and mis-shape (or fail to batch) the image columns."""
+    """`input_ids` alone does not make a row text-only: the text path swaps in a
+    text collator, silently dropping the user's image handling."""
     collator = MyVisionCollator(StubProcessor())
     dataset = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
@@ -153,10 +148,8 @@ def test_multimodal_iterable_rows_are_still_refused():
 # ---- the run has to survive the first batch --------------------------------
 
 def test_a_processor_backed_seq2seq_collator_is_rebuilt():
-    """`DataCollatorForSeq2Seq(tokenizer = processor)` is the collator the
-    bypass exists for. Left alone it pads via `self.tokenizer.pad`, which a
-    processor does not have, so the first batch dies with
-    `AttributeError: ... object has no attribute 'pad'`."""
+    """`DataCollatorForSeq2Seq(tokenizer = processor)` is what the bypass exists
+    for: left alone it pads via a `self.tokenizer.pad` a processor does not have."""
     processor = StubProcessor()
     trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = processor),
                           _text_rows())
@@ -174,8 +167,7 @@ def test_a_processor_backed_seq2seq_collator_is_rebuilt():
 
 
 def test_a_tokenizer_backed_seq2seq_collator_is_left_alone():
-    """The pre-existing path: a seq2seq collator that already pads through a
-    real tokenizer keeps its own settings."""
+    """The pre-existing path: one padding through a real tokenizer keeps its settings."""
     collator = DataCollatorForSeq2Seq(tokenizer = StubTokenizer(),
                                       pad_to_multiple_of = 8)
     trainer = StubTrainer(collator, _text_rows())
@@ -197,8 +189,8 @@ def _text_only_trainer():
 
 
 def test_a_multimodal_eval_split_still_refuses():
-    """The collator is swapped for the whole trainer, so a text-only train set
-    beside a multimodal eval set must not clear the guard."""
+    """The swap is trainer-wide, so a text-only train set beside a multimodal
+    eval set must not clear the guard."""
     trainer = _text_only_trainer()
     trainer.eval_dataset = _multimodal_rows()
     with pytest.raises(ValueError, match = "does not support response-only"):
@@ -223,8 +215,7 @@ def test_a_text_only_eval_split_is_fine():
     "flattened_patches", "high_res_pixel_values",
 ])
 def test_processor_specific_column_names_are_refused_too(column):
-    """phi4_multimodal, pix2struct and kosmos-2.5 do not spell these the way
-    the common families do."""
+    """phi4_multimodal, pix2struct and kosmos-2.5 spell these their own way."""
     dataset = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         column: [[0.0], [0.0]],
@@ -235,8 +226,7 @@ def test_processor_specific_column_names_are_refused_too(column):
 
 
 def test_a_processor_backed_collator_is_rebuilt_even_with_packing():
-    """It raises on its first batch whether or not packing is on, so the
-    tokenizer repair cannot be gated on packing the way the swap is."""
+    """It raises on the first batch either way, so the repair is not packing-gated."""
     trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubProcessor()),
                           _text_rows())
     trainer.args.packing = True
@@ -264,10 +254,8 @@ def _raw_text_rows(n = 2):
 
 
 def test_a_raw_text_only_eval_split_is_allowed_through():
-    """A text-only eval split that is not pretokenized is tokenized by the text
-    path with the inner text tokenizer, and the same dataset-level masking then
-    applies to it. Refusing it would make adding evaluation to a supported
-    text-only VLM run fail unless the user pretokenizes eval by hand."""
+    """A raw text-only eval split is tokenized by the text path with the inner
+    tokenizer and masked the same way, so users need not pretokenize it by hand."""
     trainer = _text_only_trainer()
     trainer.eval_dataset = _raw_text_rows()
 
@@ -291,8 +279,7 @@ def test_a_raw_text_only_split_in_an_eval_dict_is_allowed_through():
 
 
 def test_a_raw_split_carrying_images_is_still_refused():
-    """Raw does not mean text-only: an image column means the text path would
-    throw the user's image handling away with the collator."""
+    """Raw does not mean text-only: an image column still needs its collator."""
     trainer = _text_only_trainer()
     trainer.eval_dataset = Dataset.from_dict({
         "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
@@ -303,9 +290,8 @@ def test_a_raw_split_carrying_images_is_still_refused():
 
 
 def test_a_raw_split_with_no_text_column_is_still_refused():
-    """Conversational multimodal data carries its images inside the turns, so
-    the columns alone look text-only. There is nothing for the text path to
-    tokenize, so this must keep the old refusal rather than empty the split."""
+    """Conversational multimodal data hides its images inside the turns, so the
+    columns look text-only. Nothing to tokenize, so refuse rather than empty it."""
     trainer = _text_only_trainer()
     trainer.eval_dataset = Dataset.from_dict({"messages": [[{"role": "user"}]]})
     with pytest.raises(ValueError, match = "does not support response-only"):
@@ -315,10 +301,8 @@ def test_a_raw_split_with_no_text_column_is_still_refused():
 # ---- non-seq2seq collators that pad through a processor --------------------
 
 def test_a_processor_backed_padding_collator_is_repaired_under_packing():
-    """`DataCollatorWithPadding(tokenizer = processor)` pads through
-    `self.tokenizer.pad` exactly like the seq2seq one does, so packing being on
-    must not leave it attached: the first batch dies with
-    `AttributeError: ... object has no attribute 'pad'` either way."""
+    """`DataCollatorWithPadding(tokenizer = processor)` pads through the same
+    missing `.pad`, so packing being on must not leave it attached."""
     collator = DataCollatorWithPadding(tokenizer = StubProcessor())
     trainer = StubTrainer(collator, _text_rows())
     trainer.args.packing = True
@@ -334,7 +318,7 @@ def test_a_processor_backed_padding_collator_is_repaired_under_packing():
 
 def test_a_collator_holding_only_a_processor_is_repaired_under_packing():
     """TRL's `DataCollatorForVisionLanguageModeling` keeps the processor under
-    `.processor`, not `.tokenizer`, and has the same problem."""
+    `.processor`, not `.tokenizer`, with the same problem."""
     trainer = _text_only_trainer()          # MyVisionCollator holds `.processor`
     trainer.args.packing = True
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
@@ -343,8 +327,8 @@ def test_a_collator_holding_only_a_processor_is_repaired_under_packing():
 
 
 class PackingCollator:
-    """Stand-in for TRL's packing `DataCollatorForLanguageModeling`: it takes a
-    bare `pad_token_id` and holds no tokenizer or processor at all."""
+    """Stand-in for TRL's packing `DataCollatorForLanguageModeling`: a bare
+    `pad_token_id`, no tokenizer or processor at all."""
     def __init__(self):
         self.pad_token_id = PAD_ID
 
@@ -353,9 +337,8 @@ class PackingCollator:
 
 
 def test_a_packing_collator_that_holds_no_tokenizer_is_left_alone():
-    """The reason the swap is gated on packing: a packing collator builds the
-    packed `position_ids` itself, and DataCollatorForSeq2Seq would not. Nothing
-    above may widen far enough to catch one."""
+    """Why the swap is packing-gated: a packing collator builds the packed
+    `position_ids` itself and DataCollatorForSeq2Seq would not."""
     collator = PackingCollator()
     trainer = StubTrainer(collator, _text_rows())
     trainer.args.packing = True

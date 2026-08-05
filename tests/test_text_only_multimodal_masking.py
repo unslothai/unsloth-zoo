@@ -17,11 +17,9 @@
 """``train_on_responses_only`` on a text-only fine-tune of a multimodal model.
 
 Such a run still carries a processor as its ``tokenizer``, so a plain text
-collator trips the vision-collator check and used to raise. When the rows are
-already tokenized, labels are not rebuilt at collate time, so dataset-level
-masking is correct and the call must go through.
-
-CPU-pure and offline: the tokenizer is a local stub, no weights are loaded.
+collator trips the vision-collator check and used to raise. Already-tokenized
+rows are not relabelled at collate time, so dataset-level masking is correct
+and the call must go through. CPU-pure and offline: the tokenizer is a stub.
 """
 
 import pytest
@@ -97,8 +95,7 @@ def test_pretokenized_rows_get_dataset_level_masking():
 
 
 def test_untokenized_rows_still_refuse():
-    """Without input_ids the collator really may rebuild labels, so refusing is
-    still right: silently unmasked responses would be worse."""
+    """Without input_ids the collator may really rebuild labels, so still refuse."""
     processor = StubProcessor()
     trainer = StubTrainer(TextCollator(processor), _raw_text())
 
@@ -121,8 +118,7 @@ def test_unsloth_vision_collator_is_configured_not_bypassed():
 
 def test_iterable_dataset_clears_the_guard():
     """An IterableDataset has no column_names, so detection peeks a row instead.
-    Asserted through the guard only: the shared text path it reaches afterwards
-    is out of scope here."""
+    Only the guard is asserted; the text path it then reaches is out of scope."""
     trainer = StubTrainer(TextCollator(StubProcessor()),
                           _pretokenized().to_iterable_dataset())
 

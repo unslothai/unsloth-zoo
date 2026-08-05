@@ -260,18 +260,17 @@ del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
 
-# A torchao built for a newer torch imports symbols straight out of torch
-# (`from torch.nn.functional import ScalingType`). On an older pinned torch the
+# A torchao built for a newer torch imports symbols straight out of torch (e.g.
+# `from torch.nn.functional import ScalingType`). On an older pinned torch the
 # symbol is absent, and the ImportError arrives here naming neither package.
 _TORCHAO_TORCH_SYMBOLS = ("ScalingType", "ScalingGranularity", "Float8Tensor")
 
 
 def _torchao_is_newer_than_torch(message):
-    """Does this ImportError look like torchao reaching into a torch that lacks
-    the symbol?
+    """Is this ImportError torchao reaching into a torch that lacks the symbol?
 
-    Narrow on purpose: the symbol must be one torchao pulls from torch and the
-    failing module must be a torch one, so unrelated errors keep their own text.
+    Narrow on purpose: both the symbol and the failing module must be torch's,
+    so unrelated errors keep their own text.
     """
     try:
         message = str(message)
