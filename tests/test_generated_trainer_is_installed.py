@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """The generated trainer must actually be installed, and failing is silent.
 
 `_patch_trl_rl_trainers` wraps generation in `except Exception: logger.info(...)`
@@ -113,6 +129,11 @@ def test_generation_raises_loudly_when_called_directly():
         from unsloth.models import rl
         print("HAS_IMPL " + str(hasattr(rl, "_patch_trl_rl_trainers_impl")))
     """)
+    # _run drops UNSLOTH_ALLOW_CPU on purpose, so on a CPU-only host the import
+    # aborts before printing. Skip like `installed` does; a missing accelerator
+    # is not this test's subject.
+    if "HAS_IMPL" not in r.stdout:
+        pytest.skip(f"probe did not run: {r.stdout[-800:]} {r.stderr[-1500:]}")
     assert "HAS_IMPL True" in r.stdout, (r.stdout[-600:], r.stderr[-1200:])
 
 
