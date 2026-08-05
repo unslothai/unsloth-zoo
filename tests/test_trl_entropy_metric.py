@@ -169,6 +169,27 @@ def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
+def test_a_cpu_sentinel_tensor_does_not_drag_the_scalar_to_cpu(patched, monkeypatch):
+    """The fused-loss path returns a MODULE-LEVEL `EMPTY_LOGITS = torch.empty(0)`
+    (unsloth_zoo/fused_losses/forward_adapter.py), built at import time and so
+    always on cpu regardless of the run's device. Following the tensor's own
+    device there would hand NCCL a CPU scalar on exactly the distributed run
+    this fallback exists for, and the padding-free branch is a bare mean() with
+    no device-resident mask to rescue it."""
+    trl_utils, _, _ = patched
+    state = pytest.importorskip("accelerate.state")
+    monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))
+    assert trl_utils.entropy_from_logits(torch.empty(0)).device.type == "cuda"
+
+
+def test_a_cpu_sentinel_tensor_stays_on_cpu_for_a_cpu_run(patched, monkeypatch):
+    trl_utils, _, _ = patched
+    state = pytest.importorskip("accelerate.state")
+    monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
+    assert trl_utils.entropy_from_logits(torch.empty(0)).device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_the_fallback_follows_the_logits_device(patched):
     trl_utils, _, _ = patched
     empty = torch.empty(0, 7, device = "cuda")

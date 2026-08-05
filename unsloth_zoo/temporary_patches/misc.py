@@ -1760,8 +1760,15 @@ def patch_trl_entropy_from_logits():
         multi-GPU run would swap one crash for another. Asked of accelerate
         rather than guessed, and only once it is already initialised, so a
         single-process run keeps the CPU scalar accelerate leaves alone.
+
+        A tensor's own device is only trusted when it is NOT cpu. The
+        fused-loss path returns a module-level `EMPTY_LOGITS = torch.empty(0)`
+        (fused_losses/forward_adapter.py), built at import time and therefore
+        always on cpu no matter which device the run is on, so following it
+        would hand NCCL a CPU scalar on exactly the distributed run this
+        function exists for.
         """
-        if isinstance(logits, torch.Tensor):
+        if isinstance(logits, torch.Tensor) and logits.device.type != "cpu":
             return logits.device
         try:
             from accelerate.state import PartialState
@@ -1769,7 +1776,7 @@ def patch_trl_entropy_from_logits():
                 return PartialState().device
         except Exception:
             pass
-        return None
+        return logits.device if isinstance(logits, torch.Tensor) else None
 
     # 0-d so it broadcasts against attention_mask in both of the caller's
     # branches: sum(0 * mask)/sum(mask) and mean(0) are both 0.0, neither raises.
@@ -1793,6 +1800,11 @@ def patch_trl_entropy_from_logits():
             return _no_entropy(logits)
 
     entropy_from_logits._unsloth_patched = True
+    # Exposed so the SFT wrapper can mute this for its probing call. That call
+    # may be about to fail on the SECOND logits read, in which case the
+    # wrapper reports that both metrics are omitted and this message, which
+    # promises entropy as 0.0, would contradict it on the very first step.
+    entropy_from_logits._unsloth_warned = _warned
     for _mod_name in ("trl.trainer.utils", "trl.trainer.sft_trainer"):
         try:
             _mod = importlib.import_module(_mod_name)
@@ -1881,18 +1893,40 @@ def _sft_raised_on_empty_logits(exception):
     land in a helper trl called and because the enclosing method has been
     renamed before. The stack starts inside SFTTrainer.compute_loss either way.
     """
+    return _sft_empty_logits_outputs(exception) is not None
+pass
+
+
+_SFT_NO_LOGITS = object()
+
+
+def _sft_empty_logits_outputs(exception):
+    """The `outputs` object trl was holding, if its logits were the sentinel.
+
+    Returned rather than just a bool so the caller can replay `aux_loss` off
+    it: that metric is not logits-derived, but it lives inside the same
+    `if not self.args.use_liger_kernel` block, so skipping the block to avoid
+    the logits would silently drop it for MoE runs.
+    """
     tb = getattr(exception, "__traceback__", None)
     while tb is not None:
         frame = tb.tb_frame
         if "outputs" in frame.f_locals:
+            outputs = frame.f_locals["outputs"]
             try:
-                logits = getattr(frame.f_locals["outputs"], "logits", None)
-                unusable = _sft_logits_are_unusable(logits)
+                # A default of None would be indistinguishable from a model
+                # that really does set `logits = None`, and _..._are_unusable
+                # calls that unusable. An output object with no `logits` at all
+                # is somebody's broken contract, not our sentinel, and must
+                # keep raising.
+                logits = getattr(outputs, "logits", _SFT_NO_LOGITS)
+                unusable = (logits is not _SFT_NO_LOGITS
+                            and _sft_logits_are_unusable(logits))
             except Exception:
                 unusable = False
-            if unusable: return True
+            if unusable: return outputs
         tb = tb.tb_next
-    return False
+    return None
 pass
 
 
@@ -1901,6 +1935,62 @@ def _sft_inputs_slot(args, kwargs):
     if len(args) > 1: return 1, args[1]
     if "inputs" in kwargs: return "inputs", kwargs["inputs"]
     return None, None
+pass
+
+
+def _sft_mute_entropy_warning():
+    """Silence the entropy patch for one probing call; returns a restore token."""
+    try:
+        import trl.trainer.utils as _u
+        flag = getattr(getattr(_u, "entropy_from_logits", None), "_unsloth_warned", None)
+        if flag is None: return None
+        was, flag[0] = flag[0], True
+        return (flag, was)
+    except Exception:
+        return None
+pass
+
+
+def _sft_aux_loss_count(self):
+    """How many aux_loss values trl has logged for the current mode."""
+    metrics = getattr(self, "_metrics", None)
+    if not isinstance(metrics, dict): return None
+    mode = "train" if getattr(getattr(self, "model", None), "training", True) else "eval"
+    bucket = metrics.get(mode)
+    if bucket is None: return None
+    try:
+        return len(bucket["aux_loss"])
+    except Exception:
+        return None
+pass
+
+
+def _sft_replay_aux_loss(self, outputs, before):
+    """Log the aux_loss the skipped block would have logged.
+
+    aux_loss is not logits-derived, but on trl 0.23.0 through 0.25.x it sits
+    INSIDE the same `if not self.args.use_liger_kernel` block as the accuracy
+    metric, so turning that flag on to dodge the logits drops it too, silently,
+    for exactly the MoE runs (`output_router_logits = True`) that want it.
+
+    Gated on the count rather than on a version, because trl 1.x moved this out
+    to `# applies to both Liger and non-Liger` (1.9.2 sft_trainer.py:1826) and
+    logs it regardless, where appending again would double-count. 0.22.2 has no
+    aux_loss in this trainer at all.
+    """
+    if outputs is None or before is None: return
+    if not getattr(self, "aux_loss_enabled", False): return
+    if (_sft_aux_loss_count(self) or 0) > before: return
+    aux = getattr(outputs, "aux_loss", None)
+    if aux is None: return
+    try:
+        metrics = self._metrics["train" if self.model.training else "eval"]
+        metrics["aux_loss"].append(
+            self.accelerator.gather_for_metrics(aux).mean().item()
+        )
+    except Exception:
+        # A lost diagnostic must never take down the step that produced it.
+        pass
 pass
 
 
@@ -1919,7 +2009,14 @@ def _sft_call_without_logits_metrics(original, self, args, kwargs, contents = No
     targs = getattr(self, "args", None)
     previous = getattr(targs, "use_liger_kernel", None)
     if previous is None or previous:
-        return original(self, *args, **kwargs)
+        return original(self, *args, **kwargs), None
+    # Ask for the outputs only when there is an aux_loss to rescue off them, so
+    # the ordinary path keeps trl's exact call shape.
+    asked = args[2] if len(args) > 2 else kwargs.get("return_outputs", False)
+    force = bool(getattr(self, "aux_loss_enabled", False)) and not asked
+    if force:
+        kwargs = dict(kwargs)
+        kwargs["return_outputs"] = True
     slot, inputs = _sft_inputs_slot(args, kwargs)
     if slot is not None:
         shielded = _sft_shielded_inputs(inputs, inputs if contents is None else contents)
@@ -1936,9 +2033,12 @@ def _sft_call_without_logits_metrics(original, self, args, kwargs, contents = No
             # (sft_trainer.py:1821). There is no liger here, so that report
             # would be sent to the wrong project.
             warnings.filterwarnings("ignore", message = ".*token_accuracy.*")
-            return original(self, *args, **kwargs)
+            result = original(self, *args, **kwargs)
     finally:
         targs.use_liger_kernel = previous
+    if force and isinstance(result, tuple) and len(result) == 2:
+        return result[0], result[1]
+    return result, None
 pass
 
 
@@ -1951,7 +2051,11 @@ def _sft_wrap_compute_loss(original):
         # Per trainer, not per process: two SFTTrainers can live in one process
         # and only one of them may be running an Unsloth model.
         if getattr(self, "_unsloth_logits_are_empty", False):
-            return _sft_call_without_logits_metrics(original, self, args, kwargs)
+            before = _sft_aux_loss_count(self)
+            result, outputs = _sft_call_without_logits_metrics(
+                original, self, args, kwargs)
+            _sft_replay_aux_loss(self, outputs, before)
+            return result
         # A failed attempt leaves state behind: it advanced the token counter,
         # appended the metrics it got as far as, and let transformers pop
         # `labels` out of the inputs. All three are replayed to the retry as
@@ -1962,10 +2066,18 @@ def _sft_wrap_compute_loss(original):
             if isinstance(metrics, dict) else None
         _, inputs = _sft_inputs_slot(args, kwargs)
         contents = dict(inputs) if isinstance(inputs, Mapping) else None
+        aux_before = _sft_aux_loss_count(self)
+        # This first call is a probe. If it fails on the second logits read the
+        # warning below replaces the entropy patch's, which promises a 0.0 that
+        # is not going to be reported after all.
+        muted = _sft_mute_entropy_warning()
         try:
-            return original(self, *args, **kwargs)
+            result = original(self, *args, **kwargs)
         except Exception as e:
-            if not _sft_raised_on_empty_logits(e): raise
+            outputs = _sft_empty_logits_outputs(e)
+            if outputs is None:
+                if muted is not None: muted[0][0] = muted[1]
+                raise
             self._unsloth_logits_are_empty = True
             if counter is not None:
                 self._total_train_tokens = counter
@@ -1980,7 +2092,16 @@ def _sft_wrap_compute_loss(original):
                 "Set UNSLOTH_RETURN_LOGITS=1 before training if you need them "
                 "and can afford the memory."
             )
-            return _sft_call_without_logits_metrics(original, self, args, kwargs, contents)
+            retried, retry_outputs = _sft_call_without_logits_metrics(
+                original, self, args, kwargs, contents)
+            _sft_replay_aux_loss(
+                self, outputs if retry_outputs is None else retry_outputs, aux_before)
+            return retried
+        else:
+            # No failure, so the entropy message (if it wanted to fire) was
+            # accurate after all: let the next step emit it.
+            if muted is not None: muted[0][0] = muted[1]
+            return result
     compute_loss._unsloth_patched = True
     return compute_loss
 pass

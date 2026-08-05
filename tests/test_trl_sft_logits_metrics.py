@@ -379,5 +379,187 @@ def test_the_1x_shape_keeps_real_metrics():
         assert "skip_logits" not in seen
 
 
+# ---- aux_loss is not logits-derived and must survive the skip --------------
+
+def _run_with_aux(sftmod, logits, steps = 3, aux = torch.tensor(0.25),
+                  trainer_logs_aux = False):
+    """As `_run_steps`, but the outputs carry `aux_loss` and the trainer is a
+    MoE one (`output_router_logits = True` -> `aux_loss_enabled`).
+
+    `trainer_logs_aux` stands in for trl 1.x, which moved this metric OUT of
+    the `use_liger_kernel` branch (1.9.2 sft_trainer.py:1826 "applies to both
+    Liger and non-Liger") and therefore logs it itself.
+    """
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss logits aux_loss")
+    loss = torch.tensor(1.0)
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        if trainer_logs_aux:
+            self._metrics["train"]["aux_loss"].append(float(aux))
+        out = Out(loss, logits, aux)
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        self = _trainer(sftmod)
+        self.aux_loss_enabled = True
+        inputs = _inputs()
+        for _ in range(steps):
+            sftmod.SFTTrainer.compute_loss(self, self.model, dict(inputs),
+                                           num_items_in_batch = None)
+        return self
+    finally:
+        Trainer.compute_loss = original
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_aux_loss_survives_the_skipped_metric_block(sft, sentinel):
+    """On trl 0.23.0-0.25.x this metric sits INSIDE the block being skipped, so
+    without a replay a MoE run silently stops logging it."""
+    self = _run_with_aux(sft, sentinel(), steps = 3)
+    assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_aux_loss_is_not_logged_twice(sft, sentinel):
+    """trl 1.x logs it outside the branch, so replaying would double-count.
+    Gated on the count rather than on a version number."""
+    self = _run_with_aux(sft, sentinel(), steps = 3, trainer_logs_aux = True)
+    assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
+
+
+def test_aux_loss_is_left_alone_when_the_run_is_not_moe(sft):
+    """`aux_loss_enabled` is False for every dense model, and nothing should
+    appear for them."""
+    self, _ = _run_steps(sft, EmptyLogits(), steps = 2)
+    assert self._metrics["train"]["aux_loss"] == []
+
+
+def test_the_ordinary_call_shape_is_unchanged_for_a_dense_run():
+    """`return_outputs` is forced only when there is an aux_loss to rescue.
+
+    Asked of the wrapper's own call into trl, not of trl's call into
+    transformers: trl passes `return_outputs = True` inward on every version,
+    since that is how it reaches `outputs.logits` at all.
+    """
+    from unsloth_zoo.temporary_patches.misc import _sft_call_without_logits_metrics
+    seen = []
+
+    def original(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        seen.append(return_outputs)
+        return torch.tensor(1.0)
+
+    self = _trainer()
+    for aux_enabled, expected in ((False, False), (True, True)):
+        seen.clear()
+        self.aux_loss_enabled = aux_enabled
+        _sft_call_without_logits_metrics(
+            original, self, (self.model, _inputs()), {"num_items_in_batch": None})
+        assert seen == [expected], (aux_enabled, seen)
+
+
+def test_a_trainer_that_asked_for_outputs_still_gets_them():
+    """Forcing the flag must not change what the caller receives."""
+    from unsloth_zoo.temporary_patches.misc import _sft_call_without_logits_metrics
+    Out = collections.namedtuple("Out", "loss logits aux_loss")
+    pair = (torch.tensor(1.0), Out(torch.tensor(1.0), EmptyLogits(), torch.tensor(0.5)))
+
+    def original(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        return pair if return_outputs else pair[0]
+
+    self = _trainer()
+    self.aux_loss_enabled = True
+    result, outputs = _sft_call_without_logits_metrics(
+        original, self, (self.model, _inputs(), True), {})
+    assert result is pair
+    assert outputs is None, "the caller asked, so nothing was forced or unwrapped"
+
+
+# ---- an output object with no logits at all is somebody else's bug ---------
+
+def test_a_missing_logits_attribute_still_raises(sft):
+    """`getattr(outputs, "logits", None)` would call an absent attribute
+    unusable and retry with the metrics off, turning a broken output contract
+    into silent training."""
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss")
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        loss = torch.tensor(1.0)
+        out = Out(loss)
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        self = _trainer(sft)
+        with pytest.raises(AttributeError):
+            sft.SFTTrainer.compute_loss(self, self.model, _inputs(),
+                                        num_items_in_batch = None)
+        assert not getattr(self, "_unsloth_logits_are_empty", False)
+    finally:
+        Trainer.compute_loss = original
+
+
+def test_an_explicit_none_logits_is_still_the_sentinel(sft):
+    """The distinction is absent-vs-present, not None-vs-not: a model that
+    really sets `logits = None` must still be handled."""
+    self, _ = _run_steps(sft, None, steps = 2)
+    assert self._metrics["train"]["mean_token_accuracy"] == []
+
+
+# ---- the two warnings must not contradict each other ----------------------
+
+def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft, caplog):
+    """The entropy patch promises "Entropy will be reported as 0.0". When the
+    accuracy read then fails, the wrapper reports that BOTH are omitted, so the
+    first message is wrong and the user sees two contradictory ones on step 1."""
+    import logging
+    from unsloth_zoo.temporary_patches.misc import logger as misc_logger
+    import trl.trainer.utils as trl_utils
+    flag = getattr(trl_utils.entropy_from_logits, "_unsloth_warned", None)
+    if flag is None:
+        pytest.skip("entropy patch is not installed in this environment")
+    was = flag[0]
+    flag[0] = False
+    try:
+        with caplog.at_level(logging.WARNING, logger = misc_logger.name):
+            _run_steps(sft, EmptyLogits(), steps = 2)
+        text = caplog.text
+    finally:
+        flag[0] = was
+    assert "Both will be omitted" in text
+    assert "Entropy will be reported as 0.0" not in text
+
+
+def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
+    """The mute is for the probing call only; an unrelated error must restore
+    it rather than swallow the next legitimate entropy warning."""
+    from transformers import Trainer
+    import trl.trainer.utils as trl_utils
+    flag = getattr(trl_utils.entropy_from_logits, "_unsloth_warned", None)
+    if flag is None:
+        pytest.skip("entropy patch is not installed in this environment")
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        raise RuntimeError("something else entirely")
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    was = flag[0]
+    flag[0] = False
+    try:
+        self = _trainer(sft)
+        with pytest.raises(RuntimeError, match = "something else"):
+            sft.SFTTrainer.compute_loss(self, self.model, _inputs(),
+                                        num_items_in_batch = None)
+        assert flag[0] is False
+    finally:
+        Trainer.compute_loss = original
+        flag[0] = was
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
