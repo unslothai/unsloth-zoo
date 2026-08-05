@@ -19,6 +19,7 @@ __all__ = [
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
+    "UNSLOTH_COMPILE_DISABLE_PARTIAL",
     "get_torch_compile_options",
     "is_transformers_v5_moe_quantization_available",
     "logger",
@@ -33,6 +34,8 @@ from ..log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+# "partial" keeps the source rewrites but turns torch.compile off, like compiler.py does.
+UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
 
 # Get only allowed options
 import inspect
@@ -197,6 +200,6 @@ def _maybe_compile(**kwargs):
     rl_replacements.py NameErrors at import and the failure is swallowed.
     compiler.py emits the import when the name appears.
     """
-    if UNSLOTH_COMPILE_DISABLE:
+    if UNSLOTH_COMPILE_DISABLE or UNSLOTH_COMPILE_DISABLE_PARTIAL:
         return lambda fn: fn
     return torch.compile(**kwargs)

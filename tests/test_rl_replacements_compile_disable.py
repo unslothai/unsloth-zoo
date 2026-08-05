@@ -81,6 +81,13 @@ def test_the_flag_turns_them_off():
     assert all(v is False for v in got.values()), got
 
 
+def test_partial_also_turns_them_off():
+    """compiler.py treats "partial" as compile-off (it only skips the source
+    rewrites for "1"), so the helpers must honour it as well."""
+    got = _probe("partial")
+    assert all(v is False for v in got.values()), got
+
+
 def test_an_unset_flag_behaves_like_zero():
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
