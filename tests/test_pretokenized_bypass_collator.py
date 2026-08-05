@@ -346,6 +346,35 @@ def test_a_packing_collator_that_holds_no_tokenizer_is_left_alone():
     assert out.data_collator is collator
 
 
+class LabelRebuildingVisionCollator:
+    """A user's vision collator holding the processor for images and the text
+    tokenizer for padding, and rebuilding `labels` from `input_ids` on collate."""
+    def __init__(self, processor):
+        self.processor = processor
+        self.tokenizer = processor.tokenizer
+
+    def __call__(self, features):
+        batch = self.tokenizer.pad(features)
+        batch["labels"] = [list(ids) for ids in batch["input_ids"]]
+        return batch
+
+
+def test_a_label_rebuilding_vision_collator_is_replaced_under_packing():
+    """It pads through a real tokenizer, so the `.pad` repair does not fire. If
+    packing then leaves it attached it rebuilds `labels` at collate time, throwing
+    away the dataset-level mask this function just wrote: training on prompts."""
+    collator = LabelRebuildingVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.data_collator is not collator, "the masked labels get overwritten"
+    rows = [out.train_dataset[i] for i in range(len(out.train_dataset))]
+    labels = out.data_collator(rows)["labels"]
+    assert -100 in list(labels[0]), "the response mask did not survive collation"
+
+
 def test_a_real_tokenizer_padding_collator_is_untouched_under_packing():
     """It can pad on its own, so packing keeps it as before."""
     collator = DataCollatorWithPadding(tokenizer = StubTokenizer())
@@ -576,10 +605,13 @@ def _refuses(dataset, processor):
 def test_fuyu_style_image_columns_are_refused(column):
     """Fuyu spells its preprocessed images `image_patches`/`image_patches_indices`
     beside `input_ids`, so the columns alone look text-only."""
-    from transformers.models.fuyu.image_processing_fuyu import FuyuImageProcessor
-
+    # Literal copy of FuyuImageProcessor.model_input_names: importing it pulls in
+    # torchvision (transformers 5.x), which is not a dependency of this package.
+    fuyu_image_names = ["images", "image_input_ids", "image_patches",
+                        "image_patch_indices_per_batch",
+                        "image_patch_indices_per_subsequence"]
     processor = DerivedProcessor(
-        image_names = FuyuImageProcessor.model_input_names,
+        image_names = fuyu_image_names,
         # FuyuProcessor.model_input_names adds this one on top of the image half.
         own_names = ["image_patches", "image_patches_indices"],
     )
@@ -758,6 +790,28 @@ def test_an_eval_split_hiding_images_in_messages_is_refused():
     trainer.eval_dataset = dataset
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+@pytest.mark.parametrize("kind", ["input_image", "input_video"])
+def test_pretokenized_rows_hiding_an_input_image_part_are_refused(kind):
+    """`input_image`/`input_video` are the other spelling of an inline media part
+    (the one `mlx/loader.py` already recognises), and name media just like
+    `image` does."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "messages": [[
+            {"role": "user", "content": [{"type": kind, kind: "cat.png"},
+                                         {"type": "text", "text": "q"}]},
+        ]],
+    })
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator, "the user's collator was replaced"
+    assert "messages" in trainer.train_dataset.column_names
 
 
 def test_pretokenized_rows_with_plain_text_messages_still_pass():

@@ -839,9 +839,12 @@ def train_on_responses_only(
         pass
 
     # Keys and `type` tags a chat turn uses to point at an image/video/audio.
+    # `input_image`/`input_video` are the responses-API spelling of the same
+    # parts, and `mlx/loader.py` already renders them as media.
     _MEDIA_KEYS = frozenset((
         "image", "images", "image_url", "video", "videos", "video_url",
         "audio", "audios", "audio_url", "input_audio", "pixel_values",
+        "input_image", "input_video",
         "bytes", "path", "url",
     ))
 
@@ -1014,6 +1017,8 @@ def train_on_responses_only(
         return True
     pass
 
+    # Set when a foreign vision collator is let through to the text path below.
+    _bypassed_vision_collator = False
     data_collator = getattr(trainer, "data_collator", None)
     if _is_vision_collator(data_collator):
         masking = getattr(data_collator, "train_on_responses_only", None)
@@ -1042,6 +1047,7 @@ def train_on_responses_only(
                     "instruction_part = ..., response_part = ...) so masking runs at collate time."
                 )
             # Fall through to the dataset-level text path below.
+            _bypassed_vision_collator = True
             print(
                 f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
                 "dataset is already tokenized, so response-only masking is applied at "
@@ -1119,9 +1125,12 @@ def train_on_responses_only(
         _pad_source = getattr(_collator, "processor", None)
     _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad")
     # That repair is not packing-gated like the swap: it fails either way.
+    # Nor is a collator we bypassed above: it can rebuild `labels` in `__call__`
+    # and throw away the mask just written, which is silent training on prompts.
+    # It is no packing collator either, so the gate has nothing to protect here.
     if hasattr(trainer, "data_collator") and (
-        _processor_backed or (not isinstance(_collator, DataCollatorForSeq2Seq)
-                              and not packing_enabled)
+        _processor_backed or _bypassed_vision_collator
+        or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
     ):
         # Keep the caller's settings when only swapping the tokenizer on a seq2seq
         # collator; for any other class this is a replacement, not a swap, and its
