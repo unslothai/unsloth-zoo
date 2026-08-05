@@ -82,7 +82,12 @@ def patched():
     import trl.trainer.sft_trainer as sft
     from unsloth_zoo.temporary_patches.misc import patch_trl_entropy_from_logits
 
-    original = trl_utils.entropy_from_logits
+    # entropy_from_logits landed in trl 0.20.0 and pyproject allows >= 0.18.2,
+    # so an allowed build can lack it. Production no-ops there, so skip rather
+    # than error out of the fixture.
+    original = getattr(trl_utils, "entropy_from_logits", None)
+    if original is None:
+        pytest.skip("this trl predates entropy_from_logits (added in 0.20.0)")
     # Importing unsloth_zoo applies TEMPORARY_PATCHES, so by the time this
     # fixture runs the name may already be the wrapper. functools.wraps records
     # the real one on __wrapped__; without this the "unpatched control" test
