@@ -957,6 +957,69 @@ def test_a_raw_eval_split_whose_later_row_is_not_text_is_refused():
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
+def test_a_raw_eval_split_whose_null_is_past_the_sample_is_refused():
+    """`Value('string')` is nullable, so the dtype still reads as text and the
+    bounded sample skips row 20. Left through, the plain tokenizer meets the null
+    halfway through `map` and dies there instead of refusing here."""
+    n, null_at = 200, 20
+    texts = [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"] * n
+    texts[null_at] = None
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({"text": texts})
+    assert null_at not in {i * (n - 1) // 15 for i in range(16)}, "row is sampled"
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+# ---- what the whole-column scan is allowed to cost -------------------------
+
+@pytest.mark.parametrize("column", ["urls", "paths", "files"])
+def test_an_ambiguous_column_of_media_lists_is_refused(column):
+    """A plural media column holds a list of URLs per row, and `List(string)` is
+    provably text, so the bypass used to strip the column and train on the text
+    alone."""
+    n = 4
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW)] * n,
+        column: [["https://example.com/cat.jpg", "https://example.com/dog.png"]] * n,
+    }))
+    trainer.processing_class = StrictProcessor()
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_ambiguous_image_column_is_never_decoded_by_the_scan(monkeypatch):
+    """`media` is an ambiguous name, but its dtype is `PIL.Image.Image`, so no
+    string in it can name a file. Scanning it anyway decoded every image (~9ms
+    and ~3MB of pixels a row) only to reach the refusal the schema already gave."""
+    import io
+    import datasets.features.image as image_feature
+    from PIL import Image as PILImage
+    from datasets import Image as ImageFeature
+
+    n = 300
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (8, 8)).save(buffer, format = "PNG")
+    blob = {"bytes": buffer.getvalue(), "path": None}
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)] * n, "media": [blob] * n,
+    }).cast_column("media", ImageFeature())
+    decoded = []
+    original = image_feature.Image.decode_example
+    monkeypatch.setattr(image_feature.Image, "decode_example",
+                        lambda self, value, **kw: (decoded.append(1),
+                                                   original(self, value, **kw))[1])
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    # Only the bounded row sample may decode; the whole-column scan may not.
+    assert len(decoded) <= 16, f"{len(decoded)} images decoded for {n} rows"
+
+
 # ---- the processor may live only on the collator ---------------------------
 
 def test_the_collators_processor_derives_the_multimodal_columns():

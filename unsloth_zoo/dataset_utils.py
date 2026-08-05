@@ -880,8 +880,15 @@ def train_on_responses_only(
         ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
     )
 
-    def _looks_like_media_value(value):
-        """A string naming an image/video/audio file, by extension or data URI."""
+    def _looks_like_media_value(value, _depth = 0):
+        """A string naming an image/video/audio file, by extension or data URI.
+
+        A plural ambiguous column (`urls`, `paths`, `files`) holds a *list* of
+        those strings per row, so recurse rather than call the row safe.
+        """
+        if isinstance(value, (list, tuple)):
+            return _depth < 4 and \
+                any(_looks_like_media_value(v, _depth + 1) for v in value)
         if not isinstance(value, str): return False
         text = value.strip().lower()
         if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
@@ -891,22 +898,70 @@ def train_on_responses_only(
         return text.endswith(_MEDIA_SUFFIXES)
     pass
 
+    def _feature_holds_strings(feature, _depth = 0):
+        """True when this column's values are strings, or lists of them."""
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, (list, tuple)):
+            return bool(feature) and \
+                all(_feature_holds_strings(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)        # Sequence/List/LargeList
+        if inner is not None: return _feature_holds_strings(inner, _depth + 1)
+        dtype = getattr(feature, "dtype", None)          # Value/ClassLabel
+        return isinstance(dtype, str) and dtype.endswith("string")
+    pass
+
+    def _string_column_batches(split, name):
+        """The whole column in batches, or None when it must not be scanned.
+
+        Reading a `datasets.Image`/audio column decodes every row (minutes and
+        gigabytes on a real VLM set) to learn what its dtype already says, and
+        `_columns_are_provably_text` refuses such a column anyway, so only ever
+        scan a column the schema calls a string.
+        """
+        features = getattr(split, "features", None)
+        if not features: return None                     # an unresolved stream
+        try:
+            if not _feature_holds_strings(features.get(name)): return None
+            len(split)                                   # map-style only
+            return split.select_columns([name]).iter(batch_size = 1000)
+        except Exception:
+            return None
+    pass
+
     def _ambiguous_column_holds_media(split, name, rows):
         """Whether an ambiguous column points at media, over EVERY row when the
-        split can be indexed: the 16-row sample misses a `cat.jpg` on row 5, and
+        split can be scanned: the 16-row sample misses a `cat.jpg` on row 5, and
         its dtype is `string` either way, so the schema cannot answer for it.
         Reading one string column is cheap - no image is ever decoded.
         """
+        batches = _string_column_batches(split, name)
+        # Streaming, or a column a custom transform owns: the bounded sample is
+        # all that can be read without consuming/rewriting the split.
+        if batches is None:
+            return any(_looks_like_media_value(row.get(name)) for row in rows)
         try:
-            len(split)                                  # map-style only
-            batches = split.select_columns([name]).iter(batch_size = 1000)
             for batch in batches:
                 if any(_looks_like_media_value(v) for v in batch[name]): return True
             return False
         except Exception:
-            # Streaming, or a column a custom transform owns: the bounded sample
-            # is all that can be read without consuming/rewriting the split.
             return any(_looks_like_media_value(row.get(name)) for row in rows)
+    pass
+
+    def _column_is_all_strings(split, name):
+        """Whether EVERY row of a text column really holds a string.
+
+        `Value('string')` is nullable, so a `None` past the sample keeps the
+        dtype and would reach the plain tokenizer, crashing the run mid-`map`
+        instead of being refused here.
+        """
+        batches = _string_column_batches(split, name)
+        if batches is None: return True                  # the sample decided
+        try:
+            for batch in batches:
+                if not all(isinstance(v, str) for v in batch[name]): return False
+            return True
+        except Exception:
+            return True
     pass
 
     def _has_media_column(names, rows, split = None):
@@ -1086,6 +1141,8 @@ def train_on_responses_only(
             for row in rows:
                 if not isinstance(row.get(field), str): return False
                 if not _row_is_plain_text(row): return False
+            # The sample says these rows are text; the tokenizer reads every row.
+            if not _column_is_all_strings(split, field): return False
         return True
     pass
 
