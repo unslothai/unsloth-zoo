@@ -1952,14 +1952,21 @@ pass
 
 
 def _sft_aux_loss_count(self):
-    """How many aux_loss values trl has logged for the current mode."""
+    """How many aux_loss values trl has logged for the current mode.
+
+    `.get`, never `[...]`: `_metrics[mode]` is a `defaultdict(list)`, so a
+    subscript CREATES the key, and this runs on every step including dense
+    ones that will never have an aux_loss. trl's `SFTTrainer.log` averages
+    every key it finds with `sum(val) / len(val)` (sft_trainer.py:1194), so
+    one empty list left behind is a ZeroDivisionError at the first log.
+    """
     metrics = getattr(self, "_metrics", None)
     if not isinstance(metrics, dict): return None
     mode = "train" if getattr(getattr(self, "model", None), "training", True) else "eval"
     bucket = metrics.get(mode)
     if bucket is None: return None
     try:
-        return len(bucket["aux_loss"])
+        return len(bucket.get("aux_loss") or ())
     except Exception:
         return None
 pass
@@ -2015,8 +2022,14 @@ def _sft_call_without_logits_metrics(original, self, args, kwargs, contents = No
     asked = args[2] if len(args) > 2 else kwargs.get("return_outputs", False)
     force = bool(getattr(self, "aux_loss_enabled", False)) and not asked
     if force:
-        kwargs = dict(kwargs)
-        kwargs["return_outputs"] = True
+        # Replace the positional slot rather than adding a keyword beside it:
+        # `compute_loss(model, inputs, False, ...)` is a legal public call, and
+        # doing both would raise "got multiple values for argument".
+        if len(args) > 2:
+            args = args[:2] + (True,) + args[3:]
+        else:
+            kwargs = dict(kwargs)
+            kwargs["return_outputs"] = True
     slot, inputs = _sft_inputs_slot(args, kwargs)
     if slot is not None:
         shielded = _sft_shielded_inputs(inputs, inputs if contents is None else contents)
@@ -2083,8 +2096,14 @@ def _sft_wrap_compute_loss(original):
                 self._total_train_tokens = counter
             if lengths is not None:
                 for k, d in metrics.items():
+                    seen = lengths.get(k, {})
                     for n, v in list(d.items()):
-                        del v[lengths.get(k, {}).get(n, 0):]
+                        # Delete a key the probe invented rather than emptying
+                        # it. trl's log averages every key with
+                        # sum(val) / len(val), so an emptied list left in place
+                        # is a ZeroDivisionError at the first logging step.
+                        if n in seen: del v[seen[n]:]
+                        else: del d[n]
             logger.warning(
                 "Unsloth: your trl version logs entropy and mean_token_accuracy "
                 "from the full logits, which Unsloth does not materialise (that "

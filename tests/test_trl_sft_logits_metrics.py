@@ -561,5 +561,105 @@ def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
         flag[0] = was
 
 
+# ---- nothing may leave an empty metric list behind ------------------------
+
+def _log_would_divide_by_zero(self):
+    """Names of metrics trl's own `log` would choke on.
+
+    `SFTTrainer.log` averages every key it finds with `sum(val) / len(val)`
+    (0.25.1 sft_trainer.py:1194), so an empty list is a ZeroDivisionError at
+    the first logging step, not a missing metric.
+    """
+    return sorted(n for n, v in self._metrics["train"].items() if len(v) == 0)
+
+
+def test_a_dense_run_does_not_invent_an_aux_loss_key(sft):
+    """`_metrics[mode]` is a defaultdict(list), so reading the key would create
+    it, on every step, for models that will never have an aux_loss."""
+    self, _ = _run_steps(sft, EmptyLogits(), steps = 3)
+    assert "aux_loss" not in self._metrics["train"]
+    assert _log_would_divide_by_zero(self) == []
+
+
+def test_a_healthy_run_does_not_invent_one_either(sft):
+    """The count is taken before the probe, so real-logits steps pass through
+    it too and a dense trainer would be poisoned without ever failing."""
+    self, _ = _run_steps(sft, torch.randn(2, 6, 11), steps = 2)
+    assert "aux_loss" not in self._metrics["train"]
+    assert _log_would_divide_by_zero(self) == []
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_the_rollback_removes_keys_the_probe_invented(sft, sentinel):
+    """The failed probe can get as far as appending entropy before the accuracy
+    read fails. Truncating that list to [] leaves the key behind."""
+    self, _ = _run_steps(sft, sentinel(), steps = 2)
+    assert _log_would_divide_by_zero(self) == []
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_trl_can_actually_log_after_the_retry(sft, sentinel):
+    """The end of the story, through trl's real `log` rather than a stand-in."""
+    self, _ = _run_steps(sft, sentinel(), steps = 2)
+    logs = {}
+    import transformers
+    original = transformers.Trainer.log
+    transformers.Trainer.log = lambda self, d, start_time = None: logs.update(d)
+    try:
+        sft.SFTTrainer.log(self, {"loss": 1.0})
+    finally:
+        transformers.Trainer.log = original
+    assert logs["loss"] == 1.0
+
+
+def test_a_metric_the_probe_only_extended_is_truncated_not_dropped(sft):
+    """A key that already existed keeps its earlier values; only the probe's
+    own additions go."""
+    self = _trainer(sft)
+    self._metrics["train"]["mean_token_accuracy"].extend([0.5, 0.75])
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss logits")
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        loss = torch.tensor(1.0)
+        out = Out(loss, EmptyLogits())
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        sft.SFTTrainer.compute_loss(self, self.model, _inputs(),
+                                    num_items_in_batch = None)
+    finally:
+        Trainer.compute_loss = original
+    assert self._metrics["train"]["mean_token_accuracy"] == [0.5, 0.75]
+
+
+# ---- the public positional call shape -------------------------------------
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
+    """`compute_loss(model, inputs, False, ...)` is a legal public call. Adding
+    the keyword beside the positional would raise "got multiple values"."""
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss logits aux_loss")
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        loss = torch.tensor(1.0)
+        out = Out(loss, sentinel(), torch.tensor(0.25))
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        self = _trainer(sft)
+        self.aux_loss_enabled = True
+        for _ in range(2):
+            sft.SFTTrainer.compute_loss(self, self.model, _inputs(), False, None)
+    finally:
+        Trainer.compute_loss = original
+    assert self._metrics["train"]["aux_loss"] == [0.25, 0.25]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
