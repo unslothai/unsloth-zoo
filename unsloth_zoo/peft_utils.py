@@ -327,12 +327,8 @@ def requires_grad_for_gradient_checkpointing(model):
 
     # Add post forward hook
     def requires_grad_post_hook(module, input, output):
-        # Dynamo cannot trace requires_grad_(), so a compiled module carrying
-        # this hook dies with "Unsupported Tensor.requires_grad_() call" (and
-        # torch._dynamo.disable() does not help: under fullgraph = True it just
-        # becomes "Skip calling torch.compiler.disable()d function"). The hook
-        # is autograd bookkeeping, not compute, so skipping it while tracing is
-        # correct -- see the comment on requires_grad_pre_hook below.
+        # Dynamo cannot trace requires_grad_(), and torch._dynamo.disable() does
+        # not help under fullgraph = True. Safe to skip -- see the pre hook below.
         if torch.compiler.is_compiling(): return
         type_output = type(output)
         if type_output is torch.Tensor:
@@ -356,16 +352,11 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):
-        # Do nothing while Dynamo is tracing. Gemma 3N puts a LoRA target
-        # (embed_audio.embedding_projection) inside a forward that we compile
-        # with fullgraph = True, so tracing reaches this hook and rejects the
-        # requires_grad_() call outright. Dynamo only complains when the call
-        # would actually flip the flag, which is why this stayed hidden.
-        #
-        # Skipping it under compile is safe: the hook only exists so that a
-        # frozen input to a gradient-checkpointed block still starts an
-        # autograd graph, and anything Dynamo is tracing here already sits
-        # downstream of trainable LoRA weights.
+        # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA
+        # target (embed_audio.embedding_projection) with fullgraph = True, making
+        # this a hard error. Safe to skip: the hook only exists to start an
+        # autograd graph, and anything traced here is already downstream of
+        # trainable LoRA weights.
         if torch.compiler.is_compiling(): return
         # Try positional args first (normal text models)
         if args:

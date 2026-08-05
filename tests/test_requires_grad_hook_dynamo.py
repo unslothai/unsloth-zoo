@@ -16,22 +16,14 @@
 
 """The gradient-checkpointing hooks must not run while Dynamo is tracing.
 
-requires_grad_pre_hook / requires_grad_post_hook call `requires_grad_()`,
-which Dynamo cannot trace:
+requires_grad_pre_hook / requires_grad_post_hook call `requires_grad_()`, which
+Dynamo cannot trace. Outside a fullgraph region that is only a graph break, but
+Gemma 3N compiles a LoRA target with fullgraph = True, so it becomes a hard
+error and trainer.train() dies. torch._dynamo.disable() does not rescue it;
+guarding on `torch.compiler.is_compiling()` does, and is a no-op in eager.
 
-    Unsupported: Unsupported Tensor.requires_grad_() call
-
-Outside a fullgraph region that is only a graph break, but Gemma 3N puts a
-LoRA target (embed_audio.embedding_projection) inside a forward that
-temporary_patches/gemma3n.py compiles with fullgraph = True, so the same hook
-becomes a hard error and trainer.train() dies. torch._dynamo.disable() does
-not rescue it either -- under fullgraph it turns into "Skip calling
-torch.compiler.disable()d function". Guarding on
-`torch.compiler.is_compiling()` does, and is a no-op in eager.
-
-These tests use the real hooks, pulled off a model that
-requires_grad_for_gradient_checkpointing() has actually hooked, so they break
-if the hooks are renamed or moved. CPU only.
+Hooks are pulled off a real hooked model, so these break if they are renamed or
+moved. CPU only.
 """
 
 import ast
@@ -67,8 +59,7 @@ class _PreHookModel(nn.Module):
 
 
 class _PostHookModel(nn.Module):
-    """`head` is never called as `self.head(`, so it becomes a fallback
-    (post-hook) target instead."""
+    """`head` is never called as `self.head(`, so it is a post-hook target."""
     def __init__(self):
         super().__init__()
         self.head = nn.Linear(8, 8, bias = False)
@@ -141,17 +132,15 @@ def test_post_hook_no_ops_while_compiling(monkeypatch):
 
 
 def test_post_hook_does_not_raise_on_unknown_output_while_compiling(monkeypatch):
-    # Eagerly this output shape raises "Neither loss, logits, nor
-    # last_hidden_state are available"; under compile it must be skipped.
+    # Eagerly this output shape raises; under compile it must be skipped.
     hook = _real_post_hook()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     hook(None, None, {"not" : "a tensor"})
 
 
 def test_fullgraph_compiled_module_with_pre_hook_runs():
-    # The Gemma 3N failure, reduced: a hooked module inside a
-    # fullgraph = True region. Before the guard this raised
-    # "Unsupported: Unsupported Tensor.requires_grad_() call".
+    # The Gemma 3N failure, reduced: a hooked module in a fullgraph = True
+    # region. Before the guard this raised "Unsupported Tensor.requires_grad_()".
     torch._dynamo.reset()
     model = _PreHookModel()
     model.requires_grad_(False)
@@ -164,7 +153,6 @@ def test_fullgraph_compiled_module_with_pre_hook_runs():
     x = torch.randn(2, 8)
     out = compiled(x)
     assert out.shape == (2, 8)
-    # The LoRA-style trainable weight still carries the graph.
     assert out.requires_grad
 
 
@@ -211,12 +199,9 @@ def test_both_gradient_checkpointing_hooks_are_guarded():
 
 
 def test_make_inputs_require_grad_is_NOT_guarded():
-    """The peft_utils hooks sit on LoRA modules whose output already requires
-    grad, so skipping them under tracing changes nothing. This one is the only
-    thing making a FROZEN embedding's output require grad, and reentrant
-    gradient checkpointing needs at least one grad-carrying input. Guarding it
-    would leave that tensor detached and silently stop gradients reaching the
-    adapters, which is worse than the graph break it would have avoided.
+    """Unlike the peft_utils hooks, this is the only thing making a FROZEN
+    embedding's output require grad, which reentrant checkpointing needs.
+    Guarding it would silently stop gradients reaching the adapters.
     """
     guarded = _guarded_functions(
         _ZOO / "training_utils.py", ("make_inputs_require_grad",),

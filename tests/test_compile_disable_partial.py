@@ -16,11 +16,9 @@
 
 """UNSLOTH_COMPILE_DISABLE=partial must also switch off the temporary patches.
 
-compiler.py reads the flag as `in ("1", "partial")`, so "partial" means "keep
-the source rewrites, drop torch.compile". temporary_patches/common.py read it
-as `== "1"`, so the same value left every patch_function(fullgraph = ...)
-compiling. The escape hatch therefore could not be used to work around a
-compile-only crash such as the Gemma 3N embedder one.
+compiler.py reads the flag as `in ("1", "partial")`, but common.py read it as
+`== "1"`, so "partial" left every patch_function(fullgraph = ...) compiling and
+the escape hatch could not work around a compile-only crash.
 
 The flag is read at import, so each value is probed in a subprocess.
 """
@@ -81,7 +79,6 @@ def test_one_disables_compile():
 
 
 def test_partial_disables_compile():
-    # The bug: "partial" left the patch compiled with fullgraph = True.
     out = _probe("partial")
     assert out["flag"] is True
     assert out["compiled"] is False

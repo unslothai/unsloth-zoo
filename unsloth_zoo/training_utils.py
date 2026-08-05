@@ -480,14 +480,10 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
-                # NOT guarded on torch.compiler.is_compiling(), unlike the
-                # peft_utils hooks. Those sit on LoRA modules whose output
-                # already requires grad, so skipping them changes nothing.
-                # This one is the only thing making a FROZEN embedding's output
-                # require grad, and reentrant checkpointing needs at least one
-                # grad-carrying input. Skipping it under tracing would leave
-                # that tensor detached and silently stop gradients reaching the
-                # adapters, which is worse than a graph break.
+                # Deliberately NOT guarded on is_compiling() like the peft_utils
+                # hooks: this is the only thing making a FROZEN embedding's output
+                # require grad, which reentrant checkpointing needs. Skipping it
+                # would silently stop gradients reaching the adapters.
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
