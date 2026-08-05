@@ -684,6 +684,24 @@ def _recompile_limit_errors():
     return tuple(found)
 
 
+def _wants_hard_recompile_failure():
+    """Did the user ask Dynamo to make cache exhaustion fatal?
+
+    torch raises FailOnRecompileLimitHit from two branches with the same class
+    -- this flag, and fullgraph=True -- so the exception cannot tell them
+    apart. Falling back to eager is right for the second and wrong for the
+    first, whose whole purpose is to stop the run. Read the flag instead.
+    Renamed in 2.7 (fail_on_cache_limit_hit -> fail_on_recompile_limit_hit)
+    with the old name kept as an alias, so check both to cover 2.6.
+    """
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return False
+    return bool(getattr(_config, "fail_on_recompile_limit_hit", False) or
+                getattr(_config, "fail_on_cache_limit_hit", False))
+
+
 def _disabled_hook_graph_break_error():
     """Dynamo's graph-break exception, if this torch has one."""
     try:
@@ -804,6 +822,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         try:
             return compiled_func(*args, **kwargs)
         except errors as e:
+            if _wants_hard_recompile_failure():
+                raise
             state["eager"] = True
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "

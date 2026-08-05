@@ -324,3 +324,56 @@ def test_end_to_end_through_patch_function():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- the one case where falling back is the wrong answer ------------------
+
+def test_the_hard_failure_flag_is_respected():
+    """torch raises FailOnRecompileLimitHit from two branches with the same
+    class: fullgraph=True, where falling back is exactly right, and
+    `fail_on_recompile_limit_hit`, where the user asked for the run to stop.
+    The exception cannot tell them apart, so the flag has to be read."""
+    import torch._dynamo.config as config
+
+    c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
+    w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
+    previous = config.fail_on_recompile_limit_hit
+    config.fail_on_recompile_limit_hit = True
+    try:
+        with pytest.raises(_LIMIT_ERROR):
+            w(3)
+    finally:
+        config.fail_on_recompile_limit_hit = previous
+    # Nothing latched either, or a later call would silently go eager.
+    assert calls == {"c": 1, "e": 0}
+
+
+def test_the_flag_being_off_keeps_the_fallback():
+    import torch._dynamo.config as config
+
+    previous = config.fail_on_recompile_limit_hit
+    config.fail_on_recompile_limit_hit = False
+    try:
+        c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
+        w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
+        assert w(3) == 6
+    finally:
+        config.fail_on_recompile_limit_hit = previous
+    assert calls == {"c": 1, "e": 1}
+
+
+def test_a_torch_without_the_flag_still_falls_back():
+    """2.6 spells it fail_on_cache_limit_hit, and some builds have neither."""
+    from unsloth_zoo.temporary_patches.utils import _wants_hard_recompile_failure
+    import torch._dynamo.config as config
+
+    saved = {n: getattr(config, n) for n in
+             ("fail_on_recompile_limit_hit", "fail_on_cache_limit_hit")
+             if hasattr(config, n)}
+    for n in saved:
+        setattr(config, n, False)
+    try:
+        assert _wants_hard_recompile_failure() is False
+    finally:
+        for n, v in saved.items():
+            setattr(config, n, v)
