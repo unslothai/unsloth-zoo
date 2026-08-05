@@ -19,6 +19,7 @@ from .utils import (
     _normalize_seed,
     _torch_randperm_order,
     collect_mlx_lora_adapter_tensors,
+    encode_mlx_text,
     iter_mlx_lora_modules,
 )
 
@@ -133,10 +134,7 @@ def _render_preference_row(tokenizer, row):
     )
 
 
-def tokenize_preference_row(
-    tokenizer, row, *, max_seq_length, append_eos=True,
-):
-    """Tokenize one row and preserve a shared prompt boundary."""
+def _require_preference_fields(row):
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
     missing = {"prompt", "chosen", "rejected"} - set(row)
@@ -145,6 +143,13 @@ def tokenize_preference_row(
             "Unsloth MLX preference: every row requires explicit prompt, chosen, "
             f"and rejected fields; missing {sorted(missing)!r}."
         )
+
+
+def tokenize_preference_row(
+    tokenizer, row, *, max_seq_length, append_eos=True,
+):
+    """Tokenize one row and preserve a shared prompt boundary."""
+    _require_preference_fields(row)
     prompt_text, chosen_text, rejected_text = _render_preference_row(tokenizer, row)
     chosen = _encode_mlx_prompt_completion(
         tokenizer, prompt_text, chosen_text, append_eos=append_eos,
@@ -185,6 +190,31 @@ def tokenize_preference_row(
         tuple(chosen_prompt), tuple(chosen_response),
         tuple(rejected_prompt), tuple(rejected_response),
     )
+
+
+def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
+    """Encode one row's prompt for generation, reserving room for the sample.
+
+    ``max_new_tokens`` comes out of ``max_seq_length`` and the prompt keeps its
+    end. Not ``tokenize_preference_row``'s prompt: that boundary hands a merged
+    prompt/completion token to the response span, and generation has no
+    completion to merge with. Not the generation engine's own encoder either,
+    which omits the special tokens training adds.
+    """
+    _require_preference_fields(row)
+    prompt_text, _, _ = _render_preference_row(tokenizer, row)
+    budget = int(max_seq_length) - int(max_new_tokens)
+    if budget < 1:
+        raise ValueError(
+            "Unsloth MLX preference: max_new_tokens must leave at least one "
+            "prompt token within max_seq_length."
+        )
+    prompt_ids = [int(token) for token in encode_mlx_text(tokenizer, prompt_text)]
+    if not prompt_ids:
+        raise ValueError(
+            "Unsloth MLX preference: a row rendered an empty prompt."
+        )
+    return prompt_text, tuple(prompt_ids[-budget:])
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
