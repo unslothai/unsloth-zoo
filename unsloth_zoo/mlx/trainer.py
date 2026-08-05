@@ -68,6 +68,7 @@ SUPPORTED_MLX_LR_SCHEDULERS = (
     "constant_with_warmup",
     "inverse_sqrt",
     "warmup_stable_decay",
+    "cosine_warmup_with_min_lr",
 )
 
 
@@ -883,15 +884,20 @@ def _mlx_scheduler_kwargs(args):
 # :324), which is the same warmup ramp, the same progress definition and the
 # same 0.5*(1 + cos(pi*num_cycles*2*p)) factor this port implements.
 #
-# `cosine_warmup_with_min_lr` is deliberately NOT aliased: HF routes it to
-# get_cosine_with_min_lr_schedule_with_warmup_lr_rate, whose lambda uses a
-# different, off-by-one warmup ramp and progress definition
+# `cosine_warmup_with_min_lr` is deliberately NOT aliased onto it: HF routes
+# that name to get_cosine_with_min_lr_schedule_with_warmup_lr_rate, whose lambda
+# uses a different, off-by-one warmup ramp and progress definition
 # ((step + 1)/warmup and (step - warmup + 1)/(total - warmup),
-# transformers/optimization.py:400-406), so mapping it here would silently
-# train a different curve.
+# transformers/optimization.py:400-406), so it is carried as its own schedule.
 _MLX_LR_SCHEDULER_ALIASES = {
     "cosine_with_min_lr": "cosine",
 }
+
+# HF scheduler names that require an explicit floor rather than defaulting one
+# (transformers/optimization.py:374-375, :454-455).
+_MLX_SCHEDULERS_REQUIRING_MIN_LR = frozenset(
+    {"cosine_with_min_lr", "cosine_warmup_with_min_lr"}
+)
 
 # HF's per-scheduler `num_cycles` default. Not one value: it is 1 for the hard
 # restart schedule (optimization.py:187) but 0.5 for the cosine family
@@ -900,6 +906,7 @@ _HF_DEFAULT_NUM_CYCLES = {
     "cosine": 0.5,
     "cosine_with_restarts": 1.0,
     "warmup_stable_decay": 0.5,
+    "cosine_warmup_with_min_lr": 0.5,
 }
 
 # Scheduler kwargs each HF schedule accepts, and the subset this port
@@ -917,6 +924,9 @@ _MLX_SCHEDULER_SUPPORTED_KWARGS = {
     "inverse_sqrt": frozenset({"timescale"}),
     "warmup_stable_decay": frozenset(
         {"num_decay_steps", "num_stable_steps", "min_lr_ratio", "num_cycles"}
+    ),
+    "cosine_warmup_with_min_lr": frozenset(
+        {"num_cycles", "min_lr", "min_lr_rate", "warmup_lr_rate"}
     ),
 }
 
@@ -3548,6 +3558,9 @@ class MLXTrainer:
             return default if value is None else value
 
         power = float(knob("power", "lr_scheduler_power", 1.0))
+        warmup_lr_rate = sched_kwargs.get("warmup_lr_rate")
+        if warmup_lr_rate is not None:
+            warmup_lr_rate = float(warmup_lr_rate)
         num_cycles = float(
             knob(
                 "num_cycles",
@@ -3575,17 +3588,16 @@ class MLXTrainer:
                 "['min_lr_rate'] may be set."
             )
         if (
-            requested_name == "cosine_with_min_lr"
+            requested_name in _MLX_SCHEDULERS_REQUIRING_MIN_LR
             and min_lr is None
             and min_lr_rate_kwarg is None
             and getattr(self.args, "lr_scheduler_min_lr_rate", None) is None
         ):
-            # HF requires the floor rather than defaulting it
-            # (transformers/optimization.py:374-375). Without this the alias
-            # would accept a config HF rejects and quietly train a plain
+            # HF requires the floor rather than defaulting it. Without this the
+            # name would accept a config HF rejects and quietly train a plain
             # cosine down to 0.
             raise ValueError(
-                "Unsloth: lr_scheduler_type='cosine_with_min_lr' requires one of "
+                f"Unsloth: lr_scheduler_type={requested_name!r} requires one of "
                 "lr_scheduler_kwargs['min_lr'] or ['min_lr_rate'] (or the "
                 "lr_scheduler_min_lr_rate config attribute) to be set."
             )
@@ -3640,14 +3652,32 @@ class MLXTrainer:
         if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
             return lr
 
+        # HF's cosine_warmup_with_min_lr lambda counts the current step as one
+        # completed step: its warmup ramp is (step + 1)/warmup and its progress
+        # is (step - warmup + 1)/(total - warmup), so it reaches base_lr on the
+        # last warmup update rather than the first post-warmup one
+        # (transformers/optimization.py:400-406). Every other HF schedule here
+        # uses the plain step/warmup and (step - warmup)/(total - warmup).
+        step_offset = 1.0 if sched_type == "cosine_warmup_with_min_lr" else 0.0
+
         def warmup_multiplier(step):
             if warmup <= 0:
                 return mx.array(1.0, dtype=mx.float32)
-            return step / mx.array(max(warmup, 1), dtype=mx.float32)
+            if warmup_lr_rate is not None:
+                # The explicit-floor ramp spans warmup - 1 steps and starts at
+                # warmup_lr_rate (transformers/optimization.py:404-405).
+                return mx.array(warmup_lr_rate, dtype=mx.float32) + mx.array(
+                    1.0 - warmup_lr_rate, dtype=mx.float32
+                ) * step / mx.array(max(warmup - 1, 1), dtype=mx.float32)
+            return (
+                step + mx.array(step_offset, dtype=mx.float32)
+            ) / mx.array(max(warmup, 1), dtype=mx.float32)
 
         def decay_progress(step):
             return (
-                step - mx.array(warmup, dtype=mx.float32)
+                step
+                - mx.array(warmup, dtype=mx.float32)
+                + mx.array(step_offset, dtype=mx.float32)
             ) / mx.array(max(total_steps - warmup, 1), dtype=mx.float32)
 
         def schedule(step):
@@ -3668,7 +3698,7 @@ class MLXTrainer:
                 warm = mx.array(lr, dtype=mx.float32)
 
             progress = decay_progress(step)
-            if sched_type == "cosine":
+            if sched_type in ("cosine", "cosine_warmup_with_min_lr"):
                 # HF parity: 0.5 * (1 + cos(pi * num_cycles * 2 * progress)),
                 # which at the default num_cycles=0.5 is the half cosine falling
                 # from 1 to 0 (transformers/optimization.py:330).

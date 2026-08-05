@@ -8459,8 +8459,68 @@ def test_cosine_warmup_with_min_lr_is_not_silently_aliased():
     assert _normalize_mlx_scheduler_type("cosine_with_min_lr") == "cosine"
     assert _normalize_mlx_scheduler_type("COSINE_WITH_MIN_LR") == "cosine"
     assert _normalize_mlx_scheduler_type("SchedulerType.cosine_with_min_lr") == "cosine"
-    with pytest.raises(ValueError, match="cosine_warmup_with_min_lr"):
-        _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr")
+    assert _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr") == (
+        "cosine_warmup_with_min_lr"
+    )
+
+
+def test_cosine_warmup_with_min_lr_matches_its_own_hf_lambda():
+    """Its warmup ramp and progress are both offset by one step relative to
+    every other schedule (transformers/optimization.py:400-406), and it takes a
+    warmup_lr_rate floor no other schedule has."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup = 2e-4, 60, 5
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="cosine_warmup_with_min_lr",
+    )
+    hf_lambda = optimization._get_cosine_with_min_lr_schedule_with_warmup_lr_rate_lambda
+    for kwargs in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5},
+                   {"min_lr_rate": 0.1, "warmup_lr_rate": 0.05},
+                   {"min_lr_rate": 0.1, "num_cycles": 1.5}):
+        trainer.args.lr_scheduler_kwargs = kwargs
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * hf_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                num_cycles=kwargs.get("num_cycles", 0.5),
+                min_lr_rate=kwargs.get("min_lr_rate", kwargs.get("min_lr", 0.0) / lr),
+                warmup_lr_rate=kwargs.get("warmup_lr_rate"),
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), kwargs
+
+    # Aliasing it onto plain cosine would have been off by one step everywhere.
+    trainer.args.lr_scheduler_kwargs = {"min_lr_rate": 0.1}
+    plain = [
+        lr
+        * optimization._get_cosine_schedule_with_warmup_lr_lambda(
+            step,
+            num_warmup_steps=warmup,
+            num_training_steps=total,
+            num_cycles=0.5,
+            min_lr_rate=0.1,
+        )
+        for step in range(total)
+    ]
+    got = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert got != pytest.approx(plain, abs=1e-9)
+
+    # Same floor requirement HF enforces (transformers/optimization.py:454-455).
+    trainer.args.lr_scheduler_kwargs = None
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(total)
 
 
 def test_cosine_with_min_lr_requires_a_floor_like_hf():
