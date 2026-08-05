@@ -911,29 +911,59 @@ def train_on_responses_only(
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
-        # handed, so a raw `text`/`messages` column left on an already tokenized
-        # split kills the first batch. The trainer normally strips it, but not
+        # handed, and only pads the few it knows, so any leftover column kills
+        # the first batch: a raw `text`/`messages` cannot be tensorized, a
+        # ragged `prompt_ids` is stacked unpadded, and a scalar `label` is taken
+        # for the labels themselves. The trainer normally strips them, but not
         # when unused-column removal is off (token-type-id models above turn it
-        # off). Drop by value shape so numeric model columns are all kept.
-        import numbers as _numbers
-        def _cannot_be_tensorized(value):
-            while isinstance(value, (list, tuple)):
-                if len(value) == 0: return False
-                value = value[0]
-            if value is None: return True
-            # Tensor, ndarray or numpy scalar: already numeric.
-            if hasattr(value, "dtype"): return False
-            return not isinstance(value, _numbers.Number)
+        # off). So keep only what the model is actually fed.
+        import inspect as _inspect
+        def _model_input_columns():
+            # token_type_ids is why unused-column removal is off; the rest are
+            # asked of the processor and the model so this cannot rot.
+            names = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+            holders = [processor, tokenizer]
+            holders += [getattr(processor, attr, None) for attr in
+                        ("tokenizer", "image_processor", "feature_extractor",
+                         "video_processor", "audio_processor")]
+            for holder in holders:
+                try: names.update(getattr(holder, "model_input_names", None) or ())
+                except Exception: pass
+            # Unwrap PEFT/compile wrappers: their own forward hides pixel_values.
+            model = getattr(trainer, "model", None)
+            for _ in range(6):
+                if model is None: break
+                forward = getattr(model, "forward", None)
+                if forward is not None:
+                    try:
+                        names.update(
+                            name for name, p in _inspect.signature(forward).parameters.items()
+                            if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+                        )
+                    except (TypeError, ValueError): pass
+                unwrap = getattr(model, "get_base_model", None)
+                nxt = None
+                if callable(unwrap):
+                    try: nxt = unwrap()
+                    except Exception: nxt = None
+                if nxt is None or nxt is model:
+                    nxt = getattr(model, "_orig_mod", None) or getattr(model, "base_model", None)
+                model = None if nxt is model else nxt
+            names.discard("self")
+            return names
+        _keep_columns = _model_input_columns()
         def _drop_raw_columns(dataset):
             if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
             try:
-                row = next(iter(dataset))
-                names = getattr(dataset, "column_names", None) or list(row.keys())
+                names = getattr(dataset, "column_names", None)
+                if names is None: names = list(next(iter(dataset)).keys())
                 if isinstance(names, dict): return dataset
-                drop = [c for c in names if c in row and _cannot_be_tensorized(row[c])]
+                drop = [c for c in names if c not in _keep_columns]
             except Exception:
                 return dataset
-            return dataset.remove_columns(drop) if drop else dataset
+            if not drop: return dataset
+            print(f"Unsloth: Dropping columns the model is not fed: {sorted(drop)}")
+            return dataset.remove_columns(drop)
         if hasattr(trainer, "train_dataset"):
             trainer.train_dataset = _drop_raw_columns(trainer.train_dataset)
         _eval_now = getattr(trainer, "eval_dataset", None)

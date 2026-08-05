@@ -445,3 +445,106 @@ def test_a_tokenized_eval_split_keeps_no_raw_text():
 
     assert "text" not in out.eval_dataset["raw"].column_names
     assert "labels" in out.eval_dataset["raw"].column_names
+
+
+# ---- only model inputs may reach the collator ------------------------------
+
+class TensorizingPadTokenizer(StrictPadTokenizer):
+    """Pads the keys a real tokenizer knows about and tensorizes the rest, so a
+    ragged leftover raises exactly as `tokenizer.pad(return_tensors = "pt")` does."""
+    _PADDED = ("input_ids", "attention_mask", "token_type_ids", "special_tokens_mask")
+
+    def pad(self, features, **kwargs):
+        for key in features[0]:
+            if key in self._PADDED: continue
+            widths = {len(f[key]) if isinstance(f[key], (list, tuple)) else None
+                      for f in features}
+            if len(widths) > 1:
+                raise ValueError(
+                    f"Unable to create tensor ... (`{key}` in this case)"
+                )
+        return StrictPadTokenizer.pad(self, features, **kwargs)
+
+
+class TensorizingProcessor(StubProcessor):
+    def __init__(self):
+        super().__init__()
+        self.tokenizer = TensorizingPadTokenizer()
+
+
+def _bypass(dataset, model = None):
+    trainer = StubTrainer(MyVisionCollator(TensorizingProcessor()), dataset)
+    trainer.processing_class = TensorizingProcessor()
+    if model is not None: trainer.model = model
+    return train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_scalar_label_column_never_reaches_the_collator():
+    """`DataCollatorForSeq2Seq` reads `label` in preference to `labels`, so a
+    kept scalar `label` both loses the masked labels and dies on `len(int)`."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "label": [0, 1],
+    })
+    out = _bypass(dataset)
+
+    batch = _collate_every_row(out)     # used to raise TypeError: len() of int
+    assert "label" not in out.train_dataset.column_names
+    assert len(batch["labels"][0]) == len(ROW)
+
+
+def test_a_ragged_numeric_column_never_reaches_the_collator():
+    """Pretokenizing a prompt/completion split leaves `prompt_ids` behind. It is
+    numeric, but `tokenizer.pad` pads only its own keys, so stacking it fails."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "prompt_ids": [[1, 2], [1, 2, 3]],
+    })
+    out = _bypass(dataset)
+
+    _collate_every_row(out)             # used to raise ValueError while tensorizing
+    assert "prompt_ids" not in out.train_dataset.column_names
+
+
+def test_a_numeric_metadata_column_is_dropped():
+    """`id`/`sample_idx` tensorize cleanly but are not model inputs."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "id": [7, 8],
+        "sample_idx": [0, 1],
+    })
+    out = _bypass(dataset)
+
+    assert "id" not in out.train_dataset.column_names
+    assert "sample_idx" not in out.train_dataset.column_names
+    assert "input_ids" in out.train_dataset.column_names
+
+
+def test_model_and_processor_declared_inputs_survive():
+    """The kept names come from the processor and the model's own forward, so a
+    multimodal input this file has never heard of still gets through."""
+    class FakeModel:
+        def forward(self, input_ids = None, attention_mask = None, labels = None,
+                    pixel_values = None, deepstack_visual_embeds = None, **kwargs):
+            pass
+
+    processor_names = ["input_ids", "attention_mask", "mm_token_type_ids"]
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "token_type_ids": [[0] * len(ROW)] * 2,
+        "mm_token_type_ids": [[0] * len(ROW)] * 2,
+        "deepstack_visual_embeds": [[0] * len(ROW)] * 2,
+        "id": [1, 2],
+    })
+    trainer = StubTrainer(MyVisionCollator(TensorizingProcessor()), dataset)
+    trainer.processing_class = TensorizingProcessor()
+    trainer.processing_class.tokenizer.model_input_names = processor_names
+    trainer.model = FakeModel()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    kept = out.train_dataset.column_names
+    for column in ("input_ids", "labels", "token_type_ids", "mm_token_type_ids",
+                   "deepstack_visual_embeds"):
+        assert column in kept, column
+    assert "id" not in kept
