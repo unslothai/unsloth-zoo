@@ -59,14 +59,47 @@ import os
 import sys
 import traceback
 
-os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-
 DEFAULT_MODEL = "mlx-community/gemma-4-e2b-it-4bit"
 DURATIONS = (0.5, 1.0, 2.0, 3.7)
 RATE = 16000
 
 results = {}
+
+# How far clear of the platform's own jitter the two-tone gap has to land.
+# Deliberately generous: stage 4 asks whether audio moves the loss at all, so
+# a connected model should dwarf the jitter, and a gap that merely edges past
+# it is worth a human look rather than a recorded pass.
+TWO_TONE_MARGIN = 4.0
+
+TWO_TONE_REASONS = {
+    "same_loss": "two different tones gave the same loss, so the audio is "
+                 "not reaching the objective",
+    "below_noise": "the two tones differ by no more than this platform's own "
+                   "run-to-run noise, so this cannot say whether the audio "
+                   "reached the objective",
+}
+
+
+def two_tone_verdict(repeats, other):
+    """Did the second tone move the loss by more than the platform's jitter?
+
+    `repeats` are losses for one tone run several times, so their spread is
+    what this machine hands you for free with no audio involved; `other` is
+    the second tone. Split out from the stage so it can be tested without a
+    model, a checkpoint or a Mac -- which matters, because the branch that
+    made this necessary only fires on hardware where the model is not
+    reproducible.
+    """
+    noise = max(repeats) - min(repeats)
+    base = repeats[0]
+    signal = abs(base - other)
+    detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
+              f"signal={signal:.3g} noise={noise:.3g}")
+    if signal < 1e-6:
+        return "same_loss", detail
+    if noise > 0.0 and signal <= TWO_TONE_MARGIN * noise:
+        return "below_noise", detail
+    return "pass", detail
 
 
 def stage(name):
@@ -223,13 +256,23 @@ def check_alignment(_repo):
 
 @stage("4_audio_reaches_the_loss")
 def check_loss(_repo):
-    """Distinct audio must produce distinct losses.
+    """Distinct audio must produce distinct losses, by more than the noise.
 
     A processor that accepts the argument and drops it, or a merge that lands
     features on the wrong positions, shows up here: the loss stops depending
     on what the audio actually was.
+
+    "Distinct" only means something where the same input twice gives the same
+    loss, and on Apple Silicon this model does not: two identical uncached
+    forwards of Gemma 4 E2B differ, and a bisect puts the first differing
+    decoder layer at 0, upstream of every KV-shared layer. Against that, a
+    bare `!=` is satisfied by the noise whether or not the audio is connected,
+    so it would pass on a checkpoint whose audio is entirely disconnected.
+
+    So measure the noise first, by running one tone several times, and require
+    the two-tone gap to clear it. On a platform where the model is
+    reproducible the floor is 0 and this is the original test.
     """
-    import mlx.core as mx
     import numpy as np
 
     from unsloth_zoo.mlx.utils import (
@@ -244,8 +287,11 @@ def check_loss(_repo):
 
     held = install_audio_merge_patch(model, audio_token_id)
     try:
-        losses = []
-        for hz in (440.0, 1760.0):
+        from unsloth_zoo.mlx.utils import (
+            _collate_vlm_batch, _finalize_vlm_batch,
+        )
+
+        def loss_at(hz):
             # The decoded-column shape datasets.Audio yields, the only one
             # collation accepts.
             clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
@@ -253,9 +299,6 @@ def check_loss(_repo):
                 {"type": "audio", "audio": clip},
                 {"type": "text", "text": "Transcribe."}]},
                 {"role": "assistant", "content": "ok"}]
-            from unsloth_zoo.mlx.utils import (
-                _collate_vlm_batch, _finalize_vlm_batch,
-            )
             # Collate on the host, then finalize to MLX, as the trainer does.
             staged = _collate_vlm_batch(
                 [{"messages": messages}], processor, 512, None)
@@ -265,18 +308,30 @@ def check_loss(_repo):
             loss = float(out[0] if isinstance(out, tuple) else out)
             if not np.isfinite(loss):
                 raise AssertionError(f"loss is not finite at {hz} Hz: {loss}")
-            losses.append(loss)
-        if abs(losses[0] - losses[1]) < 1e-6:
-            raise AssertionError(
-                f"two different tones gave the same loss ({losses[0]}), so the "
-                f"audio is not reaching the objective")
-        return f"440Hz={losses[0]:.4f} 1760Hz={losses[1]:.4f}"
+            return loss
+
+        # The same tone several times: whatever these disagree by is what the
+        # platform hands you for free, with no audio involved. Three rather
+        # than two because one pair is a single sample of a spread and can
+        # land small by luck, which would put the floor back where it started.
+        repeats = [loss_at(440.0) for _ in range(3)]
+        verdict, detail = two_tone_verdict(repeats, loss_at(1760.0))
+        if verdict != "pass":
+            raise AssertionError(f"{TWO_TONE_REASONS[verdict]} [{detail}]")
+        return detail
     finally:
         if held:
             remove_audio_merge_patch(model)
 
 
 def main():
+    # Set here rather than at import: the stage helpers below are worth
+    # importing on their own from a test, and importing a module should not
+    # rewrite the environment of whatever imported it. Both are read by
+    # unsloth_zoo, which is first imported inside the stages that main() runs.
+    os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
     args = ap.parse_args()
