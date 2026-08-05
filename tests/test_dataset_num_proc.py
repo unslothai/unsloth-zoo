@@ -48,6 +48,30 @@ def dnp(monkeypatch):
     # Pin the platform: macOS is refused by policy whatever the start method
     # says. Platform tests set their own value afterwards, which wins.
     monkeypatch.setattr(module.sys, "platform", "linux")
+    # Pin the memory ceiling too, at its two sources rather than at the reader,
+    # so the memory tests can still patch either and win. Every count this
+    # module returns is clamped by free RAM and by the cgroup budget, so on a
+    # memory-limited runner a test about the start method or about an explicit
+    # value silently becomes a test of the clamp instead:
+    # `get_dataset_num_proc(6) == 6` returns 4 in a small container.
+    try:
+        import psutil
+        monkeypatch.setattr(
+            psutil, "virtual_memory", lambda: type("m", (), {"available": 1024 * 1024**3})()
+        )
+    except ImportError:
+        pass
+    # Point both cgroup readers at a path that does not exist rather than
+    # stubbing the readers themselves, so the tests that are about those
+    # readers can still install a fixture tree and win.
+    monkeypatch.setattr(module, "CGROUP_ROOT", "/nonexistent-cgroup-root-for-tests")
+    try:
+        from unsloth_zoo import hf_xet_tuning
+        monkeypatch.setattr(
+            hf_xet_tuning, "CGROUP_ROOT", Path("/nonexistent-cgroup-root-for-tests")
+        )
+    except Exception:
+        pass
     return module
 
 
@@ -486,21 +510,22 @@ def test_successful_map_is_not_disturbed(dnp):
 
 
 def test_the_recovery_advice_does_not_promise_more_than_it_delivers(dnp):
-    """UNSLOTH_DATASET_NUM_PROC=0 is not in-process on every path.
+    """UNSLOTH_DATASET_NUM_PROC=0 is not in-process on every installation.
 
     The dead-worker message is the one place a user is told what to do next, so
     it has to be true. On fork, train_on_responses_only over the Zoo's threshold
     gets ``1`` rather than ``None`` -- deliberately, since a bare None would
-    inflate to the Zoo's uncapped count -- which ``datasets`` >= 4.1 turns into a
-    Pool(1). Saying "tokenize in-process" flatly was wrong for exactly the
-    large-dataset runs that die.
+    inflate to the Zoo's uncapped count. This release reads that ``1`` as
+    in-process, but a Zoo that predates it turns it into a Pool(1), and the
+    generated code runs against whichever Zoo is installed. Saying "tokenize
+    in-process" flatly was wrong for exactly the large-dataset runs that die.
     """
     with pytest.raises(RuntimeError) as excinfo:
         with dnp.map_failure_diagnostics(8):
             raise RuntimeError("One of the subprocesses has abruptly died during map operation.")
     message = str(excinfo.value)
     assert f"{dnp.NUM_PROC_ENV_VAR}=0" in message
-    assert "one worker" in message, "the exception to in-process has to be stated"
+    assert "single worker" in message, "the exception to in-process has to be stated"
     assert "train_on_responses_only" in message, "and which path it applies to"
     assert f"{dnp.ZOO_MIN_ROWS_FOR_MULTIPROC:,}" in message, "and above which size"
 
@@ -600,8 +625,22 @@ def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
     import os
     import subprocess
 
-    environment = dict(os.environ, UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
-    result = subprocess.run(
+    result = _import_the_dotted_path(UNSLOTH_ZOO_DISABLE_GPU_INIT = "1")
+    if result.returncode != 0 and "Pytorch is not installed" in result.stderr:
+        pytest.skip("torch is not installed; the package __init__ cannot load")
+    assert result.returncode == 0, result.stderr[-2000:]
+    # The package prints a banner on import, so read the last line, not all of it.
+    assert result.stdout.strip().splitlines()[-1] == "unsloth_zoo.dataset_num_proc", (
+        result.stdout
+    )
+
+
+def _import_the_dotted_path(**environment):
+    """``from unsloth_zoo.dataset_num_proc import ...`` in a fresh interpreter."""
+    import os
+    import subprocess
+
+    return subprocess.run(
         [
             sys.executable,
             "-c",
@@ -611,12 +650,30 @@ def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
         capture_output = True,
         text = True,
         cwd = str(REPO_ROOT),
-        env = environment,
+        env = dict(os.environ, **environment),
     )
-    if result.returncode != 0 and "Pytorch is not installed" in result.stderr:
-        pytest.skip("torch is not installed; the package __init__ cannot load")
+
+
+def test_the_generated_import_works_without_the_escape_hatch():
+    """The import exactly as a generated trainer file writes it: no hatch, no help.
+
+    The test above proves the module is reachable at that dotted path, but it
+    sets UNSLOTH_ZOO_DISABLE_GPU_INIT to get there, which no generated file
+    does. This one runs the import a cold compiled cache would run. It can only
+    pass where the package __init__ is satisfied, so it skips rather than fails
+    on an environment without unsloth or torch -- which is the reason the other
+    test exists.
+    """
+    result = _import_the_dotted_path()
+    if result.returncode != 0:
+        for expected in ("Please install Unsloth", "Pytorch is not installed"):
+            if expected in result.stderr:
+                pytest.skip(f"the package __init__ cannot load here: {expected}")
     assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.strip() == "unsloth_zoo.dataset_num_proc", result.stdout
+    # The package prints a banner on import, so read the last line, not all of it.
+    assert result.stdout.strip().splitlines()[-1] == "unsloth_zoo.dataset_num_proc", (
+        result.stdout
+    )
 
 
 
