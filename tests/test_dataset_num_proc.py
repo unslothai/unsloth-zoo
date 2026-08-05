@@ -326,7 +326,9 @@ def test_env_override_beats_start_method_veto(monkeypatch, dnp):
     assert dnp.get_dataset_num_proc(None) == 24
 
 
-@pytest.mark.parametrize("raw", ["0", "none", "None", "false", ""])
+# "1" belongs here as much as "0": it is the value datasets >= 4.1 turns into a
+# Pool(1), so the hatch has its own instance of this PR's headline trap.
+@pytest.mark.parametrize("raw", ["0", "none", "None", "false", "", "1"])
 def test_env_override_can_force_in_process(monkeypatch, dnp, raw):
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, raw)
@@ -1164,4 +1166,143 @@ def test_standardize_data_formats_routes_through_the_policy(monkeypatch):
     dataset_utils.standardize_data_formats(dataset, num_proc = 1)
     assert seen["desired"] == 1, "the policy was never consulted"
     assert captured["num_proc"] is None, "num_proc=1 is a Pool(1) on datasets >= 4.1"
+
+
+def test_the_helper_backed_reader_pairs_v1_limits_with_their_own_usage(
+    monkeypatch, dnp, tmp_path
+):
+    """The v1 branch of the helper-backed reader, which the unaided one mirrors.
+
+    Every other fixture here drives v2, so the pairing on this side was asserted
+    only in the fallback the current zoo never takes: breaking it read a leaf's
+    usage against a slice's limit and silently over-subscribed every run.
+    """
+    slice_dir = tmp_path / "slurm"
+    leaf = slice_dir / "job_1"
+    leaf.mkdir(parents = True)
+    (slice_dir / "memory.limit_in_bytes").write_text("34359738368\n")
+    (slice_dir / "memory.usage_in_bytes").write_text("32212254720\n")
+    (leaf / "memory.limit_in_bytes").write_text("17179869184\n")
+    (leaf / "memory.usage_in_bytes").write_text("1073741824\n")
+
+    _fake_cgroup_module(monkeypatch, v1_dirs = [leaf, slice_dir])
+    # 34 - 32 = 2GB from the slice, 16 - 1 = 15GB from the leaf. The slice binds.
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+
+
+def test_the_unaided_reader_picks_the_right_line_under_systemd_hybrid(
+    monkeypatch, dnp, tmp_path
+):
+    """v1 and v2 lines share /proc/self/cgroup, and the v2 one is not first.
+
+    Both readers scan for their own line rather than taking line 0 for exactly
+    this layout, so a fixture where the first line is the wrong flavour is what
+    holds that scan in place.
+    """
+    _no_hf_xet_tuning(monkeypatch)
+    v2_leaf = tmp_path / "user.slice" / "app.scope"
+    v2_leaf.mkdir(parents = True)
+    (v2_leaf / "memory.max").write_text("8589934592\n")
+    (v2_leaf / "memory.current").write_text("6442450944\n")
+    # The v1 controller root exists but names a different path, so reading the
+    # first line instead of the "0::" one would miss the limit entirely.
+    v1_leaf = tmp_path / "memory" / "slurm" / "job_1"
+    v1_leaf.mkdir(parents = True)
+    (v1_leaf / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (v1_leaf / "memory.usage_in_bytes").write_text("0\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        dnp,
+        "_proc_self_cgroup",
+        lambda: ["12:memory:/slurm/job_1", "0::/user.slice/app.scope"],
+    )
+    assert dnp._cgroup_free_bytes() == 2 * 1024**3
+
+
+def test_a_bool_num_proc_counts_as_auto_for_the_responses_only_resolver(monkeypatch, dnp):
+    """train_on_responses_only reads `type(num_proc) is not int` as auto, and a
+    bool is not an int by that test, so the resolver has to agree with it or a
+    stray True would be honoured as an explicit count on a split too small for
+    workers."""
+    monkeypatch.setattr(dnp, "multiprocessing_start_method", lambda: "fork")
+    _force_cpus(monkeypatch, dnp, 64)
+
+    class _Trainer:
+        def __init__(self, split):
+            self.train_dataset = split
+            self.eval_dataset = None
+
+    small = _Trainer(_Split(dnp.ZOO_MIN_ROWS_FOR_MULTIPROC - 1))
+    # Passed straight back, so the helper still sees "auto" and its own per-split
+    # guard runs the small split in-process. Reading the bool as an explicit
+    # count instead would hand it a worker pool.
+    assert dnp.resolve_responses_only_num_proc(small, True) is True
+
+
+def test_a_dict_eval_dataset_is_measured_by_its_splits_not_its_keys(monkeypatch, dnp):
+    """len() of a dict of splits is the number of keys.
+
+    Two large splits would read as two rows, divert the resolver into the
+    small-split branch and quietly serialise a job that wanted workers.
+    """
+    monkeypatch.setattr(dnp, "multiprocessing_start_method", lambda: "fork")
+    _force_cpus(monkeypatch, dnp, 64)
+
+    class _Trainer:
+        def __init__(self, train, evaluation):
+            self.train_dataset = train
+            self.eval_dataset = evaluation
+
+    big = _Split(dnp.ZOO_MIN_ROWS_FOR_MULTIPROC * 2)
+    trainer = _Trainer(_Split(8), {"a": big, "b": big})
+    assert dnp.resolve_responses_only_num_proc(trainer, None) == dnp.AUTO_NUM_PROC_CAP
+
+
+def test_environment_override_reports_what_the_hatch_says(monkeypatch, dnp):
+    """The public reader behind the hatch, which callers use to explain
+    themselves before they act on it."""
+    monkeypatch.delenv(dnp.NUM_PROC_ENV_VAR, raising = False)
+    assert dnp.environment_override() == (False, None)
+
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "12")
+    assert dnp.environment_override() == (True, 12)
+
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "0")
+    assert dnp.environment_override() == (True, None)
+
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "banana")
+    assert dnp.environment_override() == (False, None)
+
+
+def test_standardize_data_formats_passes_no_num_proc_for_an_iterable_dataset():
+    """IterableDataset.map() has no num_proc parameter at all.
+
+    The policy call sits inside the sized-dataset branch; moving it out is a
+    TypeError on every streaming dataset, and the routing test above only
+    covers the sized path.
+    """
+    datasets = pytest.importorskip("datasets")
+    dataset_utils = pytest.importorskip("unsloth_zoo.dataset_utils")
+
+    dataset = datasets.Dataset.from_dict({
+        "conversations": [
+            [{"from": "human", "value": f"q{i}"}, {"from": "gpt", "value": f"a{i}"}]
+            for i in range(6)
+        ]
+    })
+    captured = {}
+    streaming = dataset.to_iterable_dataset()
+    original = type(streaming).map
+
+    def _capture(self, *args, **kwargs):
+        captured.update(kwargs)
+        return self
+
+    try:
+        type(streaming).map = _capture
+        dataset_utils.standardize_data_formats(streaming)
+    finally:
+        type(streaming).map = original
+    assert "num_proc" not in captured, "IterableDataset.map() has no such parameter"
 
