@@ -339,8 +339,10 @@ def patch_Qwen3_5ForCausalLM_dtype():
         RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
         # Always work with ModelOutput internally; @can_return_tuple preserves
-        # the public tuple/return_dict contract.
-        kwargs["return_dict"] = True
+        # the public tuple/return_dict contract. Use a separate dict so the
+        # synthetic return_dict never reaches the loss function.
+        model_kwargs = dict(kwargs)
+        model_kwargs["return_dict"] = True
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -348,7 +350,7 @@ def patch_Qwen3_5ForCausalLM_dtype():
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            **kwargs,
+            **model_kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -432,7 +434,9 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
         RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
         RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
-        kwargs["return_dict"] = True
+        # Keep the synthetic return_dict away from the loss function.
+        model_kwargs = dict(kwargs)
+        model_kwargs["return_dict"] = True
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -444,7 +448,7 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
-            **kwargs,
+            **model_kwargs,
         )
 
         hidden_states = outputs.last_hidden_state

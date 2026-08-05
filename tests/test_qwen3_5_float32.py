@@ -129,6 +129,28 @@ def test_qwen3_5_for_causal_lm_respects_output_hidden_states_config(monkeypatch)
     assert outputs.hidden_states is not None
 
 
+def test_qwen3_5_for_causal_lm_custom_loss_does_not_receive_return_dict(monkeypatch):
+    """A custom loss must not see the wrapper's synthetic return_dict kwarg."""
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    _apply_temporary_patches()
+
+    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
+    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
+    received_kwargs = {}
+
+    def custom_loss(*, logits, labels, vocab_size, **kwargs):
+        received_kwargs.update(kwargs)
+        return torch.tensor(0.0, dtype=logits.dtype)
+
+    model.loss_function = custom_loss
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    labels = input_ids.clone()
+    out = model(input_ids, labels=labels, use_cache=False)
+    assert out.loss is not None
+    assert "return_dict" not in received_kwargs
+
+
 @pytest.mark.parametrize("name", ["ForCausalLMLoss", "UnslothForCausalLMLoss"])
 def test_default_causal_lm_loss_accepted(name):
     """The default (and Unsloth-patched) loss names must take the fused path."""
