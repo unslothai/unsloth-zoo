@@ -4691,3 +4691,103 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
     ignored = _get_vlm_ignore_token_ids(processor=processor) or []
     for token_id in soft:
         assert token_id in ignored, token_id
+
+
+class _TruncationDivertingAudioProcessor:
+    """A processor that fans its flat keywords out to its audio extractor.
+
+    This is what transformers' `_merge_kwargs` does: a flat keyword reaches
+    every modality that declares it, and `AudioKwargs` declares `max_length`
+    and `truncation`. Gemma 3n shows the result -- a one-second clip under
+    `max_length=512` comes back as zero mel frames, the waveform cut to 512
+    samples, while `input_ids` is untouched.
+
+    An empty `audio_kwargs` is what stops it: a modality present in kwargs
+    stops reading flat keywords. This fixture reproduces exactly that rule,
+    including the part that matters most -- the text side must keep reading
+    its flat keywords, or padding and `add_special_tokens` go with it.
+    """
+
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    feature_extractor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.text_saw = {}
+
+    def __call__(self, text, audio=None, **kwargs):
+        # The `_merge_kwargs` rule, both ways round.
+        audio_reads_flat = "audio_kwargs" not in kwargs
+        text_reads_flat = "text_kwargs" not in kwargs
+        self.text_saw = {
+            "max_length": kwargs.get("max_length") if text_reads_flat else None,
+            "padding": kwargs.get("padding") if text_reads_flat else None,
+        }
+        cap = kwargs.get("max_length")
+
+        rows = [[101, 10, 11, 0] for _ in text]
+        out = {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1, 1, 1, 0] for _ in text], dtype=np.int32),
+        }
+        clips = len(audio) if audio is not None else 0
+        if clips:
+            # The waveform is cut to the cap when the audio side reads it.
+            frames = 0 if (audio_reads_flat and cap is not None) else 97
+            out["input_features"] = np.zeros((clips, frames, 128), np.float32)
+            out["input_features_mask"] = np.ones((clips, frames), np.int32)
+        return out
+
+
+def test_a_text_cap_does_not_reach_the_audio_extractor():
+    """`max_length` is a token budget and must not be read as a sample budget.
+
+    Left flat, it fans out to every modality that declares it, and
+    `AudioKwargs` declares it. Every clip longer than `max_seq_length` samples
+    -- which is every clip, at any realistic cap -- then loses its audio while
+    the row keeps its placeholders, leaving placeholders with nothing behind.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    inputs = mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+
+    assert inputs["input_features"].shape[1] > 0, (
+        "the clip was truncated to the token budget and framed to nothing"
+    )
+
+
+def test_shielding_the_audio_side_leaves_the_text_side_flat():
+    """The shield goes on the audio modality, never the text one.
+
+    Putting `text_kwargs` in instead would stop the text modality reading its
+    flat keywords, taking `padding`, `add_special_tokens` and `return_tensors`
+    with the cap -- ragged output and a doubled BOS. So the text side must
+    still see both the cap and its padding flag.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+    assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_a_text_only_batch_is_collated_exactly_as_before():
+    """The shield is for batches carrying audio, and only those.
+
+    A processor with no audio to fan the keyword into should see the call it
+    always did, so this cannot change collation for text or images.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
+    assert processor.text_saw == {"max_length": 512, "padding": True}

@@ -7312,6 +7312,31 @@ def _processor_vlm_inputs(
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
             base_kwargs["max_length"] = max_seq_length
+        if audio is not None:
+            # `max_length` is a token budget, but transformers' `_merge_kwargs`
+            # fans a flat keyword out to *every* modality that declares it, and
+            # `AudioKwargs` declares both `max_length` and `truncation`. So the
+            # token cap reaches the audio feature extractor, which reads the
+            # same number as a *sample* budget. Gemma 3n shows it plainly: a
+            # one-second 16 kHz clip under `max_length=512` comes back as
+            # `input_features` of shape (1, 0, 128) -- the waveform cut to 512
+            # samples, 0.032s, which frames to nothing -- while `input_ids` is
+            # untouched. Every clip longer than `max_seq_length` samples loses
+            # its audio that way, which at any realistic cap is every clip.
+            #
+            # An empty `audio_kwargs` shields the audio modality alone: a
+            # modality that appears in kwargs stops reading flat keywords, so
+            # the extractor no longer sees the cap while the text path keeps
+            # every flat keyword it has always had.
+            #
+            # Scoping the *text* side instead would take the same switch the
+            # other way and silently drop `padding`, `add_special_tokens` and
+            # `return_tensors` for the text modality, which returns ragged
+            # lists and a doubled BOS. The shield has to go on the side that
+            # should not be reading these keywords.
+            base_kwargs.update(_drop_unsupported_processor_kwargs(
+                processor, {"audio_kwargs": {}},
+            ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
     images = _format_vlm_images_for_processor(all_images, processor=processor)
