@@ -1127,6 +1127,47 @@ def patch_mamba_ssm_pre_ampere_fallback():
         pass
     pass
 
+    # 0c. Step 0b can only reach a modeling module that is already imported, and
+    #     on the `trust_remote_code = True` path there is never such a moment:
+    #     unsloth returns from `unsloth_compile_transformers` before the
+    #     pre_compile and post_compile phases (models/_utils.py:3277), so the
+    #     only phase that ran is "init", at `import unsloth`, and
+    #     `from_pretrained` imports modeling_zamba afterwards. Clear the flag on
+    #     the CONFIG class instead, which needs no modeling import and is
+    #     order-independent: both families bind `use_fast_kernels =
+    #     config.use_mamba_kernels` in the mixer's __init__, so a config built
+    #     after this point can no longer ask for kernels that are already gone.
+    #     Importing the two configuration modules costs ~1ms and 2 modules
+    #     inside a process that has already imported transformers, versus a
+    #     `sys.meta_path` hook, which would have to stay installed for the whole
+    #     process lifetime and tax every later import for one flag.
+    #     The marker lives on the wrapper function, not on the class: the
+    #     transformers 5 configs are strict dataclasses, and this leaves them
+    #     with no attribute of ours. Locals only, since the test extracts this
+    #     function by AST and execs it in a bare namespace.
+    import importlib
+    _raising_configs = {
+        "transformers.models.jamba.configuration_jamba" : "JambaConfig",
+        "transformers.models.zamba.configuration_zamba" : "ZambaConfig",
+    }
+    for _name, _cfg_name in _raising_configs.items():
+        try:
+            _cfg = importlib.import_module(_name).__dict__.get(_cfg_name, None)
+            if _cfg is None or getattr(_cfg.__init__, "_unsloth_slow_only", False):
+                continue
+            def _slow_only_config(self, *a, __orig = _cfg.__init__, **kw):
+                __orig(self, *a, **kw)
+                try:
+                    self.use_mamba_kernels = False
+                except Exception:
+                    pass
+            _slow_only_config._unsloth_slow_only = True
+            _cfg.__init__ = _slow_only_config
+        except Exception:
+            pass
+        pass
+    pass
+
     try:
         import mamba_ssm  # noqa: F401
     except Exception:

@@ -49,6 +49,11 @@ patch = _load()
 
 MODEL_MOD = "transformers.models.granitemoehybrid.modeling_granitemoehybrid"
 
+CONFIG_MODS = (
+    "transformers.models.jamba.configuration_jamba",
+    "transformers.models.zamba.configuration_zamba",
+)
+
 
 class _FakeCuda:
     def __init__(self, available = True, capability = (7, 5)):
@@ -91,6 +96,15 @@ def env(monkeypatch):
     integrations.hub_kernels = hk
     sys.modules["transformers.integrations"] = integrations
     sys.modules["transformers.integrations.hub_kernels"] = hk
+
+    # The config step imports these two by name. Park empty stubs on them so no
+    # test reaches out to the installed transformers and permanently rewrites
+    # the real ZambaConfig.__init__; a module with no config class in it is
+    # skipped. Tests that want the class install their own over the top, and
+    # this fixture's teardown restores whatever was there.
+    for cfg_mod_name in CONFIG_MODS:
+        saved[cfg_mod_name] = sys.modules.get(cfg_mod_name)
+        sys.modules[cfg_mod_name] = types.ModuleType(cfg_mod_name)
 
     iu = types.ModuleType("transformers.utils.import_utils")
     iu.is_mamba_ssm_available = lambda: True
@@ -345,6 +359,97 @@ def test_the_config_flag_is_cleared_for_jamba_5_5(env):
     finally:
         if saved is None: sys.modules.pop(mod_name, None)
         else: sys.modules[mod_name] = saved
+
+
+def _fake_config_module(mod_name, cls_name):
+    """A stand-in for jamba/zamba's configuration module.
+
+    `use_mamba_kernels` defaults to True and is also written out into every
+    checkpoint's config.json, so both the default and an explicit True have to
+    end up cleared (transformers 4.57.6 configuration_zamba.py:151/193, and the
+    strict-dataclass field `use_mamba_kernels: bool = True` on 5.5.0:81).
+    """
+    mod = types.ModuleType(mod_name)
+
+    class Config:
+        def __init__(self, use_mamba_kernels = True, **kwargs):
+            self.use_mamba_kernels = use_mamba_kernels
+
+    Config.__name__ = cls_name
+    setattr(mod, cls_name, Config)
+    sys.modules[mod_name] = mod
+    return mod, Config
+
+
+class _ConfigBoundMixer:
+    """Both families bind the config flag once, in the mixer's __init__."""
+    def __init__(self, config):
+        self.use_fast_kernels = config.use_mamba_kernels
+    def forward(self, *args, **kwargs):
+        if self.use_fast_kernels:
+            raise ValueError("Fast Mamba kernels are not available.")
+        return "SLOW PATH"
+
+
+@pytest.mark.parametrize("cfg_mod_name, cls_name, modeling", [
+    (CONFIG_MODS[0], "JambaConfig", "transformers.models.jamba.modeling_jamba"),
+    (CONFIG_MODS[1], "ZambaConfig", "transformers.models.zamba.modeling_zamba"),
+])
+def test_the_config_flag_is_cleared_when_modeling_is_imported_later(
+    env, cfg_mod_name, cls_name, modeling,
+):
+    """The mixer wrapper alone cannot fire when nothing has imported modeling.
+
+    `unsloth_compile_transformers` returns at models/_utils.py:3277 when
+    `trust_remote_code = True`, before both the pre_compile and the post_compile
+    phase, so the only phase that ran is "init", at `import unsloth`, and
+    transformers imports modeling_zamba later, from inside `from_pretrained`.
+    Measured: with trust_remote_code = True there is no
+    `_run_temporary_patches` call at all, and the module is still absent from
+    sys.modules when the call returns. Step 0 has already unregistered the Hub
+    kernels by then, so an unwrapped mixer raises instead of taking the slow
+    path this guard promises. Clearing the config flag is what covers it.
+    """
+    saved = sys.modules.get(modeling)
+    sys.modules.pop(modeling, None)
+    _mod, Config = _fake_config_module(cfg_mod_name, cls_name)
+    try:
+        with pytest.raises(ValueError):
+            _ConfigBoundMixer(Config()).forward()
+        patch()
+        assert Config().use_mamba_kernels is False
+        assert Config(use_mamba_kernels = True).use_mamba_kernels is False, \
+            "a checkpoint's config.json spells the flag out"
+        assert _ConfigBoundMixer(Config()).forward() == "SLOW PATH"
+        assert modeling not in sys.modules, "and without importing modeling"
+    finally:
+        if saved is None: sys.modules.pop(modeling, None)
+        else: sys.modules[modeling] = saved
+
+
+def test_the_config_wrapper_is_applied_once(env):
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    patch()
+    first = Config.__init__
+    patch()
+    assert Config.__init__ is first, "must not stack on every phase"
+    assert Config().use_mamba_kernels is False
+
+
+def test_the_config_step_leaves_no_attribute_on_the_config_class(env):
+    """transformers 5 configs are strict dataclasses, so the idempotency marker
+    goes on the wrapper function rather than on the class."""
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    before = set(Config.__dict__)
+    patch()
+    assert set(Config.__dict__) == before, "no new class attribute"
+    assert Config.__init__._unsloth_slow_only is True, "the marker rides the wrapper"
+
+
+def test_the_config_step_does_not_walk_sys_modules(env):
+    """Two import_module calls on names we already know, not a third pass over
+    every loaded module."""
+    assert _SRC.count("for _name, _mod in list(sys.modules.items()):") == 1
 
 
 def test_the_mixer_scan_does_not_walk_sys_modules(env):
