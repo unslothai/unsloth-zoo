@@ -14,128 +14,207 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests _run_eagerly_under_compile in peft_utils.py.
+"""The gradient-checkpointing hooks must not run while Dynamo is tracing.
 
-The gradient-checkpointing hooks call `requires_grad_()`, which Dynamo cannot
-trace, so a compiled model carrying one dies with
+requires_grad_pre_hook / requires_grad_post_hook call `requires_grad_()`,
+which Dynamo cannot trace:
 
     Unsupported: Unsupported Tensor.requires_grad_() call
 
-Making the hooks opaque to Dynamo fixes that, but has a second-order hazard:
-register_other_hooks() decides which hooks are OURS by matching
-__name__/__qualname__ against "requires_grad_pre_hook" and
-"requires_grad_post_hook". If wrapping lost those names, our hooks would stop
-being recognised and would be re-registered on top of themselves. torch 2.9
-carries them through torch._dynamo.disable, but that is an internal detail of
-a private module and this has to hold from torch 2.6 up, so the wrapper copies
-them explicitly.
+Outside a fullgraph region that is only a graph break, but Gemma 3N puts a
+LoRA target (embed_audio.embedding_projection) inside a forward that
+temporary_patches/gemma3n.py compiles with fullgraph = True, so the same hook
+becomes a hard error and trainer.train() dies. torch._dynamo.disable() does
+not rescue it either -- under fullgraph it turns into "Skip calling
+torch.compiler.disable()d function". Guarding on
+`torch.compiler.is_compiling()` does, and is a no-op in eager.
 
-No GPU needed.
+These tests use the real hooks, pulled off a model that
+requires_grad_for_gradient_checkpointing() has actually hooked, so they break
+if the hooks are renamed or moved. CPU only.
 """
 
 import ast
-import sys
-import types
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 
-PEFT_UTILS = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "peft_utils.py"
-_SRC = PEFT_UTILS.read_text(encoding = "utf-8")
+from unsloth_zoo.peft_utils import requires_grad_for_gradient_checkpointing
 
-
-def _load():
-    for node in ast.parse(_SRC).body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_run_eagerly_under_compile":
-            ns = {"torch": torch}
-            exec(ast.get_source_segment(_SRC, node), ns)
-            return ns[node.name]
-    raise AssertionError("_run_eagerly_under_compile not found in peft_utils.py")
+_ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
-run_eagerly = _load()
+class _Inner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(8, 8, bias = False)
+
+    def forward(self, hidden_states):
+        return self.proj(hidden_states)
 
 
-def _hook(module, args, kwargs):
-    return "called"
+class _PreHookModel(nn.Module):
+    """`self.proj(` inside _Inner.forward makes proj a pre-hook target."""
+    def __init__(self):
+        super().__init__()
+        self.vision = _Inner()
+
+    def forward(self, hidden_states):
+        return self.vision(hidden_states)
 
 
-_hook.__name__ = "requires_grad_pre_hook"
-_hook.__qualname__ = "requires_grad_for_gradient_checkpointing.<locals>.requires_grad_pre_hook"
+class _PostHookModel(nn.Module):
+    """`head` is never called as `self.head(`, so it becomes a fallback
+    (post-hook) target instead."""
+    def __init__(self):
+        super().__init__()
+        self.head = nn.Linear(8, 8, bias = False)
+
+    def forward(self, hidden_states):
+        return torch.nn.functional.linear(hidden_states, self.head.weight)
 
 
-def test_names_survive_wrapping():
-    # register_other_hooks matches on these; losing them re-registers our
-    # hooks on top of themselves.
-    w = run_eagerly(_hook)
-    assert w.__name__ == "requires_grad_pre_hook"
-    assert "requires_grad_pre_hook" in w.__qualname__
+def _real_pre_hook():
+    model = _PreHookModel()
+    model.requires_grad_(False)
+    model.vision.proj.weight.requires_grad_(True)
+    requires_grad_for_gradient_checkpointing(model)
+    hooks = list(model.vision.proj._forward_pre_hooks.values())
+    assert len(hooks) == 1, hooks
+    assert "requires_grad_pre_hook" in hooks[0].__qualname__
+    return hooks[0]
 
 
-def test_wrapped_hook_still_runs():
-    assert run_eagerly(_hook)(None, (), {}) == "called"
+def _real_post_hook():
+    model = _PostHookModel()
+    model.requires_grad_(False)
+    model.head.weight.requires_grad_(True)
+    requires_grad_for_gradient_checkpointing(model)
+    hooks = list(model.head._forward_hooks.values())
+    assert len(hooks) == 1, hooks
+    assert "requires_grad_post_hook" in hooks[0].__qualname__
+    return hooks[0]
 
 
-def test_register_other_hooks_still_recognises_it():
-    # Mirrors the matching in register_other_hooks exactly.
-    w = run_eagerly(_hook)
-    name1 = name2 = "requires_grad_pre_hook"
-    qualname = getattr(w, "__qualname__", "")
-    name = getattr(w, "__name__", "")
-    recognised = (name1 in qualname or name2 in qualname) or (name2 in name)
-    assert recognised, "our own hook would be treated as a foreign hook"
+# ---------------------------------------------------------------- eager path
+
+def test_pre_hook_still_fires_eagerly():
+    hook = _real_pre_hook()
+    x = torch.randn(2, 8)
+    hook(None, (x,), {})
+    assert x.requires_grad
 
 
-@pytest.fixture
-def _fake_dynamo():
-    # `import torch._dynamo as x` resolves the ATTRIBUTE on the torch package
-    # once the submodule is in sys.modules, so both have to be swapped.
-    saved_mod = sys.modules.get("torch._dynamo")
-    saved_attr = getattr(torch, "_dynamo", None)
-
-    def install(mod):
-        sys.modules["torch._dynamo"] = mod
-        torch._dynamo = mod
-
-    yield install
-
-    if saved_mod is None: sys.modules.pop("torch._dynamo", None)
-    else: sys.modules["torch._dynamo"] = saved_mod
-    if saved_attr is not None: torch._dynamo = saved_attr
+def test_pre_hook_still_fires_eagerly_on_kwargs():
+    hook = _real_pre_hook()
+    x = torch.randn(2, 8)
+    hook(None, (), {"inputs_embeds" : x})
+    assert x.requires_grad
 
 
-def test_falls_back_when_disable_is_absent(_fake_dynamo):
-    # Older / stripped torch builds: must be a no-op, not a crash.
-    _fake_dynamo(types.ModuleType("torch._dynamo"))
-    assert run_eagerly(_hook) is _hook
+def test_post_hook_still_fires_eagerly():
+    hook = _real_post_hook()
+    y = torch.randn(2, 8)
+    hook(None, None, y)
+    assert y.requires_grad
 
 
-def test_falls_back_when_disable_raises(_fake_dynamo):
-    mod = types.ModuleType("torch._dynamo")
-    def _boom(fn): raise RuntimeError("nope")
-    mod.disable = _boom
-    _fake_dynamo(mod)
-    assert run_eagerly(_hook) is _hook
+# -------------------------------------------------------------- under compile
+
+def test_pre_hook_no_ops_while_compiling(monkeypatch):
+    hook = _real_pre_hook()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    x = torch.randn(2, 8)
+    hook(None, (x,), {})
+    assert not x.requires_grad
 
 
-def test_tolerates_unsettable_attributes(_fake_dynamo):
-    # A C-implemented or slotted callable may refuse __name__ assignment.
-    class _Callable:
-        __slots__ = ()
-        def __call__(self, *a, **k): return "called"
-    mod = types.ModuleType("torch._dynamo")
-    mod.disable = lambda fn: _Callable()
-    _fake_dynamo(mod)
-    w = run_eagerly(_hook)          # must not raise
-    assert w(None, (), {}) == "called"
+def test_post_hook_no_ops_while_compiling(monkeypatch):
+    hook = _real_post_hook()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    y = torch.randn(2, 8)
+    hook(None, None, y)
+    assert not y.requires_grad
 
 
-def test_both_hooks_are_decorated_in_source():
-    for hook in ("requires_grad_pre_hook", "requires_grad_post_hook"):
-        i = _SRC.index(f"def {hook}(")
-        preceding = _SRC[:i].rstrip().splitlines()[-1]
-        assert "_run_eagerly_under_compile" in preceding, hook
+def test_post_hook_does_not_raise_on_unknown_output_while_compiling(monkeypatch):
+    # Eagerly this output shape raises "Neither loss, logits, nor
+    # last_hidden_state are available"; under compile it must be skipped.
+    hook = _real_post_hook()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    hook(None, None, {"not" : "a tensor"})
+
+
+def test_fullgraph_compiled_module_with_pre_hook_runs():
+    # The Gemma 3N failure, reduced: a hooked module inside a
+    # fullgraph = True region. Before the guard this raised
+    # "Unsupported: Unsupported Tensor.requires_grad_() call".
+    torch._dynamo.reset()
+    model = _PreHookModel()
+    model.requires_grad_(False)
+    model.vision.proj.weight.requires_grad_(True)
+    requires_grad_for_gradient_checkpointing(model)
+
+    compiled = torch.compile(
+        _PreHookModel.forward.__get__(model), fullgraph = True, dynamic = True,
+    )
+    x = torch.randn(2, 8)
+    out = compiled(x)
+    assert out.shape == (2, 8)
+    # The LoRA-style trainable weight still carries the graph.
+    assert out.requires_grad
+
+
+def test_fullgraph_compiled_module_with_post_hook_runs():
+    torch._dynamo.reset()
+    model = _PostHookModel()
+    model.requires_grad_(False)
+    model.head.weight.requires_grad_(True)
+    requires_grad_for_gradient_checkpointing(model)
+
+    compiled = torch.compile(
+        _PostHookModel.forward.__get__(model), fullgraph = True, dynamic = True,
+    )
+    out = compiled(torch.randn(2, 8))
+    assert out.shape == (2, 8)
+
+
+# ---------------------------------------------------------------- source shape
+
+def _guarded_functions(path, names):
+    """Which of `names` open with `if torch.compiler.is_compiling(): return`?"""
+    src = path.read_text(encoding = "utf-8")
+    found = OrderedDict()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.FunctionDef) or node.name not in names:
+            continue
+        body = [n for n in node.body if not (
+            isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+        )]
+        first = body[0] if body else None
+        found[node.name] = (
+            isinstance(first, ast.If)
+            and "is_compiling" in ast.dump(first.test)
+            and any(isinstance(n, ast.Return) for n in first.body)
+        )
+    return found
+
+
+def test_both_gradient_checkpointing_hooks_are_guarded():
+    names = ("requires_grad_pre_hook", "requires_grad_post_hook")
+    guarded = _guarded_functions(_ZOO / "peft_utils.py", names)
+    assert set(guarded) == set(names), guarded
+    assert all(guarded.values()), guarded
+
+
+def test_make_inputs_require_grad_is_guarded():
+    guarded = _guarded_functions(
+        _ZOO / "training_utils.py", ("make_inputs_require_grad",),
+    )
+    assert guarded == {"make_inputs_require_grad" : True}, guarded
 
 
 if __name__ == "__main__":

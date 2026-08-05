@@ -480,6 +480,9 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
+                # Dynamo cannot trace requires_grad_(); see the hooks in
+                # peft_utils.requires_grad_for_gradient_checkpointing.
+                if torch.compiler.is_compiling(): return
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass

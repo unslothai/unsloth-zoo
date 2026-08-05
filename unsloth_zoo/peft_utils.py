@@ -289,46 +289,6 @@ def get_lora_layer_modules():
 pass
 
 
-def _run_eagerly_under_compile(fn):
-    """Make `fn` opaque to TorchDynamo, so torch.compile runs it eagerly.
-
-    The gradient-enabling hooks mutate `requires_grad`, which Dynamo cannot
-    trace:
-
-        Unsupported: Unsupported Tensor.requires_grad_() call
-
-    They are autograd bookkeeping rather than compute -- one tensor, once per
-    forward -- so running them eagerly and graph-breaking around them is both
-    correct and cheap.
-
-    Degrades to a no-op decorator on a torch without `_dynamo`, so eager users
-    and older torch builds are unaffected.
-    """
-    try:
-        import torch._dynamo as _torch_dynamo
-    except Exception:
-        return fn
-    disable = getattr(_torch_dynamo, "disable", None)
-    if disable is None:
-        return fn
-    try:
-        wrapped = disable(fn)
-    except Exception:
-        return fn
-    # register_other_hooks() identifies our hooks by matching __name__ /
-    # __qualname__, so the names must survive the wrapper or the hooks stop
-    # being recognised as ours and get re-registered on top of themselves.
-    # torch 2.9 does carry them through disable(), but that is an internal
-    # detail of a private module and this has to hold from torch 2.6 up.
-    for _attr in ("__name__", "__qualname__", "__doc__"):
-        try:
-            setattr(wrapped, _attr, getattr(fn, _attr))
-        except (AttributeError, TypeError):
-            pass
-    return wrapped
-pass
-
-
 def requires_grad_for_gradient_checkpointing(model):
     # All Unsloth Zoo code licensed under LGPLv3
     # Enables requires_grad to make gradient checkpointing work on
@@ -366,8 +326,14 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     # Add post forward hook
-    @_run_eagerly_under_compile
     def requires_grad_post_hook(module, input, output):
+        # Dynamo cannot trace requires_grad_(), so a compiled module carrying
+        # this hook dies with "Unsupported Tensor.requires_grad_() call" (and
+        # torch._dynamo.disable() does not help: under fullgraph = True it just
+        # becomes "Skip calling torch.compiler.disable()d function"). The hook
+        # is autograd bookkeeping, not compute, so skipping it while tracing is
+        # correct -- see the comment on requires_grad_pre_hook below.
+        if torch.compiler.is_compiling(): return
         type_output = type(output)
         if type_output is torch.Tensor:
             output.requires_grad_(True)
@@ -389,8 +355,18 @@ def requires_grad_for_gradient_checkpointing(model):
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
     pass
 
-    @_run_eagerly_under_compile
     def requires_grad_pre_hook(module, args, kwargs):
+        # Do nothing while Dynamo is tracing. Gemma 3N puts a LoRA target
+        # (embed_audio.embedding_projection) inside a forward that we compile
+        # with fullgraph = True, so tracing reaches this hook and rejects the
+        # requires_grad_() call outright. Dynamo only complains when the call
+        # would actually flip the flag, which is why this stayed hidden.
+        #
+        # Skipping it under compile is safe: the hook only exists so that a
+        # frozen input to a gradient-checkpointed block still starts an
+        # autograd graph, and anything Dynamo is tracing here already sits
+        # downstream of trainable LoRA weights.
+        if torch.compiler.is_compiling(): return
         # Try positional args first (normal text models)
         if args:
             first = args[0]
