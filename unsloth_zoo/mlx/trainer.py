@@ -869,12 +869,28 @@ def _mlx_scheduler_kwargs(args):
         raw = getattr(args, "scheduler_specific_kwargs", None)
     if isinstance(raw, str):
         # TrainingArguments types this `Optional[Union[dict, str]]`; the CLI
-        # form is a JSON object.
-        try:
-            raw = json.loads(raw)
-        except (TypeError, ValueError):
+        # form is a JSON object, parsed there by a bare json.loads that lets a
+        # malformed string raise (transformers/training_args.py:1604-1612).
+        # Swallowing it here would run the default curve for a config the user
+        # asked to change.
+        if raw.strip():
+            try:
+                raw = json.loads(raw)
+            except ValueError as error:
+                raise ValueError(
+                    f"Unsloth: lr_scheduler_kwargs is not valid JSON ({error}): "
+                    f"{raw!r}."
+                ) from None
+        else:
             raw = None
-    return dict(raw) if isinstance(raw, dict) else {}
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "Unsloth: lr_scheduler_kwargs must be a dict (a JSON object when "
+            f"given as a string), got {type(raw).__name__}: {raw!r}."
+        )
+    return dict(raw)
 
 
 # HF scheduler names this MLX port serves through an existing schedule. The

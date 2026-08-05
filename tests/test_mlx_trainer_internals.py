@@ -8431,6 +8431,46 @@ def test_wsd_tail_holds_at_min_lr_ratio():
         assert tail == pytest.approx([lr * 0.1] * len(tail), abs=1e-9), num_cycles
 
 
+def test_lr_scheduler_kwargs_json_string_must_parse():
+    """A malformed CLI JSON string must raise, not fall back to defaults.
+
+    TrainingArguments parses this field with a bare json.loads
+    (transformers/training_args.py:1604-1612), so dropping an unparseable
+    string trains a curve the user did not ask for.
+    """
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 40
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=5,
+        lr_scheduler_type="cosine_with_restarts",
+    )
+
+    trainer.args.lr_scheduler_kwargs = '{"num_cycles": 3}'
+    from_string = [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 3}
+    assert from_string == pytest.approx(
+        [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    )
+
+    for bad in ('{"num_cycles": 3', "[1, 2]", "3"):
+        trainer.args.lr_scheduler_kwargs = bad
+        with pytest.raises(ValueError, match="lr_scheduler_kwargs"):
+            trainer._build_schedule(total)
+
+    trainer.args.lr_scheduler_kwargs = [("num_cycles", 3)]
+    with pytest.raises(ValueError, match="must be a dict"):
+        trainer._build_schedule(total)
+
+    # An unset field, in either spelling, is still absent rather than an error.
+    for empty in (None, "", "   "):
+        trainer.args.lr_scheduler_kwargs = empty
+        assert callable(trainer._build_schedule(total))
+
+
 def test_build_schedule_reads_hf_lr_scheduler_kwargs():
     """A ported HF/TRL config carries scheduler knobs in lr_scheduler_kwargs.
 
