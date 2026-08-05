@@ -825,6 +825,9 @@ def train_on_responses_only(
             if held is None or held is processor or held is tokenizer: continue
             holders.append(held)
             holders += [getattr(held, a, None) for a in _halves]
+        # `_is_vision_collator` also accepts a half held straight on the collator
+        # (`collator.image_processor`), and that half names its own outputs too.
+        holders += [getattr(_coll, a, None) for a in _halves]
         for holder in holders:
             if holder is None: continue
             try: names.update(getattr(holder, "model_input_names", None) or ())
@@ -888,15 +891,31 @@ def train_on_responses_only(
         return text.endswith(_MEDIA_SUFFIXES)
     pass
 
-    def _has_media_column(names, rows):
+    def _ambiguous_column_holds_media(split, name, rows):
+        """Whether an ambiguous column points at media, over EVERY row when the
+        split can be indexed: the 16-row sample misses a `cat.jpg` on row 5, and
+        its dtype is `string` either way, so the schema cannot answer for it.
+        Reading one string column is cheap - no image is ever decoded.
+        """
+        try:
+            len(split)                                  # map-style only
+            batches = split.select_columns([name]).iter(batch_size = 1000)
+            for batch in batches:
+                if any(_looks_like_media_value(v) for v in batch[name]): return True
+            return False
+        except Exception:
+            # Streaming, or a column a custom transform owns: the bounded sample
+            # is all that can be read without consuming/rewriting the split.
+            return any(_looks_like_media_value(row.get(name)) for row in rows)
+    pass
+
+    def _has_media_column(names, rows, split = None):
         """True when a top-level column points at media the text path would drop."""
-        for name in names:
-            if not isinstance(name, str) or name in _TEXT_COLUMNS: continue
-            lowered = name.lower()
-            if lowered in _MEDIA_COLUMNS: return True
-            if lowered in _AMBIGUOUS_MEDIA_COLUMNS and \
-                any(_looks_like_media_value(row.get(name)) for row in rows): return True
-        return False
+        names = [n for n in names if isinstance(n, str) and n not in _TEXT_COLUMNS]
+        if any(n.lower() in _MEDIA_COLUMNS for n in names): return True
+        # An ambiguous name costs a scan, so only reach it if no name settled it.
+        return any(n.lower() in _AMBIGUOUS_MEDIA_COLUMNS and
+                   _ambiguous_column_holds_media(split, n, rows) for n in names)
     pass
 
     def _is_plain_text(value, _depth = 0):
@@ -990,7 +1009,7 @@ def train_on_responses_only(
     pass
 
     def _split_views(dataset):
-        """`(column names, sampled rows, provably text)` per split.
+        """`(column names, sampled rows, provably text, split)` per split.
 
         `iter()` restarts a datasets IterableDataset, so peeking rows does not
         consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
@@ -1010,7 +1029,7 @@ def train_on_responses_only(
             if not names:
                 if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
                 names = list(rows[0].keys())
-            views.append((set(names), rows, _columns_are_provably_text(split, names)))
+            views.append((set(names), rows, _columns_are_provably_text(split, names), split))
         return views
     pass
 
@@ -1027,10 +1046,10 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows, provable in views:
+        for names, rows, provable, split in views:
             if "input_ids" not in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
-            if _has_media_column(names, rows): return False
+            if _has_media_column(names, rows, split): return False
             # Columns look text-only, so check the values too: a `messages` column
             # can carry inline images that the strip below would throw away.
             if not provable: return False
@@ -1056,10 +1075,10 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows, provable in views:
+        for names, rows, provable, split in views:
             if "input_ids" in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
-            if _has_media_column(names, rows): return False
+            if _has_media_column(names, rows, split): return False
             # The column `_maybe_tokenize_dataset` would actually read.
             field = text_field if text_field in names else "text"
             if field not in names: return False

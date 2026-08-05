@@ -1215,3 +1215,81 @@ def test_a_raw_eval_split_with_a_media_url_column_is_refused():
     })
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+# ---- an ambiguous media column is read to the end ---------------------------
+
+def test_an_ambiguous_media_column_is_scanned_past_the_sample():
+    """`url`/`path` are `string` either way, so the schema cannot rule them out
+    and the 16-row sample skips row 5. Read the column instead: it decodes no
+    images, so a full scan is cheap."""
+    n = 200
+    urls = ["https://en.wikipedia.org/wiki/Anarchism"] * n
+    urls[5] = "https://example.com/cat.jpg"
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, Dataset.from_dict({
+        "input_ids": [list(ROW)] * n, "url": urls,
+    }))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator
+    assert "url" in trainer.train_dataset.column_names, "the media column was dropped"
+
+
+def test_a_raw_eval_split_with_an_unsampled_media_url_is_refused():
+    """The eval half samples the same 16 positions, so it needs the scan too."""
+    n = 200
+    paths = ["corpus/shard_0007.jsonl"] * n
+    paths[5] = "/data/images/0001.png"
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"] * n, "path": paths,
+    })
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_wholly_benign_ambiguous_column_still_passes_the_scan():
+    """The scan must not turn every text corpus with a `path` column into a refusal."""
+    n = 200
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW)] * n, "path": [f"corpus/shard_{i}.jsonl" for i in range(n)],
+    }))
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.train_dataset.column_names, "the text path never ran"
+
+
+# ---- a collator holding an image processor directly -------------------------
+
+class DirectImageProcessorCollator:
+    """`_is_vision_collator` accepts a bare `collator.image_processor`, so the
+    column names that half declares have to be derived from it as well."""
+    def __init__(self, image_names):
+        self.image_processor = type("ImageProcessor", (), {
+            "model_input_names": list(image_names),
+        })()
+
+    def __call__(self, features):
+        return {"mine": True}
+
+
+def test_columns_of_a_directly_held_image_processor_are_multimodal():
+    collator = DirectImageProcessorCollator(["my_pixels"])
+    trainer = StubTrainer(collator, Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)], "my_pixels": [[0.0, 1.0], [0.0, 1.0]],
+    }))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator
+    assert "my_pixels" in trainer.train_dataset.column_names, "the media column was dropped"
+
+
+def test_a_directly_held_image_processor_still_lets_text_only_rows_through():
+    """The derivation must widen the multimodal set, not refuse every run."""
+    trainer = StubTrainer(DirectImageProcessorCollator(["my_pixels"]), _text_rows())
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.train_dataset.column_names, "the text path never ran"
