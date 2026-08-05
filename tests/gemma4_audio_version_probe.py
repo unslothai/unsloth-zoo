@@ -47,7 +47,10 @@ without a single early failure hiding everything after it:
                                      the audio encoder emits, or the merge has
                                      nothing to put behind the surplus
   4. audio reaches the loss       -- distinct audio must give distinct losses,
-                                     or the model is training on text alone
+                                     by more than this platform's own
+                                     run-to-run spread, or the model is
+                                     training on text alone and a drifting
+                                     machine is supplying the difference
 
 Run: python tests/gemma4_audio_version_probe.py [--model REPO]
 Exit code 0 only if every stage that counts passed.
@@ -59,14 +62,96 @@ import os
 import sys
 import traceback
 
-os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-
 DEFAULT_MODEL = "mlx-community/gemma-4-e2b-it-4bit"
 DURATIONS = (0.5, 1.0, 2.0, 3.7)
 RATE = 16000
 
 results = {}
+
+# How far clear of the platform's own spread the two-tone gap has to land.
+#
+# Measured on macos-14, mlx-vlm 0.6.3, mlx 0.32.0, three separate runs of this
+# probe against mlx-community/gemma-4-e2b-it-4bit:
+#
+#   run   signal (440 vs 1760)   noise (spread of three identical 440s)
+#     1   0.812                  2.27
+#     2   1.30                   0.827
+#     3   0.719                  1.25
+#
+# The spread of three identical inputs exceeds the gap between two different
+# tones. So on Apple Silicon this stage cannot separate connected audio from
+# disconnected audio at any margin, and no choice of this constant rescues it;
+# the honest report there is "could not measure", which is what Inconclusive
+# is for. On Linux the same probe gives noise=0 and signal=0.327, and the
+# stage decides normally.
+#
+# The margin only has to be large enough that jitter cannot masquerade as
+# signal on a platform where the two are separable at all.
+TWO_TONE_MARGIN = 4.0
+
+TWO_TONE_REASONS = {
+    "same_loss": "two different tones gave the same loss, so the audio is "
+                 "not reaching the objective",
+    "below_noise": "the two tones differ by no more than this platform's own "
+                   "run-to-run noise, so this cannot say whether the audio "
+                   "reached the objective",
+}
+
+
+def two_tone_verdict(repeats, other):
+    """Did the second tone move the loss by more than the platform's jitter?
+
+    `repeats` are losses for one tone run several times, so their spread is
+    what this machine hands you for free with no audio involved; `other` is
+    the second tone. Split out from the stage so it can be tested without a
+    model, a checkpoint or a Mac -- which matters, because the branch that
+    made this necessary only fires on hardware where the model is not
+    reproducible.
+    """
+    noise = max(repeats) - min(repeats)
+    # The mean, not the first sample: three forwards were paid for, and the
+    # figure printed here is the one a reader will compare against `other`.
+    base = sum(repeats) / len(repeats)
+    signal = abs(base - other)
+    # The repeats themselves, not just their spread. Jitter and a monotone
+    # drift across sequential forwards produce the same spread and call for
+    # opposite responses -- one is a platform fact to measure around, the
+    # other is a bug in the forward path -- and this string is the only
+    # artifact the macOS matrix leaves behind.
+    detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
+              f"signal={signal:.3g} noise={noise:.3g} "
+              f"repeats=[{', '.join(f'{r:.4f}' for r in repeats)}]")
+    if signal < 1e-6:
+        return "same_loss", detail
+    if noise > 0.0 and signal <= TWO_TONE_MARGIN * noise:
+        return "below_noise", detail
+    return "pass", detail
+
+
+class Inconclusive(Exception):
+    """The stage could not decide, as distinct from deciding against.
+
+    This matrix exists so that a red cell names the mlx-vlm version that
+    breaks Gemma 4 audio. A stage that could not measure anything is not that,
+    and reporting it as a failure would blame a version for a property of the
+    machine it ran on. It still does not qualify the version -- nothing was
+    demonstrated -- so it is not a pass either.
+    """
+
+
+def gating_stages(stages):
+    """The stages whose result decides this version's exit code.
+
+    Stage 0 and its subchecks are diagnostic and never gated. Neither does a
+    stage that could not measure anything: this matrix exists to name the
+    mlx-vlm version that breaks Gemma 4 audio, and on Apple Silicon stage 4
+    cannot answer at all (see TWO_TONE_MARGIN). Failing the job over that
+    would report every version as broken on the one platform the feature
+    ships to. The measured verdict still appears in PROBE_RESULT, and stages
+    1 to 3, which are what actually decide the version boundary, still gate.
+    """
+    return {k: v for k, v in stages.items()
+            if not k.startswith("0_") and not v.get("inconclusive")}
 
 
 def stage(name):
@@ -77,6 +162,12 @@ def stage(name):
                 results[name] = {"ok": True, "detail": detail}
                 print(f"[PASS] {name}: {detail}", flush=True)
                 return True
+            except Inconclusive as exc:
+                results[name] = {
+                    "ok": False, "inconclusive": True, "error": str(exc),
+                }
+                print(f"[INCONCLUSIVE] {name}: {exc}", flush=True)
+                return False
             except Exception as exc:
                 results[name] = {
                     "ok": False,
@@ -223,13 +314,23 @@ def check_alignment(_repo):
 
 @stage("4_audio_reaches_the_loss")
 def check_loss(_repo):
-    """Distinct audio must produce distinct losses.
+    """Distinct audio must produce distinct losses, by more than the noise.
 
     A processor that accepts the argument and drops it, or a merge that lands
     features on the wrong positions, shows up here: the loss stops depending
     on what the audio actually was.
+
+    "Distinct" only means something where the same input twice gives the same
+    loss, and on Apple Silicon this model does not: two identical uncached
+    forwards of Gemma 4 E2B differ, and a bisect puts the first differing
+    decoder layer at 0, upstream of every KV-shared layer. Against that, a
+    bare `!=` is satisfied by the noise whether or not the audio is connected,
+    so it would pass on a checkpoint whose audio is entirely disconnected.
+
+    So measure the noise first, by running one tone several times, and require
+    the two-tone gap to clear it. On a platform where the model is
+    reproducible the floor is 0 and this is the original test.
     """
-    import mlx.core as mx
     import numpy as np
 
     from unsloth_zoo.mlx.utils import (
@@ -244,8 +345,11 @@ def check_loss(_repo):
 
     held = install_audio_merge_patch(model, audio_token_id)
     try:
-        losses = []
-        for hz in (440.0, 1760.0):
+        from unsloth_zoo.mlx.utils import (
+            _collate_vlm_batch, _finalize_vlm_batch,
+        )
+
+        def loss_at(hz):
             # The decoded-column shape datasets.Audio yields, the only one
             # collation accepts.
             clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
@@ -253,9 +357,6 @@ def check_loss(_repo):
                 {"type": "audio", "audio": clip},
                 {"type": "text", "text": "Transcribe."}]},
                 {"role": "assistant", "content": "ok"}]
-            from unsloth_zoo.mlx.utils import (
-                _collate_vlm_batch, _finalize_vlm_batch,
-            )
             # Collate on the host, then finalize to MLX, as the trainer does.
             staged = _collate_vlm_batch(
                 [{"messages": messages}], processor, 512, None)
@@ -265,18 +366,32 @@ def check_loss(_repo):
             loss = float(out[0] if isinstance(out, tuple) else out)
             if not np.isfinite(loss):
                 raise AssertionError(f"loss is not finite at {hz} Hz: {loss}")
-            losses.append(loss)
-        if abs(losses[0] - losses[1]) < 1e-6:
-            raise AssertionError(
-                f"two different tones gave the same loss ({losses[0]}), so the "
-                f"audio is not reaching the objective")
-        return f"440Hz={losses[0]:.4f} 1760Hz={losses[1]:.4f}"
+            return loss
+
+        # The same tone several times: whatever these disagree by is what the
+        # platform hands you for free, with no audio involved. Three rather
+        # than two because one pair is a single sample of a spread and can
+        # land small by luck, which would put the floor back where it started.
+        repeats = [loss_at(440.0) for _ in range(3)]
+        verdict, detail = two_tone_verdict(repeats, loss_at(1760.0))
+        if verdict == "below_noise":
+            raise Inconclusive(f"{TWO_TONE_REASONS[verdict]} [{detail}]")
+        if verdict != "pass":
+            raise AssertionError(f"{TWO_TONE_REASONS[verdict]} [{detail}]")
+        return detail
     finally:
         if held:
             remove_audio_merge_patch(model)
 
 
 def main():
+    # Set here rather than at import: the stage helpers below are worth
+    # importing on their own from a test, and importing a module should not
+    # rewrite the environment of whatever imported it. Both are read by
+    # unsloth_zoo, which is first imported inside the stages that main() runs.
+    os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
     args = ap.parse_args()
@@ -323,9 +438,7 @@ def main():
     print("PROBE_RESULT " + json.dumps(
         {"mlx_vlm": version, "transformers": transformers.__version__,
          "model": args.model, "stages": results}), flush=True)
-    # Stage 0 and its subchecks are diagnostic and never gate the exit code.
-    verdict = {k: v for k, v in results.items() if not k.startswith("0_")}
-    sys.exit(0 if all(r["ok"] for r in verdict.values()) else 1)
+    sys.exit(0 if all(r["ok"] for r in gating_stages(results).values()) else 1)
 
 
 if __name__ == "__main__":
