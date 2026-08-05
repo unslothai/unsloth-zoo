@@ -481,7 +481,7 @@ def prepare_model_for_training(
         else:
             def make_inputs_require_grad(module, input, output):
                 # Deliberately NOT guarded on is_compiling() like the peft_utils
-                # hooks: this is the only thing making a FROZEN embedding's output
+                # pre hook: this is the only thing making a FROZEN embedding's output
                 # require grad, which reentrant checkpointing needs. Skipping it
                 # would silently stop gradients reaching the adapters.
                 output.requires_grad_(True)

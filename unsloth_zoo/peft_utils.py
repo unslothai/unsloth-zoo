@@ -327,28 +327,33 @@ def requires_grad_for_gradient_checkpointing(model):
 
     # Add post forward hook
     def requires_grad_post_hook(module, input, output):
-        # Dynamo cannot trace requires_grad_(), and torch._dynamo.disable() does
-        # not help under fullgraph = True. Safe to skip -- see the pre hook below.
-        if torch.compiler.is_compiling(): return
         type_output = type(output)
         if type_output is torch.Tensor:
-            output.requires_grad_(True)
+            target = output
         else:
             try: # For HF dataclass, try loss or logits
                 if hasattr(output, "loss") and output.loss is not None:
-                    output.loss.requires_grad_(True)
+                    target = output.loss
                 elif hasattr(output, "logits") and output.logits is not None: # RL like GRPO has no loss (no labels)
-                    output.logits.requires_grad_(True)
+                    target = output.logits
                 elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
                     # Encoder / decoder-style embedding backbones (e.g. Qwen3-Embedding) return a
                     # BaseModelOutputWithPast with only last_hidden_state (no loss/logits) when called
                     # for sentence embeddings. Make it require grad so gradient checkpointing works.
                     # See https://github.com/unslothai/unsloth/issues/5360
-                    output.last_hidden_state.requires_grad_(True)
+                    target = output.last_hidden_state
                 else:
+                    # Dynamo cannot trace the raise either, so stay quiet while tracing.
+                    if torch.compiler.is_compiling(): return
                     raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
+        # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping a
+        # no-op keeps fullgraph = True working. Flipping is NOT a no-op on the frozen
+        # input embedding this also lands on: skip it there and reentrant checkpointing
+        # loses every gradient, exactly like the training_utils hook this mirrors.
+        if torch.compiler.is_compiling() and target.requires_grad: return
+        target.requires_grad_(True)
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):

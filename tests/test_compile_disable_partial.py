@@ -53,8 +53,20 @@ _SCRIPT = textwrap.dedent("""
 """)
 
 
+def _probe_env(value):
+    # Without the separate `unsloth` package installed, unsloth_zoo/__init__ raises
+    # "Please install Unsloth" before the probe prints anything; this env var takes
+    # the lightweight import path and reads the same flag.
+    return dict(
+        os.environ,
+        PYTHONPATH = str(ROOT),
+        UNSLOTH_COMPILE_DISABLE = value,
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
+    )
+
+
 def _probe(value):
-    env = dict(os.environ, PYTHONPATH = str(ROOT), UNSLOTH_COMPILE_DISABLE = value)
+    env = _probe_env(value)
     r = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
         capture_output = True, text = True, timeout = 900, env = env,
@@ -64,6 +76,12 @@ def _probe(value):
     out = json.loads(line[0][len("PROBE "):])
     if out["skip"]: pytest.skip("transformers has no gemma3n")
     return out
+
+
+def test_probe_survives_a_zoo_only_checkout():
+    """CI installs `unsloth` with `|| true`, so it can legitimately be absent."""
+    env = _probe_env("0")
+    assert env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] == "1"
 
 
 def test_unset_still_compiles():
