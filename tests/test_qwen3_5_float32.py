@@ -193,10 +193,17 @@ def test_fused_loss_kwargs_filter():
     kwargs = {
         "num_items_in_batch": 8,
         "shift_labels": False,
+        "ignore_index": -100,
+        "label_smoothing": 0.1,
         "output_attentions": True,
         "output_hidden_states": True,
         "return_dict": True,
         "use_cache": True,
     }
     filtered = _unsloth_fused_loss_kwargs(kwargs)
-    assert filtered == {"num_items_in_batch": 8, "shift_labels": False}
+    assert filtered == {
+        "num_items_in_batch": 8,
+        "shift_labels": False,
+        "ignore_index": -100,
+        "label_smoothing": 0.1,
+    }
