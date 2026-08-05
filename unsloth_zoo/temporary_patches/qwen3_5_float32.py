@@ -124,6 +124,8 @@ _FUSED_LOSS_KWARG_KEYS = frozenset({
     "num_items_in_batch",
     "n_items",
     "shift_labels",
+    "ignore_index",
+    "label_smoothing",
     "logit_scale_multiply",
     "logit_scale_divide",
     "logit_softcapping",
