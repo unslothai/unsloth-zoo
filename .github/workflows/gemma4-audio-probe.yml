@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Re-measures the gemma4 row of _AUDIO_QUALIFIED_FAMILIES on real Apple
+# Silicon, once per candidate mlx-vlm version, against a real checkpoint.
+#
+# That row cannot be reasoned about: the 0.4.4 it used to carry was correct
+# when written and was invalidated by the checkpoint being re-exported on the
+# Hub. A version key cannot express a fact about an artefact, so re-measure.
+#
+# What it found: mlx-vlm 0.6.2 (Blaizzy/mlx-vlm#1301) stopped building k_proj /
+# v_proj / k_norm for layers in the KV-shared range, the 60 tensors E2B does
+# not ship. 0.6.1 red, 0.6.2 green; both stay in the matrix to hold that edge.
+#
+# Opt-in, so it costs no macOS minutes unless asked for. 0.6.5+ is absent
+# because it needs transformers>=5.14 and this package caps it at 5.5.0.
+
+name: Gemma4 audio probe (Apple Silicon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Checkpoint to probe'
+        required: false
+        default: 'mlx-community/gemma-4-e2b-it-4bit'
+  pull_request:
+    # Label only: replaying the whole matrix takes a deliberate act.
+    types: [labeled]
+
+concurrency:
+  # Never cancel a label-triggered run: concurrency is claimed before the
+  # job-level `if` runs, so an unrelated label would kill a live macOS matrix.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "gemma4 audio @ mlx-vlm ${{ matrix.mlx_vlm }}"
+    # Match the label just added: `contains(labels.*)` fires on any label event
+    # while the label is attached, replaying all seven macOS jobs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gemma4-probe'
+    runs-on: macos-14
+    timeout-minutes: 45
+    strategy:
+      # "Where does it start failing" is the point, so one red must not cancel
+      # the rest.
+      fail-fast: false
+      matrix:
+        mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install zoo with the pinned mlx-vlm
+        # One resolution, so pip honours this package's transformers cap. torch
+        # first, as in mlx-ci.yml: pyproject gates it off on darwin+arm64 but
+        # the zoo import path still wants it.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}"
+          python -c "
+          import mlx_vlm, transformers
+          print('mlx-vlm', mlx_vlm.__version__, 'transformers', transformers.__version__)
+          assert mlx_vlm.__version__ == '${{ matrix.mlx_vlm }}', mlx_vlm.__version__
+          "
+
+      - name: Cache the checkpoint
+        # 3.4 GB, and every job wants the same one. Shared key on purpose: the
+        # first to finish saves it, the rest log a collision and move on.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gemma4-e2b-4bit-v1
+
+      - name: Probe
+        # No torchvision, matching what a Mac user installing zoo[mlx] gets.
+        # Raw mlx-vlm goes through transformers' AutoProcessor, whose video
+        # processor requires it and so fails; zoo resolves the mlx-vlm
+        # processor directly and does not. Stage 0 records that difference.
+        #
+        # The checkpoint arrives through env rather than interpolation: it is
+        # the one free-text value here.
+        env:
+          MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e2b-it-4bit' }}
+        run: python tests/gemma4_audio_version_probe.py --model "$MODEL"

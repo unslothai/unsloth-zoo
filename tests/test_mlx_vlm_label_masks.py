@@ -2696,19 +2696,51 @@ def test_qualified_families_carry_their_probed_requirements():
     """The table itself: which families, over which mlx-vlm releases.
 
     Bounded at both ends, so an unreleased version is refused rather than
-    assumed good. Gemma 4 stays at the version its probes ran on: its processor
-    changed in 0.5.0, upstream reports it failing to load from 0.6.4
-    (Blaizzy/mlx-vlm#1526), and 0.6.3 split off a separate `gemma4_unified`.
+    assumed good. Gemma 4 starts higher than the rest because below 0.6.2
+    mlx-vlm cannot load the checkpoint at all: E2B's KV-shared layers ship no
+    k_proj/v_proj/k_norm, and mlx-vlm built those modules regardless until
+    Blaizzy/mlx-vlm#1301.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     versions = mlx_utils._AudioVersions
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
         "gemma3n": versions("0.4.4", "0.6.4"),
-        "gemma4": versions("0.4.4", "0.4.4"),
+        "gemma4": versions("0.6.2", "0.6.4"),
         "phi4mm": versions("0.4.4", "0.6.4"),
         "minicpmo": versions("0.4.4", "0.6.4"),
     }
+
+
+@pytest.mark.parametrize("installed,admitted", [
+    ("0.4.4", False),        # loads nothing: 60 KV-shared tensors missing
+    ("0.5.0", False),
+    ("0.6.0", False),
+    ("0.6.1", False),        # last release before #1301
+    ("0.6.2", True),         # #1301: KV-shared layers stop building k/v proj
+    ("0.6.3", True),
+    ("0.6.4", True),         # double conv transpose, undone by loader.py (PR 879)
+    ("0.6.5", False),        # needs transformers>=5.14, capped at 5.5.0
+    ("0.6.2.post1", False),  # post-releases and prereleases were not probed
+    ("0.6.2rc1", False),
+])
+def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
+        installed, admitted):
+    """The boundary, measured rather than argued.
+
+    Every released row from 0.4.4 to 0.6.4 was run end to end on macos-14
+    against mlx-community/gemma-4-e2b-it-4bit: model load, placeholder counts
+    against what the audio tower returns, and two clips giving two losses.
+    0.6.1 red, 0.6.2 green.
+
+    The other rows are policy, not measurement. 0.6.5 cannot be installed
+    beside this package (it needs transformers>=5.14, capped at 5.5.0), and
+    mlx-vlm has published no post-release or prerelease to run.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
+    assert window.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,admitted", [
@@ -2778,13 +2810,14 @@ def test_only_a_published_final_release_is_inside_the_window():
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
-    assert gemma4.admits("0.4.4") is True
-    for unqualified in ("0.4.4.post1", "0.4.4.post2", "0.4.4+local",
-                        "0.4.4rc1", "0.4.4.dev0"):
+    assert gemma4.admits("0.6.2") is True
+    for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
+                        "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor the next release, which is a different processor.
-    assert gemma4.admits("0.4.5") is False
-    assert gemma4.admits("0.5.0") is False
+    # Nor either side. 0.6.1 measured red; 0.6.5 is refused for being
+    # uninstallable here, not for failing.
+    assert gemma4.admits("0.6.1") is False
+    assert gemma4.admits("0.6.5") is False
 
 
 def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
@@ -2802,7 +2835,10 @@ def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
         mlx_utils._check_audio_family_gate(unified())
     message = str(excinfo.value)
     assert "gemma4_unified" in message and "'gemma4'" in message
-    assert "0.4.4" in message, "the version to pin is not named"
+    # Read the window off the table: the refusal must name whatever gemma4 is
+    # currently qualified for, and that moves when it is re-probed.
+    window = str(mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"])
+    assert window in message, "the version to pin is not named"
 
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
@@ -4655,3 +4691,103 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
     ignored = _get_vlm_ignore_token_ids(processor=processor) or []
     for token_id in soft:
         assert token_id in ignored, token_id
+
+
+class _TruncationDivertingAudioProcessor:
+    """A processor that fans its flat keywords out to its audio extractor.
+
+    This is what transformers' `_merge_kwargs` does: a flat keyword reaches
+    every modality that declares it, and `AudioKwargs` declares `max_length`
+    and `truncation`. Gemma 3n shows the result -- a one-second clip under
+    `max_length=512` comes back as zero mel frames, the waveform cut to 512
+    samples, while `input_ids` is untouched.
+
+    An empty `audio_kwargs` is what stops it: a modality present in kwargs
+    stops reading flat keywords. This fixture reproduces exactly that rule,
+    including the part that matters most -- the text side must keep reading
+    its flat keywords, or padding and `add_special_tokens` go with it.
+    """
+
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    feature_extractor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.text_saw = {}
+
+    def __call__(self, text, audio=None, **kwargs):
+        # The `_merge_kwargs` rule, both ways round.
+        audio_reads_flat = "audio_kwargs" not in kwargs
+        text_reads_flat = "text_kwargs" not in kwargs
+        self.text_saw = {
+            "max_length": kwargs.get("max_length") if text_reads_flat else None,
+            "padding": kwargs.get("padding") if text_reads_flat else None,
+        }
+        cap = kwargs.get("max_length")
+
+        rows = [[101, 10, 11, 0] for _ in text]
+        out = {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1, 1, 1, 0] for _ in text], dtype=np.int32),
+        }
+        clips = len(audio) if audio is not None else 0
+        if clips:
+            # The waveform is cut to the cap when the audio side reads it.
+            frames = 0 if (audio_reads_flat and cap is not None) else 97
+            out["input_features"] = np.zeros((clips, frames, 128), np.float32)
+            out["input_features_mask"] = np.ones((clips, frames), np.int32)
+        return out
+
+
+def test_a_text_cap_does_not_reach_the_audio_extractor():
+    """`max_length` is a token budget and must not be read as a sample budget.
+
+    Left flat, it fans out to every modality that declares it, and
+    `AudioKwargs` declares it. Every clip longer than `max_seq_length` samples
+    -- which is every clip, at any realistic cap -- then loses its audio while
+    the row keeps its placeholders, leaving placeholders with nothing behind.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    inputs = mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+
+    assert inputs["input_features"].shape[1] > 0, (
+        "the clip was truncated to the token budget and framed to nothing"
+    )
+
+
+def test_shielding_the_audio_side_leaves_the_text_side_flat():
+    """The shield goes on the audio modality, never the text one.
+
+    Putting `text_kwargs` in instead would stop the text modality reading its
+    flat keywords, taking `padding`, `add_special_tokens` and `return_tensors`
+    with the cap -- ragged output and a doubled BOS. So the text side must
+    still see both the cap and its padding flag.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+    assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_a_text_only_batch_is_collated_exactly_as_before():
+    """The shield is for batches carrying audio, and only those.
+
+    A processor with no audio to fan the keyword into should see the call it
+    always did, so this cannot change collation for text or images.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
+    assert processor.text_saw == {"max_length": 512, "padding": True}
