@@ -27,9 +27,11 @@ masking instead of being refused. Two things it must not do on the way:
 CPU-pure and offline: everything here is a local stub, no weights are loaded.
 """
 
+import re
+
 import pytest
 from datasets import Dataset
-from transformers import DataCollatorForSeq2Seq
+from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
 
 from unsloth_zoo.dataset_utils import train_on_responses_only
 
@@ -40,18 +42,35 @@ USER_ID, ASSISTANT_ID, PAD_ID = 1, 2, 0
 ROW = [USER_ID, 10, 11, ASSISTANT_ID, 20, 21]
 
 
+class _Encoding(dict):
+    """Mapping (what `datasets.map` wants) that also answers `.input_ids`."""
+    @property
+    def input_ids(self):
+        return self["input_ids"]
+
+
 class StubTokenizer:
     """A text tokenizer: it can pad, which is the whole point below."""
     padding_side = "right"
     pad_token_id = PAD_ID
     model_input_names = ["input_ids", "attention_mask"]
 
-    def __call__(self, text, add_special_tokens = False):
-        result = type("R", (), {})()
-        if text == INSTRUCTION_PART:   result.input_ids = [USER_ID]
-        elif text == RESPONSE_PART:    result.input_ids = [ASSISTANT_ID]
-        else:                          result.input_ids = [ord(c) for c in text]
-        return result
+    @staticmethod
+    def _ids(text):
+        # Markers are single tokens; everything else is one token per character.
+        ids = []
+        for piece in re.split(f"({re.escape(INSTRUCTION_PART)}|{re.escape(RESPONSE_PART)})", text):
+            if piece == INSTRUCTION_PART:   ids.append(USER_ID)
+            elif piece == RESPONSE_PART:    ids.append(ASSISTANT_ID)
+            else:                           ids.extend(ord(c) for c in piece)
+        return ids
+
+    def __call__(self, text, add_special_tokens = False, **kwargs):
+        if isinstance(text, (list, tuple)):
+            batch = [self._ids(t) for t in text]
+            return _Encoding(input_ids = batch,
+                             attention_mask = [[1] * len(ids) for ids in batch])
+        return _Encoding(input_ids = self._ids(text))
 
     def pad(self, features, padding = True, max_length = None,
             pad_to_multiple_of = None, return_tensors = None, **kwargs):
@@ -84,7 +103,9 @@ class StubTrainer:
         self.train_dataset = train_dataset
         self.eval_dataset = None
         self.processing_class = StubProcessor()
-        self.args = type("Args", (), {"packing": False})()
+        self.args = type("Args", (), {
+            "packing": False, "max_length": 64, "dataset_text_field": "text",
+        })()
 
 
 def _text_rows():
@@ -232,3 +253,120 @@ def test_the_rebuild_keeps_the_settings_the_caller_chose():
     assert trainer.data_collator.pad_to_multiple_of == 8
     assert trainer.data_collator.label_pad_token_id == -123
     assert hasattr(trainer.data_collator.tokenizer, "pad")
+
+
+# ---- raw text-only splits reach the text path too --------------------------
+
+def _raw_text_rows(n = 2):
+    return Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{i}{RESPONSE_PART}a{i}" for i in range(n)],
+    })
+
+
+def test_a_raw_text_only_eval_split_is_allowed_through():
+    """A text-only eval split that is not pretokenized is tokenized by the text
+    path with the inner text tokenizer, and the same dataset-level masking then
+    applies to it. Refusing it would make adding evaluation to a supported
+    text-only VLM run fail unless the user pretokenizes eval by hand."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = _raw_text_rows()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    eval_split = out.eval_dataset
+    assert "labels" in eval_split.column_names, "eval was never tokenized/masked"
+    row = eval_split[0]
+    unmasked = [i for i, l in enumerate(row["labels"]) if l != -100]
+    assert unmasked, "eval labels are all -100"
+    # Only the answer is trained on; the question and both markers stay masked.
+    assert [row["input_ids"][i] for i in unmasked] == [ord("a"), ord("0")]
+    assert row["labels"][row["input_ids"].index(ASSISTANT_ID)] == -100
+
+
+def test_a_raw_text_only_split_in_an_eval_dict_is_allowed_through():
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = {"pretok": _text_rows(), "raw": _raw_text_rows()}
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.eval_dataset["raw"].column_names
+
+
+def test_a_raw_split_carrying_images_is_still_refused():
+    """Raw does not mean text-only: an image column means the text path would
+    throw the user's image handling away with the collator."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "images": [[0.0]],
+    })
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_raw_split_with_no_text_column_is_still_refused():
+    """Conversational multimodal data carries its images inside the turns, so
+    the columns alone look text-only. There is nothing for the text path to
+    tokenize, so this must keep the old refusal rather than empty the split."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({"messages": [[{"role": "user"}]]})
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+# ---- non-seq2seq collators that pad through a processor --------------------
+
+def test_a_processor_backed_padding_collator_is_repaired_under_packing():
+    """`DataCollatorWithPadding(tokenizer = processor)` pads through
+    `self.tokenizer.pad` exactly like the seq2seq one does, so packing being on
+    must not leave it attached: the first batch dies with
+    `AttributeError: ... object has no attribute 'pad'` either way."""
+    collator = DataCollatorWithPadding(tokenizer = StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.data_collator is not collator, "still padding through the processor"
+    assert hasattr(out.data_collator.tokenizer, "pad")
+    rows = [out.train_dataset[i] for i in range(len(out.train_dataset))]
+    batch = out.data_collator(rows)   # used to raise AttributeError
+    assert "input_ids" in batch and "labels" in batch
+
+
+def test_a_collator_holding_only_a_processor_is_repaired_under_packing():
+    """TRL's `DataCollatorForVisionLanguageModeling` keeps the processor under
+    `.processor`, not `.tokenizer`, and has the same problem."""
+    trainer = _text_only_trainer()          # MyVisionCollator holds `.processor`
+    trainer.args.packing = True
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert hasattr(out.data_collator.tokenizer, "pad")
+
+
+class PackingCollator:
+    """Stand-in for TRL's packing `DataCollatorForLanguageModeling`: it takes a
+    bare `pad_token_id` and holds no tokenizer or processor at all."""
+    def __init__(self):
+        self.pad_token_id = PAD_ID
+
+    def __call__(self, features):
+        return {"packed": True}
+
+
+def test_a_packing_collator_that_holds_no_tokenizer_is_left_alone():
+    """The reason the swap is gated on packing: a packing collator builds the
+    packed `position_ids` itself, and DataCollatorForSeq2Seq would not. Nothing
+    above may widen far enough to catch one."""
+    collator = PackingCollator()
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert out.data_collator is collator
+
+
+def test_a_real_tokenizer_padding_collator_is_untouched_under_packing():
+    """It can pad on its own, so packing keeps it as before."""
+    collator = DataCollatorWithPadding(tokenizer = StubTokenizer())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert out.data_collator is collator
