@@ -783,7 +783,7 @@ def test_text_only_processor_still_rejected():
 def test_vision_processor_still_constructs():
     # Vision path is byte-identical: image_processor present -> gate not triggered.
     collator = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
-    assert hasattr(collator.processor, "image_processor")
+    assert getattr(collator.processor, "image_processor", None) is not None
 
 
 class _VoxtralLikeProcessor(_ChatTemplateMixin):
@@ -998,7 +998,7 @@ def test_audio_only_collator_masks_audio_and_pad_tokens():
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen2-Audio-7B-Instruct"])
 def test_real_audio_processor_constructs_and_round_trips(model_id):
     # Full-fidelity check against a REAL audio processor. Skips in CI when
-    # transformers / the processor download / soundfile are unavailable.
+    # transformers or the processor download are unavailable.
     transformers = pytest.importorskip("transformers")
     try:
         proc = transformers.AutoProcessor.from_pretrained(model_id)
