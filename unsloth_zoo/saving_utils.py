@@ -2938,8 +2938,7 @@ def merge_and_overwrite_lora(
                 f"`{save_directory}`. Use `save_method=\"forced_merged_4bit\"` instead."
             )
         if final_model_name is None:
-            # A repo that exists but ships no safetensors also lands here, and
-            # "the name is wrong" would be actively misleading for it.
+            # A repo that exists but ships no safetensors also lands here.
             _bin_only = _hub_repo_weights_without_safetensors(model_name, token)
             if _bin_only is not None:
                 raise RuntimeError(
@@ -4757,13 +4756,10 @@ pass
 def _hub_repo_weights_without_safetensors(model_name, token = None):
     """Weight files in a repo that exists but ships no safetensors, else None.
 
-    `check_hf_model_exists` answers False both for a repo that is not there and
-    for one that is there in a format the merge cannot read, so callers blame
-    the name for repos like `unsloth/bge-m3`, which is public and ships only
-    `pytorch_model.bin`.
-
-    Diagnosis only: which repos resolve is unchanged, and anything unanswerable
-    returns None so the caller's original message stands.
+    `check_hf_model_exists` answers False both for a missing repo and for one
+    in a format the merge cannot read, like `unsloth/bge-m3`, so callers blame
+    the name. Diagnosis only: None whenever unanswerable, so the caller's
+    original message stands.
     """
     if not _is_hub_repo_id(model_name): return None
     try:

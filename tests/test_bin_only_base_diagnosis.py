@@ -16,10 +16,9 @@
 
 """A base that exists but ships no safetensors must not be called missing.
 
-`check_hf_model_exists` returns True only when the listing contains a
-`.safetensors` file, so a public `.bin`-only repo such as `unsloth/bge-m3`
-answers False exactly like a repo that is not there, and the caller blames
-the name. Diagnosis only: which repos resolve is unchanged.
+`check_hf_model_exists` only returns True when the listing holds a
+`.safetensors`, so a `.bin`-only repo like `unsloth/bge-m3` looks absent and
+the caller blames the name. Diagnosis only: which repos resolve is unchanged.
 """
 
 import os
@@ -67,7 +66,6 @@ def test_pt_and_bin_are_both_reported(fs):
 
 
 def test_safetensors_repo_says_nothing(fs):
-    # This one resolves normally, so there is no second diagnosis to offer.
     fs(["config.json", "model.safetensors"])
     assert su._hub_repo_weights_without_safetensors("org/m") is None
 
@@ -84,8 +82,7 @@ def test_repo_with_no_weights_at_all_says_nothing(fs):
 
 
 def test_unreachable_hub_says_nothing(fs):
-    # Absent, gated and unreachable are already described by the caller, and a
-    # guess here would override a more accurate message.
+    # Already described by the caller; a guess would override a better message.
     fs(ConnectionError("boom"))
     assert su._hub_repo_weights_without_safetensors("org/m") is None
 
@@ -104,8 +101,8 @@ def test_openvino_subdirectory_bins_do_not_count(fs):
 def test_caller_raises_the_specific_message():
     """The bin-only branch must reach the user, not just exist.
 
-    Assert on the RENDERED message: the literal is split across implicit
-    concatenation, so no phrase a user would read is contiguous in the source.
+    Asserts on the rendered message: implicit concatenation means no phrase a
+    user would read is contiguous in the source.
     """
     import ast, re
     src = Path(su.__file__).read_text(encoding = "utf-8")
@@ -125,9 +122,7 @@ def test_caller_raises_the_specific_message():
     assert "Convert the base to safetensors" in msg[0]
 
 
-# An env var, not a pytest flag: `--live` was never registered through
-# pytest_addoption, so `pytest --live` exits with "unrecognized arguments"
-# before collection and this test could never actually be run.
+# An env var, not `--live`: an unregistered pytest flag aborts collection.
 @pytest.mark.skipif(
     os.environ.get("UNSLOTH_LIVE_TESTS", "0") != "1",
     reason = "needs network; set UNSLOTH_LIVE_TESTS=1",

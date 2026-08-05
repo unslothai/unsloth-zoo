@@ -16,23 +16,14 @@
 
 """An OOM-killed GGUF conversion can usually just be retried onto disk.
 
-The converter holds tensors in host RAM. A large model on a free Colab or
-Kaggle VM is taken by the kernel OOM-killer, and subprocess reports only
+The converter holds tensors in host RAM, so a large model on a free Colab or
+Kaggle VM is OOM-killed and subprocess reports only SIGKILL. Measured on
+`Gemma3N_(4B)-Audio`, which trains, infers and merges cleanly with 155GB disk
+free, then dies here.
 
-    Command '[...]' died with <Signals.SIGKILL: 9>
-
-`Gemma3N_(4B)-Audio` dies exactly here, measured: it trains, infers and merges
-cleanly (15.7GB written, 155GB disk free, freed before the conversion) and the
-converter is then killed, on the high-RAM T4 as well as the plain one.
-
-llama.cpp already has the answer. `--use-temp-file` is documented as "helpful
-when running out of memory, process killed". The catch is that it refuses to
-run alongside splitting:
-
-    Error: Cannot use temp file when splitting
-
-and `--split-max-size` is always passed, so the flag has to arrive with the
-split options removed or the retry swaps one hard failure for another.
+llama.cpp's `--use-temp-file` is the documented fix, but it refuses to run
+alongside splitting ("Cannot use temp file when splitting") and
+`--split-max-size` is always passed, so the retry must drop the split options.
 """
 
 import sys
@@ -87,9 +78,8 @@ BASE = ["/usr/bin/python3", "/root/.unsloth/llama.cpp/unsloth_convert_hf_to_gguf
 
 
 def test_the_split_option_is_removed():
-    """This is the whole point. llama.cpp exits 1 on the combination, so a
-    retry that kept --split-max-size would fail differently and look like a
-    new bug."""
+    """llama.cpp exits 1 on the combination, so keeping --split-max-size would
+    only swap one failure for another."""
     out = _retry_with_temp_file(BASE)
     assert "--split-max-size" not in out
     assert "50G" not in out
@@ -102,8 +92,7 @@ def test_split_max_tensors_is_removed_too():
 
 
 def test_a_valueless_split_flag_does_not_eat_the_next_option():
-    """Defensive: skipping "the token after" would drop an unrelated flag if a
-    split option ever arrives without a value."""
+    """Defensive: skipping "the token after" would drop an unrelated flag."""
     cmd = ["/usr/bin/python3", "conv.py", "--split-max-size", "--outtype", "f16",
            "/tmp/model_dir"]
     out = _retry_with_temp_file(cmd)
@@ -127,8 +116,7 @@ def test_everything_else_survives():
 
 
 def test_it_refuses_to_retry_twice():
-    """Without this the loop would re-issue the same command forever on a
-    machine that is simply too small."""
+    """Otherwise the loop re-issues the same command forever on a small machine."""
     once = _retry_with_temp_file(BASE)
     assert _retry_with_temp_file(once) is None
 
@@ -158,8 +146,7 @@ def test_the_retry_happens_at_most_once():
 
 
 def test_it_says_what_it_is_doing():
-    """A silent retry that then succeeds hides a real capacity problem, and one
-    that then fails looks like a single inexplicable failure."""
+    """A silent retry hides a real capacity problem."""
     body = _loop_src()
     assert "--use-temp-file" in body and "host RAM" in body
 
@@ -179,10 +166,8 @@ def _touch(directory, name, data = b"GGUF"):
 
 
 def test_the_shards_of_a_killed_split_run_are_removed(tmp_path):
-    """GGUFWriter.open_output_file opens every shard with "wb" before a single
-    tensor byte, so a SIGKILL always leaves them. The retry then drops
-    --split-max-size and writes the unsharded name instead, and callers upload
-    every save_directory/*.gguf, so the stubs would ship beside the real file."""
+    """The writer opens every shard with "wb" before any tensor byte, so a
+    SIGKILL leaves stubs that would ship beside the retry's unsharded file."""
     out = str(tmp_path / "model.BF16.gguf")
     shards = [_touch(tmp_path, f"model.BF16-{i:05d}-of-00003.gguf") for i in (1, 2, 3)]
     _remove_gguf_outputs(out)
@@ -205,12 +190,8 @@ def test_unrelated_ggufs_are_left_alone(tmp_path):
 
 
 def test_a_neighbour_whose_name_ends_with_ours_is_left_alone(tmp_path):
-    """The shard pattern is matched against the whole filename.
-
-    These paths are os.remove'd, so an unanchored match would take somebody
-    else's export: "old-model.BF16-00001-of-00002" ends with the shard name
-    that cleaning "model.BF16" looks for.
-    """
+    """Matched against the whole filename: these are os.remove'd, so an
+    unanchored match would take "old-model.BF16-00001-of-00002" too."""
     keep = [_touch(tmp_path, "old-model.BF16-00001-of-00002.gguf"),
             _touch(tmp_path, "my-model.BF16-00002-of-00002.gguf")]
     mine = _touch(tmp_path, "model.BF16-00001-of-00002.gguf")
@@ -238,9 +219,8 @@ def test_the_retry_clears_the_old_output_first():
 
 
 def test_a_failed_projector_is_removed_and_stops_claiming_vlm():
-    """The converter truncates its --outfile at header time, so "a failed
-    optional run wrote no file" was never true: the partial projector, or a good
-    one from an earlier export, sits there and gets uploaded as valid."""
+    """The converter truncates its --outfile at header time, so the failed run
+    leaves a partial projector that would be uploaded as valid."""
     src = (ROOT / "unsloth_zoo" / "llama_cpp.py").read_text(encoding="utf-8")
     i = src.index("if not required:")
     body = src[i:src.index("if optional_failed:", i)]

@@ -16,12 +16,9 @@
 
 """Tests the bitsandbytes guard in llama_cpp.convert_to_gguf.
 
-llama.cpp has no bitsandbytes dequantizer, and only raises
-`NotImplementedError: Quant method is not yet supported: 'bitsandbytes'` after
-reading the entire model, so the guard has to fire before the subprocess.
-
-The detector searches nested dicts because VLMs keep their quantization_config
-under a sub-config, the same reason _remove_quantization_config recurses.
+llama.cpp has no bitsandbytes dequantizer and only refuses after reading the
+entire model, so the guard has to fire before the subprocess. The detector
+recurses because VLMs keep quantization_config under a sub-config.
 """
 
 import ast
@@ -88,8 +85,7 @@ def test_non_dict_inputs_are_safe():
 def test_guard_is_wired_into_convert_to_gguf():
     body = _SRC[_SRC.index("def convert_to_gguf("):]
     assert "_find_bitsandbytes_quantization(config_file)" in body
-    # The whole point is failing fast, so the guard has to come before the
-    # converter subprocess rather than after a multi-GB read.
+    # Failing fast: the guard must precede the converter subprocess.
     guard = body.index("_find_bitsandbytes_quantization(config_file)")
     launch = body.index("subprocess.run")
     assert guard < launch
@@ -97,8 +93,7 @@ def test_guard_is_wired_into_convert_to_gguf():
 
 def test_error_message_is_actionable():
     assert "load_in_4bit = False" in _SRC
-    # An 8bit checkpoint carries the same quant_method and hits the same guard,
-    # so the remediation has to name its flag too.
+    # 8bit hits the same guard, so the remediation must name its flag too.
     assert "load_in_8bit = False" in _SRC
     assert "merged_16bit" in _SRC
 
