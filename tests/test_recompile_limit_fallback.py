@@ -98,7 +98,10 @@ def test_recompile_limit_falls_back_instead_of_raising():
     c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
 
 
 def test_the_fallback_latches():
@@ -121,7 +124,9 @@ def test_the_fallback_latches():
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     for _ in range(5):
         assert w(1) == 2
-    assert calls["c"] == 1, "the compiler must not be re-entered after the latch"
+    # One failing attempt plus the single bumped retry, and nothing after the
+    # latch: the compiler is not consulted again.
+    assert calls["c"] == 2, "the compiler must not be re-entered after the latch"
     assert calls["e"] == 5
 
 
@@ -258,10 +263,13 @@ def test_cache_exhaustion_reported_as_a_bare_unsupported_falls_back(message):
     c, e, calls = _pair(Unsupported(message))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
     # And it latches, like every other fallback reason.
     assert w(3) == 6
-    assert calls["c"] == 1
+    assert calls["c"] == 2
 
 
 def test_error_tuple_is_non_empty_on_this_torch():
@@ -373,7 +381,10 @@ def test_the_flag_being_off_keeps_the_fallback():
         c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
         w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
         assert w(3) == 6
-    assert calls == {"c": 1, "e": 1}
+    # Two compiled attempts: the one that hit the limit and the one retry the
+    # wrapper makes with a raised budget, so a step that is halfway through an
+    # activation-checkpoint pack can still finish compiled. Then eager.
+    assert calls == {"c": 2, "e": 1}
 
 
 def test_a_torch_without_the_flag_still_falls_back():

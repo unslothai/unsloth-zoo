@@ -38,6 +38,7 @@ __all__ = [
     "dedent",
     "eager_fallback_state",
     "force_eager_fallback",
+    "apply_pending_eager_fallbacks",
 ]
 import functools
 import inspect
@@ -778,6 +779,43 @@ def _is_our_own_disabled_hook(exc):
     )
 
 
+# torch 2.7 renamed both recompile budgets; 2.6 and older still use the old
+# spelling, and the old names survive as aliases afterwards. Bumping whichever
+# pair the installed torch actually reads is the only portable way to buy the
+# current step a few more compilations.
+_RECOMPILE_LIMIT_NAMES = (
+    ("recompile_limit", "cache_size_limit"),
+    ("accumulated_recompile_limit", "accumulated_cache_size_limit"),
+)
+
+# How much headroom one bump buys, and how many bumps a single wrapper may ask
+# for before we give up and go eager. Bounded on purpose: the limit exists to
+# stop unbounded compilation, and this must not quietly remove it.
+_RECOMPILE_LIMIT_BUMP = 16
+_MAX_RECOMPILE_LIMIT_BUMPS = 4
+
+
+def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
+    """Raise both recompile budgets. False if this torch exposes neither."""
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return False
+    bumped = False
+    for names in _RECOMPILE_LIMIT_NAMES:
+        for name in names:
+            current = getattr(_config, name, None)
+            if isinstance(current, int) and not isinstance(current, bool):
+                try:
+                    setattr(_config, name, current + extra)
+                except Exception:
+                    continue
+                bumped = True
+                # Only the name this torch really reads; the alias follows.
+                break
+    return bumped
+
+
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
 
@@ -808,12 +846,47 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
-    state = {"warned": False, "eager": False}
+    state = {"warned": False, "eager": False, "pending_eager": False, "bumps": 0}
 
     def _warn(message):
         if not state["warned"]:
             state["warned"] = True
             logger.warning(message)
+
+    # Nothing is a valid return value, so the retry needs its own sentinel.
+    _NO_RESULT = object()
+
+    def _retry_with_more_budget(args, kwargs):
+        """Finish THIS call the way it started, if we can.
+
+        Switching to eager here is what breaks non-reentrant activation
+        checkpointing: the pack and the recompute of one and the same region
+        then run in different compile modes, and torch aborts the backward with
+        "Something went unexpectedly wrong in activation checkpoint" or the
+        neighbouring "A different number of tensors was saved" / "different
+        metadata" errors. Buying a little more recompile budget keeps the call
+        compiled and defers the switch to the next step boundary, where nothing
+        is half-packed. Bounded, so a model that recompiles forever still ends
+        up eager rather than compiling without limit.
+        """
+        if state["bumps"] >= _MAX_RECOMPILE_LIMIT_BUMPS:
+            return _NO_RESULT
+        if not _bump_recompile_limits():
+            return _NO_RESULT
+        state["bumps"] += 1
+        try:
+            result = compiled_func(*args, **kwargs)
+        except Exception:
+            # Not BaseException: a Ctrl-C here must reach the user, not be
+            # spent silently re-running the call eagerly.
+            return _NO_RESULT
+        state["pending_eager"] = True
+        _warn(
+            f"Unsloth: torch.compile ran out of recompilation cache for "
+            f"{label}; finishing this step compiled and switching to eager at "
+            f"the next step. Training is unaffected apart from speed."
+        )
+        return result
 
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
@@ -824,6 +897,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         except errors as e:
             if _wants_hard_recompile_failure():
                 raise
+            result = _retry_with_more_budget(args, kwargs)
+            if result is not _NO_RESULT:
+                return result
             state["eager"] = True
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
@@ -836,6 +912,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # (2.4), then our own `torch.compiler.disable` hook. Anything else
             # is a real graph break and must keep raising.
             if _is_recompile_limit_unsupported(e):
+                result = _retry_with_more_budget(args, kwargs)
+                if result is not _NO_RESULT:
+                    return result
                 state["eager"] = True
                 _warn(
                     f"Unsloth: torch.compile ran out of recompilation cache "
@@ -884,6 +963,35 @@ def eager_fallback_state() -> dict[str, bool]:
     return out
 
 
+def apply_pending_eager_fallbacks() -> int:
+    """Latch every wrapper that deferred its switch. Returns how many flipped.
+
+    Call this at a training-step boundary, where no activation-checkpoint
+    region is half-packed. A wrapper that ran out of recompile budget mid-step
+    kept itself compiled for the rest of that step (see
+    `_fall_back_to_eager_on_recompile_limit`) precisely so the pack and the
+    recompute of every checkpointed region agree; this is where that debt is
+    settled.
+
+    Flipping one wrapper flips all of them, for the same reason
+    `force_eager_fallback` does: one checkpointed region usually spans several
+    patched functions, and leaving the rest compiled just moves the mismatch.
+
+    Safe to call on every step. Nothing pending means nothing happens.
+    """
+    live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
+            if w is not None]
+    if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
+        return 0
+    flipped = 0
+    for w in live:
+        if not w._unsloth_fallback_state["eager"]:
+            flipped += 1
+        w._unsloth_fallback_state["eager"] = True
+        w._unsloth_fallback_state["pending_eager"] = False
+    return flipped
+
+
 def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     """Latch every wrapper to eager. Returns how many are eager afterwards.
 
@@ -904,10 +1012,13 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
     if only_if_already_triggered and not any(
-            w._unsloth_fallback_state["eager"] for w in live):
+            w._unsloth_fallback_state["eager"]
+            or w._unsloth_fallback_state.get("pending_eager")
+            for w in live):
         return 0
     for w in live:
         w._unsloth_fallback_state["eager"] = True
+        w._unsloth_fallback_state["pending_eager"] = False
     return len(live)
 
 

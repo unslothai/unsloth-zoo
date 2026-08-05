@@ -95,8 +95,9 @@ def test_the_fallback_latches():
     w = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
     modes = [w(i)[0] for i in range(6)]
     assert modes == ["compiled", "compiled", "eager", "eager", "eager", "eager"]
-    # 3 attempts: two that worked and the one that raised. Never again.
-    assert calls["compiled"] == 3
+    # 4 attempts: two that worked, the one that raised, and the single bumped
+    # retry the wrapper makes before giving up. Never again.
+    assert calls["compiled"] == 4
 
 
 def test_the_warning_is_logged_once(monkeypatch):
