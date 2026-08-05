@@ -350,6 +350,13 @@ def test_env_override_is_uncapped(monkeypatch, dnp):
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "100")
     assert dnp.get_dataset_num_proc(None) == 100
+    # Above the auto cap is the easy half. The memory clamp is the one that
+    # matters: the fixture leaves room for 512 workers, so without pinning it
+    # this asserts nothing about the exemption. map_failure_diagnostics points
+    # users at this hatch on exactly the host where the clamp would bite.
+    monkeypatch.setattr(dnp, "_affordable_workers", lambda: 2)
+    assert dnp.get_dataset_num_proc(None) == 100
+    assert dnp.get_dataset_num_proc(4) == 100
 
 
 def test_invalid_env_override_is_ignored_with_a_warning(monkeypatch, dnp, capsys):
@@ -524,6 +531,17 @@ def test_unrelated_errors_pass_through_untouched(dnp):
         with dnp.map_failure_diagnostics(4):
             raise key
     assert caught_key.value is key
+
+    # The identity assertions above hold under `except Exception` as well, since
+    # the guard re-raises the same object. This one does not: it carries the
+    # dead-worker text, so a widened clause would rewrite it into a RuntimeError.
+    lookalike = ValueError(
+        "One of the subprocesses has abruptly died during map operation."
+    )
+    with pytest.raises(ValueError) as caught_other:
+        with dnp.map_failure_diagnostics(4):
+            raise lookalike
+    assert caught_other.value is lookalike
 
 
 def test_successful_map_is_not_disturbed(dnp):
