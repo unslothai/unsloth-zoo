@@ -23,6 +23,7 @@ __all__ = [
 ]
 
 from typing import Union, Callable, Optional, List, Dict
+import itertools as _itertools
 import torch
 
 def _iterable_batch_size(dataset, default = 1000):
@@ -672,9 +673,42 @@ def train_on_responses_only(
         print("Unsloth: Warning: " + message)
     pass
 
+    def _no_training_signal(dataset_name, how_many):
+        return ValueError(
+            f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}"
+            f"{how_many}, so there is nothing to train on. The response marker "
+            f"{repr(response_part)} was not found in any sample - check that "
+            "instruction_part and response_part match your chat template."
+        )
+    pass
+
+    # Streaming rows cannot be counted or filtered, and fix_zero_training_loss
+    # skips them too, so sample a bounded prefix instead: all -100 there means the
+    # markers do not match this template. Iterating restarts the stream, so no rows
+    # are consumed.
+    _STREAM_SCAN_ROWS = 16
+
+    def _check_streaming_labels(dataset, dataset_name):
+        seen = 0
+        try:
+            for row in _itertools.islice(iter(dataset), _STREAM_SCAN_ROWS):
+                labels = row.get("labels") if isinstance(row, dict) else None
+                if labels is None: return
+                if getattr(labels, "tolist", None): labels = labels.tolist()
+                if any(l != -100 for l in labels): return
+                seen += 1
+        except Exception:
+            return  # unreadable stream: leave it exactly as before
+        if seen == 0: return
+        raise _no_training_signal(dataset_name, f" (first {seen} samples)")
+    pass
+
     def _filter_fully_masked(dataset, dataset_name="dataset"):
         if isinstance(dataset, IterableDataset):
-            return dataset  # Cannot filter IterableDataset efficiently
+            # Cannot filter an IterableDataset efficiently, but a fully masked one
+            # would otherwise train on no signal at all.
+            _check_streaming_labels(dataset, dataset_name)
+            return dataset
         if "labels" not in dataset.column_names:
             return dataset
         # filter rewrites the whole Arrow table even when it drops nothing, so scan the
@@ -702,11 +736,7 @@ def train_on_responses_only(
         # Everything masked and not from truncation: the markers do not match the
         # template at all, so fail clearly instead of returning an empty dataset.
         if len(dropped) == n_before:
-            raise ValueError(
-                f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}, "
-                f"so there is nothing to train on. The response marker {repr(response_part)} was not "
-                "found in any sample - check that instruction_part and response_part match your chat template."
-            )
+            raise _no_training_signal(dataset_name, "")
         # Drop via filter (Arrow mask), not select(keep_indices): a keep list would be one
         # Python int per surviving row (GBs on a large corpus). _has_valid_labels is the
         # exact inverse of `dropped`, so survivors are identical.
@@ -767,13 +797,21 @@ def train_on_responses_only(
         every new model spells its own. Each processor half declares its outputs
         in `model_input_names`, so ask them and subtract the text half.
         """
+        _halves = ("image_processor", "video_processor", "feature_extractor",
+                   "audio_processor", "qformer_tokenizer")
         names = set()
-        holders = [getattr(processor, attr, None) for attr in
-                   ("image_processor", "video_processor", "feature_extractor",
-                    "audio_processor", "qformer_tokenizer")]
+        holders = [getattr(processor, attr, None) for attr in _halves]
         # The processor's own list merges text and vision (that is the only place
         # FuyuProcessor names `image_patches_indices`), so take it too.
         if processor is not tokenizer: holders.append(processor)
+        # With the `tokenizer =` override `processor` is the unwrapped text
+        # tokenizer, and the real multimodal processor is only on the collator.
+        _coll = getattr(trainer, "data_collator", None)
+        for attr in ("processor", "tokenizer"):
+            held = getattr(_coll, attr, None)
+            if held is None or held is processor or held is tokenizer: continue
+            holders.append(held)
+            holders += [getattr(held, a, None) for a in _halves]
         for holder in holders:
             if holder is None: continue
             try: names.update(getattr(holder, "model_input_names", None) or ())
@@ -824,10 +862,29 @@ def train_on_responses_only(
         return all(_is_plain_text(v) for k, v in row.items() if k not in _TEXT_COLUMNS)
     pass
 
-    def _split_views(dataset):
-        """`(column names, first row)` per split, row `None` when unreadable.
+    # A one-row peek calls a mixed split text-only: row 0 holds plain `messages`
+    # while a later row hides an inline image. Sample a small fixed number of rows
+    # instead - bounded, so a huge or streaming split stays cheap.
+    _SCAN_ROWS = 16
 
-        `iter()` restarts a datasets IterableDataset, so peeking one row does not
+    def _sample_rows(split):
+        try: n = len(split)
+        except Exception: n = None
+        if n is None:
+            # Streaming: a prefix is all that can be read without consuming it.
+            return list(_itertools.islice(iter(split), _SCAN_ROWS))
+        if n == 0: return []
+        # Spread the sample over the whole split, first and last row included;
+        # random access is cheap on Arrow.
+        if n <= _SCAN_ROWS: idx = range(n)
+        else: idx = sorted({i * (n - 1) // (_SCAN_ROWS - 1) for i in range(_SCAN_ROWS)})
+        return [split[i] for i in idx]
+    pass
+
+    def _split_views(dataset):
+        """`(column names, sampled rows)` per split, rows `[]` when unreadable.
+
+        `iter()` restarts a datasets IterableDataset, so peeking rows does not
         consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
         """
         splits = list(dataset.values()) if isinstance(dataset, dict) else [dataset]
@@ -836,18 +893,16 @@ def train_on_responses_only(
             if split is None: continue
             names = getattr(split, "column_names", None)
             if isinstance(names, dict): names = None
-            row = None
+            rows = []
             try:
-                row = next(iter(split))
-            except StopIteration:
-                row = None          # empty split: nothing to inspect
+                rows = [r for r in _sample_rows(split) if isinstance(r, dict)]
             except Exception:
                 if not names: raise
-            if not isinstance(row, dict): row = None
+                rows = []
             if not names:
-                if row is None: raise ValueError("Unsloth: cannot read the dataset columns")
-                names = list(row.keys())
-            views.append((set(names), row))
+                if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
+                names = list(rows[0].keys())
+            views.append((set(names), rows))
         return views
     pass
 
@@ -864,12 +919,13 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, row in views:
+        for names, rows in views:
             if "input_ids" not in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
             # Columns look text-only, so check the values: a `messages` column can
             # carry inline images that the strip below would throw away.
-            if row is not None and not _row_is_plain_text(row): return False
+            for row in rows:
+                if not _row_is_plain_text(row): return False
         return True
     pass
 
@@ -890,13 +946,13 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, row in views:
+        for names, rows in views:
             if "input_ids" in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
             # The column `_maybe_tokenize_dataset` would actually read.
             field = text_field if text_field in names else "text"
             if field not in names: return False
-            if row is not None:
+            for row in rows:
                 if not isinstance(row.get(field), str): return False
                 if not _row_is_plain_text(row): return False
         return True

@@ -816,3 +816,162 @@ def test_a_raw_iterable_eval_split_of_real_text_is_still_allowed():
     trainer.eval_dataset = _raw_text_rows().to_iterable_dataset()
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in next(iter(out.eval_dataset))
+
+
+# ---- one row is not the whole split ----------------------------------------
+
+def _rows_with_an_image_at(n, image_at):
+    """`n` pretokenized rows; only row `image_at` carries an image, under a column
+    name no static list mentions. Exactly what a partly-illustrated set looks like."""
+    import io
+    from PIL import Image as PILImage
+    from datasets import Image as ImageFeature
+
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (2, 2)).save(buffer, format = "PNG")
+    media = [{"bytes": buffer.getvalue(), "path": None} if i == image_at else None
+             for i in range(n)]
+    return Dataset.from_dict({
+        "input_ids": [list(ROW)] * n, "media": media,
+    }).cast_column("media", ImageFeature())
+
+
+def test_a_later_row_hiding_an_image_is_refused():
+    """Row 0 has no image, so the old one-row peek cleared the guard and the strip
+    below then dropped the column, images and all."""
+    n = 5
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, _rows_with_an_image_at(n, image_at = n - 1))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator
+    assert "media" in trainer.train_dataset.column_names
+
+
+def test_the_bounded_scan_reaches_the_end_of_a_long_split():
+    """The scan is a small constant, so it samples across the split (first and
+    last row included) rather than the first N rows."""
+    n = 200
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          _rows_with_an_image_at(n, image_at = n - 1))
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_long_plain_text_split_is_still_allowed():
+    """The other half: scanning more rows must not refuse an honest text run."""
+    n = 200
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)] * n,
+        "messages": _messages_of_plain_text() * n,
+    })
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), dataset)
+    trainer.processing_class = StrictProcessor()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "messages" not in out.train_dataset.column_names
+
+
+def test_a_later_streaming_row_hiding_an_image_is_refused():
+    """Streaming rows arrive as they were written, so row 0 really can be plain
+    while a later one carries inline image parts."""
+    from datasets import IterableDataset
+
+    rows = [{"input_ids": list(ROW), "messages": _messages_of_plain_text()[0]},
+            {"input_ids": list(ROW), "messages": _messages_of_plain_text()[0]},
+            {"input_ids": list(ROW), "messages": _messages_with_an_image()[0]}]
+    dataset = IterableDataset.from_generator(lambda: iter(rows))
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert len(list(trainer.train_dataset)) == len(rows), "the peek consumed the stream"
+
+
+def test_a_raw_eval_split_whose_later_row_is_not_text_is_refused():
+    """The same one-row peek also admitted a mixed raw eval split to the plain
+    tokenizer, which cannot encode a null."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a", None],
+    })
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+# ---- the processor may live only on the collator ---------------------------
+
+def test_the_collators_processor_derives_the_multimodal_columns():
+    """With the public `tokenizer =` override the multimodal processor is no
+    longer `processing_class`, but the collator still holds it, so its derived
+    output names must still block the bypass."""
+    processor = DerivedProcessor(image_names = ["widget_patches"])
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "widget_patches": [[0.0]],
+    })
+    collator = MyVisionCollator(processor)
+    trainer = StubTrainer(collator, dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART,
+                                tokenizer = StubTokenizer())
+
+    assert trainer.data_collator is collator
+    assert "widget_patches" in trainer.train_dataset.column_names
+
+
+def test_the_tokenizer_override_still_allows_a_text_only_run():
+    """Deriving from the collator only adds names, so a text-only split passes."""
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), _text_rows())
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART,
+                                  tokenizer = StrictPadTokenizer())
+    assert "labels" in out.train_dataset.column_names
+
+
+# ---- a streaming split cannot be filtered, so sample its labels -------------
+
+def _unmatched_rows(n = 3):
+    # No response marker anywhere: every label ends up -100.
+    return Dataset.from_dict({"input_ids": [[10, 11, 12]] * n})
+
+
+def test_a_fully_masked_streaming_train_split_is_reported():
+    """`_filter_fully_masked` and `fix_zero_training_loss` both skip streaming, so
+    the bypass would otherwise start a run with no training signal at all."""
+    dataset = _unmatched_rows().to_iterable_dataset()
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+    with pytest.raises(ValueError, match = "nothing to train on"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_the_streaming_label_check_does_not_consume_the_stream():
+    dataset = _unmatched_rows(n = 5).to_iterable_dataset()
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+    with pytest.raises(ValueError, match = "nothing to train on"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert len(list(dataset)) == 5
+
+
+def test_a_fully_masked_streaming_eval_split_names_the_split():
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
+    trainer.eval_dataset = {"bad": _unmatched_rows().to_iterable_dataset()}
+    with pytest.raises(ValueError, match = r"eval_dataset\[bad\]"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_partly_masked_streaming_split_still_trains():
+    """Only an all -100 sample is an error; rows without a response are normal."""
+    from datasets import concatenate_datasets
+
+    dataset = concatenate_datasets([_unmatched_rows(n = 2), _text_rows()])
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset.to_iterable_dataset())
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert len(list(out.train_dataset)) == 4
