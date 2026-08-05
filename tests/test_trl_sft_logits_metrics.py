@@ -381,6 +381,42 @@ def test_the_1x_shape_keeps_real_metrics():
 
 # ---- aux_loss is not logits-derived and must survive the skip --------------
 
+@pytest.fixture(scope = "module")
+def trl_logs_aux(sft):
+    """Does the INSTALLED trl log aux_loss once the metric block is skipped?
+
+    0.23.0-0.25.x keep it inside the `use_liger_kernel` branch; 0.29.0 and 1.x
+    moved it out (0.29.1 sft_trainer.py:1323). Asked by running it, so a future
+    move either way is picked up.
+    """
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss logits aux_loss")
+    loss, aux = torch.tensor(1.0), torch.tensor(0.25)
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        out = Out(loss, EmptyLogits(), aux)
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        self = _trainer(sft)
+        self.aux_loss_enabled = True
+        self.args.use_liger_kernel = True
+        # trl's own compute_loss: the wrapper would replay on top of the reading.
+        inner = getattr(sft.SFTTrainer.compute_loss, "__wrapped__",
+                        sft.SFTTrainer.compute_loss)
+        with warnings.catch_warnings():
+            # There is no liger here, so trl's report would go to that project.
+            warnings.filterwarnings("ignore", message = ".*token_accuracy.*")
+            inner(self, self.model, _inputs(), num_items_in_batch = None)
+        return bool(self._metrics["train"]["aux_loss"])
+    except Exception:
+        return False
+    finally:
+        Trainer.compute_loss = original
+
+
 def _run_with_aux(sftmod, logits, steps = 3, aux = torch.tensor(0.25),
                   trainer_logs_aux = False):
     """As `_run_steps`, but the outputs carry `aux_loss` and the trainer is a
@@ -423,10 +459,14 @@ def test_aux_loss_survives_the_skipped_metric_block(sft, sentinel):
 
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
-def test_aux_loss_is_not_logged_twice(sft, sentinel):
+def test_aux_loss_is_not_logged_twice(sft, trl_logs_aux, sentinel):
     """trl 1.x logs it outside the branch, so replaying would double-count.
-    Gated on the count rather than on a version number."""
-    self = _run_with_aux(sft, sentinel(), steps = 3, trainer_logs_aux = True)
+    Gated on the count rather than on a version number. Stand in for that only
+    when the installed trl does not already do it, or the stand-in is a second
+    logger and doubles the count by itself.
+    """
+    self = _run_with_aux(sft, sentinel(), steps = 3,
+                         trainer_logs_aux = not trl_logs_aux)
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
 
 
