@@ -144,10 +144,15 @@ def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performa
         }))
     """, {"HF_XET_CACHE": str(xet_cache), "HF_HOME": str(tmp_path / "hf")})
 
-    assert result["hp"] not in ("1", "true", "yes", "on"), (
+    # Judge the flag with the parser the tuning code uses: it strips and lowercases, so a raw
+    # membership test would let "True" or " on " through while the process is in fact sized for
+    # high performance -- the regression back, in a different spelling.
+    from unsloth_zoo.hf_xet_tuning import _is_true
+
+    assert not _is_true(result["hp"]), (
         f"import put this process into high-performance mode ({result['hp']!r}); xet-core then "
         "applies its 64GB preset AFTER reading the environment and discards every cap below"
     )
-    assert result["hp_alias"] not in ("1", "true", "yes", "on")
+    assert not _is_true(result["hp_alias"])
     # The caps only mean anything while the preset is off, so assert they arrived at all.
     assert result["limit"] and int(result["limit"]) <= 64_000_000_000
