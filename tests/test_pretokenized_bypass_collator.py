@@ -697,3 +697,122 @@ def test_a_columnless_streaming_dataset_reaches_masking():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     row = next(iter(out.train_dataset))     # used to raise AttributeError
     assert [l for l in row["labels"] if l != -100] == [20, 21]
+
+
+# ---- a text column is a column that actually holds text --------------------
+
+def _messages_with_an_image():
+    return [[
+        {"role": "user", "content": [{"type": "image", "image": "cat.png"},
+                                     {"type": "text",  "text": "q"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+    ]]
+
+
+def _messages_of_plain_text():
+    return [[
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]]
+
+
+def test_pretokenized_rows_hiding_images_in_messages_are_refused():
+    """The column names look text-only, but `messages` carries inline image parts
+    the user's collator is what turns into pixels. The strip drops the column, so
+    the images would be lost silently."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "messages": _messages_with_an_image(),
+    })
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator, "the user's collator was replaced"
+    assert "messages" in trainer.train_dataset.column_names
+
+
+def test_a_pretokenized_iterable_hiding_images_in_messages_is_refused():
+    """No column_names to read, so the row peek has to make the same call - and
+    it must not eat the row it peeked."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "messages": _messages_with_an_image(),
+    }).to_iterable_dataset()
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert len(list(trainer.train_dataset)) == 1, "the peek consumed the stream"
+
+
+def test_an_eval_split_hiding_images_in_messages_is_refused():
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "messages": _messages_with_an_image(),
+    })
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = dataset
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_pretokenized_rows_with_plain_text_messages_still_pass():
+    """The other half of the same check: a conversation of plain strings holds no
+    image handling to lose, so `dataset.map` without remove_columns keeps working."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)],
+        "messages": _messages_of_plain_text(),
+    })
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), dataset)
+    trainer.processing_class = StrictProcessor()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "messages" not in out.train_dataset.column_names
+    _collate_every_row(out)
+
+
+def test_dataset_text_field_pointing_at_conversations_is_refused():
+    """`dataset_text_field = "messages"` used to clear the guard by name alone,
+    and the raw conversations then reached the plain tokenizer with no chat
+    template applied, failing after the collator had already been swapped."""
+    trainer = _text_only_trainer()
+    trainer.args.dataset_text_field = "messages"
+    trainer.eval_dataset = Dataset.from_dict({"messages": _messages_of_plain_text()})
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_dataset_text_field_pointing_at_a_real_string_column_is_allowed():
+    """The bypass is about strings, not about the name `text`."""
+    trainer = _text_only_trainer()
+    trainer.args.dataset_text_field = "prompt"
+    trainer.eval_dataset = Dataset.from_dict({
+        "prompt": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert "prompt" not in out.eval_dataset.column_names
+
+
+def test_a_raw_eval_split_whose_text_column_is_structured_is_refused():
+    """Same column name, non-string rows: `text` holding message dicts is not
+    something the plain tokenizer can encode."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({"text": _messages_of_plain_text()})
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_raw_iterable_eval_split_of_real_text_is_still_allowed():
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = _raw_text_rows().to_iterable_dataset()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in next(iter(out.eval_dataset))

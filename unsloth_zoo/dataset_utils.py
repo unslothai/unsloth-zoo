@@ -787,64 +787,119 @@ def train_on_responses_only(
     except Exception:
         pass
 
-    def _dataset_is_pretokenized(dataset):
-        """True when rows carry `input_ids` and no image/video/audio column, i.e.
-        text tokenized up front where dataset-level masking is correct. Multimodal
-        or unreadable rows return False, keeping the caller's old refusal (the text
-        path swaps in a text collator and would drop the image handling).
+    # Keys and `type` tags a chat turn uses to point at an image/video/audio.
+    _MEDIA_KEYS = frozenset((
+        "image", "images", "image_url", "video", "videos", "video_url",
+        "audio", "audios", "audio_url", "input_audio", "pixel_values",
+        "bytes", "path", "url",
+    ))
+
+    def _is_plain_text(value, _depth = 0):
+        """True only for text/scalars and nests of them.
+
+        A column name says nothing about its contents: `messages` holds a list of
+        turns whose content can be inline image parts, and dropping that column
+        would drop the images. So anything the text path cannot encode -- a dict
+        naming media, a PIL image, bytes -- is not plain text.
         """
-        if dataset is None:
-            return False
-
-        def _text_only(names):
-            names = set(names)
-            return "input_ids" in names and names.isdisjoint(_MULTIMODAL_COLUMNS)
-
-        try:
-            names = getattr(dataset, "column_names", None)
-            if isinstance(names, dict):  # DatasetDict
-                names = [c for v in names.values() for c in (v or [])]
-            if names:
-                return _text_only(names)
-            # No column_names (IterableDataset and friends): peek one row.
-            for row in dataset:
-                return isinstance(row, dict) and _text_only(row.keys())
-        except Exception:
-            return False
+        if isinstance(value, str) or value is None: return True
+        if isinstance(value, (bool, int, float)): return True
+        if _depth >= 6: return False
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str): return False
+                if key.lower() in _MEDIA_KEYS: return False
+                if not _is_plain_text(item, _depth + 1): return False
+            kind = value.get("type")
+            if isinstance(kind, str) and kind.lower() in _MEDIA_KEYS: return False
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(_is_plain_text(v, _depth + 1) for v in value)
         return False
     pass
 
+    def _row_is_plain_text(row):
+        # Tokenizer/model columns are numeric by construction; the rest is what
+        # can smuggle in images.
+        return all(_is_plain_text(v) for k, v in row.items() if k not in _TEXT_COLUMNS)
+    pass
+
+    def _split_views(dataset):
+        """`(column names, first row)` per split, row `None` when unreadable.
+
+        `iter()` restarts a datasets IterableDataset, so peeking one row does not
+        consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
+        """
+        splits = list(dataset.values()) if isinstance(dataset, dict) else [dataset]
+        views = []
+        for split in splits:
+            if split is None: continue
+            names = getattr(split, "column_names", None)
+            if isinstance(names, dict): names = None
+            row = None
+            try:
+                row = next(iter(split))
+            except StopIteration:
+                row = None          # empty split: nothing to inspect
+            except Exception:
+                if not names: raise
+            if not isinstance(row, dict): row = None
+            if not names:
+                if row is None: raise ValueError("Unsloth: cannot read the dataset columns")
+                names = list(row.keys())
+            views.append((set(names), row))
+        return views
+    pass
+
+    def _dataset_is_pretokenized(dataset):
+        """True when rows carry `input_ids` and nothing but plain text beside them,
+        i.e. text tokenized up front where dataset-level masking is correct.
+        Multimodal or unreadable rows return False, keeping the caller's old refusal
+        (the text path swaps in a text collator and would drop the image handling).
+        """
+        if dataset is None:
+            return False
+        try:
+            views = _split_views(dataset)
+        except Exception:
+            return False
+        if not views: return False
+        for names, row in views:
+            if "input_ids" not in names: return False
+            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            # Columns look text-only, so check the values: a `messages` column can
+            # carry inline images that the strip below would throw away.
+            if row is not None and not _row_is_plain_text(row): return False
+        return True
+    pass
+
     def _eval_split_is_raw_text_only(dataset):
-        """True when an eval split carries no `input_ids` but a text column.
+        """True when an eval split carries no `input_ids` but a real string column.
 
         Eval only: train must still be pretokenized, since that is the evidence
         the run is text-only, and `_maybe_tokenize_dataset` below tokenizes a raw
-        eval split with the same text tokenizer. A split with neither `input_ids`
-        nor a text column stays refused, which keeps conversational multimodal
-        splits (`messages` alone, images inline) on the old refusal.
+        eval split with the same text tokenizer. The column it would tokenize has
+        to hold strings, not conversations: a list of turns needs a chat template,
+        and its content can be inline images.
         """
         if dataset is None:
             return False
         text_field = getattr(getattr(trainer, "args", None), "dataset_text_field", None) or "text"
-
-        def _raw_text(names):
-            names = set(names)
-            if "input_ids" in names: return False
-            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
-            return text_field in names or "text" in names
-
         try:
-            names = getattr(dataset, "column_names", None)
-            if isinstance(names, dict):  # DatasetDict
-                names = [c for v in names.values() for c in (v or [])]
-            if names:
-                return _raw_text(names)
-            # No column_names (IterableDataset and friends): peek one row.
-            for row in dataset:
-                return isinstance(row, dict) and _raw_text(row.keys())
+            views = _split_views(dataset)
         except Exception:
             return False
-        return False
+        if not views: return False
+        for names, row in views:
+            if "input_ids" in names: return False
+            if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            # The column `_maybe_tokenize_dataset` would actually read.
+            field = text_field if text_field in names else "text"
+            if field not in names: return False
+            if row is not None:
+                if not isinstance(row.get(field), str): return False
+                if not _row_is_plain_text(row): return False
+        return True
     pass
 
     data_collator = getattr(trainer, "data_collator", None)
