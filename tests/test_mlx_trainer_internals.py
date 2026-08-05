@@ -8385,6 +8385,52 @@ def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():
     )
 
 
+def test_wsd_tail_holds_at_min_lr_ratio():
+    """Past warmup+stable+decay HF returns min_lr_ratio, flat.
+
+    Evaluating the cosine at a clipped local progress of 1 only coincides with
+    that at the default num_cycles=0.5; a full wave lands back on peak LR.
+    """
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup, stable, decay = 2e-4, 60, 5, 10, 20
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay",
+    )
+    for num_cycles in (0.5, 1.0, 1.5):
+        trainer.args.lr_scheduler_kwargs = {
+            "num_stable_steps": stable,
+            "num_decay_steps": decay,
+            "min_lr_ratio": 0.1,
+            "num_cycles": num_cycles,
+        }
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * optimization._get_wsd_scheduler_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_stable_steps=stable,
+                num_decay_steps=decay,
+                warmup_type="linear",
+                decay_type="cosine",
+                min_lr_ratio=0.1,
+                num_cycles=num_cycles,
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), num_cycles
+        tail = got[warmup + stable + decay:]
+        assert tail == pytest.approx([lr * 0.1] * len(tail), abs=1e-9), num_cycles
+
+
 def test_build_schedule_reads_hf_lr_scheduler_kwargs():
     """A ported HF/TRL config carries scheduler knobs in lr_scheduler_kwargs.
 

@@ -3629,25 +3629,32 @@ class MLXTrainer:
         # optional `num_stable_steps`; express both as a fraction of the
         # post-warmup window. With neither set, decay spans the whole window.
         decay_window = max(total_steps - warmup, 1)
-        wsd_decay_frac = 1.0
-        wsd_stable_frac = 0.0
+        wsd_stable_steps = 0.0
+        wsd_decay_steps = float(decay_window)
         if sched_type == "warmup_stable_decay":
             num_decay_steps = sched_kwargs.get("num_decay_steps")
             num_stable_steps = sched_kwargs.get("num_stable_steps")
             if num_stable_steps is not None:
-                wsd_stable_frac = min(
-                    max(float(num_stable_steps) / decay_window, 0.0), 1.0
+                wsd_stable_steps = min(
+                    max(float(num_stable_steps), 0.0), float(decay_window)
                 )
-                wsd_decay_frac = (
-                    min(max(float(num_decay_steps) / decay_window, 0.0), 1.0)
+                wsd_decay_steps = (
+                    min(max(float(num_decay_steps), 0.0), float(decay_window))
                     if num_decay_steps is not None
-                    else max(1.0 - wsd_stable_frac, 0.0)
+                    else decay_window - wsd_stable_steps
                 )
             elif num_decay_steps is not None:
-                wsd_decay_frac = min(
-                    max(float(num_decay_steps) / decay_window, 0.0), 1.0
+                wsd_decay_steps = min(
+                    max(float(num_decay_steps), 0.0), float(decay_window)
                 )
-                wsd_stable_frac = max(1.0 - wsd_decay_frac, 0.0)
+                wsd_stable_steps = decay_window - wsd_decay_steps
+        wsd_stable_frac = wsd_stable_steps / decay_window
+        wsd_decay_frac = wsd_decay_steps / decay_window
+        # The tail boundary is compared in step space, not against
+        # wsd_stable_frac + wsd_decay_frac: two separately rounded fractions
+        # need not sum to the fraction of the boundary step, and a 1-ULP miss
+        # there puts the boundary step back on the cosine.
+        wsd_tail_start = float(warmup) + wsd_stable_steps + wsd_decay_steps
 
         if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
             return lr
@@ -3794,6 +3801,16 @@ class MLXTrainer:
                     in_stable,
                     mx.array(1.0, dtype=mx.float32),
                     decay_phase,
+                )
+                # Past warmup + stable + decay HF returns min_lr_ratio flat
+                # (optimization.py:503). Clipping local progress to 1 instead
+                # keeps evaluating the cosine, which for a whole wave
+                # (num_cycles=1.0) puts the tail back at peak LR. 0 here is the
+                # floor after the min_lr_rate rescale below.
+                decay = mx.where(
+                    step >= mx.array(wsd_tail_start, dtype=mx.float32),
+                    mx.array(0.0, dtype=mx.float32),
+                    decay,
                 )
             else:  # constant / constant_with_warmup
                 decay = mx.array(1.0, dtype=mx.float32)
