@@ -600,6 +600,11 @@ def train_on_responses_only(
         _map_kwargs = {"batched": True, "num_proc": _effective_num_proc(dataset)}
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
+        # Drop the raw columns we just tokenized. Keeping them would hand the
+        # collator a string column it cannot stack into a tensor.
+        _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
+        if not isinstance(_raw_columns, dict):
+            _map_kwargs["remove_columns"] = list(_raw_columns)
         import warnings as _w
         with _w.catch_warnings():
             _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
@@ -904,6 +909,40 @@ def train_on_responses_only(
             if _same_class and hasattr(_collator, name)
         }
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
+
+        # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
+        # handed, so a raw `text`/`messages` column left on an already tokenized
+        # split kills the first batch. The trainer normally strips it, but not
+        # when unused-column removal is off (token-type-id models above turn it
+        # off). Drop by value shape so numeric model columns are all kept.
+        import numbers as _numbers
+        def _cannot_be_tensorized(value):
+            while isinstance(value, (list, tuple)):
+                if len(value) == 0: return False
+                value = value[0]
+            if value is None: return True
+            # Tensor, ndarray or numpy scalar: already numeric.
+            if hasattr(value, "dtype"): return False
+            return not isinstance(value, _numbers.Number)
+        def _drop_raw_columns(dataset):
+            if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
+            try:
+                row = next(iter(dataset))
+                names = getattr(dataset, "column_names", None) or list(row.keys())
+                if isinstance(names, dict): return dataset
+                drop = [c for c in names if c in row and _cannot_be_tensorized(row[c])]
+            except Exception:
+                return dataset
+            return dataset.remove_columns(drop) if drop else dataset
+        if hasattr(trainer, "train_dataset"):
+            trainer.train_dataset = _drop_raw_columns(trainer.train_dataset)
+        _eval_now = getattr(trainer, "eval_dataset", None)
+        if type(_eval_now) is dict:
+            for _key in list(_eval_now.keys()):
+                _eval_now[_key] = _drop_raw_columns(_eval_now[_key])
+        elif _eval_now is not None:
+            trainer.eval_dataset = _drop_raw_columns(_eval_now)
+    pass
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
     from .training_utils import fix_zero_training_loss

@@ -353,3 +353,95 @@ def test_a_real_tokenizer_padding_collator_is_untouched_under_packing():
     trainer.args.packing = True
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert out.data_collator is collator
+
+
+# ---- raw columns must not reach the collator -------------------------------
+
+class StrictPadTokenizer(StubTokenizer):
+    """Pads like the real thing: it tensorizes every key it is handed, so a raw
+    string column raises exactly as `tokenizer.pad(return_tensors = "pt")` does."""
+    def pad(self, features, **kwargs):
+        for feature in features:
+            for key, value in feature.items():
+                probe = value
+                while isinstance(probe, (list, tuple)) and probe:
+                    probe = probe[0]
+                if not isinstance(probe, (int, float, bool)):
+                    raise ValueError(
+                        f"Unable to create tensor ... (`{key}` in this case)"
+                    )
+        return StubTokenizer.pad(self, features, **kwargs)
+
+
+class StrictProcessor(StubProcessor):
+    def __init__(self):
+        super().__init__()
+        self.tokenizer = StrictPadTokenizer()
+
+
+def _collate_every_row(trainer):
+    dataset = trainer.train_dataset
+    return trainer.data_collator([dataset[i] for i in range(len(dataset))])
+
+
+def test_a_leftover_text_column_never_reaches_the_collator():
+    """Pretokenizing with `dataset.map` and no `remove_columns` leaves `text`
+    behind. Unused-column removal is off for token-type-id models, so the raw
+    string reaches the swapped-in collator and dies while tensorizing."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "text": ["q0", "q1"],
+    })
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), dataset)
+    trainer.processing_class = StrictProcessor()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "text" not in out.train_dataset.column_names
+    _collate_every_row(out)     # used to raise ValueError while tensorizing
+
+
+def test_a_leftover_conversational_column_never_reaches_the_collator():
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "messages": [[{"role": "user", "content": "q"}]] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), dataset)
+    trainer.processing_class = StrictProcessor()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "messages" not in out.train_dataset.column_names
+    _collate_every_row(out)
+
+
+def test_numeric_model_columns_survive_the_strip():
+    """token_type_ids is exactly why unused-column removal was turned off, so
+    dropping raw columns must not take it (or any other numeric column) along."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "token_type_ids": [[0] * len(ROW)] * 2,
+        "text": ["q0", "q1"],
+    })
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), dataset)
+    trainer.processing_class = StrictProcessor()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    for column in ("input_ids", "attention_mask", "token_type_ids", "labels"):
+        assert column in out.train_dataset.column_names, column
+    assert "text" not in out.train_dataset.column_names
+
+
+def test_a_tokenized_eval_split_keeps_no_raw_text():
+    """The raw eval split the bypass tokenizes for the user must come back with
+    the text column replaced, not beside it."""
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), _text_rows())
+    trainer.processing_class = StrictProcessor()
+    trainer.eval_dataset = {"raw": _raw_text_rows(), "pretok": _text_rows()}
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "text" not in out.eval_dataset["raw"].column_names
+    assert "labels" in out.eval_dataset["raw"].column_names
