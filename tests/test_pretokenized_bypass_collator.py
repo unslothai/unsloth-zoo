@@ -548,3 +548,152 @@ def test_model_and_processor_declared_inputs_survive():
                    "deepstack_visual_embeds"):
         assert column in kept, column
     assert "id" not in kept
+
+
+# ---- the multimodal set follows the installed processor --------------------
+
+class DerivedProcessor(StubProcessor):
+    """A processor whose image half declares its own output names, the way every
+    transformers image processor / feature extractor does."""
+    def __init__(self, image_names = (), own_names = ()):
+        super().__init__()
+        self.image_processor = type("ImageProcessor", (), {
+            "model_input_names": list(image_names),
+        })()
+        if own_names:
+            self.model_input_names = list(self.tokenizer.model_input_names) + list(own_names)
+
+
+def _refuses(dataset, processor):
+    trainer = StubTrainer(MyVisionCollator(processor), dataset)
+    trainer.processing_class = processor
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    return trainer
+
+
+@pytest.mark.parametrize("column", ["image_patches", "image_patches_indices"])
+def test_fuyu_style_image_columns_are_refused(column):
+    """Fuyu spells its preprocessed images `image_patches`/`image_patches_indices`
+    beside `input_ids`, so the columns alone look text-only."""
+    from transformers.models.fuyu.image_processing_fuyu import FuyuImageProcessor
+
+    processor = DerivedProcessor(
+        image_names = FuyuImageProcessor.model_input_names,
+        # FuyuProcessor.model_input_names adds this one on top of the image half.
+        own_names = ["image_patches", "image_patches_indices"],
+    )
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: [[0.0], [0.0]],
+    })
+    trainer = _refuses(dataset, processor)
+    assert isinstance(trainer.data_collator, MyVisionCollator)
+
+
+def test_a_column_name_this_file_has_never_heard_of_is_refused():
+    """The point of deriving: a processor output no static list mentions still
+    keeps the user's collator."""
+    processor = DerivedProcessor(image_names = ["widget_patches", "widget_offsets"])
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "widget_patches": [[0.0], [0.0]],
+    })
+    _refuses(dataset, processor)
+
+
+def test_a_raw_eval_split_with_a_derived_column_is_refused():
+    """`_eval_split_is_raw_text_only` reads the same set."""
+    processor = DerivedProcessor(image_names = ["widget_patches"])
+    trainer = StubTrainer(MyVisionCollator(processor), _text_rows())
+    trainer.processing_class = processor
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "widget_patches": [[0.0]],
+    })
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_deriving_never_denylists_the_text_columns():
+    """An image processor that repeats `input_ids`/`attention_mask` must not turn
+    every text-only row into a refusal."""
+    processor = DerivedProcessor(
+        image_names = ["input_ids", "attention_mask", "token_type_ids", "labels"],
+    )
+    trainer = StubTrainer(MyVisionCollator(processor), _text_rows())
+    trainer.processing_class = processor
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.train_dataset.column_names
+
+
+# ---- a DatasetDict eval is a dict of splits, not one dataset ---------------
+
+def test_a_datasetdict_eval_is_normalized_per_split():
+    """`type(x) is dict` is False for a DatasetDict, so the eval branches used to
+    treat the whole mapping as one dataset: `column_names` came back a dict, the
+    raw `text` column was never dropped, and the collator died tensorizing it."""
+    from datasets import DatasetDict
+
+    trainer = StubTrainer(MyVisionCollator(StrictProcessor()), _text_rows())
+    trainer.processing_class = StrictProcessor()
+    trainer.eval_dataset = DatasetDict({"raw": _raw_text_rows(),
+                                        "pretok": _text_rows()})
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    for key in ("raw", "pretok"):
+        columns = out.eval_dataset[key].column_names
+        assert "labels" in columns, f"{key} was never masked"
+        assert "text" not in columns, f"{key} kept its raw text column"
+        split = out.eval_dataset[key]
+        out.data_collator([split[i] for i in range(len(split))])
+
+
+def test_a_multimodal_split_in_a_datasetdict_eval_still_refuses():
+    from datasets import DatasetDict
+
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = DatasetDict({"a": _text_rows(), "b": _multimodal_rows()})
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_iterable_datasetdict_eval_is_normalized_per_split():
+    from datasets import IterableDatasetDict
+
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
+    trainer.eval_dataset = IterableDatasetDict(
+        {"a": _text_rows().to_iterable_dataset()},
+    )
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in next(iter(out.eval_dataset["a"]))
+
+
+# ---- a fresh streaming dataset carries no batch_size -----------------------
+
+def test_a_pretokenized_streaming_dataset_reaches_masking():
+    """The bypass accepts an IterableDataset, so the map below must not read a
+    `_ex_iterable.batch_size` a fresh ArrowExamplesIterable does not have."""
+    dataset = _text_rows().to_iterable_dataset()
+    assert not hasattr(dataset._ex_iterable, "batch_size")
+
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    row = next(iter(out.train_dataset))     # used to raise AttributeError
+    assert [l for l in row["labels"] if l != -100] == [20, 21]
+
+
+def test_a_columnless_streaming_dataset_reaches_masking():
+    """`load_dataset(streaming = True)` can resolve no features, so the bypass
+    peeks a row instead - and the same map still has to run."""
+    dataset = _text_rows().to_iterable_dataset()
+    dataset._info.features = None       # what an unresolved stream looks like
+    assert dataset.column_names is None
+    assert not hasattr(dataset._ex_iterable, "batch_size")
+
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    row = next(iter(out.train_dataset))     # used to raise AttributeError
+    assert [l for l in row["labels"] if l != -100] == [20, 21]

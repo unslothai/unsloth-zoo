@@ -737,6 +737,7 @@ def train_on_responses_only(
     pass
 
     # Processor outputs beside `input_ids`; a row with any of these needs its collator.
+    # Only the floor: the real set is derived below from the installed processor.
     _MULTIMODAL_COLUMNS = frozenset((
         "pixel_values", "pixel_values_videos", "pixel_attention_mask",
         "image_grid_thw", "video_grid_thw", "image_sizes", "image_sizes_videos",
@@ -747,7 +748,44 @@ def train_on_responses_only(
         # Processor-specific spellings: phi4_multimodal, pix2struct, kosmos-2.5.
         "image_pixel_values", "audio_input_features", "audio_embed_sizes",
         "high_res_pixel_values", "flattened_patches",
+        # Fuyu keeps its preprocessed images here, beside `input_ids`.
+        "image_patches", "image_patches_indices",
     ))
+
+    # Names the text tokenizer owns; a processor half repeating one of these must
+    # not turn every text-only row into a refusal.
+    _TEXT_COLUMNS = frozenset((
+        "input_ids", "attention_mask", "token_type_ids", "position_ids",
+        "labels", "label", "label_ids", "special_tokens_mask",
+        "offset_mapping", "length",
+    ))
+
+    def _derive_multimodal_columns():
+        """The non-text names this processor actually produces.
+
+        A hand list rots: Fuyu emits `image_patches`/`image_patches_indices` and
+        every new model spells its own. Each processor half declares its outputs
+        in `model_input_names`, so ask them and subtract the text half.
+        """
+        names = set()
+        holders = [getattr(processor, attr, None) for attr in
+                   ("image_processor", "video_processor", "feature_extractor",
+                    "audio_processor", "qformer_tokenizer")]
+        # The processor's own list merges text and vision (that is the only place
+        # FuyuProcessor names `image_patches_indices`), so take it too.
+        if processor is not tokenizer: holders.append(processor)
+        for holder in holders:
+            if holder is None: continue
+            try: names.update(getattr(holder, "model_input_names", None) or ())
+            except Exception: pass
+        names -= set(getattr(tokenizer, "model_input_names", None) or ())
+        return frozenset(names - _TEXT_COLUMNS)
+    pass
+
+    try:
+        _MULTIMODAL_COLUMNS = _MULTIMODAL_COLUMNS | _derive_multimodal_columns()
+    except Exception:
+        pass
 
     def _dataset_is_pretokenized(dataset):
         """True when rows carry `input_ids` and no image/video/audio column, i.e.
@@ -873,8 +911,10 @@ def train_on_responses_only(
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
-        # Eval datasets could be a dict!
-        if type(trainer.eval_dataset) is dict:
+        # Eval datasets could be a dict! DatasetDict subclasses dict, so match on
+        # isinstance: `type(...) is dict` sent it down the single-dataset path,
+        # where column_names is a dict of splits and every per-split step no-ops.
+        if isinstance(trainer.eval_dataset, dict):
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -985,7 +1025,7 @@ def train_on_responses_only(
         if hasattr(trainer, "train_dataset"):
             trainer.train_dataset = _drop_raw_columns(trainer.train_dataset)
         _eval_now = getattr(trainer, "eval_dataset", None)
-        if type(_eval_now) is dict:
+        if isinstance(_eval_now, dict):
             for _key in list(_eval_now.keys()):
                 _eval_now[_key] = _drop_raw_columns(_eval_now[_key])
         elif _eval_now is not None:
