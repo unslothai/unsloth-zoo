@@ -76,6 +76,20 @@ class EmptyLogits:
     __getattr__ = raise_getattr_error
 
 
+@pytest.fixture(autouse = True)
+def _pin_the_accelerate_device(monkeypatch):
+    """`accelerate.PartialState` is a process-global borg. Anything earlier in
+    the session that builds an Accelerator (many tests here do) leaves
+    `_shared_state["device"] = cuda`, and the fallback below then allocates its
+    scalar there, where it meets the CPU tensors in these tests and raises
+    "Expected all tensors to be on the same device". Pinned so the result of
+    this module does not depend on what ran before it in the same process; the
+    two device tests set their own value on top of it.
+    """
+    state = pytest.importorskip("accelerate.state")
+    monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
+
+
 @pytest.fixture(scope="module")
 def patched():
     trl_utils = pytest.importorskip("trl.trainer.utils")
