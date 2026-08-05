@@ -982,6 +982,9 @@ def create_new_function(
     imports += "from torch.nn import functional as F\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
+    if "_maybe_compile" in new_source:
+        # Decorators travel with the copied source, so the name must resolve here.
+        imports += "from unsloth_zoo.temporary_patches.common import _maybe_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
     if (
