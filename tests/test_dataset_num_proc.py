@@ -1213,9 +1213,9 @@ def test_the_unaided_reader_picks_the_right_line_under_systemd_hybrid(
 ):
     """v1 and v2 lines share /proc/self/cgroup, and the v2 one is not first.
 
-    Both readers scan for their own line rather than taking line 0 for exactly
-    this layout, so a fixture where the first line is the wrong flavour is what
-    holds that scan in place.
+    This pins the v2 scan: the v1 line comes first, so taking line 0 would miss
+    the "0::" path entirely. The v1 scan has its own case below, since here its
+    own flavour is already the first line.
     """
     _no_hf_xet_tuning(monkeypatch)
     v2_leaf = tmp_path / "user.slice" / "app.scope"
@@ -1322,5 +1322,51 @@ def test_standardize_data_formats_passes_no_num_proc_for_an_iterable_dataset():
         dataset_utils.standardize_data_formats(streaming)
     finally:
         type(streaming).map = original
+    assert captured, "map() was never called, so this asserts nothing"
     assert "num_proc" not in captured, "IterableDataset.map() has no such parameter"
+
+
+def test_the_unaided_reader_picks_its_own_v1_line_too(monkeypatch, dnp, tmp_path):
+    """The other half of the scan: a v1 line that is not the first line.
+
+    The hybrid case above puts the memory controller first, so taking line 0
+    would still land on it. Here a pids line comes first and the memory
+    controller sits at a different path, which is what a Slurm step looks like:
+    reading line 0 walks a directory that does not exist and loses the ceiling
+    the step was given.
+    """
+    _no_hf_xet_tuning(monkeypatch)
+    v2_leaf = tmp_path / "user.slice" / "app.scope"
+    v2_leaf.mkdir(parents = True)
+    (v2_leaf / "memory.max").write_text("8589934592\n")
+    (v2_leaf / "memory.current").write_text("6442450944\n")
+    # 4GB capped, 3 spent: 1GB free, which is less than the v2 side's 2GB.
+    v1_leaf = tmp_path / "memory" / "slurm" / "job_1"
+    v1_leaf.mkdir(parents = True)
+    (v1_leaf / "memory.limit_in_bytes").write_text("4294967296\n")
+    (v1_leaf / "memory.usage_in_bytes").write_text("3221225472\n")
+
+    monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        dnp,
+        "_proc_self_cgroup",
+        lambda: [
+            "11:pids:/user.slice/user-1000.slice/session-3.scope",
+            "10:memory:/slurm/job_1",
+            "0::/user.slice/app.scope",
+        ],
+    )
+    assert dnp._cgroup_free_bytes() == 1024**3
+
+
+def test_the_hatch_wins_on_a_small_split_too(monkeypatch, dnp):
+    """A split under the threshold is where the resolver would otherwise stand
+    down, and standing down there would silently discard the count a user set
+    by hand to get workers on a small dataset."""
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_stdlib_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "16")
+
+    small = type("t", (), {"train_dataset": _Split(100)})()
+    assert dnp.resolve_responses_only_num_proc(small, None) == 16
 
