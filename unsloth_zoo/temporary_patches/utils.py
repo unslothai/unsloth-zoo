@@ -36,8 +36,12 @@ __all__ = [
     "ProcessorMixin",
     "_get_unique_storage_name",
     "dedent",
+    "eager_fallback_state",
+    "force_eager_fallback",
 ]
+import functools
 import inspect
+import weakref
 import typing as t
 import torch
 from textwrap import dedent
@@ -661,6 +665,252 @@ def _get_unique_storage_name(
 pass
 
 
+def _recompile_limit_errors():
+    """Dynamo's cache-exhaustion exceptions on whichever torch is installed.
+
+    Looked up by name: torch 2.6 to 2.11 do not agree on which exist, and a
+    missing one must not stop the tuple from being built.
+    """
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        return ()
+    found = []
+    for _n in ("FailOnRecompileLimitHit", "RecompileLimitExceeded",
+               "CacheLimitExceeded"):
+        _e = getattr(_exc, _n, None)
+        if isinstance(_e, type) and issubclass(_e, BaseException):
+            found.append(_e)
+    return tuple(found)
+
+
+def _wants_hard_recompile_failure():
+    """Did the user ask Dynamo to make cache exhaustion fatal?
+
+    torch raises FailOnRecompileLimitHit from two branches with the same class
+    -- this flag, and fullgraph=True -- so the exception cannot tell them
+    apart. Falling back to eager is right for the second and wrong for the
+    first, whose whole purpose is to stop the run. Read the flag instead.
+    Renamed in 2.7 (fail_on_cache_limit_hit -> fail_on_recompile_limit_hit)
+    with the old name kept as an alias, so check both to cover 2.6.
+    """
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return False
+    return bool(getattr(_config, "fail_on_recompile_limit_hit", False) or
+                getattr(_config, "fail_on_cache_limit_hit", False))
+
+
+def _disabled_hook_graph_break_error():
+    """Dynamo's graph-break exception, if this torch has one."""
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        return ()
+    _e = getattr(_exc, "Unsupported", None)
+    if isinstance(_e, type) and issubclass(_e, BaseException):
+        return (_e,)
+    return ()
+
+
+def _is_recompile_limit_unsupported(exc):
+    """Cache exhaustion reported as a plain graph break.
+
+    torch 2.4 has no exception class for it: `convert_frame` ends the
+    cache-limit branch in `unimplemented(f"{limit_type} reached")`, which
+    raises `Unsupported`, so `_recompile_limit_errors()` is empty there and
+    the message is all that is left to match on. 2.5 added `CacheLimitExceeded`
+    and 2.6 `RecompileLimitExceeded`, but both still fall through to the same
+    `unimplemented` when `skip_code_recursive_on_cache_limit_hit` is off.
+
+    `limit_type` is `cache_size_limit` or `accumulated_cache_size_limit`,
+    renamed to `recompile_limit` / `accumulated_recompile_limit` in torch 2.7.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return ("cache_size_limit reached" in text
+            or "recompile_limit reached" in text)
+
+
+# The complete set of texts Dynamo uses to refuse a disabled callable, one per
+# wording, each a literal from the single `_torchdynamo_disable` branch of
+# `UserFunctionVariable.call_function` in `torch/_dynamo/variables/functions.py`.
+# Nothing else in Dynamo emits them, which is what keeps the match narrow.
+#
+#   torch 2.4 to 2.6  unimplemented(f"call torch._dynamo.disable() wrapped
+#                     function {self.value}")   (2.4.0 L604, 2.5.1 L655, 2.6.0 L620)
+#   torch 2.7+        unimplemented_v2(gb_type="Skip calling
+#                     `torch.compiler.disable()`d function", ...)  (2.7.0 L1173)
+#
+# Both spellings stay listed: pyproject allows torch>=2.4, and the older one is
+# all those releases ever emit.
+_DISABLED_HOOK_SIGNATURES = (
+    ("Skip calling", "torch.compiler.disable"),
+    ("torch._dynamo.disable() wrapped function",),
+)
+
+
+def _is_our_own_disabled_hook(exc):
+    """Did we break our own graph with our own `torch.compiler.disable`?
+
+    Our `torch.compiler.disable`d requires_grad hooks can be invoked from
+    inside a `fullgraph = True` region, and Dynamo refuses with
+
+        Unsupported: Skip calling `torch.compiler.disable()`d function
+
+    or, before torch 2.7 renamed it,
+
+        Unsupported: call torch._dynamo.disable() wrapped function <...>
+
+    Matched narrowly on those signatures: any other graph break under fullgraph
+    must still raise, since those point at real problems.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return any(
+        all(part in text for part in signature)
+        for signature in _DISABLED_HOOK_SIGNATURES
+    )
+
+
+def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
+    """Run eager instead of dying when the recompile cache is exhausted.
+
+    `fullgraph = True` makes Dynamo raise on cache exhaustion rather than fall
+    back, turning a performance problem into a hard training failure:
+
+        FailOnRecompileLimitHit: recompile_limit reached with fullgraph=True
+
+    Only cache exhaustion and our own disabled-hook graph break are caught, so
+    any other graph break under fullgraph still raises exactly as before.
+
+    The fallback LATCHES. Do not make it retry per call. Non-reentrant
+    activation checkpointing recomputes each packed forward during backward and
+    compares the saved intermediates, and a compiled pack recomputed eagerly
+    aborts the backward with "Something went unexpectedly wrong in activation
+    checkpoint". Per-call retry does not fix that: the pack and the recompute
+    run under different guards (grad mode differs, and the recompute is inside
+    backward), so the compiler can succeed for one and raise for the other in
+    either direction. Latching makes every call after the first failure eager,
+    so every later pack and recompute agree.
+
+    That leaves one mixed step, the one during which the latch flips. See
+    `force_eager_fallback` below, which unsloth uses to close it.
+    """
+    errors = _recompile_limit_errors()
+    graph_break_errors = _disabled_hook_graph_break_error()
+    if not errors and not graph_break_errors:
+        return compiled_func
+
+    # Warn once. The condition repeats every call, and the log should not.
+    state = {"warned": False, "eager": False}
+
+    def _warn(message):
+        if not state["warned"]:
+            state["warned"] = True
+            logger.warning(message)
+
+    @functools.wraps(eager_func)
+    def wrapper(*args, **kwargs):
+        if state["eager"]:
+            return eager_func(*args, **kwargs)
+        try:
+            return compiled_func(*args, **kwargs)
+        except errors as e:
+            if _wants_hard_recompile_failure():
+                raise
+            state["eager"] = True
+            _warn(
+                f"Unsloth: torch.compile ran out of recompilation cache for "
+                f"{label}; running it eagerly from here. Training is "
+                f"unaffected apart from speed. ({type(e).__name__})"
+            )
+            return eager_func(*args, **kwargs)
+        except graph_break_errors as e:
+            # Cache exhaustion on a torch that has no exception class for it
+            # (2.4), then our own `torch.compiler.disable` hook. Anything else
+            # is a real graph break and must keep raising.
+            if _is_recompile_limit_unsupported(e):
+                state["eager"] = True
+                _warn(
+                    f"Unsloth: torch.compile ran out of recompilation cache "
+                    f"for {label}; running it eagerly from here. Training is "
+                    f"unaffected apart from speed. ({type(e).__name__})"
+                )
+                return eager_func(*args, **kwargs)
+            if not _is_our_own_disabled_hook(e):
+                raise
+            state["eager"] = True
+            _warn(
+                f"Unsloth: torch.compile hit one of Unsloth's own "
+                f"`torch.compiler.disable`d gradient-checkpointing hooks "
+                f"inside {label}; running it eagerly from here. Training is "
+                f"unaffected apart from speed."
+            )
+            return eager_func(*args, **kwargs)
+
+    # Keep the compiled callable reachable for anything that unwraps it, and
+    # keep `get_compiler_config` present so the unwrap check below still sees
+    # a compiled function and reaches `__wrapped__` (the eager original).
+    wrapper._unsloth_compiled_func = compiled_func
+    _gcc = getattr(compiled_func, "get_compiler_config", None)
+    if _gcc is not None:
+        wrapper.get_compiler_config = _gcc
+
+    wrapper._unsloth_fallback_state = state
+    wrapper._unsloth_fallback_label = label
+    _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
+    return wrapper
+
+
+# Every wrapper built above, weakly, so a patched-then-discarded model does not
+# keep its functions alive. Weak refs also mean the registry cannot report a
+# switch for something nobody is calling any more.
+_EAGER_FALLBACK_WRAPPERS: list = []
+
+
+def eager_fallback_state() -> dict[str, bool]:
+    """{label: already fell back} for every live wrapper. For tests and logs."""
+    out = {}
+    for ref in _EAGER_FALLBACK_WRAPPERS:
+        w = ref()
+        if w is not None:
+            out[w._unsloth_fallback_label] = bool(w._unsloth_fallback_state["eager"])
+    return out
+
+
+def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
+    """Latch every wrapper to eager. Returns how many are eager afterwards.
+
+    For unsloth to call when a backward dies inside activation checkpointing,
+    so the retry of that step is consistent. The limit is hit per function, so
+    one fallback can strand a checkpointed region spanning several; switching
+    them together removes the whole class of mismatch.
+
+    Returns a count of live wrappers, not of changes: the wrapper that caused
+    the trouble has already latched itself, so "how many changed" would be 0 in
+    exactly the case that matters.
+
+    `only_if_already_triggered` refuses to switch off compilation for a model
+    that never fell back. A caller that gets 0 has learned the checkpoint
+    assertion was not a compile-mode flip, and should re-raise rather than
+    retry.
+    """
+    live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
+            if w is not None]
+    if only_if_already_triggered and not any(
+            w._unsloth_fallback_state["eager"] for w in live):
+        return 0
+    for w in live:
+        w._unsloth_fallback_state["eager"] = True
+    return len(live)
+
+
 def patch_function(
     target_obj: Any,
     attr_name: str,
@@ -686,12 +936,20 @@ def patch_function(
             new_func = new_func.__wrapped__
         if hasattr(original_func, "get_compiler_config"):
             original_func = original_func.__wrapped__
+        _eager_func = new_func
         new_func = torch.compile(
             new_func,
             fullgraph = fullgraph,
             dynamic = dynamic,
             options = torch_compile_options,
         )
+        if fullgraph:
+            # Only fullgraph turns cache exhaustion into a raise; without it
+            # Dynamo already falls back on its own.
+            new_func = _fall_back_to_eager_on_recompile_limit(
+                new_func, _eager_func,
+                f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+            )
     pass
 
     # Stash original under a unique name for later restoration.
