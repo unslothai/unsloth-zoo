@@ -28,6 +28,7 @@ The fallback is narrow on purpose. A genuine graph break under fullgraph
 still raises, because that is a correctness signal about the patch itself.
 """
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -328,37 +329,50 @@ if __name__ == "__main__":
 
 # ---- the one case where falling back is the wrong answer ------------------
 
+@contextlib.contextmanager
+def _hard_failure(enabled):
+    """Set whichever spelling this torch has, and put it back.
+
+    2.6 only has fail_on_cache_limit_hit; 2.7 renamed it to
+    fail_on_recompile_limit_hit and kept the old name as an alias. Reading a
+    fixed name here would AttributeError on 2.6, which pyproject allows.
+    """
+    import torch._dynamo.config as config
+
+    names = [n for n in ("fail_on_recompile_limit_hit", "fail_on_cache_limit_hit")
+             if hasattr(config, n)]
+    if not names:
+        pytest.skip("this torch has no recompile-limit hard-failure flag")
+    previous = {n: getattr(config, n) for n in names}
+    # One name, since on 2.7+ the second is an alias of the first and writing
+    # both would just set the same value twice.
+    setattr(config, names[0], enabled)
+    try:
+        yield
+    finally:
+        for n, v in previous.items():
+            setattr(config, n, v)
+
+
 def test_the_hard_failure_flag_is_respected():
     """torch raises FailOnRecompileLimitHit from two branches with the same
     class: fullgraph=True, where falling back is exactly right, and
     `fail_on_recompile_limit_hit`, where the user asked for the run to stop.
     The exception cannot tell them apart, so the flag has to be read."""
-    import torch._dynamo.config as config
-
     c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
-    previous = config.fail_on_recompile_limit_hit
-    config.fail_on_recompile_limit_hit = True
-    try:
+    with _hard_failure(True):
         with pytest.raises(_LIMIT_ERROR):
             w(3)
-    finally:
-        config.fail_on_recompile_limit_hit = previous
     # Nothing latched either, or a later call would silently go eager.
     assert calls == {"c": 1, "e": 0}
 
 
 def test_the_flag_being_off_keeps_the_fallback():
-    import torch._dynamo.config as config
-
-    previous = config.fail_on_recompile_limit_hit
-    config.fail_on_recompile_limit_hit = False
-    try:
+    with _hard_failure(False):
         c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
         w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
         assert w(3) == 6
-    finally:
-        config.fail_on_recompile_limit_hit = previous
     assert calls == {"c": 1, "e": 1}
 
 
