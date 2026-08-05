@@ -76,7 +76,14 @@ def dnp(monkeypatch):
     try:
         from unsloth_zoo import hf_xet_tuning
     except Exception:
-        hf_xet_tuning = None
+        # Importing the package can fail long after it has imported this
+        # submodule (__init__ pulls in hf_xet_tuning near the top and only
+        # raises "Please install Unsloth" at the end), and the failure removes
+        # unsloth_zoo from sys.modules while leaving unsloth_zoo.hf_xet_tuning
+        # behind. The module under test reaches it through exactly that cache
+        # entry, so treating the failure as absence would leave the real readers
+        # live on the runner's own /sys/fs/cgroup.
+        hf_xet_tuning = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if hf_xet_tuning is not None:
         for name, neutral in (
             ("CGROUP_ROOT", Path("/nonexistent-cgroup-root-for-tests")),
@@ -673,16 +680,18 @@ def test_the_generated_import_works_without_the_escape_hatch():
 
     The test above proves the module is reachable at that dotted path, but it
     sets UNSLOTH_ZOO_DISABLE_GPU_INIT to get there, which no generated file
-    does. This one runs the import a cold compiled cache would run. It can only
-    pass where the package __init__ is satisfied, so it skips rather than fails
-    on an environment without unsloth or torch -- which is the reason the other
-    test exists.
+    does. This one runs the import a cold compiled cache would run.
+
+    UNSLOTH_IS_PRESENT is set rather than skipped on: the package refuses to
+    load without it, and every process that runs a generated trainer file has it
+    because importing unsloth is what generated the file. Skipping on that
+    message instead would retire this canary on any machine where nobody
+    imported unsloth first, which is most of them. A genuinely missing torch is
+    still a skip, since no change here could fix it.
     """
-    result = _import_the_dotted_path()
-    if result.returncode != 0:
-        for expected in ("Please install Unsloth", "Pytorch is not installed"):
-            if expected in result.stderr:
-                pytest.skip(f"the package __init__ cannot load here: {expected}")
+    result = _import_the_dotted_path(UNSLOTH_IS_PRESENT = "1")
+    if result.returncode != 0 and "Pytorch is not installed" in result.stderr:
+        pytest.skip("the package __init__ cannot load here: no torch")
     assert result.returncode == 0, result.stderr[-2000:]
     # The package prints a banner on import, so read the last line, not all of it.
     assert result.stdout.strip().splitlines()[-1] == "unsloth_zoo.dataset_num_proc", (
@@ -1095,3 +1104,21 @@ def test_an_explicit_count_the_host_can_afford_is_untouched_by_the_row_guard(mon
 
     small = type("t", (), {"train_dataset": _Split(100)})()
     assert dnp.resolve_responses_only_num_proc(small, 4) == 4
+
+
+def test_the_fixture_really_neutralises_the_zoo_readers(dnp):
+    """The fixture's patching must survive a package __init__ that raises.
+
+    unsloth_zoo/__init__ imports hf_xet_tuning near the top and can raise at the
+    end, which drops the package from sys.modules but leaves the submodule
+    cached -- and that cache entry is what the policy imports. Patching only on
+    a clean `from unsloth_zoo import hf_xet_tuning` leaves the real readers live
+    on the runner's own /sys/fs/cgroup, so every sizing assertion silently
+    becomes a test of the container's memory limit.
+    """
+    module = sys.modules.get("unsloth_zoo.hf_xet_tuning")
+    if module is None:
+        pytest.skip("unsloth_zoo.hf_xet_tuning is not reachable here")
+    assert str(module.CGROUP_ROOT).startswith("/nonexistent"), module.CGROUP_ROOT
+    assert module._cgroup_v2_dirs() == []
+    assert module._cgroup_v1_dirs("memory") == []
