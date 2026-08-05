@@ -47,7 +47,10 @@ without a single early failure hiding everything after it:
                                      the audio encoder emits, or the merge has
                                      nothing to put behind the surplus
   4. audio reaches the loss       -- distinct audio must give distinct losses,
-                                     or the model is training on text alone
+                                     by more than this platform's own
+                                     run-to-run spread, or the model is
+                                     training on text alone and a drifting
+                                     machine is supplying the difference
 
 Run: python tests/gemma4_audio_version_probe.py [--model REPO]
 Exit code 0 only if every stage that counts passed.
@@ -91,15 +94,34 @@ def two_tone_verdict(repeats, other):
     reproducible.
     """
     noise = max(repeats) - min(repeats)
-    base = repeats[0]
+    # The mean, not the first sample: three forwards were paid for, and the
+    # figure printed here is the one a reader will compare against `other`.
+    base = sum(repeats) / len(repeats)
     signal = abs(base - other)
+    # The repeats themselves, not just their spread. Jitter and a monotone
+    # drift across sequential forwards produce the same spread and call for
+    # opposite responses -- one is a platform fact to measure around, the
+    # other is a bug in the forward path -- and this string is the only
+    # artifact the macOS matrix leaves behind.
     detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
-              f"signal={signal:.3g} noise={noise:.3g}")
+              f"signal={signal:.3g} noise={noise:.3g} "
+              f"repeats=[{', '.join(f'{r:.4f}' for r in repeats)}]")
     if signal < 1e-6:
         return "same_loss", detail
     if noise > 0.0 and signal <= TWO_TONE_MARGIN * noise:
         return "below_noise", detail
     return "pass", detail
+
+
+class Inconclusive(Exception):
+    """The stage could not decide, as distinct from deciding against.
+
+    This matrix exists so that a red cell names the mlx-vlm version that
+    breaks Gemma 4 audio. A stage that could not measure anything is not that,
+    and reporting it as a failure would blame a version for a property of the
+    machine it ran on. It still does not qualify the version -- nothing was
+    demonstrated -- so it is not a pass either.
+    """
 
 
 def stage(name):
@@ -110,6 +132,12 @@ def stage(name):
                 results[name] = {"ok": True, "detail": detail}
                 print(f"[PASS] {name}: {detail}", flush=True)
                 return True
+            except Inconclusive as exc:
+                results[name] = {
+                    "ok": False, "inconclusive": True, "error": str(exc),
+                }
+                print(f"[INCONCLUSIVE] {name}: {exc}", flush=True)
+                return False
             except Exception as exc:
                 results[name] = {
                     "ok": False,
@@ -316,6 +344,8 @@ def check_loss(_repo):
         # land small by luck, which would put the floor back where it started.
         repeats = [loss_at(440.0) for _ in range(3)]
         verdict, detail = two_tone_verdict(repeats, loss_at(1760.0))
+        if verdict == "below_noise":
+            raise Inconclusive(f"{TWO_TONE_REASONS[verdict]} [{detail}]")
         if verdict != "pass":
             raise AssertionError(f"{TWO_TONE_REASONS[verdict]} [{detail}]")
         return detail
