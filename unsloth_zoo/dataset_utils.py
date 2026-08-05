@@ -580,7 +580,14 @@ def train_on_responses_only(
     # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
     _MIN_ROWS_FOR_MULTIPROC = 5_000
     def _effective_num_proc(dataset):
-        if num_proc is None or num_proc == 1: return num_proc
+        # `1` means "no multiprocessing" to everyone who passes it, but datasets
+        # >= 4.1 pools for any num_proc >= 1, so returning it verbatim built a
+        # Pool(1): one forked child holding a whole tokenizer, on a split over
+        # _MIN_ROWS_FOR_MULTIPROC where the guard below no longer applies. That
+        # left UNSLOTH_DATASET_NUM_PROC=0 -- the remedy the dead-worker message
+        # recommends -- still forking. `None` is in-process on every supported
+        # release, and is what datasets 3.x already did with `1`.
+        if num_proc is None or num_proc == 1: return None
         if not _num_proc_was_auto: return num_proc  # honor explicit user value
         try:
             if len(dataset) < _MIN_ROWS_FOR_MULTIPROC: return None
@@ -901,19 +908,12 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        import multiprocessing as _mp
-        if num_proc is None or type(num_proc) is not int:
-            if _mp.get_start_method() != 'fork':
-                num_proc = None
-            else:
-                import psutil
-                num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-                memory_gb_left = psutil.virtual_memory().available / (1024**3)
-                if memory_gb_left <= 2:
-                    num_proc = 1
-                else:
-                    num_proc = min(num_proc, int(memory_gb_left))
-        dataset_map_kwargs['num_proc'] = num_proc
+        # One policy, one place. The copy that used to live here read stdlib
+        # multiprocessing's start method while datasets uses multiprocess, and it
+        # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
+        # on datasets >= 4.1, the pool this exists to avoid.
+        from .dataset_num_proc import get_dataset_num_proc
+        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
