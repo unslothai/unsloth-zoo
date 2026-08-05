@@ -29,6 +29,7 @@ import transformers.models.qwen3_5.modeling_qwen3_5 as qwen  # noqa: E402
 
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES  # noqa: E402
 from unsloth_zoo.temporary_patches.qwen3_5_float32 import (  # noqa: E402
+    _unsloth_fused_loss_kwargs,
     _unsloth_is_default_causal_lm_loss,
 )
 
@@ -185,3 +186,17 @@ def test_custom_loss_rejected():
     """Custom losses must fall back to the logits + loss_function branch."""
     fake_loss = type("_FakeLoss", (), {"__name__": "CustomFocalLoss"})()
     assert _unsloth_is_default_causal_lm_loss(fake_loss) is False
+
+
+def test_fused_loss_kwargs_filter():
+    """Model-only kwargs must not leak into the fused CE kernel."""
+    kwargs = {
+        "num_items_in_batch": 8,
+        "shift_labels": False,
+        "output_attentions": True,
+        "output_hidden_states": True,
+        "return_dict": True,
+        "use_cache": True,
+    }
+    filtered = _unsloth_fused_loss_kwargs(kwargs)
+    assert filtered == {"num_items_in_batch": 8, "shift_labels": False}

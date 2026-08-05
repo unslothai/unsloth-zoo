@@ -102,6 +102,24 @@ def _unsloth_is_default_causal_lm_loss(loss_function):
     return name.endswith("ForCausalLMLoss")
 
 
+# Kwargs allowed through to the fused CE kernel. Model-only keys such as
+# output_attentions / output_hidden_states / return_dict must not be forwarded
+# because unsloth_fused_ce_loss passes them into an autograd Function.
+_FUSED_LOSS_KWARG_KEYS = frozenset({
+    "num_items_in_batch",
+    "n_items",
+    "shift_labels",
+    "logit_scale_multiply",
+    "logit_scale_divide",
+    "logit_softcapping",
+})
+
+
+def _unsloth_fused_loss_kwargs(kwargs):
+    """Return only the kwargs the fused loss kernel understands."""
+    return {k: v for k, v in kwargs.items() if k in _FUSED_LOSS_KWARG_KEYS}
+
+
 def _unsloth_cast_position_embeddings(position_embeddings, dtype):
     """Cast a (cos, sin) tuple to dtype when necessary."""
     if position_embeddings is None:
@@ -232,7 +250,7 @@ def patch_Qwen3_5VisionAttention_dtype():
 
     original_forward = cls.forward
 
-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb=None, position_embeddings=None, **kwargs):
+    def forward(self, hidden_states, cu_seqlens, position_embeddings=None, max_seqlen=None, **kwargs):
         input_dtype = hidden_states.dtype
         target_dtype = _unsloth_get_linear_weight_dtype(self)
         if target_dtype is not None and hidden_states.dtype != target_dtype:
@@ -243,8 +261,8 @@ def patch_Qwen3_5VisionAttention_dtype():
             self,
             hidden_states,
             cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
+            max_seqlen=max_seqlen,
             **kwargs,
         )
 
@@ -338,6 +356,10 @@ def patch_Qwen3_5ForCausalLM_dtype():
         RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
         RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
+        # can_return_tuple normally pops return_dict, but be defensive so a
+        # caller-supplied return_dict never reaches the loss function either.
+        kwargs.pop("return_dict", None)
+
         # Always work with ModelOutput internally; @can_return_tuple preserves
         # the public tuple/return_dict contract. Use a separate dict so the
         # synthetic return_dict never reaches the loss function.
@@ -381,7 +403,11 @@ def patch_Qwen3_5ForCausalLM_dtype():
             # only inject the dtype alignment at the hidden-state boundary.
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
-            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+            loss = fused_loss(
+                lm_input, self.lm_head, labels,
+                vocab_size=self.config.vocab_size,
+                **_unsloth_fused_loss_kwargs(loss_kwargs),
+            )
             logits = EMPTY_LOGITS
         else:
             # Inference path (or explicit logits opt-in / custom loss):
@@ -392,7 +418,11 @@ def patch_Qwen3_5ForCausalLM_dtype():
 
             loss = None
             if labels is not None:
-                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+                loss = self.loss_function(
+                    logits=logits, labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    **loss_kwargs,
+                )
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -440,6 +470,10 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
         RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
         RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
 
+        # can_return_tuple normally pops return_dict, but be defensive so a
+        # caller-supplied return_dict never reaches the loss function either.
+        kwargs.pop("return_dict", None)
+
         # Keep the synthetic return_dict away from the loss function.
         model_kwargs = dict(kwargs)
         model_kwargs["return_dict"] = True
@@ -481,7 +515,11 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
                 and _unsloth_is_default_causal_lm_loss(self.loss_function):
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
-            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.text_config.vocab_size, **loss_kwargs)
+            loss = fused_loss(
+                lm_input, self.lm_head, labels,
+                vocab_size=self.config.text_config.vocab_size,
+                **_unsloth_fused_loss_kwargs(loss_kwargs),
+            )
             logits = EMPTY_LOGITS
         else:
             if target_dtype is not None and lm_input.dtype != target_dtype:
