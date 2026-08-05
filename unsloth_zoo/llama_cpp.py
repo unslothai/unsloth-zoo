@@ -2392,13 +2392,16 @@ def _gguf_output_paths(output_file):
     """`output_file` plus any shards llama.cpp names after it."""
     basename_without_gguf = os.path.splitext(output_file)[0]
     shard_pattern = re.compile(
-        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
     )
     parent_dir = os.path.dirname(output_file) or '.'
     paths = [output_file]
     try:
+        # fullmatch, not search: these paths get os.remove'd, and an unanchored
+        # match would delete a neighbour whose name merely ends with ours
+        # (cleaning "model.BF16" would take "old-model.BF16-00001-of-00002").
         paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
-                        if shard_pattern.search(f))
+                        if shard_pattern.fullmatch(f))
     except OSError:
         pass
     return paths
@@ -2458,15 +2461,19 @@ def convert_to_gguf(
         # raises `NotImplementedError: Quant method is not yet supported:
         # 'bitsandbytes'` after reading the whole model, so fail here instead
         # of after a multi-GB download and a long conversion.
+        # Names both flags: the guard fires on 8bit checkpoints too (they carry
+        # the same quant_method), and naming only the 4bit one would send an
+        # 8bit user back to an identical failure.
         raise RuntimeError(
-            f"Unsloth: `{input_folder}` still holds bitsandbytes 4bit weights "
-            f"(`quantization_config` at {_bnb_where}), and llama.cpp cannot "
-            f"convert those to GGUF.\n"
+            f"Unsloth: `{input_folder}` still holds bitsandbytes quantized "
+            f"weights (`quantization_config` at {_bnb_where}), and llama.cpp "
+            f"cannot convert those to GGUF.\n"
             f"GGUF export needs dequantized 16bit weights. Either load the "
-            f"model with `load_in_4bit = False` before saving, or merge a LoRA "
-            f"adapter with `save_method = \"merged_16bit\"`, which downloads "
-            f"the original 16bit weights. Saving a 4bit model that has no "
-            f"adapter does not dequantize it."
+            f"model with `load_in_4bit = False` and `load_in_8bit = False` "
+            f"before saving, or merge a LoRA adapter with "
+            f"`save_method = \"merged_16bit\"`, which downloads the original "
+            f"16bit weights. Saving a quantized model that has no adapter does "
+            f"not dequantize it."
         )
 
     # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`

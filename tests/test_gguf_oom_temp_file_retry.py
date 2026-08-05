@@ -204,6 +204,21 @@ def test_unrelated_ggufs_are_left_alone(tmp_path):
     assert all(k.exists() for k in keep)
 
 
+def test_a_neighbour_whose_name_ends_with_ours_is_left_alone(tmp_path):
+    """The shard pattern is matched against the whole filename.
+
+    These paths are os.remove'd, so an unanchored match would take somebody
+    else's export: "old-model.BF16-00001-of-00002" ends with the shard name
+    that cleaning "model.BF16" looks for.
+    """
+    keep = [_touch(tmp_path, "old-model.BF16-00001-of-00002.gguf"),
+            _touch(tmp_path, "my-model.BF16-00002-of-00002.gguf")]
+    mine = _touch(tmp_path, "model.BF16-00001-of-00002.gguf")
+    _remove_gguf_outputs(str(tmp_path / "model.BF16.gguf"))
+    assert all(k.exists() for k in keep)
+    assert not mine.exists()
+
+
 def test_removing_a_missing_output_is_not_an_error(tmp_path):
     _remove_gguf_outputs(str(tmp_path / "nothing" / "model.gguf"))
 

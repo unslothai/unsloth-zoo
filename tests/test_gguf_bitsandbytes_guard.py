@@ -97,6 +97,9 @@ def test_guard_is_wired_into_convert_to_gguf():
 
 def test_error_message_is_actionable():
     assert "load_in_4bit = False" in _SRC
+    # An 8bit checkpoint carries the same quant_method and hits the same guard,
+    # so the remediation has to name its flag too.
+    assert "load_in_8bit = False" in _SRC
     assert "merged_16bit" in _SRC
 
 
