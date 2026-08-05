@@ -369,13 +369,19 @@ def patch_Qwen3_5ForCausalLM_dtype():
 
         target_dtype = _unsloth_weight_dtype(self.lm_head)
 
+        # Some model classes (notably Qwen3_5ForConditionalGeneration) set
+        # accepts_loss_kwargs=False to avoid scaling the loss by
+        # num_items_in_batch during gradient accumulation. Mirror that contract
+        # instead of blindly forwarding all kwargs to the loss.
+        loss_kwargs = kwargs if getattr(self, "accepts_loss_kwargs", True) else {}
+
         if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS \
                 and _unsloth_is_default_causal_lm_loss(self.loss_function):
             # Training path: keep the fused lm-head / cross-entropy path and
             # only inject the dtype alignment at the hidden-state boundary.
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
-            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.vocab_size, **loss_kwargs)
             logits = EMPTY_LOGITS
         else:
             # Inference path (or explicit logits opt-in / custom loss):
@@ -386,7 +392,7 @@ def patch_Qwen3_5ForCausalLM_dtype():
 
             loss = None
             if labels is not None:
-                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -467,11 +473,15 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
 
         target_dtype = _unsloth_weight_dtype(self.lm_head)
 
+        # Honor accepts_loss_kwargs (upstream Qwen3_5ForConditionalGeneration
+        # sets this to False so num_items_in_batch is not applied to the loss).
+        loss_kwargs = kwargs if getattr(self, "accepts_loss_kwargs", True) else {}
+
         if labels is not None and fused_loss is not None and EMPTY_LOGITS is not None and not RETURN_LOGITS \
                 and _unsloth_is_default_causal_lm_loss(self.loss_function):
             if target_dtype is not None and lm_input.dtype != target_dtype:
                 lm_input = lm_input.to(target_dtype)
-            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.text_config.vocab_size, **kwargs)
+            loss = fused_loss(lm_input, self.lm_head, labels, vocab_size=self.config.text_config.vocab_size, **loss_kwargs)
             logits = EMPTY_LOGITS
         else:
             if target_dtype is not None and lm_input.dtype != target_dtype:
@@ -484,7 +494,7 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
-                    **kwargs,
+                    **loss_kwargs,
                 )
 
         return CausalLMOutputWithPast(
@@ -499,3 +509,4 @@ def patch_Qwen3_5ForConditionalGeneration_dtype():
     forward = can_return_tuple(forward)
     patch_function(cls, "forward", forward, force=True, match_level="relaxed")
 TEMPORARY_PATCHES.append(patch_Qwen3_5ForConditionalGeneration_dtype)
+
