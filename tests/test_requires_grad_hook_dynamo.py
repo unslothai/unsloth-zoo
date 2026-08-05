@@ -210,11 +210,18 @@ def test_both_gradient_checkpointing_hooks_are_guarded():
     assert all(guarded.values()), guarded
 
 
-def test_make_inputs_require_grad_is_guarded():
+def test_make_inputs_require_grad_is_NOT_guarded():
+    """The peft_utils hooks sit on LoRA modules whose output already requires
+    grad, so skipping them under tracing changes nothing. This one is the only
+    thing making a FROZEN embedding's output require grad, and reentrant
+    gradient checkpointing needs at least one grad-carrying input. Guarding it
+    would leave that tensor detached and silently stop gradients reaching the
+    adapters, which is worse than the graph break it would have avoided.
+    """
     guarded = _guarded_functions(
         _ZOO / "training_utils.py", ("make_inputs_require_grad",),
     )
-    assert guarded == {"make_inputs_require_grad" : True}, guarded
+    assert guarded == {"make_inputs_require_grad" : False}, guarded
 
 
 if __name__ == "__main__":
