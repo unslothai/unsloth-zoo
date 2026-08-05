@@ -1094,14 +1094,36 @@ def patch_mamba_ssm_pre_ampere_fallback():
     # 2. Modules ALREADY imported have baked the flag in; flip it directly.
     #    Confined to transformers' own model modules so vLLM's independent
     #    Triton kernels are left alone.
+    # Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
+    # (True by default) at construction and RAISE inside that branch when the
+    # module flag is False, so clearing the flag alone turns their forward into
+    # `ValueError: Fast Mamba kernels are not available` instead of the slow
+    # path this guard promises. Local, not a module global: the test extracts
+    # this function by AST and execs it in a bare namespace.
+    _raising_mixers = {
+        "transformers.models.jamba.modeling_jamba" : "JambaMambaMixer",
+        "transformers.models.zamba.modeling_zamba" : "ZambaMambaMixer",
+    }
     _touched = False
     for _name, _mod in list(sys.modules.items()):
         if not _name.startswith("transformers.models.") or _mod is None:
             continue
-        if not getattr(_mod, "is_fast_path_available", False):
+        # __dict__, not getattr: transformers 5 registers ~200 alias modules
+        # named transformers.models.<m>.image_processing_<m>_fast whose
+        # catch-all __getattr__ imports the real image processor, so a getattr
+        # probe warns 200 times, drags in 3800 modules (3.8s measured) per
+        # phase, and can propagate an ImportError out of `import unsloth`.
+        if not _mod.__dict__.get("is_fast_path_available", False):
             continue
         try:
             _mod.is_fast_path_available = False
+            _mixer = getattr(_mod, _raising_mixers.get(_name, ""), None)
+            if _mixer is not None and not _mixer.__dict__.get("_unsloth_slow_only", False):
+                def _slow_only(self, *a, __orig = _mixer.forward, **kw):
+                    self.use_fast_kernels = False
+                    return __orig(self, *a, **kw)
+                _mixer.forward = _slow_only
+                _mixer._unsloth_slow_only = True
             for _sym in (
                 "selective_state_update",
                 "mamba_chunk_scan_combined",
@@ -1180,14 +1202,17 @@ def patch_datasets_map_worker_death_retry():
                 except Exception:
                     call_args, call_kwargs = args, dict(kwargs)
                     num_proc = None
-            if not isinstance(num_proc, int) or num_proc <= 1:
+            if not isinstance(num_proc, int) or num_proc < 1:
                 raise
             print(
                 f"Unsloth: a dataset worker was killed with num_proc={num_proc} "
                 f"(most likely out of system RAM). Retrying single-process; "
                 f"this is slower but survives."
             )
-            call_kwargs["num_proc"] = 1
+            # None, not 1: datasets >= 4.1.0 gates the pool on
+            # `num_proc is not None and num_proc >= 1` (arrow_dataset.py), so
+            # num_proc=1 still forks a worker and the kernel can kill it again.
+            call_kwargs["num_proc"] = None
             return original_map(self, *call_args, **call_kwargs)
         pass
     pass

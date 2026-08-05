@@ -147,6 +147,82 @@ def test_pre_ampere_disables_fast_path(env):
     assert iu.is_mamba_2_ssm_available() is False
 
 
+def _fake_mixer_module(mod_name, cls_name, weight_attr):
+    """A stand-in for jamba/zamba: the flag plus a mixer that raises on it.
+
+    Both bind `self.use_fast_kernels = config.use_mamba_kernels` (True by
+    default) at construction, and their forward raises rather than falling back
+    when the module flag is False (transformers 4.57.6
+    models/jamba/modeling_jamba.py:815-821, models/zamba/modeling_zamba.py:553-560;
+    zamba still does in 5.5.0 and 5.14.1).
+    """
+    mod = types.ModuleType(mod_name)
+    mod.is_fast_path_available = True
+
+    class Mixer:
+        def __init__(self):
+            self.use_fast_kernels = True
+            setattr(self, weight_attr,
+                    types.SimpleNamespace(device = types.SimpleNamespace(type = "cuda")))
+        def forward(self, *args, **kwargs):
+            if self.use_fast_kernels:
+                if not mod.is_fast_path_available:
+                    raise ValueError("Fast Mamba kernels are not available.")
+                return "FAST PATH"
+            return "SLOW PATH"
+
+    Mixer.__name__ = cls_name
+    setattr(mod, cls_name, Mixer)
+    sys.modules[mod_name] = mod
+    return mod, Mixer
+
+
+@pytest.mark.parametrize("mod_name, cls_name, weight_attr", [
+    ("transformers.models.jamba.modeling_jamba", "JambaMambaMixer", "x_proj"),
+    ("transformers.models.zamba.modeling_zamba", "ZambaMambaMixer", "x_proj_weight"),
+])
+def test_jamba_and_zamba_reach_the_slow_path_not_a_valueerror(
+    env, mod_name, cls_name, weight_attr,
+):
+    saved = sys.modules.get(mod_name)
+    mod, Mixer = _fake_mixer_module(mod_name, cls_name, weight_attr)
+    try:
+        mixer = Mixer()
+        assert mixer.forward() == "FAST PATH"
+        assert patch() is True
+        assert mod.is_fast_path_available is False
+        # The guard promises the slow path; it must not hand back a ValueError.
+        assert mixer.forward() == "SLOW PATH"
+        assert Mixer().forward() == "SLOW PATH", "instances built later too"
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_the_mixer_wrapper_is_applied_once(env):
+    mod_name = "transformers.models.zamba.modeling_zamba"
+    saved = sys.modules.get(mod_name)
+    mod, Mixer = _fake_mixer_module(mod_name, "ZambaMambaMixer", "x_proj_weight")
+    try:
+        assert patch() is True
+        first = Mixer.forward
+        mod.is_fast_path_available = True   # a later phase sees it truthy again
+        assert patch() is True
+        assert Mixer.forward is first, "must not stack on every phase"
+    finally:
+        if saved is None: sys.modules.pop(mod_name, None)
+        else: sys.modules[mod_name] = saved
+
+
+def test_alias_modules_are_not_probed_through_getattr():
+    """transformers 5 registers ~200 `image_processing_<m>_fast` alias modules
+    whose catch-all __getattr__ imports the real image processor. Probing them
+    with getattr costs seconds per phase and can propagate an ImportError out
+    of `import unsloth`, so the scan must read __dict__ instead."""
+    assert '_mod.__dict__.get("is_fast_path_available", False)' in _SRC
+    assert 'getattr(_mod, "is_fast_path_available", False)' not in _SRC
+
+
 def test_ampere_keeps_fast_path(env, monkeypatch):
     model_mod, iu, _hk = env
     monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0)), raising = False)

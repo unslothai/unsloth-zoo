@@ -53,16 +53,51 @@ def patched():
         R.ROPE_INIT_FUNCTIONS["longrope"] = before_dict
 
 
+class _Config:
+    """The parts of a config the longrope initializer touches, on 4 and on 5.
+
+    transformers 5 renamed the dict to `rope_parameters`, keeps `rope_scaling`
+    as a read/write alias property (configuration_utils.py), moved `rope_theta`
+    and `original_max_position_embeddings` inside it, and calls
+    `config.standardize_rope_params()` first. A SimpleNamespace has none of
+    that and would `AttributeError` on every transformers 5 in the support
+    envelope.
+    """
+
+    def __init__(self, scaling, original_max, max_pos):
+        self.rope_parameters = scaling
+        self.original_max_position_embeddings = original_max
+        self.max_position_embeddings = max_pos
+        self.rope_theta = 10000.0
+        self.hidden_size = 3072
+        self.num_attention_heads = 32
+        self.head_dim = 96
+
+    @property
+    def rope_scaling(self):
+        return self.rope_parameters
+
+    @rope_scaling.setter
+    def rope_scaling(self, value):
+        self.rope_parameters = value
+
+    def standardize_rope_params(self):
+        if not isinstance(self.rope_parameters, dict): return
+        self.rope_parameters.setdefault("rope_theta", self.rope_theta)
+        self.rope_parameters.setdefault(
+            "original_max_position_embeddings",
+            getattr(self, "original_max_position_embeddings",
+                    self.max_position_embeddings),
+        )
+
+
 def _cfg(attention_factor=None, factor=32.0, original_max=4096,
          max_pos=131072):
     scaling = {"rope_type": "longrope", "factor": factor,
                "short_factor": [1.0] * 48, "long_factor": [1.0] * 48}
     if attention_factor is not None:
         scaling["attention_factor"] = attention_factor
-    return types.SimpleNamespace(
-        rope_scaling=scaling, original_max_position_embeddings=original_max,
-        max_position_embeddings=max_pos, rope_theta=10000.0,
-        hidden_size=3072, num_attention_heads=32, head_dim=96)
+    return _Config(scaling, original_max, max_pos)
 
 
 def _att(cfg):

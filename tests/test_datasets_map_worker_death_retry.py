@@ -85,7 +85,7 @@ def test_retries_single_process_after_worker_death():
     Dataset = _make_fake_datasets(original)
     assert patch() is True
     assert Dataset().map(lambda x: x, num_proc = 8) == "mapped"
-    assert calls == [8, 1], "should retry exactly once, with num_proc=1"
+    assert calls == [8, None], "should retry exactly once, truly single-process"
 
 
 def test_single_process_death_is_reraised():
@@ -154,7 +154,43 @@ def test_positional_num_proc_is_retried():
     Dataset = _make_fake_datasets(original)
     patch()
     assert Dataset().map(lambda x: x, False, 6) == "mapped"
-    assert calls == [6, 1]
+    assert calls == [6, None]
+
+
+def test_the_retry_disables_multiprocessing_rather_than_asking_for_one_worker():
+    """datasets >= 4.1.0 gates its pool on `num_proc is not None and
+    num_proc >= 1` (arrow_dataset.py, changed from `> 1` in 4.1.0 and still
+    that way in 4.4.1), so `num_proc = 1` forks one worker and the kernel can
+    kill it again. Only None is genuinely single-process on every version."""
+    calls = []
+
+    def original(self, fn, num_proc = None, **kw):
+        calls.append(num_proc)
+        if num_proc is not None:
+            raise RuntimeError(WORKER_DIED)
+        return "mapped"
+
+    Dataset = _make_fake_datasets(original)
+    patch()
+    assert Dataset().map(lambda x: x, num_proc = 8) == "mapped"
+    assert calls == [8, None]
+
+
+def test_a_worker_death_at_num_proc_one_is_still_retried():
+    """`dataset_utils.py` picks num_proc = 1 when under 2 GB of RAM is free, so
+    refusing to retry there opts out on the machine the guard exists for."""
+    calls = []
+
+    def original(self, fn, num_proc = None, **kw):
+        calls.append(num_proc)
+        if num_proc is not None:
+            raise RuntimeError(WORKER_DIED)
+        return "mapped"
+
+    Dataset = _make_fake_datasets(original)
+    patch()
+    assert Dataset().map(lambda x: x, num_proc = 1) == "mapped"
+    assert calls == [1, None]
 
 
 def test_idempotent():
