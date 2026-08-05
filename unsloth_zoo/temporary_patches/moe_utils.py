@@ -299,13 +299,16 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    if not torch.cuda.is_available():
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.xpu.current_device()
+    else:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        device = torch.cuda.current_device()
         dtype = torch.float16
 
         # 1 expert, 1 token, dim 8 (safe alignment).
@@ -335,8 +338,13 @@ def _transposed_view_grouped_mm_is_safe():
 
     safe = False
     try:
-        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
+        if torch.cuda.is_available():
             device = torch.cuda.current_device()
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = torch.xpu.current_device()
+        else:
+            device = None
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
