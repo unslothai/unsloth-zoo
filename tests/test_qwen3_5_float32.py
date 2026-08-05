@@ -28,6 +28,9 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig 
 import transformers.models.qwen3_5.modeling_qwen3_5 as qwen  # noqa: E402
 
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES  # noqa: E402
+from unsloth_zoo.temporary_patches.qwen3_5_float32 import (  # noqa: E402
+    _unsloth_is_default_causal_lm_loss,
+)
 
 
 def _apply_temporary_patches():
@@ -124,3 +127,16 @@ def test_qwen3_5_for_causal_lm_respects_output_hidden_states_config(monkeypatch)
     outputs = model(input_ids, use_cache=False)
     assert outputs.logits.shape == (2, 4, config.vocab_size)
     assert outputs.hidden_states is not None
+
+
+@pytest.mark.parametrize("name", ["ForCausalLMLoss", "UnslothForCausalLMLoss"])
+def test_default_causal_lm_loss_accepted(name):
+    """The default (and Unsloth-patched) loss names must take the fused path."""
+    fake_loss = type("_FakeLoss", (), {"__name__": name})()
+    assert _unsloth_is_default_causal_lm_loss(fake_loss) is True
+
+
+def test_custom_loss_rejected():
+    """Custom losses must fall back to the logits + loss_function branch."""
+    fake_loss = type("_FakeLoss", (), {"__name__": "CustomFocalLoss"})()
+    assert _unsloth_is_default_causal_lm_loss(fake_loss) is False
