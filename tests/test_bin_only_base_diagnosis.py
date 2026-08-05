@@ -22,6 +22,7 @@ answers False exactly like a repo that is not there, and the caller blames
 the name. Diagnosis only: which repos resolve is unchanged.
 """
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -124,7 +125,13 @@ def test_caller_raises_the_specific_message():
     assert "Convert the base to safetensors" in msg[0]
 
 
-@pytest.mark.skipif("--live" not in sys.argv, reason = "needs network")
+# An env var, not a pytest flag: `--live` was never registered through
+# pytest_addoption, so `pytest --live` exits with "unrecognized arguments"
+# before collection and this test could never actually be run.
+@pytest.mark.skipif(
+    os.environ.get("UNSLOTH_LIVE_TESTS", "0") != "1",
+    reason = "needs network; set UNSLOTH_LIVE_TESTS=1",
+)
 def test_live_bge_m3():
     got = su._hub_repo_weights_without_safetensors("unsloth/bge-m3")
     assert got and "pytorch_model.bin" in got
