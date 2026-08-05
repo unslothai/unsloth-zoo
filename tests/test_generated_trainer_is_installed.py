@@ -16,36 +16,18 @@
 
 """The generated trainer must actually be installed, and failing is silent.
 
-`_patch_trl_rl_trainers` wraps generation in `except Exception: logger.info(...)`
-and `patch_trl_rl_trainers` wraps THAT in `except Exception: logger.warning_once`.
-So when generation breaks, nothing is raised, nothing is printed at default log
-level, and every SFT run quietly falls back to plain `trl.SFTTrainer`.
+`_patch_trl_rl_trainers` and `patch_trl_rl_trainers` each swallow generation
+errors, so a break raises nothing, prints nothing at default log level, and
+every SFT run quietly falls back to plain `trl.SFTTrainer`.
 
-That happened. `_maybe_compile` was added to `rl_replacements.py` to make
-UNSLOTH_COMPILE_DISABLE reach three GRPO helpers, and the compiler copies
-function SOURCE verbatim into the generated module -- decorator line included.
-The helper was not in scope there:
-
-    UnslothSFTTrainer.py line 128
-    @_maybe_compile(dynamic = True, fullgraph = True, options = ...)
-    NameError: name '_maybe_compile' is not defined
-
-Three notebooks then failed with three unrelated-looking errors:
-
-    Magistral_(24B)   No columns in the dataset match the model's forward
-                      method signature ... ignored: [text]
-    Gemma3_(27B)      Unsloth: Detected a vision data collator that does not
-                      support response-only masking
-    Qwen3_(32B)       NotImplementedError: Unsloth: Logits are empty ...
-
-all of them downstream of trl's own SFTTrainer running instead of ours. The
-common cause was invisible in the messages and obvious in the artifacts:
-`UnslothSFTTrainer` appears three times in every run that trained and zero
-times in every run that failed.
+That happened. `_maybe_compile` was added to `rl_replacements.py`, and since the
+compiler copies function SOURCE verbatim into the generated module, decorator
+line included, the generated module hit `NameError: name '_maybe_compile' is not
+defined`. Three notebooks then failed with three unrelated-looking errors, all
+downstream of trl's own SFTTrainer running instead of ours.
 
 So this file asserts the end state -- the generated class is installed -- rather
-than any particular reason it might not be. A future helper added to a copied
-function has the same failure mode and would be caught here.
+than any particular reason it might not be.
 """
 
 import os
@@ -60,8 +42,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _have_unsloth():
-    """importlib rather than a sibling-checkout path, so this runs wherever
-    unsloth happens to be installed."""
+    """importlib rather than a sibling-checkout path, so this runs anywhere."""
     import importlib.util
     try:
         return importlib.util.find_spec("unsloth") is not None
@@ -70,24 +51,22 @@ def _have_unsloth():
 
 
 def _run(body: str, timeout: int = 900):
-    """A subprocess, because unsloth patches trl at import and the decision is
-    then cached in sys.modules for the life of the process."""
+    """A subprocess: unsloth patches trl at import and the decision is then
+    cached in sys.modules for the life of the process."""
     script = textwrap.dedent(f"""
         import os, sys
         sys.path.insert(0, {str(ROOT)!r})
         {body}
     """)
     env = dict(os.environ)
-    # NOT /tmp: writes there are blocked in this sandbox, and a cache the
-    # compiler cannot write to fails generation for a reason that has nothing
-    # to do with what is under test.
+    # NOT /tmp: writes are blocked in this sandbox, and a cache the compiler
+    # cannot write to fails generation for an unrelated reason.
     cache = Path(os.environ.get("UNSLOTH_WORKSPACE", ROOT.parent)) / "temp" / "gen_test_cache"
     cache.mkdir(parents=True, exist_ok=True)
     env["UNSLOTH_COMPILE_LOCATION"] = str(cache)
-    # conftest sets UNSLOTH_ALLOW_CPU=1 for the whole suite, and that flag makes
-    # PatchFastRL / _patch_trl_trainer early-return ON PURPOSE so trl.SFTTrainer
-    # stays pristine for the getsource drift detectors. Inherited here it would
-    # guarantee a plain SFTTrainer and this file would "fail" on a healthy tree.
+    # conftest sets UNSLOTH_ALLOW_CPU=1 suite-wide, which makes PatchFastRL
+    # early-return on purpose. Inherited here it would guarantee a plain
+    # SFTTrainer and this file would "fail" on a healthy tree.
     env.pop("UNSLOTH_ALLOW_CPU", None)
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=timeout, env=env)
@@ -119,9 +98,8 @@ def test_the_generated_sft_trainer_is_what_trl_hands_out(installed):
 
 
 def test_generation_raises_loudly_when_called_directly():
-    """The swallow is deliberate (TRL 1.x renames classes), so the guard here is
-    not that it stops swallowing -- it is that a direct call still surfaces the
-    error, which is the only way anyone can debug this."""
+    """The swallow is deliberate (TRL 1.x renames classes), so the guard is that
+    a direct call still surfaces the error -- the only way to debug this."""
     if not _have_unsloth():
         pytest.skip("unsloth is not installed")
     r = _run("""
@@ -129,9 +107,7 @@ def test_generation_raises_loudly_when_called_directly():
         from unsloth.models import rl
         print("HAS_IMPL " + str(hasattr(rl, "_patch_trl_rl_trainers_impl")))
     """)
-    # _run drops UNSLOTH_ALLOW_CPU on purpose, so on a CPU-only host the import
-    # aborts before printing. Skip like `installed` does; a missing accelerator
-    # is not this test's subject.
+    # _run drops UNSLOTH_ALLOW_CPU, so a CPU-only host aborts before printing.
     if "HAS_IMPL" not in r.stdout:
         pytest.skip(f"probe did not run: {r.stdout[-800:]} {r.stderr[-1500:]}")
     assert "HAS_IMPL True" in r.stdout, (r.stdout[-600:], r.stderr[-1200:])
@@ -140,9 +116,8 @@ def test_generation_raises_loudly_when_called_directly():
 # ---- the specific shape that broke, so it cannot come back ---------------
 
 def test_every_name_in_a_copied_decorator_is_importable_by_the_generator():
-    """The compiler emits an import for a name only if it thinks to. Each
-    decorator on a function whose source gets copied needs a matching rule in
-    compiler.py, or the generated module NameErrors at import."""
+    """Each decorator on a function whose source gets copied needs a matching
+    import rule in compiler.py, or the generated module NameErrors at import."""
     import ast
 
     src = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding="utf-8")

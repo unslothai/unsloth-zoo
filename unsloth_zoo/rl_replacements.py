@@ -84,20 +84,12 @@ def chunked_hidden_states_selective_log_softmax(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # Reshape against this tensor's own last dim. It is always a no-op, so a
-    # caller that passes the wrong width cannot have its row count silently
-    # rewritten, and the mismatch surfaces at the matmul below, which prints
-    # both operands:
-    #     a and b must have same reduction dim, but got
-    #     [((s47*s87 + 255)//256), s33] X [1536, 151936]
-    # That message is the diagnosis, not a symptom to suppress: `s33` is a
-    # backed symbol and `Eq(s33, 1536)` is genuinely False, i.e. the tensor is
-    # not hidden states. Callers dispatch on the width before getting here --
-    # see `compute_logprobs_chunk` and the packed path below. A bare
-    # `torch._check(hidden_states.shape[-1] == lm_head.shape[-1])` reports only
-    # "Expected cond to be True, but got False", naming neither operand, and a
-    # message that would name them cannot be built: Dynamo rejects a callable
-    # message with "Failed to convert args/kwargs to proxy".
+    # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
+    # cannot have its row count silently rewritten and instead fails at the
+    # matmul below, which prints both operands. Do not swap in a bare
+    # torch._check: it reports only "Expected cond to be True", naming neither
+    # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
+    # the width first -- see `compute_logprobs_chunk` and the packed path.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
 
@@ -1175,13 +1167,10 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    # `.logits` only carries hidden states when the model's
-                    # forward is the Unsloth generated one that honours
-                    # UNSLOTH_RETURN_HIDDEN_STATES. When it is not, this is a
-                    # real [T, vocab] logits tensor and the lm_head matmul dies
-                    # with "a and b must have same reduction dim". Dispatch on
-                    # the width, exactly as `compute_logprobs_chunk` does for
-                    # the padded path.
+                    # `.logits` carries hidden states only when the forward is the
+                    # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                    # otherwise it is real [T, vocab] logits and the lm_head matmul
+                    # dies. Dispatch on width, as the padded path already does.
                     _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
                     _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
                     if _pack_h.shape[-1] == lm_head.shape[1]:

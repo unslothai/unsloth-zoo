@@ -16,27 +16,18 @@
 
 """The GRPO chunked log-softmax and its reduction dim.
 
-An earlier revision of this file claimed the function took its reduction dim
-from the wrong operand and that
+The reduction dim is not the bug. In
 
     a and b must have same reduction dim, but got
     [((s47*s87 + 255)//256), s33] X [1536, 151936]
 
-was a dynamic-shape guard Dynamo could not discharge. It is not. `s33` is a
-backed symbol and `Eq(s33, 1536)` evaluates to False: the tensor really was the
-wrong width. `lm_head` is `get_output_embeddings().weight`, an nn.Parameter of
-[vocab, hidden] = [151936, 1536] and therefore shape-static, which is why `b`
-prints concrete beside a symbolic `a`.
-
-So the reduction dim is not the bug, and switching it to `lm_head.shape[-1]`
-plus a bare `torch._check` changed nothing except the error text -- the guard
-sets are identical (verified with TORCH_LOGS=guards; dim 2 specializes to 1536
-either way), and the message got worse: `Expected cond to be True, but got
-False`, naming neither operand. The real cause and its fix live in
+`s33` is a backed symbol and `Eq(s33, 1536)` is False -- the tensor really was
+the wrong width. Switching the reduction dim to `lm_head.shape[-1]` plus a bare
+`torch._check` left the guard sets identical (verified with TORCH_LOGS=guards)
+and only made the message worse. The real cause and fix live in
 tests/test_grpo_packed_raw_logits_dispatch.py.
 
-What is left here is the numeric contract, which is worth keeping as a
-regression guard even though it never distinguished the two spellings.
+What is left here is the numeric contract, kept as a regression guard.
 """
 
 import os
@@ -65,17 +56,14 @@ def _fn_source():
 
 def test_the_reshape_uses_its_own_last_dim():
     """A no-op reshape. Against `lm_head.shape[-1]` a mismatched caller whose
-    element count happens to divide gets its row count silently rewritten
-    instead of failing at the matmul."""
+    element count divides gets its row count silently rewritten."""
     body = _fn_source()
     assert "hidden_states.reshape(-1, hidden_states.shape[-1])" in body
 
 
 def test_no_message_less_check_is_reintroduced():
-    """`torch._check(cond)` with no message reports only "Expected cond to be
-    True, but got False". A message that would name the widths cannot be added
-    either: Dynamo rejects a callable message. So the matmul must be left to
-    raise, since it prints both operands."""
+    """`torch._check(cond)` names neither operand and Dynamo rejects a callable
+    message, so the matmul must be left to raise -- it prints both."""
     import ast
     calls = [
         n for n in ast.walk(ast.parse(_fn_source()))
@@ -86,9 +74,7 @@ def test_no_message_less_check_is_reintroduced():
 
 
 def test_the_sibling_helper_is_left_alone():
-    """`chunked_selective_log_softmax` reshapes against its own last dim too,
-    but it has no matmul, so there is nothing for a guard to fail on and no
-    reason to touch it."""
+    """The sibling reshapes against its own last dim too, but has no matmul."""
     assert "logits.reshape(-1, logits.shape[-1])" in SRC
 
 
@@ -109,8 +95,7 @@ def _setup():
     )
     if torch.cuda.is_available():
         return torch, fn, "cuda", torch.bfloat16, 128, 256, 2e-2
-    # CPU keeps the shapes small; compiling this at 1536x151936 on CPU is not
-    # a test, it is a wait.
+    # CPU keeps the shapes small: compiling 1536x151936 there is a wait, not a test.
     return torch, fn, "cpu", torch.float32, 32, 64, 1e-4
 
 
@@ -124,7 +109,7 @@ def _reference(torch, hidden_states, lm_head, index, temperature = 1.0):
 
 @pytest.mark.parametrize("batch,seq,chunks,temperature", [
     (2, 16, 4, 1.0),
-    (4, 24, 256, 1.0),   # chunks > rows, which is where the ceil-division bites
+    (4, 24, 256, 1.0),   # chunks > rows, where the ceil-division bites
     (3, 40, 8, 0.7),
     (1, 7, 3, 1.0),      # rows not divisible by chunks
 ])
@@ -135,8 +120,7 @@ def test_it_still_matches_a_plain_log_softmax(batch, seq, chunks, temperature):
     lm_head = torch.randn(vocab, hidden, device = dev, dtype = dtype) / 30
     index = torch.randint(0, vocab, (batch, seq), device = dev)
 
-    # What the real run has and a bare call does not: the hidden dim arrives
-    # marked dynamic from the surrounding compiled trainer.
+    # The compiled trainer marks the hidden dim dynamic; a bare call does not.
     torch._dynamo.mark_dynamic(hidden_states, 2)
 
     got = fn(hidden_states, lm_head, index,
@@ -148,10 +132,9 @@ def test_it_still_matches_a_plain_log_softmax(batch, seq, chunks, temperature):
 
 
 def test_a_mismatched_lm_head_fails_loudly():
-    """Without the check, `hidden_states` of the wrong width can still reshape
-    cleanly whenever the element count happens to divide -- 2x16x768 against a
-    1536-wide lm_head becomes 16 rows instead of 32 -- and the wrongness only
-    surfaces later, as a confusing reshape error about the output."""
+    """Wrong-width hidden states can reshape cleanly when the element count
+    divides (2x16x768 against a 1536-wide lm_head gives 16 rows, not 32), so the
+    wrongness must surface here rather than later."""
     torch, fn, dev, dtype, hidden, vocab, _ = _setup()
     hidden_states = torch.randn(2, 16, hidden // 2, device = dev, dtype = dtype)
     lm_head = torch.randn(vocab, hidden, device = dev, dtype = dtype)

@@ -16,24 +16,15 @@
 
 """UNSLOTH_COMPILE_DISABLE did not reach the GRPO helpers.
 
-Three functions in `rl_replacements.py` carried a bare
-`@torch.compile(dynamic = True, fullgraph = True, ...)`. A decorator runs at
-import, before any of the compiler's gates, so the flag never applied to them
--- while `compiler.py` and `temporary_patches/utils.py` both consult it.
+Three functions in `rl_replacements.py` carried a bare `@torch.compile(...)`.
+A decorator runs at import, before any of the compiler's gates, so the flag
+never applied to them -- while `compiler.py` and `temporary_patches/utils.py`
+both consult it. That matters because the flag is the documented escape hatch
+for precisely the failure they produce: re-running `NeMo-Gym-Sudoku` with
+UNSLOTH_COMPILE_DISABLE=1 changed nothing, since the compile had already
+happened at import.
 
-That matters because the flag is the documented escape hatch for precisely the
-failure they produce. `NeMo-Gym-Sudoku` reaches `trainer.train()` and dies in
-`chunked_hidden_states_selective_log_softmax` with
-
-    a and b must have same reduction dim, but got
-    [((s47*s87 + 255)//256), s33] X [1536, 151936]
-
-and re-running the whole notebook with UNSLOTH_COMPILE_DISABLE=1 changed
-nothing at all: same TorchRuntimeError, same cell, with the artifact confirming
-the variable was set. The compile had already happened at import.
-
-This makes the flag work. It does NOT fix the shape bug, and these tests are
-careful not to imply otherwise.
+This makes the flag work. It does NOT fix the shape bug.
 """
 
 import os
@@ -53,13 +44,9 @@ FUNCS = [
 
 
 def _probe(value):
-    """Import rl_replacements in a subprocess with the flag set, and report
-    whether each helper came out compiled.
-
-    A subprocess because the flag is read at import time and the module is
-    cached in sys.modules; re-importing in-process would measure the first
-    import's decision forever.
-    """
+    """Import rl_replacements in a subprocess with the flag set and report
+    whether each helper came out compiled. A subprocess because the flag is read
+    at import and the module is then cached in sys.modules."""
     script = textwrap.dedent("""
         import json, torch
         import unsloth_zoo.rl_replacements as R
@@ -83,8 +70,7 @@ def _probe(value):
 
 
 def test_the_helpers_are_compiled_by_default():
-    """The point of the change is to add an off switch, not to turn
-    compilation off. If this ever fails, the default has regressed and every
+    """The change adds an off switch, not off-by-default. If this fails, every
     GRPO run just got slower."""
     got = _probe("0")
     assert all(v is True for v in got.values()), got
@@ -113,8 +99,7 @@ def _src():
 
 
 def test_no_bare_torch_compile_decorator_remains():
-    """A fourth helper added later with a bare decorator would silently
-    reintroduce the gap."""
+    """A fourth helper with a bare decorator would reintroduce the gap."""
     src = _src()
     bare = [n for n, line in enumerate(src.splitlines(), 1)
             if line.strip().startswith("@torch.compile")]
@@ -122,9 +107,8 @@ def test_no_bare_torch_compile_decorator_remains():
 
 
 def test_the_generated_code_string_is_left_alone():
-    """One `@torch.compile(...)` lives inside a string this module emits as
-    generated source. Rewriting it would emit a call to a helper the generated
-    module does not import."""
+    """One `@torch.compile(...)` lives inside a string emitted as generated
+    source; rewriting it would call a helper that module does not import."""
     assert '"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\\n"' in _src()
 
 
@@ -133,8 +117,8 @@ def _common_src():
 
 
 def test_the_helper_falls_back_to_identity_not_to_none():
-    """Returning None from the decorator factory would replace the function
-    with None and fail at call time rather than at import."""
+    """Returning None would replace the function with None and fail at call
+    time rather than at import."""
     src = _common_src()
     i = src.index("def _maybe_compile(")
     body = src[i:]
@@ -142,9 +126,7 @@ def test_the_helper_falls_back_to_identity_not_to_none():
 
 
 def test_the_flag_comes_from_the_shared_definition():
-    """Re-reading os.environ in either place would drift from compiler.py,
-    which is how two parts of one codebase end up disagreeing about whether
-    compilation is on."""
+    """Re-reading os.environ in either place would drift from compiler.py."""
     assert "UNSLOTH_COMPILE_DISABLE" not in _src(), "read it via _maybe_compile"
     common = _common_src()
     i = common.index("def _maybe_compile(")
@@ -153,10 +135,9 @@ def test_the_flag_comes_from_the_shared_definition():
 
 
 def test_the_helper_is_not_defined_beside_its_callers():
-    """It was, and the compiler copies decorated function source verbatim into
-    the generated trainer modules, where a name defined in rl_replacements does
-    not resolve. Every SFT run then fell back to plain trl, silently. See
-    tests/test_generated_trainer_is_installed.py."""
+    """It was, and the compiler copies decorated source into generated trainer
+    modules, where a name from rl_replacements does not resolve -- every SFT run
+    then fell back to plain trl, silently."""
     assert "def _maybe_compile(" not in _src()
     assert "def _maybe_compile(" in _common_src()
 
