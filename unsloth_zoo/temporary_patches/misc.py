@@ -1042,6 +1042,276 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path on pre-Ampere GPUs.
+
+    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
+    and `is_fast_path_available` is True, so transformers routes into
+    `cuda_kernels_forward` and Triton only fails once training starts, with an
+    opaque `RuntimeError: PassManager::run failed`.
+
+    `is_fast_path_available` is baked in at module import, so flip both the
+    availability predicates (for modules imported later) and the flag on
+    already-imported modules. A capability check rather than a trial launch
+    like the causal_conv1d probe above, which would pay a Triton compile at
+    every import just to watch it fail. Real NVIDIA CUDA only.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    if (major, minor) >= (8, 0):
+        return  # Ampere or newer; the fast path is fine
+
+    import sys
+
+    # 0. transformers 5 can also fetch these kernels from the Hub, through
+    #    `lazy_load_kernel`, which needs no local wheel and never consults the
+    #    predicates below. Drop the registry entries so it returns None and the
+    #    fast path stays unavailable. Before the local-wheel check, since the
+    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+            # An already-resolved module has to go too. None is enough:
+            # lazy_load_kernel only short-circuits on a real module object.
+            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+    except Exception:
+        pass
+    pass
+
+    # 0b. Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
+    #     (True by default) at construction and RAISE inside that branch when the
+    #     fast path is unavailable, so step 0 above and step 1 below turn their
+    #     forward into `ValueError: Fast Mamba kernels are not available` instead
+    #     of the slow path this guard promises. Wrapping the mixer is the only
+    #     thing that clears the instance flag, so it must not hang off the
+    #     module's `is_fast_path_available`:
+    #       - transformers >= 5.3 assigns that name from inside the mixer's
+    #         __init__ (`global is_fast_path_available`,
+    #         models/zamba/modeling_zamba.py:257 on 5.5.0), so it is absent from
+    #         the module dict until a mixer already exists, and 5.5's forward
+    #         recomputes it as a local (line 449) anyway.
+    #       - on 4.x it IS a module global, but step 1 has already made it False
+    #         by the time the modeling module gets imported, so a truthiness gate
+    #         never fired there either.
+    #     Before the local-wheel check: step 0 alone is enough to make the fast
+    #     path unavailable, and therefore enough to trigger the raise.
+    #     `sys.modules.get`, never a getattr scan: transformers 5 registers ~200
+    #     alias modules whose catch-all __getattr__ imports the real object.
+    #     Local, not a module global: the test extracts this function by AST and
+    #     execs it in a bare namespace.
+    _raising_mixers = {
+        "transformers.models.jamba.modeling_jamba" : "JambaMambaMixer",
+        "transformers.models.zamba.modeling_zamba" : "ZambaMambaMixer",
+    }
+    for _name, _cls_name in _raising_mixers.items():
+        _mod = sys.modules.get(_name, None)
+        if _mod is None:
+            continue
+        try:
+            _mixer = _mod.__dict__.get(_cls_name, None)
+            if _mixer is None or _mixer.__dict__.get("_unsloth_slow_only", False):
+                continue
+            def _slow_only(self, *a, __orig = _mixer.forward, **kw):
+                self.use_fast_kernels = False
+                try:
+                    # Jamba on transformers 5.5 reads `self.config.use_mamba_kernels`
+                    # rather than the instance flag, and clears exactly this on its
+                    # own fallback (models/jamba/modeling_jamba.py:470).
+                    _config = getattr(self, "config", None)
+                    if getattr(_config, "use_mamba_kernels", False):
+                        _config.use_mamba_kernels = False
+                except Exception:
+                    pass
+                return __orig(self, *a, **kw)
+            _mixer.forward = _slow_only
+            _mixer._unsloth_slow_only = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    # 0c. Step 0b can only reach a modeling module that is already imported, and
+    #     on the `trust_remote_code = True` path there is never such a moment:
+    #     unsloth returns from `unsloth_compile_transformers` before the
+    #     pre_compile and post_compile phases (models/_utils.py:3277), so the
+    #     only phase that ran is "init", at `import unsloth`, and
+    #     `from_pretrained` imports modeling_zamba afterwards. Clear the flag on
+    #     the CONFIG class instead, which needs no modeling import and is
+    #     order-independent: both families bind `use_fast_kernels =
+    #     config.use_mamba_kernels` in the mixer's __init__, so a config built
+    #     after this point can no longer ask for kernels that are already gone.
+    #     Importing the two configuration modules costs ~1ms and 2 modules
+    #     inside a process that has already imported transformers, versus a
+    #     `sys.meta_path` hook, which would have to stay installed for the whole
+    #     process lifetime and tax every later import for one flag.
+    #     The marker lives on the wrapper function, not on the class: the
+    #     transformers 5 configs are strict dataclasses, and this leaves them
+    #     with no attribute of ours. Locals only, since the test extracts this
+    #     function by AST and execs it in a bare namespace.
+    import importlib
+    _raising_configs = {
+        "transformers.models.jamba.configuration_jamba" : "JambaConfig",
+        "transformers.models.zamba.configuration_zamba" : "ZambaConfig",
+    }
+    for _name, _cfg_name in _raising_configs.items():
+        try:
+            _cfg = importlib.import_module(_name).__dict__.get(_cfg_name, None)
+            if _cfg is None or getattr(_cfg.__init__, "_unsloth_slow_only", False):
+                continue
+            def _slow_only_config(self, *a, __orig = _cfg.__init__, **kw):
+                __orig(self, *a, **kw)
+                try:
+                    self.use_mamba_kernels = False
+                except Exception:
+                    pass
+            _slow_only_config._unsloth_slow_only = True
+            _cfg.__init__ = _slow_only_config
+        except Exception:
+            pass
+        pass
+    pass
+
+    try:
+        import mamba_ssm  # noqa: F401
+    except Exception:
+        return  # Not installed locally, and the Hub entries are already gone
+
+    # 1. Modules imported LATER see the package as unavailable, so their
+    #    `is_fast_path_available` evaluates to False at import time.
+    try:
+        import transformers.utils.import_utils as _iu
+        for _pred in ("is_mamba_ssm_available", "is_mamba_2_ssm_available"):
+            if hasattr(_iu, _pred):
+                setattr(_iu, _pred, lambda: False)
+    except Exception:
+        pass
+    pass
+
+    # 2. Modules ALREADY imported have baked the flag in; flip it directly.
+    #    Confined to transformers' own model modules so vLLM's independent
+    #    Triton kernels are left alone. Jamba and Zamba are handled in 0b above,
+    #    which does not depend on the flag being present or truthy.
+    _touched = False
+    for _name, _mod in list(sys.modules.items()):
+        if not _name.startswith("transformers.models.") or _mod is None:
+            continue
+        # __dict__, not getattr: transformers 5 registers ~200 alias modules
+        # named transformers.models.<m>.image_processing_<m>_fast whose
+        # catch-all __getattr__ imports the real image processor, so a getattr
+        # probe warns 200 times, drags in 3800 modules (3.8s measured) per
+        # phase, and can propagate an ImportError out of `import unsloth`.
+        if not _mod.__dict__.get("is_fast_path_available", False):
+            continue
+        try:
+            _mod.is_fast_path_available = False
+            for _sym in (
+                "selective_state_update",
+                "mamba_chunk_scan_combined",
+                "mamba_split_conv1d_scan_combined",
+            ):
+                if getattr(_mod, _sym, None) is not None:
+                    setattr(_mod, _sym, None)
+            _touched = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    print(
+        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
+        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
+        f"Mamba models."
+    )
+    return _touched
+
+
+TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
+def patch_datasets_map_worker_death_retry():
+    """Retry `Dataset.map` single-process when a worker is killed outright.
+
+    Long-text corpora can have the kernel OOM-kill a `dataset_num_proc`
+    worker, which datasets turns into "One of the subprocesses has abruptly
+    died during map operation", killing the run inside SFTTrainer.__init__.
+    The map is issued deep inside TRL, so the user cannot disable
+    multiprocessing themselves.
+
+    Narrow by design: only a vanished worker (OOM-kill, segfault) matches, a
+    genuine exception from the map function is re-raised as itself and still
+    propagates, single-process maps re-raise untouched, and the retry cannot
+    recurse because num_proc is pinned to 1.
+    """
+    try:
+        from datasets import Dataset
+    except Exception:
+        return  # datasets not installed
+
+    original_map = getattr(Dataset, "map", None)
+    if original_map is None or getattr(original_map, "_unsloth_worker_death_retry", False):
+        return
+
+    import functools
+
+    @functools.wraps(original_map)
+    def map(self, *args, **kwargs):
+        try:
+            return original_map(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "abruptly died" not in str(exc):
+                raise
+            # num_proc has to end up as a keyword we can override, so a call
+            # that passed it positionally is re-expanded into keywords first.
+            call_args, call_kwargs = args, dict(kwargs)
+            num_proc = call_kwargs.get("num_proc", None)
+            if num_proc is None and args:
+                try:
+                    sig = inspect.signature(original_map)
+                    if any(p.kind is p.VAR_POSITIONAL for p in sig.parameters.values()):
+                        raise TypeError("cannot normalise *args")
+                    bound = sig.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    num_proc = bound.arguments.get("num_proc", None)
+                    var_kw = {}
+                    for p in sig.parameters.values():
+                        if p.kind is p.VAR_KEYWORD:
+                            var_kw = bound.arguments.pop(p.name, None) or {}
+                    bound.arguments.pop("self", None)
+                    call_args = ()
+                    call_kwargs = {**bound.arguments, **var_kw}
+                except Exception:
+                    call_args, call_kwargs = args, dict(kwargs)
+                    num_proc = None
+            if not isinstance(num_proc, int) or num_proc < 1:
+                raise
+            print(
+                f"Unsloth: a dataset worker was killed with num_proc={num_proc} "
+                f"(most likely out of system RAM). Retrying single-process; "
+                f"this is slower but survives."
+            )
+            # None, not 1: datasets >= 4.1.0 gates the pool on
+            # `num_proc is not None and num_proc >= 1` (arrow_dataset.py), so
+            # num_proc=1 still forks a worker and the kernel can kill it again.
+            call_kwargs["num_proc"] = None
+            return original_map(self, *call_args, **call_kwargs)
+        pass
+    pass
+
+    map._unsloth_worker_death_retry = True
+    Dataset.map = map
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
@@ -2164,3 +2434,89 @@ def patch_trl_sft_logits_metrics():
     trainer.compute_loss = _sft_wrap_compute_loss(original)
 pass
 TEMPORARY_PATCHES.append(patch_trl_sft_logits_metrics)
+
+def patch_longrope_impossible_attention_factor():
+    """Ignore a LongRoPE `attention_factor` that cannot be a real one.
+
+    The factor is by construction
+
+        sqrt(1 + log(factor) / log(original_max_position_embeddings))
+
+    a number near 1. transformers derives that when the key is absent, but
+    takes the config's word for it when present, and
+    unsloth/Phi-3.5-mini-instruct{,-bnb-4bit} set it equal to `factor` (32.0),
+    roughly 27x the real value. Nothing raises; the model just predicts badly
+    (4.74 vs 2.13 cross-entropy on the same text).
+
+    The signature is exact on purpose: attention_factor == factor AND
+    factor > 2. A genuine attention factor is never the extension ratio and
+    never much above 1.5. The real remedy is republishing those configs.
+    """
+    try:
+        import functools
+        import math
+        from transformers import modeling_rope_utils as _rope
+    except Exception:
+        return
+    original = getattr(_rope, "_compute_longrope_parameters", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    def _sanitise(config):
+        scaling = getattr(config, "rope_scaling", None)
+        if not isinstance(scaling, dict):
+            return
+        factor = scaling.get("factor")
+        attention_factor = scaling.get("attention_factor")
+        if attention_factor is None or factor is None:
+            return
+        try:
+            if float(attention_factor) != float(factor) or float(factor) <= 2.0:
+                return
+        except (TypeError, ValueError):
+            return
+        original_max = getattr(config, "original_max_position_embeddings", None) \
+            or getattr(config, "max_position_embeddings", None)
+        try:
+            correct = math.sqrt(1 + math.log(float(factor)) / math.log(float(original_max)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            correct = None
+        cleaned = dict(scaling)
+        cleaned.pop("attention_factor", None)
+        try:
+            config.rope_scaling = cleaned
+        except Exception:
+            return
+        print(
+            f"Unsloth: This model's config sets a LongRoPE attention_factor of "
+            f"{attention_factor}, which equals its extension factor and cannot be "
+            f"a real attention factor"
+            + (f" (the derived value is {correct:.4f})" if correct else "")
+            + ". Ignoring it so attention is scaled correctly."
+        )
+
+    # Everything but `config` is forwarded untouched: on transformers 5 every
+    # other parameter has a default and `_init_weights` calls the rope init as
+    # `rope_fn(module.config)`, so naming `device` here would make every
+    # LongRoPE model fail to load with a missing-argument TypeError.
+    @functools.wraps(original)
+    def _compute_longrope_parameters(config, *args, **kwargs):
+        try:
+            _sanitise(config)
+        except Exception:
+            # Never let the guard itself break a model that would have loaded.
+            pass
+        return original(config, *args, **kwargs)
+
+    _compute_longrope_parameters._unsloth_patched = True
+    try:
+        _rope._compute_longrope_parameters = _compute_longrope_parameters
+        # Models resolve the callable through this dict, not the module
+        # attribute, so patching only the attribute would be a no-op.
+        if getattr(_rope, "ROPE_INIT_FUNCTIONS", None) is not None:
+            if _rope.ROPE_INIT_FUNCTIONS.get("longrope") is original:
+                _rope.ROPE_INIT_FUNCTIONS["longrope"] = _compute_longrope_parameters
+    except Exception:
+        return
+pass
+TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
