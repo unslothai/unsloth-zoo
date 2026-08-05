@@ -602,9 +602,10 @@ def train_on_responses_only(
     def _maybe_tokenize_dataset(dataset):
         if dataset is None:
             return dataset
-        sample = next(iter(dataset))
-        if "input_ids" in sample:
-            return dataset  # Already tokenized
+        # An empty split has no row to peek at and nothing to tokenize.
+        sample = next(iter(dataset), None)
+        if sample is None or "input_ids" in sample:
+            return dataset  # Empty, or already tokenized
         _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
         # Use the actual tokenizer, not the processor
         if hasattr(_tokenizer, "tokenizer"):
@@ -673,8 +674,8 @@ def train_on_responses_only(
         print("Unsloth: Warning: " + message)
     pass
 
-    def _no_training_signal(dataset_name, how_many):
-        return ValueError(
+    def _no_training_signal_message(dataset_name, how_many):
+        return (
             f"Unsloth: train_on_responses_only masked every label to -100 in {dataset_name}"
             f"{how_many}, so there is nothing to train on. The response marker "
             f"{repr(response_part)} was not found in any sample - check that "
@@ -682,25 +683,37 @@ def train_on_responses_only(
         )
     pass
 
+    def _no_training_signal(dataset_name, how_many):
+        return ValueError(_no_training_signal_message(dataset_name, how_many))
+    pass
+
     # Streaming rows cannot be counted or filtered, and fix_zero_training_loss
-    # skips them too, so sample a bounded prefix instead: all -100 there means the
-    # markers do not match this template. Iterating restarts the stream, so no rows
-    # are consumed.
+    # skips them too, so read a bounded prefix instead. Iterating restarts the
+    # stream, so no rows are consumed.
     _STREAM_SCAN_ROWS = 16
 
     def _check_streaming_labels(dataset, dataset_name):
-        seen = 0
+        rows = 0
         try:
-            for row in _itertools.islice(iter(dataset), _STREAM_SCAN_ROWS):
+            # One row past the bound, to tell "the whole stream" from "a prefix".
+            for row in _itertools.islice(iter(dataset), _STREAM_SCAN_ROWS + 1):
+                rows += 1
+                if rows > _STREAM_SCAN_ROWS: break
                 labels = row.get("labels") if isinstance(row, dict) else None
                 if labels is None: return
                 if getattr(labels, "tolist", None): labels = labels.tolist()
                 if any(l != -100 for l in labels): return
-                seen += 1
         except Exception:
             return  # unreadable stream: leave it exactly as before
-        if seen == 0: return
-        raise _no_training_signal(dataset_name, f" (first {seen} samples)")
+        if rows == 0: return
+        # Only a stream that ENDED inside the prefix is provably all masked. A
+        # longer one may be sorted or filtered so that responses start later, and
+        # refusing it would block a run that trains fine, so only warn.
+        if rows <= _STREAM_SCAN_ROWS:
+            raise _no_training_signal(dataset_name, "")
+        print("Unsloth: Warning: " + _no_training_signal_message(
+            dataset_name, f" (first {_STREAM_SCAN_ROWS} samples)",
+        ) + "\nLater samples may still carry responses, so training continues.")
     pass
 
     def _filter_fully_masked(dataset, dataset_name="dataset"):
@@ -881,8 +894,49 @@ def train_on_responses_only(
         return [split[i] for i in idx]
     pass
 
+    # A sample of any fixed size is guesswork: a 200-row split reads 16 positions,
+    # so an image on row 5 goes unseen and the strip below drops it. Arrow types
+    # are uniform down a column, so the schema answers for EVERY row at once, and
+    # reading it is constant time - where scanning one `datasets.Image` column
+    # exhaustively decodes each image (~1ms/row, ~94s per 100k rows).
+    _PLAIN_DTYPES = ("string", "large_string", "bool", "null", "int", "uint",
+                     "float", "double", "decimal", "date", "time", "duration",
+                     "timestamp")
+
+    def _feature_is_plain_text(feature, _depth = 0):
+        """True only when this column type cannot hold media in any row."""
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, dict):                       # struct
+            for key, value in feature.items():
+                if not isinstance(key, str) or key.lower() in _MEDIA_KEYS: return False
+                if not _feature_is_plain_text(value, _depth + 1): return False
+            return True
+        if isinstance(feature, (list, tuple)):
+            return all(_feature_is_plain_text(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
+        if inner is not None: return _feature_is_plain_text(inner, _depth + 1)
+        # Value/ClassLabel name a primitive dtype. Image is "PIL.Image.Image" and
+        # Audio/Video a dict, so anything unrecognised stays unsafe.
+        dtype = getattr(feature, "dtype", None)
+        if not isinstance(dtype, str): return False
+        return dtype.startswith(_PLAIN_DTYPES)
+    pass
+
+    def _columns_are_provably_text(split, names):
+        features = getattr(split, "features", None)
+        if features:
+            try:
+                return all(_feature_is_plain_text(f) for name, f in features.items()
+                           if name not in _TEXT_COLUMNS)
+            except Exception:
+                return False
+        # No schema (an unresolved stream): a sample cannot prove what the rows it
+        # never reads hold, so trust only the tokenizer's own columns.
+        return not (set(names) - _TEXT_COLUMNS)
+    pass
+
     def _split_views(dataset):
-        """`(column names, sampled rows)` per split, rows `[]` when unreadable.
+        """`(column names, sampled rows, provably text)` per split.
 
         `iter()` restarts a datasets IterableDataset, so peeking rows does not
         consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
@@ -902,7 +956,7 @@ def train_on_responses_only(
             if not names:
                 if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
                 names = list(rows[0].keys())
-            views.append((set(names), rows))
+            views.append((set(names), rows, _columns_are_provably_text(split, names)))
         return views
     pass
 
@@ -919,11 +973,12 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows in views:
+        for names, rows, provable in views:
             if "input_ids" not in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
-            # Columns look text-only, so check the values: a `messages` column can
-            # carry inline images that the strip below would throw away.
+            # Columns look text-only, so check the values too: a `messages` column
+            # can carry inline images that the strip below would throw away.
+            if not provable: return False
             for row in rows:
                 if not _row_is_plain_text(row): return False
         return True
@@ -946,12 +1001,13 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows in views:
+        for names, rows, provable in views:
             if "input_ids" in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
             # The column `_maybe_tokenize_dataset` would actually read.
             field = text_field if text_field in names else "text"
             if field not in names: return False
+            if not provable: return False
             for row in rows:
                 if not isinstance(row.get(field), str): return False
                 if not _row_is_plain_text(row): return False
@@ -1144,8 +1200,10 @@ def train_on_responses_only(
     pass
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
+    # Eval-only trainers have no train split, and this check calls len() on it.
     from .training_utils import fix_zero_training_loss
-    fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
+    if getattr(trainer, "train_dataset", None) is not None:
+        fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 pass
 

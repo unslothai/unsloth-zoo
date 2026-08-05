@@ -975,3 +975,112 @@ def test_a_partly_masked_streaming_split_still_trains():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
     assert len(list(out.train_dataset)) == 4
+
+
+# ---- a 16-row sample is not the whole split either --------------------------
+
+def test_an_image_on_an_unsampled_row_is_refused():
+    """The bounded scan reads 16 fixed positions, so a 200-row split checks rows
+    0, 13, 26, ... and an image on row 5 was never looked at. The column type is
+    uniform down the whole split, so the schema settles it for every row."""
+    n = 200
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, _rows_with_an_image_at(n, image_at = 5))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator
+    assert "media" in trainer.train_dataset.column_names, "the images were dropped"
+
+
+def test_a_raw_eval_split_with_an_image_on_an_unsampled_row_is_refused():
+    """`_eval_split_is_raw_text_only` samples the same 16 positions, so the eval
+    half needs the schema just as much as the train half does."""
+    import io
+    from PIL import Image as PILImage
+    from datasets import Image as ImageFeature
+
+    buffer = io.BytesIO()
+    PILImage.new("RGB", (2, 2)).save(buffer, format = "PNG")
+    n = 200
+    media = [{"bytes": buffer.getvalue(), "path": None} if i == 5 else None
+             for i in range(n)]
+    eval_split = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"] * n, "media": media,
+    }).cast_column("media", ImageFeature())
+
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = eval_split
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "media" in trainer.eval_dataset.column_names
+
+
+# ---- a masked prefix is not a masked stream --------------------------------
+
+def test_a_stream_whose_responses_start_later_still_trains():
+    """A sorted or filtered stream can put every prompt-only row first. The
+    bounded prefix cannot see past row 16, so it must not refuse the run."""
+    from datasets import IterableDataset
+
+    rows = [{"input_ids": [10, 11, 12]} for _ in range(16)]
+    rows += [{"input_ids": list(ROW)} for _ in range(4)]
+    dataset = IterableDataset.from_generator(lambda: iter(rows))
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    got = list(out.train_dataset)
+    assert len(got) == len(rows)
+    assert [l for l in got[-1]["labels"] if l != -100] == [20, 21]
+
+
+def test_a_stream_masked_past_the_prefix_warns_instead(capsys):
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          _unmatched_rows(n = 40).to_iterable_dataset())
+    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "nothing to train on" in capsys.readouterr().out
+
+
+# ---- empty splits ----------------------------------------------------------
+
+def test_an_empty_raw_eval_split_is_handled():
+    """`_maybe_tokenize_dataset` peeks one row, and an empty split has none."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
+    trainer.eval_dataset = Dataset.from_dict({"text": []})
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert len(out.eval_dataset) == 0
+    assert "labels" in out.train_dataset.column_names
+
+
+def test_an_empty_pretokenized_eval_split_is_handled():
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
+    trainer.eval_dataset = Dataset.from_dict({"input_ids": []})
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert len(out.eval_dataset) == 0
+
+
+# ---- a trainer need not have a train split ---------------------------------
+
+def test_an_eval_only_trainer_is_not_a_crash():
+    """`Trainer(eval_dataset = ...)` with no train split: the final all-masked
+    check calls len() on it, so it must not run with nothing there."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), None)
+    trainer.eval_dataset = _text_rows()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.train_dataset is None
+    assert "labels" in out.eval_dataset.column_names
+
+
+def test_an_eval_only_trainer_on_the_plain_text_path_is_not_a_crash():
+    """Same call, reached without the bypass at all."""
+    trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubTokenizer()), None)
+    trainer.eval_dataset = _text_rows()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.eval_dataset.column_names
