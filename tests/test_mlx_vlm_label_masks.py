@@ -2696,19 +2696,51 @@ def test_qualified_families_carry_their_probed_requirements():
     """The table itself: which families, over which mlx-vlm releases.
 
     Bounded at both ends, so an unreleased version is refused rather than
-    assumed good. Gemma 4 stays at the version its probes ran on: its processor
-    changed in 0.5.0, upstream reports it failing to load from 0.6.4
-    (Blaizzy/mlx-vlm#1526), and 0.6.3 split off a separate `gemma4_unified`.
+    assumed good. Gemma 4 starts higher than the rest because below 0.6.2
+    mlx-vlm cannot load the checkpoint at all: E2B's KV-shared layers ship no
+    k_proj/v_proj/k_norm, and mlx-vlm built those modules regardless until
+    Blaizzy/mlx-vlm#1301.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     versions = mlx_utils._AudioVersions
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
         "gemma3n": versions("0.4.4", "0.6.4"),
-        "gemma4": versions("0.4.4", "0.4.4"),
+        "gemma4": versions("0.6.2", "0.6.4"),
         "phi4mm": versions("0.4.4", "0.6.4"),
         "minicpmo": versions("0.4.4", "0.6.4"),
     }
+
+
+@pytest.mark.parametrize("installed,admitted", [
+    ("0.4.4", False),        # loads nothing: 60 KV-shared tensors missing
+    ("0.5.0", False),
+    ("0.6.0", False),
+    ("0.6.1", False),        # last release before #1301
+    ("0.6.2", True),         # #1301: KV-shared layers stop building k/v proj
+    ("0.6.3", True),
+    ("0.6.4", True),         # double conv transpose, undone by loader.py (PR 879)
+    ("0.6.5", False),        # needs transformers>=5.14, capped at 5.5.0
+    ("0.6.2.post1", False),  # post-releases and prereleases were not probed
+    ("0.6.2rc1", False),
+])
+def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
+        installed, admitted):
+    """The boundary, measured rather than argued.
+
+    Every released row from 0.4.4 to 0.6.4 was run end to end on macos-14
+    against mlx-community/gemma-4-e2b-it-4bit: model load, placeholder counts
+    against what the audio tower returns, and two clips giving two losses.
+    0.6.1 red, 0.6.2 green.
+
+    The other rows are policy, not measurement. 0.6.5 cannot be installed
+    beside this package (it needs transformers>=5.14, capped at 5.5.0), and
+    mlx-vlm has published no post-release or prerelease to run.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
+    assert window.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,admitted", [
@@ -2778,13 +2810,14 @@ def test_only_a_published_final_release_is_inside_the_window():
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
-    assert gemma4.admits("0.4.4") is True
-    for unqualified in ("0.4.4.post1", "0.4.4.post2", "0.4.4+local",
-                        "0.4.4rc1", "0.4.4.dev0"):
+    assert gemma4.admits("0.6.2") is True
+    for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
+                        "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor the next release, which is a different processor.
-    assert gemma4.admits("0.4.5") is False
-    assert gemma4.admits("0.5.0") is False
+    # Nor either side. 0.6.1 measured red; 0.6.5 is refused for being
+    # uninstallable here, not for failing.
+    assert gemma4.admits("0.6.1") is False
+    assert gemma4.admits("0.6.5") is False
 
 
 def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
@@ -2802,7 +2835,10 @@ def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
         mlx_utils._check_audio_family_gate(unified())
     message = str(excinfo.value)
     assert "gemma4_unified" in message and "'gemma4'" in message
-    assert "0.4.4" in message, "the version to pin is not named"
+    # Read the window off the table: the refusal must name whatever gemma4 is
+    # currently qualified for, and that moves when it is re-probed.
+    window = str(mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"])
+    assert window in message, "the version to pin is not named"
 
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(

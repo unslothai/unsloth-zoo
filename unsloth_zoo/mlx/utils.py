@@ -5663,12 +5663,28 @@ class _AudioVersions(NamedTuple):
 # processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
 # 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
 #
-# Gemma 4 stays at 0.4.4: its processor changed in 0.5.0, upstream reports it
-# failing to load from 0.6.4 with 0.6.3 good (Blaizzy/mlx-vlm#1526), and 0.6.3
-# added a separate `gemma4_unified` family. Re-probing needs Apple hardware.
+# Gemma 4 starts at 0.6.2, not 0.4.4: below that mlx-vlm cannot load the
+# checkpoint at all. E2B's KV-shared layers reuse an earlier layer's K/V and
+# ship no k_proj/v_proj/k_norm, and mlx-vlm built those modules for every layer
+# until Blaizzy/mlx-vlm#1301, so loading died on 60 missing tensors.
+#
+# The 0.4.4 this replaces was correct when written -- the export before
+# 2026-07-06 shipped those projections -- and was invalidated by the checkpoint
+# being re-uploaded. A version key cannot express a fact about an artefact, so
+# re-measure with `tests/gemma4_audio_version_probe.py` rather than argue.
+#
+# Measured on macos-14 against mlx-community/gemma-4-e2b-it-4bit @ 2387675275,
+# 0.4.4 through 0.6.4: load, placeholder count vs the positions `audio_tower`
+# returns at 0.5s/1.0s/2.0s/3.7s, two clips giving two losses. 0.6.1 red,
+# 0.6.2-0.6.4 green. 0.6.5+ was never run: it cannot be installed here.
+#
+# 0.6.4 is in deliberately. Raw mlx-vlm 0.6.4 fails on these weights -- #1498
+# made sanitize unconditional, double-transposing pre-converted convs -- but
+# loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
+# fixed it in 0.6.5 (#1523). The ceiling is 0.6.4 only for the transformers cap.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
-    "gemma4": _AudioVersions("0.4.4", "0.4.4"),
+    "gemma4": _AudioVersions("0.6.2", "0.6.4"),
     "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
@@ -5679,6 +5695,8 @@ _AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
 # differently, so they are refused rather than assumed compatible.
+# Redundant now gemma4's floor is 0.6.2 (every mlx-vlm there needs
+# transformers>=5.5.0), but kept for hand-assembled environments.
 _AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
 
 _AUDIO_CAST_HINT = (
