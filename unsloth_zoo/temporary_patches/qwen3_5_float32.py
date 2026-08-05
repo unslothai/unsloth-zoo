@@ -47,10 +47,22 @@ from .common import TEMPORARY_PATCHES
 from .utils import patch_function, raise_error
 
 
+def _unsloth_base_linear(linear):
+    """Return the underlying Linear if `linear` is a PEFT/LoRA adapter wrapper."""
+    if linear is None:
+        return None
+    if hasattr(linear, "get_base_layer"):
+        return linear.get_base_layer()
+    return getattr(linear, "base_layer", linear)
+
+
 def _unsloth_get_linear_weight_dtype(module):
     """Return a representative fp Linear weight dtype, or None if absent."""
     for attr in ("q_proj", "qkv", "in_proj_qkv", "gate_proj", "linear_fc1", "up_proj", "fc1", "lm_head"):
         linear = getattr(module, attr, None)
+        if linear is None:
+            continue
+        linear = _unsloth_base_linear(linear)
         if linear is None:
             continue
         weight = getattr(linear, "weight", None)
@@ -75,6 +87,9 @@ def _unsloth_weight_dtype(linear):
     Mirrors the guard in ``_unsloth_get_linear_weight_dtype`` so we do not
     cast activations to a packed quantized storage dtype or to fp8.
     """
+    if linear is None:
+        return None
+    linear = _unsloth_base_linear(linear)
     if linear is None:
         return None
     weight = getattr(linear, "weight", None)
