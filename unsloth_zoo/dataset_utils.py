@@ -713,25 +713,45 @@ def train_on_responses_only(
         return hasattr(collator, "image_processor")
     pass
 
+    # What a processor emits beside `input_ids`. A row carrying any of these
+    # still needs the collator that knows how to batch it.
+    _MULTIMODAL_COLUMNS = frozenset((
+        "pixel_values", "pixel_values_videos", "pixel_attention_mask",
+        "image_grid_thw", "video_grid_thw", "image_sizes", "image_sizes_videos",
+        "images", "image", "videos", "video", "audio", "audios",
+        "token_type_ids_images", "input_features", "input_features_mask",
+        "audio_values", "audio_attention_mask", "input_audio_embeds",
+        "aspect_ratio_ids", "aspect_ratio_mask", "cross_attention_mask",
+    ))
+
     def _dataset_is_pretokenized(dataset):
-        """True when rows already carry `input_ids`.
+        """True when rows carry `input_ids` and nothing else to collate.
 
         Separates "the collator rebuilds labels from a processor at collate time"
         from "text was tokenized up front and the collator only pads", where
         dataset-level masking is correct. Anything unreadable returns False, so
         the caller keeps the old strict behaviour.
+
+        Rows that also carry image/video/audio columns are NOT that case: the
+        text path below swaps the collator for a text one, which would throw
+        away the user's image handling, so those keep the old refusal.
         """
         if dataset is None:
             return False
+
+        def _text_only(names):
+            names = set(names)
+            return "input_ids" in names and names.isdisjoint(_MULTIMODAL_COLUMNS)
+
         try:
             names = getattr(dataset, "column_names", None)
             if isinstance(names, dict):  # DatasetDict
                 names = [c for v in names.values() for c in (v or [])]
             if names:
-                return "input_ids" in names
+                return _text_only(names)
             # IterableDataset and friends expose no column_names; peek one row.
             for row in dataset:
-                return isinstance(row, dict) and "input_ids" in row
+                return isinstance(row, dict) and _text_only(row.keys())
         except Exception:
             return False
         return False
@@ -824,9 +844,19 @@ def train_on_responses_only(
     # only pads already-tokenized text.
     from transformers import DataCollatorForSeq2Seq
     packing_enabled = getattr(trainer.args, "packing", False)
+    _collator = getattr(trainer, "data_collator", None)
+    # DataCollatorForSeq2Seq(tokenizer = <VLM processor>) pads through
+    # self.tokenizer.pad / .padding_side, which processors do not have, so it
+    # dies on the first batch. Rebuild that one around the unwrapped text
+    # tokenizer too; gate on the capability rather than the processor type, so
+    # this stays right if transformers ever gives ProcessorMixin a .pad.
+    _rebuild = (
+        not isinstance(_collator, DataCollatorForSeq2Seq)
+        or not hasattr(getattr(_collator, "tokenizer", None), "pad")
+    )
     if (
         hasattr(trainer, "data_collator")
-        and not isinstance(trainer.data_collator, DataCollatorForSeq2Seq)
+        and _rebuild
         and not packing_enabled
     ):
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
