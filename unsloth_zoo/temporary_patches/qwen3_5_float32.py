@@ -92,13 +92,14 @@ def _unsloth_weight_dtype(linear):
 
 
 def _unsloth_is_default_causal_lm_loss(loss_function):
-    """True when the configured loss is the standard HF causal-LM objective.
+    """True when the configured loss is the standard HF/Unsloth causal-LM objective.
 
-    Custom loss functions should fall back to the logits + loss_function path
-    rather than being silently replaced by the fused CE kernel.
+    Unsloth renames the default loss to ``UnslothForCausalLMLoss``; keep the
+    same suffix rule used by the compiler rewrite so the default fused path is
+    still taken while custom losses fall back to logits + loss_function.
     """
     name = getattr(loss_function, "__name__", "")
-    return name in ("ForCausalLMLoss",)
+    return name.endswith("ForCausalLMLoss")
 
 
 def _unsloth_cast_position_embeddings(position_embeddings, dtype):
