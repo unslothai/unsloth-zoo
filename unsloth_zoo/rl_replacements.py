@@ -84,16 +84,21 @@ def chunked_hidden_states_selective_log_softmax(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # Take the reduction dim from lm_head, not hidden_states. Same number, but
-    # under dynamic = True hidden_states' last dim stays a free symbol that
-    # Dynamo cannot prove equal to lm_head's concrete one, so the matmul guard
-    # fails before anything runs:
+    # Reshape against this tensor's own last dim. It is always a no-op, so a
+    # caller that passes the wrong width cannot have its row count silently
+    # rewritten, and the mismatch surfaces at the matmul below, which prints
+    # both operands:
     #     a and b must have same reduction dim, but got
     #     [((s47*s87 + 255)//256), s33] X [1536, 151936]
-    # torch._check states the equality to the shape system, and in eager mode
-    # asserts it instead of letting a mismatched lm_head reach the matmul.
-    torch._check(hidden_states.shape[-1] == lm_head.shape[-1])
-    flat_hidden_states = hidden_states.reshape(-1, lm_head.shape[-1])
+    # That message is the diagnosis, not a symptom to suppress: `s33` is a
+    # backed symbol and `Eq(s33, 1536)` is genuinely False, i.e. the tensor is
+    # not hidden states. Callers dispatch on the width before getting here --
+    # see `compute_logprobs_chunk` and the packed path below. A bare
+    # `torch._check(hidden_states.shape[-1] == lm_head.shape[-1])` reports only
+    # "Expected cond to be True, but got False", naming neither operand, and a
+    # message that would name them cannot be built: Dynamo rejects a callable
+    # message with "Failed to convert args/kwargs to proxy".
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
@@ -1170,11 +1175,26 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
-                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
-                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                    )[0]
+                    # `.logits` only carries hidden states when the model's
+                    # forward is the Unsloth generated one that honours
+                    # UNSLOTH_RETURN_HIDDEN_STATES. When it is not, this is a
+                    # real [T, vocab] logits tensor and the lm_head matmul dies
+                    # with "a and b must have same reduction dim". Dispatch on
+                    # the width, exactly as `compute_logprobs_chunk` does for
+                    # the padded path.
+                    _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
+                    _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                    if _pack_h.shape[-1] == lm_head.shape[1]:
+                        _pack_sel = chunked_hidden_states_selective_log_softmax(
+                            _pack_h, lm_head, _pack_tid, _pack_chunks,
+                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                        )[0]
+                    else:
+                        # Raw logits: the forward already applied scale/softcap.
+                        _pack_sel = chunked_selective_log_softmax(
+                            _pack_h, _pack_tid,
+                            temperature = temperature, chunks = _pack_chunks,
+                        )[0]
                 # GPT-OSS offload race guard (matches the padded loop)
                 device_synchronize()
                 # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded

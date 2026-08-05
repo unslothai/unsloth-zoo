@@ -14,33 +14,29 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO chunked log-softmax took its reduction dim from the wrong operand.
+"""The GRPO chunked log-softmax and its reduction dim.
 
-`chunked_hidden_states_selective_log_softmax` is compiled with dynamic = True
-and fullgraph = True, and opened with
-
-    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-
-Under dynamic = True that last dim stays a free symbol. The very next thing the
-function does is matmul it against lm_head, whose hidden size is concrete, and
-Dynamo cannot prove the two are equal, so the guard fails before a single
-element is computed:
+An earlier revision of this file claimed the function took its reduction dim
+from the wrong operand and that
 
     a and b must have same reduction dim, but got
     [((s47*s87 + 255)//256), s33] X [1536, 151936]
 
-That is NeMo-Gym-Sudoku at cell 21, inside the generated UnslothGRPOTrainer,
-which carries a copy of this function's source. Isolation with
-UNSLOTH_COMPILE_DISABLE=1 (once that flag actually reached these helpers, zoo
-b6638c070) made the error disappear entirely, which is what says the problem is
-the guard rather than the chunk arithmetic: the ceil-division in the first
-operand is just `torch.chunk` and is fine.
+was a dynamic-shape guard Dynamo could not discharge. It is not. `s33` is a
+backed symbol and `Eq(s33, 1536)` evaluates to False: the tensor really was the
+wrong width. `lm_head` is `get_output_embeddings().weight`, an nn.Parameter of
+[vocab, hidden] = [151936, 1536] and therefore shape-static, which is why `b`
+prints concrete beside a symbolic `a`.
 
-The fix takes the reduction dim from the operand it has to match, and states the
-equality to the symbolic shape system with torch._check. Both sides are then the
-same expression and there is nothing left to prove. The two are the same number
-whenever the matmul is legal at all, so nothing about the maths changes -- which
-is what the numeric tests here are for.
+So the reduction dim is not the bug, and switching it to `lm_head.shape[-1]`
+plus a bare `torch._check` changed nothing except the error text -- the guard
+sets are identical (verified with TORCH_LOGS=guards; dim 2 specializes to 1536
+either way), and the message got worse: `Expected cond to be True, but got
+False`, naming neither operand. The real cause and its fix live in
+tests/test_grpo_packed_raw_logits_dispatch.py.
+
+What is left here is the numeric contract, which is worth keeping as a
+regression guard even though it never distinguished the two spellings.
 """
 
 import os
@@ -67,21 +63,26 @@ def _fn_source():
     raise AssertionError("function not found")
 
 
-def test_the_reduction_dim_comes_from_lm_head():
+def test_the_reshape_uses_its_own_last_dim():
+    """A no-op reshape. Against `lm_head.shape[-1]` a mismatched caller whose
+    element count happens to divide gets its row count silently rewritten
+    instead of failing at the matmul."""
     body = _fn_source()
-    assert "hidden_states.reshape(-1, lm_head.shape[-1])" in body
-    assert "hidden_states.reshape(-1, hidden_states.shape[-1])" not in body
+    assert "hidden_states.reshape(-1, hidden_states.shape[-1])" in body
 
 
-def test_the_equality_is_stated_to_the_shape_system():
-    body = _fn_source()
-    assert "torch._check(hidden_states.shape[-1] == lm_head.shape[-1])" in body
-
-
-def test_the_check_runs_before_the_reshape():
-    """After the reshape it is too late to say anything useful."""
-    body = _fn_source()
-    assert body.index("torch._check(") < body.index("reshape(-1, lm_head")
+def test_no_message_less_check_is_reintroduced():
+    """`torch._check(cond)` with no message reports only "Expected cond to be
+    True, but got False". A message that would name the widths cannot be added
+    either: Dynamo rejects a callable message. So the matmul must be left to
+    raise, since it prints both operands."""
+    import ast
+    calls = [
+        n for n in ast.walk(ast.parse(_fn_source()))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_check"
+    ]
+    assert calls == [], "torch._check without a message is back"
 
 
 def test_the_sibling_helper_is_left_alone():
