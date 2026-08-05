@@ -473,8 +473,10 @@ def test_a_trainer_that_asked_for_outputs_still_gets_them():
     self.aux_loss_enabled = True
     result, outputs = _sft_call_without_logits_metrics(
         original, self, (self.model, _inputs(), True), {})
-    assert result is pair
-    assert outputs is None, "the caller asked, so nothing was forced or unwrapped"
+    assert result is pair, "the caller asked, so the tuple is handed back intact"
+    # Still harvested for the replay: an eval step arrives already asking, and
+    # those are the batches that would otherwise lose the metric.
+    assert outputs is pair[1]
 
 
 # ---- an output object with no logits at all is somebody else's bug ---------
@@ -659,6 +661,73 @@ def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
     finally:
         Trainer.compute_loss = original
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25]
+
+
+# ---- eval and predict, where the caller already asked for outputs ---------
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
+    """`Trainer.prediction_step` calls compute_loss(..., return_outputs=True),
+    so `force` is False and the outputs side channel would be empty for exactly
+    the batches that still want the metric."""
+    from transformers import Trainer
+    Out = collections.namedtuple("Out", "loss logits aux_loss")
+
+    def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        loss = torch.tensor(1.0)
+        out = Out(loss, sentinel(), torch.tensor(0.25))
+        return (loss, out) if return_outputs else loss
+
+    original = Trainer.compute_loss
+    Trainer.compute_loss = fake
+    try:
+        self = _trainer(sft)
+        self.aux_loss_enabled = True
+        for _ in range(3):
+            got = sft.SFTTrainer.compute_loss(
+                self, self.model, _inputs(), return_outputs = True,
+                num_items_in_batch = None)
+            assert isinstance(got, tuple) and len(got) == 2, got
+    finally:
+        Trainer.compute_loss = original
+    assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
+
+
+# ---- a retry that also fails must not latch the trainer -------------------
+
+def test_a_failing_retry_does_not_latch_the_fast_path():
+    """If the logits are wanted by something other than the metric block
+    (trl's loss_type='dft', a custom loss), the retry raises too. Latching
+    before it would keep this trainer in the no-logits path for the rest of the
+    process, including a rerun with UNSLOTH_RETURN_LOGITS=1 set.
+
+    Driven through the wrapper directly: the detector reads a frame local
+    named `outputs`, and going via the installed trl would only ever raise
+    from the metric block, which the retry skips by construction.
+    """
+    from unsloth_zoo.temporary_patches.misc import _sft_wrap_compute_loss
+    Out = collections.namedtuple("Out", "loss logits")
+    calls = []
+
+    def original(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+        calls.append(self.args.use_liger_kernel)
+        outputs = Out(torch.tensor(1.0), EmptyLogits())  # noqa: F841 - read off the frame
+        raise RuntimeError("this loss needs the logits itself")
+
+    self = _trainer()
+    with pytest.raises(RuntimeError, match = "needs the logits"):
+        _sft_wrap_compute_loss(original)(self, self.model, _inputs(),
+                                         num_items_in_batch = None)
+    assert calls == [False, True], calls
+    assert not getattr(self, "_unsloth_logits_are_empty", False)
+
+
+def test_a_succeeding_retry_still_latches(sft):
+    """The other half: the fast path exists so step 2 onwards costs one attempt,
+    not two."""
+    self, calls = _run_steps(sft, EmptyLogits(), steps = 3)
+    assert getattr(self, "_unsloth_logits_are_empty", False)
+    assert calls == 4, calls
 
 
 if __name__ == "__main__":

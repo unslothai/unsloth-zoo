@@ -2049,9 +2049,15 @@ def _sft_call_without_logits_metrics(original, self, args, kwargs, contents = No
             result = original(self, *args, **kwargs)
     finally:
         targs.use_liger_kernel = previous
-    if force and isinstance(result, tuple) and len(result) == 2:
-        return result[0], result[1]
-    return result, None
+    # Take the outputs whenever they are there, not only when we asked. An
+    # eval or predict step arrives with return_outputs already True
+    # (Trainer.prediction_step), so `force` is False and the side channel would
+    # otherwise be empty for exactly the batches that still want aux_loss.
+    _outputs = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+    if force and _outputs is not None:
+        # We asked for these, the caller did not: hand back only the loss.
+        result = result[0]
+    return result, _outputs
 pass
 
 
@@ -2091,7 +2097,6 @@ def _sft_wrap_compute_loss(original):
             if outputs is None:
                 if muted is not None: muted[0][0] = muted[1]
                 raise
-            self._unsloth_logits_are_empty = True
             if counter is not None:
                 self._total_train_tokens = counter
             if lengths is not None:
@@ -2113,6 +2118,12 @@ def _sft_wrap_compute_loss(original):
             )
             retried, retry_outputs = _sft_call_without_logits_metrics(
                 original, self, args, kwargs, contents)
+            # Latched only now. If the retry raises too, the logits were wanted
+            # by something other than the metric block (trl's loss_type='dft',
+            # a custom loss), and latching would keep this trainer in the
+            # no-logits path for the rest of the process -- including a rerun
+            # with UNSLOTH_RETURN_LOGITS=1, which would then never re-probe.
+            self._unsloth_logits_are_empty = True
             _sft_replay_aux_loss(
                 self, outputs if retry_outputs is None else retry_outputs, aux_before)
             return retried
