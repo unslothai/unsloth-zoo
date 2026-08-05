@@ -686,9 +686,15 @@ def test_the_generated_import_works_without_the_escape_hatch():
     load without it, and every process that runs a generated trainer file has it
     because importing unsloth is what generated the file. Skipping on that
     message instead would retire this canary on any machine where nobody
-    imported unsloth first, which is most of them. A genuinely missing torch is
-    still a skip, since no change here could fix it.
+    imported unsloth first, which is most of them.
+
+    A missing dependency is a different thing and is still a skip, decided here
+    rather than from the child's stderr: __init__ raises the same "Please install
+    Unsloth" message for `find_spec("unsloth") is None`, which no environment
+    variable satisfies, so a zoo-only checkout would otherwise fail this outright.
     """
+    if importlib.util.find_spec("unsloth") is None:
+        pytest.skip("unsloth is not installed; the package __init__ cannot load")
     result = _import_the_dotted_path(UNSLOTH_IS_PRESENT = "1")
     if result.returncode != 0 and "Pytorch is not installed" in result.stderr:
         pytest.skip("the package __init__ cannot load here: no torch")
@@ -1122,3 +1128,40 @@ def test_the_fixture_really_neutralises_the_zoo_readers(dnp):
     assert str(module.CGROUP_ROOT).startswith("/nonexistent"), module.CGROUP_ROOT
     assert module._cgroup_v2_dirs() == []
     assert module._cgroup_v1_dirs("memory") == []
+
+
+def test_standardize_data_formats_routes_through_the_policy(monkeypatch):
+    """The other public map() in dataset_utils, not just the trainer path.
+
+    It carried its own copy of the heuristic: it read stdlib multiprocessing's
+    start method while datasets uses multiprocess, and under memory pressure it
+    fell back to num_proc = 1, which is a Pool(1) on datasets >= 4.1 -- the pool
+    this policy exists to avoid. A user calling standardize_sharegpt before
+    training reaches it.
+    """
+    datasets = pytest.importorskip("datasets")
+    dnp_module = pytest.importorskip("unsloth_zoo.dataset_num_proc")
+    dataset_utils = pytest.importorskip("unsloth_zoo.dataset_utils")
+
+    real = dnp_module.get_dataset_num_proc
+    seen = {}
+
+    def recording(desired = None, **kwargs):
+        seen["desired"] = desired
+        return real(desired, **kwargs)
+
+    monkeypatch.setattr(dnp_module, "get_dataset_num_proc", recording)
+    dataset = datasets.Dataset.from_dict({
+        "conversations": [
+            [{"from": "human", "value": f"q{i}"}, {"from": "gpt", "value": f"a{i}"}]
+            for i in range(6)
+        ]
+    })
+    captured = {}
+    monkeypatch.setattr(
+        datasets.Dataset, "map", lambda self, *a, **kw: (captured.update(kw), self)[1]
+    )
+    dataset_utils.standardize_data_formats(dataset, num_proc = 1)
+    assert seen["desired"] == 1, "the policy was never consulted"
+    assert captured["num_proc"] is None, "num_proc=1 is a Pool(1) on datasets >= 4.1"
+
