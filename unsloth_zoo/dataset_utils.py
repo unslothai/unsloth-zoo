@@ -848,6 +848,57 @@ def train_on_responses_only(
         "bytes", "path", "url",
     ))
 
+    # Top-level column names that only ever point at media. A pretokenized VLM
+    # set often keeps its media as a plain URL/path string beside `input_ids`,
+    # and a string value alone looks like text, so the name has to say so.
+    _MEDIA_COLUMNS = frozenset((
+        "image_url", "image_urls", "img_url", "img_urls", "image_link",
+        "video_url", "video_urls", "audio_url", "audio_urls",
+        "input_image", "input_images", "input_video", "input_videos",
+        "input_audio", "input_audios",
+        "image_path", "image_paths", "img_path", "img_paths",
+        "video_path", "video_paths", "audio_path", "audio_paths",
+        "image_file", "image_files", "video_file", "video_files",
+        "audio_file", "audio_files", "image_filename", "image_bytes",
+    ))
+
+    # Names that are media half the time and an ordinary text field the other
+    # half (`path` is a source file, `url` a citation), so refusing on the name
+    # would refuse good text runs. Ask the value instead.
+    _AMBIGUOUS_MEDIA_COLUMNS = frozenset((
+        "path", "paths", "url", "urls", "uri", "file", "files",
+        "file_path", "filepath", "file_name", "filename", "media", "source_url",
+    ))
+
+    _MEDIA_SUFFIXES = (
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+        ".svg", ".heic", ".heif", ".ppm", ".pgm",
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v",
+        ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
+    )
+
+    def _looks_like_media_value(value):
+        """A string naming an image/video/audio file, by extension or data URI."""
+        if not isinstance(value, str): return False
+        text = value.strip().lower()
+        if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
+        # Drop a query string/fragment: `.../cat.jpg?width=64`.
+        for sep in ("?", "#"):
+            text = text.split(sep, 1)[0]
+        return text.endswith(_MEDIA_SUFFIXES)
+    pass
+
+    def _has_media_column(names, rows):
+        """True when a top-level column points at media the text path would drop."""
+        for name in names:
+            if not isinstance(name, str) or name in _TEXT_COLUMNS: continue
+            lowered = name.lower()
+            if lowered in _MEDIA_COLUMNS: return True
+            if lowered in _AMBIGUOUS_MEDIA_COLUMNS and \
+                any(_looks_like_media_value(row.get(name)) for row in rows): return True
+        return False
+    pass
+
     def _is_plain_text(value, _depth = 0):
         """True only for text/scalars and nests of them.
 
@@ -979,6 +1030,7 @@ def train_on_responses_only(
         for names, rows, provable in views:
             if "input_ids" not in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            if _has_media_column(names, rows): return False
             # Columns look text-only, so check the values too: a `messages` column
             # can carry inline images that the strip below would throw away.
             if not provable: return False
@@ -1007,6 +1059,7 @@ def train_on_responses_only(
         for names, rows, provable in views:
             if "input_ids" in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
+            if _has_media_column(names, rows): return False
             # The column `_maybe_tokenize_dataset` would actually read.
             field = text_field if text_field in names else "text"
             if field not in names: return False

@@ -1138,3 +1138,80 @@ def test_an_eval_only_trainer_on_the_plain_text_path_is_not_a_crash():
     trainer.eval_dataset = _text_rows()
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in out.eval_dataset.column_names
+
+
+# ---- a media URL/path column is media, even as a plain string ---------------
+
+@pytest.mark.parametrize("column", [
+    "image_url", "video_url", "audio_url", "input_image", "input_video",
+    "image_path", "img_url", "image_file",
+])
+def test_a_top_level_media_url_column_is_refused(column):
+    """A pretokenized VLM set often stores its media as a URL string beside
+    `input_ids`. The value is a string, so only the column name says it is media,
+    and dropping it would leave a text-only run over a vision dataset."""
+    collator = MyVisionCollator(StubProcessor())
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: ["https://example.com/cat.jpg"] * 2,
+    })
+    trainer = StubTrainer(collator, dataset)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator, "the user's collator was replaced"
+    assert column in trainer.train_dataset.column_names, "the media column was dropped"
+
+
+@pytest.mark.parametrize("column, value", [
+    ("path",      "/data/images/0001.png"),
+    ("file_name", "clips/intro.mp4"),
+    ("url",       "https://example.com/a.jpeg?width=64"),
+    ("uri",       "data:image/png;base64,AAAA"),
+])
+def test_an_ambiguous_column_pointing_at_media_is_refused(column, value):
+    """`path`/`url` are media only sometimes, so the value decides."""
+    collator = MyVisionCollator(StubProcessor())
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: [value] * 2,
+    })
+    trainer = StubTrainer(collator, dataset)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert trainer.data_collator is collator
+
+
+@pytest.mark.parametrize("column, value", [
+    ("path",      "corpus/shard_0007.jsonl"),
+    ("path",      "wiki/en/Anarchism"),
+    ("url",       "https://en.wikipedia.org/wiki/Anarchism"),
+    ("file_name", "notes.txt"),
+    ("source",    "wikipedia"),
+    ("doc_id",    "id-42"),
+])
+def test_a_benign_metadata_column_is_still_allowed(column, value):
+    """The other direction: `path` is a source file in plenty of text corpora, so
+    a name alone must not refuse an ordinary text-only run."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: [value] * 2,
+    }))
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.train_dataset.column_names, "the text path never ran"
+    assert column not in out.train_dataset.column_names
+
+
+def test_a_raw_eval_split_with_a_media_url_column_is_refused():
+    """The same column on a raw eval split, which `_maybe_tokenize_dataset` would
+    tokenize from `text` and strip the media from."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "image_url": ["https://example.com/cat.png"],
+    })
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
