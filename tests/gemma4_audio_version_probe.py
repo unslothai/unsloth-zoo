@@ -68,10 +68,25 @@ RATE = 16000
 
 results = {}
 
-# How far clear of the platform's own jitter the two-tone gap has to land.
-# Deliberately generous: stage 4 asks whether audio moves the loss at all, so
-# a connected model should dwarf the jitter, and a gap that merely edges past
-# it is worth a human look rather than a recorded pass.
+# How far clear of the platform's own spread the two-tone gap has to land.
+#
+# Measured on macos-14, mlx-vlm 0.6.3, mlx 0.32.0, three separate runs of this
+# probe against mlx-community/gemma-4-e2b-it-4bit:
+#
+#   run   signal (440 vs 1760)   noise (spread of three identical 440s)
+#     1   0.812                  2.27
+#     2   1.30                   0.827
+#     3   0.719                  1.25
+#
+# The spread of three identical inputs exceeds the gap between two different
+# tones. So on Apple Silicon this stage cannot separate connected audio from
+# disconnected audio at any margin, and no choice of this constant rescues it;
+# the honest report there is "could not measure", which is what Inconclusive
+# is for. On Linux the same probe gives noise=0 and signal=0.327, and the
+# stage decides normally.
+#
+# The margin only has to be large enough that jitter cannot masquerade as
+# signal on a platform where the two are separable at all.
 TWO_TONE_MARGIN = 4.0
 
 TWO_TONE_REASONS = {
@@ -122,6 +137,21 @@ class Inconclusive(Exception):
     machine it ran on. It still does not qualify the version -- nothing was
     demonstrated -- so it is not a pass either.
     """
+
+
+def gating_stages(stages):
+    """The stages whose result decides this version's exit code.
+
+    Stage 0 and its subchecks are diagnostic and never gated. Neither does a
+    stage that could not measure anything: this matrix exists to name the
+    mlx-vlm version that breaks Gemma 4 audio, and on Apple Silicon stage 4
+    cannot answer at all (see TWO_TONE_MARGIN). Failing the job over that
+    would report every version as broken on the one platform the feature
+    ships to. The measured verdict still appears in PROBE_RESULT, and stages
+    1 to 3, which are what actually decide the version boundary, still gate.
+    """
+    return {k: v for k, v in stages.items()
+            if not k.startswith("0_") and not v.get("inconclusive")}
 
 
 def stage(name):
@@ -408,9 +438,7 @@ def main():
     print("PROBE_RESULT " + json.dumps(
         {"mlx_vlm": version, "transformers": transformers.__version__,
          "model": args.model, "stages": results}), flush=True)
-    # Stage 0 and its subchecks are diagnostic and never gate the exit code.
-    verdict = {k: v for k, v in results.items() if not k.startswith("0_")}
-    sys.exit(0 if all(r["ok"] for r in verdict.values()) else 1)
+    sys.exit(0 if all(r["ok"] for r in gating_stages(results).values()) else 1)
 
 
 if __name__ == "__main__":

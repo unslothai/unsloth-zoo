@@ -57,12 +57,17 @@ def test_importing_the_probe_does_not_rewrite_the_environment(monkeypatch, var):
         # behaviour that existed before and must not change.
         ("reproducible_and_connected", [19.3557] * 3, 19.6828, "pass"),
         ("reproducible_and_disconnected", [19.3557] * 3, 19.3557, "same_loss"),
-        # A machine where identical forwards disagree, so a bare inequality is
-        # satisfied by the drift alone. Here the audio is disconnected and the
-        # gap is no bigger than the model's own jitter.
-        ("drifting_and_disconnected", [19.30, 19.55, 19.81], 19.62,
+        # Apple Silicon, measured rather than invented: macos-14, mlx-vlm
+        # 0.6.3, run 2 of three. Three identical 440 Hz forwards spread by
+        # 0.827 while the gap to 1760 Hz was 1.30, so the spread is the same
+        # size as the signal and the stage cannot decide. It reports that,
+        # instead of reporting a pass the numbers do not support.
+        ("measured_on_metal", [24.8986, 25.4577, 25.7256], 26.1988,
          "below_noise"),
-        ("drifting_and_connected", [19.30, 19.55, 19.81], 27.4, "pass"),
+        # The same machine if the audio were plainly connected: a gap that
+        # dwarfs the spread still decides.
+        ("drifting_but_signal_dwarfs_it", [24.8986, 25.4577, 25.7256], 40.0,
+         "pass"),
         # Two repeats can agree by luck on a drifting machine, which would put
         # the floor back at zero and pass the disconnected case; the third is
         # what stops that.
@@ -103,3 +108,29 @@ def test_the_reported_tone_loss_is_the_mean_of_the_repeats():
     """Three forwards are paid for, so the figure printed uses all three."""
     _, detail = probe.two_tone_verdict([19.0, 20.0, 21.0], 30.0)
     assert "440Hz=20.0000" in detail
+
+
+def test_an_unmeasurable_stage_does_not_fail_the_version():
+    """Metal cannot decide stage 4, and that is not the version's fault.
+
+    Measured: three identical 440 Hz forwards spread further apart than the
+    gap to a different tone. Gating on that would paint every mlx-vlm version
+    red on the only platform this feature ships to.
+    """
+    stages = {
+        "0_mlx_vlm_alone_loads": {"ok": False},
+        "1_zoo_loads_it": {"ok": True},
+        "4_audio_reaches_the_loss": {"ok": False, "inconclusive": True},
+    }
+    gating = probe.gating_stages(stages)
+    assert set(gating) == {"1_zoo_loads_it"}
+    assert all(s["ok"] for s in gating.values())
+
+
+def test_a_real_stage_failure_still_fails_the_version():
+    stages = {
+        "1_zoo_loads_it": {"ok": True},
+        "3_placeholders_match_the_audio_tower": {"ok": False},
+    }
+    gating = probe.gating_stages(stages)
+    assert not all(s["ok"] for s in gating.values())
