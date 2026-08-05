@@ -722,6 +722,10 @@ def train_on_responses_only(
         "token_type_ids_images", "input_features", "input_features_mask",
         "audio_values", "audio_attention_mask", "input_audio_embeds",
         "aspect_ratio_ids", "aspect_ratio_mask", "cross_attention_mask",
+        # Processor-specific spellings: phi4_multimodal, then pix2struct and
+        # kosmos-2.5, which emit flattened_patches with nothing else alongside.
+        "image_pixel_values", "audio_input_features", "audio_embed_sizes",
+        "high_res_pixel_values", "flattened_patches",
     ))
 
     def _dataset_is_pretokenized(dataset):
@@ -770,7 +774,13 @@ def train_on_responses_only(
             # never rebuilds labels from images. Discriminate on the data: rows
             # that already hold `input_ids` were tokenized up front, so the text
             # path below is correct.
-            if not _dataset_is_pretokenized(getattr(trainer, "train_dataset", None)):
+            # Every split that will be collated, not just train: the collator is
+            # swapped for the whole trainer below, so a multimodal eval set would
+            # lose its image handling on a train-only check.
+            _splits = [getattr(trainer, "train_dataset", None)]
+            _eval = getattr(trainer, "eval_dataset", None)
+            _splits += list(_eval.values()) if isinstance(_eval, dict) else [_eval]
+            if not all(_dataset_is_pretokenized(d) for d in _splits if d is not None):
                 # A processor-style collator we cannot reliably configure: do not return as
                 # if masking were applied (it would leave responses unmasked silently).
                 raise ValueError(
@@ -850,16 +860,25 @@ def train_on_responses_only(
     # dies on the first batch. Rebuild that one around the unwrapped text
     # tokenizer too; gate on the capability rather than the processor type, so
     # this stays right if transformers ever gives ProcessorMixin a .pad.
-    _rebuild = (
-        not isinstance(_collator, DataCollatorForSeq2Seq)
-        or not hasattr(getattr(_collator, "tokenizer", None), "pad")
+    _processor_backed = (
+        isinstance(_collator, DataCollatorForSeq2Seq)
+        and not hasattr(getattr(_collator, "tokenizer", None), "pad")
     )
-    if (
-        hasattr(trainer, "data_collator")
-        and _rebuild
-        and not packing_enabled
+    # A processor-backed collator raises on its first batch whatever packing
+    # says, so that repair is not gated on packing the way the swap is.
+    if hasattr(trainer, "data_collator") and (
+        _processor_backed or (not isinstance(_collator, DataCollatorForSeq2Seq)
+                              and not packing_enabled)
     ):
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+        # Carry the settings across when we are only swapping the tokenizer,
+        # so a caller's pad_to_multiple_of or label_pad_token_id survives.
+        _kept = {
+            name: getattr(_collator, name)
+            for name in ("model", "padding", "max_length", "pad_to_multiple_of",
+                         "label_pad_token_id", "return_tensors")
+            if _processor_backed and hasattr(_collator, name)
+        }
+        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
 
     # Check if all labels randomnly got masked to nothing - maybe wrong chat template?
     from .training_utils import fix_zero_training_loss

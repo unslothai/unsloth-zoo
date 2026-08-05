@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """What the pretokenized bypass is allowed to hand to the text path.
@@ -167,3 +167,68 @@ def test_a_tokenizer_backed_seq2seq_collator_is_left_alone():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---- the follow-on cases the first round of this fix missed ---------------
+
+def _text_only_trainer():
+    return StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
+
+
+def test_a_multimodal_eval_split_still_refuses():
+    """The collator is swapped for the whole trainer, so a text-only train set
+    beside a multimodal eval set must not clear the guard."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = _multimodal_rows()
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_multimodal_split_in_an_eval_dict_still_refuses():
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = {"a": _text_rows(), "b": _multimodal_rows()}
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_text_only_eval_split_is_fine():
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = _text_rows()
+    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+@pytest.mark.parametrize("column", [
+    "image_pixel_values", "audio_input_features", "audio_embed_sizes",
+    "flattened_patches", "high_res_pixel_values",
+])
+def test_processor_specific_column_names_are_refused_too(column):
+    """phi4_multimodal, pix2struct and kosmos-2.5 do not spell these the way
+    the common families do."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: [[0.0], [0.0]],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_processor_backed_collator_is_rebuilt_even_with_packing():
+    """It raises on its first batch whether or not packing is on, so the
+    tokenizer repair cannot be gated on packing the way the swap is."""
+    trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubProcessor()),
+                          _text_rows())
+    trainer.args.packing = True
+    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert hasattr(trainer.data_collator.tokenizer, "pad")
+
+
+def test_the_rebuild_keeps_the_settings_the_caller_chose():
+    collator = DataCollatorForSeq2Seq(tokenizer = StubProcessor(),
+                                      pad_to_multiple_of = 8,
+                                      label_pad_token_id = -123)
+    trainer = StubTrainer(collator, _text_rows())
+    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert trainer.data_collator.pad_to_multiple_of == 8
+    assert trainer.data_collator.label_pad_token_id == -123
+    assert hasattr(trainer.data_collator.tokenizer, "pad")
