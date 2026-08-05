@@ -60,24 +60,9 @@ def _unsloth_get_linear_weight_dtype(module):
     """Return a representative fp Linear weight dtype, or None if absent."""
     for attr in ("q_proj", "qkv", "in_proj_qkv", "gate_proj", "linear_fc1", "up_proj", "fc1", "lm_head"):
         linear = getattr(module, attr, None)
-        if linear is None:
-            continue
-        linear = _unsloth_base_linear(linear)
-        if linear is None:
-            continue
-        weight = getattr(linear, "weight", None)
-        if weight is None:
-            continue
-        quant_state = getattr(weight, "quant_state", None)
-        if quant_state is not None:
-            continue
-        dtype = getattr(weight, "dtype", None)
-        if dtype is None or not getattr(dtype, "is_floating_point", False):
-            continue
-        # Skip sub-2-byte floats (fp8) where casting would destroy values.
-        if getattr(dtype, "itemsize", 2) < 2:
-            continue
-        return dtype
+        dtype = _unsloth_weight_dtype(linear)
+        if dtype is not None:
+            return dtype
     return None
 
 
@@ -196,7 +181,7 @@ def patch_Qwen3_5Attention_dtype():
     def forward(
         self,
         hidden_states,
-        position_embeddings=None,
+        position_embeddings,
         attention_mask=None,
         past_key_values=None,
         **kwargs,
