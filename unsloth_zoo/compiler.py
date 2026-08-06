@@ -397,9 +397,10 @@ def _get_compile_folder(use_tempfile=False):
             logger.error(
                 f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}"
             )
-
-            # Instead use a temporary location!
-            location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile=True)
+            # Tell every rank to resolve its own temp directory. Creating rank
+            # 0's temp path here could raise before the broadcast completes.
+            UNSLOTH_COMPILE_USE_TEMP = True
+            return None, True
     return location, UNSLOTH_COMPILE_USE_TEMP
 
 
@@ -415,7 +416,18 @@ def get_compile_folder(use_tempfile=False):
         # are available, converge that rank-local state before anyone returns.
         use_temp = distributed_any(use_temp)
     if use_temp:
-        return _get_compile_folder(use_tempfile=True)
+        location = None
+        local_error = None
+        try:
+            location, _ = _get_compile_folder(use_tempfile=True)
+        except Exception as error:
+            local_error = error
+        agreed_error = _agreed_error(
+            local_error, "Node-local temp compile folder creation",
+        )
+        if agreed_error is not None:
+            raise agreed_error
+        return location, True
 
     location, use_temp = distributed_function(
         2, _get_compile_folder, False
@@ -423,7 +435,7 @@ def get_compile_folder(use_tempfile=False):
     # Rank 0 can fall back while creating the persistent cache. The broadcast
     # tells every rank to switch modes, but its temp path is not portable.
     if use_temp:
-        return _get_compile_folder(use_tempfile=True)
+        return get_compile_folder(use_tempfile=True)
     return location, False
 
 
@@ -921,6 +933,36 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
 # Grace period for a network filesystem to publish rank 0's cache file.
 _COMPILED_CACHE_VISIBILITY_TIMEOUT = 5.0
 
+def _generated_cache_source(write_new_source):
+    """Rank 0's generated source and its digest for node-local cache writes."""
+    return (
+        write_new_source,
+        hashlib.sha256(write_new_source.encode("utf-8")).hexdigest(),
+    )
+pass
+
+def _retained_cache_source(function_location):
+    """Rank 0's retained on-disk source, digest, and a non-raising error."""
+    try:
+        with open(function_location, "rb") as file:
+            contents = file.read()
+        return (
+            contents.decode("utf-8"),
+            hashlib.sha256(contents).hexdigest(),
+            "",
+        )
+    except Exception as error:
+        return None, None, f"{type(error).__name__}: {error}"
+pass
+
+def _remove_compiled_cache_bytecode(function_location):
+    """Remove this rank's timestamp-based pyc before loading verified source."""
+    try:
+        os.remove(importlib.util.cache_from_source(function_location))
+    except (NotImplementedError, OSError):
+        pass
+pass
+
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
     """Rank 0's write decision, plus a digest of the bytes it will import."""
     should_write = overwrite or not os.path.isfile(function_location)
@@ -938,14 +980,18 @@ def _compiled_cache_decision(function_location, write_new_source, overwrite):
         return False, None
 pass
 
-def _verify_compiled_cache_file(function_location, expected_digest):
+def _verify_compiled_cache_file(
+    function_location, expected_digest, visibility_timeout=None,
+):
     """Fail loudly if this rank would import different bytes than rank 0.
 
     Retries first, since a network filesystem can publish the file just after
     the barrier.
     """
     rank = current_rank()
-    deadline = time.monotonic() + _COMPILED_CACHE_VISIBILITY_TIMEOUT
+    if visibility_timeout is None:
+        visibility_timeout = _COMPILED_CACHE_VISIBILITY_TIMEOUT
+    deadline = time.monotonic() + visibility_timeout
     delay = 0.05
     local_digest = None
     while True:
@@ -969,7 +1015,7 @@ def _verify_compiled_cache_file(function_location, expected_digest):
         raise FileNotFoundError(
             f"Unsloth: Compiled cache file {function_location} exists on rank 0 "
             f"but is not readable on rank {rank} after "
-            f"{_COMPILED_CACHE_VISIBILITY_TIMEOUT:.0f}s. Ensure the compiled cache "
+            f"{visibility_timeout:.0f}s. Ensure the compiled cache "
             "is on a shared filesystem with consistent metadata."
         )
     raise RuntimeError(
@@ -991,28 +1037,29 @@ def _agreed_error(local_error, operation):
     return local_error or RuntimeError(f"Unsloth: {operation} failed on another rank.")
 pass
 
-def _raise_if_any_rank_failed(local_error, operation):
-    """Raise on every rank when `operation` failed anywhere."""
-    error = _agreed_error(local_error, operation)
-    if error is not None:
-        raise error
-pass
-
-def _cache_verification_error(function_location, expected_digest):
+def _cache_verification_error(
+    function_location, expected_digest, visibility_timeout=None,
+):
     """The agreed verification error for this cache file, or None."""
     if not torch_distributed_is_initialized():
         return None
     local_error = None
     try:
-        _verify_compiled_cache_file(function_location, expected_digest)
+        _verify_compiled_cache_file(
+            function_location, expected_digest, visibility_timeout,
+        )
     except Exception as error:
         local_error = error
     return _agreed_error(local_error, "Compiled cache verification")
 pass
 
-def _verify_compiled_cache_file_collectively(function_location, expected_digest):
+def _verify_compiled_cache_file_collectively(
+    function_location, expected_digest, visibility_timeout=None,
+):
     """Verify on every rank, and fail on every rank if any rank disagrees."""
-    error = _cache_verification_error(function_location, expected_digest)
+    error = _cache_verification_error(
+        function_location, expected_digest, visibility_timeout,
+    )
     if error is not None:
         raise error
 pass
@@ -1176,18 +1223,26 @@ def create_new_function(
     # Write function
     global UNSLOTH_COMPILE_USE_TEMP
     file_source = None
+    cache_read_failed = False
     compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile=False)
     function_location = os.path.join(compile_folder, f"{name}.py")
 
     # Check if file was already created!
     if not overwrite and os.path.isfile(function_location):
         # Check if exactly equivalent
-        with open(function_location, "r", encoding="utf-8") as f:
-            file_source = f.read()
-
-        if file_source != write_new_source:
+        try:
+            with open(function_location, "r", encoding="utf-8") as f:
+                file_source = f.read()
+        except (OSError, UnicodeError):
+            # Do not let a rank-local cache read fail before peers reach the
+            # first collective. Rank 0's broadcast decision remains authoritative.
+            file_source = None
+            cache_read_failed = True
             overwrite = True
-        elif not overwrite:
+
+        if file_source is not None and file_source != write_new_source:
+            overwrite = True
+        elif file_source is not None and not overwrite:
             if "__UNSLOTH_VERSIONING__" not in file_source:
                 overwrite = True
             else:
@@ -1197,7 +1252,9 @@ def create_new_function(
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
         # Even with OVERWRITE disabled, force recompile on transformers version mismatch
-        if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
+        if cache_read_failed:
+            overwrite = True
+        elif file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
@@ -1279,6 +1336,25 @@ def create_new_function(
 
     pass
 
+    def rank0_generated_source():
+        return distributed_function(
+            2, _generated_cache_source, write_new_source,
+        )
+
+    pass
+
+    def rank0_retained_source():
+        cache_source, cache_digest, read_error = distributed_function(
+            3, _retained_cache_source, function_location,
+        )
+        if read_error:
+            # Rank 0 cannot preserve bytes it cannot read. Regenerate from rank
+            # 0's source, matching the fallback behavior before cache verification.
+            return rank0_generated_source()
+        return cache_source, cache_digest
+
+    pass
+
     # A rank arriving after rank 0 has written the file would skip this collective
     # and desynchronise the group, so rank 0 decides and broadcasts.
     should_write_cache_file, cache_file_digest = distributed_function(
@@ -1287,7 +1363,8 @@ def create_new_function(
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
             # The cache is already the per-node temp directory.
-            write_failure = write_node_local_file(function_location, write_new_source)
+            cache_source, cache_file_digest = rank0_generated_source()
+            write_failure = write_node_local_file(function_location, cache_source)
         else:
             wrote, write_error = distributed_function(
                 2, write_file_outcome, function_location, write_new_source,
@@ -1298,7 +1375,9 @@ def create_new_function(
         # read the bytes back rather than trusting the outcome.
         if write_failure is None:
             write_failure = _cache_verification_error(
-                function_location, cache_file_digest,
+                function_location,
+                cache_file_digest,
+                0 if UNSLOTH_COMPILE_USE_TEMP else None,
             )
         if write_failure is not None:
             if UNSLOTH_COMPILE_USE_TEMP:
@@ -1308,34 +1387,38 @@ def create_new_function(
                 use_tempfile=True
             )
             function_location = os.path.join(compile_folder, f"{name}.py")
-            temp_failure = write_node_local_file(function_location, write_new_source)
+            cache_source, cache_file_digest = rank0_generated_source()
+            temp_failure = write_node_local_file(function_location, cache_source)
             if temp_failure is not None:
                 raise temp_failure
             _verify_compiled_cache_file_collectively(
-                function_location, cache_file_digest,
+                function_location, cache_file_digest, 0,
             )
         pass
     else:
         # Rank 0 kept an existing file. Persistent-cache disagreement is a
         # configuration error, but node-local temp caches can legitimately be
         # warm on one node and cold or stale on another. Repair every local copy
-        # from the generated source so all ranks still take the same branch.
+        # from rank 0's retained bytes so overwrite opt-out remains intact.
         verification_error = _cache_verification_error(
-            function_location, cache_file_digest,
+            function_location,
+            cache_file_digest,
+            0 if UNSLOTH_COMPILE_USE_TEMP else None,
         )
         if verification_error is not None:
+            cache_source, retained_digest = rank0_retained_source()
             if not UNSLOTH_COMPILE_USE_TEMP:
-                raise verification_error
-            generated_digest = hashlib.sha256(
-                write_new_source.encode("utf-8")
-            ).hexdigest()
+                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
+                    use_tempfile=True
+                )
+                function_location = os.path.join(compile_folder, f"{name}.py")
             temp_failure = write_node_local_file(
-                function_location, write_new_source,
+                function_location, cache_source,
             )
             if temp_failure is not None:
                 raise temp_failure
             _verify_compiled_cache_file_collectively(
-                function_location, generated_digest,
+                function_location, retained_digest, 0,
             )
     pass
 
@@ -1347,19 +1430,21 @@ def create_new_function(
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Add directory to sys.path temporarily if it's not already there
-        if compile_folder not in sys.path:
+        # Put the verified cache first even when it already appears later.
+        if not sys.path or sys.path[0] != compile_folder:
             old_path = list(sys.path)
-            # Fail if name already exists!
-            if name in old_path:
-                raise OSError(f"Unsloth: File {name} already exists")
+            sys.path[:] = [path for path in sys.path if path != compile_folder]
             sys.path.insert(0, compile_folder)
         try:
             with lock:
                 # Try standard import
+                _remove_compiled_cache_bytecode(target_name)
+                importlib.invalidate_caches()
                 new_module = importlib.import_module(name)
                 return new_module, old_path
         except Exception as e:
+            if old_path is not None:
+                sys.path[:] = old_path
             if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 logger.error(
                     f"Unsloth: Failed to import module {name} because {str(e)}"
@@ -1373,10 +1458,15 @@ def create_new_function(
         file_location = os.path.join(compile_folder, name) + ".py"
         lock = get_lock(file_location)
         with lock:
+            _remove_compiled_cache_bytecode(file_location)
             spec = importlib.util.spec_from_file_location(module_name, file_location)
             new_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = new_module
-            spec.loader.exec_module(new_module)
+            try:
+                spec.loader.exec_module(new_module)
+            except Exception:
+                sys.modules.pop(module_name, None)
+                raise
         return new_module
 
     pass
@@ -1410,14 +1500,14 @@ def create_new_function(
                     logger.info(
                         f"Standard import failed for {name}: {reason}. Using tempfile instead!"
                     )
+                cache_source, generated_digest = rank0_generated_source()
                 temp_failure = write_node_local_file(
-                    function_location, write_new_source,
+                    function_location, cache_source,
                 )
                 if temp_failure is not None:
                     raise temp_failure
                 _verify_compiled_cache_file_collectively(
-                    function_location,
-                    hashlib.sha256(write_new_source.encode("utf-8")).hexdigest(),
+                    function_location, generated_digest, 0,
                 )
             pass
             # Every rank loads by path so successful ranks cannot reuse the
@@ -1430,9 +1520,13 @@ def create_new_function(
                 direct_load_error = RuntimeError(
                     f"Direct module loading failed for {name}: {error}"
                 )
-            _raise_if_any_rank_failed(
+            agreed_load_error = _agreed_error(
                 direct_load_error, f"Direct module loading for {name}",
             )
+            if agreed_load_error is not None:
+                sys.modules.pop(name, None)
+                sys.modules.pop(f"unsloth_cache_{name}", None)
+                raise agreed_load_error
             # Republish under the plain name so `import <name>` keeps resolving
             # the way it does without a recovery, now pointing at what we loaded.
             sys.modules[name] = new_module
@@ -1440,7 +1534,7 @@ def create_new_function(
     finally:
         # Restore original sys.path if we modified it
         if old_path is not None:
-            sys.path = old_path
+            sys.path[:] = old_path
 
     if new_module is None:
         raise ImportError(
