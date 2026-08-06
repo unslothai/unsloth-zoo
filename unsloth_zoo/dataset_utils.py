@@ -1433,9 +1433,32 @@ def train_on_responses_only(
     _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad") \
         and isinstance(_collator, _PAD_DELEGATING_COLLATORS)
     # That repair is not packing-gated like the swap: it fails either way.
-    # Nor is a collator we bypassed above: it can rebuild `labels` in `__call__`
-    # and throw away the mask just written, which is silent training on prompts.
-    # It is no packing collator either, so the gate has nothing to protect here.
+    # Nor is a collator we bypassed above whose class we recognise: it either
+    # delegates its padding to `.pad` or rebuilds `labels` in `__call__`, and the
+    # latter throws away the mask just written, which is silent training on prompts.
+    def _is_known_bypassed_collator(collator):
+        if isinstance(collator, _PAD_DELEGATING_COLLATORS): return True
+        # TRL's vision collator rebuilds labels through its processor. Matched by
+        # name so this does not depend on which TRL version is installed.
+        return any(b.__name__ == "DataCollatorForVisionLanguageModeling"
+                   for b in type(collator).__mro__)
+    # Any other bypassed collator under packing is the case with no right answer:
+    # `_is_vision_collator` matches one merely holding a processor, and a custom
+    # self-packing collator does exactly that. Replacing it discards its packing,
+    # its `position_ids` and any block-attention inputs; keeping it risks its
+    # `__call__` rebuilding `labels` over the mask. Both are silently wrong, so
+    # say so rather than guess.
+    if packing_enabled and _bypassed_vision_collator and \
+        not _is_known_bypassed_collator(_collator):
+        raise ValueError(
+            f"Unsloth: `{type(_collator).__name__}` holds a processor and does not support "
+            "response-only masking, and `packing = True` asks that same collator to build the "
+            "packed batch. Both cannot be honoured: replacing it discards its packing, its "
+            "`position_ids` and any block-attention inputs, while keeping it risks its "
+            "`__call__` rebuilding `labels` over the mask just written. Turn packing off, or "
+            "build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+            "instruction_part = ..., response_part = ...) so masking runs at collate time."
+        )
     if hasattr(trainer, "data_collator") and (
         _processor_backed or _bypassed_vision_collator
         or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)

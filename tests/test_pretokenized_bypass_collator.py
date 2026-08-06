@@ -318,8 +318,13 @@ def test_a_processor_backed_padding_collator_is_repaired_under_packing():
 
 def test_a_collator_holding_only_a_processor_is_repaired_under_packing():
     """TRL's `DataCollatorForVisionLanguageModeling` keeps the processor under
-    `.processor`, not `.tokenizer`, with the same problem."""
-    trainer = _text_only_trainer()          # MyVisionCollator holds `.processor`
+    `.processor`, not `.tokenizer`, with the same problem. It rebuilds labels
+    through that processor, so it is a class we know how to answer for and the
+    repair still runs with packing on."""
+    from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
+
+    trainer = _text_only_trainer()
+    trainer.data_collator = DataCollatorForVisionLanguageModeling(processor = StubProcessor())
     trainer.args.packing = True
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
@@ -359,13 +364,12 @@ class LabelRebuildingVisionCollator:
         return batch
 
 
-def test_a_label_rebuilding_vision_collator_is_replaced_under_packing():
-    """It pads through a real tokenizer, so the `.pad` repair does not fire. If
-    packing then leaves it attached it rebuilds `labels` at collate time, throwing
-    away the dataset-level mask this function just wrote: training on prompts."""
+def test_a_label_rebuilding_vision_collator_is_replaced():
+    """It pads through a real tokenizer, so the `.pad` repair does not fire. Left
+    attached it rebuilds `labels` at collate time, throwing away the dataset-level
+    mask this function just wrote: training on prompts."""
     collator = LabelRebuildingVisionCollator(StubProcessor())
     trainer = StubTrainer(collator, _text_rows())
-    trainer.args.packing = True
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
@@ -373,6 +377,18 @@ def test_a_label_rebuilding_vision_collator_is_replaced_under_packing():
     rows = [out.train_dataset[i] for i in range(len(out.train_dataset))]
     labels = out.data_collator(rows)["labels"]
     assert -100 in list(labels[0]), "the response mask did not survive collation"
+
+
+def test_a_label_rebuilding_vision_collator_is_refused_under_packing():
+    """With packing on the same collator has no right answer: this file cannot
+    tell a custom label rebuilder from a custom packer, and both readings lose
+    something silently. Refuse instead of picking one."""
+    collator = LabelRebuildingVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
 def test_a_real_tokenizer_padding_collator_is_untouched_under_packing():
@@ -1848,3 +1864,34 @@ def test_remove_unused_columns_false_keeps_the_users_columns():
     columns = set(out.train_dataset.column_names)
     assert "sample_weight" in columns, sorted(columns)
     assert out.train_dataset[0]["sample_weight"] == 0.25
+
+
+def test_a_bypassed_self_packing_collator_is_refused_under_packing():
+    """Neither answer is right here, so neither may be taken silently.
+
+    `_is_vision_collator` matches any collator merely holding a processor, and
+    the bypass disjunct is not packing-gated, so a custom self-packing collator
+    was replaced with `DataCollatorForSeq2Seq` and its packing, its
+    `position_ids` and any block-attention inputs went with it. Keeping it is no
+    safer: its `__call__` may rebuild `labels` over the mask just written.
+    """
+    collator = SelfPackingCollator(StubProcessor())   # a processor, so bypassed
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+
+    with pytest.raises(ValueError, match = "does not support response-only") as excinfo:
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "SelfPackingCollator" in str(excinfo.value), "the refusal does not name the collator"
+    assert trainer.data_collator is collator, "the user's collator was replaced anyway"
+
+
+def test_a_bypassed_self_packing_collator_is_untouched_without_packing():
+    """The blast radius: with packing off there is nothing to lose, so the
+    replacement runs exactly as before."""
+    collator = SelfPackingCollator(StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+
