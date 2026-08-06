@@ -45,6 +45,7 @@ from .utils import (
     Version,
     is_main_process,
     is_distributed,
+    current_rank,
     distributed_function,
     distributed_any,
     get_lock,
@@ -929,7 +930,7 @@ def _verify_compiled_cache_file(function_location, expected_digest):
     Retries first, since a network filesystem can publish the file just after
     the barrier.
     """
-    rank = os.environ.get("RANK", "0")
+    rank = current_rank()
     deadline = time.monotonic() + _COMPILED_CACHE_VISIBILITY_TIMEOUT
     delay = 0.05
     local_digest = None
@@ -1287,8 +1288,10 @@ def create_new_function(
                     2, write_file_outcome, function_location, write_new_source,
                 )
                 if is_main_process():
+                    # None here means another rank failed, not this one.
+                    reason = import_error or "an import failure on another rank"
                     logger.info(
-                        f"Standard import failed for {name}: {import_error}. Using tempfile instead!"
+                        f"Standard import failed for {name}: {reason}. Using tempfile instead!"
                     )
                 try:
                     new_module, old_path = import_module(compile_folder, name)

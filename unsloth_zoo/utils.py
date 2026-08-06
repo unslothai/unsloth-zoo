@@ -19,6 +19,7 @@ __all__ = [
     "_get_dtype",
     "is_main_process",
     "is_distributed",
+    "current_rank",
     "distributed_function",
     "distributed_any",
     "torch_distributed_get_rank",
@@ -147,6 +148,13 @@ pass
 
 def is_distributed():
     return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
+pass
+
+def current_rank():
+    """Best effort rank, for diagnostics only. RANK is unset outside a launcher."""
+    if torch_distributed_is_initialized():
+        return torch_distributed_get_rank()
+    return os.environ.get("RANK", "0")
 pass
 
 def distributed_function(n = 1, function = None, *args, **kwargs):

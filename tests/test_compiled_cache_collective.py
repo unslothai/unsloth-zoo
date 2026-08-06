@@ -248,6 +248,26 @@ def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch):
     )
 
 
+def test_current_rank_without_process_group(monkeypatch):
+    """RANK is unset outside a launcher, and get_rank() would raise."""
+    from unsloth_zoo.utils import current_rank
+
+    monkeypatch.delenv("RANK", raising=False)
+    assert str(current_rank()) == "0"
+    monkeypatch.setenv("RANK", "3")
+    assert str(current_rank()) == "3"
+
+
+def test_import_recovery_message_does_not_blame_this_rank():
+    """A rank whose own import succeeded must not log 'failed ... : None'."""
+    src = _compiler_source()
+    assert "Standard import failed for {name}: {import_error}" not in src, (
+        "import_error is None on a rank that imported fine but was pulled onto the "
+        "recovery by another rank, so this logs a bare None."
+    )
+    assert 'reason = import_error or "an import failure on another rank"' in src
+
+
 def test_verify_falls_back_to_existence_when_rank0_digest_unknown(tmp_path):
     """If rank 0 could not digest its copy, existence is all we can check."""
     from unsloth_zoo import compiler
