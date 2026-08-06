@@ -1458,3 +1458,71 @@ def test_precomputed_labels_survive_the_raw_column_drop():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
     assert out.train_dataset[0]["labels"] == old, "the caller's mask was lost"
+
+
+# ---- provenance structs are not media --------------------------------------
+
+def _meta_trainer(meta, n = 2, iterable = False):
+    dataset = Dataset.from_dict({"input_ids": [list(ROW)] * n, "meta": meta})
+    if iterable: dataset = dataset.to_iterable_dataset()
+    return StubTrainer(MyVisionCollator(StubProcessor()), dataset)
+
+
+def test_a_nested_provenance_struct_is_not_refused_as_media():
+    """`meta = {"url": ..., "path": ...}` is what every web-scraped text corpus
+    carries. Judged on the key name alone it refused a text-only run, while the
+    same strings in top-level `path`/`url` columns are value-scanned and pass."""
+    trainer = _meta_trainer([{"url": "https://en.wikipedia.org/wiki/Cat",
+                              "path": "corpus/shard.jsonl",
+                              "source": "wiki"}] * 2)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert any(l != -100 for l in out.train_dataset[0]["labels"])
+
+
+def test_a_nested_media_reference_is_still_refused():
+    """The value, not the key, is what decides: a `cat.jpg` under the same key
+    still points at an image the text path would drop."""
+    trainer = _meta_trainer([{"path": "images/cat.jpg"}] * 2)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_nested_media_reference_past_the_sample_is_still_refused():
+    """The 16-row sample never reads row 137, so the whole column is scanned."""
+    n = 300
+    meta = [{"path": "corpus/shard.jsonl"} for _ in range(n)]
+    meta[137] = {"path": "images/cat.jpg"}
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(_meta_trainer(meta, n), INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_unscannable_nested_provenance_struct_is_refused_by_name():
+    """A stream hands over no more than a prefix, so the rows it never reads
+    cannot be called text; the refusal names the column to drop."""
+    trainer = _meta_trainer([{"path": "corpus/shard.jsonl"}] * 40, n = 40,
+                            iterable = True)
+    with pytest.raises(ValueError, match = "cannot be read past its first rows") as excinfo:
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "['meta']" in str(excinfo.value), "the refusal does not name the column"
+
+
+def test_an_inline_image_url_part_is_still_refused():
+    """`image_url` is unambiguous, so a chat turn holding one never reaches the
+    value scan - the struct is refused on the key."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW)] * 2,
+        "messages": [[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://x/cat.jpg"}}]}]] * 2,
+    }))
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_undecoded_image_struct_is_still_refused():
+    """`datasets.Image(decode = False)` is `{"bytes": ..., "path": ...}`; `bytes`
+    stays a hard reject so relaxing `path` cannot let an image through."""
+    trainer = _meta_trainer([{"bytes": b"\x89PNG", "path": "a"}] * 2)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)

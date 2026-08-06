@@ -851,6 +851,13 @@ def train_on_responses_only(
         "bytes", "path", "url",
     ))
 
+    # The subset of those keys that is media only half the time: `meta = {"url":
+    # ..., "path": "corpus/shard.jsonl"}` is ordinary provenance on a text corpus,
+    # so refusing on the key name alone refuses a healthy text-only run. Judged by
+    # value instead, exactly like `_AMBIGUOUS_MEDIA_COLUMNS` at the top level.
+    # `bytes` stays a hard reject: raw binary is never text.
+    _AMBIGUOUS_MEDIA_KEYS = frozenset(("path", "url"))
+
     # Top-level column names that only ever point at media. A pretokenized VLM
     # set often keeps its media as a plain URL/path string beside `input_ids`,
     # and a string value alone looks like text, so the name has to say so.
@@ -1014,7 +1021,10 @@ def train_on_responses_only(
         if isinstance(value, dict):
             for key, item in value.items():
                 if not isinstance(key, str): return False
-                if key.lower() in _MEDIA_KEYS: return False
+                lower = key.lower()
+                if lower in _AMBIGUOUS_MEDIA_KEYS:
+                    if _looks_like_media_value(item): return False
+                elif lower in _MEDIA_KEYS: return False
                 if not _is_plain_text(item, _depth + 1): return False
             kind = value.get("type")
             if isinstance(kind, str) and kind.lower() in _MEDIA_KEYS: return False
@@ -1063,7 +1073,11 @@ def train_on_responses_only(
         if feature is None or _depth >= 8: return False
         if isinstance(feature, dict):                       # struct
             for key, value in feature.items():
-                if not isinstance(key, str) or key.lower() in _MEDIA_KEYS: return False
+                if not isinstance(key, str): return False
+                lower = key.lower()
+                # An ambiguous key is settled by the value scan below, not by name.
+                if lower in _MEDIA_KEYS and lower not in _AMBIGUOUS_MEDIA_KEYS:
+                    return False
                 if not _feature_is_plain_text(value, _depth + 1): return False
             return True
         if isinstance(feature, (list, tuple)):
@@ -1077,12 +1091,52 @@ def train_on_responses_only(
         return dtype.startswith(_PLAIN_DTYPES)
     pass
 
+    def _feature_has_ambiguous_media_key(feature, _depth = 0):
+        """Whether this column's schema nests a `path`/`url`, whose dtype is
+        `string` for both a media reference and ordinary provenance."""
+        if feature is None or _depth >= 8: return False
+        if isinstance(feature, dict):
+            return any(isinstance(k, str) and (k.lower() in _AMBIGUOUS_MEDIA_KEYS or
+                                               _feature_has_ambiguous_media_key(v, _depth + 1))
+                       for k, v in feature.items())
+        if isinstance(feature, (list, tuple)):
+            return any(_feature_has_ambiguous_media_key(f, _depth + 1) for f in feature)
+        inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
+        if inner is not None: return _feature_has_ambiguous_media_key(inner, _depth + 1)
+        return False
+    pass
+
+    def _column_values_are_plain_text(split, name):
+        """Whether EVERY row of a struct column with a nested `path`/`url` is text.
+
+        The 16-row sample misses a `cat.jpg` on row 5000 and the schema says
+        `string` either way, so read the whole column - the same trade the
+        top-level ambiguous columns already make. Callers gate on
+        `_feature_is_plain_text` first, so no Image/Audio column is ever decoded.
+        """
+        try:
+            len(split)                                   # map-style only
+            batches = split.select_columns([name]).iter(batch_size = 1000)
+            for batch in batches:
+                if not all(_is_plain_text(v) for v in batch[name]): return False
+            return True
+        except Exception:
+            # A stream cannot speak for the rows it never hands over; guessing
+            # "text" would drop a media column silently, so refuse instead.
+            _unscannable_media_columns.add(name)
+            return False
+    pass
+
     def _columns_are_provably_text(split, names):
         features = getattr(split, "features", None)
         if features:
             try:
-                return all(_feature_is_plain_text(f) for name, f in features.items()
-                           if name not in _TEXT_COLUMNS)
+                for name, feature in features.items():
+                    if name in _TEXT_COLUMNS: continue
+                    if not _feature_is_plain_text(feature): return False
+                    if _feature_has_ambiguous_media_key(feature) and \
+                        not _column_values_are_plain_text(split, name): return False
+                return True
             except Exception:
                 return False
         # No schema (an unresolved stream): a sample cannot prove what the rows it
