@@ -92,6 +92,13 @@ def aiter_attention_forward(
     if os.environ.get(_DISABLE_ENV, "0") == "1":
         return _fallback()
 
+    # Registration is AMD gated, but this is exported, directly callable, and the
+    # gate behind it is cached at import. Re-check per call: `is_hip` is uncached
+    # and cheap, and ROCm tensors report device.type "cuda", so both are needed.
+    from ..device_type import is_hip
+    if not is_hip() or not query.is_cuda:
+        return _fallback()
+
     # Needs the probability matrix, which a fused kernel never materialises.
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         return _fallback()
