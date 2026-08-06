@@ -24,6 +24,7 @@ __all__ = [
     "device_empty_cache",
     "device_is_bf16_supported",
     "is_mlx_available",
+    "get_recommended_attn_implementation",
 ]
 
 import functools
@@ -313,4 +314,19 @@ def device_is_bf16_supported():
             if hasattr(torch.xpu, "is_bf16_supported"):
                 return torch.xpu.is_bf16_supported()
     return False
+pass
+
+
+def get_recommended_attn_implementation():
+    """
+    Return "sdpa" on AMD ROCm, None elsewhere (no override, keep your default).
+
+    Callers MUST check the resolved model class first. 43 causal LM
+    architectures on transformers 4.57 (GptOss, Mamba, Bloom, GPT-J, MPT, ...)
+    set `_supports_sdpa = False` and `from_config` raises ValueError for them:
+    `AutoModelForCausalLM._model_mapping[type(config)]._supports_sdpa`.
+    """
+    if is_hip():
+        return "sdpa"
+    return None
 pass
