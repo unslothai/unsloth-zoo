@@ -433,3 +433,34 @@ def test_an_unrelated_error_from_the_retry_is_not_swallowed():
 
     # Two compiled attempts, and eager never ran: the caller sees its own error.
     assert calls == {"c": 2, "e": 0}
+
+
+def test_the_recompile_budget_is_bounded_and_handed_back():
+    """The budgets are process-global, so a per-wrapper cap bounds nothing.
+
+    Every bump raises `torch._dynamo.config` for the whole process. Without a
+    shared cap, N wrappers (or several models trained in one process) each spend
+    their own allowance and the limit ends up hundreds higher for every unrelated
+    compiled function; without a restore it stays there for the process's life.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global, saved_orig = u._GLOBAL_BUMPS, dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    try:
+        # Far more attempts than the cap allows, as many wrappers would make.
+        granted = sum(bool(u._bump_recompile_limits()) for _ in range(50))
+        assert granted == u._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS, granted
+        raised = getattr(config, name)
+        assert raised == before + granted * u._RECOMPILE_LIMIT_BUMP, (before, raised)
+
+        assert u._restore_recompile_limits() >= 1
+        assert getattr(config, name) == before
+        # And the allowance is available again for the next model.
+        assert u._GLOBAL_BUMPS == 0
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = saved_global, saved_orig

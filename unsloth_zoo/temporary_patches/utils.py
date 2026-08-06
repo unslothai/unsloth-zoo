@@ -794,12 +794,25 @@ _RECOMPILE_LIMIT_NAMES = (
 _RECOMPILE_LIMIT_BUMP = 16
 _MAX_RECOMPILE_LIMIT_BUMPS = 4
 
+# The budgets live on torch._dynamo.config, which is process-global, so the
+# per-wrapper cap above bounds nothing on its own: N wrappers, or several models
+# trained in one process, each spend their 4 bumps and the global limit ends up
+# hundreds higher, permanently, for every unrelated compiled function. Cap the
+# total and put the originals back once the debt is settled.
+_MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
+_GLOBAL_BUMPS = 0
+_ORIGINAL_RECOMPILE_LIMITS = {}
+
 
 def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
-    """Raise both recompile budgets. False if this torch exposes neither."""
+    """Raise both recompile budgets. False if this torch exposes neither, or if
+    the process-wide bump budget is spent."""
+    global _GLOBAL_BUMPS
     try:
         import torch._dynamo.config as _config
     except Exception:
+        return False
+    if _GLOBAL_BUMPS >= _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS:
         return False
     bumped = False
     for names in _RECOMPILE_LIMIT_NAMES:
@@ -810,10 +823,55 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                     setattr(_config, name, current + extra)
                 except Exception:
                     continue
+                _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
                 bumped = True
                 # Only the name this torch really reads; the alias follows.
                 break
+    if bumped:
+        _GLOBAL_BUMPS += 1
     return bumped
+
+
+def _restore_recompile_limits_if_idle():
+    """Restore only when no live wrapper is still relying on the extra headroom.
+
+    A wrapper that borrowed budget and has not yet gone eager is still compiling
+    against the raised limit; taking it away mid-flight would push it straight
+    into the fallback we just paid to avoid.
+    """
+    for ref in _EAGER_FALLBACK_WRAPPERS:
+        w = ref()
+        if w is None:
+            continue
+        st = w._unsloth_fallback_state
+        if st.get("bumps") and not st.get("eager"):
+            return 0
+    return _restore_recompile_limits()
+
+
+def _restore_recompile_limits():
+    """Put the budgets back. Returns how many names were restored.
+
+    Called once every wrapper that borrowed headroom has gone eager, so nothing
+    still needs it and the process stops carrying a raised limit around.
+    """
+    global _GLOBAL_BUMPS
+    if not _ORIGINAL_RECOMPILE_LIMITS:
+        return 0
+    try:
+        import torch._dynamo.config as _config
+    except Exception:
+        return 0
+    restored = 0
+    for name, original in list(_ORIGINAL_RECOMPILE_LIMITS.items()):
+        try:
+            setattr(_config, name, original)
+        except Exception:
+            continue
+        restored += 1
+        _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
+    _GLOBAL_BUMPS = 0
+    return restored
 
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
@@ -906,6 +964,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             if result is not _NO_RESULT:
                 return result
             state["eager"] = True
+            _restore_recompile_limits_if_idle()
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
                 f"{label}; running it eagerly from here. Training is "
@@ -994,6 +1053,9 @@ def apply_pending_eager_fallbacks() -> int:
             flipped += 1
         w._unsloth_fallback_state["eager"] = True
         w._unsloth_fallback_state["pending_eager"] = False
+    # Everything that borrowed headroom is eager now, so hand the budget back
+    # rather than leaving the process permanently raised.
+    _restore_recompile_limits()
     return flipped
 
 
@@ -1024,6 +1086,7 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     for w in live:
         w._unsloth_fallback_state["eager"] = True
         w._unsloth_fallback_state["pending_eager"] = False
+    _restore_recompile_limits()
     return len(live)
 
 
