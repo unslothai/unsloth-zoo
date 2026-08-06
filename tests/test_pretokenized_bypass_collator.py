@@ -1586,6 +1586,41 @@ def test_a_media_filename_column_is_refused(column, value):
     assert column in trainer.train_dataset.column_names, "the media column was dropped"
 
 
+@pytest.mark.parametrize("key, value", [
+    ("file_path",  "images/cat.jpg"),
+    ("filepath",   "images/cat.jpg"),
+    ("file_name",  "cat.jpg"),
+    ("filename",   "cat.jpg"),
+    ("file",       "clips/intro.mp4"),
+    ("uri",        "https://example.com/cat.jpg"),
+    ("media",      "clips/take1.wav"),
+    ("source_url", "https://example.com/cat.png"),
+    ("paths",      ["images/cat.jpg"]),
+    ("urls",       ["https://example.com/cat.jpg"]),
+])
+def test_a_nested_generic_media_alias_is_scanned_by_value(key, value):
+    """Only `path`/`url` were value-scanned one level down, so every other
+    generic spelling the top level treats as ambiguous was called text and the
+    media it pointed at was dropped with the column."""
+    trainer = _meta_trainer([{key: value}] * 2)
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "meta" in trainer.train_dataset.column_names, "the media was dropped"
+
+
+def test_a_nested_generic_alias_holding_provenance_still_passes():
+    """The value still decides: a shard path under the same keys is what a text
+    corpus carries, so widening the nested set must not refuse it."""
+    trainer = _meta_trainer([{"file_path": "corpus/shard.jsonl",
+                              "uri": "s3://bucket/key.txt"}] * 2)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert any(l != -100 for l in out.train_dataset[0]["labels"])
+
+
 class ProcessorWithoutImages:
     """A processor half with no `.pad` and no `image_processor`, so the vision
     bypass never sees it and only the `.pad` repair can fire."""

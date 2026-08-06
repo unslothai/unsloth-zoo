@@ -931,6 +931,12 @@ def train_on_responses_only(
         "file_path", "filepath", "file_name", "filename", "media", "source_url",
     ))
 
+    # Those names are ambiguous nested too: `{"file_path": "images/cat.jpg"}` in a
+    # turn or a `meta` struct is the top-level column moved one level down, and
+    # only `path`/`url` were value-scanned there, so every other spelling was
+    # called text and its media dropped.
+    _AMBIGUOUS_MEDIA_KEYS = _AMBIGUOUS_MEDIA_KEYS | _AMBIGUOUS_MEDIA_COLUMNS
+
     # Every suffix a missing entry costs is a VLM row silently trained as text,
     # so cover the modern web formats too (`.avif` is what most image CDNs serve
     # now) and the older spellings of the ones already here.
