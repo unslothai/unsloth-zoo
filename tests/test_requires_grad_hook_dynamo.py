@@ -16,18 +16,14 @@
 
 """The gradient-checkpointing hooks must not flip requires_grad while Dynamo traces.
 
-requires_grad_pre_hook / requires_grad_post_hook call `requires_grad_()`, which
-Dynamo rejects when it would change the flag. Outside a fullgraph region that is
-only a graph break, but Gemma 3N compiles a LoRA target with fullgraph = True, so
-it becomes a hard error and trainer.train() dies. torch._dynamo.disable() does not
-rescue it; guarding on `torch.compiler.is_compiling()` does, and is a no-op in eager.
+Dynamo rejects `requires_grad_()` when it would change the flag, and Gemma 3N compiles
+a LoRA target with fullgraph = True, so it is a hard error rather than a graph break.
+torch._dynamo.disable() does not rescue it; `torch.compiler.is_compiling()` does.
 
-The post hook also lands on `get_input_embeddings()`, where it is the only thing
-making a FROZEN embedding's output require grad, so it may skip only the no-op
-case; skipping unconditionally there loses every adapter gradient.
+The post hook also lands on `get_input_embeddings()`, where it is the only thing making
+a FROZEN embedding's output require grad, so it may skip only the no-op case.
 
-Hooks are pulled off a real hooked model, so these break if they are renamed or
-moved. CPU only.
+Hooks are pulled off a real hooked model, so these break on a rename. CPU only.
 """
 
 import ast
@@ -74,8 +70,8 @@ class _PostHookModel(nn.Module):
 
 
 class _Trunk(nn.Module):
-    """Never called as `self.adapter(`, so `_TupleOutputModel` takes the fallback
-    post-hook path -- onto a module whose output is a tuple, like a decoder layer."""
+    """Never called as `self.adapter(`, so the fallback post hook lands here, on a
+    tuple-returning module like a decoder layer."""
     def __init__(self):
         super().__init__()
         self.adapter = nn.Linear(8, 8, bias = False)
@@ -103,8 +99,8 @@ class _Layer(nn.Module):
 
 
 class _LanguageModel(nn.Module):
-    """`for layer in self.layers:` makes this itself the hook target, and it has
-    get_input_embeddings(), so the post hook lands on the FROZEN embedding."""
+    """`for layer in self.layers:` makes this the hook target, and get_input_embeddings()
+    puts the post hook on the FROZEN embedding."""
     def __init__(self):
         super().__init__()
         self.embed_tokens = nn.Embedding(16, 8)
@@ -193,9 +189,8 @@ def test_post_hook_no_ops_while_compiling_when_output_already_requires_grad(monk
 
 
 def test_post_hook_still_flips_a_frozen_output_while_compiling(monkeypatch):
-    """The post hook also lands on `get_input_embeddings()`, where it is the only
-    thing making a FROZEN embedding's output require grad. Skipping it there loses
-    gradients, so only the no-op case may be skipped."""
+    """On `get_input_embeddings()` this is the only thing making a FROZEN embedding's
+    output require grad, so only the no-op case may be skipped."""
     hook = _real_post_hook()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     y = torch.randn(2, 8)
@@ -204,12 +199,8 @@ def test_post_hook_still_flips_a_frozen_output_while_compiling(monkeypatch):
 
 
 def test_post_hook_still_raises_on_unknown_output_while_compiling(monkeypatch):
-    """An output the hook cannot mark must stay a loud error while tracing.
-
-    `is_compiling()` is constant folded into the graph, so a skip here is
-    permanent: the compiled artifact never re-checks the output, and a
-    checkpointed region trains with no adapter gradients at all.
-    """
+    """An unmarkable output must stay a loud error while tracing: is_compiling() is
+    constant folded, so a skip is permanent and the region trains with no gradients."""
     hook = _real_post_hook()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     with pytest.raises(RuntimeError, match = "Failed to make output require gradients"):
@@ -218,10 +209,8 @@ def test_post_hook_still_raises_on_unknown_output_while_compiling(monkeypatch):
 
 def test_compiled_tuple_output_still_raises():
     """End to end: a fallback post-hook target returning a tuple, under compile.
-
-    `requires_grad_for_gradient_checkpointing` itself picks this target, so the
-    shape is one Unsloth produces; the error must survive tracing.
-    """
+    requires_grad_for_gradient_checkpointing picks this target itself, so the shape is
+    one Unsloth produces and the error must survive tracing."""
     torch._dynamo.reset()
     model = _TupleOutputModel()
     model.requires_grad_(False)
@@ -271,10 +260,8 @@ def test_fullgraph_compiled_module_with_post_hook_runs():
 
 
 def test_compiled_frozen_embedding_still_carries_gradients():
-    """The end-to-end shape of the post hook on `get_input_embeddings()`: compile the
-    frozen embedding, then feed it to a reentrant-checkpointed trainable layer. If the
-    hook no-ops while tracing, checkpointing sees no grad-carrying input and the
-    adapter gets no gradient at all."""
+    """Compile the frozen embedding, then feed it to a reentrant-checkpointed trainable
+    layer. If the hook no-ops while tracing, the adapter gets no gradient at all."""
     torch._dynamo.reset()
     model = _EmbeddingHookModel()
     model.requires_grad_(False)
@@ -325,8 +312,8 @@ def test_pre_hook_is_guarded():
 
 
 def test_post_hook_guard_is_not_unconditional():
-    """A bare `if is_compiling(): return` would drop a frozen embedding's flag, so the
-    post hook may only skip the no-op case (the output already requires grad)."""
+    """A bare `if is_compiling(): return` would drop a frozen embedding's flag, so only
+    the no-op case (output already requires grad) may be skipped."""
     src = (_ZOO / "peft_utils.py").read_text(encoding = "utf-8")
     fn = next(
         n for n in ast.walk(ast.parse(src))
@@ -344,10 +331,8 @@ def test_post_hook_guard_is_not_unconditional():
 
 
 def test_make_inputs_require_grad_is_NOT_guarded():
-    """Unlike the peft_utils hooks, this is the only thing making a FROZEN
-    embedding's output require grad, which reentrant checkpointing needs.
-    Guarding it would silently stop gradients reaching the adapters.
-    """
+    """Unlike the peft_utils hooks, this is the only thing making a FROZEN embedding's
+    output require grad, so guarding it would silently starve the adapters."""
     guarded = _guarded_functions(
         _ZOO / "training_utils.py", ("make_inputs_require_grad",),
     )

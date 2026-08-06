@@ -343,28 +343,22 @@ def requires_grad_for_gradient_checkpointing(model):
                     # See https://github.com/unslothai/unsloth/issues/5360
                     target = output.last_hidden_state
                 else:
-                    # Raise while tracing too. Skipping here would leave a tuple /
-                    # list / dict output unmarked, and `is_compiling()` is constant
-                    # folded, so the compiled graph would never re-check it: a
-                    # checkpointed region would then train with no adapter
-                    # gradients instead of failing loudly.
+                    # Raise while tracing too: is_compiling() is constant folded, so a skip
+                    # here is permanent and the region trains with no adapter gradients.
                     raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
-        # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping a
-        # no-op keeps fullgraph = True working. Flipping is NOT a no-op on the frozen
-        # input embedding this also lands on: skip it there and reentrant checkpointing
-        # loses every gradient, exactly like the training_utils hook this mirrors.
+        # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping the
+        # no-op keeps fullgraph = True working. Skipping a real flip would break the frozen
+        # input embedding this also lands on, losing every checkpointing gradient.
         if torch.compiler.is_compiling() and target.requires_grad: return
         target.requires_grad_(True)
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):
-        # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA
-        # target (embed_audio.embedding_projection) with fullgraph = True, making
-        # this a hard error. Safe to skip: the hook only exists to start an
-        # autograd graph, and anything traced here is already downstream of
-        # trainable LoRA weights.
+        # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA target
+        # (embed_audio.embedding_projection) with fullgraph = True, so it is a hard error.
+        # Safe to skip: anything traced here is already downstream of trainable LoRA weights.
         if torch.compiler.is_compiling(): return
         # Try positional args first (normal text models)
         if args:

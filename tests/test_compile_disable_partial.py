@@ -16,11 +16,10 @@
 
 """UNSLOTH_COMPILE_DISABLE=partial must also switch off the temporary patches.
 
-compiler.py reads the flag as `in ("1", "partial")`, but common.py read it as
-`== "1"`, so "partial" left every patch_function(fullgraph = ...) compiling and
-the escape hatch could not work around a compile-only crash.
-
-The flag is read at import, so each value is probed in a subprocess.
+compiler.py reads the flag as `in ("1", "partial")` but common.py read it as `== "1"`,
+so "partial" left every patch_function(fullgraph = ...) compiling and the escape hatch
+could not work around a compile-only crash. The flag is read at import, so each value
+is probed in a subprocess.
 """
 
 import json
@@ -54,9 +53,8 @@ _SCRIPT = textwrap.dedent("""
 
 
 def _probe_env(value):
-    # Without the separate `unsloth` package installed, unsloth_zoo/__init__ raises
-    # "Please install Unsloth" before the probe prints anything; this env var takes
-    # the lightweight import path and reads the same flag.
+    # Without the `unsloth` package, unsloth_zoo/__init__ raises "Please install Unsloth"
+    # before the probe prints; this env var takes the light import path, same flag.
     return dict(
         os.environ,
         PYTHONPATH = str(ROOT),
