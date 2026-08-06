@@ -25,6 +25,17 @@ __all__ = [
 from typing import Union, Callable, Optional, List, Dict
 import torch
 
+def _iterable_batch_size(dataset, default = 1000):
+    """Batch size to re-use when mapping an IterableDataset.
+
+    Only a dataset that has already been mapped carries one: a fresh streaming
+    dataset holds an ArrowExamplesIterable, which has no `batch_size` at all, so
+    reading it raised AttributeError before the first map could run. `default`
+    matches datasets' own `map` default.
+    """
+    return getattr(getattr(dataset, "_ex_iterable", None), "batch_size", None) or default
+
+
 # From https://www.geeksforgeeks.org/longest-common-substring-array-strings/
 # Longest Common Substring in an Array of Strings
 def _old_longest_common_substring(arr):
@@ -569,7 +580,14 @@ def train_on_responses_only(
     # num_proc caused Windows spawn loops #3211/#3397); keep explicit user values.
     _MIN_ROWS_FOR_MULTIPROC = 5_000
     def _effective_num_proc(dataset):
-        if num_proc is None or num_proc == 1: return num_proc
+        # `1` means "no multiprocessing" to everyone who passes it, but datasets
+        # >= 4.1 pools for any num_proc >= 1, so returning it verbatim built a
+        # Pool(1): one forked child holding a whole tokenizer, on a split over
+        # _MIN_ROWS_FOR_MULTIPROC where the guard below no longer applies. That
+        # left UNSLOTH_DATASET_NUM_PROC=0 -- the remedy the dead-worker message
+        # recommends -- still forking. `None` is in-process on every supported
+        # release, and is what datasets 3.x already did with `1`.
+        if num_proc is None or num_proc == 1: return None
         if not _num_proc_was_auto: return num_proc  # honor explicit user value
         try:
             if len(dataset) < _MIN_ROWS_FOR_MULTIPROC: return None
@@ -750,7 +768,7 @@ def train_on_responses_only(
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
         trainer.train_dataset = _maybe_tokenize_dataset(trainer.train_dataset)
         if isinstance(trainer.train_dataset, IterableDataset):
-            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = trainer.train_dataset._ex_iterable.batch_size, batched = True)
+            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(trainer.train_dataset), batched = True)
         else:
             trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.train_dataset))
         trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
@@ -764,7 +782,7 @@ def train_on_responses_only(
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
                 value = _maybe_tokenize_dataset(value)
                 if isinstance(value, IterableDataset):
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = value._ex_iterable.batch_size, batched = True)
+                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
                 else:
                     trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
                 trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
@@ -773,7 +791,7 @@ def train_on_responses_only(
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
             trainer.eval_dataset = _maybe_tokenize_dataset(trainer.eval_dataset)
             if isinstance(trainer.eval_dataset, IterableDataset):
-                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = trainer.eval_dataset._ex_iterable.batch_size, batched = True)
+                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(trainer.eval_dataset), batched = True)
             else:
                 trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.eval_dataset))
             trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
@@ -890,19 +908,12 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        import multiprocessing as _mp
-        if num_proc is None or type(num_proc) is not int:
-            if _mp.get_start_method() != 'fork':
-                num_proc = None
-            else:
-                import psutil
-                num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)
-                memory_gb_left = psutil.virtual_memory().available / (1024**3)
-                if memory_gb_left <= 2:
-                    num_proc = 1
-                else:
-                    num_proc = min(num_proc, int(memory_gb_left))
-        dataset_map_kwargs['num_proc'] = num_proc
+        # One policy, one place. The copy that used to live here read stdlib
+        # multiprocessing's start method while datasets uses multiprocess, and it
+        # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
+        # on datasets >= 4.1, the pool this exists to avoid.
+        from .dataset_num_proc import get_dataset_num_proc
+        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
@@ -1090,7 +1101,7 @@ def sft_prepare_dataset(
                         dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))
             map_kwargs["num_proc"] = dataset_num_proc
         else:
-            map_kwargs["batch_size"] = dataset._ex_iterable.batch_size
+            map_kwargs["batch_size"] = _iterable_batch_size(dataset)
 
         if do_prompt_completion:
             _eos_token = getattr(tokenizer, 'eos_token', None)

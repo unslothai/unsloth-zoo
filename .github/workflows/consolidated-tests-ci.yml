@@ -103,7 +103,9 @@ jobs:
         # + cache-completeness gate (CPU-pure; collect-only would let it
         # regress silently). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
-        # no weights). test_mlx_quantized_optimizer_routing pins which optim
+        # no weights). The preference suite pins token boundaries, scheduling,
+        # objective normalization, and reference lifecycle without model weights.
+        # test_mlx_quantized_optimizer_routing pins which optim
         # names reach the 8-bit path; it runs under the torch shim so it
         # EXECUTES here rather than skipping (the numerics need real MLX and run
         # in the mlx-cpu job below and on the Apple Silicon job).
@@ -120,6 +122,7 @@ jobs:
         # CPU-pure and monkeypatch every Hub entry point, so they cost under two
         # seconds. Left out of a gate they would have been collected but never
         # run: `pytest tests/ --collect-only` above proves only that they import.
+        # Executing these files here keeps fixture/source drift visible.
         #
         # test_python39_compatibility pins the package to the floor pyproject
         # declares. No job here runs that floor -- the matrix above starts at 3.10 --
@@ -134,6 +137,7 @@ jobs:
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
+            tests/test_mlx_preference.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -147,6 +151,11 @@ jobs:
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_python39_compatibility.py \
             -v
+
+      - name: pytest MLX adapter-filter gate (HARD GATE)
+        # Run in a fresh process so its module-scoped MLX simulation does not
+        # inherit module state from another MLX test file.
+        run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a

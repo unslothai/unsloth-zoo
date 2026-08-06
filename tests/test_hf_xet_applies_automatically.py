@@ -120,3 +120,39 @@ def test_a_user_who_asked_for_high_performance_still_has_it_after_import(tmp_pat
 
     for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
         assert key not in result, key
+
+
+@pytest.mark.timeout(1200)
+def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performance(tmp_path):
+    """The 2026.6.7 regression lived in ``__init__``, not in the tuning function, so it can only be
+    caught by importing. That release read hf_xet's logs for a prior 429 and, finding none, set
+    ``HF_XET_HIGH_PERFORMANCE=1`` -- which on a VM created seconds ago is every single time. Colab
+    standard then OOM-killed a 29.5GB download at 11.32GB RSS against 13.61GB of RAM.
+
+    An empty log directory is the exact state under test, so create one and point the cache at it
+    rather than relying on whatever this machine happens to have.
+    """
+    xet_cache = tmp_path / "xet"
+    (xet_cache / "logs").mkdir(parents = True)   # exists, and holds no 429 -- the fresh-VM case
+    result = _run(tmp_path, """
+        import json, os
+        import unsloth_zoo  # noqa: F401  -- the import IS the thing under test
+        print(json.dumps({
+            "hp": os.environ.get("HF_XET_HIGH_PERFORMANCE"),
+            "hp_alias": os.environ.get("HF_XET_HP"),
+            "limit": os.environ.get("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"),
+        }))
+    """, {"HF_XET_CACHE": str(xet_cache), "HF_HOME": str(tmp_path / "hf")})
+
+    # Judge the flag with the parser the tuning code uses: it strips and lowercases, so a raw
+    # membership test would let "True" or " on " through while the process is in fact sized for
+    # high performance -- the regression back, in a different spelling.
+    from unsloth_zoo.hf_xet_tuning import _is_true
+
+    assert not _is_true(result["hp"]), (
+        f"import put this process into high-performance mode ({result['hp']!r}); xet-core then "
+        "applies its 64GB preset AFTER reading the environment and discards every cap below"
+    )
+    assert not _is_true(result["hp_alias"])
+    # The caps only mean anything while the preset is off, so assert they arrived at all.
+    assert result["limit"] and int(result["limit"]) <= 64_000_000_000
