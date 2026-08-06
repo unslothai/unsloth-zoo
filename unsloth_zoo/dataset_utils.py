@@ -953,6 +953,11 @@ def train_on_responses_only(
     # called text and its media dropped.
     _AMBIGUOUS_MEDIA_KEYS = _AMBIGUOUS_MEDIA_KEYS | _AMBIGUOUS_MEDIA_COLUMNS
 
+    # Keys whose dtype cannot settle the column. `type` joins the ambiguous
+    # media names because the chat-part convention puts the modality in the
+    # value: `{"type": "image", "content": "cat.jpg"}` is all `string`.
+    _VALUE_SCAN_KEYS = _AMBIGUOUS_MEDIA_KEYS | frozenset(("type",))
+
     # Every suffix a missing entry costs is a VLM row silently trained as text,
     # so cover the modern web formats too (`.avif` is what most image CDNs serve
     # now) and the older spellings of the ones already here.
@@ -1173,23 +1178,30 @@ def train_on_responses_only(
         return dtype.startswith(_PLAIN_DTYPES)
     pass
 
-    def _feature_has_ambiguous_media_key(feature, _depth = 0):
-        """Whether this column's schema nests a `path`/`url`, whose dtype is
-        `string` for both a media reference and ordinary provenance."""
+    def _feature_needs_a_value_scan(feature, _depth = 0):
+        """Whether the dtypes alone cannot settle this column.
+
+        Two all-string shapes decide at value level. A nested `path`/`url` is
+        `string` for both a media reference and ordinary provenance. So is a
+        `type` tag: `{"type": "image", "content": "cat.jpg"}` is an image part
+        and `{"type": "text", ...}` is not, and calling the schema plain marked
+        the column proven, which skips the tag check in `_row_is_plain_text` and
+        drops the media silently.
+        """
         if feature is None or _depth >= 8: return False
         if isinstance(feature, dict):
-            return any(isinstance(k, str) and (k.lower() in _AMBIGUOUS_MEDIA_KEYS or
-                                               _feature_has_ambiguous_media_key(v, _depth + 1))
+            return any(isinstance(k, str) and (k.lower() in _VALUE_SCAN_KEYS or
+                                               _feature_needs_a_value_scan(v, _depth + 1))
                        for k, v in feature.items())
         if isinstance(feature, (list, tuple)):
-            return any(_feature_has_ambiguous_media_key(f, _depth + 1) for f in feature)
+            return any(_feature_needs_a_value_scan(f, _depth + 1) for f in feature)
         inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
-        if inner is not None: return _feature_has_ambiguous_media_key(inner, _depth + 1)
+        if inner is not None: return _feature_needs_a_value_scan(inner, _depth + 1)
         return False
     pass
 
     def _column_values_are_plain_text(split, name):
-        """Whether EVERY row of a struct column with a nested `path`/`url` is text.
+        """Whether EVERY row of a struct the schema could not settle is text.
 
         The 16-row sample misses a `cat.jpg` on row 5000 and the schema says
         `string` either way, so read the whole column - the same trade the
@@ -1222,7 +1234,7 @@ def train_on_responses_only(
                 for name, feature in features.items():
                     if name in _TEXT_COLUMNS: continue
                     if not _feature_is_plain_text(feature): return False, proven
-                    if _feature_has_ambiguous_media_key(feature) and \
+                    if _feature_needs_a_value_scan(feature) and \
                         not _column_values_are_plain_text(split, name): return False, proven
                     proven.add(name)
                 return True, proven
@@ -1318,6 +1330,46 @@ def train_on_responses_only(
         return True
     pass
 
+    # Classified up here rather than beside the swap below, so the packing
+    # refusal can run before either split is tokenized: it is a deterministic
+    # configuration error, and raising it after a full preprocessing pass makes
+    # a large corpus pay for the answer twice and leaves the datasets mutated.
+    from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
+    import transformers as _transformers
+    _PAD_DELEGATING_COLLATORS = tuple(_cls for _cls in (
+        DataCollatorForSeq2Seq, DataCollatorWithPadding,
+        getattr(_transformers, "DataCollatorForTokenClassification", None),
+        getattr(_transformers, "DataCollatorForLanguageModeling", None),
+        getattr(_transformers, "DataCollatorForMultipleChoice", None),
+    ) if isinstance(_cls, type))
+    # Read defensively: this now runs ahead of the early returns below, and a
+    # trainer without `.args` used to reach one of them.
+    packing_enabled = getattr(getattr(trainer, "args", None), "packing", False)
+
+    def _is_known_bypassed_collator(collator):
+        if isinstance(collator, _PAD_DELEGATING_COLLATORS): return True
+        # TRL's vision collator rebuilds labels through its processor. Matched by
+        # name so this does not depend on which TRL version is installed.
+        return any(b.__name__ == "DataCollatorForVisionLanguageModeling"
+                   for b in type(collator).__mro__)
+
+    def _refuse_packing_with_a_foreign_collator(collator):
+        """The case with no right answer: `_is_vision_collator` matches one
+        merely holding a processor, and a custom self-packing collator does
+        exactly that. Replacing it discards its packing, its `position_ids` and
+        any block-attention inputs; keeping it risks its `__call__` rebuilding
+        `labels` over the mask. Both are silently wrong, so say so."""
+        if not packing_enabled or _is_known_bypassed_collator(collator): return
+        raise ValueError(
+            f"Unsloth: `{type(collator).__name__}` holds a processor and does not support "
+            "response-only masking, and `packing = True` asks that same collator to build the "
+            "packed batch. Both cannot be honoured: replacing it discards its packing, its "
+            "`position_ids` and any block-attention inputs, while keeping it risks its "
+            "`__call__` rebuilding `labels` over the mask just written. Turn packing off, or "
+            "build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+            "instruction_part = ..., response_part = ...) so masking runs at collate time."
+        )
+
     # Set when a foreign vision collator is let through to the text path below.
     _bypassed_vision_collator = False
     data_collator = getattr(trainer, "data_collator", None)
@@ -1367,6 +1419,7 @@ def train_on_responses_only(
                     + _hint
                 )
             # Fall through to the dataset-level text path below.
+            _refuse_packing_with_a_foreign_collator(data_collator)
             _bypassed_vision_collator = True
             print(
                 f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
@@ -1431,8 +1484,6 @@ def train_on_responses_only(
 
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
     # from a processor already returned above, so what is left here only pads.
-    from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
-    packing_enabled = getattr(trainer.args, "packing", False)
     _collator = getattr(trainer, "data_collator", None)
     # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
     # through a `.pad` processors do not have, so it dies on the first batch;
@@ -1444,45 +1495,14 @@ def train_on_responses_only(
     # replacing that one throws its packing away. So only the classes that provably
     # delegate to `.pad` are repaired from the attribute; TRL's vision collator
     # calls its processor instead and is already covered by the bypass flag below.
-    import transformers as _transformers
-    _PAD_DELEGATING_COLLATORS = tuple(_cls for _cls in (
-        DataCollatorForSeq2Seq, DataCollatorWithPadding,
-        getattr(_transformers, "DataCollatorForTokenClassification", None),
-        getattr(_transformers, "DataCollatorForLanguageModeling", None),
-        getattr(_transformers, "DataCollatorForMultipleChoice", None),
-    ) if isinstance(_cls, type))
     _pad_source = getattr(_collator, "tokenizer", None)
     if _pad_source is None:
         _pad_source = getattr(_collator, "processor", None)
     _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad") \
         and isinstance(_collator, _PAD_DELEGATING_COLLATORS)
-    # That repair is not packing-gated like the swap: it fails either way.
-    # Nor is a collator we bypassed above whose class we recognise: it either
-    # delegates its padding to `.pad` or rebuilds `labels` in `__call__`, and the
-    # latter throws away the mask just written, which is silent training on prompts.
-    def _is_known_bypassed_collator(collator):
-        if isinstance(collator, _PAD_DELEGATING_COLLATORS): return True
-        # TRL's vision collator rebuilds labels through its processor. Matched by
-        # name so this does not depend on which TRL version is installed.
-        return any(b.__name__ == "DataCollatorForVisionLanguageModeling"
-                   for b in type(collator).__mro__)
-    # Any other bypassed collator under packing is the case with no right answer:
-    # `_is_vision_collator` matches one merely holding a processor, and a custom
-    # self-packing collator does exactly that. Replacing it discards its packing,
-    # its `position_ids` and any block-attention inputs; keeping it risks its
-    # `__call__` rebuilding `labels` over the mask. Both are silently wrong, so
-    # say so rather than guess.
-    if packing_enabled and _bypassed_vision_collator and \
-        not _is_known_bypassed_collator(_collator):
-        raise ValueError(
-            f"Unsloth: `{type(_collator).__name__}` holds a processor and does not support "
-            "response-only masking, and `packing = True` asks that same collator to build the "
-            "packed batch. Both cannot be honoured: replacing it discards its packing, its "
-            "`position_ids` and any block-attention inputs, while keeping it risks its "
-            "`__call__` rebuilding `labels` over the mask just written. Turn packing off, or "
-            "build UnslothVisionDataCollator(..., train_on_responses_only = True, "
-            "instruction_part = ..., response_part = ...) so masking runs at collate time."
-        )
+    # That repair is not packing-gated like the swap: it fails either way. The
+    # bypassed-collator case under packing already refused above, before
+    # anything was mapped.
     if hasattr(trainer, "data_collator") and (
         _processor_backed or _bypassed_vision_collator
         or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
@@ -1501,9 +1521,14 @@ def train_on_responses_only(
             hasattr(_collator, _n)
             for _n in ("padding", "max_length", "pad_to_multiple_of")
         )
+        # `label_pad_token_id` means the same thing to DataCollatorForSeq2Seq as
+        # it does to a DataCollatorForTokenClassification, so a caller who chose
+        # a non-default one keeps it; dropping it padded unequal-length batches
+        # with -100 instead and can break a loss that reads the pad value.
         _names = ("model", "padding", "max_length", "pad_to_multiple_of",
                   "label_pad_token_id", "return_tensors") if _same_class else \
-                 ("padding", "max_length", "pad_to_multiple_of", "return_tensors")
+                 ("padding", "max_length", "pad_to_multiple_of",
+                  "label_pad_token_id", "return_tensors")
         _kept = {
             name: getattr(_collator, name)
             for name in _names

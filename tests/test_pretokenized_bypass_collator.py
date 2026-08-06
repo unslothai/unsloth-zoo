@@ -1932,3 +1932,99 @@ def test_remove_unused_columns_false_survives_a_raw_train_split():
     columns = set(out.train_dataset.column_names)
     assert "sample_weight" in columns, sorted(columns)
     assert "text" not in columns, sorted(columns)
+
+
+# ---- round N: three more Codex items ---------------------------------------
+
+def test_the_packing_refusal_lands_before_the_dataset_is_touched():
+    """It is a deterministic configuration error, so it must not cost a full
+    tokenize/map/mask/filter pass over a large corpus first -- and the failed
+    call used to leave the trainer's datasets rewritten behind it."""
+    collator = LabelRebuildingVisionCollator(StubProcessor())
+    rows = Dataset.from_dict({"text": ["a" * 4, "b" * 4]})
+    trainer = StubTrainer(collator, rows)
+    trainer.args.packing = True
+    before = trainer.train_dataset
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.train_dataset is before, "the split was mutated before refusing"
+    assert trainer.train_dataset.column_names == ["text"]
+
+
+def test_the_packing_refusal_does_not_map_the_eval_split_either():
+    collator = LabelRebuildingVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.eval_dataset = Dataset.from_dict({"input_ids": [list(ROW)]})
+    trainer.args.packing = True
+    before = trainer.eval_dataset
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert trainer.eval_dataset is before
+
+
+def test_a_type_tagged_struct_column_is_still_scanned():
+    """`{"type": "image", "content": "cat.jpg"}` is all `string`, so the schema
+    called the column plain and marked it proven -- which is exactly what makes
+    `_row_is_plain_text` skip it, so the `type` tag was never read and the image
+    column was dropped, training the row as text."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "part": [{"type": "text", "content": "hello"},
+                 {"type": "image", "content": "cat.jpg"}],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_type_tagged_struct_of_real_text_still_passes():
+    """The scan answers per value, so an ordinary tagged text part is fine and
+    the run is not refused for carrying a `type` field."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "part": [{"type": "text", "content": "hello"},
+                 {"type": "text", "content": "there"}],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert out is trainer
+
+
+def test_a_nested_type_tag_is_scanned_too():
+    """A tag one level down inside a list of turns is the same shape."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "turns": [[{"type": "text", "content": "hi"}],
+                  [{"type": "image", "content": "dog.png"}]],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_custom_label_pad_value_survives_the_repair():
+    """DataCollatorForSeq2Seq takes `label_pad_token_id` too, so a caller who
+    chose one keeps it; dropping it padded with -100 instead."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(
+        tokenizer = StubProcessor(), padding = "max_length", max_length = 32,
+        label_pad_token_id = -1,
+    )
+    trainer = StubTrainer(collator, _text_rows())
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert out.data_collator.label_pad_token_id == -1
+    assert out.data_collator.padding == "max_length"
+    assert out.data_collator.max_length == 32
+
+
+def test_the_default_label_pad_value_is_unchanged():
+    """The copy must not move the default off -100 for everyone else."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert out.data_collator.label_pad_token_id == -100
