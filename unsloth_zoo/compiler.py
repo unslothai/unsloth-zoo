@@ -966,6 +966,43 @@ def _verify_compiled_cache_file(function_location, expected_digest):
     )
 pass
 
+def _agreed_error(local_error, operation):
+    """The error every rank must act on, or None when no rank failed.
+
+    Returned rather than raised so a caller can still take a collective fallback
+    with the whole group in step.
+    """
+    if not distributed_any(local_error is not None):
+        return None
+    return local_error or RuntimeError(f"Unsloth: {operation} failed on another rank.")
+pass
+
+def _raise_if_any_rank_failed(local_error, operation):
+    """Raise on every rank when `operation` failed anywhere."""
+    error = _agreed_error(local_error, operation)
+    if error is not None:
+        raise error
+pass
+
+def _cache_verification_error(function_location, expected_digest):
+    """The agreed verification error for this cache file, or None."""
+    if not is_distributed():
+        return None
+    local_error = None
+    try:
+        _verify_compiled_cache_file(function_location, expected_digest)
+    except Exception as error:
+        local_error = error
+    return _agreed_error(local_error, "Compiled cache verification")
+pass
+
+def _verify_compiled_cache_file_collectively(function_location, expected_digest):
+    """Verify on every rank, and fail on every rank if any rank disagrees."""
+    error = _cache_verification_error(function_location, expected_digest)
+    if error is not None:
+        raise error
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -1212,31 +1249,62 @@ def create_new_function(
 
     pass
 
+    def write_node_local_file(function_location, write_new_source):
+        """Write this rank's own copy, then agree the outcome. Returns an error or None.
+
+        The temp cache is `tempfile.gettempdir()`, which is per node, so routing
+        it through distributed_function() would write it on rank 0 alone and
+        leave every other node without the file. write_file() locks and compares
+        before writing, so ranks sharing a node stay idempotent.
+        """
+        wrote, write_error = write_file_outcome(function_location, write_new_source)
+        return _agreed_error(
+            None if wrote else RuntimeError(write_error),
+            f"Compiled cache write for {name}",
+        )
+
+    pass
+
     # A rank arriving after rank 0 has written the file would skip this collective
     # and desynchronise the group, so rank 0 decides and broadcasts.
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
     if should_write_cache_file:
-        wrote, write_error = distributed_function(
-            2, write_file_outcome, function_location, write_new_source,
-        )
-        if not wrote:
+        if UNSLOTH_COMPILE_USE_TEMP:
+            # The cache is already the per-node temp directory.
+            write_failure = write_node_local_file(function_location, write_new_source)
+        else:
+            wrote, write_error = distributed_function(
+                2, write_file_outcome, function_location, write_new_source,
+            )
+            write_failure = RuntimeError(write_error) if not wrote else None
+        pass
+        # write_file() reports success even when it silently wrote nothing, so
+        # read the bytes back rather than trusting the outcome.
+        if write_failure is None:
+            write_failure = _cache_verification_error(
+                function_location, cache_file_digest,
+            )
+        if write_failure is not None:
             if UNSLOTH_COMPILE_USE_TEMP:
-                raise RuntimeError(write_error)
+                raise write_failure
             # Failed so instead use a temporary directory
             compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
                 use_tempfile=True
             )
             function_location = os.path.join(compile_folder, f"{name}.py")
-            wrote, write_error = distributed_function(
-                2, write_file_outcome, function_location, write_new_source,
+            temp_failure = write_node_local_file(function_location, write_new_source)
+            if temp_failure is not None:
+                raise temp_failure
+            _verify_compiled_cache_file_collectively(
+                function_location, cache_file_digest,
             )
-            if not wrote:
-                raise RuntimeError(write_error)
         pass
-    elif is_distributed():
-        _verify_compiled_cache_file(function_location, cache_file_digest)
+    else:
+        # Rank 0 kept an existing file, so there is no write to retry: a rank
+        # whose copy differs would silently import another implementation.
+        _verify_compiled_cache_file_collectively(function_location, cache_file_digest)
     pass
 
     # Now import modules! Use a tempfile if it fails on the first try!
@@ -1267,6 +1335,19 @@ def create_new_function(
 
     pass
 
+    def load_module_directly(compile_folder, name):
+        module_name = f"unsloth_cache_{name}"
+        file_location = os.path.join(compile_folder, name) + ".py"
+        lock = get_lock(file_location)
+        with lock:
+            spec = importlib.util.spec_from_file_location(module_name, file_location)
+            new_module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = new_module
+            spec.loader.exec_module(new_module)
+        return new_module
+
+    pass
+
     try:
         import_error = None
         try:
@@ -1284,40 +1365,42 @@ def create_new_function(
                     use_tempfile=True
                 )
                 function_location = os.path.join(compile_folder, f"{name}.py")
-                distributed_function(
-                    2, write_file_outcome, function_location, write_new_source,
-                )
+                # Report what sent us here before anything below can raise, or
+                # the trigger is lost behind the failure it caused.
                 if is_main_process():
                     # None here means another rank failed, not this one.
                     reason = import_error or "an import failure on another rank"
                     logger.info(
                         f"Standard import failed for {name}: {reason}. Using tempfile instead!"
                     )
-                try:
-                    new_module, old_path = import_module(compile_folder, name)
-                except Exception as e:
-                    new_module = None
-                    if is_main_process():
-                        logger.info(
-                            f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!"
-                        )
+                temp_failure = write_node_local_file(
+                    function_location, write_new_source,
+                )
+                if temp_failure is not None:
+                    raise temp_failure
+                _verify_compiled_cache_file_collectively(
+                    function_location,
+                    hashlib.sha256(write_new_source.encode("utf-8")).hexdigest(),
+                )
             pass
-            # Fallback to direct module loading
-            if new_module is None:
-                try:
-                    module_name = f"unsloth_cache_{name}"
-                    file_location = os.path.join(compile_folder, name) + ".py"
-                    lock = get_lock(file_location)
-                    with lock:
-                        spec = importlib.util.spec_from_file_location(
-                            module_name, file_location
-                        )
-                        new_module = importlib.util.module_from_spec(spec)
-                        sys.modules[module_name] = new_module
-                        spec.loader.exec_module(new_module)
-                except Exception as e:
-                    raise RuntimeError(f"Direct module loading failed for {name}: {e}")
-            pass
+            # Every rank loads by path. importlib.import_module(name) would return
+            # a successful rank's old sys.modules entry instead of the temp file,
+            # so drop that entry too or a later import resurrects it.
+            sys.modules.pop(name, None)
+            direct_load_error = None
+            try:
+                new_module = load_module_directly(compile_folder, name)
+            except Exception as error:
+                new_module = None
+                direct_load_error = RuntimeError(
+                    f"Direct module loading failed for {name}: {error}"
+                )
+            _raise_if_any_rank_failed(
+                direct_load_error, f"Direct module loading for {name}",
+            )
+            # Republish under the plain name so `import <name>` keeps resolving
+            # the way it does without a recovery, now pointing at what we loaded.
+            sys.modules[name] = new_module
         pass
     finally:
         # Restore original sys.path if we modified it
