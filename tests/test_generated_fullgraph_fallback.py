@@ -183,3 +183,106 @@ def test_the_eager_path_is_the_original_function():
 
     wrapped = torch_compile_with_fallback(fullgraph = True)(some_forward)
     assert wrapped.__wrapped__ is some_forward
+
+
+# --- what the seventh review round found ------------------------------------
+
+def _bare_fullgraph_alias_sites():
+    """Every `@torch_compile(... fullgraph = True)` in the package.
+
+    The scan above reads three named files and only recognises a literal
+    `torch.compile`, so the alias sites in gpt_oss / qwen3_vl_moe / gemma sat
+    outside it: `torch_compile` was `functools.partial(torch.compile)` and went
+    straight to Dynamo, where cache exhaustion under fullgraph is fatal.
+    """
+    import re
+    pattern = re.compile(r"\b_?torch_compile\s*\([^)]*fullgraph\s*=\s*True", re.S)
+    found = []
+    for path in sorted((ZOO / "temporary_patches").glob("*.py")):
+        if path.name in ("common.py", "utils.py"):
+            continue
+        text = path.read_text(encoding = "utf-8")
+        for match in pattern.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            if text.splitlines()[line - 1].lstrip().startswith("#"):
+                continue
+            found.append(f"{path.name}:{line}")
+    return found
+
+
+def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
+    """They are not rewritten one by one; the alias routes them.
+
+    Fixing ten decorators leaves the eleventh, so `torch_compile` and
+    `_torch_compile` now go through `_compile_or_fall_back`, which hands any
+    fullgraph compile to `torch_compile_with_fallback`.
+    """
+    sites = _bare_fullgraph_alias_sites()
+    assert sites, "the scan found no alias sites at all; has the spelling changed?"
+
+    common = (ZOO / "temporary_patches" / "common.py").read_text(encoding = "utf-8")
+    assert "def _compile_or_fall_back" in common
+    assert "torch_compile_with_fallback" in common
+    # By line, not by substring: `_torch_compile = ...` is itself a substring of
+    # `_raw_torch_compile = ...`, which deliberately DOES partial torch.compile
+    # (compile_with_eager_fallback applies the wrapper itself, and wrapping a
+    # wrapper leaves the inner one swallowing the exhaustion).
+    lines = common.split("\n")
+    for name in ("torch_compile", "_torch_compile"):
+        starts = [i for i, ln in enumerate(lines)
+                  if ln.strip().startswith(f"{name} = functools.partial(")]
+        assert starts, f"{name} is no longer a partial; has the alias moved?"
+        for i in starts:
+            body = "\n".join(lines[i:i + 4])
+            assert "_compile_or_fall_back" in body, \
+                f"{name} still partials torch.compile directly, so {sites} stay fatal"
+    raw = [ln for ln in lines
+           if ln.strip().startswith("_raw_torch_compile = functools.partial(")]
+    assert raw, "the raw alias compile_with_eager_fallback needs is gone"
+
+
+def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
+    from unsloth_zoo.temporary_patches import common as C
+    seen = {}
+
+    def _fake(**kwargs):
+        seen.update(kwargs)
+        return lambda fn: fn
+
+    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
+                        "torch_compile_with_fallback", _fake)
+
+    @C.torch_compile(dynamic = True, fullgraph = True)
+    def _f(x): return x
+
+    assert seen.get("fullgraph") is True
+
+
+def test_the_alias_still_accepts_a_function_positionally():
+    """`prepare = torch_compile(prepare, fullgraph = True)` is how gemma.py and
+    gpt_oss.py call it, and a kwargs-only helper would TypeError there."""
+    from unsloth_zoo.temporary_patches import common as C
+
+    def _f(x): return x * 2
+    wrapped = C.torch_compile(_f, dynamic = True, fullgraph = True)
+    assert callable(wrapped)
+    assert wrapped(3) == 6
+
+
+def test_a_non_fullgraph_compile_is_left_alone(monkeypatch):
+    """Dynamo already falls back by itself without fullgraph, so wrapping there
+    would add a layer that can never fire."""
+    from unsloth_zoo.temporary_patches import common as C
+    called = {"n": 0}
+
+    def _boom(**kwargs):
+        called["n"] += 1
+        return lambda fn: fn
+
+    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
+                        "torch_compile_with_fallback", _boom)
+
+    @C.torch_compile(dynamic = True)
+    def _f(x): return x
+
+    assert called["n"] == 0

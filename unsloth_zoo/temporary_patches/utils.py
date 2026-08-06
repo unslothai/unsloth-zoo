@@ -1164,8 +1164,12 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     `_fall_back_to_eager_on_recompile_limit` (only `patch_function` applies it), so
     cache exhaustion aborts training instead of latching to eager.
     """
-    from .common import torch_compile
-    compiled = torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
+    # The RAW compile: `torch_compile` now routes fullgraph regions through the
+    # fallback itself, and wrapping the result again would leave the inner
+    # wrapper swallowing the exhaustion under a label nobody looks up, while the
+    # outer one this function returns never latched.
+    from .common import _raw_torch_compile
+    compiled = _raw_torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
     # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
         return compiled
@@ -1175,6 +1179,11 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
 # Call sites that have already given up, by label. Outlives the wrappers, which
 # the registry holds only weakly.
 _LATCHED_EAGER_LABELS: set = set()
+
+# Call sites that deferred their switch to the next step boundary. Same reason:
+# a wrapper built inside a forward is unreachable before the boundary arrives,
+# so the deferral has to be recorded somewhere that survives it.
+_PENDING_EAGER_LABELS: set = set()
 
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
@@ -1215,7 +1224,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # The decision belongs to the call site, not to the object, so carry it by
     # label across rebuilds.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": False, "bumps": 0}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
 
     def _warn(message):
         if not state["warned"]:
@@ -1309,6 +1318,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # walk straight past both the per-wrapper and global caps. The
             # retry DID finish; treat it as one and still let the signal out.
             state["pending_eager"] = True
+            _PENDING_EAGER_LABELS.add(label)
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
                 f"{label} during checkpoint recomputation; switching to eager "
@@ -1325,6 +1335,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         # Falling through to eager would run the same call twice, applying any
         # mutation it already made a second time, and would bury the error.
         state["pending_eager"] = True
+        _PENDING_EAGER_LABELS.add(label)
         _warn(
             f"Unsloth: torch.compile ran out of recompilation cache for "
             f"{label}; finishing this step compiled and switching to eager at "
@@ -1549,7 +1560,13 @@ def apply_pending_eager_fallbacks() -> int:
         )
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
-    if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
+    # By label as well as by object. A wrapper built inside a forward is already
+    # collected by the time the boundary arrives, so asking only the live ones
+    # answered "nothing pending" and the next step compiled it again -- the
+    # bounded transition this function promises never happened for GRPO's
+    # `accumulate_chunk`.
+    if not _PENDING_EAGER_LABELS and \
+        not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
         # Nothing to flip, but a borrower that bumped and was then collected
         # (training aborted, or the patched object was replaced) would otherwise
         # leave the process-wide limit raised and its allowance spent forever.
@@ -1562,6 +1579,10 @@ def apply_pending_eager_fallbacks() -> int:
             flipped += 1
         w._unsloth_fallback_state["eager"] = True
         w._unsloth_fallback_state["pending_eager"] = False
+    # The deferral is settled, so the call sites that took it are eager from now
+    # on however often their wrappers are rebuilt.
+    _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
+    _PENDING_EAGER_LABELS.clear()
     # Everything that borrowed headroom is eager now, so hand the budget back
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()

@@ -773,6 +773,20 @@ def _utils():
 
 
 @pytest.fixture(autouse = True)
+def _leave_the_packages_kernels_as_found():
+    """`_latch_all_to_eager` takes every live borrower with it, and the registry
+    is process-wide, so a test here that exhausts its budget also latches
+    gemma/gemma4/qwen3 and their own tests then read the wrong state."""
+    import unsloth_zoo.temporary_patches.utils as U
+    saved = [(w, dict(w._unsloth_fallback_state))
+             for w in (r() for r in U._EAGER_FALLBACK_WRAPPERS) if w is not None]
+    yield
+    for w, st in saved:
+        w._unsloth_fallback_state.clear()
+        w._unsloth_fallback_state.update(st)
+
+
+@pytest.fixture(autouse = True)
 def _forget_this_files_latches():
     """The give-up decision is now kept by LABEL, so it outlives the wrapper --
     that is the point, since a wrapper built inside a forward is collected the
@@ -780,8 +794,10 @@ def _forget_this_files_latches():
     around each one; the package's real kernels keep theirs."""
     import unsloth_zoo.temporary_patches.utils as U
     U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
+    U._PENDING_EAGER_LABELS -= set(_OUR_LABELS)
     yield
     U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
+    U._PENDING_EAGER_LABELS -= set(_OUR_LABELS)
 
 
 # Labels this file's own wrappers are built with, so the reset can leave the
@@ -823,6 +839,7 @@ def _reset_bump_state(U):
     # built inside a forward keeps it across rebuilds. Same scoping rule: drop
     # only this file's labels, or the package's own kernels lose their latch.
     U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
+    U._PENDING_EAGER_LABELS -= set(_OUR_LABELS)
     # Clearing the bookkeeping alone left a real bump standing: a wrapper that
     # exhausted its cache raised both budgets by 16 before signalling, so every
     # later test ran against enlarged limits and could stop reaching the
@@ -1466,3 +1483,50 @@ def test_a_different_call_site_is_not_dragged_along():
     c2, e2, calls2 = _pair()
     assert _fall_back_to_eager_on_recompile_limit(c2, e2, "B.forward")(5) == 10
     assert calls2 == {"c": 1, "e": 0}
+
+
+def test_a_deferred_switch_survives_the_wrapper_too():
+    """The give-up path recorded its label, but the DEFERRED path -- the normal
+    one, where the bumped retry succeeds and the switch waits for the step
+    boundary -- kept it only in wrapper-local state. GRPO's `accumulate_chunk`
+    is unreachable by the time the boundary arrives, so `pending_eager` died
+    with it and the next step compiled a fresh one."""
+    U = _utils()
+    c, e, _ = _pair(_LIMIT_ERROR("recompile_limit reached"))
+    w = _fall_back_to_eager_on_recompile_limit(c, e, "C.forward")
+    w(1)
+    assert "C.forward" in (U._LATCHED_EAGER_LABELS | U._PENDING_EAGER_LABELS)
+
+
+def test_the_boundary_settles_a_deferred_label_with_no_live_wrapper():
+    """`apply_pending_eager_fallbacks` asked only the live wrappers, so a label
+    whose wrapper had already been collected read as nothing pending."""
+    U = _utils()
+    U._PENDING_EAGER_LABELS.add("C.forward")
+    U.apply_pending_eager_fallbacks()
+    assert "C.forward" in U._LATCHED_EAGER_LABELS
+    assert "C.forward" not in U._PENDING_EAGER_LABELS
+
+    c, e, calls = _pair()
+    assert _fall_back_to_eager_on_recompile_limit(c, e, "C.forward")(5) == 10
+    assert calls == {"c": 0, "e": 1}, "the rebuilt wrapper compiled again"
+
+
+def test_a_rebuilt_wrapper_inherits_the_deferral_not_the_latch():
+    """Before the boundary it is still pending, not eager: the whole point of
+    deferring is that the switch waits for a step boundary."""
+    U = _utils()
+    U._PENDING_EAGER_LABELS.add("B.forward")
+    c, e, _ = _pair()
+    w = _fall_back_to_eager_on_recompile_limit(c, e, "B.forward")
+    assert w._unsloth_fallback_state["pending_eager"] is True
+    assert w._unsloth_fallback_state["eager"] is False
+
+
+def test_an_untouched_call_site_is_not_settled_by_someone_elses_boundary():
+    U = _utils()
+    U._PENDING_EAGER_LABELS.add("A.forward")
+    U.apply_pending_eager_fallbacks()
+    c, e, calls = _pair()
+    assert _fall_back_to_eager_on_recompile_limit(c, e, "B.forward")(5) == 10
+    assert calls == {"c": 1, "e": 0}

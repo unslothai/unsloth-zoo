@@ -58,6 +58,7 @@ def _isolate_registry(monkeypatch):
     # forward keeps it across rebuilds. That also outlives a test, and every
     # test here reuses "M.forward" / "M.f".
     monkeypatch.setattr(U, "_LATCHED_EAGER_LABELS", set())
+    monkeypatch.setattr(U, "_PENDING_EAGER_LABELS", set())
 
 
 def _pair(fail_after=0):

@@ -127,6 +127,7 @@ def dynamo_limits():
     # test here reuses "test_norm", so a latch from an earlier one would start
     # the next already eager.
     U._LATCHED_EAGER_LABELS.discard("test_norm")
+    U._PENDING_EAGER_LABELS.discard("test_norm")
     try:
         yield
     finally:
