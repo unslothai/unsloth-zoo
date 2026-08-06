@@ -79,17 +79,12 @@ def simulate_mlx_on_torch(*, fake_apple_silicon: bool = True):
 _PLATFORM_SPOOFED = False
 
 # Only these see the fake host. The spoof is process-wide and permanent, so
-# anything collected after an MLX test module inherits it: torch's inductor
-# picks its CPU vector ISA from platform.machine()
-# (torch/_inductor/cpu_vec_isa.py, behind functools.cache), and "arm64" on an
-# x86_64 box yields an empty ISA list, after which every torch.compile in the
-# process emits `at::vec` C++ that will not compile.
-#
-# Allow-list rather than deny-list on purpose. A deny-list has to name every
-# library that reads the host to dispatch native code, and the one it forgets
-# fails exactly like the above: silently, far away, and only once some other
-# test happens to be collected afterwards. Only the _IS_MLX gate needs the lie,
-# so an unrecognised caller gets the truth, which is the safe direction.
+# anything collected after an MLX test module inherits it: inductor caches its
+# CPU vector ISA from platform.machine(), and "arm64" on x86_64 yields an empty
+# list, after which every torch.compile emits uncompilable `at::vec` C++.
+# Allow-list, not deny-list: a deny-list must name every library that dispatches
+# native code off the host, and the one it misses fails the same silent, far-away
+# way. Only the _IS_MLX gate needs the lie, so everyone else gets the truth.
 _SPOOF_CONSUMERS = frozenset({
     "unsloth", "unsloth_zoo", "tests", "mlx_simulation",
 })
@@ -101,8 +96,7 @@ def _spoof_apple_silicon_platform():
     Idempotent.  PR-B's _IS_MLX gate in unsloth/__init__.py uses these
     to decide between MLX and CUDA dispatch.
 
-    The lie is scoped to the immediate caller: only the packages in
-    _SPOOF_CONSUMERS see it, everything else sees the real host.
+    Scoped to the immediate caller: only _SPOOF_CONSUMERS see the lie.
     """
     global _PLATFORM_SPOOFED
     if _PLATFORM_SPOOFED:
@@ -114,8 +108,8 @@ def _spoof_apple_silicon_platform():
 
     def _scoped(real, fake):
         def spoofed():
-            # depth 1 is this wrapper's caller; functools.cache and other C-level
-            # wrappers push no Python frame, so this is the real reading module.
+            # depth 1 is the real reading module: functools.cache and other
+            # C-level wrappers push no Python frame.
             root = sys._getframe(1).f_globals.get("__name__", "").partition(".")[0]
             return fake if root in _SPOOF_CONSUMERS else real()
         return spoofed
