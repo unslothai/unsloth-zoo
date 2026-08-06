@@ -31,7 +31,15 @@ jobs:
       # 5-concurrent-Windows-runner limit when this job runs alongside others.
       max-parallel: 3
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        # No macOS leg on purpose. Both test files here are pure Python --
+        # monkeypatched subprocess plus AST parsing of upstream sources, no
+        # torch and no GGUF binary -- and neither contains a single
+        # `sys.platform` / `Darwin` / `arm64` reference, so the macOS row
+        # asserted exactly what the Linux row asserts. Windows stays because
+        # path handling genuinely differs there. macOS concurrency is capped at
+        # 5 jobs account-wide and is shared with unslothai/unsloth, so this was
+        # the one routine per-PR macOS job in this repo and it bought no signal.
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
