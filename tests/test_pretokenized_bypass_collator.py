@@ -1356,3 +1356,105 @@ def test_a_directly_held_image_processor_still_lets_text_only_rows_through():
     trainer = StubTrainer(DirectImageProcessorCollator(["my_pixels"]), _text_rows())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in out.train_dataset.column_names, "the text path never ran"
+
+
+# ---- what the second review round found ------------------------------------
+
+@pytest.mark.parametrize("suffix", [".avif", ".jfif", ".jpe", ".apng", ".ogv", ".wma"])
+def test_less_common_media_suffixes_are_recognized(suffix):
+    """A suffix missing from the list makes the column look like prose, so the
+    bypass fires and the media column is dropped: VLM rows trained as text."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "url": [f"https://example.com/cat{suffix}", f"https://example.com/dog{suffix}"],
+    }))
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "url" in trainer.train_dataset.column_names, "the media column was dropped"
+
+
+def test_an_unscannable_ambiguous_column_is_refused():
+    """A stream cannot be read past its prefix, so a `cat.jpg` further down goes
+    unseen. Assuming text there drops the column silently, so refuse instead."""
+    n = 40
+    urls = ["some prose, not a file"] * n
+    urls[30] = "https://example.com/cat.jpg"        # past the 16-row prefix
+    dataset = Dataset.from_dict({"input_ids": [list(ROW)] * n, "url": urls})
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          dataset.to_iterable_dataset())
+
+    with pytest.raises(ValueError, match = "cannot be read past its first rows") as excinfo:
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "['url']" in str(excinfo.value), "the refusal does not name the column"
+
+
+def test_an_unscannable_non_string_column_is_not_called_media():
+    """Only a string can name a file, so an ambiguous name over ints stays text."""
+    n = 40
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW)] * n, "file": list(range(n)),
+    }).to_iterable_dataset())
+    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_padding_collator_rebuild_keeps_the_padding_the_caller_chose():
+    """`DataCollatorWithPadding` forwards these to `tokenizer.pad` exactly as the
+    replacement does, so dropping them turns max_length padding into dynamic."""
+    collator = DataCollatorWithPadding(tokenizer = StubProcessor(),
+                                       padding = "max_length", max_length = 32,
+                                       pad_to_multiple_of = 8)
+    trainer = StubTrainer(collator, _text_rows())
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.data_collator is not collator
+    assert out.data_collator.padding == "max_length"
+    assert out.data_collator.max_length == 32
+    assert out.data_collator.pad_to_multiple_of == 8
+    assert hasattr(out.data_collator.tokenizer, "pad")
+
+
+class OffsetTokenizer(StubTokenizer):
+    """The caller's own text tokenizer: same text, a different vocabulary."""
+    OFF = 1000
+
+    @classmethod
+    def _ids(cls, text):
+        return [i + cls.OFF for i in StubTokenizer._ids(text)]
+
+
+def test_a_raw_eval_split_is_tokenized_with_the_override_tokenizer():
+    """The response markers were tokenized with the `tokenizer =` override, so
+    encoding the eval split with the trainer's processor gives IDs that can
+    never match and the whole split comes back masked."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          Dataset.from_dict({"input_ids": [[i + OffsetTokenizer.OFF
+                                                            for i in ROW]] * 2}))
+    trainer.eval_dataset = _raw_text_rows()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART,
+                                  tokenizer = OffsetTokenizer())
+
+    row = out.eval_dataset[0]
+    assert all(i >= OffsetTokenizer.OFF for i in row["input_ids"]), \
+        "eval was encoded with the trainer's processor, not the override"
+    assert any(l != -100 for l in row["labels"]), "eval labels are all -100"
+
+
+def test_precomputed_labels_survive_the_raw_column_drop():
+    """A raw split can carry token-level `labels` the caller already masked;
+    the masking pass intersects with them, so they must not be removed with the
+    raw text or every response token gets un-masked."""
+    text = f"{INSTRUCTION_PART}ab{RESPONSE_PART}cd"
+    ids = StubTokenizer._ids(text)
+    old = [-100] * len(ids)
+    old[-2] = ids[-2]                    # the caller masked the final token
+
+    trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubTokenizer()),
+                          Dataset.from_dict({"text": [text] * 2,
+                                             "labels": [list(old)] * 2}))
+    trainer.processing_class = StubTokenizer()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.train_dataset[0]["labels"] == old, "the caller's mask was lost"

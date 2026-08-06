@@ -606,12 +606,10 @@ def train_on_responses_only(
         sample = next(iter(dataset), None)
         if sample is None or "input_ids" in sample:
             return dataset  # Empty, or already tokenized
-        _tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
-        # Use the actual tokenizer, not the processor
-        if hasattr(_tokenizer, "tokenizer"):
-            _tok = _tokenizer.tokenizer
-        else:
-            _tok = _tokenizer
+        # The already-unwrapped text tokenizer, and the `tokenizer =` override
+        # when the caller gave one: the response markers were tokenized with it,
+        # so encoding here with anything else yields IDs they can never match.
+        _tok = tokenizer
         max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", 2048)
         text_field = getattr(trainer.args, "dataset_text_field", "text")
         def _tokenize_fn(examples):
@@ -621,10 +619,12 @@ def train_on_responses_only(
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
         # Drop the raw columns we just tokenized. Keeping them would hand the
-        # collator a string column it cannot stack into a tensor.
+        # collator a string column it cannot stack into a tensor. `labels` is the
+        # one exception: it is already token-level, and the masking pass below
+        # intersects with it, so removing it would un-mask what the caller masked.
         _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
         if not isinstance(_raw_columns, dict):
-            _map_kwargs["remove_columns"] = list(_raw_columns)
+            _map_kwargs["remove_columns"] = [c for c in _raw_columns if c != "labels"]
         import warnings as _w
         with _w.catch_warnings():
             _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
@@ -873,11 +873,17 @@ def train_on_responses_only(
         "file_path", "filepath", "file_name", "filename", "media", "source_url",
     ))
 
+    # Every suffix a missing entry costs is a VLM row silently trained as text,
+    # so cover the modern web formats too (`.avif` is what most image CDNs serve
+    # now) and the older spellings of the ones already here.
     _MEDIA_SUFFIXES = (
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
-        ".svg", ".heic", ".heif", ".ppm", ".pgm",
+        ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
+        ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
+        ".jp2", ".j2k", ".jxl", ".ppm", ".pgm", ".pnm", ".pbm",
         ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v",
+        ".ogv", ".3gp", ".3g2", ".wmv", ".flv", ".m2ts", ".mts",
         ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
+        ".wma", ".aiff", ".aif", ".aifc", ".amr", ".mka", ".weba",
     )
 
     def _looks_like_media_value(value, _depth = 0):
@@ -928,6 +934,20 @@ def train_on_responses_only(
             return None
     pass
 
+    def _column_holds_strings(split, name):
+        """Whether the schema says this column's values are strings."""
+        features = getattr(split, "features", None)
+        if not features: return False
+        try:
+            return _feature_holds_strings(features.get(name))
+        except Exception:
+            return False
+    pass
+
+    # Ambiguous string columns that could not be read past the sample. Named in
+    # the refusal below, since dropping the column is the fix when it is text.
+    _unscannable_media_columns = set()
+
     def _ambiguous_column_holds_media(split, name, rows):
         """Whether an ambiguous column points at media, over EVERY row when the
         split can be scanned: the 16-row sample misses a `cat.jpg` on row 5, and
@@ -935,16 +955,23 @@ def train_on_responses_only(
         Reading one string column is cheap - no image is ever decoded.
         """
         batches = _string_column_batches(split, name)
-        # Streaming, or a column a custom transform owns: the bounded sample is
-        # all that can be read without consuming/rewriting the split.
         if batches is None:
-            return any(_looks_like_media_value(row.get(name)) for row in rows)
+            # Not strings, so the name alone cannot make the column media.
+            if not _column_holds_strings(split, name):
+                return any(_looks_like_media_value(row.get(name)) for row in rows)
+            # Strings this split will not hand over in full (streaming, or a
+            # column a custom transform owns). The sample cannot speak for the
+            # rows it never reads, and guessing "text" drops a media column
+            # silently, so refuse instead.
+            _unscannable_media_columns.add(name)
+            return True
         try:
             for batch in batches:
                 if any(_looks_like_media_value(v) for v in batch[name]): return True
             return False
         except Exception:
-            return any(_looks_like_media_value(row.get(name)) for row in rows)
+            _unscannable_media_columns.add(name)
+            return True
     pass
 
     def _column_is_all_strings(split, name):
@@ -1170,10 +1197,19 @@ def train_on_responses_only(
             ):
                 # Cannot configure this collator, so refuse rather than silently
                 # return with responses left unmasked.
+                _hint = ""
+                if _unscannable_media_columns:
+                    _hint = (
+                        f" Column(s) {sorted(_unscannable_media_columns)} may point at "
+                        "images/videos/audio and this split cannot be read past its first "
+                        "rows to tell, so they are assumed to be media - drop them with "
+                        "`dataset.remove_columns([...])` if they are ordinary text."
+                    )
                 raise ValueError(
                     "Unsloth: Detected a vision data collator that does not support response-only "
                     "masking. Build UnslothVisionDataCollator(..., train_on_responses_only = True, "
                     "instruction_part = ..., response_part = ...) so masking runs at collate time."
+                    + _hint
                 )
             # Fall through to the dataset-level text path below.
             _bypassed_vision_collator = True
@@ -1240,7 +1276,7 @@ def train_on_responses_only(
 
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
     # from a processor already returned above, so what is left here only pads.
-    from transformers import DataCollatorForSeq2Seq
+    from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
     packing_enabled = getattr(trainer.args, "packing", False)
     _collator = getattr(trainer, "data_collator", None)
     # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding, TRL's
@@ -1265,11 +1301,19 @@ def train_on_responses_only(
         # collator; for any other class this is a replacement, not a swap, and its
         # same-named attributes need not mean the same thing.
         _same_class = _processor_backed and isinstance(_collator, DataCollatorForSeq2Seq)
+        # DataCollatorWithPadding hands these four to `tokenizer.pad` exactly as
+        # DataCollatorForSeq2Seq does, so a repair that dropped them would turn a
+        # `padding = "max_length"` run into a dynamically padded one, silently
+        # reshaping every batch.
+        _padding_class = _processor_backed and not _same_class and \
+            isinstance(_collator, DataCollatorWithPadding)
+        _names = ("model", "padding", "max_length", "pad_to_multiple_of",
+                  "label_pad_token_id", "return_tensors") if _same_class else \
+                 ("padding", "max_length", "pad_to_multiple_of", "return_tensors")
         _kept = {
             name: getattr(_collator, name)
-            for name in ("model", "padding", "max_length", "pad_to_multiple_of",
-                         "label_pad_token_id", "return_tensors")
-            if _same_class and hasattr(_collator, name)
+            for name in _names
+            if (_same_class or _padding_class) and hasattr(_collator, name)
         }
         trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
 
