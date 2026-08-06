@@ -82,14 +82,15 @@ _PLATFORM_SPOOFED = False
 # anything collected after an MLX test module inherits it: inductor caches its
 # CPU vector ISA from platform.machine(), and "arm64" on x86_64 yields an empty
 # list, after which every torch.compile emits uncompilable `at::vec` C++.
-# Allow-list, not deny-list: a deny-list must name every library that dispatches
-# native code off the host, and the one it misses fails the same silent, far-away
-# way. Only the _IS_MLX gate needs the lie, so everyone else gets the truth.
-# `tests` is deliberately absent: under --import-mode=importlib a test module is
-# named tests.<mod>, so listing it would hand the fake host to the very tests
-# that verify the scoping, and to every other test in the namespace.
+#
+# Exact module names, not packages. Allow-listing all of `unsloth_zoo` still lied
+# to unrelated host-sensitive code in it: unsloth_zoo.llama_cpp reads the host to
+# pick a prebuilt archive, so a later llama.cpp call on Linux x86_64 would fetch
+# the macOS arm64 build. These two modules are the only places the MLX gate reads
+# the host; everything downstream of them consumes the cached boolean.
 _SPOOF_CONSUMERS = frozenset({
-    "unsloth", "unsloth_zoo", "mlx_simulation",
+    "unsloth",                  # unsloth/__init__.py::_is_mlx_available
+    "unsloth_zoo.mlx.runtime",  # is_mlx_available
 })
 
 
@@ -113,8 +114,8 @@ def _spoof_apple_silicon_platform():
         def spoofed():
             # depth 1 is the real reading module: functools.cache and other
             # C-level wrappers push no Python frame.
-            root = sys._getframe(1).f_globals.get("__name__", "").partition(".")[0]
-            return fake if root in _SPOOF_CONSUMERS else real()
+            name = sys._getframe(1).f_globals.get("__name__", "")
+            return fake if name in _SPOOF_CONSUMERS else real()
         return spoofed
 
     if not hasattr(platform, "_orig_system_for_mlx_shim"):

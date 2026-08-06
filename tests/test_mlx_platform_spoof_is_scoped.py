@@ -48,7 +48,7 @@ def test_the_toolchain_still_sees_the_real_host():
 def test_the_gate_still_sees_apple_silicon():
     _spoof_apple_silicon_platform()
 
-    # Same call from a module whose top-level package is on the allow-list.
+    # Same call from one of the two gate modules.
     namespace = {"__name__": "unsloth_zoo.mlx.runtime", "platform": platform}
     exec("machine = platform.machine()\nsystem = platform.system()", namespace)
 
@@ -82,3 +82,21 @@ def test_inductor_observes_the_real_machine(monkeypatch):
         "so the spoof reached it and every torch.compile in this process would "
         "emit uncompilable at::vec code"
     )
+
+
+def test_other_modules_in_the_same_package_still_see_the_real_host():
+    """The allow-list is exact module names, not packages.
+
+    `unsloth_zoo.llama_cpp` reads the host to pick a prebuilt llama.cpp archive,
+    so allow-listing the whole package made a later call on Linux x86_64 select
+    the macOS arm64 build. Only the two modules that implement the MLX gate need
+    the lie; everything else downstream consumes the boolean they cached.
+    """
+    _spoof_apple_silicon_platform()
+
+    for module in ("unsloth_zoo.llama_cpp", "unsloth_zoo.device_type",
+                   "unsloth.models.loader", "unsloth_zoo"):
+        namespace = {"__name__": module, "platform": platform}
+        exec("machine = platform.machine()\nsystem = platform.system()", namespace)
+        assert namespace["machine"] == platform._orig_machine_for_mlx_shim(), module
+        assert namespace["system"] == platform._orig_system_for_mlx_shim(), module
