@@ -897,7 +897,11 @@ def eager_fallback_state() -> dict[str, bool]:
     for ref in _EAGER_FALLBACK_WRAPPERS:
         w = ref()
         if w is not None:
-            out[w._unsloth_fallback_label] = bool(w._unsloth_fallback_state["eager"])
+            label = w._unsloth_fallback_label
+            # OR, not assign: two wrappers can share a label, and plain assignment
+            # lets a later False hide an earlier True, reporting compiled for a
+            # path that is already eager.
+            out[label] = out.get(label, False) or bool(w._unsloth_fallback_state["eager"])
     return out
 
 

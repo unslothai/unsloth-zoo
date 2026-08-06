@@ -443,7 +443,7 @@ pass
 
 # Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
 # raise, and only this wrapper latches to eager instead of aborting training.
-_gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward")
+_gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward (float32)")
 
 
 def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
@@ -454,7 +454,7 @@ def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
     return output_fp32.to(hidden_states_2d.dtype)
 pass
 
-_gemma3_rms_norm_generic = compile_with_eager_fallback(_gemma3_rms_norm_generic, "Gemma3RMSNorm.forward")
+_gemma3_rms_norm_generic = compile_with_eager_fallback(_gemma3_rms_norm_generic, "Gemma3RMSNorm.forward (generic)")
 
 
 def patch_Gemma3RMSNorm():

@@ -304,7 +304,7 @@ pass
 
 # Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
 # raise, and only this wrapper latches to eager instead of aborting training.
-_gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward")
+_gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward (scaled)")
 
 
 def _gemma4_rms_norm_unscaled(hidden_states_2d, eps):
@@ -314,7 +314,7 @@ def _gemma4_rms_norm_unscaled(hidden_states_2d, eps):
     return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
 pass
 
-_gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward")
+_gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward (unscaled)")
 
 
 def patch_Gemma4RMSNorm():

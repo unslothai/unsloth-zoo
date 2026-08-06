@@ -287,3 +287,34 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
     assert _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"], (
         "the cache was never actually exhausted, so this asserted nothing"
     )
+
+
+def test_each_kernel_reports_its_own_fallback_state():
+    """Two wrappers sharing a label hide each other in the public diagnostic.
+
+    `eager_fallback_state()` keys by label, so when the scaled kernel latched to
+    eager and the unscaled one had not, the later entry overwrote the earlier and
+    the dict said the active path was still compiled.
+    """
+    from unsloth_zoo.temporary_patches.utils import eager_fallback_state
+    from unsloth_zoo.temporary_patches.gemma4_float32 import (
+        _gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
+    )
+    from unsloth_zoo.temporary_patches.gemma import (
+        _gemma3_rms_norm_float32, _gemma3_rms_norm_generic,
+    )
+
+    labels = [k._unsloth_fallback_label for k in
+              (_gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
+               _gemma3_rms_norm_float32, _gemma3_rms_norm_generic)]
+    assert len(set(labels)) == len(labels), f"labels collide: {labels}"
+
+    # One latched, its neighbour not: the dict must show the latched one.
+    saved = dict(_gemma4_rms_norm_scaled._unsloth_fallback_state)
+    _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"] = True
+    try:
+        state = eager_fallback_state()
+        assert state[_gemma4_rms_norm_scaled._unsloth_fallback_label] is True
+        assert state[_gemma4_rms_norm_unscaled._unsloth_fallback_label] is False
+    finally:
+        _gemma4_rms_norm_scaled._unsloth_fallback_state.update(saved)
