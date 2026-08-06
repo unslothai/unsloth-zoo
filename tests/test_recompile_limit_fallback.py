@@ -592,3 +592,99 @@ def test_a_live_borrower_still_keeps_its_headroom():
         u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
         u._EAGER_FALLBACK_WRAPPERS.clear()
         u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+@contextlib.contextmanager
+def _isolated_budget():
+    """Run with a private registry and a fresh, restored bump allowance.
+
+    The bump state is process-global, so a test that leaves it dirty poisons
+    every later test in the same worker.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+    try:
+        yield u, config, name, before
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+@pytest.mark.parametrize("boom", [
+    RuntimeError("a real model failure, not a compiler one"),
+    _dynamo_exc.Unsupported("a real graph break, not a budget problem"),
+], ids = ["unrelated_error", "real_graph_break"])
+def test_a_retry_that_raises_hands_the_borrowed_budget_back(boom):
+    """A retry that dies must not keep the headroom it borrowed.
+
+    The retry raises the budget for the whole process and counts a bump against
+    the wrapper. If the call then fails for a reason of its own -- a bad batch
+    the caller catches and skips, or a genuine graph break -- the wrapper stays
+    non-eager with a bump outstanding, so the step boundary finds nothing
+    pending and `_restore_recompile_limits_if_idle` refuses forever. The raised
+    `torch._dynamo.config` and the spent shared allowance then outlive the run
+    for every later model and unrelated compiled function.
+    """
+    with _isolated_budget() as (u, config, name, before):
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            raise boom
+
+        def eager(x):
+            return x * 2
+
+        with _hard_failure(False):
+            w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+            with pytest.raises(type(boom)):
+                w(3)
+
+        assert calls["c"] == 2, "the retry did not run"
+        state = w._unsloth_fallback_state
+        assert state["bumps"] == 0, "the failed call kept its bump"
+        assert getattr(config, name) == before, "limit left raised for the process"
+        assert u._GLOBAL_BUMPS == 0, "bump allowance left spent for later models"
+
+
+def test_a_successful_retry_keeps_its_bump():
+    """The control for the test above.
+
+    The wrapper is genuinely compiling against the extra headroom until it goes
+    eager, so a retry that succeeded must hold on to its bump; releasing it
+    would take the budget away mid-flight.
+    """
+    with _isolated_budget() as (u, config, name, before):
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            return x * 2
+
+        def eager(x):
+            return x * 2
+
+        with _hard_failure(False):
+            w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+            assert w(3) == 6
+
+        state = w._unsloth_fallback_state
+        assert state["bumps"] == 1 and state["pending_eager"] is True
+        assert getattr(config, name) > before, "headroom taken back mid-flight"
+        assert u._GLOBAL_BUMPS == 1

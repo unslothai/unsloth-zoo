@@ -942,6 +942,21 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             st["pending_eager"] = False
         _restore_recompile_limits_if_idle()
 
+    def _release_borrowed_budget():
+        """Hand back the bump a retry took out but never got to use.
+
+        The call died for a reason of the model's own, not the compiler's, so
+        the wrapper is not compiling against that headroom. Leaving the bump
+        counted would keep this wrapper looking like a live borrower forever:
+        it is neither eager nor pending, so the step boundary never settles it,
+        `_restore_recompile_limits_if_idle` keeps declining, and the raised
+        process-global limit and the spent shared allowance outlive the run.
+        """
+        if state["bumps"] > 0:
+            state["bumps"] -= 1
+        # Declines while any other wrapper still relies on the headroom.
+        _restore_recompile_limits_if_idle()
+
     def _retry_with_more_budget(args, kwargs):
         """Finish THIS call the way it started, if we can.
 
@@ -963,10 +978,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         try:
             result = compiled_func(*args, **kwargs)
         except errors:
+            # Keep the bump: the caller latches everything that borrowed to
+            # eager next, and that hand-back is what restores the budgets.
             return _NO_RESULT
         except graph_break_errors as e:
             if _is_recompile_limit_unsupported(e) or _is_our_own_disabled_hook(e):
                 return _NO_RESULT
+            _release_borrowed_budget()
+            raise
+        except BaseException:
+            # Anything else propagates to the caller, which may well catch it
+            # and carry on (skipping a bad batch, say), so the budget has to go
+            # back rather than be stranded on a call that never completed.
+            _release_borrowed_budget()
             raise
         # Anything else is a real failure of the model, not of the compiler.
         # Falling through to eager would run the same call twice, applying any
