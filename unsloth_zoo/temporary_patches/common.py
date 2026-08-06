@@ -248,4 +248,10 @@ def _maybe_compile(**kwargs):
     """
     if UNSLOTH_COMPILE_DISABLE or UNSLOTH_COMPILE_DISABLE_PARTIAL:
         return lambda fn: fn
-    return torch.compile(**kwargs)
+    if not kwargs.get("fullgraph"):
+        return torch.compile(**kwargs)
+    # Under fullgraph Dynamo makes cache exhaustion fatal, so these regions get
+    # the same eager fallback `patch_function` applies. Imported lazily: utils
+    # imports this module.
+    from .utils import torch_compile_with_fallback
+    return torch_compile_with_fallback(**kwargs)

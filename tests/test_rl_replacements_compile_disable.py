@@ -116,7 +116,8 @@ def test_no_bare_torch_compile_decorator_remains():
 def test_the_generated_code_string_is_left_alone():
     """One `@torch.compile(...)` lives inside a string emitted as generated
     source; rewriting it would call a helper that module does not import."""
-    assert '"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\\n"' in _src()
+    assert ('"@torch_compile_with_fallback(dynamic = True, fullgraph = True, '
+            'options = torch_compile_options)\\n"') in _src()
 
 
 def _common_src():

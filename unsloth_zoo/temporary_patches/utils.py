@@ -806,6 +806,35 @@ def _in_non_reentrant_checkpoint():
     return _walk_for_checkpoint_frame()
 
 
+# Set when a compiled call ran with a non-reentrant checkpoint's pack hook on
+# top: its activations were packed COMPILED and a backward is still owed. The
+# give-up path used to ask only whether the CURRENT call is inside a region,
+# which is false once that layer's forward has returned, so latching every
+# borrower eager mid-step left the earlier layer to recompute eagerly in
+# backward -- an abort, or silently wrong gradients when the shapes line up.
+_PACKED_COMPILED_IN_CHECKPOINT = False
+
+
+def _note_packed_under_checkpoint():
+    """Cheap probe, run per compiled call: the hook accessor only, no frame walk."""
+    global _PACKED_COMPILED_IN_CHECKPOINT
+    if _PACKED_COMPILED_IN_CHECKPOINT:
+        return
+    top = _saved_tensor_hook_accessor()
+    if top is None:
+        # torch < 2.8 cannot answer. Assume a region may be open: ending a step
+        # is rare and recoverable, wrong gradients are neither.
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+        return
+    try:
+        hooks = top(True)                       # ignore_is_tracing
+    except Exception:
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+        return
+    if hooks and _is_checkpoint_pack_hook(hooks[0]):
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+
+
 def _wants_hard_recompile_failure():
     """Did the user ask Dynamo to make cache exhaustion fatal?
 
@@ -944,6 +973,12 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
         import torch._dynamo.config as _config
     except Exception:
         return False
+    # Measured here, not read from whatever the last restore happened to leave
+    # behind. That restore may have run under a `config.patch` that hid our
+    # value, where nothing is in effect and the count reads 0, while the borrow
+    # below happens outside it against the real raised limit.
+    _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
+                         for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
     if _GLOBAL_BUMPS >= _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS:
         return False
     bumped = False
@@ -964,7 +999,13 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                 # value from before the outer bump. Keying the baseline by the
                 # value we wrote answers both, because the live value at
                 # restore time says which bump is the one still standing.
-                _BUMPED_RECOMPILE_LIMITS.setdefault(name, {})[current + extra] = current
+                # A stack per value, not one entry. A scoped patch can repeat
+                # the outer baseline -- bump 8->24, patch to 8, bump to 24
+                # again -- and a single entry collapsed the two debts, so the
+                # inner restore deleted both and the patch exit resurrected 24
+                # with nothing left to hand back.
+                _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
+                    current + extra, []).append(current)
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
                 bumped = True
                 # Only the name this torch really reads; the alias follows.
@@ -997,7 +1038,9 @@ def _restore_recompile_limits():
     Called once every wrapper that borrowed headroom has gone eager, so nothing
     still needs it and the process stops carrying a raised limit around.
     """
-    global _GLOBAL_BUMPS
+    global _GLOBAL_BUMPS, _PACKED_COMPILED_IN_CHECKPOINT
+    # A new step packs its own activations; last step's are long since freed.
+    _PACKED_COMPILED_IN_CHECKPOINT = False
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1020,10 +1063,10 @@ def _restore_recompile_limits():
             # 1056->1040, and so on, so one hop would hand back the previous
             # bump rather than the value we started from. Bounded by the map,
             # and `seen` stops a cycle if a bump ever lands on an earlier one.
-            original, chain = baselines[live], {live}
+            original, chain = baselines[live][-1], [live]
             while original in baselines and original not in chain:
-                chain.add(original)
-                original = baselines[original]
+                chain.append(original)
+                original = baselines[original][-1]
             setattr(_config, name, original)
             restored += 1
         except Exception:
@@ -1033,17 +1076,43 @@ def _restore_recompile_limits():
         # 2, bump 2->18, restore -- the 24->8 debt went with it, and the patch
         # exit then resurrected 24 permanently.
         for value in chain:
-            baselines.pop(value, None)
+            stack = baselines.get(value)
+            if stack: stack.pop()
+            if not stack: baselines.pop(value, None)
         if not baselines:
             _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
             _BUMPED_RECOMPILE_LIMITS.pop(name, None)
     # Repay only the debts actually settled. Zeroing while a scoped patch still
     # hid a live bump handed the next wrapper the whole global allowance again,
-    # so repeated patches walked straight past the total cap. One bump call
-    # records one value per name, so the longest surviving map is the count.
-    _GLOBAL_BUMPS = max((len(m) for m in _BUMPED_RECOMPILE_LIMITS.values()),
-                        default = 0)
+    # so repeated patches walked straight past the total cap.
+    _GLOBAL_BUMPS = max((_live_bump_depth(_config, n)
+                         for n in _BUMPED_RECOMPILE_LIMITS), default = 0)
     return restored
+
+
+def _live_bump_depth(_config, name):
+    """How many of our bumps are IN EFFECT on this name right now.
+
+    Counting every recorded branch instead was wrong in both directions. A
+    branch a completed `config.patch` rolled back is gone -- its headroom is
+    not in the limit any more -- yet it kept consuming the process-wide
+    allowance forever, so repeated scoped patches eventually starved every
+    wrapper of budget nobody was using. And a branch hidden by a LIVE patch is
+    equally not in effect: the limit is the patched value, so borrowing against
+    it is bounded by that value, and the debt is counted again the moment the
+    patch exits and hands it back.
+
+    Walking back from the live value answers both, and it is the same chain the
+    restore follows, so the two cannot disagree.
+    """
+    live = getattr(_config, name, None)
+    baselines = _BUMPED_RECOMPILE_LIMITS.get(name, {})
+    depth, seen = 0, set()
+    while live in baselines and live not in seen:
+        seen.add(live)
+        depth += 1
+        live = baselines[live][-1]
+    return depth
 
 
 def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
@@ -1216,13 +1285,18 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         is eager by now, so the caller's retry is consistent, which is the
         contract `force_eager_fallback` offers reactively.
         """
+        # Read BEFORE latching: latching hands the borrowed budget back, and
+        # that settlement is a step boundary, which clears the marker.
+        # Not just "are we in a region now": anything this step already packed
+        # compiled owes a backward that would now recompute eagerly.
+        packed = _in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT
         _latch_all_to_eager()
         _warn(
             f"Unsloth: torch.compile ran out of recompilation cache for "
             f"{label}; running it eagerly from here. Training is "
             f"unaffected apart from speed. ({type(e).__name__})"
         )
-        if _in_non_reentrant_checkpoint():
+        if packed:
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
@@ -1234,6 +1308,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         if state["eager"]:
             return eager_func(*args, **kwargs)
         try:
+            _note_packed_under_checkpoint()
             return compiled_func(*args, **kwargs)
         except errors as e:
             if _wants_hard_recompile_failure():
@@ -1266,6 +1341,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # keep `get_compiler_config` present so the unwrap check below still sees
     # a compiled function and reaches `__wrapped__` (the eager original).
     wrapper._unsloth_compiled_func = compiled_func
+    # Anything asking "is this compiled?" looks here, torch included, and the
+    # wrapper is the object callers now hold. Forwarding it keeps that answer
+    # true instead of making the fallback look like it un-compiled the region.
+    _orig = getattr(compiled_func, "_torchdynamo_orig_callable", None)
+    if _orig is not None:
+        wrapper._torchdynamo_orig_callable = _orig
     _gcc = getattr(compiled_func, "get_compiler_config", None)
     if _gcc is not None:
         wrapper.get_compiler_config = _gcc

@@ -39,7 +39,14 @@ import torch
 
 from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
-COMPILER = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "compiler.py"
+ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
+COMPILER = ZOO / "compiler.py"
+# Every module that hands torch a fullgraph region, not just the compiler. The
+# first pass scanned compiler.py alone and passed while GRPO's own
+# `grpo_compute_loss_slow` and `accumulate_chunk` still carried bare
+# decorators, so cache exhaustion there stayed fatal.
+FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
+                   ZOO / "temporary_patches" / "common.py")
 
 
 # ---- what the compiler emits ---------------------------------------------
@@ -51,10 +58,47 @@ def test_no_emitter_writes_a_bare_fullgraph_compile():
     a single missed emitter is exactly how the cross-entropy template kept its
     bare decorator after the first four were fixed.
     """
-    src = COMPILER.read_text()
-    bare = [line.strip() for line in src.splitlines()
-            if "@torch.compile(fullgraph" in line and not line.lstrip().startswith("#")]
+    bare = []
+    for path in FULLGRAPH_SITES:
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "@torch.compile(fullgraph" in line or "@torch.compile(dynamic" in line:
+                bare.append(f"{path.name}: {stripped}")
     assert not bare, bare
+
+
+def test_the_grpo_loss_regions_are_wrapped():
+    """The two sites the first pass missed. `grpo_compute_loss_slow` is emitted
+    as source into the generated trainer, and `accumulate_chunk` is compiled at
+    call time inside UnslothEfficientGRPO's backward."""
+    from unsloth_zoo.rl_replacements import RL_REPLACEMENTS
+    slow = RL_REPLACEMENTS["grpo_compute_loss_slow"]
+    assert "@torch_compile_with_fallback(" in slow
+    assert "import torch_compile_with_fallback" in slow, \
+        "the name has to resolve inside the generated module"
+    src = (ZOO / "rl_replacements.py").read_text()
+    assert "torch_compile_with_fallback(\n            fullgraph = True," in src, \
+        "accumulate_chunk is still compiled bare"
+
+
+def test_maybe_compile_routes_fullgraph_through_the_fallback():
+    """Three more fullgraph regions go through this one helper, so wiring it
+    covers them without touching each decorator."""
+    from unsloth_zoo.temporary_patches import common
+    src = (ZOO / "temporary_patches" / "common.py").read_text()
+    body = src.split("def _maybe_compile(", 1)[1].split("\ndef ", 1)[0]
+    assert "torch_compile_with_fallback" in body
+    # Without fullgraph Dynamo already falls back by itself, so leave it alone.
+    assert 'if not kwargs.get("fullgraph"):' in body
+
+    def f(x):
+        return x
+    wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
+    assert hasattr(wrapped, "_unsloth_fallback_state")
+    plain = common._maybe_compile(dynamic = True)(f)
+    assert not hasattr(plain, "_unsloth_fallback_state")
 
 
 def test_the_generated_preamble_imports_the_helper():

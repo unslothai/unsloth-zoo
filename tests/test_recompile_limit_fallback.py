@@ -988,9 +988,15 @@ def test_a_hidden_branch_survives_restoring_a_visible_one():
         _reset_bump_state(U)
 
 
-def test_the_global_bump_count_is_not_repaid_for_unsettled_debt():
+def test_the_allowance_counts_what_is_actually_in_effect():
     """Zeroing the counter unconditionally let repeated scoped patches borrow
-    the whole process-wide allowance again while a bump was still live."""
+    the whole process-wide allowance again.
+
+    Counting every recorded branch instead was wrong the other way: a branch a
+    completed patch rolled back is not in the limit any more, so charging for
+    it starved wrappers of budget nobody was using. The count is the depth of
+    the chain under the LIVE value, which answers both.
+    """
     import torch._dynamo.config as cfg
     U = _utils()
     name = _limit_names()[0]
@@ -1001,9 +1007,59 @@ def test_the_global_bump_count_is_not_repaid_for_unsettled_debt():
         assert U._GLOBAL_BUMPS == 1
         with torch._dynamo.config.patch({name: 2}):
             U._restore_recompile_limits()             # nothing settled
-            assert U._GLOBAL_BUMPS == 1, "an unsettled bump was marked repaid"
+            # Under the patch the limit is 2: our headroom is not in effect,
+            # so borrowing here is bounded by 2 and not by our raised value.
+            assert U._GLOBAL_BUMPS == 0
+        # ...and the moment the patch hands it back it is charged again.
+        U._bump_recompile_limits(0)
+        assert U._GLOBAL_BUMPS >= 1, "a live bump stopped being counted"
+        U._restore_recompile_limits()
         U._restore_recompile_limits()
         assert U._GLOBAL_BUMPS == 0, "a settled bump must be repaid"
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_a_branch_a_completed_patch_rolled_back_stops_counting():
+    """The starvation case: a bump taken inside a patch dies with it, so its
+    entry must not keep consuming the process-wide allowance."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        with torch._dynamo.config.patch({name: 2}):
+            U._bump_recompile_limits(16)              # 2 -> 18, dies on exit
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer
+        assert U._GLOBAL_BUMPS == 0, "an unreachable branch was still charged"
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_two_bumps_landing_on_the_same_value_are_two_debts():
+    """A scoped patch can repeat the outer baseline, and one map entry per
+    value collapsed the pair: the inner restore deleted both, and the patch
+    exit then resurrected the bumped value with nothing left to restore it."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        bumped = getattr(cfg, name)
+        with torch._dynamo.config.patch({name: outer}):
+            U._bump_recompile_limits(16)              # outer -> outer+16 again
+            U._restore_recompile_limits()             # settles ONE of them
+            assert getattr(cfg, name) == outer
+        assert getattr(cfg, name) == bumped, "patch exit hands the outer one back"
+        assert U._restore_recompile_limits() == 1, "the second debt was lost"
+        assert getattr(cfg, name) == outer
     finally:
         setattr(cfg, name, outer)
         _reset_bump_state(U)
@@ -1062,3 +1118,87 @@ def test_the_reset_helper_puts_the_real_budgets_back():
     assert any(getattr(cfg, n) != before[n] for n in names), "nothing bumped"
     _reset_bump_state(U)
     assert {n: getattr(cfg, n) for n in names} == before
+
+
+def test_giving_up_ends_the_step_when_an_earlier_layer_packed_compiled():
+    """Not just "are we inside checkpoint() right now".
+
+    A checkpointed layer's forward returns long before its backward runs. If the
+    budget is exhausted after that, `_in_non_reentrant_checkpoint()` is False,
+    so the old give-up path went eager and returned -- while every borrower had
+    just been latched, including the wrapper whose activations were packed
+    COMPILED earlier in the same step. That layer then recomputes eagerly in
+    backward, which either aborts the checkpoint consistency check or hands
+    back wrong gradients when the shapes happen to line up.
+    """
+    U = _utils()
+    _reset_bump_state(U)
+    U._PACKED_COMPILED_IN_CHECKPOINT = False
+
+    def eager(x):
+        return x
+
+    class _Exhausted:
+        def __call__(self, x):
+            raise U._recompile_limit_errors()[0]("cache exhausted")
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Exhausted(), eager, "M.forward")
+    real_in = U._in_non_reentrant_checkpoint
+    real_bump = U._bump_recompile_limits
+    U._in_non_reentrant_checkpoint = lambda: False   # the layer has returned
+    U._bump_recompile_limits = lambda *a, **k: False # nothing left to borrow
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = True
+        with pytest.raises(U._recompile_limit_errors()):
+            wrapped(torch.zeros(1))
+        assert U._RAISED_INSIDE_CHECKPOINT is True, \
+            "the step has to be ended so the caller can retry it"
+    finally:
+        U._in_non_reentrant_checkpoint = real_in
+        U._bump_recompile_limits = real_bump
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        _reset_bump_state(U)
+
+
+def test_nothing_packed_this_step_still_just_goes_eager():
+    """The ordinary case must not start ending steps: no checkpoint is open and
+    none was, so eager is survivable and cheaper than a retry."""
+    U = _utils()
+    _reset_bump_state(U)
+    calls = {"e": 0}
+
+    def eager(x):
+        calls["e"] += 1
+        return x
+
+    class _Exhausted:
+        def __call__(self, x):
+            raise U._recompile_limit_errors()[0]("cache exhausted")
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Exhausted(), eager, "M.forward")
+    real_in = U._in_non_reentrant_checkpoint
+    real_bump = U._bump_recompile_limits
+    U._in_non_reentrant_checkpoint = lambda: False
+    U._bump_recompile_limits = lambda *a, **k: False
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        assert wrapped(torch.zeros(1)) is not None
+        assert calls["e"] == 1
+        assert U._RAISED_INSIDE_CHECKPOINT is False
+    finally:
+        U._in_non_reentrant_checkpoint = real_in
+        U._bump_recompile_limits = real_bump
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        _reset_bump_state(U)
+
+
+def test_the_packed_marker_is_cleared_at_the_step_boundary():
+    """Last step's activations are freed, so the flag must not stick and end
+    every later step."""
+    U = _utils()
+    _reset_bump_state(U)
+    U._PACKED_COMPILED_IN_CHECKPOINT = True
+    U._restore_recompile_limits()
+    assert U._PACKED_COMPILED_IN_CHECKPOINT is False

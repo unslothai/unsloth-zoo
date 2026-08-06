@@ -183,13 +183,16 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    saved_global = U._GLOBAL_BUMPS
-    U._GLOBAL_BUMPS = U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS      # nothing left to buy
+    # Deny the loan at its source. Pinning `_GLOBAL_BUMPS` stopped working once
+    # the allowance became a live measurement of the chain under the current
+    # limit rather than a stored count, and the retry silently succeeded.
+    real_bump = U._bump_recompile_limits
+    U._bump_recompile_limits = lambda *a, **k: False
     try:
         with pytest.raises(U._recompile_limit_errors()):
             _run_checkpointed_step(fn)
     finally:
-        U._GLOBAL_BUMPS = saved_global
+        U._bump_recompile_limits = real_bump
 
     state = fn._unsloth_fallback_state
     assert state["eager"], "the wrapper must latch so the retry is consistent"
@@ -303,15 +306,15 @@ def test_a_spent_budget_still_falls_back_outside_a_checkpoint(dynamo_limits):
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    saved_global = U._GLOBAL_BUMPS
-    U._GLOBAL_BUMPS = U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS
+    real_bump = U._bump_recompile_limits
+    U._bump_recompile_limits = lambda *a, **k: False
     try:
         torch.manual_seed(0)
         w = torch.randn(16, requires_grad = True)
         for k in range(8):                      # a fresh guard variant each time
             fn(w, torch.randn(2, 4, 16), k).sum().backward()
     finally:
-        U._GLOBAL_BUMPS = saved_global
+        U._bump_recompile_limits = real_bump
 
     assert fn._unsloth_fallback_state["eager"], "it should have run out at all"
 
