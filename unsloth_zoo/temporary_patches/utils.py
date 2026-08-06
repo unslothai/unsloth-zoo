@@ -802,6 +802,11 @@ _MAX_RECOMPILE_LIMIT_BUMPS = 4
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
+# What we last set each name to. A bump taken inside `torch._dynamo.config.patch`
+# records the context's temporary value as the original, and the context restores
+# the outer one on exit, so writing the captured value back later would overwrite
+# it. Only restore a name still holding the value we put there.
+_BUMPED_RECOMPILE_LIMITS = {}
 
 
 def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
@@ -824,6 +829,7 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                 except Exception:
                     continue
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
+                _BUMPED_RECOMPILE_LIMITS[name] = current + extra
                 bumped = True
                 # Only the name this torch really reads; the alias follows.
                 break
@@ -865,11 +871,15 @@ def _restore_recompile_limits():
     restored = 0
     for name, original in list(_ORIGINAL_RECOMPILE_LIMITS.items()):
         try:
-            setattr(_config, name, original)
+            # Someone else owns this name now, so our captured value is stale.
+            # Drop the claim rather than clobber theirs.
+            if getattr(_config, name, None) == _BUMPED_RECOMPILE_LIMITS.get(name):
+                setattr(_config, name, original)
+                restored += 1
         except Exception:
             continue
-        restored += 1
         _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
+        _BUMPED_RECOMPILE_LIMITS.pop(name, None)
     _GLOBAL_BUMPS = 0
     return restored
 

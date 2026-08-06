@@ -604,17 +604,27 @@ def _isolated_budget():
     from unsloth_zoo.temporary_patches import utils as u
     import torch._dynamo.config as config
 
-    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
-    before = getattr(config, name)
+    keys = u._LIMIT_KEYS if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS
+    name = keys[0]
+    # A bump raises the accumulated limit too, and one test leaves its bump
+    # active on purpose, so restoring only the first name leaks +16 on the
+    # second into every later test in this worker.
+    before_all = {k: getattr(config, k) for k in keys if hasattr(config, k)}
+    before = before_all[name]
     saved_global = u._GLOBAL_BUMPS
     saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_bumped = dict(u._BUMPED_RECOMPILE_LIMITS)
     saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
     u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._BUMPED_RECOMPILE_LIMITS.clear()
     u._EAGER_FALLBACK_WRAPPERS.clear()
     try:
         yield u, config, name, before
     finally:
-        setattr(config, name, before)
+        for key, value in before_all.items():
+            setattr(config, key, value)
+        u._BUMPED_RECOMPILE_LIMITS.clear()
+        u._BUMPED_RECOMPILE_LIMITS.update(saved_bumped)
         u._GLOBAL_BUMPS = saved_global
         u._ORIGINAL_RECOMPILE_LIMITS.clear()
         u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
@@ -659,6 +669,33 @@ def test_a_retry_that_raises_hands_the_borrowed_budget_back(boom):
         assert state["bumps"] == 0, "the failed call kept its bump"
         assert getattr(config, name) == before, "limit left raised for the process"
         assert u._GLOBAL_BUMPS == 0, "bump allowance left spent for later models"
+
+
+def test_the_fixture_restores_every_limit_a_bump_raised():
+    """`_bump_recompile_limits` raises the accumulated limit as well as the
+    per-code one, and `test_a_successful_retry_keeps_its_bump` deliberately
+    exits with its bump still active. Restoring one name left the other +16
+    for every later test sharing this worker."""
+    keys = [k for k in _LIMIT_KEYS if hasattr(torch._dynamo.config, k)]
+    assert len(keys) > 1, "this torch exposes only one limit; nothing to leak"
+    outer = {k: getattr(torch._dynamo.config, k) for k in keys}
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        assert all(getattr(config, k) > outer[k] for k in keys), "bump raised one only"
+    assert {k: getattr(torch._dynamo.config, k) for k in keys} == outer
+
+
+def test_a_bump_taken_inside_a_scoped_config_patch_is_not_written_back():
+    """`torch._dynamo.config.patch` restores its outer value on exit, so the
+    value captured inside it is stale by the time we settle up. Writing it back
+    would change the process-wide limit for good."""
+    with _isolated_budget() as (mod, config, name, before):
+        with torch._dynamo.config.patch({name: 2}):
+            mod._bump_recompile_limits()
+            assert mod._ORIGINAL_RECOMPILE_LIMITS[name] == 2, "captured the temporary"
+        assert getattr(config, name) == before, "dynamo restored the outer value"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "clobbered the outer value"
 
 
 def test_a_successful_retry_keeps_its_bump():
