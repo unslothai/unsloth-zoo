@@ -44,8 +44,8 @@ import tokenize
 from .utils import (
     Version,
     is_main_process,
-    is_distributed,
     current_rank,
+    torch_distributed_is_initialized,
     distributed_function,
     distributed_any,
     get_lock,
@@ -910,7 +910,7 @@ _COMPILED_CACHE_VISIBILITY_TIMEOUT = 5.0
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
     """Rank 0's write decision, plus a digest of the bytes it will import."""
     should_write = overwrite or not os.path.isfile(function_location)
-    if not is_distributed():
+    if not torch_distributed_is_initialized():
         return should_write, None
     if should_write:
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
@@ -986,7 +986,7 @@ pass
 
 def _cache_verification_error(function_location, expected_digest):
     """The agreed verification error for this cache file, or None."""
-    if not is_distributed():
+    if not torch_distributed_is_initialized():
         return None
     local_error = None
     try:

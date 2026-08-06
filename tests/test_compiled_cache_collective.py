@@ -87,7 +87,6 @@ def test_decision_is_broadcast_not_computed_locally(
         return real(n, function, *args, **kwargs)
 
     monkeypatch.setattr(compiler, "distributed_function", spy)
-    monkeypatch.setattr(compiler, "is_distributed", lambda: False)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -120,7 +119,7 @@ def test_decision_digests_disk_not_generated_source(
     Digesting write_new_source instead of the bytes on disk would make every rank
     reject a cache file rank 0 deliberately kept.
     """
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     location = tmp_path / "mod.py"
     location.write_bytes(b"older cached source")
 
@@ -134,17 +133,38 @@ def test_decision_digests_disk_not_generated_source(
     )
 
 
-def test_decision_skips_hashing_when_not_distributed(
+def test_decision_skips_hashing_without_process_group(
     tmp_path, monkeypatch, compiler,
 ):
-    """Single process: same answer as the old expression, and no extra file read."""
-    monkeypatch.setattr(compiler, "is_distributed", lambda: False)
+    """A launched process without a group keeps the old independent behavior."""
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: False)
     location = tmp_path / "mod.py"
 
     assert compiler._compiled_cache_decision(str(location), "src", False) == (True, None)
     location.write_bytes(b"cached")
     assert compiler._compiled_cache_decision(str(location), "src", False) == (False, None)
     assert compiler._compiled_cache_decision(str(location), "src", True) == (True, None)
+
+
+def test_collective_verification_skips_without_process_group(
+    tmp_path, monkeypatch, compiler,
+):
+    """Do not claim cross-rank agreement before collectives are available."""
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: False)
+    monkeypatch.setattr(
+        compiler,
+        "_verify_compiled_cache_file",
+        lambda *_args: pytest.fail("verification ran without a process group"),
+    )
+    monkeypatch.setattr(
+        compiler,
+        "distributed_any",
+        lambda *_args: pytest.fail("collective agreement ran without a process group"),
+    )
+
+    assert compiler._cache_verification_error(
+        str(tmp_path / "mod.py"), "digest",
+    ) is None
 
 
 def test_verify_accepts_matching_file(tmp_path, compiler):
@@ -199,7 +219,7 @@ def test_write_path_verifies_the_file_on_every_rank(
     single-process test cannot tell the difference.
     """
     verified = []
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "is_main_process", lambda: is_rank_zero)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
     monkeypatch.setattr(
@@ -242,7 +262,7 @@ def test_cache_verification_failure_is_coordinated(
 ):
     """Every rank enters the failure collective before any rank raises."""
     calls = []
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(
         compiler,
         "_verify_compiled_cache_file",
@@ -281,7 +301,7 @@ def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
         return (str(recovery), True) if use_tempfile else (str(cache), False)
 
     monkeypatch.setattr(compiler, "get_compile_folder", fake_get_compile_folder)
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
     # create_new_function() assigns this global, which monkeypatch cannot undo
@@ -334,7 +354,7 @@ def test_the_tempfile_fallback_writes_on_every_rank(
     cache.mkdir()
     node_local.mkdir()
 
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "is_main_process", lambda: False)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
@@ -387,7 +407,7 @@ def test_a_retained_but_divergent_file_still_fails_loudly(
 
     Falling back to a tempfile here would mask a genuinely misconfigured cache.
     """
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
@@ -540,7 +560,7 @@ def test_temp_recovery_loads_by_path_on_every_rank(
     recovery = tmp_path / "recovery"
     primary.mkdir()
     recovery.mkdir()
-    monkeypatch.setattr(compiler, "is_distributed", lambda: True)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
 
     def fake_get_compile_folder(use_tempfile=False):
