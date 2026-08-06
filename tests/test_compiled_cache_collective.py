@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
 import importlib.util
 import pathlib
 import sys
@@ -27,10 +28,29 @@ import time
 import pytest
 
 
+_COMPILER_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "unsloth_zoo"
+    / "compiler.py"
+)
+
+
 def _compiler_source() -> str:
-    spec = importlib.util.find_spec("unsloth_zoo.compiler")
-    assert spec is not None and spec.origin, "cannot locate unsloth_zoo.compiler"
-    return pathlib.Path(spec.origin).read_text(encoding="utf-8")
+    """Read compiler.py without importing the unsloth_zoo package."""
+    return _COMPILER_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def compiler():
+    """Runtime compiler module, skipped when the companion package is absent."""
+    if importlib.util.find_spec("unsloth") is None:
+        pytest.skip("requires the companion `unsloth` package")
+    try:
+        return importlib.import_module("unsloth_zoo.compiler")
+    except ImportError as error:
+        if "Please install Unsloth" in str(error):
+            pytest.skip("requires the companion `unsloth` package")
+        raise
 
 
 def test_write_guard_is_not_rank_local():
@@ -55,10 +75,10 @@ def test_write_guard_is_not_rank_local():
     )
 
 
-def test_decision_is_broadcast_not_computed_locally(tmp_path, monkeypatch):
+def test_decision_is_broadcast_not_computed_locally(
+    tmp_path, monkeypatch, compiler,
+):
     """Every rank must take the branch rank 0 chose."""
-    from unsloth_zoo import compiler
-
     calls = []
     real = compiler.distributed_function
 
@@ -82,14 +102,14 @@ def test_decision_is_broadcast_not_computed_locally(tmp_path, monkeypatch):
     )
 
 
-def test_decision_digests_disk_not_generated_source(tmp_path, monkeypatch):
+def test_decision_digests_disk_not_generated_source(
+    tmp_path, monkeypatch, compiler,
+):
     """UNSLOTH_COMPILE_OVERWRITE=0 keeps a cache file that != write_new_source.
 
     Digesting write_new_source instead of the bytes on disk would make every rank
     reject a cache file rank 0 deliberately kept.
     """
-    from unsloth_zoo import compiler
-
     monkeypatch.setattr(compiler, "is_distributed", lambda: True)
     location = tmp_path / "mod.py"
     location.write_bytes(b"older cached source")
@@ -104,10 +124,10 @@ def test_decision_digests_disk_not_generated_source(tmp_path, monkeypatch):
     )
 
 
-def test_decision_skips_hashing_when_not_distributed(tmp_path, monkeypatch):
+def test_decision_skips_hashing_when_not_distributed(
+    tmp_path, monkeypatch, compiler,
+):
     """Single process: same answer as the old expression, and no extra file read."""
-    from unsloth_zoo import compiler
-
     monkeypatch.setattr(compiler, "is_distributed", lambda: False)
     location = tmp_path / "mod.py"
 
@@ -117,19 +137,15 @@ def test_decision_skips_hashing_when_not_distributed(tmp_path, monkeypatch):
     assert compiler._compiled_cache_decision(str(location), "src", True) == (True, None)
 
 
-def test_verify_accepts_matching_file(tmp_path):
-    from unsloth_zoo import compiler
-
+def test_verify_accepts_matching_file(tmp_path, compiler):
     location = tmp_path / "mod.py"
     location.write_bytes(b"same bytes")
     digest = hashlib.sha256(b"same bytes").hexdigest()
     compiler._verify_compiled_cache_file(str(location), digest)  # must not raise
 
 
-def test_verify_rejects_divergent_file(tmp_path, monkeypatch):
+def test_verify_rejects_divergent_file(tmp_path, monkeypatch, compiler):
     """A stale-but-present file must not be silently imported."""
-    from unsloth_zoo import compiler
-
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
     location = tmp_path / "mod.py"
     location.write_bytes(b"stale bytes")
@@ -139,9 +155,7 @@ def test_verify_rejects_divergent_file(tmp_path, monkeypatch):
         compiler._verify_compiled_cache_file(str(location), rank0_digest)
 
 
-def test_verify_reports_missing_file(tmp_path, monkeypatch):
-    from unsloth_zoo import compiler
-
+def test_verify_reports_missing_file(tmp_path, monkeypatch, compiler):
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
     location = tmp_path / "never_written.py"
 
@@ -151,10 +165,8 @@ def test_verify_reports_missing_file(tmp_path, monkeypatch):
         )
 
 
-def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch):
+def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch, compiler):
     """A network filesystem may publish the file just after the barrier."""
-    from unsloth_zoo import compiler
-
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 5.0)
     location = tmp_path / "mod.py"
     digest = hashlib.sha256(b"late bytes").hexdigest()
@@ -167,7 +179,7 @@ def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("is_rank_zero", [True, False], ids=["rank0", "nonzero_rank"])
 def test_write_path_verifies_the_file_on_every_rank(
-    tmp_path, monkeypatch, is_rank_zero,
+    tmp_path, monkeypatch, is_rank_zero, compiler,
 ):
     """A rank-local stale file must be checked even when rank 0 writes.
 
@@ -176,8 +188,6 @@ def test_write_path_verifies_the_file_on_every_rank(
     the ones that can actually hold a divergent file -- unchecked, and a
     single-process test cannot tell the difference.
     """
-    from unsloth_zoo import compiler
-
     verified = []
     monkeypatch.setattr(compiler, "is_distributed", lambda: True)
     monkeypatch.setattr(compiler, "is_main_process", lambda: is_rank_zero)
@@ -218,11 +228,9 @@ def test_write_path_verifies_the_file_on_every_rank(
     ],
 )
 def test_cache_verification_failure_is_coordinated(
-    tmp_path, monkeypatch, local_error, expected_match,
+    tmp_path, monkeypatch, local_error, expected_match, compiler,
 ):
     """Every rank enters the failure collective before any rank raises."""
-    from unsloth_zoo import compiler
-
     calls = []
     monkeypatch.setattr(compiler, "is_distributed", lambda: True)
     monkeypatch.setattr(
@@ -245,7 +253,7 @@ def test_cache_verification_failure_is_coordinated(
 
 
 def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, compiler,
 ):
     """A write can be reported as successful without the bytes arriving.
 
@@ -254,8 +262,6 @@ def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
     to route into the collective tempfile fallback the same way an outright write
     failure does, rather than raise.
     """
-    from unsloth_zoo import compiler
-
     cache = tmp_path / "cache"
     recovery = tmp_path / "recovery"
     cache.mkdir()
@@ -304,15 +310,15 @@ def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
         sys.modules.pop(f"unsloth_cache_{name}", None)
 
 
-def test_the_tempfile_fallback_writes_on_every_rank(tmp_path, monkeypatch):
+def test_the_tempfile_fallback_writes_on_every_rank(
+    tmp_path, monkeypatch, compiler,
+):
     """The temp cache is per node, so a rank-0-only write never reaches it.
 
     Simulates a non-zero rank on a second node: whatever rank 0 writes lands on
     a filesystem this rank cannot see, so unless this rank writes its own copy
     the fallback produces nothing for it to import and the recovery cannot work.
     """
-    from unsloth_zoo import compiler
-
     cache = tmp_path / "cache"
     node_local = tmp_path / "node_local_tmp"
     cache.mkdir()
@@ -364,13 +370,13 @@ def test_the_tempfile_fallback_writes_on_every_rank(tmp_path, monkeypatch):
         sys.modules.pop(f"unsloth_cache_{name}", None)
 
 
-def test_a_retained_but_divergent_file_still_fails_loudly(tmp_path, monkeypatch):
+def test_a_retained_but_divergent_file_still_fails_loudly(
+    tmp_path, monkeypatch, compiler,
+):
     """The counterpart: with no write to retry, a stale copy must raise.
 
     Falling back to a tempfile here would mask a genuinely misconfigured cache.
     """
-    from unsloth_zoo import compiler
-
     monkeypatch.setattr(compiler, "is_distributed", lambda: True)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
@@ -465,18 +471,15 @@ def test_import_recovery_is_agreed_across_ranks():
     ), "distributed_any() does not guard the collective part of the import recovery."
 
 
-def test_distributed_any_without_process_group():
+def test_distributed_any_without_process_group(compiler):
     """Mirrors distributed_function's tolerance of an uninitialised group."""
-    from unsloth_zoo.utils import distributed_any
-    assert distributed_any(True) is True
-    assert distributed_any(False) is False
-    assert distributed_any("non-empty") is True
+    assert compiler.distributed_any(True) is True
+    assert compiler.distributed_any(False) is False
+    assert compiler.distributed_any("non-empty") is True
 
 
-def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch):
+def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch, compiler):
     """A read-only cache directory must reach the tempfile fallback, not raise."""
-    from unsloth_zoo import compiler
-
     cache = tmp_path / "readonly_cache"
     cache.mkdir()
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(cache))
@@ -501,14 +504,12 @@ def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch):
     )
 
 
-def test_current_rank_without_process_group(monkeypatch):
+def test_current_rank_without_process_group(monkeypatch, compiler):
     """RANK is unset outside a launcher, and get_rank() would raise."""
-    from unsloth_zoo.utils import current_rank
-
     monkeypatch.delenv("RANK", raising=False)
-    assert str(current_rank()) == "0"
+    assert str(compiler.current_rank()) == "0"
     monkeypatch.setenv("RANK", "3")
-    assert str(current_rank()) == "3"
+    assert str(compiler.current_rank()) == "3"
 
 
 def test_import_recovery_message_does_not_blame_this_rank():
@@ -521,10 +522,10 @@ def test_import_recovery_message_does_not_blame_this_rank():
     assert 'reason = import_error or "an import failure on another rank"' in src
 
 
-def test_temp_recovery_loads_by_path_on_every_rank(tmp_path, monkeypatch):
+def test_temp_recovery_loads_by_path_on_every_rank(
+    tmp_path, monkeypatch, compiler,
+):
     """A successful rank must not reuse its old sys.modules entry."""
-    from unsloth_zoo import compiler
-
     primary = tmp_path / "primary"
     recovery = tmp_path / "recovery"
     primary.mkdir()
@@ -588,10 +589,10 @@ def test_temp_recovery_loads_by_path_on_every_rank(tmp_path, monkeypatch):
         sys.modules.pop(f"unsloth_cache_{name}", None)
 
 
-def test_verify_falls_back_to_existence_when_rank0_digest_unknown(tmp_path):
+def test_verify_falls_back_to_existence_when_rank0_digest_unknown(
+    tmp_path, compiler,
+):
     """If rank 0 could not digest its copy, existence is all we can check."""
-    from unsloth_zoo import compiler
-
     location = tmp_path / "mod.py"
     location.write_bytes(b"anything")
     compiler._verify_compiled_cache_file(str(location), None)  # must not raise
