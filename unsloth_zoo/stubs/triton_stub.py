@@ -187,6 +187,9 @@ class InterpreterError(TritonError): pass
 class OutOfResources(TritonError): pass
 class PTXASError(TritonError): pass
 class AutotunerError(TritonError): pass
+# Only Intel's triton declares IntelGPUError; torch imports it under
+# `except ImportError` and then catches it, so the stub must supply a class.
+class IntelGPUError(TritonError): pass
 class CompilationError(TritonError): pass
 class CompileTimeAssertionFailure(CompilationError): pass
 class UnsupportedLanguageConstruct(CompilationError): pass
@@ -202,6 +205,9 @@ class KernelParam(_StubClass): pass
 # triton.runtime.autotuner
 class Autotuner(KernelInterface): pass
 class Heuristics(KernelInterface): pass
+
+# triton.runtime.interpreter — inductor does isinstance(self.fn, InterpretedFunction)
+class InterpretedFunction(KernelInterface): pass
 
 # triton.compiler
 class CompiledKernel(_StubClass): pass
@@ -258,7 +264,10 @@ runtime = _make_module("triton.runtime", {
     "errors": _make_module("triton.runtime.errors", {
         "TritonError": TritonError, "InterpreterError": InterpreterError,
         "OutOfResources": OutOfResources, "PTXASError": PTXASError,
-        "AutotunerError": AutotunerError,
+        "AutotunerError": AutotunerError, "IntelGPUError": IntelGPUError,
+    }),
+    "interpreter": _make_module("triton.runtime.interpreter", {
+        "InterpretedFunction": InterpretedFunction,
     }),
     "jit": _make_module("triton.runtime.jit", {
         "JITFunction": JITFunction, "JITCallable": JITCallable,
@@ -323,6 +332,7 @@ def inject_into_sys_modules():
         "triton.runtime.errors":         runtime.errors,
         "triton.runtime.jit":            runtime.jit,
         "triton.runtime.autotuner":      runtime.autotuner,
+        "triton.runtime.interpreter":    runtime.interpreter,
         "triton.compiler":               compiler,
         "triton.compiler.compiler":      compiler.compiler,
         "triton.compiler.errors":        compiler.errors,

@@ -66,7 +66,8 @@ _TRITON_CLASSES = {
     "triton.runtime.autotuner": ["Autotuner", "Heuristics", "Config",
                                  "OutOfResources", "PTXASError"],
     "triton.runtime.errors": ["TritonError", "InterpreterError", "OutOfResources",
-                              "PTXASError", "AutotunerError"],
+                              "PTXASError", "AutotunerError", "IntelGPUError"],
+    "triton.runtime.interpreter": ["InterpretedFunction"],
     "triton.errors": ["TritonError"],
     "triton.compiler": ["CompiledKernel", "ASTSource", "IRSource", "LazyDict",
                         "CompilationError"],
@@ -81,7 +82,8 @@ _TRITON_CLASSES = {
 
 # Exceptions must be catchable: `except <non-class>` raises TypeError too.
 _TRITON_EXCEPTIONS = ["TritonError", "InterpreterError", "OutOfResources",
-                      "PTXASError", "AutotunerError", "CompilationError"]
+                      "PTXASError", "AutotunerError", "CompilationError",
+                      "IntelGPUError"]
 
 
 @pytest.mark.parametrize("module_path,names", sorted(_TRITON_CLASSES.items()))
@@ -133,6 +135,46 @@ _SUBPROCESS = textwrap.dedent(
     print("OK")
     """
 )
+
+
+# inductor's two other class-sensitive uses, verbatim from torch main:
+# triton_compat.py imports IntelGPUError under `except ImportError` and
+# triton_heuristics.py catches it; _interpret_args_grid isinstance()s
+# InterpretedFunction. Both names come from modules the finder auto-creates.
+_INDUCTOR_SUBPROCESS = textwrap.dedent(
+    """
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("triton_stub", {stub!r})
+    stub = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = stub
+    spec.loader.exec_module(stub)
+    stub.inject_into_sys_modules()
+
+    try:
+        from triton.runtime.errors import IntelGPUError
+    except ImportError:
+        class IntelGPUError(Exception): pass
+    from triton.runtime.errors import OutOfResources, PTXASError
+    try:
+        raise RuntimeError("compile failed")
+    except (OutOfResources, PTXASError, IntelGPUError):
+        raise AssertionError("stub error classes must not swallow RuntimeError")
+    except RuntimeError:
+        pass
+
+    from triton.runtime.interpreter import InterpretedFunction
+    assert isinstance(object(), InterpretedFunction) is False
+    print("OK")
+    """
+)
+
+
+def test_inductor_error_and_interpreter_symbols():
+    code = _INDUCTOR_SUBPROCESS.format(stub=str(STUB_PATH))
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, cwd=str(REPO_ROOT))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "OK" in proc.stdout
 
 
 def _torch_flop_counter_imports_jitfunction() -> bool:
