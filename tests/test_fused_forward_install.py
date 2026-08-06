@@ -23,8 +23,7 @@ import pytest
 
 
 def get_device_type():
-    # Broad except: a torch that fails on missing driver libs must degrade to a
-    # skip, not error out the whole module during collection.
+    # Broad except: a torch broken by missing driver libs must skip, not fail collection.
     try:
         import torch as _torch
     except Exception:

@@ -299,8 +299,7 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    # Typed device, not a bare index: torch resolves an int against the compiled-in
-    # accelerator, so it would not carry the branch taken here.
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
     if torch.cuda.is_available():
         device = torch.device("cuda", torch.cuda.current_device())
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
