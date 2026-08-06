@@ -507,3 +507,88 @@ def test_exhausting_the_budget_takes_the_other_borrowers_with_it():
     # The bystander never bumped, so it stays compiled.
     assert bystander._unsloth_fallback_state["eager"] is False
     u._GLOBAL_BUMPS = saved_global
+
+
+def _dead_ref():
+    """A weakref whose referent is already gone, as the registry holds them."""
+    import weakref
+    def _gone(): pass
+    ref = weakref.ref(_gone)
+    del _gone
+    import gc; gc.collect()
+    return ref
+
+
+def test_a_collected_borrower_does_not_strand_the_raised_limit():
+    """The no-pending path must still settle debt.
+
+    A wrapper can bump the budget, mark itself pending, and then be dropped
+    before the next step boundary: training aborts, or the patched object is
+    re-patched or replaced, and the registry holds it only weakly. The boundary
+    hook then sees nothing pending and used to return early, leaving
+    `torch._dynamo.config` raised for the life of the process and the shared
+    bump allowance spent for every later model.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+    try:
+        assert u._bump_recompile_limits()
+        assert getattr(config, name) > before
+        # The borrower is gone: every registered ref is dead, as it would be
+        # after the wrapper was collected.
+        u._EAGER_FALLBACK_WRAPPERS.append(_dead_ref())
+
+        u.apply_pending_eager_fallbacks()
+
+        assert getattr(config, name) == before, "limit left raised for the process"
+        assert u._GLOBAL_BUMPS == 0, "bump allowance left spent for later models"
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+
+
+def test_a_live_borrower_still_keeps_its_headroom():
+    """The control for the test above: do not hand the budget back underneath a
+    wrapper that borrowed it and is still compiling against it."""
+    from unsloth_zoo.temporary_patches import utils as u
+    import torch._dynamo.config as config
+
+    name = u._LIMIT_KEYS[0] if hasattr(u, "_LIMIT_KEYS") else _LIMIT_KEYS[0]
+    before = getattr(config, name)
+    saved_global = u._GLOBAL_BUMPS
+    saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
+    saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
+    u._EAGER_FALLBACK_WRAPPERS.clear()
+
+    def _borrower(): pass
+    _borrower._unsloth_fallback_state = {"eager": False, "pending_eager": False, "bumps": 1}
+    _borrower._unsloth_fallback_label = "borrower"
+    try:
+        assert u._bump_recompile_limits()
+        raised = getattr(config, name)
+        import weakref
+        u._EAGER_FALLBACK_WRAPPERS.append(weakref.ref(_borrower))
+
+        u.apply_pending_eager_fallbacks()
+
+        assert getattr(config, name) == raised, "took the headroom back mid-flight"
+    finally:
+        setattr(config, name, before)
+        u._GLOBAL_BUMPS = saved_global
+        u._ORIGINAL_RECOMPILE_LIMITS.clear()
+        u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        u._EAGER_FALLBACK_WRAPPERS.clear()
+        u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)

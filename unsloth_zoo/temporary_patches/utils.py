@@ -1073,6 +1073,11 @@ def apply_pending_eager_fallbacks() -> int:
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
     if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
+        # Nothing to flip, but a borrower that bumped and was then collected
+        # (training aborted, or the patched object was replaced) would otherwise
+        # leave the process-wide limit raised and its allowance spent forever.
+        # The helper declines while any live wrapper still needs the headroom.
+        _restore_recompile_limits_if_idle()
         return 0
     flipped = 0
     for w in live:
