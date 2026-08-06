@@ -402,3 +402,34 @@ def test_a_torch_without_the_flag_still_falls_back():
     finally:
         for n, v in saved.items():
             setattr(config, n, v)
+
+
+def test_an_unrelated_error_from_the_retry_is_not_swallowed():
+    """The retry must only absorb compiler failures.
+
+    On cache exhaustion the wrapper retries the compiled function once with a
+    raised budget. If that retry fails for a real reason -- a data-dependent op,
+    a shape error, anything of the model's own -- falling through to eager runs
+    the same call a second time, re-applying any mutation it already made, and
+    buries the error. Only a recompile-limit failure may reach eager.
+    """
+    calls = {"c": 0, "e": 0}
+    boom = RuntimeError("a real model failure, not a compiler one")
+
+    def compiled(x):
+        calls["c"] += 1
+        if calls["c"] == 1:
+            raise _LIMIT_ERROR("recompile_limit reached")
+        raise boom
+
+    def eager(x):
+        calls["e"] += 1
+        return x * 2
+
+    with _hard_failure(False):
+        w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+        with pytest.raises(RuntimeError, match = "a real model failure"):
+            w(3)
+
+    # Two compiled attempts, and eager never ran: the caller sees its own error.
+    assert calls == {"c": 2, "e": 0}

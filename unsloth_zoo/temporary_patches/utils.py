@@ -876,10 +876,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         state["bumps"] += 1
         try:
             result = compiled_func(*args, **kwargs)
-        except Exception:
-            # Not BaseException: a Ctrl-C here must reach the user, not be
-            # spent silently re-running the call eagerly.
+        except errors:
             return _NO_RESULT
+        except graph_break_errors as e:
+            if _is_recompile_limit_unsupported(e) or _is_our_own_disabled_hook(e):
+                return _NO_RESULT
+            raise
+        # Anything else is a real failure of the model, not of the compiler.
+        # Falling through to eager would run the same call twice, applying any
+        # mutation it already made a second time, and would bury the error.
         state["pending_eager"] = True
         _warn(
             f"Unsloth: torch.compile ran out of recompilation cache for "
