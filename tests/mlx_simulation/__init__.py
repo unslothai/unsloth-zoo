@@ -85,8 +85,11 @@ _PLATFORM_SPOOFED = False
 # Allow-list, not deny-list: a deny-list must name every library that dispatches
 # native code off the host, and the one it misses fails the same silent, far-away
 # way. Only the _IS_MLX gate needs the lie, so everyone else gets the truth.
+# `tests` is deliberately absent: under --import-mode=importlib a test module is
+# named tests.<mod>, so listing it would hand the fake host to the very tests
+# that verify the scoping, and to every other test in the namespace.
 _SPOOF_CONSUMERS = frozenset({
-    "unsloth", "unsloth_zoo", "tests", "mlx_simulation",
+    "unsloth", "unsloth_zoo", "mlx_simulation",
 })
 
 

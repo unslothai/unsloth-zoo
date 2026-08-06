@@ -14,7 +14,10 @@ only when run after an MLX module.
 
 import platform
 
-from tests.mlx_simulation import _spoof_apple_silicon_platform
+# `mlx_simulation`, not `tests.mlx_simulation`: conftest puts tests/ on sys.path
+# for exactly this, the rest of the MLX suite imports it that way, and an
+# installed package named `tests` would otherwise win over this directory.
+from mlx_simulation import _spoof_apple_silicon_platform
 
 
 def test_the_toolchain_still_sees_the_real_host():
@@ -39,16 +42,29 @@ def test_the_gate_still_sees_apple_silicon():
     assert namespace["system"] == "Darwin"
 
 
-def test_inductor_can_still_choose_a_vector_isa():
+def test_inductor_observes_the_real_machine(monkeypatch):
     # The concrete consequence, asserted without paying for a compile.
-    import torch
-
-    _spoof_apple_silicon_platform()
+    import torch                                          # noqa: F401  (loads _inductor)
     from torch._inductor import cpu_vec_isa
 
+    _spoof_apple_silicon_platform()
+
+    # Read platform the way cpu_vec_isa does, from its own module namespace.
+    namespace = {"__name__": cpu_vec_isa.__name__, "platform": platform}
+    exec("machine = platform.machine()", namespace)
+    assert namespace["machine"] == platform._orig_machine_for_mlx_shim()
+
+    # And the ISA list it derives from that. Compared against the same call with
+    # the real value forced, not against non-emptiness: a host that supports none
+    # of this build's ISAs legitimately yields an empty list, and asserting
+    # non-emptiness would fail there for a reason unrelated to the spoof.
     cpu_vec_isa.valid_vec_isa_list.cache_clear()
-    if platform._orig_machine_for_mlx_shim() in ("x86_64", "AMD64"):
-        assert cpu_vec_isa.valid_vec_isa_list(), (
-            "inductor found no vector ISA, so the spoof reached it and every "
-            "torch.compile in this process would emit uncompilable at::vec code"
-        )
+    observed = cpu_vec_isa.valid_vec_isa_list()
+    monkeypatch.setattr(platform, "machine", platform._orig_machine_for_mlx_shim)
+    cpu_vec_isa.valid_vec_isa_list.cache_clear()
+    expected = cpu_vec_isa.valid_vec_isa_list()
+    assert observed == expected, (
+        "inductor derived a different vector ISA list than the real host gives, "
+        "so the spoof reached it and every torch.compile in this process would "
+        "emit uncompilable at::vec code"
+    )
