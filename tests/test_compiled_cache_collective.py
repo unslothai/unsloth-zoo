@@ -164,6 +164,90 @@ def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch):
     assert time.monotonic() - started >= 0.4, "did not actually wait for the file"
 
 
+def _create_new_function_ast() -> ast.FunctionDef:
+    tree = ast.parse(_compiler_source())
+    return next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "create_new_function"
+    )
+
+
+def test_write_file_is_never_run_bare_inside_the_collective():
+    """get_lock() raises outside write_file()'s own guard.
+
+    distributed_function() runs the function on rank 0 before broadcasting, so a
+    raise there abandons the broadcast the other ranks are already inside and the
+    group mis-pairs its next collective (gloo aborts on the payload size).
+    """
+    func = _create_new_function_ast()
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "distributed_function":
+            continue
+        if len(node.args) < 2:
+            continue
+        assert getattr(node.args[1], "id", None) != "write_file", (
+            "distributed_function() runs write_file() directly; a get_lock() failure "
+            "on a read-only cache directory then leaves rank 0 outside the broadcast."
+        )
+
+
+def test_import_recovery_is_agreed_across_ranks():
+    """An import can fail on one rank only, but its recovery is collective."""
+    func = _create_new_function_ast()
+    guards = [
+        node for node in ast.walk(func)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and getattr(node.test.func, "id", None) == "distributed_any"
+    ]
+    assert guards, (
+        "the tempfile import recovery is entered on a rank-local exception; a rank "
+        "taking it alone calls get_compile_folder() and distributed_function(), "
+        "which the other ranks never reach."
+    )
+    assert any(
+        "get_compile_folder" in ast.dump(guard) for guard in guards
+    ), "distributed_any() does not guard the collective part of the import recovery."
+
+
+def test_distributed_any_without_process_group():
+    """Mirrors distributed_function's tolerance of an uninitialised group."""
+    from unsloth_zoo.utils import distributed_any
+    assert distributed_any(True) is True
+    assert distributed_any(False) is False
+    assert distributed_any("non-empty") is True
+
+
+def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch):
+    """A read-only cache directory must reach the tempfile fallback, not raise."""
+    from unsloth_zoo import compiler
+
+    cache = tmp_path / "readonly_cache"
+    cache.mkdir()
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(cache))
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+
+    real_get_lock = compiler.get_lock
+
+    def fake_get_lock(target, *args, **kwargs):
+        if str(target).startswith(str(cache)):
+            raise OSError("simulated read-only cache directory")
+        return real_get_lock(target, *args, **kwargs)
+
+    monkeypatch.setattr(compiler, "get_lock", fake_get_lock)
+
+    module = compiler.create_new_function(
+        "pr967_readonly", "def pr967_readonly_fn(x):\n    return x * 3\n", "pr967", {},
+        overwrite=True,
+    )
+    assert module.pr967_readonly_fn(14) == 42
+    assert not (cache / "pr967_readonly.py").exists(), (
+        "the write was expected to fail against the read-only directory"
+    )
+
+
 def test_verify_falls_back_to_existence_when_rank0_digest_unknown(tmp_path):
     """If rank 0 could not digest its copy, existence is all we can check."""
     from unsloth_zoo import compiler

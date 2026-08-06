@@ -46,6 +46,7 @@ from .utils import (
     is_main_process,
     is_distributed,
     distributed_function,
+    distributed_any,
     get_lock,
 )
 from .log import logger
@@ -902,39 +903,31 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
     lines.insert(insert_at, alias_text)
     return "".join(lines)
 
-# How long a rank waits for rank 0's compiled cache file to become visible before
-# giving up. Network filesystems can lag behind the barrier by a little.
+# Grace period for a network filesystem to publish rank 0's cache file.
 _COMPILED_CACHE_VISIBILITY_TIMEOUT = 5.0
 
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
-    """Rank 0 decides whether the compiled cache file needs writing.
-
-    Returns (should_write, digest) where digest is of the bytes rank 0 ends up
-    importing, so the other ranks can confirm they import the same module.
-    """
+    """Rank 0's write decision, plus a digest of the bytes it will import."""
     should_write = overwrite or not os.path.isfile(function_location)
     if not is_distributed():
-        # Nothing to cross-check against, so skip hashing entirely.
         return should_write, None
     if should_write:
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
-    # Digest what is actually on disk rather than write_new_source: with
-    # UNSLOTH_COMPILE_OVERWRITE=0 rank 0 deliberately keeps an older cache file
-    # that does not equal write_new_source.
+    # Digest the file, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an
+    # older cache file on purpose.
     try:
         with open(function_location, "rb") as f:
             return False, hashlib.sha256(f.read()).hexdigest()
     except Exception:
-        # Cannot read it; fall back to an existence check on the other ranks.
+        # Unreadable on rank 0, so the others can only check existence.
         return False, None
 pass
 
 def _verify_compiled_cache_file(function_location, expected_digest):
-    """Confirm this rank sees the same cache file rank 0 skipped rewriting.
+    """Fail loudly if this rank would import different bytes than rank 0.
 
-    Rank 0 evaluated the write condition for everyone, so a rank whose local view
-    disagrees would otherwise silently import a different module. Retries briefly
-    to absorb network filesystem propagation lag.
+    Retries first, since a network filesystem can publish the file just after
+    the barrier.
     """
     rank = os.environ.get("RANK", "0")
     deadline = time.monotonic() + _COMPILED_CACHE_VISIBILITY_TIMEOUT
@@ -1204,27 +1197,42 @@ def create_new_function(
 
     pass
 
-    # distributed_function() is collective, so every rank has to reach it. Deciding
-    # locally lets a rank that arrives after rank 0 has written the file skip the
-    # collective, which desynchronises the group and hangs it. Rank 0 decides and
-    # broadcasts instead.
+    def write_file_outcome(function_location, write_new_source):
+        """write_file(), reporting failure rather than raising.
+
+        Only rank 0 runs this, and a raise would abandon the broadcast the other
+        ranks are waiting in. write_file() guards its writes; get_lock() does not.
+        """
+        try:
+            write_file(function_location, write_new_source)
+            return True, ""
+        except Exception as error:
+            return False, f"{type(error).__name__}: {error}"
+
+    pass
+
+    # A rank arriving after rank 0 has written the file would skip this collective
+    # and desynchronise the group, so rank 0 decides and broadcasts.
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
     if should_write_cache_file:
-        try:
-            distributed_function(1, write_file, function_location, write_new_source)
-        except Exception as error:
+        wrote, write_error = distributed_function(
+            2, write_file_outcome, function_location, write_new_source,
+        )
+        if not wrote:
             if UNSLOTH_COMPILE_USE_TEMP:
-                raise RuntimeError(error)
-            else:
-                # Failed so instead use a temporary directory
-                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
-                    use_tempfile=True
-                )
-                function_location = os.path.join(compile_folder, f"{name}.py")
-                distributed_function(1, write_file, function_location, write_new_source)
-            pass
+                raise RuntimeError(write_error)
+            # Failed so instead use a temporary directory
+            compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
+                use_tempfile=True
+            )
+            function_location = os.path.join(compile_folder, f"{name}.py")
+            wrote, write_error = distributed_function(
+                2, write_file_outcome, function_location, write_new_source,
+            )
+            if not wrote:
+                raise RuntimeError(write_error)
         pass
     elif is_distributed():
         _verify_compiled_cache_file(function_location, cache_file_digest)
@@ -1259,44 +1267,54 @@ def create_new_function(
     pass
 
     try:
-        new_module, old_path = import_module(compile_folder, name)
-    except Exception as e:
-        new_module = None
-        # Try using temp directory instead!
-        if not UNSLOTH_COMPILE_USE_TEMP:
-            compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
-                use_tempfile=True
-            )
-            function_location = os.path.join(compile_folder, f"{name}.py")
-            distributed_function(1, write_file, function_location, write_new_source)
-            if is_main_process():
-                logger.info(
-                    f"Standard import failed for {name}: {e}. Using tempfile instead!"
+        import_error = None
+        try:
+            new_module, old_path = import_module(compile_folder, name)
+        except Exception as e:
+            new_module = None
+            import_error = e
+
+        # An import can fail on one rank only, but the recovery below is
+        # collective, so any failure moves every rank onto it.
+        if distributed_any(import_error is not None):
+            # Try using temp directory instead!
+            if not UNSLOTH_COMPILE_USE_TEMP:
+                compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
+                    use_tempfile=True
                 )
-            try:
-                new_module, old_path = import_module(compile_folder, name)
-            except Exception as e:
-                new_module = None
+                function_location = os.path.join(compile_folder, f"{name}.py")
+                distributed_function(
+                    2, write_file_outcome, function_location, write_new_source,
+                )
                 if is_main_process():
                     logger.info(
-                        f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!"
+                        f"Standard import failed for {name}: {import_error}. Using tempfile instead!"
                     )
-        pass
-        # Fallback to direct module loading
-        if new_module is None:
-            try:
-                module_name = f"unsloth_cache_{name}"
-                file_location = os.path.join(compile_folder, name) + ".py"
-                lock = get_lock(file_location)
-                with lock:
-                    spec = importlib.util.spec_from_file_location(
-                        module_name, file_location
-                    )
-                    new_module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = new_module
-                    spec.loader.exec_module(new_module)
-            except Exception as e:
-                raise RuntimeError(f"Direct module loading failed for {name}: {e}")
+                try:
+                    new_module, old_path = import_module(compile_folder, name)
+                except Exception as e:
+                    new_module = None
+                    if is_main_process():
+                        logger.info(
+                            f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!"
+                        )
+            pass
+            # Fallback to direct module loading
+            if new_module is None:
+                try:
+                    module_name = f"unsloth_cache_{name}"
+                    file_location = os.path.join(compile_folder, name) + ".py"
+                    lock = get_lock(file_location)
+                    with lock:
+                        spec = importlib.util.spec_from_file_location(
+                            module_name, file_location
+                        )
+                        new_module = importlib.util.module_from_spec(spec)
+                        sys.modules[module_name] = new_module
+                        spec.loader.exec_module(new_module)
+                except Exception as e:
+                    raise RuntimeError(f"Direct module loading failed for {name}: {e}")
+            pass
         pass
     finally:
         # Restore original sys.path if we modified it
