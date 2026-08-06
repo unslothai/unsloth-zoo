@@ -422,15 +422,14 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
-# Module-level floats so `torch.finfo` stays out of the graph.
+# Module-level so `torch.finfo` stays out of the graph.
 _GEMMA3_FP16_MAX = float(torch.finfo(torch.float16).max)
 _GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
 
 
-# Every Gemma3 RMSNorm instance shares this one kernel, so its Dynamo cache holds
-# the product of every axis its guards see. A plain Tensor weight view keeps the
-# norm width dynamic and a rank 2 input collapses the rank axis, leaving only
-# dtype, grad mode and requires_grad.
+# Every Gemma3 RMSNorm shares this one kernel, so its Dynamo cache holds the product
+# of every axis its guards see. A plain Tensor weight view keeps the width dynamic
+# and a rank 2 input drops the rank axis, leaving dtype, grad mode and requires_grad.
 def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -438,11 +437,11 @@ def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     # weight may be bf16; cast for the (1.0 + weight) op.
     output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
     clamped_output_fp32 = torch.clamp(output_fp32, min = _GEMMA3_FP16_MIN, max = _GEMMA3_FP16_MAX)
-    return clamped_output_fp32.to(torch.float16) # Output fp16
+    return clamped_output_fp32.to(torch.float16)
 pass
 
-# Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
-# raise, and only this wrapper latches to eager instead of aborting training.
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
+# this wrapper latches to eager instead of aborting the run.
 _gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward (float32)")
 
 
@@ -477,8 +476,8 @@ def patch_Gemma3RMSNorm():
         out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
         return out.reshape(shape)
     pass
-    # Not `fullgraph = True`: the kernel is the compiled unit, and compiling this
-    # wrapper too would put `self` back into the guards.
+    # No `fullgraph`: the kernel is the compiled unit; compiling this wrapper too
+    # would put `self` back into the guards.
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)

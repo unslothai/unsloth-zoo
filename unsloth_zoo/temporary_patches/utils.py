@@ -780,17 +780,16 @@ def _is_our_own_disabled_hook(exc):
 
 
 def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
-    """`torch_compile` the function, keeping the eager fallback `patch_function` gives.
+    """`torch_compile` a standalone kernel, keeping `patch_function`'s eager fallback.
 
-    A bare `@torch_compile(fullgraph = True)` on a module-level kernel skips
-    `_fall_back_to_eager_on_recompile_limit`, which only `patch_function` applies,
-    so cache exhaustion aborts training instead of latching to eager. Use this for
-    any standalone kernel compiled with `fullgraph = True`.
+    A bare `@torch_compile(fullgraph = True)` skips
+    `_fall_back_to_eager_on_recompile_limit` (only `patch_function` applies it), so
+    cache exhaustion aborts training instead of latching to eager.
     """
     from .common import torch_compile
     compiled = torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
+    # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
-        # Without fullgraph Dynamo already falls back by itself.
         return compiled
     return _fall_back_to_eager_on_recompile_limit(compiled, func, label)
 
@@ -898,9 +897,8 @@ def eager_fallback_state() -> dict[str, bool]:
         w = ref()
         if w is not None:
             label = w._unsloth_fallback_label
-            # OR, not assign: two wrappers can share a label, and plain assignment
-            # lets a later False hide an earlier True, reporting compiled for a
-            # path that is already eager.
+            # OR, not assign: labels can collide, and a later False would hide an
+            # earlier True, reporting compiled for an already-eager path.
             out[label] = out.get(label, False) or bool(w._unsloth_fallback_state["eager"])
     return out
 

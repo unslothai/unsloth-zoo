@@ -106,13 +106,13 @@ TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
 
 # Clamp bound so a large residual never becomes inf on the cast back. Module-level
-# float keeps `torch.finfo` out of the traced graph.
+# keeps `torch.finfo` out of the graph.
 _QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# Every Qwen3-MoE RMSNorm instance shares this one kernel, so its Dynamo cache holds
-# the product of every axis its guards see. A plain Tensor weight view and a rank 2
-# input drop the norm-width and rank axes, leaving dtype, grad mode and requires_grad.
+# Every Qwen3-MoE RMSNorm shares this one kernel, so its Dynamo cache holds the product
+# of every axis its guards see. A plain Tensor weight view and a rank 2 input drop the
+# width and rank axes, leaving dtype, grad mode and requires_grad.
 def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -121,8 +121,8 @@ def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     return torch.clamp(normed_fp32, min = -_QWEN3_MOE_FP16_MAX, max = _QWEN3_MOE_FP16_MAX).to(torch.float16)
 pass
 
-# Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
-# raise, and only this wrapper latches to eager instead of aborting training.
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
+# this wrapper latches to eager instead of aborting the run.
 _qwen3_moe_rms_norm = compile_with_eager_fallback(_qwen3_moe_rms_norm, "Qwen3MoeRMSNorm.forward")
 
 
@@ -143,8 +143,7 @@ def patch_Qwen3MoeRMSNorm_float32():
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Qwen3 scales by `weight` directly (no 1.0 + weight) with variance_epsilon.
-        # `self` stays in eager so the kernel's guards never see the norm width,
-        # the input rank or any Python attribute.
+        # `self` stays in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
         normed = _qwen3_moe_rms_norm(
             hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon,

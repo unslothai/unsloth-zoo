@@ -192,11 +192,10 @@ else:
     )
 
 def flatten_for_elementwise_norm(hidden_states):
-    """``(..., H)`` -> ``((N, H), original_shape)`` for a compiled norm kernel.
+    """``(..., H)`` -> ``((N, H), original_shape)``.
 
-    Norms only touch the last dim, so making every caller rank 2 drops the rank
-    and leading-dim guards from the shared kernel's Dynamo cache (Gemma calls the
-    same norm with ``(B, S, H)`` residuals and ``(B, heads, S, D)`` q/k norms).
+    Norms only touch the last dim, so making every caller rank 2 drops the rank and
+    leading-dim guards from the shared kernel's Dynamo cache.
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
@@ -206,11 +205,9 @@ pass
 def unwrap_norm_weight(weight):
     """Hand a norm weight to a compiled kernel as a plain Tensor view.
 
-    Dynamo pins a static shape for anything whose ``type`` is ``nn.Parameter``,
-    even under ``dynamic = True``, so reading ``self.weight`` inside a compiled
-    norm makes every distinct norm width another cache entry. A view is a plain
-    Tensor, so it gets dynamic shapes while autograd still reaches the Parameter,
-    without relaxing parameter shapes globally.
+    Dynamo pins a static shape for anything whose ``type`` is ``nn.Parameter`` even
+    under ``dynamic = True``, so every distinct norm width would be another cache
+    entry. A view takes dynamic shapes, and autograd still reaches the Parameter.
     """
     if weight is None: return None
     return weight.reshape(-1)
@@ -221,17 +218,16 @@ def publish_to_modeling_module(modeling_module, **names):
 
     ``create_standalone_class`` copies the patched forward's source into
     ``unsloth_compiled_cache`` and resolves its free names against the modeling
-    module, so helpers living in unsloth_zoo must be published here or the
-    generated module raises NameError on import.
+    module, so unsloth_zoo helpers must be published here or the generated module
+    raises NameError on import.
     """
     for name, value in names.items():
         try:
             setattr(modeling_module, name, value)
         except Exception as e:
             # Log, never swallow: silence reappears as an unexplained NameError from
-            # generated cache code. `warning`, not `warning_once`: the latter is
-            # monkeypatched on by transformers and may not exist yet, and an
-            # AttributeError here would hide the original failure.
+            # generated cache code. `warning`, not `warning_once`, which transformers
+            # monkeypatches on later and may not exist yet.
             logger.warning(
                 f"Unsloth: could not publish `{name}` to "
                 f"{getattr(modeling_module, '__name__', modeling_module)}: {e}"
