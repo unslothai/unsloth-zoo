@@ -1137,9 +1137,11 @@ def create_new_function(
     # locally lets a rank that arrives after rank 0 has written the file skip the
     # collective, which desynchronises the group and hangs it. Rank 0 decides and
     # broadcasts instead.
-    if distributed_function(
-        1, lambda: overwrite or not os.path.isfile(function_location)
-    ):
+    def _should_write_cache_file():
+        return overwrite or not os.path.isfile(function_location)
+
+    should_write_cache_file = distributed_function(1, _should_write_cache_file)
+    if should_write_cache_file:
         try:
             distributed_function(1, write_file, function_location, write_new_source)
         except Exception as error:
@@ -1154,6 +1156,12 @@ def create_new_function(
                 distributed_function(1, write_file, function_location, write_new_source)
             pass
         pass
+    elif not os.path.isfile(function_location):
+        raise FileNotFoundError(
+            f"Unsloth: Compiled cache file {function_location} exists on rank 0 "
+            "but is not visible on this rank. Ensure the compiled cache is on a "
+            "shared filesystem with consistent metadata."
+        )
     pass
 
     # Now import modules! Use a tempfile if it fails on the first try!
