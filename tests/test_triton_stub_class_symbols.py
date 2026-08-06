@@ -16,23 +16,13 @@
 
 """Class-valued symbols of the Apple Silicon triton stub.
 
-The stub's MetaPathFinder auto-creates any unseeded ``triton.*`` submodule and
-serves unknown attributes as ``_Noop`` instances. An instance is not a type, so
-``isinstance(x, Noop)`` / ``issubclass`` / ``except Noop:`` all raise
-``TypeError: isinstance() arg 2 must be a type``.
-
-torch >= 2.10 does exactly this at import time of ``torch.utils.flop_counter``::
-
-    try:
-        from triton.runtime.jit import JITFunction as _JITFunction
-    except ImportError:
-        _JITFunction = NoneType
-    ...
-    isinstance(target, (torch._ops.OpOverloadPacket, _JITFunction, HigherOrderOperator))
-
-With triton genuinely absent the import fails and torch takes the NoneType
-branch. The stub makes the import succeed, so every name real triton exposes as
-a class has to be seeded as a real class.
+Unseeded ``triton.*`` attributes come back as ``_Noop`` instances, and an
+instance is not a type, so ``isinstance`` / ``issubclass`` / ``except`` on one
+raises ``TypeError: isinstance() arg 2 must be a type``. torch >= 2.10 imports
+``triton.runtime.jit.JITFunction`` at import time of ``torch.utils.flop_counter``
+and isinstance()s it: with triton truly absent that import fails and torch falls
+back to NoneType, but the stub makes it succeed, so every name real triton
+exposes as a class has to be seeded as a real class.
 """
 
 from __future__ import annotations
@@ -138,9 +128,8 @@ _SUBPROCESS = textwrap.dedent(
 
 
 # inductor's two other class-sensitive uses, verbatim from torch main:
-# triton_compat.py imports IntelGPUError under `except ImportError` and
-# triton_heuristics.py catches it; _interpret_args_grid isinstance()s
-# InterpretedFunction. Both names come from modules the finder auto-creates.
+# triton_compat imports IntelGPUError and triton_heuristics catches it;
+# _interpret_args_grid isinstance()s InterpretedFunction.
 _INDUCTOR_SUBPROCESS = textwrap.dedent(
     """
     import importlib.util, sys

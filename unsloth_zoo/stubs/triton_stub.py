@@ -154,16 +154,11 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# Names real triton exposes as CLASSES.
-#
-# A _Noop is an instance, not a type, so `isinstance(x, Noop)`,
-# `issubclass(...)` and `except Noop:` all raise
-# "TypeError: isinstance() arg 2 must be a type". torch does exactly that:
-# `from triton.runtime.jit import JITFunction` then
-# `isinstance(target, (OpOverloadPacket, JITFunction, HigherOrderOperator))`
-# at import time of torch.utils.flop_counter. With triton genuinely absent the
-# import raises ImportError and torch falls back to NoneType; the stub makes
-# the import succeed, so every class-valued name must be a real class.
+# Names real triton exposes as CLASSES. A _Noop is an instance, not a type, so
+# isinstance/issubclass/except on one raises TypeError. torch.utils.flop_counter
+# imports triton.runtime.jit.JITFunction and isinstance()s it: with triton truly
+# absent that import fails and torch falls back to NoneType, but the stub makes
+# it succeed, so every class-valued name must be a real class.
 # ---------------------------------------------------------------------------
 class _StubMeta(type):
     """Keeps class-valued stubs permissive: unknown class attrs stay _Noop."""
@@ -180,15 +175,13 @@ class _StubClass(metaclass=_StubMeta):
             raise AttributeError(name)
         return _Noop(f"{type(self).__name__}.{name}")
 
-# triton.errors / triton.runtime.errors / triton.compiler.errors — these are
-# caught with `except`, which also demands a real exception class.
+# triton.errors / runtime.errors / compiler.errors: `except` also demands a class.
 class TritonError(Exception, metaclass=_StubMeta): pass
 class InterpreterError(TritonError): pass
 class OutOfResources(TritonError): pass
 class PTXASError(TritonError): pass
 class AutotunerError(TritonError): pass
-# Only Intel's triton declares IntelGPUError; torch imports it under
-# `except ImportError` and then catches it, so the stub must supply a class.
+# Only Intel's triton declares IntelGPUError, but torch still imports and catches it.
 class IntelGPUError(TritonError): pass
 class CompilationError(TritonError): pass
 class CompileTimeAssertionFailure(CompilationError): pass
@@ -206,7 +199,7 @@ class KernelParam(_StubClass): pass
 class Autotuner(KernelInterface): pass
 class Heuristics(KernelInterface): pass
 
-# triton.runtime.interpreter — inductor does isinstance(self.fn, InterpretedFunction)
+# triton.runtime.interpreter: inductor isinstance()s InterpretedFunction
 class InterpretedFunction(KernelInterface): pass
 
 # triton.compiler
