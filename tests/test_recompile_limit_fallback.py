@@ -772,6 +772,13 @@ def _utils():
     return U
 
 
+# Labels this file's own wrappers are built with, so the reset can leave the
+# package's real kernels registered.
+_OUR_LABELS = frozenset((
+    "M.forward", "A.forward", "B.forward", "C.forward", "probe",
+))
+
+
 def _limit_names():
     import torch._dynamo.config as cfg
     return [n for group in _utils()._RECOMPILE_LIMIT_NAMES for n in group
@@ -792,7 +799,14 @@ def _reset_bump_state(U):
     U._ORIGINAL_RECOMPILE_LIMITS.clear()
     U._BUMPED_RECOMPILE_LIMITS.clear()
     U._GLOBAL_BUMPS = 0
-    U._EAGER_FALLBACK_WRAPPERS.clear()
+    # Drop only the wrappers this file made. The registry is process-wide and
+    # holds every patched kernel in the package, so clearing it deregistered
+    # gemma/gemma4/qwen3 for the rest of the worker and their own tests then
+    # could not find themselves in eager_fallback_state().
+    U._EAGER_FALLBACK_WRAPPERS[:] = [
+        _r for _r in U._EAGER_FALLBACK_WRAPPERS if _r() is not None
+        and getattr(_r(), "_unsloth_fallback_label", None) not in _OUR_LABELS
+    ]
     # Clearing the bookkeeping alone left a real bump standing: a wrapper that
     # exhausted its cache raised both budgets by 16 before signalling, so every
     # later test ran against enlarged limits and could stop reaching the

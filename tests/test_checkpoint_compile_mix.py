@@ -107,15 +107,32 @@ def dynamo_limits():
     # bookkeeping has to come back too. Left behind, a later fallback restores
     # this test's limit of 2 over the process default, or finds the shared
     # allowance already spent.
+    # These tests deliberately exhaust the process-wide allowance, and running
+    # out takes EVERY live borrower eager -- including the package's own patched
+    # kernels, which stay latched for the rest of the worker. Snapshot them.
+    saved_states = [(_w, dict(_w._unsloth_fallback_state))
+                    for _w in (_r() for _r in U._EAGER_FALLBACK_WRAPPERS)
+                    if _w is not None]
     saved_global = U._GLOBAL_BUMPS
     saved_orig = dict(U._ORIGINAL_RECOMPILE_LIMITS)
-    saved_bumped = {k: set(v) for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
+    # dict, not set: the map is {bumped value: the value it came from}, and
+    # copying it as a set put sets back into it, so the restore chain broke.
+    saved_bumped = {k: dict(v) for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
     try:
         yield
     finally:
         for n, v in saved.items():
             setattr(dynamo.config, n, v)
+        # Drop only what died. The registry is process-wide, and a module
+        # imported during these tests appends its own kernels past the mark, so
+        # truncating deregistered gemma/gemma4/qwen3 for the rest of the worker.
+        _tail = [_r for _r in U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
+                 if _r() is not None]
         del U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
+        U._EAGER_FALLBACK_WRAPPERS.extend(_tail)
+        for _w, _st in saved_states:
+            _w._unsloth_fallback_state.clear()
+            _w._unsloth_fallback_state.update(_st)
         U._GLOBAL_BUMPS = saved_global
         U._ORIGINAL_RECOMPILE_LIMITS.clear()
         U._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
