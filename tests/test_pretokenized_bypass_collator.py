@@ -665,7 +665,7 @@ def test_an_integer_side_car_is_refused_without_the_processor(column):
 
 
 def test_a_raw_eval_split_with_a_derived_column_is_refused():
-    """`_eval_split_is_raw_text_only` reads the same set."""
+    """`_split_is_raw_text_only` reads the same set."""
     processor = DerivedProcessor(image_names = ["widget_patches"])
     trainer = StubTrainer(MyVisionCollator(processor), _text_rows())
     trainer.processing_class = processor
@@ -1047,7 +1047,11 @@ def test_an_ambiguous_image_column_is_never_decoded_by_the_scan(monkeypatch):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
     # Only the bounded row sample may decode; the whole-column scan may not.
-    assert len(decoded) <= 16, f"{len(decoded)} images decoded for {n} rows"
+    # 16 per split, and the train split is now scanned as well as the eval one
+    # (train no longer has to be pretokenized), so the bound is per split. What
+    # matters is that it stays a constant and does not grow with `n`.
+    assert len(decoded) <= 16 * 2, f"{len(decoded)} images decoded for {n} rows"
+    assert len(decoded) < n / 4, "the sample is scaling with the dataset"
 
 
 # ---- the processor may live only on the collator ---------------------------
@@ -1142,7 +1146,7 @@ def test_an_image_on_an_unsampled_row_is_refused():
 
 
 def test_a_raw_eval_split_with_an_image_on_an_unsampled_row_is_refused():
-    """`_eval_split_is_raw_text_only` samples the same 16 positions, so the eval
+    """`_split_is_raw_text_only` samples the same 16 positions, so the eval
     half needs the schema just as much as the train half does."""
     import io
     from PIL import Image as PILImage

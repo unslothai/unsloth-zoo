@@ -1284,14 +1284,15 @@ def train_on_responses_only(
         return True
     pass
 
-    def _eval_split_is_raw_text_only(dataset):
-        """True when an eval split carries no `input_ids` but a real string column.
+    def _split_is_raw_text_only(dataset):
+        """True when a split carries no `input_ids` but a real string column.
 
-        Eval only: train must still be pretokenized, since that is the evidence
-        the run is text-only, and `_maybe_tokenize_dataset` below tokenizes a raw
-        eval split with the same text tokenizer. The column it would tokenize has
-        to hold strings, not conversations: a list of turns needs a chat template,
-        and its content can be inline images.
+        Applies to train and eval alike: proving every row of the text column is
+        a string IS the evidence that the run is text-only, and it does not get
+        stronger by the split's name. `_maybe_tokenize_dataset` below tokenizes
+        such a split with the same text tokenizer. The column has to hold
+        strings, not conversations: a list of turns needs a chat template, and
+        its content can be inline images.
         """
         if dataset is None:
             return False
@@ -1334,10 +1335,20 @@ def train_on_responses_only(
             _eval = getattr(trainer, "eval_dataset", None)
             _eval_splits = list(_eval.values()) if isinstance(_eval, dict) else [_eval]
             _train = getattr(trainer, "train_dataset", None)
+            # The train split gets the same allowance as an eval one. Requiring
+            # it to be PRE-tokenized refused the common case: TRL 0.22.2 hands
+            # a plain text SFT on a multimodal checkpoint its own
+            # `DataCollatorForVisionLanguageModeling` and leaves the dataset at
+            # `["text"]`, tokenizing inside the collator. Nothing there is a
+            # vision run, and `_split_is_raw_text_only` proves it over every
+            # row, so refusing lost Gemma3_(4B), Gemma3N_(4B)-Conversational,
+            # Gemma3_(27B)_A100 and Qwen_3_5_27B for a masking pass that is
+            # exactly what the dataset path below does correctly.
+            def _collatable(d):
+                return _dataset_is_pretokenized(d) or _split_is_raw_text_only(d)
             if not (
-                (_train is None or _dataset_is_pretokenized(_train))
-                and all(_dataset_is_pretokenized(d) or _eval_split_is_raw_text_only(d)
-                        for d in _eval_splits if d is not None)
+                (_train is None or _collatable(_train))
+                and all(_collatable(d) for d in _eval_splits if d is not None)
             ):
                 # Cannot configure this collator, so refuse rather than silently
                 # return with responses left unmasked.

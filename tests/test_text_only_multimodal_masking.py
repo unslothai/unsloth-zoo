@@ -34,13 +34,35 @@ USER_ID, ASSISTANT_ID = 1, 2
 ROW = [USER_ID, 10, 11, ASSISTANT_ID, 20, 21]
 
 
+class StubEncoding(dict):
+    """What a real tokenizer returns: a mapping that also has attributes.
+
+    `datasets.map` rejects anything that is not a dict, and the raw-text path
+    feeds tokenizer output straight into it.
+    """
+    __getattr__ = dict.__getitem__
+
+
 class StubTokenizer:
-    def __call__(self, text, add_special_tokens = False):
-        result = type("R", (), {})()
-        if text == INSTRUCTION_PART:   result.input_ids = [USER_ID]
-        elif text == RESPONSE_PART:    result.input_ids = [ASSISTANT_ID]
-        else:                          result.input_ids = [ord(c) for c in text]
-        return result
+    # `**kwargs` because the raw-text path calls with truncation/max_length,
+    # which nothing reached while that path still refused.
+    def __call__(self, text, add_special_tokens = False, **kwargs):
+        if isinstance(text, (list, tuple)):
+            ids = [self(t).input_ids for t in text]
+            return StubEncoding(input_ids = ids,
+                                attention_mask = [[1] * len(r) for r in ids])
+        ids = []
+        rest = text
+        while rest:
+            for marker, tid in ((INSTRUCTION_PART, USER_ID), (RESPONSE_PART, ASSISTANT_ID)):
+                if rest.startswith(marker):
+                    ids.append(tid)
+                    rest = rest[len(marker):]
+                    break
+            else:
+                ids.append(ord(rest[0]))
+                rest = rest[1:]
+        return StubEncoding(input_ids = ids, attention_mask = [1] * len(ids))
 
 
 class StubProcessor:
@@ -94,13 +116,33 @@ def test_pretokenized_rows_get_dataset_level_masking():
         assert any(label != -100 for label in row), "everything was masked"
 
 
-def test_untokenized_rows_still_refuse():
-    """Without input_ids the collator may really rebuild labels, so still refuse."""
+def test_raw_text_rows_are_tokenized_and_masked():
+    """Raw text is the COMMON case, not a reason to refuse.
+
+    This asserted a refusal on the theory that a collator handed raw rows may
+    rebuild labels itself and discard ours. Measured on the real path it does
+    not: TRL 0.22.2 gives a plain text SFT on gemma-3-4b-it its own
+    `DataCollatorForVisionLanguageModeling` and leaves the dataset at
+    `["text"]`, and after `_maybe_tokenize_dataset` the columns are
+    `input_ids/attention_mask/labels` with the text column GONE, so there is
+    nothing left for a collator to rebuild from. A real batch came back 12/16
+    masked with the prompt masked at the front.
+
+    Refusing instead cost four shipped notebooks: Gemma3_(4B),
+    Gemma3N_(4B)-Conversational, Gemma3_(27B)_A100-Conversational and
+    Qwen_3_5_27B_A100(80GB).
+    """
     processor = StubProcessor()
     trainer = StubTrainer(TextCollator(processor), _raw_text())
 
-    with pytest.raises(ValueError, match = "does not support response-only"):
-        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "text" not in out.train_dataset.column_names, \
+        "the consumed text column must not survive for a collator to re-read"
+    labels = out.train_dataset["labels"]
+    for row in labels:
+        assert any(l == -100 for l in row), "nothing was masked"
+        assert any(l != -100 for l in row), "everything was masked"
 
 
 def test_unsloth_vision_collator_is_configured_not_bypassed():
