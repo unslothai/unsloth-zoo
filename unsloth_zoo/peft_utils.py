@@ -327,9 +327,6 @@ def requires_grad_for_gradient_checkpointing(model):
 
     # Add post forward hook
     def requires_grad_post_hook(module, input, output):
-        # Dynamo cannot trace requires_grad_(), and torch._dynamo.disable() does
-        # not help under fullgraph = True. Safe to skip -- see the pre hook below.
-        if torch.compiler.is_compiling(): return
         type_output = type(output)
         if type_output is torch.Tensor:
             target = output
