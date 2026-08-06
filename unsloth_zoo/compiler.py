@@ -1311,9 +1311,27 @@ def create_new_function(
             )
         pass
     else:
-        # Rank 0 kept an existing file, so there is no write to retry: a rank
-        # whose copy differs would silently import another implementation.
-        _verify_compiled_cache_file_collectively(function_location, cache_file_digest)
+        # Rank 0 kept an existing file. Persistent-cache disagreement is a
+        # configuration error, but node-local temp caches can legitimately be
+        # warm on one node and cold or stale on another. Repair every local copy
+        # from the generated source so all ranks still take the same branch.
+        verification_error = _cache_verification_error(
+            function_location, cache_file_digest,
+        )
+        if verification_error is not None:
+            if not UNSLOTH_COMPILE_USE_TEMP:
+                raise verification_error
+            generated_digest = hashlib.sha256(
+                write_new_source.encode("utf-8")
+            ).hexdigest()
+            temp_failure = write_node_local_file(
+                function_location, write_new_source,
+            )
+            if temp_failure is not None:
+                raise temp_failure
+            _verify_compiled_cache_file_collectively(
+                function_location, generated_digest,
+            )
     pass
 
     # Now import modules! Use a tempfile if it fails on the first try!

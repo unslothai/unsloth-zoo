@@ -33,11 +33,20 @@ _COMPILER_PATH = (
     / "unsloth_zoo"
     / "compiler.py"
 )
+_CACHE_LEAF = "persistent-cache"
 
 
 def _compiler_source() -> str:
     """Read compiler.py without importing the unsloth_zoo package."""
     return _COMPILER_PATH.read_text(encoding="utf-8")
+
+
+def _create_new_function_ast() -> ast.FunctionDef:
+    tree = ast.parse(_compiler_source())
+    return next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "create_new_function"
+    )
 
 
 @pytest.fixture
@@ -53,16 +62,72 @@ def compiler():
         raise
 
 
+@pytest.fixture(autouse=True)
+def _temp_mode_does_not_leak():
+    """Catch a prior test that forgot to let monkeypatch restore temp mode."""
+    module = sys.modules.get("unsloth_zoo.compiler")
+    if module is not None:
+        assert module.UNSLOTH_COMPILE_USE_TEMP is False
+
+
+@pytest.fixture
+def probe(compiler):
+    """Compile generated probes and always remove both module aliases."""
+    names = []
+
+    def create(name, body="return x", *, overwrite=True):
+        names.append(name)
+        indented_body = "\n".join(f"    {line}" for line in body.splitlines())
+        return compiler.create_new_function(
+            name,
+            f"def {name}_fn(x):\n{indented_body}\n",
+            "pr967",
+            {},
+            overwrite=overwrite,
+        )
+
+    yield create
+    for name in names:
+        sys.modules.pop(name, None)
+        sys.modules.pop(f"unsloth_cache_{name}", None)
+
+
+def _own_temp_mode(monkeypatch, compiler, value=False):
+    """Let monkeypatch restore the global even when production reassigns it."""
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", value)
+
+
+def _stub_compile_folders(
+    monkeypatch, compiler, primary, temp, *, temp_active=False,
+):
+    """Route persistent and node-local folders without a real collective."""
+    _own_temp_mode(monkeypatch, compiler, temp_active)
+    monkeypatch.setattr(
+        compiler,
+        "get_compile_folder",
+        lambda use_tempfile=False: (
+            (str(temp), True)
+            if (temp_active or use_tempfile)
+            else (str(primary), False)
+        ),
+    )
+
+
+def _configure_local_temp(tmp_path, monkeypatch, compiler):
+    local_temp = tmp_path / "rank1-temp"
+    monkeypatch.setattr(
+        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path / _CACHE_LEAF),
+    )
+    _own_temp_mode(monkeypatch, compiler)
+    monkeypatch.setattr(compiler.tempfile, "gettempdir", lambda: str(local_temp))
+    return local_temp
+
+
 def test_explicit_temp_compile_folder_is_resolved_locally(
     tmp_path, monkeypatch, compiler,
 ):
     """An explicitly requested temp path must not be broadcast from rank 0."""
-    local_temp = tmp_path / "rank1-temp"
-    monkeypatch.setattr(
-        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path / "persistent-cache"),
-    )
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-    monkeypatch.setattr(compiler.tempfile, "gettempdir", lambda: str(local_temp))
+    local_temp = _configure_local_temp(tmp_path, monkeypatch, compiler)
     monkeypatch.setattr(
         compiler,
         "distributed_function",
@@ -73,7 +138,7 @@ def test_explicit_temp_compile_folder_is_resolved_locally(
 
     location, use_temp = compiler.get_compile_folder(use_tempfile=True)
 
-    assert pathlib.Path(location) == local_temp / "persistent-cache"
+    assert pathlib.Path(location) == local_temp / _CACHE_LEAF
     assert pathlib.Path(location).is_dir()
     assert use_temp is True
 
@@ -82,15 +147,9 @@ def test_rank0_temp_fallback_is_recomputed_locally(
     tmp_path, monkeypatch, compiler,
 ):
     """The fallback decision is shared, but rank 0's temp path is not."""
-    local_temp = tmp_path / "rank1-temp"
-    rank0_temp = "/rank0-private/tmp/persistent-cache"
+    local_temp = _configure_local_temp(tmp_path, monkeypatch, compiler)
+    rank0_temp = f"/rank0-private/tmp/{_CACHE_LEAF}"
     calls = []
-
-    monkeypatch.setattr(
-        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path / "persistent-cache"),
-    )
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-    monkeypatch.setattr(compiler.tempfile, "gettempdir", lambda: str(local_temp))
 
     def rank0_fell_back(n, function, *args, **kwargs):
         calls.append((n, function, args, kwargs))
@@ -101,7 +160,7 @@ def test_rank0_temp_fallback_is_recomputed_locally(
     location, use_temp = compiler.get_compile_folder(use_tempfile=False)
 
     assert len(calls) == 1
-    assert pathlib.Path(location) == local_temp / "persistent-cache"
+    assert pathlib.Path(location) == local_temp / _CACHE_LEAF
     assert pathlib.Path(location).is_dir()
     assert location != rank0_temp
     assert use_temp is True
@@ -109,11 +168,7 @@ def test_rank0_temp_fallback_is_recomputed_locally(
 
 def test_write_guard_is_not_rank_local():
     """The guard's test must come from a collective, not a local os.path.isfile."""
-    tree = ast.parse(_compiler_source())
-    func = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "create_new_function"
-    )
+    func = _create_new_function_ast()
     # The `if <cond>:` whose body calls distributed_function(..., write_file, ...)
     guards = [
         node for node in ast.walk(func)
@@ -130,7 +185,7 @@ def test_write_guard_is_not_rank_local():
 
 
 def test_decision_is_broadcast_not_computed_locally(
-    tmp_path, monkeypatch, compiler,
+    tmp_path, monkeypatch, compiler, probe,
 ):
     """Every rank must take the branch rank 0 chose."""
     calls = []
@@ -142,27 +197,22 @@ def test_decision_is_broadcast_not_computed_locally(
 
     monkeypatch.setattr(compiler, "distributed_function", spy)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    _own_temp_mode(monkeypatch, compiler)
     monkeypatch.syspath_prepend(str(tmp_path))
 
     name = "pr967_probe"
-    try:
-        module = compiler.create_new_function(
-            name, "def pr967_probe_fn(x):\n    return x\n", "pr967", {},
-            overwrite=True,
-        )
-        assert (tmp_path / f"{name}.py").is_file(), "probe did not compile into tmp_path"
-        assert pathlib.Path(module.__file__).parent == tmp_path, (
-            "a successful persistent-cache import was mistaken for a failure and "
-            "unnecessarily recovered to the tempfile cache"
-        )
-        assert compiler.UNSLOTH_COMPILE_USE_TEMP is False
-        assert "_compiled_cache_decision" in calls, (
-            "the write decision was not routed through distributed_function(); it is "
-            "rank-local again -- regression of PR #967."
-        )
-    finally:
-        sys.modules.pop(name, None)
+    module = probe(name)
+
+    assert (tmp_path / f"{name}.py").is_file(), "probe did not compile into tmp_path"
+    assert pathlib.Path(module.__file__).parent == tmp_path, (
+        "a successful persistent-cache import was mistaken for a failure and "
+        "unnecessarily recovered to the tempfile cache"
+    )
+    assert compiler.UNSLOTH_COMPILE_USE_TEMP is False
+    assert "_compiled_cache_decision" in calls, (
+        "the write decision was not routed through distributed_function(); it is "
+        "rank-local again -- regression of PR #967."
+    )
 
 
 def test_decision_digests_disk_not_generated_source(
@@ -263,7 +313,7 @@ def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch, compiler):
 
 @pytest.mark.parametrize("is_rank_zero", [True, False], ids=["rank0", "nonzero_rank"])
 def test_write_path_verifies_the_file_on_every_rank(
-    tmp_path, monkeypatch, is_rank_zero, compiler,
+    tmp_path, monkeypatch, is_rank_zero, compiler, probe,
 ):
     """A rank-local stale file must be checked even when rank 0 writes.
 
@@ -275,11 +325,8 @@ def test_write_path_verifies_the_file_on_every_rank(
     verified = []
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "is_main_process", lambda: is_rank_zero)
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-    monkeypatch.setattr(
-        compiler,
-        "get_compile_folder",
-        lambda use_tempfile=False: (str(tmp_path), False),
+    _stub_compile_folders(
+        monkeypatch, compiler, tmp_path, tmp_path / "temp-cache",
     )
     monkeypatch.setattr(
         compiler,
@@ -288,16 +335,7 @@ def test_write_path_verifies_the_file_on_every_rank(
     )
 
     name = "pr967_verify_after_write"
-    try:
-        compiler.create_new_function(
-            name,
-            f"def {name}_fn(x):\n    return x\n",
-            "pr967",
-            {},
-            overwrite=True,
-        )
-    finally:
-        sys.modules.pop(name, None)
+    probe(name)
 
     assert len(verified) == 1
     assert verified[0][0] == str(tmp_path / f"{name}.py")
@@ -337,7 +375,7 @@ def test_cache_verification_failure_is_coordinated(
 
 
 def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
-    tmp_path, monkeypatch, compiler,
+    tmp_path, monkeypatch, compiler, probe,
 ):
     """A write can be reported as successful without the bytes arriving.
 
@@ -351,16 +389,10 @@ def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
     cache.mkdir()
     recovery.mkdir()
 
-    def fake_get_compile_folder(use_tempfile=False):
-        return (str(recovery), True) if use_tempfile else (str(cache), False)
-
-    monkeypatch.setattr(compiler, "get_compile_folder", fake_get_compile_folder)
+    _stub_compile_folders(monkeypatch, compiler, cache, recovery)
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
-    # create_new_function() assigns this global, which monkeypatch cannot undo
-    # unless it owns the attribute first.
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
 
     name = "pr967_silent_write_failure"
     blocked = cache / f"{name}.py"
@@ -378,24 +410,15 @@ def test_a_silently_failed_write_recovers_instead_of_killing_the_job(
 
     monkeypatch.setattr(compiler, "distributed_function", report_a_write_that_never_lands)
 
-    try:
-        module = compiler.create_new_function(
-            name,
-            f"def {name}_fn(x):\n    return x * 2\n",
-            "pr967",
-            {},
-            overwrite=True,
-        )
-        assert pathlib.Path(module.__file__).parent == recovery
-        assert getattr(module, f"{name}_fn")(21) == 42
-        assert blocked.read_text() == "stale = 1\n", "the write was not supposed to land"
-    finally:
-        sys.modules.pop(name, None)
-        sys.modules.pop(f"unsloth_cache_{name}", None)
+    module = probe(name, "return x * 2")
+
+    assert pathlib.Path(module.__file__).parent == recovery
+    assert getattr(module, f"{name}_fn")(21) == 42
+    assert blocked.read_text() == "stale = 1\n", "the write was not supposed to land"
 
 
 def test_the_tempfile_fallback_writes_on_every_rank(
-    tmp_path, monkeypatch, compiler,
+    tmp_path, monkeypatch, compiler, probe,
 ):
     """The temp cache is per node, so a rank-0-only write never reaches it.
 
@@ -412,14 +435,7 @@ def test_the_tempfile_fallback_writes_on_every_rank(
     monkeypatch.setattr(compiler, "is_main_process", lambda: False)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-    monkeypatch.setattr(
-        compiler,
-        "get_compile_folder",
-        lambda use_tempfile=False: (
-            (str(node_local), True) if use_tempfile else (str(cache), False)
-        ),
-    )
+    _stub_compile_folders(monkeypatch, compiler, cache, node_local)
 
     real_distributed_function = compiler.distributed_function
 
@@ -435,27 +451,64 @@ def test_the_tempfile_fallback_writes_on_every_rank(
     )
 
     name = "pr967_fallback_every_rank"
-    try:
-        module = compiler.create_new_function(
-            name,
-            f"def {name}_fn(x):\n    return x * 2\n",
-            "pr967",
-            {},
-            overwrite=True,
-        )
-        assert (node_local / f"{name}.py").is_file(), (
-            "the fallback wrote on rank 0 only, so this rank's per-node temp "
-            "cache is empty and the recovery cannot produce a module"
-        )
-        assert pathlib.Path(module.__file__).parent == node_local
-        assert getattr(module, f"{name}_fn")(21) == 42
-    finally:
-        sys.modules.pop(name, None)
-        sys.modules.pop(f"unsloth_cache_{name}", None)
+    module = probe(name, "return x * 2")
+
+    assert (node_local / f"{name}.py").is_file(), (
+        "the fallback wrote on rank 0 only, so this rank's per-node temp "
+        "cache is empty and the recovery cannot produce a module"
+    )
+    assert pathlib.Path(module.__file__).parent == node_local
+    assert getattr(module, f"{name}_fn")(21) == 42
+
+
+@pytest.mark.parametrize(
+    "local_bytes",
+    [None, b"stale node-local source"],
+    ids=["missing", "stale"],
+)
+def test_inconsistent_retained_temp_cache_is_rebuilt(
+    tmp_path, monkeypatch, compiler, probe, local_bytes,
+):
+    """A warm rank 0 must not make cold/stale worker nodes skip their write."""
+    node_temp = tmp_path / "node-temp"
+    node_temp.mkdir()
+    name = "pr967_mixed_temp_cache"
+    location = node_temp / f"{name}.py"
+    if local_bytes is not None:
+        location.write_bytes(local_bytes)
+
+    rank0_bytes = b"rank 0 retained source"
+    rank0_digest = hashlib.sha256(rank0_bytes).hexdigest()
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
+    monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0)
+    _stub_compile_folders(
+        monkeypatch,
+        compiler,
+        tmp_path / _CACHE_LEAF,
+        node_temp,
+        temp_active=True,
+    )
+
+    def rank0_retained_its_copy(n, function, *args, **kwargs):
+        assert function is compiler._compiled_cache_decision
+        return False, rank0_digest
+
+    monkeypatch.setattr(
+        compiler, "distributed_function", rank0_retained_its_copy,
+    )
+
+    module = probe(name, "return x * 2", overwrite=False)
+
+    assert pathlib.Path(module.__file__).parent == node_temp
+    assert getattr(module, f"{name}_fn")(21) == 42
+    assert "return x * 2" in location.read_text(encoding="utf-8")
 
 
 def test_a_retained_but_divergent_file_still_fails_loudly(
-    tmp_path, monkeypatch, compiler,
+    tmp_path, monkeypatch, compiler, probe,
 ):
     """The counterpart: with no write to retry, a stale copy must raise.
 
@@ -464,11 +517,8 @@ def test_a_retained_but_divergent_file_still_fails_loudly(
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "distributed_any", lambda value: bool(value))
     monkeypatch.setattr(compiler, "_COMPILED_CACHE_VISIBILITY_TIMEOUT", 0.2)
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-    monkeypatch.setattr(
-        compiler,
-        "get_compile_folder",
-        lambda use_tempfile=False: (str(tmp_path), False),
+    _stub_compile_folders(
+        monkeypatch, compiler, tmp_path, tmp_path / "temp-cache",
     )
     # Rank 0 keeps its file, and this rank's copy at the same path differs.
     monkeypatch.setattr(
@@ -481,17 +531,7 @@ def test_a_retained_but_divergent_file_still_fails_loudly(
     (tmp_path / f"{name}.py").write_bytes(b"this rank's bytes")
 
     with pytest.raises(RuntimeError, match="differs between rank 0"):
-        compiler.create_new_function(
-            name, f"def {name}_fn(x):\n    return x\n", "pr967", {}, overwrite=False,
-        )
-
-
-def _create_new_function_ast() -> ast.FunctionDef:
-    tree = ast.parse(_compiler_source())
-    return next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "create_new_function"
-    )
+        probe(name, overwrite=False)
 
 
 def test_write_file_is_never_run_bare_inside_the_collective():
@@ -562,12 +602,14 @@ def test_distributed_any_without_process_group(compiler):
     assert compiler.distributed_any("non-empty") is True
 
 
-def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch, compiler):
+def test_write_failure_falls_back_to_tempfile(
+    tmp_path, monkeypatch, compiler, probe,
+):
     """A read-only cache directory must reach the tempfile fallback, not raise."""
     cache = tmp_path / "readonly_cache"
     cache.mkdir()
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(cache))
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    _own_temp_mode(monkeypatch, compiler)
 
     real_get_lock = compiler.get_lock
 
@@ -578,12 +620,11 @@ def test_write_failure_falls_back_to_tempfile(tmp_path, monkeypatch, compiler):
 
     monkeypatch.setattr(compiler, "get_lock", fake_get_lock)
 
-    module = compiler.create_new_function(
-        "pr967_readonly", "def pr967_readonly_fn(x):\n    return x * 3\n", "pr967", {},
-        overwrite=True,
-    )
+    name = "pr967_readonly"
+    module = probe(name, "return x * 3")
+
     assert module.pr967_readonly_fn(14) == 42
-    assert not (cache / "pr967_readonly.py").exists(), (
+    assert not (cache / f"{name}.py").exists(), (
         "the write was expected to fail against the read-only directory"
     )
 
@@ -607,7 +648,7 @@ def test_import_recovery_message_does_not_blame_this_rank():
 
 
 def test_temp_recovery_loads_by_path_on_every_rank(
-    tmp_path, monkeypatch, compiler,
+    tmp_path, monkeypatch, compiler, probe,
 ):
     """A successful rank must not reuse its old sys.modules entry."""
     primary = tmp_path / "primary"
@@ -615,12 +656,7 @@ def test_temp_recovery_loads_by_path_on_every_rank(
     primary.mkdir()
     recovery.mkdir()
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
-    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
-
-    def fake_get_compile_folder(use_tempfile=False):
-        return (str(recovery), True) if use_tempfile else (str(primary), False)
-
-    monkeypatch.setattr(compiler, "get_compile_folder", fake_get_compile_folder)
+    _stub_compile_folders(monkeypatch, compiler, primary, recovery)
 
     # Fire on the import guard, identified as the first collective after the
     # write-path verification where this rank itself saw no failure. Keyed on
@@ -649,28 +685,19 @@ def test_temp_recovery_loads_by_path_on_every_rank(
     monkeypatch.setattr(compiler, "distributed_any", another_rank_failed_to_import)
 
     name = "pr967_temp_reload"
-    try:
-        module = compiler.create_new_function(
-            name,
-            f"def {name}_fn(x):\n    return x * 2\n",
-            "pr967",
-            {},
-            overwrite=True,
-        )
-        assert pathlib.Path(module.__file__).parent == recovery
-        assert module.pr967_temp_reload_fn(21) == 42
-        # Importable by name again, but resolving to what the recovery loaded
-        # rather than the pre-recovery module from the primary folder.
-        assert sys.modules[name] is module, (
-            "the recovered module is not importable by its plain name, so a "
-            "later `import` fails where it succeeds without a recovery."
-        )
-        assert pathlib.Path(sys.modules[name].__file__).parent == recovery, (
-            "`import` by name resurrects the implementation the recovery replaced."
-        )
-    finally:
-        sys.modules.pop(name, None)
-        sys.modules.pop(f"unsloth_cache_{name}", None)
+    module = probe(name, "return x * 2")
+
+    assert pathlib.Path(module.__file__).parent == recovery
+    assert module.pr967_temp_reload_fn(21) == 42
+    # Importable by name again, but resolving to what the recovery loaded
+    # rather than the pre-recovery module from the primary folder.
+    assert sys.modules[name] is module, (
+        "the recovered module is not importable by its plain name, so a "
+        "later `import` fails where it succeeds without a recovery."
+    )
+    assert pathlib.Path(sys.modules[name].__file__).parent == recovery, (
+        "`import` by name resurrects the implementation the recovery replaced."
+    )
 
 
 def test_verify_falls_back_to_existence_when_rank0_digest_unknown(
