@@ -1636,3 +1636,32 @@ def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_under_packing(
 
     assert out.data_collator is not collator, "still padding through the processor"
     assert hasattr(out.data_collator.tokenizer, "pad")
+
+
+# --- what the fourth review round found -----------------------------------
+
+def test_a_model_input_column_survives_raw_text_tokenization():
+    """A field the model is fed but the tokenizer does not recreate must survive.
+
+    The raw-text tokenize path removed every original column except `labels`, so
+    a per-row `sample_weight` (or any custom auxiliary target declared by
+    `model.forward`) vanished before the later model-input keep-list could save
+    it, leaving a missing required forward argument at train time.
+    """
+    class _ModelWithExtraInput:
+        def forward(self, input_ids = None, attention_mask = None, labels = None,
+                    sample_weight = None):
+            raise AssertionError("not called")
+
+    trainer = _text_only_trainer()
+    rows = _raw_text_rows(2).add_column("sample_weight", [0.25, 0.75])
+    trainer.eval_dataset = rows
+    trainer.model = _ModelWithExtraInput()
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    columns = set(out.eval_dataset.column_names)
+    assert "sample_weight" in columns, sorted(columns)
+    assert out.eval_dataset[0]["sample_weight"] == 0.25
+    # The raw text it replaced is still gone: the collator cannot stack strings.
+    assert "text" not in columns, sorted(columns)

@@ -359,6 +359,37 @@ def get_chat_template_parts(tokenizer):
 pass
 
 
+def _model_forward_parameter_names(model):
+    """Every named parameter of `model.forward`, unwrapping PEFT / compile layers.
+
+    A wrapper's own forward hides the real signature, so walk down to the base
+    model. Used to decide what a dataset column must survive for: anything the
+    model is actually fed.
+    """
+    import inspect as _inspect
+    names = set()
+    for _ in range(6):
+        if model is None: break
+        forward = getattr(model, "forward", None)
+        if forward is not None:
+            try:
+                names.update(
+                    name for name, p in _inspect.signature(forward).parameters.items()
+                    if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+                )
+            except (TypeError, ValueError): pass
+        unwrap = getattr(model, "get_base_model", None)
+        nxt = None
+        if callable(unwrap):
+            try: nxt = unwrap()
+            except Exception: nxt = None
+        if nxt is None or nxt is model:
+            nxt = getattr(model, "_orig_mod", None) or getattr(model, "base_model", None)
+        model = None if nxt is model else nxt
+    names.discard("self")
+    return names
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -619,12 +650,17 @@ def train_on_responses_only(
         if isinstance(dataset, IterableDataset):
             _map_kwargs = {"batched": True}
         # Drop the raw columns we just tokenized. Keeping them would hand the
-        # collator a string column it cannot stack into a tensor. `labels` is the
-        # one exception: it is already token-level, and the masking pass below
-        # intersects with it, so removing it would un-mask what the caller masked.
+        # collator a string column it cannot stack into a tensor. Two exceptions:
+        # `labels`, which is already token-level and which the masking pass below
+        # intersects with, so removing it would un-mask what the caller masked;
+        # and anything `model.forward` declares, such as a per-row `sample_weight`
+        # or a custom auxiliary target, which the tokenizer does not recreate and
+        # which the later model-input keep-list never gets the chance to save.
         _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
         if not isinstance(_raw_columns, dict):
-            _map_kwargs["remove_columns"] = [c for c in _raw_columns if c != "labels"]
+            _keep = {"labels"} | _model_forward_parameter_names(
+                getattr(trainer, "model", None))
+            _map_kwargs["remove_columns"] = [c for c in _raw_columns if c not in _keep]
         import warnings as _w
         with _w.catch_warnings():
             _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
@@ -1413,25 +1449,7 @@ def train_on_responses_only(
                 try: names.update(getattr(holder, "model_input_names", None) or ())
                 except Exception: pass
             # Unwrap PEFT/compile wrappers: their own forward hides pixel_values.
-            model = getattr(trainer, "model", None)
-            for _ in range(6):
-                if model is None: break
-                forward = getattr(model, "forward", None)
-                if forward is not None:
-                    try:
-                        names.update(
-                            name for name, p in _inspect.signature(forward).parameters.items()
-                            if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
-                        )
-                    except (TypeError, ValueError): pass
-                unwrap = getattr(model, "get_base_model", None)
-                nxt = None
-                if callable(unwrap):
-                    try: nxt = unwrap()
-                    except Exception: nxt = None
-                if nxt is None or nxt is model:
-                    nxt = getattr(model, "_orig_mod", None) or getattr(model, "base_model", None)
-                model = None if nxt is model else nxt
+            names.update(_model_forward_parameter_names(getattr(trainer, "model", None)))
             names.discard("self")
             return names
         _keep_columns = _model_input_columns()
