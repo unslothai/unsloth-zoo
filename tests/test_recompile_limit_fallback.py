@@ -1202,3 +1202,66 @@ def test_the_packed_marker_is_cleared_at_the_step_boundary():
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     U._restore_recompile_limits()
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+
+
+def test_the_packed_probe_is_invisible_to_dynamo():
+    """It sits in the wrapper body, so a nested compiled region traces it, and
+    the saved-tensor-hook accessor is a pybind builtin Dynamo refuses to enter.
+    Under fullgraph that is fatal, not a graph break: Gemma4_(E2B)-Vision
+    passes without the probe and died at cell 15 with it."""
+    U = _utils()
+    real = U._dynamo_is_tracing
+    U._dynamo_is_tracing = lambda: True
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is False, \
+            "the probe must not run, or even look, while tracing"
+    finally:
+        U._dynamo_is_tracing = real
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+
+
+def test_the_probe_still_runs_from_eager():
+    U = _utils()
+    real = U._dynamo_is_tracing
+    U._dynamo_is_tracing = lambda: False
+    saved = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None   # torch < 2.8: assume the worst
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is True
+    finally:
+        U._dynamo_is_tracing = real
+        U._saved_tensor_hook_accessor = saved
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+
+
+def test_the_tracing_check_survives_a_torch_without_it():
+    """torch 2.4 has neither accessor; answering False keeps the old path."""
+    U = _utils()
+    assert U._dynamo_is_tracing() in (True, False)
+
+
+def test_a_real_compiled_region_traces_through_the_wrapper():
+    """The end-to-end shape: compile a function that calls a wrapped one under
+    fullgraph. Before the guard this raised `Attempted to call function marked
+    as skipped`."""
+    U = _utils()
+    _reset_bump_state(U)
+
+    def eager(x):
+        return x * 2
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(eager, eager, "M.forward")
+
+    def outer(x):
+        return wrapped(x) + 1
+
+    compiled = torch.compile(outer, fullgraph = True, backend = "aot_eager")
+    try:
+        assert torch.equal(compiled(torch.ones(3)), torch.full((3,), 3.0))
+    finally:
+        _reset_bump_state(U)
+        torch._dynamo.reset()

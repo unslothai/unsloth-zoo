@@ -815,10 +815,37 @@ def _in_non_reentrant_checkpoint():
 _PACKED_COMPILED_IN_CHECKPOINT = False
 
 
+def _dynamo_is_tracing():
+    """True while Dynamo is compiling the caller, across the supported torches."""
+    for mod, name in ((getattr(torch, "compiler", None), "is_compiling"),
+                      (getattr(torch, "_dynamo", None), "is_compiling")):
+        fn = getattr(mod, name, None)
+        if fn is None:
+            continue
+        try:
+            return bool(fn())
+        except Exception:
+            continue
+    return False
+
+
 def _note_packed_under_checkpoint():
-    """Cheap probe, run per compiled call: the hook accessor only, no frame walk."""
+    """Cheap probe, run per compiled call: the hook accessor only, no frame walk.
+
+    Skipped while Dynamo is tracing. This sits in the wrapper body, so a nested
+    compiled region traces it, and the accessor is a pybind builtin Dynamo
+    refuses to enter:
+
+        Attempted to call function marked as skipped
+        torch._C._autograd...._top_saved_tensors_default_hooks
+
+    which under `fullgraph = True` is fatal rather than a graph break. It cost
+    Gemma4_(E2B)-Vision, which passes without this probe and died at cell 15
+    with it. Nothing is lost: the answer is meaningless mid-trace, and the same
+    wrapper is entered from eager on the call that actually packs.
+    """
     global _PACKED_COMPILED_IN_CHECKPOINT
-    if _PACKED_COMPILED_IN_CHECKPOINT:
+    if _PACKED_COMPILED_IN_CHECKPOINT or _dynamo_is_tracing():
         return
     top = _saved_tensor_hook_accessor()
     if top is None:
