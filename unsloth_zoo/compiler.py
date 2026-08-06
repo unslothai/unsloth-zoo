@@ -375,118 +375,179 @@ pass
 
 
 
+_AITER_SDPA_NAMES = frozenset((
+    "scaled_dot_product_attention",
+    "F.scaled_dot_product_attention",
+    "nn.functional.scaled_dot_product_attention",
+    "torch.nn.functional.scaled_dot_product_attention",
+))
+
+
+def _dotted_name(node):
+    """Render an ast expression as a dotted name, or None if it is not one."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _is_plain_causal_sdpa(node):
+    """Match exactly `out = <prefix.>scaled_dot_product_attention(q, k, v, is_causal=True)`.
+
+    Rejects attn_mask/dropout_p/scale/enable_gqa, positional extras,
+    is_causal=False or a variable, non-Name q/k/v, and attribute/tuple targets.
+    """
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        return None
+    target = node.targets[0]
+    if not isinstance(target, ast.Name):
+        return None
+    call = node.value
+    if not isinstance(call, ast.Call):
+        return None
+    if _dotted_name(call.func) not in _AITER_SDPA_NAMES:
+        return None
+    if len(call.args) != 3 or not all(isinstance(a, ast.Name) for a in call.args):
+        return None
+    if len(call.keywords) != 1:
+        return None
+    keyword = call.keywords[0]
+    if keyword.arg != "is_causal":
+        return None
+    if not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True):
+        return None
+    return target.id, [a.id for a in call.args]
+
+
+def _owns_its_lines(node, lines):
+    """True when the statement is alone on its line(s).
+
+    Rejects `a = 1; out = sdpa(...)` and `if c: out = sdpa(...)`, where replacing
+    the line range would delete the neighbour or the `if` header.
+    """
+    if lines[node.lineno - 1][:node.col_offset].strip():
+        return False
+    after = lines[node.end_lineno - 1][node.end_col_offset:].strip()
+    return not after or after.startswith("#")
+
+
+def _unique_suffix(source):
+    """Pick a name suffix that collides with nothing already in the source."""
+    suffix, counter = "", 0
+    while any(f"{n}{suffix}" in source for n in (
+        "_aiter_fn", "_aiter_ok", "_aiter_q", "_aiter_k", "_aiter_v",
+        "_aiter_out", "_call_aiter_safe", "_get_aiter_fn",
+    )):
+        counter += 1
+        suffix = f"_{counter}"
+    return suffix
+
+
 def replace_sdpa_with_amd_aiter(source):
     """
     For AMD ROCm with amd-aiter installed: replace scaled_dot_product_attention
     calls with amd-aiter Flash Attention in the compiled source.
 
-    Activation requirements (ALL must hold):
-      1. get_amd_attention_implementation() == "amd_aiter"
-         — requires ROCm >= 7.0, aiter installed, gfx942 or gfx950 arch
-      2. rest_args is exactly ", is_causal=True" (optional trailing comma/whitespace)
-         — any other argument (positional or keyword) leaves the call unchanged
-      3. Call is not immediately followed by a method chain, subscript, or operator
-         — .transpose(), * scale, [0], etc. are rejected (negative lookahead)
-      4. At runtime, _aiter_ok additionally checks:
-         - q/k seq lengths equal (causal mask alignment differs between SDPA and aiter)
-         - input dtype is float16 or bfloat16 (aiter does not support float32)
-         - no input has requires_grad=True (aiter asserts return_lse for backward;
-           we omit return_lse, so the fast path is inference-only)
-      5. aiter call wrapped in try/except with SDPA fallback for unsupported head dims
-         or JIT failures
+    Activation requires ALL of:
+      1. get_amd_attention_implementation() == "amd_aiter" (ROCm >= 7.0, aiter
+         installed, gfx942 or gfx950)
+      2. the statement is exactly
+         `<name> = <prefix.>scaled_dot_product_attention(q, k, v, is_causal=True)`
+         with q/k/v plain names, matched on the parsed AST rather than on text
+      3. the statement occupies its own line(s)
+      4. at runtime: q/k seq lengths equal (SDPA aligns causal masks top-left,
+         aiter bottom-right), fp16/bf16, and no input requires grad (aiter
+         asserts return_lse for backward, which we omit, so this is inference
+         only)
+      5. failures return None from a helper and fall back to SDPA
 
-    Known limitation: the rewrite currently only matches user-code SDPA calls with
-    the bare is_causal=True form. Unsloth's own compiled SDPA paths emit attn_mask=
-    or is_causal=<variable> which are correctly rejected by guard 2. Wiring this
-    to Unsloth's SDPA shim requires a separate follow-up PR.
+    Selecting on the AST means comments and string literals can never be
+    rewritten, and unparseable source is returned untouched.
 
-    No-op on NVIDIA and on ROCm without amd-aiter, ROCm < 7.0, or unsupported arch.
+    Known limitation: Unsloth's own compiled SDPA paths emit attn_mask= or
+    is_causal=<variable>, which guard 2 correctly rejects, so this only matches
+    user-code calls. Wiring it to Unsloth's shim is a separate follow-up.
+
+    No-op on NVIDIA, and on ROCm without amd-aiter, ROCm < 7.0 or another arch.
     """
-    # Import inside function — avoids compile-time NameError in caller scope
     from unsloth_zoo.device_type import get_amd_attention_implementation
     if get_amd_attention_implementation() != "amd_aiter":
         return source
 
-    import re
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Rewriting source we cannot parse would turn a parse error into
+        # corrupted code.
+        return source
 
-    # Pattern:  out = <prefix.>scaled_dot_product_attention(q, k, v, ...)
-    # Excludes: disable_compile_scaled_dot_product_attention (opt-out shim)
-    # Uses ((?:[^)]|\([^)]*\))*) to handle one level of nested parens in args
-    sdpa_call_pattern = (
-        # Negative lookbehind: reject attribute assignments like self.attn_output = ...
-        # which would leave "self." dangling before the generated if/else block.
-        r"([ \t]*)(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*"
-        r"(?:(?:torch\.nn\.functional|F|nn\.functional)\.)?scaled_dot_product_attention"
-        r"\("
-        r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
-        r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*,"
-        r"[ \t\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*"
-        r"((?:[^)]|\([^)]*\))*)\)"
-        r"(?![ \t]*[^\s#])"  # reject any non-ws/non-comment suffix (* scale, [0], .method)
-    )
+    lines = source.splitlines(keepends = True)
+    matches = [
+        (node, parsed[0], tuple(parsed[1]))
+        for node in ast.walk(tree)
+        for parsed in [_is_plain_causal_sdpa(node)]
+        if parsed is not None and _owns_its_lines(node, lines)
+    ]
+    if not matches:
+        return source
 
-    def aiter_replacement(m):
-        indent  = m.group(1)
-        out_var = m.group(2)
-        q_var   = m.group(3)
-        k_var   = m.group(4)
-        v_var   = m.group(5)
-        rest_args = m.group(6)
+    suffix = _unique_suffix(source)
+    fn_var  = f"_aiter_fn{suffix}"
+    ok_var  = f"_aiter_ok{suffix}"
+    out_tmp = f"_aiter_out{suffix}"
+    safe_fn = f"_call_aiter_safe{suffix}"
+    get_fn  = f"_get_aiter_fn{suffix}"
+    qt, kt, vt = f"_aiter_q{suffix}", f"_aiter_k{suffix}", f"_aiter_v{suffix}"
 
-        # Only bare is_causal=True (optional trailing comma/whitespace) is rewritten.
-        # Any other argument — positional or keyword — is left unchanged;
-        # positional args like (q, k, v, None, 0.1, ...) carry semantics aiter ignores.
-        rest_args_stripped = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
-        if not re.fullmatch(r"is_causal\s*=\s*True", rest_args_stripped):
-            return m.group(0)
+    # Bottom up so earlier line numbers stay valid.
+    for node, out_var, (q_var, k_var, v_var) in sorted(
+        matches, key = lambda item: item[0].lineno, reverse = True,
+    ):
+        indent = " " * node.col_offset
 
-        # rest_args is ", is_causal=True" here (fullmatch guarantees it).
-        # Reconstruct with leading comma for the SDPA fallback.
-        _kw = rest_args.strip().lstrip(",").strip().rstrip(",").strip()
-        rest_args_formatted = (", " + _kw) if _kw else ""
+        def sdpa_fallback(pad):
+            return [
+                f"{pad}{out_var} = torch.nn.functional.scaled_dot_product_attention(",
+                f"{pad}    {q_var}, {k_var}, {v_var}, is_causal=True)",
+            ]
 
-        # Generated code is exec()'d in isolation — all symbols must be imported inside.
-        lines = [
-            f"{indent}# AMD aiter Flash Attention (MFMA + causal tile skip)",
-            f"{indent}# Requires: pip install amd-aiter  (ROCm >= 7.0)",
-            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as _get_aiter_fn",
-            f"{indent}_aiter_fn = _get_aiter_fn()",
-            f"{indent}_aiter_ok = (",
-            f"{indent}    _aiter_fn is not None",
-            f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",  # equal seq lengths
-            f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",  # dtype guard
-            # Inference-only: aiter.flash_attn_func asserts return_lse=True when
-            # any input has requires_grad=True (aiter/ops/mha.py:2502,2536). We
-            # omit return_lse, so calling it during training raises AssertionError.
-            # Must check all three of q/k/v: a LoRA targeting k_proj/v_proj but
-            # not q_proj leaves k and v with grad while q.requires_grad is False.
+        block = [
+            f"{indent}# AMD aiter Flash Attention, requires: pip install amd-aiter (ROCm >= 7.0)",
+            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
+            f"{indent}{fn_var} = {get_fn}()",
+            f"{indent}{ok_var} = (",
+            f"{indent}    {fn_var} is not None",
+            # SDPA aligns causal masks top-left, aiter bottom-right; they agree
+            # only at equal q/k lengths.
+            f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",
+            f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",
+            # aiter asserts return_lse when any input requires grad
+            # (aiter/ops/mha.py) and we omit it, so this is inference only.
             f"{indent}    and not ({q_var}.requires_grad or {k_var}.requires_grad or {v_var}.requires_grad)",
             f"{indent})",
-            f"{indent}if _aiter_ok:",
-            f"{indent}    _aiter_q = {q_var}.transpose(1, 2)",
-            f"{indent}    _aiter_k = {k_var}.transpose(1, 2)",
-            f"{indent}    _aiter_v = {v_var}.transpose(1, 2)",
-            # _call_aiter_safe returns None on failure; avoids try/except in
-            # generated code which breaks torch.compile(fullgraph=True).
-            f"{indent}    def _call_aiter_safe(_fn, _q, _k, _v):",
+            f"{indent}if {ok_var}:",
+            f"{indent}    {qt} = {q_var}.transpose(1, 2)",
+            f"{indent}    {kt} = {k_var}.transpose(1, 2)",
+            f"{indent}    {vt} = {v_var}.transpose(1, 2)",
+            # A helper returning None keeps try/except out of the compiled
+            # region, which torch.compile(fullgraph=True) would reject.
+            f"{indent}    def {safe_fn}(_fn, _q, _k, _v):",
             f"{indent}        try: return _fn(_q, _k, _v, causal=True)",
             f"{indent}        except Exception: return None",
-            f"{indent}    _aiter_out = _call_aiter_safe(_aiter_fn, _aiter_q, _aiter_k, _aiter_v)",
-            f"{indent}    if _aiter_out is not None:",
-            f"{indent}        {out_var} = _aiter_out.transpose(1, 2)",
+            f"{indent}    {out_tmp} = {safe_fn}({fn_var}, {qt}, {kt}, {vt})",
+            f"{indent}    if {out_tmp} is not None:",
+            f"{indent}        {out_var} = {out_tmp}.transpose(1, 2)",
             f"{indent}    else:",
-            f"{indent}        {out_var} = torch.nn.functional.scaled_dot_product_attention(",
-            f"{indent}            {q_var}, {k_var}, {v_var}{rest_args_formatted})",
-            # else: _aiter_ok is False — fall back to plain SDPA directly
+        ] + sdpa_fallback(indent + " " * 8) + [
             f"{indent}else:",
-            f"{indent}    {out_var} = torch.nn.functional.scaled_dot_product_attention(",
-            f"{indent}        {q_var}, {k_var}, {v_var}{rest_args_formatted})",
-        ]
-        return "\n".join(lines)
+        ] + sdpa_fallback(indent + " " * 4)
+        lines[node.lineno - 1 : node.end_lineno] = [("\n".join(block)) + "\n"]
 
-    new_source, n = re.subn(sdpa_call_pattern, aiter_replacement, source, flags=re.DOTALL)
-    return new_source
-
+    return "".join(lines)
 
 
 def _get_compile_folder(use_tempfile=False):

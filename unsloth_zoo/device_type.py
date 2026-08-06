@@ -225,8 +225,8 @@ def _detect_gfx_arch():
     system-wide output and may return a different arch than the active device.
     """
     import re as _re
-    # First: query the currently active PyTorch device — always returns the right
-    # arch for the GPU PyTorch is using, respects HIP_VISIBLE_DEVICES.
+    # Active device first: right arch for the GPU torch is using, and it
+    # respects HIP_VISIBLE_DEVICES.
     try:
         if torch.cuda.is_available():
             dev = torch.cuda.current_device()
@@ -263,8 +263,8 @@ def get_amd_attention_implementation():
     Return the best available attention implementation for AMD ROCm.
 
     Priority:
-    1. "amd_aiter" — AMD aiter (pip install amd-aiter, ROCm >= 7.0 required)
-    2. "sdpa"      — PyTorch SDPA via MIOpen (always available on ROCm)
+    1. "amd_aiter": AMD aiter (pip install amd-aiter, ROCm >= 7.0 required)
+    2. "sdpa": PyTorch SDPA via MIOpen (always available on ROCm)
 
     Returns: "amd_aiter" | "sdpa"
     """
@@ -272,9 +272,8 @@ def get_amd_attention_implementation():
         return "sdpa"
 
     # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dep on libamdhip64.so.7).
-    # Prefer torch.version.hip — always present in ROCm PyTorch wheels and not
-    # affected by rocm-smi which reports the kernel driver version, not the
-    # ROCm runtime version (the two can differ on wheel-only installs).
+    # Prefer torch.version.hip: always present in ROCm wheels. rocm-smi
+    # reports the kernel driver version, which can differ from the runtime.
     try:
         _hip_ver = getattr(torch.version, "hip", None)
         if _hip_ver is not None:
@@ -321,9 +320,9 @@ def get_amd_flash_attn_func():
     """
     Return the amd-aiter flash attention function, or None if unavailable.
 
-    Checks both naming conventions across amd-aiter versions:
-    - flash_attn_func (newer, lowercase)
-    - FlashAttnFunc   (older, class-based callable)
+    Only the functional API `flash_attn_func` (aiter >= 0.7) is accepted. The
+    class API `FlashAttnFunc` is deliberately not wrapped, so environments with
+    only that one get None and fall back to SDPA.
 
     Call signature: func(q, k, v, causal=True)
     Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
@@ -338,7 +337,7 @@ def get_amd_flash_attn_func():
         # FlashAttnFunc is a torch.autograd.Function whose .apply() requires 13+
         # positional arguments (dropout_p, softmax_scale, causal, window_size,
         # bias, alibi_slopes, deterministic, return_lse, return_softmax,
-        # is_grad_enabled, ...) — see ROCm/aiter:aiter/ops/mha.py.
+        # is_grad_enabled, ...), see ROCm/aiter:aiter/ops/mha.py.
         # We cannot safely wrap it without knowing the required defaults for the
         # installed aiter version.  Return None so callers fall back to SDPA.
         # (FlashAttnFunc environments should expose flash_attn_func in aiter >= 0.7)
