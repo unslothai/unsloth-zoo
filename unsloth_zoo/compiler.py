@@ -24,6 +24,7 @@ __all__ = [
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import hashlib
 import io
 import inspect
 import re
@@ -901,6 +902,76 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
     lines.insert(insert_at, alias_text)
     return "".join(lines)
 
+# How long a rank waits for rank 0's compiled cache file to become visible before
+# giving up. Network filesystems can lag behind the barrier by a little.
+_COMPILED_CACHE_VISIBILITY_TIMEOUT = 5.0
+
+def _compiled_cache_decision(function_location, write_new_source, overwrite):
+    """Rank 0 decides whether the compiled cache file needs writing.
+
+    Returns (should_write, digest) where digest is of the bytes rank 0 ends up
+    importing, so the other ranks can confirm they import the same module.
+    """
+    should_write = overwrite or not os.path.isfile(function_location)
+    if not is_distributed():
+        # Nothing to cross-check against, so skip hashing entirely.
+        return should_write, None
+    if should_write:
+        return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
+    # Digest what is actually on disk rather than write_new_source: with
+    # UNSLOTH_COMPILE_OVERWRITE=0 rank 0 deliberately keeps an older cache file
+    # that does not equal write_new_source.
+    try:
+        with open(function_location, "rb") as f:
+            return False, hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        # Cannot read it; fall back to an existence check on the other ranks.
+        return False, None
+pass
+
+def _verify_compiled_cache_file(function_location, expected_digest):
+    """Confirm this rank sees the same cache file rank 0 skipped rewriting.
+
+    Rank 0 evaluated the write condition for everyone, so a rank whose local view
+    disagrees would otherwise silently import a different module. Retries briefly
+    to absorb network filesystem propagation lag.
+    """
+    rank = os.environ.get("RANK", "0")
+    deadline = time.monotonic() + _COMPILED_CACHE_VISIBILITY_TIMEOUT
+    delay = 0.05
+    local_digest = None
+    while True:
+        try:
+            with open(function_location, "rb") as f:
+                contents = f.read()
+            if expected_digest is None:
+                # Rank 0 could not digest its own copy, so existence is all we can check.
+                return
+            local_digest = hashlib.sha256(contents).hexdigest()
+            if local_digest == expected_digest:
+                return
+        except OSError:
+            local_digest = None
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(delay)
+        delay = min(delay * 2, 0.5)
+
+    if local_digest is None:
+        raise FileNotFoundError(
+            f"Unsloth: Compiled cache file {function_location} exists on rank 0 "
+            f"but is not readable on rank {rank} after "
+            f"{_COMPILED_CACHE_VISIBILITY_TIMEOUT:.0f}s. Ensure the compiled cache "
+            "is on a shared filesystem with consistent metadata."
+        )
+    raise RuntimeError(
+        f"Unsloth: Compiled cache file {function_location} differs between rank 0 "
+        f"({expected_digest[:12]}) and rank {rank} ({local_digest[:12]}), so the "
+        "ranks would import different implementations. Ensure the compiled cache "
+        "is on a shared filesystem, or delete it so it is regenerated."
+    )
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -1137,10 +1208,9 @@ def create_new_function(
     # locally lets a rank that arrives after rank 0 has written the file skip the
     # collective, which desynchronises the group and hangs it. Rank 0 decides and
     # broadcasts instead.
-    def _should_write_cache_file():
-        return overwrite or not os.path.isfile(function_location)
-
-    should_write_cache_file = distributed_function(1, _should_write_cache_file)
+    should_write_cache_file, cache_file_digest = distributed_function(
+        2, _compiled_cache_decision, function_location, write_new_source, overwrite,
+    )
     if should_write_cache_file:
         try:
             distributed_function(1, write_file, function_location, write_new_source)
@@ -1156,12 +1226,8 @@ def create_new_function(
                 distributed_function(1, write_file, function_location, write_new_source)
             pass
         pass
-    elif not os.path.isfile(function_location):
-        raise FileNotFoundError(
-            f"Unsloth: Compiled cache file {function_location} exists on rank 0 "
-            "but is not visible on this rank. Ensure the compiled cache is on a "
-            "shared filesystem with consistent metadata."
-        )
+    elif is_distributed():
+        _verify_compiled_cache_file(function_location, cache_file_digest)
     pass
 
     # Now import modules! Use a tempfile if it fails on the first try!
