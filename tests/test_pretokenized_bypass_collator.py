@@ -1665,3 +1665,47 @@ def test_a_model_input_column_survives_raw_text_tokenization():
     assert out.eval_dataset[0]["sample_weight"] == 0.25
     # The raw text it replaced is still gone: the collator cannot stack strings.
     assert "text" not in columns, sorted(columns)
+
+
+def test_a_bare_image_column_of_paths_is_refused():
+    """`img` holding "cat.jpg" is media, and looked like text on schema alone.
+
+    `_MEDIA_KEYS` already treats the bare names as unambiguous media one level
+    down; the top-level list only carried the compound spellings, so a
+    pretokenized VLM split keeping its images in a plain `img` column passed the
+    bypass and had the column dropped before training.
+    """
+    trainer = _text_only_trainer()
+    trainer.train_dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "img": ["images/cat.jpg", "images/dog.png"],
+    })
+
+    with pytest.raises(Exception):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_token_classification_collator_keeps_its_padding_settings():
+    """Every pad-delegating collator's padding fields must survive the repair.
+
+    `DataCollatorForTokenClassification` is a separate class, not a subclass of
+    `DataCollatorWithPadding`, so an isinstance check on that one class dropped
+    `padding = "max_length"` and silently reshaped every batch to dynamic.
+    """
+    from transformers import DataCollatorForTokenClassification
+
+    collator = DataCollatorForTokenClassification(
+        tokenizer = StubProcessor(),
+        padding = "max_length",
+        max_length = 128,
+        pad_to_multiple_of = 8,
+    )
+    trainer = _text_only_trainer()
+    trainer.data_collator = collator
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    repaired = out.data_collator
+    assert repaired.padding == "max_length", repaired.padding
+    assert repaired.max_length == 128, repaired.max_length
+    assert repaired.pad_to_multiple_of == 8, repaired.pad_to_multiple_of

@@ -911,6 +911,11 @@ def train_on_responses_only(
         # list, so its plain string schema called the split text-only.
         "image_filename", "image_filenames", "video_filename", "video_filenames",
         "audio_filename", "audio_filenames",
+        # Bare names, which `_MEDIA_KEYS` already treats as unambiguous media one
+        # level down. A pretokenized set storing "cat.jpg" in a plain `img` column
+        # looked like text on schema alone, so the value was never examined and the
+        # images were dropped before training.
+        "img", "imgs", "image", "images", "video", "videos", "audio", "audios",
     ))
 
     # A name that only ever points at media points at media nested too: a turn
@@ -1413,12 +1418,16 @@ def train_on_responses_only(
         # collator; for any other class this is a replacement, not a swap, and its
         # same-named attributes need not mean the same thing.
         _same_class = _processor_backed and isinstance(_collator, DataCollatorForSeq2Seq)
-        # DataCollatorWithPadding hands these four to `tokenizer.pad` exactly as
-        # DataCollatorForSeq2Seq does, so a repair that dropped them would turn a
-        # `padding = "max_length"` run into a dynamically padded one, silently
-        # reshaping every batch.
-        _padding_class = _processor_backed and not _same_class and \
-            isinstance(_collator, DataCollatorWithPadding)
+        # These are handed to `tokenizer.pad` with the same meaning by every
+        # pad-delegating collator, not just DataCollatorWithPadding: a
+        # DataCollatorForTokenClassification carrying `padding = "max_length"` is
+        # a separate class, not a subclass, so an isinstance check on that one
+        # class dropped its settings and silently turned the run into a
+        # dynamically padded one. Ask whether the fields are there.
+        _padding_class = _processor_backed and not _same_class and any(
+            hasattr(_collator, _n)
+            for _n in ("padding", "max_length", "pad_to_multiple_of")
+        )
         _names = ("model", "padding", "max_length", "pad_to_multiple_of",
                   "label_pad_token_id", "return_tensors") if _same_class else \
                  ("padding", "max_length", "pad_to_multiple_of", "return_tensors")
