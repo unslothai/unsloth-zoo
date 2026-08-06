@@ -862,7 +862,18 @@ def _note_packed_under_checkpoint():
     except Exception:
         _PACKED_COMPILED_IN_CHECKPOINT = True
         return
-    if hooks and _is_checkpoint_pack_hook(hooks[0]):
+    if not hooks:
+        return                                  # no region open, definitively
+    if _is_checkpoint_pack_hook(hooks[0]):
+        _PACKED_COMPILED_IN_CHECKPOINT = True
+        return
+    # The accessor reports only the TOP of the stack, and a user's own
+    # `saved_tensors_hooks` / `save_on_cpu` entered inside the region sits above
+    # ours. An unrecognised hook is "cannot tell from here", not "no region", so
+    # ask the frames -- the same fallback `_in_non_reentrant_checkpoint` makes.
+    # Cheap enough for the per-call probe: it is only reached while a foreign
+    # hook is installed, and it latches on the first hit.
+    if _walk_for_checkpoint_frame():
         _PACKED_COMPILED_IN_CHECKPOINT = True
 
 
@@ -1161,6 +1172,11 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     return _fall_back_to_eager_on_recompile_limit(compiled, func, label)
 
 
+# Call sites that have already given up, by label. Outlives the wrappers, which
+# the registry holds only weakly.
+_LATCHED_EAGER_LABELS: set = set()
+
+
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
 
@@ -1191,7 +1207,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
-    state = {"warned": False, "eager": False, "pending_eager": False, "bumps": 0}
+    # A wrapper built inside a forward -- GRPO's `accumulate_chunk` closes over
+    # per-call accumulators, so it cannot be hoisted -- is unreachable the moment
+    # that forward returns, and the registry holds it only weakly. Latching it
+    # therefore bought nothing: the next step built and compiled a fresh one,
+    # borrowed budget again, and the bounded transition to eager never happened.
+    # The decision belongs to the call site, not to the object, so carry it by
+    # label across rebuilds.
+    state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
+             "pending_eager": False, "bumps": 0}
 
     def _warn(message):
         if not state["warned"]:
@@ -1218,6 +1242,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         """
         state["eager"] = True
         state["pending_eager"] = False
+        _LATCHED_EAGER_LABELS.add(label)
         for ref in _EAGER_FALLBACK_WRAPPERS:
             w = ref()
             if w is None:
@@ -1227,6 +1252,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 continue
             st["eager"] = True
             st["pending_eager"] = False
+            _wl = getattr(w, "_unsloth_fallback_label", None)
+            if _wl is not None: _LATCHED_EAGER_LABELS.add(_wl)
         _restore_recompile_limits_if_idle()
 
     def _release_borrowed_budget():

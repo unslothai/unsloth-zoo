@@ -772,6 +772,18 @@ def _utils():
     return U
 
 
+@pytest.fixture(autouse = True)
+def _forget_this_files_latches():
+    """The give-up decision is now kept by LABEL, so it outlives the wrapper --
+    that is the point, since a wrapper built inside a forward is collected the
+    moment it returns. It also outlives a test, so drop this file's own labels
+    around each one; the package's real kernels keep theirs."""
+    import unsloth_zoo.temporary_patches.utils as U
+    U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
+    yield
+    U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
+
+
 # Labels this file's own wrappers are built with, so the reset can leave the
 # package's real kernels registered.
 _OUR_LABELS = frozenset((
@@ -807,6 +819,10 @@ def _reset_bump_state(U):
         _r for _r in U._EAGER_FALLBACK_WRAPPERS if _r() is not None
         and getattr(_r(), "_unsloth_fallback_label", None) not in _OUR_LABELS
     ]
+    # The give-up decision now outlives the wrapper, by label, so a wrapper
+    # built inside a forward keeps it across rebuilds. Same scoping rule: drop
+    # only this file's labels, or the package's own kernels lose their latch.
+    U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
     # Clearing the bookkeeping alone left a real bump standing: a wrapper that
     # exhausted its cache raised both budgets by 16 before signalling, so every
     # later test ran against enlarged limits and could stop reaching the
@@ -1352,3 +1368,101 @@ def test_a_settled_boundary_is_quiet(caplog):
     with caplog.at_level(logging.WARNING):
         U.apply_pending_eager_fallbacks()
     assert "has not been finalised" not in caplog.text
+
+
+def test_a_user_hook_above_the_checkpoints_does_not_hide_it():
+    """The accessor reports only the TOP of the saved-tensor hook stack. A
+    `saved_tensors_hooks` / `save_on_cpu` entered inside the region sits above
+    the checkpoint's, so the probe saw an unrecognised hook and left the marker
+    false. If that layer then returned and a later wrapper exhausted its cache,
+    `_give_up` found neither a live frame nor the marker, latched everything
+    eager, and the earlier compiled activation was recomputed eagerly."""
+    U = _utils()
+    def _mine(*a, **k): ...
+    _mine.__qualname__ = "save_on_cpu.<locals>.pack_to_cpu"
+    _mine.__module__ = "torch.autograd.graph"
+    saved_accessor = U._saved_tensor_hook_accessor
+    saved_walk = U._walk_for_checkpoint_frame
+    saved_marker = U._PACKED_COMPILED_IN_CHECKPOINT
+    U._saved_tensor_hook_accessor = lambda: (lambda _: [_mine, _mine])
+    U._walk_for_checkpoint_frame = lambda: True     # a region IS open
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is True
+    finally:
+        U._saved_tensor_hook_accessor = saved_accessor
+        U._walk_for_checkpoint_frame = saved_walk
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved_marker
+
+
+def test_a_user_hook_with_no_region_below_it_does_not_latch():
+    """The frames are consulted, not assumed: an ordinary `saved_tensors_hooks`
+    outside any checkpoint must stay unlatched, or every such run loses the
+    eager fallback."""
+    U = _utils()
+    def _mine(*a, **k): ...
+    saved_accessor = U._saved_tensor_hook_accessor
+    saved_walk = U._walk_for_checkpoint_frame
+    saved_marker = U._PACKED_COMPILED_IN_CHECKPOINT
+    U._saved_tensor_hook_accessor = lambda: (lambda _: [_mine, _mine])
+    U._walk_for_checkpoint_frame = lambda: False
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+    finally:
+        U._saved_tensor_hook_accessor = saved_accessor
+        U._walk_for_checkpoint_frame = saved_walk
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved_marker
+
+
+def test_an_empty_hook_stack_never_walks_the_frames():
+    """The common case stays cheap: no hooks means no region, definitively, so
+    the per-call probe must not pay for a full stack walk."""
+    U = _utils()
+    walked = {"n": 0}
+    saved_accessor = U._saved_tensor_hook_accessor
+    saved_walk = U._walk_for_checkpoint_frame
+    saved_marker = U._PACKED_COMPILED_IN_CHECKPOINT
+    def _count():
+        walked["n"] += 1
+        return True
+    U._saved_tensor_hook_accessor = lambda: (lambda _: [])
+    U._walk_for_checkpoint_frame = _count
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert walked["n"] == 0
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+    finally:
+        U._saved_tensor_hook_accessor = saved_accessor
+        U._walk_for_checkpoint_frame = saved_walk
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved_marker
+
+
+def test_a_rebuilt_wrapper_remembers_the_give_up():
+    """GRPO's `accumulate_chunk` closes over per-call accumulators, so it is
+    built inside `forward` and unreachable the moment that forward returns --
+    and the registry holds it weakly. Latching it bought nothing: the next step
+    compiled a fresh one and borrowed budget again, so the bounded transition to
+    eager never happened. The decision belongs to the call site."""
+    c1, e1, calls1 = _pair(_LIMIT_ERROR("recompile_limit reached"))
+    w1 = _fall_back_to_eager_on_recompile_limit(c1, e1, "C.forward")
+    w1(1)
+    assert w1._unsloth_fallback_state["eager"], "the first one should have latched"
+    del w1
+
+    c2, e2, calls2 = _pair()
+    w2 = _fall_back_to_eager_on_recompile_limit(c2, e2, "C.forward")
+    assert w2(5) == 10
+    assert calls2 == {"c": 0, "e": 1}, "the rebuilt wrapper compiled again"
+
+
+def test_a_different_call_site_is_not_dragged_along():
+    c1, e1, _ = _pair(_LIMIT_ERROR("recompile_limit reached"))
+    _fall_back_to_eager_on_recompile_limit(c1, e1, "C.forward")(1)
+
+    c2, e2, calls2 = _pair()
+    assert _fall_back_to_eager_on_recompile_limit(c2, e2, "B.forward")(5) == 10
+    assert calls2 == {"c": 1, "e": 0}

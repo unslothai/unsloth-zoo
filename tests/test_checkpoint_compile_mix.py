@@ -122,6 +122,11 @@ def dynamo_limits():
     # the snapshot teardown restores from.
     saved_bumped = {k: {kk: list(vv) for kk, vv in v.items()}
                     for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
+    # The give-up decision is kept by LABEL now, so it outlives the wrapper --
+    # which is the point, since one built inside a forward dies with it. Every
+    # test here reuses "test_norm", so a latch from an earlier one would start
+    # the next already eager.
+    U._LATCHED_EAGER_LABELS.discard("test_norm")
     try:
         yield
     finally:

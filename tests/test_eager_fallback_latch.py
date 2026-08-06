@@ -54,6 +54,10 @@ def _isolate_registry(monkeypatch):
     monkeypatch.setattr(U, "_EAGER_FALLBACK_WRAPPERS", [])
     monkeypatch.setattr(U, "_recompile_limit_errors", lambda: (Boom,))
     monkeypatch.setattr(U, "_disabled_hook_graph_break_error", lambda: ())
+    # The give-up decision is kept by LABEL now, so a wrapper built inside a
+    # forward keeps it across rebuilds. That also outlives a test, and every
+    # test here reuses "M.forward" / "M.f".
+    monkeypatch.setattr(U, "_LATCHED_EAGER_LABELS", set())
 
 
 def _pair(fail_after=0):
