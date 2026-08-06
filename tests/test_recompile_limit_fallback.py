@@ -716,6 +716,25 @@ def test_a_bump_taken_inside_a_scoped_config_patch_is_not_written_back():
         assert getattr(config, name) == before, "clobbered the outer value"
 
 
+def test_a_restore_underneath_an_active_config_patch_keeps_the_debt():
+    """A step boundary can land inside someone's `torch._dynamo.config.patch`.
+
+    Our bumped value is not the live one then, and dropping the bookkeeping for
+    that reason loses the original: the patch exits, dynamo hands our bump
+    back, and nothing is left that knows what it was.
+    """
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        bumped = getattr(config, name)
+        assert bumped > before
+        with torch._dynamo.config.patch({name: 2}):
+            mod._restore_recompile_limits()     # our value is hidden right now
+            assert getattr(config, name) == 2, "clobbered the patched value"
+        assert getattr(config, name) == bumped, "dynamo restored our bump"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "the bump was stranded forever"
+
+
 def test_a_successful_retry_keeps_its_bump():
     """The control for the test above.
 

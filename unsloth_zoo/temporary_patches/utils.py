@@ -969,11 +969,15 @@ def _restore_recompile_limits():
     restored = 0
     for name, original in list(_ORIGINAL_RECOMPILE_LIMITS.items()):
         try:
-            # Someone else owns this name now, so our captured value is stale.
-            # Drop the claim rather than clobber theirs.
-            if getattr(_config, name, None) in _BUMPED_RECOMPILE_LIMITS.get(name, ()):
-                setattr(_config, name, original)
-                restored += 1
+            if getattr(_config, name, None) not in _BUMPED_RECOMPILE_LIMITS.get(name, ()):
+                # Not our value right now: either someone else's write or a
+                # live `torch._dynamo.config.patch` hiding ours, and the two
+                # are indistinguishable. Dropping the claim loses the original
+                # when that patch exits and hands our bump back, so keep it and
+                # settle at a later boundary.
+                continue
+            setattr(_config, name, original)
+            restored += 1
         except Exception:
             continue
         _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
