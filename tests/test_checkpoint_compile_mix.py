@@ -136,6 +136,66 @@ def test_exhausted_recompile_cache_does_not_break_the_backward(dynamo_limits):
     not U._recompile_limit_errors(),
     reason = "this torch has no recompile-limit exception to raise",
 )
+@pytest.mark.skipif(
+    U._in_non_reentrant_checkpoint() is None,
+    reason = "torch < 2.8 cannot report whether a checkpoint region is live",
+)
+def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limits):
+    """The same regression, on the path where there is no budget left to buy.
+
+    Deferring needs a compiled result to defer with, and here there is none:
+    the call raised and the retry could not be paid for. Running it eagerly
+    finishes the forward but strands what the step already packed compiled, so
+    the backward either aborts or, when the shapes line up, returns silently
+    wrong gradients. End the step and let the caller retry it consistently.
+    """
+    _reset_dynamo(2)
+    compiled = torch.compile(_norm, fullgraph = True, dynamic = False,
+                             backend = _BACKEND)
+    fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
+
+    saved_global = U._GLOBAL_BUMPS
+    U._GLOBAL_BUMPS = U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS      # nothing left to buy
+    try:
+        with pytest.raises(U._recompile_limit_errors()):
+            _run_checkpointed_step(fn)
+    finally:
+        U._GLOBAL_BUMPS = saved_global
+
+    state = fn._unsloth_fallback_state
+    assert state["eager"], "the wrapper must latch so the retry is consistent"
+    assert state["bumps"] == 0, "no budget was borrowed"
+
+
+@pytest.mark.skipif(
+    not U._recompile_limit_errors(),
+    reason = "this torch has no recompile-limit exception to raise",
+)
+def test_a_spent_budget_still_falls_back_outside_a_checkpoint(dynamo_limits):
+    """The majority case must not regress. With no checkpoint region live there
+    is nothing packed to strand, so eager is safe and the run continues."""
+    _reset_dynamo(2)
+    compiled = torch.compile(_norm, fullgraph = True, dynamic = False,
+                             backend = _BACKEND)
+    fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
+
+    saved_global = U._GLOBAL_BUMPS
+    U._GLOBAL_BUMPS = U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS
+    try:
+        torch.manual_seed(0)
+        w = torch.randn(16, requires_grad = True)
+        for k in range(8):                      # a fresh guard variant each time
+            fn(w, torch.randn(2, 4, 16), k).sum().backward()
+    finally:
+        U._GLOBAL_BUMPS = saved_global
+
+    assert fn._unsloth_fallback_state["eager"], "it should have run out at all"
+
+
+@pytest.mark.skipif(
+    not U._recompile_limit_errors(),
+    reason = "this torch has no recompile-limit exception to raise",
+)
 def test_pending_switch_is_applied_at_the_step_boundary(dynamo_limits):
     _reset_dynamo(2)
     compiled = torch.compile(_norm, fullgraph = True, dynamic = False,

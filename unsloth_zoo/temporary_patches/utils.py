@@ -685,6 +685,30 @@ def _recompile_limit_errors():
     return tuple(found)
 
 
+def _in_non_reentrant_checkpoint():
+    """Are we inside a `use_reentrant = False` region? None when torch cannot say.
+
+    The only saved-tensor hooks `torch.utils.checkpoint` installs are the two
+    the non-reentrant path uses, and their qualnames separate the forward pack
+    from the backward recompute. Both class names are unchanged from 2.6 to
+    current main. The accessor arrived in 2.8, so 2.6 and 2.7 answer None and
+    keep the old behaviour. Reentrant checkpointing installs no hooks and
+    answers False, which is right: it re-differentiates what it recomputes, so
+    a mode flip cannot strand it.
+    """
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if top is None: return None
+    try:
+        hooks = top(True)                       # ignore_is_tracing
+    except Exception:
+        return None
+    if not hooks: return False
+    pack = hooks[0]
+    if getattr(pack, "__module__", "") != "torch.utils.checkpoint": return False
+    return getattr(pack, "__qualname__", "").startswith(
+        ("_checkpoint_hook", "_recomputation_hook"))
+
+
 def _wants_hard_recompile_failure():
     """Did the user ask Dynamo to make cache exhaustion fatal?
 
@@ -1013,6 +1037,26 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         )
         return result
 
+    def _give_up(e, args, kwargs):
+        """No budget left. Latch, then decide whether eager is even survivable.
+
+        Inside a non-reentrant checkpoint region it is not: whatever this step
+        already packed compiled gets recomputed eagerly, and the backward
+        either aborts or, when the shapes happen to line up, hands back wrong
+        gradients (torch compares only shape/dtype/device). Nothing is left to
+        keep this call compiled with, so end the step instead. Every borrower
+        is eager by now, so the caller's retry is consistent, which is the
+        contract `force_eager_fallback` offers reactively.
+        """
+        _latch_all_to_eager()
+        _warn(
+            f"Unsloth: torch.compile ran out of recompilation cache for "
+            f"{label}; running it eagerly from here. Training is "
+            f"unaffected apart from speed. ({type(e).__name__})"
+        )
+        if _in_non_reentrant_checkpoint(): raise e
+        return eager_func(*args, **kwargs)
+
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
         if state["eager"]:
@@ -1025,13 +1069,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             result = _retry_with_more_budget(args, kwargs)
             if result is not _NO_RESULT:
                 return result
-            _latch_all_to_eager()
-            _warn(
-                f"Unsloth: torch.compile ran out of recompilation cache for "
-                f"{label}; running it eagerly from here. Training is "
-                f"unaffected apart from speed. ({type(e).__name__})"
-            )
-            return eager_func(*args, **kwargs)
+            return _give_up(e, args, kwargs)
         except graph_break_errors as e:
             # Cache exhaustion on a torch that has no exception class for it
             # (2.4), then our own `torch.compiler.disable` hook. Anything else
@@ -1040,13 +1078,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 result = _retry_with_more_budget(args, kwargs)
                 if result is not _NO_RESULT:
                     return result
-                _latch_all_to_eager()
-                _warn(
-                    f"Unsloth: torch.compile ran out of recompilation cache "
-                    f"for {label}; running it eagerly from here. Training is "
-                    f"unaffected apart from speed. ({type(e).__name__})"
-                )
-                return eager_func(*args, **kwargs)
+                return _give_up(e, args, kwargs)
             if not _is_our_own_disabled_hook(e):
                 raise
             state["eager"] = True
