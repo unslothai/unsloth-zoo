@@ -170,6 +170,24 @@ class TestFlashInferGuard:
                     f"{env_key} must be deleted by _clear_flashinfer_env_on_hip on AMD ROCm"
                 )
 
+    def test_production_guard_clears_attention_backend_on_hip(self):
+        """VLLM_ATTENTION_BACKEND=FLASHINFER must also be cleared on AMD ROCm.
+
+        A future change that stops clearing this key would leave vLLM on the
+        CUDA-only FlashInfer path on ROCm — this test catches that regression.
+        """
+        import os
+        import unsloth_zoo.vllm_utils as vu
+        env_key = "VLLM_ATTENTION_BACKEND"
+        with mock.patch.dict(os.environ, {env_key: "FLASHINFER"}):
+            with mock.patch.object(vu, "is_hip", return_value=True):
+                returned = vu._clear_flashinfer_env_on_hip()
+                assert returned is True
+                assert env_key not in os.environ, (
+                    f"{env_key}=FLASHINFER must be cleared by "
+                    "_clear_flashinfer_env_on_hip on AMD ROCm"
+                )
+
     def test_production_guard_preserves_env_on_cuda(self):
         """On CUDA, _clear_flashinfer_env_on_hip must return False and leave env untouched."""
         import os
