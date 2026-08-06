@@ -1099,10 +1099,14 @@ def train_on_responses_only(
         return False
     pass
 
-    def _row_is_plain_text(row):
+    def _row_is_plain_text(row, schema_proven = frozenset()):
         # Tokenizer/model columns are numeric by construction; the rest is what
-        # can smuggle in images.
-        return all(_is_plain_text(v) for k, v in row.items() if k not in _TEXT_COLUMNS)
+        # can smuggle in images. A column the schema already proved needs no
+        # second opinion: it judged EVERY row, where re-reading it as a value is
+        # strictly weaker and misreads the tensor/ndarray `with_format("torch")`
+        # and `with_format("numpy")` hand back for an ordinary numeric column.
+        return all(_is_plain_text(v) for k, v in row.items()
+                   if k not in _TEXT_COLUMNS and k not in schema_proven)
     pass
 
     # A one-row peek calls a mixed split text-only: row 0 holds plain `messages`
@@ -1193,24 +1197,31 @@ def train_on_responses_only(
     pass
 
     def _columns_are_provably_text(split, names):
+        """`(every column is text, the columns the schema itself proved)`.
+
+        The second half is threaded down to `_row_is_plain_text`, which must not
+        re-judge a column the schema has already settled for every row.
+        """
         features = getattr(split, "features", None)
         if features:
+            proven = set()
             try:
                 for name, feature in features.items():
                     if name in _TEXT_COLUMNS: continue
-                    if not _feature_is_plain_text(feature): return False
+                    if not _feature_is_plain_text(feature): return False, proven
                     if _feature_has_ambiguous_media_key(feature) and \
-                        not _column_values_are_plain_text(split, name): return False
-                return True
+                        not _column_values_are_plain_text(split, name): return False, proven
+                    proven.add(name)
+                return True, proven
             except Exception:
-                return False
+                return False, proven
         # No schema (an unresolved stream): a sample cannot prove what the rows it
         # never reads hold, so trust only the tokenizer's own columns.
-        return not (set(names) - _TEXT_COLUMNS)
+        return not (set(names) - _TEXT_COLUMNS), set()
     pass
 
     def _split_views(dataset):
-        """`(column names, sampled rows, provably text, split)` per split.
+        """`(column names, sampled rows, provably text, schema-proven, split)` per split.
 
         `iter()` restarts a datasets IterableDataset, so peeking rows does not
         consume the stream (this is how `_maybe_tokenize_dataset` peeks too).
@@ -1230,7 +1241,8 @@ def train_on_responses_only(
             if not names:
                 if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
                 names = list(rows[0].keys())
-            views.append((set(names), rows, _columns_are_provably_text(split, names), split))
+            provable, proven = _columns_are_provably_text(split, names)
+            views.append((set(names), rows, provable, proven, split))
         return views
     pass
 
@@ -1247,7 +1259,7 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows, provable, split in views:
+        for names, rows, provable, proven, split in views:
             if "input_ids" not in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
             if _has_media_column(names, rows, split): return False
@@ -1255,7 +1267,7 @@ def train_on_responses_only(
             # can carry inline images that the strip below would throw away.
             if not provable: return False
             for row in rows:
-                if not _row_is_plain_text(row): return False
+                if not _row_is_plain_text(row, proven): return False
         return True
     pass
 
@@ -1276,7 +1288,7 @@ def train_on_responses_only(
         except Exception:
             return False
         if not views: return False
-        for names, rows, provable, split in views:
+        for names, rows, provable, proven, split in views:
             if "input_ids" in names: return False
             if not names.isdisjoint(_MULTIMODAL_COLUMNS): return False
             if _has_media_column(names, rows, split): return False
@@ -1286,7 +1298,7 @@ def train_on_responses_only(
             if not provable: return False
             for row in rows:
                 if not isinstance(row.get(field), str): return False
-                if not _row_is_plain_text(row): return False
+                if not _row_is_plain_text(row, proven): return False
             # The sample says these rows are text; the tokenizer reads every row.
             if not _column_is_all_strings(split, field): return False
         return True

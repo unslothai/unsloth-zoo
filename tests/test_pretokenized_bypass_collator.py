@@ -1782,3 +1782,47 @@ def test_a_raw_eval_split_whose_full_scan_fails_is_refused():
     with pytest.raises(ValueError, match = "does not support response-only") as excinfo:
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "['text']" in str(excinfo.value), "the refusal does not name the column"
+
+
+@pytest.mark.parametrize("fmt", ["torch", "numpy"])
+def test_a_formatted_numeric_column_still_reaches_masking(fmt):
+    """A schema-proven column must not be re-judged through its row value.
+
+    Under `with_format("torch")`/`with_format("numpy")` an auxiliary numeric
+    column such as `sample_weight` or `source_id` comes back as a tensor/array,
+    which `_is_plain_text` does not recognise, so a perfectly good text-only run
+    was refused with the vision-collator error. The schema already judged every
+    row of that column, so the row check has nothing left to add.
+    """
+    trainer = _text_only_trainer()
+    trainer.train_dataset = Dataset.from_dict({
+        "input_ids": [list(ROW)] * 4,
+        "sample_weight": [0.25, 0.75, 0.5, 1.0],
+        "source_id": [1, 2, 3, 4],
+    }).with_format(fmt)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.train_dataset.column_names, "the split was never masked"
+
+
+@pytest.mark.parametrize("fmt", ["torch", "numpy"])
+def test_a_formatted_image_column_is_still_refused(fmt):
+    """The guard that matters: an image is a numeric tensor under these formats
+    too, so skipping the row check must only ever cover what the schema proved."""
+    from datasets import Features, Image, Sequence, Value
+    from PIL import Image as PILImage
+
+    picture = PILImage.new("RGB", (2, 2))
+    dataset = Dataset.from_dict(
+        {"input_ids": [list(ROW)] * 2, "picture": [picture, picture]},
+        features = Features({
+            "input_ids": Sequence(Value("int32")),
+            "picture": Image(),
+        }),
+    ).with_format(fmt)
+    trainer = _text_only_trainer()
+    trainer.train_dataset = dataset
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
