@@ -225,13 +225,15 @@ def test_processor_specific_column_names_are_refused_too(column):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
-def test_a_processor_backed_collator_is_rebuilt_even_with_packing():
-    """It raises on the first batch either way, so the repair is not packing-gated."""
+def test_a_processor_backed_collator_under_packing_is_refused():
+    """The repair rebuilds it as a plain DataCollatorForSeq2Seq, which packs
+    nothing and drops the inputs a packed batch needs, so say so rather than
+    train an unpacked run the caller did not ask for."""
     trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubProcessor()),
                           _text_rows())
     trainer.args.packing = True
-    train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert hasattr(trainer.data_collator.tokenizer, "pad")
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
 def test_the_rebuild_keeps_the_settings_the_caller_chose():
@@ -300,12 +302,20 @@ def test_a_raw_split_with_no_text_column_is_still_refused():
 
 # ---- non-seq2seq collators that pad through a processor --------------------
 
-def test_a_processor_backed_padding_collator_is_repaired_under_packing():
+def test_a_processor_backed_padding_collator_under_packing_is_refused():
     """`DataCollatorWithPadding(tokenizer = processor)` pads through the same
-    missing `.pad`, so packing being on must not leave it attached."""
+    missing `.pad`, so it is replaced too, and the replacement does not pack."""
     collator = DataCollatorWithPadding(tokenizer = StubProcessor())
     trainer = StubTrainer(collator, _text_rows())
     trainer.args.packing = True
+
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_processor_backed_padding_collator_is_repaired():
+    collator = DataCollatorWithPadding(tokenizer = StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
@@ -316,19 +326,27 @@ def test_a_processor_backed_padding_collator_is_repaired_under_packing():
     assert "input_ids" in batch and "labels" in batch
 
 
-def test_a_collator_holding_only_a_processor_is_repaired_under_packing():
+def test_a_collator_holding_only_a_processor_is_repaired():
     """TRL's `DataCollatorForVisionLanguageModeling` keeps the processor under
     `.processor`, not `.tokenizer`, with the same problem. It rebuilds labels
-    through that processor, so it is a class we know how to answer for and the
-    repair still runs with packing on."""
+    through that processor, so it is a class we know how to answer for."""
+    from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
+
+    trainer = _text_only_trainer()
+    trainer.data_collator = DataCollatorForVisionLanguageModeling(processor = StubProcessor())
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert hasattr(out.data_collator.tokenizer, "pad")
+
+
+def test_a_collator_holding_only_a_processor_under_packing_is_refused():
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 
     trainer = _text_only_trainer()
     trainer.data_collator = DataCollatorForVisionLanguageModeling(processor = StubProcessor())
     trainer.args.packing = True
-    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
-    assert hasattr(out.data_collator.tokenizer, "pad")
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
 class PackingCollator:
@@ -1693,13 +1711,22 @@ def test_a_self_packing_collator_holding_a_processor_is_left_alone():
     assert "position_ids" in out.data_collator(rows), "its packing did not survive"
 
 
-def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_under_packing():
-    """The other direction: a class that really does pad through `.pad` is still
-    rebuilt even with packing on, since it dies on the first batch either way."""
+def test_a_seq2seq_collator_holding_a_processor_is_refused_under_packing():
+    """The other direction: a class that really does pad through `.pad` would be
+    rebuilt, and the rebuilt collator packs nothing, so packing is refused."""
     collator = DataCollatorForSeq2Seq(tokenizer = ProcessorWithoutImages())
     trainer = StubTrainer(collator, _text_rows())
     trainer.processing_class = StubTokenizer()
     trainer.args.packing = True
+
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_without_packing():
+    collator = DataCollatorForSeq2Seq(tokenizer = ProcessorWithoutImages())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.processing_class = StubTokenizer()
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
@@ -2107,15 +2134,106 @@ def test_packing_on_a_raw_bypass_is_refused():
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
-def test_packing_on_a_pretokenized_bypass_is_unchanged():
-    """Those rows carry their own `input_ids`, so nothing here claims to pack
-    them and the exemption still applies."""
+def test_packing_on_a_pretokenized_bypass_is_refused_too():
+    """Pretokenized is not packed. Either the rows were never concatenated, or
+    they were and the replacement DataCollatorForSeq2Seq drops the `seq_lengths`
+    that rebuild `position_ids`, so the packed examples attend to each other."""
     from transformers import DataCollatorForTokenClassification
     collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
     trainer = StubTrainer(collator, _text_rows())
     trainer.args.packing = True
+    with pytest.raises(ValueError, match = "position_ids"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_packing_subclass_of_a_known_collator_is_refused():
+    """`isinstance` marks a packing subclass of a padding collator as known, so
+    the foreign-collator refusal skips it and the bypass would replace it with a
+    plain DataCollatorForSeq2Seq, discarding its packing."""
+    class PackingSeq2Seq(DataCollatorForSeq2Seq): pass
+    trainer = StubTrainer(PackingSeq2Seq(tokenizer = StubProcessor()), _text_rows())
+    trainer.args.packing = True
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_pretokenized_bypass_without_packing_is_still_repaired():
+    """The new refusal is gated on packing, not on the rows being pretokenized."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+
+
+@pytest.mark.parametrize("dtype", ("int8", "int16", "uint8", "uint16"))
+def test_a_narrow_integer_sequence_column_is_not_proven_text(dtype):
+    """int16 PCM under `speech` is the same waveform as the float32 case, and
+    only float sequences were rejected, so the column read as plain text, its
+    values were never sampled and the audio was dropped before training."""
+    from datasets import Dataset, Features, Sequence, Value
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)], "speech": [[1, 2, 3], [4, 5, 6]]},
+        features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "speech": Sequence(Value(dtype)),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+@pytest.mark.parametrize("dtype", ("int32", "int64"))
+def test_a_token_width_integer_sequence_is_still_proven_text(dtype):
+    """Token ids arrive at int32 or wider from every tokenizer."""
+    from datasets import Dataset, Features, Sequence, Value
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)],
+         "position_ids": [[0, 1, 2], [0, 1, 2]]},
+        features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "position_ids": Sequence(Value(dtype)),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    assert train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART) is trainer
+
+
+class TextTakingModel:
+    """A `forward` that happens to declare `text`, which is a real signature on
+    models whose processor is folded into the module."""
+    def forward(self, input_ids = None, attention_mask = None, labels = None,
+                text = None): ...
+
+
+def test_a_forward_declaring_text_does_not_keep_the_raw_string_column():
+    """The keep-list saves anything `forward` names, so a `text` parameter kept
+    the raw string the tokenizer had just replaced, and DataCollatorForSeq2Seq
+    died tensorizing it on the first batch."""
+    rows = Dataset.from_dict({"text": [
+        f"{INSTRUCTION_PART}hi{RESPONSE_PART}there",
+        f"{INSTRUCTION_PART}yo{RESPONSE_PART}hello",
+    ]})
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.model = TextTakingModel()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "text" not in out.train_dataset.column_names
+    assert "input_ids" in out.train_dataset.column_names
+
+
+def test_a_forward_declaring_text_does_not_keep_a_pretokenized_string_column():
+    """Same hole one keep-list later: an already-tokenized split that still
+    carries its source `text` never reaches the tokenizing strip."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        "text": ["a", "b"],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.model = TextTakingModel()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "text" not in out.train_dataset.column_names
 
 
 def test_a_raw_bypass_without_packing_is_untouched():

@@ -667,6 +667,11 @@ def train_on_responses_only(
         if not isinstance(_raw_columns, dict):
             _keep = {"labels"} | _model_forward_parameter_names(
                 getattr(trainer, "model", None))
+            # The raw text always goes, whatever else asks for it: it was just
+            # turned into `input_ids`, and a `forward` that happens to declare a
+            # `text` parameter would otherwise keep the string column for the
+            # collator to fail on.
+            _keep -= {text_field, "text"}
             # This strip runs before the keep-list at the end of the function, so
             # it has to honour the opt-out itself or the column is already gone.
             # Only the text just tokenized still goes: it is the string the
@@ -1169,6 +1174,20 @@ def train_on_responses_only(
         return isinstance(dtype, str) and dtype.startswith(
             ("float", "double", "half", "bfloat"))
 
+    def _leaf_dtype_is_narrow_int(feature, _depth = 0):
+        """Does this feature bottom out in a sub-32-bit integer?
+
+        That is a raw buffer, not tokens: int16 PCM, uint8 pixels. Token ids
+        arrive as int32/int64 from every tokenizer, and the columns they land in
+        are exempted by `_TEXT_COLUMNS` before this is ever asked.
+        """
+        if feature is None or _depth >= 8: return False
+        inner = getattr(feature, "feature", None)
+        if inner is not None: return _leaf_dtype_is_narrow_int(inner, _depth + 1)
+        dtype = getattr(feature, "dtype", None)
+        return isinstance(dtype, str) and dtype.startswith(
+            ("int8", "int16", "uint8", "uint16"))
+
     def _is_numeric_array_feature(feature):
         """`Array2D`/`Array3D`/`Array4D`/`Array5D`, by shape rather than name."""
         return (getattr(feature, "shape", None) is not None
@@ -1196,10 +1215,12 @@ def train_on_responses_only(
         inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
         if inner is not None:
             # Same for a float sequence: `Sequence(float32)` under `speech` is a
-            # waveform. Integer sequences stay plain -- that is the shape every
-            # pretokenized column has, and refusing them would refuse the case
-            # this bypass exists for.
+            # waveform, and `Sequence(int16)` under the same name is the same
+            # waveform stored as PCM. Wider integer sequences stay plain -- that
+            # is the shape every pretokenized column has, and refusing them would
+            # refuse the case this bypass exists for.
             if _leaf_dtype_is_float(inner): return False
+            if _leaf_dtype_is_narrow_int(inner): return False
             return _feature_is_plain_text(inner, _depth + 1)
         # Value/ClassLabel name a primitive dtype. Image is "PIL.Image.Image" and
         # Audio/Video a dict, so anything unrecognised stays unsafe.
@@ -1376,6 +1397,13 @@ def train_on_responses_only(
     # trainer without `.args` used to reach one of them.
     packing_enabled = getattr(getattr(trainer, "args", None), "packing", False)
 
+    def _pads_through_a_processor(collator):
+        """A pad-delegating collator holding a processor, which has no `.pad`."""
+        source = getattr(collator, "tokenizer", None)
+        if source is None: source = getattr(collator, "processor", None)
+        return (source is not None and not hasattr(source, "pad")
+                and isinstance(collator, _PAD_DELEGATING_COLLATORS))
+
     def _is_known_bypassed_collator(collator):
         if isinstance(collator, _PAD_DELEGATING_COLLATORS): return True
         # TRL's vision collator rebuilds labels through its processor. Matched by
@@ -1384,20 +1412,25 @@ def train_on_responses_only(
                    for b in type(collator).__mro__)
 
     def _refuse_packing_that_will_not_happen(collator, raw_splits):
-        """A raw split taking the bypass gets no packing at all.
+        """Nothing that takes this bypass gets packed.
 
-        `_maybe_tokenize_dataset` tokenizes each row on its own and the swap
-        below installs a plain DataCollatorForSeq2Seq, so nothing concatenates
-        the examples and nothing builds the packing-specific inputs. That is
-        true even for the collators exempted just above, because the exemption
-        is about who pads, not about who packs.
+        A raw split is tokenized row by row, so nothing concatenates the
+        examples. A pretokenized one is no better off: either the rows were
+        never packed, or they were and the plain DataCollatorForSeq2Seq the swap
+        installs drops the `seq_lengths` the packed batch needs to rebuild
+        `position_ids`, silently letting the packed examples attend to each
+        other. That holds for the collators exempted just above, and for a
+        packing subclass of one, because the exemption is about who pads.
         """
-        if not packing_enabled or not raw_splits: return
+        if not packing_enabled: return
+        _how = ("tokenizes each row on its own" if raw_splits else
+                "cannot rebuild the packed batch's `position_ids`")
         raise ValueError(
             f"Unsloth: `packing = True` is not supported here. `{type(collator).__name__}` "
             "holds a processor, so response-only masking is applied at the dataset level, "
-            "and that path tokenizes each row on its own -- nothing packs them. Turn packing "
-            "off, or pre-tokenize the dataset so the trainer's own packing runs."
+            f"and that path {_how} -- packing would be silently dropped. Turn packing off, or "
+            "build UnslothVisionDataCollator(..., train_on_responses_only = True, "
+            "instruction_part = ..., response_part = ...) so masking runs at collate time."
         )
 
     def _refuse_packing_with_a_foreign_collator(collator):
@@ -1496,6 +1529,13 @@ def train_on_responses_only(
             return trainer
     pass
 
+    # The other route to the same replacement: a pad-delegating collator holding
+    # a processor is rebuilt around the text tokenizer below, which packs no more
+    # than the swap above does. Refused here, before either split is mapped, and
+    # after the block above so a collator that masks for itself is left alone.
+    if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
+        _refuse_packing_that_will_not_happen(trainer.data_collator, None)
+
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
@@ -1546,11 +1586,7 @@ def train_on_responses_only(
     # replacing that one throws its packing away. So only the classes that provably
     # delegate to `.pad` are repaired from the attribute; TRL's vision collator
     # calls its processor instead and is already covered by the bypass flag below.
-    _pad_source = getattr(_collator, "tokenizer", None)
-    if _pad_source is None:
-        _pad_source = getattr(_collator, "processor", None)
-    _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad") \
-        and isinstance(_collator, _PAD_DELEGATING_COLLATORS)
+    _processor_backed = _pads_through_a_processor(_collator)
     # That repair is not packing-gated like the swap: it fails either way. The
     # bypassed-collator case under packing already refused above, before
     # anything was mapped.
@@ -1609,6 +1645,10 @@ def train_on_responses_only(
             # Unwrap PEFT/compile wrappers: their own forward hides pixel_values.
             names.update(_model_forward_parameter_names(getattr(trainer, "model", None)))
             names.discard("self")
+            # Same reason as the tokenizing strip above: a `forward` declaring
+            # `text` must not keep a raw string column no collator can tensorize.
+            names -= {getattr(getattr(trainer, "args", None),
+                              "dataset_text_field", None) or "text", "text"}
             return names
         _keep_columns = _model_input_columns()
         def _drop_raw_columns(dataset):
