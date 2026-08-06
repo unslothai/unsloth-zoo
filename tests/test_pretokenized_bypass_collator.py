@@ -1826,3 +1826,25 @@ def test_a_formatted_image_column_is_still_refused(fmt):
 
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_remove_unused_columns_false_keeps_the_users_columns():
+    """`remove_unused_columns = False` is an explicit instruction, not a hint.
+
+    A custom `Trainer.compute_loss` that pops `sample_weight` before calling the
+    model leaves that field out of `model.forward`, so the model-input keep-list
+    deleted it and the weighting was silently lost. HF's Trainer honours the flag;
+    so must the strip.
+    """
+    trainer = _text_only_trainer()
+    trainer.train_dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "sample_weight": [0.25, 0.75],
+    })
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    columns = set(out.train_dataset.column_names)
+    assert "sample_weight" in columns, sorted(columns)
+    assert out.train_dataset[0]["sample_weight"] == 0.25

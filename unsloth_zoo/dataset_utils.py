@@ -1488,7 +1488,13 @@ def train_on_responses_only(
             names.discard("self")
             return names
         _keep_columns = _model_input_columns()
+        # `remove_unused_columns = False` is the user asking for their columns to
+        # survive, and HF's Trainer honours it: a custom `compute_loss` can pop a
+        # `sample_weight` the model itself never declares, so the keep-list above
+        # would delete the weighting the run depends on.
+        _keep_every_column = not getattr(trainer.args, "remove_unused_columns", True)
         def _drop_raw_columns(dataset):
+            if _keep_every_column: return dataset
             if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
             try:
                 names = getattr(dataset, "column_names", None)
