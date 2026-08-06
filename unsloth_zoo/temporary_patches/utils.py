@@ -710,8 +710,15 @@ def _frame_local(frame, name):
         return _UNKNOWN
 
 
-def _walk_for_checkpoint_frame(_limit = 60):
+def _walk_for_checkpoint_frame():
     """The pre-2.8 answer: is any `torch.utils.checkpoint` frame on the stack?
+
+    The whole live chain is walked. A depth cap cannot be read as proof that
+    no region is open: `checkpoint()` sits well over 60 frames above the
+    compiled call under nested module dispatch, and stopping early answered
+    "no region" and switched to eager inside one. This runs only on the
+    give-up path, which the bump caps bound to a handful per process, so the
+    walk is not on any hot path.
 
     torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
     there would quietly restore the old behaviour on the releases pyproject
@@ -729,8 +736,8 @@ def _walk_for_checkpoint_frame(_limit = 60):
     except Exception:
         return None
     if not origin: return None
-    frame, seen, reentrant = sys._getframe(1), 0, 0
-    while frame is not None and seen < _limit:
+    frame, reentrant = sys._getframe(1), 0
+    while frame is not None:
         if frame.f_code.co_filename == origin:
             name = frame.f_code.co_name
             if name in _REENTRANT_FRAMES:
@@ -742,8 +749,25 @@ def _walk_for_checkpoint_frame(_limit = 60):
                 elif use_reentrant is _UNKNOWN: return True
             else:
                 return True                     # a pack or recompute frame
-        frame, seen = frame.f_back, seen + 1
+        frame = frame.f_back
     return False
+
+
+def _checkpoint_early_stop_errors():
+    """Checkpoint's "recomputation finished" signal, as an except-able tuple.
+
+    Private and version-dependent, so resolve it by name and fall back to an
+    empty tuple, which `except` accepts and never matches.
+    """
+    try:
+        import torch.utils.checkpoint as _checkpoint
+    except Exception:
+        return ()
+    found = tuple(
+        cls for cls in (getattr(_checkpoint, "_StopRecomputationError", None),)
+        if isinstance(cls, type) and issubclass(cls, BaseException)
+    )
+    return found
 
 
 def _is_checkpoint_pack_hook(pack):
@@ -902,9 +926,12 @@ _ORIGINAL_RECOMPILE_LIMITS = {}
 # `torch._dynamo.config.patch` records the context's temporary value as the
 # original, and the context restores the outer one on exit, so writing the
 # captured value back later would overwrite it. Only restore a name still
-# holding a value we put there. This is a set rather than the last value
-# because bumps nest: bump to 24, patch down to 2, bump to 18, and on exit
-# dynamo restores 24, which is also ours and still owes the original 8.
+# holding a value we put there, and restore the baseline THAT value came from:
+# name -> {bumped value: value it was bumped from}. Bumps nest, and the two
+# orderings need opposite answers.
+#   bump 1024->1040, patch, bump inside, exit  -> dynamo hands back 1040, owes 1024
+#   patch(2), bump 2->18, exit, bump 8->24     -> live 24 owes 8, NOT the scoped 2
+# A single recorded original answers one and gets the other wrong.
 _BUMPED_RECOMPILE_LIMITS = {}
 
 
@@ -927,8 +954,17 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                     setattr(_config, name, current + extra)
                 except Exception:
                     continue
+                # Remember which baseline each bumped value came FROM, rather
+                # than one original plus a set of values. Two scoped-patch
+                # orderings are indistinguishable at bump time and need
+                # opposite answers: a first bump inside `config.patch` followed
+                # by an ordinary one must restore the outer value, while an
+                # ordinary bump followed by a nested one must restore the
+                # value from before the outer bump. Keying the baseline by the
+                # value we wrote answers both, because the live value at
+                # restore time says which bump is the one still standing.
+                _BUMPED_RECOMPILE_LIMITS.setdefault(name, {})[current + extra] = current
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
-                _BUMPED_RECOMPILE_LIMITS.setdefault(name, set()).add(current + extra)
                 bumped = True
                 # Only the name this torch really reads; the alias follows.
                 break
@@ -968,15 +1004,25 @@ def _restore_recompile_limits():
     except Exception:
         return 0
     restored = 0
-    for name, original in list(_ORIGINAL_RECOMPILE_LIMITS.items()):
+    for name in list(_ORIGINAL_RECOMPILE_LIMITS):
         try:
-            if getattr(_config, name, None) not in _BUMPED_RECOMPILE_LIMITS.get(name, ()):
+            live = getattr(_config, name, None)
+            baselines = _BUMPED_RECOMPILE_LIMITS.get(name, {})
+            if live not in baselines:
                 # Not our value right now: either someone else's write or a
                 # live `torch._dynamo.config.patch` hiding ours, and the two
                 # are indistinguishable. Dropping the claim loses the original
                 # when that patch exits and hands our bump back, so keep it and
                 # settle at a later boundary.
                 continue
+            # Follow the chain back: successive bumps record 1040->1024,
+            # 1056->1040, and so on, so one hop would hand back the previous
+            # bump rather than the value we started from. Bounded by the map,
+            # and `seen` stops a cycle if a bump ever lands on an earlier one.
+            original, seen = baselines[live], {live}
+            while original in baselines and original not in seen:
+                seen.add(original)
+                original = baselines[original]
             setattr(_config, name, original)
             restored += 1
         except Exception:
@@ -1099,6 +1145,21 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 return _NO_RESULT
             _release_borrowed_budget()
             raise
+        except _checkpoint_early_stop_errors() as e:
+            # Not a failure: with early-stop on, checkpoint's recompute hook
+            # raises this once every needed tensor is back, and the checkpoint
+            # machinery swallows it as a successful recomputation. Releasing
+            # the bump and returning here left the wrapper compiled with its
+            # counters reset, so each new guard variant could borrow again and
+            # walk straight past both the per-wrapper and global caps. The
+            # retry DID finish; treat it as one and still let the signal out.
+            state["pending_eager"] = True
+            _warn(
+                f"Unsloth: torch.compile ran out of recompilation cache for "
+                f"{label} during checkpoint recomputation; switching to eager "
+                f"at the next step. Training is unaffected apart from speed."
+            )
+            raise
         except BaseException:
             # Anything else propagates to the caller, which may well catch it
             # and carry on (skipping a bad batch, say), so the budget has to go
@@ -1211,13 +1272,20 @@ _CHECKPOINT_SETTLE_ATTEMPTS = 0
 
 
 def _checkpoint_hooks_left_installed():
-    """Are `torch.utils.checkpoint`'s hooks still on top? False when unknowable."""
+    """Are checkpoint's hooks still on top? `_UNKNOWN` when torch cannot say.
+
+    Before 2.8 there is no accessor. Answering False there let settlement give
+    up after one failed collection, and the case that needs the retry is
+    exactly the one that cannot be inspected: a traceback held by
+    `except ... as exc` still roots the generator, so the collect cannot work
+    until the caller drops it.
+    """
     top = _saved_tensor_hook_accessor()
-    if top is None: return False
+    if top is None: return _UNKNOWN
     try:
         hooks = top(True)
     except Exception:
-        return False
+        return _UNKNOWN
     return bool(hooks) and _is_checkpoint_pack_hook(hooks[0])
 
 
@@ -1240,7 +1308,10 @@ def _settle_abandoned_checkpoint_generator():
     # A caller retrying from inside `except ... as exc` still roots the
     # traceback, so the generator survives every collection. Stay pending and
     # try again at the next boundary rather than never again.
-    if _checkpoint_hooks_left_installed() and \
+    # `_UNKNOWN` counts as still pending: before 2.8 nothing can be inspected,
+    # and that is precisely when the retry is needed.
+    _left = _checkpoint_hooks_left_installed()
+    if (_left is _UNKNOWN or _left) and \
         _CHECKPOINT_SETTLE_ATTEMPTS < _MAX_CHECKPOINT_SETTLE_ATTEMPTS:
         return False
     _RAISED_INSIDE_CHECKPOINT = False

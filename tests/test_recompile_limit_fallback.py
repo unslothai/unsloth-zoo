@@ -762,3 +762,159 @@ def test_a_successful_retry_keeps_its_bump():
         assert state["bumps"] == 1 and state["pending_eager"] is True
         assert getattr(config, name) > before, "headroom taken back mid-flight"
         assert u._GLOBAL_BUMPS == 1
+
+
+# ---- round 3: four Codex items ------------------------------------------
+
+def _utils():
+    """The module itself, so module-level bookkeeping can be reset."""
+    import unsloth_zoo.temporary_patches.utils as U
+    return U
+
+
+def _reset_bump_state(U):
+    U._ORIGINAL_RECOMPILE_LIMITS.clear()
+    U._BUMPED_RECOMPILE_LIMITS.clear()
+    U._GLOBAL_BUMPS = 0
+    U._EAGER_FALLBACK_WRAPPERS.clear()
+
+def test_a_scoped_first_bump_does_not_strand_a_stale_original():
+    """`setdefault` alone kept the PATCHED value as the recorded original.
+
+    First bump inside `torch._dynamo.config.patch` records the temporary value.
+    Leaving the patch restores the real outer one, which we keep a claim on
+    because it is not in the bumped set. Without rebasing, the next ordinary
+    bump preserves the stale original and a later restore writes it over the
+    real outer value, lowering the process-wide limit for good.
+    """
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = "recompile_limit" if hasattr(cfg, "recompile_limit") else "cache_size_limit"
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        with torch._dynamo.config.patch({name: 2}):
+            U._bump_recompile_limits(16)          # records original 2
+        assert getattr(cfg, name) == outer, "patch exit should restore the outer value"
+        U._bump_recompile_limits(16)              # must rebase onto `outer`
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer, (
+            f"limit left at {getattr(cfg, name)}, expected {outer}")
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_frame_walk_has_no_depth_cap():
+    """A cap cannot be read as proof that no checkpoint is open: `checkpoint()`
+    sits well over 60 frames up under nested module dispatch, and stopping
+    early answered "no region" and switched to eager inside one."""
+    import inspect
+    U = _utils()
+    src = inspect.getsource(U._walk_for_checkpoint_frame)
+    assert "_limit" not in src, "the depth cap is back"
+    assert "seen" not in src
+
+
+def test_deep_nesting_still_finds_the_region():
+    U = _utils()
+    if U._saved_tensor_hook_accessor() is None:
+        pytest.skip("needs a torch that can build the region")
+    seen = {}
+
+    def probe():
+        seen["walk"] = U._walk_for_checkpoint_frame()
+        return torch.zeros(1, requires_grad=True).sum()
+
+    def deep(n):
+        return probe() if n == 0 else deep(n - 1)
+
+    x = torch.randn(4, 4, requires_grad=True)
+    torch.utils.checkpoint.checkpoint(lambda _: deep(120), x, use_reentrant=False)
+    assert seen["walk"] is True, "120 frames deep and the walk lost the region"
+
+
+def test_an_uninspectable_hook_stack_reads_as_unknown():
+    """Before 2.8 nothing can be inspected, and that is exactly when the
+    settlement retry is needed, so False was the wrong answer."""
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        assert U._checkpoint_hooks_left_installed() is U._UNKNOWN
+    finally:
+        U._saved_tensor_hook_accessor = real
+
+
+def test_settlement_stays_pending_when_it_cannot_be_inspected():
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        U._RAISED_INSIDE_CHECKPOINT = True
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        assert U._settle_abandoned_checkpoint_generator() is False
+        assert U._RAISED_INSIDE_CHECKPOINT is True
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def test_settlement_still_gives_up_eventually():
+    """Bounded, so a permanently rooted traceback cannot cost a collect a step
+    forever."""
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        U._RAISED_INSIDE_CHECKPOINT = True
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        for _ in range(U._MAX_CHECKPOINT_SETTLE_ATTEMPTS + 2):
+            if U._settle_abandoned_checkpoint_generator():
+                break
+        else:
+            pytest.fail("settlement never gave up")
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def test_the_early_stop_signal_is_resolvable():
+    U = _utils()
+    errs = U._checkpoint_early_stop_errors()
+    assert isinstance(errs, tuple)
+    for cls in errs:
+        assert issubclass(cls, BaseException)
+
+
+def test_early_stop_counts_as_a_finished_retry():
+    """checkpoint's recompute hook raises this once every needed tensor is
+    back, and the machinery swallows it as success. Releasing the bump and
+    re-raising left the wrapper compiled with its counters reset, so each new
+    guard variant could borrow again and walk past both caps."""
+    U = _utils()
+    errs = U._checkpoint_early_stop_errors()
+    if not errs:
+        pytest.skip("this torch has no _StopRecomputationError")
+    stop = errs[0]
+    calls = {"n": 0}
+
+    def eager(x):
+        return x
+
+    class _Compiled:
+        def __call__(self, x):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise U._recompile_limit_errors()[0]("cache exhausted")
+            raise stop()
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_Compiled(), eager, "probe")
+    _reset_bump_state(U)
+    with pytest.raises(stop):
+        wrapped(torch.zeros(1))
+    assert wrapped._unsloth_fallback_state["pending_eager"] is True, \
+        "the retry finished; the wrapper must still be latched for next step"
+    _reset_bump_state(U)
