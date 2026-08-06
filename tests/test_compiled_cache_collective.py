@@ -107,7 +107,7 @@ def _stub_compile_folders(
         "get_compile_folder",
         lambda use_tempfile=False: (
             (str(temp), True)
-            if (temp_active or use_tempfile)
+            if (compiler.UNSLOTH_COMPILE_USE_TEMP or use_tempfile)
             else (str(primary), False)
         ),
     )
@@ -163,6 +163,35 @@ def test_rank0_temp_fallback_is_recomputed_locally(
     assert pathlib.Path(location) == local_temp / _CACHE_LEAF
     assert pathlib.Path(location).is_dir()
     assert location != rank0_temp
+    assert use_temp is True
+
+
+@pytest.mark.parametrize("local_temp_active", [False, True])
+def test_temp_mode_is_agreed_before_skipping_folder_collective(
+    tmp_path, monkeypatch, compiler, local_temp_active,
+):
+    """Divergent pre-group fallback state must converge before any rank returns."""
+    local_temp = _configure_local_temp(tmp_path, monkeypatch, compiler)
+    _own_temp_mode(monkeypatch, compiler, local_temp_active)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        compiler,
+        "distributed_any",
+        lambda value: calls.append(value) or True,
+    )
+    monkeypatch.setattr(
+        compiler,
+        "distributed_function",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a rank entered the folder broadcast after temp mode was agreed"
+        ),
+    )
+
+    location, use_temp = compiler.get_compile_folder(use_tempfile=False)
+
+    assert calls == [local_temp_active]
+    assert pathlib.Path(location) == local_temp / _CACHE_LEAF
     assert use_temp is True
 
 
@@ -698,6 +727,13 @@ def test_temp_recovery_loads_by_path_on_every_rank(
     assert pathlib.Path(sys.modules[name].__file__).parent == recovery, (
         "`import` by name resurrects the implementation the recovery replaced."
     )
+
+    updated = probe(name, "return x * 20")
+
+    assert updated is not module
+    assert pathlib.Path(updated.__file__).parent == recovery
+    assert getattr(updated, f"{name}_fn")(21) == 420
+    assert sys.modules[name] is updated
 
 
 def test_verify_falls_back_to_existence_when_rank0_digest_unknown(

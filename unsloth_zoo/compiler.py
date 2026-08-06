@@ -409,7 +409,12 @@ pass
 def get_compile_folder(use_tempfile=False):
     # tempfile.gettempdir() can differ by node. Never broadcast rank 0's temp
     # path: every rank has to resolve and create its own node-local directory.
-    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+    use_temp = UNSLOTH_COMPILE_USE_TEMP or use_tempfile
+    if torch_distributed_is_initialized():
+        # A rank can fall back before the process group exists. Once collectives
+        # are available, converge that rank-local state before anyone returns.
+        use_temp = distributed_any(use_temp)
+    if use_temp:
         return _get_compile_folder(use_tempfile=True)
 
     location, use_temp = distributed_function(
@@ -1377,6 +1382,10 @@ def create_new_function(
     pass
 
     try:
+        # The verified file on disk is authoritative. A prior invocation can
+        # leave either alias cached, including after tempfile recovery.
+        sys.modules.pop(name, None)
+        sys.modules.pop(f"unsloth_cache_{name}", None)
         import_error = None
         try:
             new_module, old_path = import_module(compile_folder, name)
@@ -1411,10 +1420,8 @@ def create_new_function(
                     hashlib.sha256(write_new_source.encode("utf-8")).hexdigest(),
                 )
             pass
-            # Every rank loads by path. importlib.import_module(name) would return
-            # a successful rank's old sys.modules entry instead of the temp file,
-            # so drop that entry too or a later import resurrects it.
-            sys.modules.pop(name, None)
+            # Every rank loads by path so successful ranks cannot reuse the
+            # module they imported before another rank requested recovery.
             direct_load_error = None
             try:
                 new_module = load_module_directly(compile_folder, name)
