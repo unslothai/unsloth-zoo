@@ -1674,10 +1674,14 @@ def test_a_nested_generic_alias_holding_provenance_still_passes():
 
 
 class ProcessorWithoutImages:
-    """A processor half with no `.pad` and no `image_processor`, so the vision
-    bypass never sees it and only the `.pad` repair can fire."""
+    """A processor half with no `.pad` and no modality half, so the multimodal
+    bypass never sees it and only the `.pad` repair can fire.
+
+    It used to carry a `feature_extractor` as an inert marker. That is an audio
+    half, and now marks the holder as multimodal like `image_processor` always
+    did, so it would take this stub down the bypass the tests below want to miss.
+    """
     def __init__(self):
-        self.feature_extractor = object()
         self.tokenizer = StubTokenizer()
 
 
@@ -2280,3 +2284,93 @@ def test_remove_unused_columns_false_without_a_text_column_is_untouched():
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "sample_weight" in out.train_dataset.column_names
+
+
+# --- what the seventh review round found -----------------------------------
+
+class AudioOnlyProcessor:
+    """Whisper and friends: a processor whose only half is audio."""
+    def __init__(self):
+        self.feature_extractor = object()
+        self.tokenizer = StubTokenizer()
+
+
+class VideoOnlyProcessor:
+    def __init__(self):
+        self.video_processor = object()
+        self.tokenizer = StubTokenizer()
+
+
+@pytest.mark.parametrize("processor, column", [
+    (AudioOnlyProcessor, "input_features"),
+    (VideoOnlyProcessor, "pixel_values_videos"),
+])
+def test_an_audio_or_video_processor_is_multimodal_too(processor, column):
+    """`image_processor` was the only half that counted, so a collator holding an
+    audio- or video-only processor missed every multimodal guard and fell through
+    to the `.pad` repair, which rebuilds it around the plain tokenizer and drops
+    the modality column it was holding the processor to batch."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        column: [[0.1, 0.2], [0.3, 0.4]],
+    })
+    collator = DataCollatorForSeq2Seq(tokenizer = processor())
+    trainer = StubTrainer(collator, rows)
+    trainer.processing_class = StubTokenizer()
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert trainer.data_collator is collator, "the multimodal collator was rebuilt"
+    assert column in trainer.train_dataset.column_names, "the modality column went"
+
+
+def test_a_processor_half_the_column_deriver_asks_for_is_a_multimodal_marker():
+    """The two lists must not drift: a half `_derive_multimodal_columns` reads
+    outputs from is by definition a half that makes its holder multimodal."""
+    import inspect as _inspect
+    from unsloth_zoo import dataset_utils as D
+    source = _inspect.getsource(D)
+    for half in ("image_processor", "video_processor", "feature_extractor",
+                 "audio_processor", "qformer_tokenizer"):
+        assert source.count(f'"{half}"') >= 2, \
+            f"{half} is asked for in one place only, so the two lists have drifted"
+
+
+def test_remove_unused_columns_false_drops_columns_no_collator_can_stack():
+    """`tokenizer.pad(..., return_tensors = "pt")` tensorizes every key it is
+    handed, so a kept `messages`/`source` dies on the first batch, before the
+    custom `compute_loss` the opt-out exists for ever runs."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        "messages": [[{"role": "user", "content": "hi"}]] * 2,
+        "source": ["a", "b"],
+        "sample_weight": [1.0, 2.0],
+        "aux_target": [[1, 2], [3, 4]],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    kept = out.train_dataset.column_names
+    assert "messages" not in kept, "a list of dicts cannot be tensorized"
+    assert "source" not in kept, "a string column cannot be tensorized"
+    assert "sample_weight" in kept, "a numeric column is what the opt-out is for"
+    assert "aux_target" in kept, "a nested numeric column is tensorizable"
+
+
+def test_a_model_input_column_is_never_judged_by_one_row():
+    """`token_type_ids` and friends are the collator's job. Whatever a sampled
+    row holds for them, they are fed to the model and must not be dropped."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        "token_type_ids": [None, None],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "token_type_ids" in out.train_dataset.column_names

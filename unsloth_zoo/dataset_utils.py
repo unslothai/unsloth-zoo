@@ -826,11 +826,17 @@ def train_on_responses_only(
         if collator is None: return False
         if any(b.__name__ == "UnslothVisionDataCollator" for b in type(collator).__mro__): return True
         # A vision collator may hold the processor under .processor or the common .tokenizer field
-        # (e.g. DataCollatorForSeq2Seq(tokenizer=processor)); either exposing image_processor marks it.
+        # (e.g. DataCollatorForSeq2Seq(tokenizer=processor)); any multimodal half marks it.
+        # Not `image_processor` alone: a Whisper/audio or video-only processor exposes
+        # `feature_extractor`/`audio_processor`/`video_processor` and nothing else, so it
+        # missed every guard below and went straight to the collator repair, which drops
+        # the modality columns. Same list `_derive_multimodal_columns` asks for outputs.
+        _halves = ("image_processor", "video_processor", "feature_extractor",
+                   "audio_processor", "qformer_tokenizer")
         for attr in ("processor", "tokenizer"):
             obj = getattr(collator, attr, None)
-            if obj is not None and hasattr(obj, "image_processor"): return True
-        return hasattr(collator, "image_processor")
+            if obj is not None and any(hasattr(obj, h) for h in _halves): return True
+        return any(hasattr(collator, h) for h in _halves)
     pass
 
     # Processor outputs beside `input_ids`; a row with any of these needs its collator.
@@ -1653,19 +1659,60 @@ def train_on_responses_only(
         _keep_columns = _model_input_columns()
         _text_columns = {getattr(getattr(trainer, "args", None),
                                  "dataset_text_field", None) or "text", "text"}
+
+        import numbers as _numbers
+        def _is_tensorizable(value, _depth = 0):
+            """Can `tokenizer.pad(..., return_tensors = 'pt')` stack this?
+
+            It tensorizes every key it is handed, so under the opt-out a kept
+            `messages`/`source`/string id fails the first batch before any
+            custom `compute_loss` sees it. Numbers and nests of numbers survive,
+            which is what a per-row `sample_weight` or auxiliary target is.
+            """
+            if _depth >= 6: return False
+            # str before Sequence: it is one, of one-character strings, forever.
+            if isinstance(value, (str, bytes, bytearray, dict)) or value is None:
+                return False
+            # Tensors and arrays answer at once, by their own dtype: iterating a
+            # long one element-wise to reach the same answer is pure cost, and
+            # `numbers` misses `np.int64`, which is not an `int` subclass.
+            kind = getattr(getattr(value, "dtype", None), "kind", None)
+            if kind is not None: return kind in "biufc"
+            if isinstance(value, torch.Tensor): return True
+            if isinstance(value, _numbers.Number): return True
+            try: items = list(value)
+            except Exception: return False
+            return all(_is_tensorizable(v, _depth + 1) for v in items)
+
+        def _untensorizable_columns(dataset):
+            """Named from a sampled row, so a column is judged by what it holds.
+
+            Nothing the model is fed is ever named here, however odd it looks:
+            those columns are the collator's job, not a guess from one row.
+            """
+            try: row = next(iter(dataset), None)
+            except Exception: return set()
+            if not isinstance(row, dict): return set()
+            return {k for k, v in row.items()
+                    if k not in _keep_columns and not _is_tensorizable(v)}
+
         def _drop_raw_columns(dataset):
             if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
             try:
                 names = getattr(dataset, "column_names", None)
                 if names is None: names = list(next(iter(dataset)).keys())
                 if isinstance(names, dict): return dataset
-                # The opt-out keeps the caller's own columns, but never the raw
-                # text: an already-tokenized split carrying its source `text`
-                # never reaches the tokenizing strip, and the replacement
-                # collator dies tensorizing the strings on the first batch.
-                drop = [c for c in names
-                        if c in _text_columns] if _keep_every_column else \
-                       [c for c in names if c not in _keep_columns]
+                # The opt-out keeps the caller's own columns, but only the ones
+                # `tokenizer.pad(..., return_tensors = "pt")` can actually
+                # stack. It tensorizes every key it is handed, so a surviving
+                # `text`/`messages`/`source` dies on the first batch, before the
+                # custom `compute_loss` the opt-out exists for ever runs. A
+                # numeric `sample_weight` or auxiliary target still comes through.
+                if _keep_every_column:
+                    unusable = _text_columns | _untensorizable_columns(dataset)
+                    drop = [c for c in names if c in unusable]
+                else:
+                    drop = [c for c in names if c not in _keep_columns]
             except Exception:
                 return dataset
             if not drop: return dataset
