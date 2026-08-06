@@ -869,8 +869,18 @@ def train_on_responses_only(
         "image_path", "image_paths", "img_path", "img_paths",
         "video_path", "video_paths", "audio_path", "audio_paths",
         "image_file", "image_files", "video_file", "video_files",
-        "audio_file", "audio_files", "image_filename", "image_bytes",
+        "audio_file", "audio_files", "image_bytes",
+        # `*_filename` is as common a spelling as `*_path`, and only `image_`
+        # was here: a `video_filename`/`audio_filename` column matched neither
+        # list, so its plain string schema called the split text-only.
+        "image_filename", "image_filenames", "video_filename", "video_filenames",
+        "audio_filename", "audio_filenames",
     ))
+
+    # A name that only ever points at media points at media nested too: a turn
+    # storing `{"image_path": "cat.jpg"}` is exactly the top-level column moved
+    # one level down, and a nested string is what `_is_plain_text` calls text.
+    _MEDIA_KEYS = _MEDIA_KEYS | _MEDIA_COLUMNS
 
     # Names that are media half the time and an ordinary text field the other
     # half (`path` is a source file, `url` a citation), so refusing on the name
@@ -1333,16 +1343,28 @@ def train_on_responses_only(
     from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
     packing_enabled = getattr(trainer.args, "packing", False)
     _collator = getattr(trainer, "data_collator", None)
-    # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding, TRL's
-    # DataCollatorForVisionLanguageModeling) pads through a `.pad` processors do
-    # not have, so it dies on the first batch; rebuild it around the unwrapped
-    # text tokenizer. Key on a held padding object that cannot pad rather than on
-    # the type, so a collator holding none stays untouched (TRL's packing
+    # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
+    # through a `.pad` processors do not have, so it dies on the first batch;
+    # rebuild it around the unwrapped text tokenizer. A collator holding no
+    # padding object at all stays untouched (TRL's packing
     # DataCollatorForLanguageModeling takes a bare pad_token_id).
+    # Holding the object is not proof it is padded through: a custom collator can
+    # keep a processor for its own use and batch (and pack) everything itself, and
+    # replacing that one throws its packing away. So only the classes that provably
+    # delegate to `.pad` are repaired from the attribute; TRL's vision collator
+    # calls its processor instead and is already covered by the bypass flag below.
+    import transformers as _transformers
+    _PAD_DELEGATING_COLLATORS = tuple(_cls for _cls in (
+        DataCollatorForSeq2Seq, DataCollatorWithPadding,
+        getattr(_transformers, "DataCollatorForTokenClassification", None),
+        getattr(_transformers, "DataCollatorForLanguageModeling", None),
+        getattr(_transformers, "DataCollatorForMultipleChoice", None),
+    ) if isinstance(_cls, type))
     _pad_source = getattr(_collator, "tokenizer", None)
     if _pad_source is None:
         _pad_source = getattr(_collator, "processor", None)
-    _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad")
+    _processor_backed = _pad_source is not None and not hasattr(_pad_source, "pad") \
+        and isinstance(_collator, _PAD_DELEGATING_COLLATORS)
     # That repair is not packing-gated like the swap: it fails either way.
     # Nor is a collator we bypassed above: it can rebuild `labels` in `__call__`
     # and throw away the mask just written, which is silent training on prompts.

@@ -1526,3 +1526,113 @@ def test_an_undecoded_image_struct_is_still_refused():
     trainer = _meta_trainer([{"bytes": b"\x89PNG", "path": "a"}] * 2)
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+# ---- what the third review round found --------------------------------------
+
+@pytest.mark.parametrize("key, value", [
+    ("image_path",     "images/cat.jpg"),
+    ("video_path",     "clips/intro.mp4"),
+    ("audio_path",     "clips/take1.wav"),
+    ("image_file",     "images/cat.png"),
+    ("image_filename", "cat.jpg"),
+    ("image_url",      "https://example.com/cat.jpg"),
+])
+def test_a_nested_path_style_media_key_is_refused(key, value):
+    """The same name is media at the top level, so it is media one level down
+    too: a turn carrying `{"image_path": ...}` holds a plain string, which is
+    what the schema and the sampled values both see, so only the key can say it
+    is an image the text path would drop."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), Dataset.from_dict({
+        "input_ids": [list(ROW)] * 2,
+        "messages": [[{"role": "user", "content": "describe", key: value}]] * 2,
+    }))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "messages" in trainer.train_dataset.column_names, "the media was dropped"
+
+
+def test_a_nested_media_path_in_a_plain_struct_is_refused():
+    """Not only conversations: a `meta` struct pointing at the media file is the
+    same silent text-only run."""
+    trainer = _meta_trainer([{"video_path": "clips/intro.mp4",
+                              "source": "youtube"}] * 2)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+@pytest.mark.parametrize("column, value", [
+    ("video_filename",  "intro.mp4"),
+    ("audio_filename",  "take1.wav"),
+    ("image_filename",  "cat.jpg"),
+    ("video_filenames", ["intro.mp4"]),
+    ("audio_filenames", ["take1.wav"]),
+])
+def test_a_media_filename_column_is_refused(column, value):
+    """`*_filename` is as ordinary a spelling as `*_path`, and only the image one
+    was listed: the column is `string`, so nothing else can catch it."""
+    collator = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(collator, Dataset.from_dict({
+        "input_ids": [list(ROW)] * 2,
+        column: [value] * 2,
+    }))
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert trainer.data_collator is collator, "the user's collator was replaced"
+    assert column in trainer.train_dataset.column_names, "the media column was dropped"
+
+
+class ProcessorWithoutImages:
+    """A processor half with no `.pad` and no `image_processor`, so the vision
+    bypass never sees it and only the `.pad` repair can fire."""
+    def __init__(self):
+        self.feature_extractor = object()
+        self.tokenizer = StubTokenizer()
+
+
+class SelfPackingCollator:
+    """A user's own packing collator: it holds a processor for its own use and
+    concatenates the batch itself, so it never calls `.pad` on anything."""
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, features):
+        ids, position_ids = [], []
+        for feature in features:
+            ids += list(feature["input_ids"])
+            position_ids += list(range(len(feature["input_ids"])))
+        return {"input_ids": [ids], "position_ids": [position_ids]}
+
+
+def test_a_self_packing_collator_holding_a_processor_is_left_alone():
+    """Holding a processor is not proof of padding through it. This one packs and
+    batches itself, so replacing it with DataCollatorForSeq2Seq silently drops the
+    packed `position_ids` - exactly what the packing gate exists to prevent."""
+    collator = SelfPackingCollator(ProcessorWithoutImages())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.processing_class = StubTokenizer()      # a plain text run
+    trainer.args.packing = True
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.data_collator is collator, "the custom packing collator was replaced"
+    rows = [out.train_dataset[i] for i in range(len(out.train_dataset))]
+    assert "position_ids" in out.data_collator(rows), "its packing did not survive"
+
+
+def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_under_packing():
+    """The other direction: a class that really does pad through `.pad` is still
+    rebuilt even with packing on, since it dies on the first batch either way."""
+    collator = DataCollatorForSeq2Seq(tokenizer = ProcessorWithoutImages())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.processing_class = StubTokenizer()
+    trainer.args.packing = True
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert out.data_collator is not collator, "still padding through the processor"
+    assert hasattr(out.data_collator.tokenizer, "pad")
