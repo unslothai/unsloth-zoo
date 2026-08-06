@@ -18,7 +18,13 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    flatten_for_elementwise_norm,
+    unwrap_norm_weight,
+    publish_to_modeling_module,
+)
 from .utils import (
     patch_function,
     process_output_options,
@@ -415,6 +421,38 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
+# Clamp bounds as module-level floats so `torch.finfo` stays out of the graph.
+_GEMMA3_FP16_MAX = float(torch.finfo(torch.float16).max)
+_GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
+
+
+# One compiled kernel is shared by every Gemma3 RMSNorm instance (text norms,
+# q/k norms, vision norms), so its Dynamo cache holds the product of every axis
+# its guards see. Taking the weight as a plain Tensor view keeps the norm width
+# dynamic, and taking the input as rank 2 collapses the (B, S, H) vs
+# (B, heads, S, D) rank axis; only dtype, grad mode and requires_grad remain.
+@torch_compile(fullgraph = True, dynamic = True)
+def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    # weight may be bf16; cast to fp32 for the (1.0 + weight) op.
+    output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
+    clamped_output_fp32 = torch.clamp(output_fp32, min = _GEMMA3_FP16_MIN, max = _GEMMA3_FP16_MAX)
+    return clamped_output_fp32.to(torch.float16) # Output fp16
+pass
+
+
+@torch_compile(fullgraph = True, dynamic = True)
+def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
+    return output_fp32.to(hidden_states_2d.dtype)
+pass
+
+
 def patch_Gemma3RMSNorm():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -423,22 +461,21 @@ def patch_Gemma3RMSNorm():
     except Exception as e:
         return raise_error("Gemma3RMSNorm.forward", e)
 
+    publish_to_modeling_module(
+        transformers.models.gemma3.modeling_gemma3,
+        flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+        unwrap_norm_weight           = unwrap_norm_weight,
+        _gemma3_rms_norm_float32     = _gemma3_rms_norm_float32,
+    )
+
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
-
-        # self.weight may be bf16; cast to fp32 for the (1.0 + weight) op.
-        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
-
-        # Clamp to fp16 range before casting back to fp16
-        fp16_max = torch.finfo(torch.float16).max
-        fp16_min = torch.finfo(torch.float16).min
-        clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
-
-        return clamped_output_fp32.to(torch.float16) # Output fp16
+        x_2d, shape = flatten_for_elementwise_norm(x)
+        out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        return out.reshape(shape)
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+    # Not `fullgraph = True`: the kernel above is the compiled unit, and
+    # compiling this wrapper as well would put `self` back into the guards.
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
@@ -695,14 +732,19 @@ def patch_Gemma3RMSNorm_generic():
     except Exception as e:
         return raise_error("Gemma3RMSNorm.forward", e)
 
+    publish_to_modeling_module(
+        transformers.models.gemma3.modeling_gemma3,
+        flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+        unwrap_norm_weight           = unwrap_norm_weight,
+        _gemma3_rms_norm_generic     = _gemma3_rms_norm_generic,
+    )
+
     def forward(self, x):
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
-        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
-        return output_fp32.to(x.dtype)
+        x_2d, shape = flatten_for_elementwise_norm(x)
+        out = _gemma3_rms_norm_generic(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        return out.reshape(shape)
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm_generic)
 
