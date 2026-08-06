@@ -1651,14 +1651,21 @@ def train_on_responses_only(
                               "dataset_text_field", None) or "text", "text"}
             return names
         _keep_columns = _model_input_columns()
+        _text_columns = {getattr(getattr(trainer, "args", None),
+                                 "dataset_text_field", None) or "text", "text"}
         def _drop_raw_columns(dataset):
-            if _keep_every_column: return dataset
             if dataset is None or not hasattr(dataset, "remove_columns"): return dataset
             try:
                 names = getattr(dataset, "column_names", None)
                 if names is None: names = list(next(iter(dataset)).keys())
                 if isinstance(names, dict): return dataset
-                drop = [c for c in names if c not in _keep_columns]
+                # The opt-out keeps the caller's own columns, but never the raw
+                # text: an already-tokenized split carrying its source `text`
+                # never reaches the tokenizing strip, and the replacement
+                # collator dies tensorizing the strings on the first batch.
+                drop = [c for c in names
+                        if c in _text_columns] if _keep_every_column else \
+                       [c for c in names if c not in _keep_columns]
             except Exception:
                 return dataset
             if not drop: return dataset

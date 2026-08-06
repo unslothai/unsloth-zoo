@@ -2247,3 +2247,36 @@ def test_a_raw_bypass_without_packing_is_untouched():
     trainer = StubTrainer(collator, rows)
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+
+
+def test_remove_unused_columns_false_still_drops_the_raw_text():
+    """`sft_prepare_dataset` turns the opt-out on by itself for a token-type-id
+    model. A pretokenized split carrying its source `text` never reaches the
+    tokenizing strip, so the opt-out was the only thing keeping the strings, and
+    the replacement collator died tensorizing them on the first batch."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        "text": ["a", "b"],
+        "sample_weight": [1.0, 2.0],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    kept = out.train_dataset.column_names
+    assert "text" not in kept, "the raw strings survived the opt-out"
+    assert "sample_weight" in kept, "the opt-out must still keep the user's own columns"
+
+
+def test_remove_unused_columns_false_without_a_text_column_is_untouched():
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "sample_weight": [1.0, 2.0],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "sample_weight" in out.train_dataset.column_names
