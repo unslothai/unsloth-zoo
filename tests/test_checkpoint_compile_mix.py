@@ -117,7 +117,11 @@ def dynamo_limits():
     saved_orig = dict(U._ORIGINAL_RECOMPILE_LIMITS)
     # dict, not set: the map is {bumped value: the value it came from}, and
     # copying it as a set put sets back into it, so the restore chain broke.
-    saved_bumped = {k: dict(v) for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
+    # The baseline lists are appended to and popped in place, so copying only
+    # the two dict layers lets a test that settles an outstanding debt mutate
+    # the snapshot teardown restores from.
+    saved_bumped = {k: {kk: list(vv) for kk, vv in v.items()}
+                    for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
     try:
         yield
     finally:

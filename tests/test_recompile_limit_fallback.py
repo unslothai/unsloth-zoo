@@ -1227,7 +1227,10 @@ def test_the_probe_still_runs_from_eager():
     real = U._dynamo_is_tracing
     U._dynamo_is_tracing = lambda: False
     saved = U._saved_tensor_hook_accessor
-    U._saved_tensor_hook_accessor = lambda: None   # torch < 2.8: assume the worst
+    def _pack(*a, **k): ...
+    _pack.__qualname__ = "_checkpoint_hook.<locals>.pack_hook"
+    _pack.__module__ = "torch.utils.checkpoint"
+    U._saved_tensor_hook_accessor = lambda: (lambda _: [_pack, _pack])
     try:
         U._PACKED_COMPILED_IN_CHECKPOINT = False
         U._note_packed_under_checkpoint()
@@ -1265,3 +1268,87 @@ def test_a_real_compiled_region_traces_through_the_wrapper():
     finally:
         _reset_bump_state(U)
         torch._dynamo.reset()
+
+
+# --- what the sixth review round found -------------------------------------
+
+def test_a_pre_2_8_torch_does_not_mark_every_call_as_packed():
+    """The accessor arrived in 2.8, so on 2.4-2.7 it is always absent, and
+    latching there marked EVERY compiled call packed. A latched marker makes
+    `_give_up` rethrow instead of running eagerly, which is the one outcome the
+    wrapper exists to prevent, on four supported releases."""
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    saved = U._PACKED_COMPILED_IN_CHECKPOINT
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved
+
+
+def test_a_pre_2_8_give_up_still_sees_a_region_around_the_failing_call():
+    """What is lost is only the already-returned earlier layer: the give-up path
+    walks the live stack itself, and that walk works on every torch."""
+    U = _utils()
+    real_accessor = U._saved_tensor_hook_accessor
+    real_walk = U._walk_for_checkpoint_frame
+    U._saved_tensor_hook_accessor = lambda: None
+    U._walk_for_checkpoint_frame = lambda: True
+    try:
+        assert U._in_non_reentrant_checkpoint() is True
+    finally:
+        U._saved_tensor_hook_accessor = real_accessor
+        U._walk_for_checkpoint_frame = real_walk
+
+
+def test_an_uninspectable_accessor_that_raises_still_latches():
+    """A present-but-broken accessor is a different case from an absent one:
+    torch could answer and did not, so stay conservative."""
+    U = _utils()
+    def _boom(*a, **k): raise RuntimeError("no")
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: _boom
+    saved = U._PACKED_COMPILED_IN_CHECKPOINT
+    try:
+        U._PACKED_COMPILED_IN_CHECKPOINT = False
+        U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is True
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved
+
+
+def test_an_unsettled_boundary_says_so(caplog):
+    """`apply_pending_eager_fallbacks` dropped the settlement result, so a
+    caller retrying from inside `except ... as exc` -- whose traceback roots the
+    abandoned generator -- was told the boundary was clean while the checkpoint
+    hooks were still installed."""
+    import logging
+    U = _utils()
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None      # settlement stays pending
+    try:
+        U._RAISED_INSIDE_CHECKPOINT = True
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        try: U.logger.warning_once.cache_clear()
+        except Exception: pass
+        with caplog.at_level(logging.WARNING):
+            U.apply_pending_eager_fallbacks()
+        assert "has not been finalised" in caplog.text
+    finally:
+        U._saved_tensor_hook_accessor = real
+        U._RAISED_INSIDE_CHECKPOINT = False
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def test_a_settled_boundary_is_quiet(caplog):
+    import logging
+    U = _utils()
+    U._RAISED_INSIDE_CHECKPOINT = False
+    with caplog.at_level(logging.WARNING):
+        U.apply_pending_eager_fallbacks()
+    assert "has not been finalised" not in caplog.text

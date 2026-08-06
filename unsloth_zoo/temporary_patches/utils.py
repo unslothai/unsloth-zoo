@@ -849,9 +849,13 @@ def _note_packed_under_checkpoint():
         return
     top = _saved_tensor_hook_accessor()
     if top is None:
-        # torch < 2.8 cannot answer. Assume a region may be open: ending a step
-        # is rare and recoverable, wrong gradients are neither.
-        _PACKED_COMPILED_IN_CHECKPOINT = True
+        # torch < 2.8 has no accessor, and the frame walk that answers instead
+        # is give-up-only by design, so there is no cheap probe to run here.
+        # Latching anyway marked EVERY call on 2.4-2.7 as packed, and a latched
+        # marker makes `_give_up` rethrow: the one path this wrapper exists to
+        # avoid, on four supported releases. The give-up path still walks the
+        # live stack, so a region open around the failing call is still seen;
+        # only the already-returned earlier layer needs 2.8 to be caught.
         return
     try:
         hooks = top(True)                       # ignore_is_tracing
@@ -1503,7 +1507,19 @@ def apply_pending_eager_fallbacks() -> int:
 
     Safe to call on every step. Nothing pending means nothing happens.
     """
-    _settle_abandoned_checkpoint_generator()
+    _settled = _settle_abandoned_checkpoint_generator()
+    if _RAISED_INSIDE_CHECKPOINT and not _settled:
+        # The abandoned generator is still rooted, so its saved-tensor hooks are
+        # still on the stack and the next region would pack under them. Almost
+        # always a caller retrying from inside `except ... as exc`, whose
+        # traceback holds the frames alive. Say so rather than let the flip read
+        # as a clean boundary.
+        logger.warning_once(
+            "Unsloth: a checkpoint region left by the compile-mode fallback has "
+            "not been finalised yet, so its saved-tensor hooks are still "
+            "installed. Retry the step outside the `except` block (or clear the "
+            "exception first) so the region can close."
+        )
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
     if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
