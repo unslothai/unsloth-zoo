@@ -25,7 +25,6 @@ __all__ = [
     "device_is_bf16_supported",
     "is_mlx_available",
     "get_recommended_attn_implementation",
-    "check_amd_vram_utilization",
 ]
 
 import functools
@@ -320,93 +319,14 @@ pass
 
 def get_recommended_attn_implementation():
     """
-    Return "sdpa" on AMD ROCm, None on all other devices.
+    Return "sdpa" on AMD ROCm, None elsewhere (no override, keep your default).
 
-    None means no AMD-specific override — callers keep their own default.
-
-    Callers MUST validate model SDPA support before using this as
-    `attn_implementation`. Many architectures (e.g. GptOss, Mamba, Bloom,
-    GPT-J, MPT — 43 total on transformers 4.57) set `_supports_sdpa = False`
-    and raise ValueError if "sdpa" is passed to `from_config`. Check via
+    Callers MUST check the resolved model class first. 43 causal LM
+    architectures on transformers 4.57 (GptOss, Mamba, Bloom, GPT-J, MPT, ...)
+    set `_supports_sdpa = False` and `from_config` raises ValueError for them:
     `AutoModelForCausalLM._model_mapping[type(config)]._supports_sdpa`.
     """
     if is_hip():
         return "sdpa"
     return None
-pass
-
-
-# Module-level sentinel: emit the VRAM advisory at most once per process.
-_AMD_VRAM_ADVISORY_EMITTED = False
-
-
-def check_amd_vram_utilization(batch_size, seq_len=512, log_fn=None, device=None):
-    """
-    Warn when batch_size is likely under-utilizing a large AMD GPU.
-
-    AMD Instinct MI300X/MI325X GPUs have 192-256 GB HBM3/HBM3e.  At the default
-    batch_size=4 with seq_len=512, a 1B-parameter LoRA training run uses roughly
-    6-12 GB of VRAM.  Throughput scales almost linearly with batch size up to
-    memory saturation; batch=16 gives ~+51% throughput over batch=4 with no other
-    changes (benchmark: MI325X, LoRA r=16, seq=512, bfloat16).
-
-    The advisory is emitted at most once per process (module-level guard), so
-    repeated calls from trainer setup loops do not spam logs.
-
-    The recommendation is based on the amount of *free* VRAM on the active device
-    rather than total device capacity, so it correctly stays silent when a large
-    model or long context has already consumed most of the GPU memory.
-
-    Args:
-        batch_size: per-device training batch size.
-        seq_len:    kept for API compatibility; no longer interpolated in the message.
-        log_fn:     callable(str) for the warning; defaults to print().
-        device:     torch device index or None (defaults to current CUDA device).
-    """
-    global _AMD_VRAM_ADVISORY_EMITTED
-    if _AMD_VRAM_ADVISORY_EMITTED:
-        return  # Already warned this process — stay silent on repeated calls
-    if not is_hip():
-        return
-    if not torch.cuda.is_available():
-        return
-    try:
-        # Use the caller's active device, not always device 0
-        if device is None:
-            device = torch.cuda.current_device()
-        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-        if total_vram_gb < 128:
-            return
-        if batch_size > 4:
-            return
-        # Use free VRAM (not total): a loaded model may have already consumed most
-        # of the device; recommending a larger batch on 20 GB free risks OOM.
-        free_bytes, _ = torch.cuda.mem_get_info(device)
-        free_vram_gb = free_bytes / (1024 ** 3)
-        if free_vram_gb < 20:
-            return  # VRAM already mostly consumed — don't recommend larger batch
-        # Suggest a batch size that uses roughly 1/8 of free VRAM, capped at 16.
-        # No unconditional floor: if the estimate does not strictly exceed the
-        # current batch_size, the workload's per-batch memory cost is already
-        # substantial relative to free VRAM and we stay silent.
-        suggested = min(16, int(free_vram_gb / 8))
-        if suggested < 2 * batch_size:
-            return
-        _AMD_VRAM_ADVISORY_EMITTED = True
-        # Keep benchmark attribution fixed to its actual conditions (batch 4->16, seq=512).
-        # Report the runtime suggestion separately so the claim is not applied to
-        # different seq_len values or smaller batch increments.
-        msg = (
-            f"Unsloth [AMD ROCm]: batch_size={batch_size} with {free_vram_gb:.0f} GB "
-            f"free VRAM on your {total_vram_gb:.0f} GB GPU.  "
-            f"Consider --per_device_train_batch_size={suggested} to better utilize "
-            f"available VRAM.  "
-            f"(Reference benchmark: batch 4->16, seq=512, MI325X, LoRA: +51% throughput.)"
-        )
-        if log_fn is None:
-            print(msg)
-        else:
-            log_fn(msg)
-    except Exception:
-        pass  # Never block training on a diagnostic warning
 pass
