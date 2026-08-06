@@ -1019,17 +1019,29 @@ def _restore_recompile_limits():
             # 1056->1040, and so on, so one hop would hand back the previous
             # bump rather than the value we started from. Bounded by the map,
             # and `seen` stops a cycle if a bump ever lands on an earlier one.
-            original, seen = baselines[live], {live}
-            while original in baselines and original not in seen:
-                seen.add(original)
+            original, chain = baselines[live], {live}
+            while original in baselines and original not in chain:
+                chain.add(original)
                 original = baselines[original]
             setattr(_config, name, original)
             restored += 1
         except Exception:
             continue
-        _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
-        _BUMPED_RECOMPILE_LIMITS.pop(name, None)
-    _GLOBAL_BUMPS = 0
+        # Only the branch just unwound. Dropping the whole map also threw away
+        # branches a live `config.patch` is still hiding: bump 8->24, patch to
+        # 2, bump 2->18, restore -- the 24->8 debt went with it, and the patch
+        # exit then resurrected 24 permanently.
+        for value in chain:
+            baselines.pop(value, None)
+        if not baselines:
+            _ORIGINAL_RECOMPILE_LIMITS.pop(name, None)
+            _BUMPED_RECOMPILE_LIMITS.pop(name, None)
+    # Repay only the debts actually settled. Zeroing while a scoped patch still
+    # hid a live bump handed the next wrapper the whole global allowance again,
+    # so repeated patches walked straight past the total cap. One bump call
+    # records one value per name, so the longest surviving map is the count.
+    _GLOBAL_BUMPS = max((len(m) for m in _BUMPED_RECOMPILE_LIMITS.values()),
+                        default = 0)
     return restored
 
 

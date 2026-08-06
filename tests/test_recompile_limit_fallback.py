@@ -772,11 +772,33 @@ def _utils():
     return U
 
 
+def _limit_names():
+    import torch._dynamo.config as cfg
+    return [n for group in _utils()._RECOMPILE_LIMIT_NAMES for n in group
+            if isinstance(getattr(cfg, n, None), int)]
+
+
+def _snapshot_limits():
+    import torch._dynamo.config as cfg
+    return {n: getattr(cfg, n) for n in _limit_names()}
+
+
+# Captured at import, before any test bumps: pytest imports the module first.
+_PRISTINE_LIMITS = _snapshot_limits()
+
+
 def _reset_bump_state(U):
+    import torch._dynamo.config as cfg
     U._ORIGINAL_RECOMPILE_LIMITS.clear()
     U._BUMPED_RECOMPILE_LIMITS.clear()
     U._GLOBAL_BUMPS = 0
     U._EAGER_FALLBACK_WRAPPERS.clear()
+    # Clearing the bookkeeping alone left a real bump standing: a wrapper that
+    # exhausted its cache raised both budgets by 16 before signalling, so every
+    # later test ran against enlarged limits and could stop reaching the
+    # exhaustion it exercises.
+    for name, value in _PRISTINE_LIMITS.items():
+        setattr(cfg, name, value)
 
 def test_a_scoped_first_bump_does_not_strand_a_stale_original():
     """`setdefault` alone kept the PATCHED value as the recorded original.
@@ -918,3 +940,111 @@ def test_early_stop_counts_as_a_finished_retry():
     assert wrapped._unsloth_fallback_state["pending_eager"] is True, \
         "the retry finished; the wrapper must still be latched for next step"
     _reset_bump_state(U)
+
+
+# ---- round 4: three Codex items -----------------------------------------
+
+def test_a_hidden_branch_survives_restoring_a_visible_one():
+    """Restoring one branch used to drop every branch recorded for the name.
+
+    Bump 8->24, enter a patch at 2, restore (24 is hidden, so the debt is
+    kept), bump 2->18, restore. That second restore popped the whole per-name
+    map, taking the 24->8 debt with it, and the patch exit then handed 24 back
+    as the process-wide limit for good.
+    """
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)                  # outer -> outer+16
+        bumped = getattr(cfg, name)
+        with torch._dynamo.config.patch({name: 2}):
+            U._restore_recompile_limits()             # ours is hidden: keep it
+            U._bump_recompile_limits(16)              # 2 -> 18
+            U._restore_recompile_limits()             # settles 18 -> 2
+            assert getattr(cfg, name) == 2
+        assert getattr(cfg, name) == bumped, "patch exit hands our bump back"
+        assert U._restore_recompile_limits() == 1, "the hidden debt was dropped"
+        assert getattr(cfg, name) == outer, (
+            f"limit left at {getattr(cfg, name)}, expected {outer}")
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_global_bump_count_is_not_repaid_for_unsettled_debt():
+    """Zeroing the counter unconditionally let repeated scoped patches borrow
+    the whole process-wide allowance again while a bump was still live."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)
+        assert U._GLOBAL_BUMPS == 1
+        with torch._dynamo.config.patch({name: 2}):
+            U._restore_recompile_limits()             # nothing settled
+            assert U._GLOBAL_BUMPS == 1, "an unsettled bump was marked repaid"
+        U._restore_recompile_limits()
+        assert U._GLOBAL_BUMPS == 0, "a settled bump must be repaid"
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_total_cap_still_holds_across_scoped_patches():
+    """The end the counter exists for: bumps stay bounded even when every
+    restore lands under a patch that hides the live value."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        taken = 0
+        for _ in range(U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS + 4):
+            if U._bump_recompile_limits(16):
+                taken += 1
+            with torch._dynamo.config.patch({name: 2}):
+                U._restore_recompile_limits()
+        assert taken == U._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS, taken
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_a_fully_settled_name_leaves_no_bookkeeping_behind():
+    """The ordinary path must still clear out, or the counter never reaches 0
+    and bumps stop being available at all."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    name = _limit_names()[0]
+    _reset_bump_state(U)
+    outer = getattr(cfg, name)
+    try:
+        U._bump_recompile_limits(16)
+        U._bump_recompile_limits(16)
+        U._restore_recompile_limits()
+        assert getattr(cfg, name) == outer
+        assert not U._BUMPED_RECOMPILE_LIMITS
+        assert not U._ORIGINAL_RECOMPILE_LIMITS
+        assert U._GLOBAL_BUMPS == 0
+    finally:
+        setattr(cfg, name, outer)
+        _reset_bump_state(U)
+
+
+def test_the_reset_helper_puts_the_real_budgets_back():
+    """It only cleared bookkeeping, so a test whose wrapper really bumped left
+    both limits +16 for everything that ran after it."""
+    import torch._dynamo.config as cfg
+    U = _utils()
+    names = _limit_names()
+    before = {n: getattr(cfg, n) for n in names}
+    U._bump_recompile_limits(16)
+    assert any(getattr(cfg, n) != before[n] for n in names), "nothing bumped"
+    _reset_bump_state(U)
+    assert {n: getattr(cfg, n) for n in names} == before
