@@ -685,6 +685,45 @@ def _recompile_limit_errors():
     return tuple(found)
 
 
+_UNKNOWN = object()
+
+
+def _saved_tensor_hook_accessor():
+    """torch 2.8 added this; 2.4 to 2.7 have no way to read the hook stack.
+
+    Its own function so a test can stand in for an older torch without having
+    to write to the read-only `torch._C._autograd`.
+    """
+    return getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+# `CheckpointFunction.forward`/`.backward`, the reentrant path's own frames.
+# Reentrant checkpointing re-differentiates what it recomputes, so a mode flip
+# cannot strand it, and both phases carry one of these.
+_REENTRANT_FRAMES = ("forward", "backward")
+
+
+def _walk_for_checkpoint_frame(_limit = 60):
+    """The pre-2.8 answer: is any `torch.utils.checkpoint` frame on the stack?
+
+    torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
+    there would quietly restore the old behaviour on the releases pyproject
+    still supports. The module file is stable across every supported version.
+    """
+    try:
+        import sys                              # module-level `_sys` is deleted above
+        import torch.utils.checkpoint as _checkpoint
+        origin = _checkpoint.__file__
+    except Exception:
+        return None
+    if not origin: return None
+    frame, seen, found = sys._getframe(1), 0, False
+    while frame is not None and seen < _limit:
+        if frame.f_code.co_filename == origin:
+            if frame.f_code.co_name in _REENTRANT_FRAMES: return False
+            found = True
+        frame, seen = frame.f_back, seen + 1
+    return found
+
+
 def _in_non_reentrant_checkpoint():
     """Are we inside a `use_reentrant = False` region? None when torch cannot say.
 
@@ -696,17 +735,19 @@ def _in_non_reentrant_checkpoint():
     answers False, which is right: it re-differentiates what it recomputes, so
     a mode flip cannot strand it.
     """
-    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
-    if top is None: return None
-    try:
-        hooks = top(True)                       # ignore_is_tracing
-    except Exception:
-        return None
-    if not hooks: return False
-    pack = hooks[0]
-    if getattr(pack, "__module__", "") != "torch.utils.checkpoint": return False
-    return getattr(pack, "__qualname__", "").startswith(
-        ("_checkpoint_hook", "_recomputation_hook"))
+    top = _saved_tensor_hook_accessor()
+    if top is not None:
+        try:
+            hooks = top(True)                   # ignore_is_tracing
+        except Exception:
+            hooks = _UNKNOWN
+        if hooks is not _UNKNOWN:
+            if not hooks: return False
+            pack = hooks[0]
+            if getattr(pack, "__module__", "") != "torch.utils.checkpoint": return False
+            return getattr(pack, "__qualname__", "").startswith(
+                ("_checkpoint_hook", "_recomputation_hook"))
+    return _walk_for_checkpoint_frame()
 
 
 def _wants_hard_recompile_failure():
@@ -826,10 +867,13 @@ _MAX_RECOMPILE_LIMIT_BUMPS = 4
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
-# What we last set each name to. A bump taken inside `torch._dynamo.config.patch`
-# records the context's temporary value as the original, and the context restores
-# the outer one on exit, so writing the captured value back later would overwrite
-# it. Only restore a name still holding the value we put there.
+# Every value we have set each name to. A bump taken inside
+# `torch._dynamo.config.patch` records the context's temporary value as the
+# original, and the context restores the outer one on exit, so writing the
+# captured value back later would overwrite it. Only restore a name still
+# holding a value we put there. This is a set rather than the last value
+# because bumps nest: bump to 24, patch down to 2, bump to 18, and on exit
+# dynamo restores 24, which is also ours and still owes the original 8.
 _BUMPED_RECOMPILE_LIMITS = {}
 
 
@@ -853,7 +897,7 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                 except Exception:
                     continue
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
-                _BUMPED_RECOMPILE_LIMITS[name] = current + extra
+                _BUMPED_RECOMPILE_LIMITS.setdefault(name, set()).add(current + extra)
                 bumped = True
                 # Only the name this torch really reads; the alias follows.
                 break
@@ -897,7 +941,7 @@ def _restore_recompile_limits():
         try:
             # Someone else owns this name now, so our captured value is stale.
             # Drop the claim rather than clobber theirs.
-            if getattr(_config, name, None) == _BUMPED_RECOMPILE_LIMITS.get(name):
+            if getattr(_config, name, None) in _BUMPED_RECOMPILE_LIMITS.get(name, ()):
                 setattr(_config, name, original)
                 restored += 1
         except Exception:
@@ -1054,7 +1098,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             f"{label}; running it eagerly from here. Training is "
             f"unaffected apart from speed. ({type(e).__name__})"
         )
-        if _in_non_reentrant_checkpoint(): raise e
+        if _in_non_reentrant_checkpoint():
+            global _RAISED_INSIDE_CHECKPOINT
+            _RAISED_INSIDE_CHECKPOINT = True
+            raise e
         return eager_func(*args, **kwargs)
 
     @functools.wraps(eager_func)
@@ -1120,6 +1167,28 @@ def eager_fallback_state() -> dict[str, bool]:
     return out
 
 
+_RAISED_INSIDE_CHECKPOINT = False
+
+
+def _settle_abandoned_checkpoint_generator():
+    """Finalise the checkpoint generator our give-up raise left mid-flight.
+
+    `_checkpoint_without_reentrant_generator` holds `with _checkpoint_hook(...)`
+    open across its yield, so an exception escaping the region abandons the
+    generator with its saved-tensor hooks still installed, and every later
+    region sees them. Refcounting usually finalises it at once; raising through
+    the compiled frames leaves a cycle, so it waits for a collection. One
+    collect here makes the retry we promised the caller deterministic. Only
+    after a give-up raise, which the bump caps bound to a handful per process.
+    """
+    global _RAISED_INSIDE_CHECKPOINT
+    if not _RAISED_INSIDE_CHECKPOINT: return False
+    _RAISED_INSIDE_CHECKPOINT = False
+    import gc
+    gc.collect()
+    return True
+
+
 def apply_pending_eager_fallbacks() -> int:
     """Latch every wrapper that deferred its switch. Returns how many flipped.
 
@@ -1136,6 +1205,7 @@ def apply_pending_eager_fallbacks() -> int:
 
     Safe to call on every step. Nothing pending means nothing happens.
     """
+    _settle_abandoned_checkpoint_generator()
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
     if not any(w._unsloth_fallback_state.get("pending_eager") for w in live):

@@ -685,6 +685,24 @@ def test_the_fixture_restores_every_limit_a_bump_raised():
     assert {k: getattr(torch._dynamo.config, k) for k in keys} == outer
 
 
+def test_a_bump_nested_inside_a_scoped_config_patch_still_settles_up():
+    """Bumps nest, so the last value we set is not the only one that is ours.
+
+    Bump to 24, patch down to 2, bump to 18. On exit dynamo restores 24, which
+    is also ours and still owes the original 8. Recording only the newest value
+    made that look like someone else's change, so 24 stayed forever."""
+    with _isolated_budget() as (mod, config, name, before):
+        mod._bump_recompile_limits()
+        first = getattr(config, name)
+        assert first > before
+        with torch._dynamo.config.patch({name: 2}):
+            mod._bump_recompile_limits()
+            assert getattr(config, name) != first, "the nested bump is a new value"
+        assert getattr(config, name) == first, "dynamo restored our earlier bump"
+        mod._restore_recompile_limits()
+        assert getattr(config, name) == before, "the first bump was stranded"
+
+
 def test_a_bump_taken_inside_a_scoped_config_patch_is_not_written_back():
     """`torch._dynamo.config.patch` restores its outer value on exit, so the
     value captured inside it is stale by the time we settle up. Writing it back

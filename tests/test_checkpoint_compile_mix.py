@@ -103,12 +103,24 @@ def dynamo_limits():
     saved = {n: getattr(dynamo.config, n) for n in names
              if hasattr(dynamo.config, n)}
     n_wrappers = len(U._EAGER_FALLBACK_WRAPPERS)
+    # These tests end with a bump deliberately still outstanding, so the
+    # bookkeeping has to come back too. Left behind, a later fallback restores
+    # this test's limit of 2 over the process default, or finds the shared
+    # allowance already spent.
+    saved_global = U._GLOBAL_BUMPS
+    saved_orig = dict(U._ORIGINAL_RECOMPILE_LIMITS)
+    saved_bumped = {k: set(v) for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
     try:
         yield
     finally:
         for n, v in saved.items():
             setattr(dynamo.config, n, v)
         del U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
+        U._GLOBAL_BUMPS = saved_global
+        U._ORIGINAL_RECOMPILE_LIMITS.clear()
+        U._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
+        U._BUMPED_RECOMPILE_LIMITS.clear()
+        U._BUMPED_RECOMPILE_LIMITS.update(saved_bumped)
         dynamo.reset()
 
 
@@ -165,6 +177,60 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
     state = fn._unsloth_fallback_state
     assert state["eager"], "the wrapper must latch so the retry is consistent"
     assert state["bumps"] == 0, "no budget was borrowed"
+
+    # The promise is that the caller can retry the step. torch holds
+    # `with _checkpoint_hook(...)` open across the generator's yield, so our
+    # raise abandons it with the hooks installed and every later region sees
+    # them; the step boundary is where that gets settled.
+    U.apply_pending_eager_fallbacks()
+    def plain(x): return torch.nn.functional.softmax(x * 2, dim = -1)
+    checkpoint(plain, torch.randn(4, 4, requires_grad = True),
+               use_reentrant = False).sum().backward()
+
+
+def test_the_pre_2_8_fallback_answers_the_same_as_the_accessor():
+    """torch 2.4 to 2.7 have no saved-tensor-hook accessor, and answering None
+    there would quietly restore the old behaviour on releases pyproject still
+    supports. The frame walk has to agree with the accessor where both exist,
+    including saying False for reentrant checkpointing, which is not at risk."""
+    assert U._walk_for_checkpoint_frame() is False, "outside any region"
+
+    seen = []
+    def probe(x):
+        seen.append((U._in_non_reentrant_checkpoint(), U._walk_for_checkpoint_frame()))
+        return torch.nn.functional.softmax(x * 2, dim = -1)
+
+    for reentrant, expected in ((False, True), (True, False)):
+        seen.clear()
+        x = torch.randn(4, 4, requires_grad = True)
+        checkpoint(probe, x, use_reentrant = reentrant).sum().backward()
+        assert seen, "the probe never ran"
+        for accessor, walked in seen:
+            assert walked is expected, f"use_reentrant={reentrant}: {walked}"
+            if accessor is not None:
+                assert accessor == walked, "the two disagree"
+
+
+def test_an_older_torch_falls_through_to_the_frame_walk():
+    """Standing in for 2.4 to 2.7, where the accessor does not exist. Returning
+    None there would silently restore the pre-fix behaviour."""
+    seen = []
+    def probe(x):
+        seen.append(U._in_non_reentrant_checkpoint())
+        return torch.nn.functional.softmax(x * 2, dim = -1)
+
+    real = U._saved_tensor_hook_accessor
+    U._saved_tensor_hook_accessor = lambda: None
+    try:
+        assert U._in_non_reentrant_checkpoint() is False, "outside any region"
+        for reentrant, expected in ((False, True), (True, False)):
+            seen.clear()
+            x = torch.randn(4, 4, requires_grad = True)
+            checkpoint(probe, x, use_reentrant = reentrant).sum().backward()
+            assert seen and all(s is expected for s in seen), \
+                f"use_reentrant={reentrant}: {seen}"
+    finally:
+        U._saved_tensor_hook_accessor = real
 
 
 @pytest.mark.skipif(
