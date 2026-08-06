@@ -38,6 +38,7 @@ from .mixtral_moe import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
+from .amd_aiter import *
 from .mxfp4 import *
 from .bitsandbytes import *
 from .moe_utils_bnb4bit import *

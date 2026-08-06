@@ -299,13 +299,17 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    if not torch.cuda.is_available():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu", torch.xpu.current_device())
+    else:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        device = torch.cuda.current_device()
         dtype = torch.float16
 
         # 1 expert, 1 token, dim 8 (safe alignment).
@@ -335,8 +339,13 @@ def _transposed_view_grouped_mm_is_safe():
 
     safe = False
     try:
-        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
-            device = torch.cuda.current_device()
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = torch.device("xpu", torch.xpu.current_device())
+        else:
+            device = None
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
@@ -1361,9 +1370,14 @@ def forward_native_grouped_mm(
 
     # Runtime safety check (defense in depth).
     if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        # Compute Capability is CUDA-only; on XPU it would mask this message.
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            where = f"this device (Compute Capability {major}.{minor})"
+        else:
+            where = "this device"
         raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
+            f"torch._grouped_mm is not supported on {where}. "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
