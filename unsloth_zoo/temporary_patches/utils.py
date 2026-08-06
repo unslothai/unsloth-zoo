@@ -1129,8 +1129,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             f"unaffected apart from speed. ({type(e).__name__})"
         )
         if _in_non_reentrant_checkpoint():
-            global _RAISED_INSIDE_CHECKPOINT
+            global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
             raise e
         return eager_func(*args, **kwargs)
 
@@ -1198,6 +1199,21 @@ def eager_fallback_state() -> dict[str, bool]:
 
 
 _RAISED_INSIDE_CHECKPOINT = False
+# Retries are bounded: one collection per step forever would cost more than the
+# stale hooks do, and torch < 2.8 cannot report them at all.
+_MAX_CHECKPOINT_SETTLE_ATTEMPTS = 8
+_CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+def _checkpoint_hooks_left_installed():
+    """Are `torch.utils.checkpoint`'s hooks still on top? False when unknowable."""
+    top = _saved_tensor_hook_accessor()
+    if top is None: return False
+    try:
+        hooks = top(True)
+    except Exception:
+        return False
+    return bool(hooks) and _is_checkpoint_pack_hook(hooks[0])
 
 
 def _settle_abandoned_checkpoint_generator():
@@ -1211,11 +1227,19 @@ def _settle_abandoned_checkpoint_generator():
     collect here makes the retry we promised the caller deterministic. Only
     after a give-up raise, which the bump caps bound to a handful per process.
     """
-    global _RAISED_INSIDE_CHECKPOINT
+    global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
     if not _RAISED_INSIDE_CHECKPOINT: return False
-    _RAISED_INSIDE_CHECKPOINT = False
     import gc
     gc.collect()
+    _CHECKPOINT_SETTLE_ATTEMPTS += 1
+    # A caller retrying from inside `except ... as exc` still roots the
+    # traceback, so the generator survives every collection. Stay pending and
+    # try again at the next boundary rather than never again.
+    if _checkpoint_hooks_left_installed() and \
+        _CHECKPOINT_SETTLE_ATTEMPTS < _MAX_CHECKPOINT_SETTLE_ATTEMPTS:
+        return False
+    _RAISED_INSIDE_CHECKPOINT = False
+    _CHECKPOINT_SETTLE_ATTEMPTS = 0
     return True
 
 

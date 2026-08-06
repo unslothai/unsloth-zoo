@@ -321,6 +321,46 @@ def test_pending_switch_is_applied_at_the_step_boundary(dynamo_limits):
     _run_checkpointed_step(fn)
 
 
+@pytest.mark.skipif(
+    U._saved_tensor_hook_accessor() is None,
+    reason = "torch < 2.8 cannot report whether the hooks are still installed",
+)
+def test_settlement_retries_until_the_generator_is_actually_collected():
+    """A caller that retries from inside `except ... as exc` still roots the
+    traceback, so the abandoned checkpoint generator survives the collection and
+    its hooks stay installed for every later region. Clearing the pending flag
+    regardless meant the next boundary never tried again."""
+    import gc
+
+    def boom(x):
+        raise RuntimeError("give up")
+
+    saved = U._RAISED_INSIDE_CHECKPOINT
+    try:
+        try:
+            checkpoint(boom, torch.randn(4, 4, requires_grad = True),
+                       use_reentrant = False)
+        except RuntimeError as exc:
+            cycle = {"exc": exc}                # a cycle, as raising through
+            cycle["self"] = cycle               # compiled frames leaves
+            U._RAISED_INSIDE_CHECKPOINT = True
+            # The step boundary the caller reaches before retrying: the
+            # traceback is still live, so no collection can finalise anything.
+            U.apply_pending_eager_fallbacks()
+            assert U._in_non_reentrant_checkpoint() is True, "hooks already gone"
+
+        del cycle                               # garbage now, but only to gc
+        assert U._in_non_reentrant_checkpoint() is True, "refcounting freed it"
+
+        U.apply_pending_eager_fallbacks()       # the next boundary must retry
+        assert U._in_non_reentrant_checkpoint() is False, \
+            "the abandoned generator was never settled"
+    finally:
+        U._RAISED_INSIDE_CHECKPOINT = saved
+        U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+        gc.collect()
+
+
 def test_apply_pending_is_a_no_op_without_a_pending_switch(dynamo_limits):
     fn = U._fall_back_to_eager_on_recompile_limit(
         lambda *a, **k: None, lambda *a, **k: None, "untriggered",
