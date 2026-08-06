@@ -343,8 +343,11 @@ def requires_grad_for_gradient_checkpointing(model):
                     # See https://github.com/unslothai/unsloth/issues/5360
                     target = output.last_hidden_state
                 else:
-                    # Dynamo cannot trace the raise either, so stay quiet while tracing.
-                    if torch.compiler.is_compiling(): return
+                    # Raise while tracing too. Skipping here would leave a tuple /
+                    # list / dict output unmarked, and `is_compiling()` is constant
+                    # folded, so the compiled graph would never re-check it: a
+                    # checkpointed region would then train with no adapter
+                    # gradients instead of failing loudly.
                     raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")

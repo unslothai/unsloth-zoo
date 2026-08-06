@@ -73,6 +73,26 @@ class _PostHookModel(nn.Module):
         return torch.nn.functional.linear(hidden_states, self.head.weight)
 
 
+class _Trunk(nn.Module):
+    """Never called as `self.adapter(`, so `_TupleOutputModel` takes the fallback
+    post-hook path -- onto a module whose output is a tuple, like a decoder layer."""
+    def __init__(self):
+        super().__init__()
+        self.adapter = nn.Linear(8, 8, bias = False)
+
+    def forward(self, hidden_states):
+        return (torch.nn.functional.linear(hidden_states, self.adapter.weight), None)
+
+
+class _TupleOutputModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.trunk = _Trunk()
+
+    def forward(self, hidden_states):
+        return getattr(self, "trunk")(hidden_states)[0]
+
+
 class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -183,11 +203,39 @@ def test_post_hook_still_flips_a_frozen_output_while_compiling(monkeypatch):
     assert y.requires_grad
 
 
-def test_post_hook_does_not_raise_on_unknown_output_while_compiling(monkeypatch):
-    # Eagerly this output shape raises; under compile it must be skipped.
+def test_post_hook_still_raises_on_unknown_output_while_compiling(monkeypatch):
+    """An output the hook cannot mark must stay a loud error while tracing.
+
+    `is_compiling()` is constant folded into the graph, so a skip here is
+    permanent: the compiled artifact never re-checks the output, and a
+    checkpointed region trains with no adapter gradients at all.
+    """
     hook = _real_post_hook()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    hook(None, None, {"not" : "a tensor"})
+    with pytest.raises(RuntimeError, match = "Failed to make output require gradients"):
+        hook(None, None, {"not" : "a tensor"})
+
+
+def test_compiled_tuple_output_still_raises():
+    """End to end: a fallback post-hook target returning a tuple, under compile.
+
+    `requires_grad_for_gradient_checkpointing` itself picks this target, so the
+    shape is one Unsloth produces; the error must survive tracing.
+    """
+    torch._dynamo.reset()
+    model = _TupleOutputModel()
+    model.requires_grad_(False)
+    model.trunk.adapter.weight.requires_grad_(True)
+    requires_grad_for_gradient_checkpointing(model)
+    hooks = list(model.trunk._forward_hooks.values())
+    assert len(hooks) == 1, hooks
+    assert "requires_grad_post_hook" in hooks[0].__qualname__
+
+    x = torch.randn(2, 8)
+    with pytest.raises(RuntimeError, match = "Failed to make output require gradients"):
+        model(x)
+    with pytest.raises(RuntimeError, match = "Failed to make output require gradients"):
+        torch.compile(model, backend = "aot_eager")(x)
 
 
 def test_fullgraph_compiled_module_with_pre_hook_runs():
