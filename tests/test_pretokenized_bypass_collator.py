@@ -634,6 +634,20 @@ def test_a_column_name_this_file_has_never_heard_of_is_refused():
     _refuses(dataset, processor)
 
 
+@pytest.mark.parametrize("column", ["num_crops", "num_tiles"])
+def test_an_integer_side_car_is_refused_without_the_processor(column):
+    """Gemma 3 declares `num_crops` and Llama 3.2 Vision `num_tiles` beside
+    `pixel_values`. Their dtype is an ordinary int, so the schema calls them
+    plain and only the name can refuse - and a processor that will not name its
+    own outputs leaves the static set as the only thing that knows."""
+    processor = DerivedProcessor()          # declares nothing to derive from
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: [4, 4],
+    })
+    _refuses(dataset, processor)
+
+
 def test_a_raw_eval_split_with_a_derived_column_is_refused():
     """`_eval_split_is_raw_text_only` reads the same set."""
     processor = DerivedProcessor(image_names = ["widget_patches"])

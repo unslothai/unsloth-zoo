@@ -829,6 +829,9 @@ def train_on_responses_only(
         "high_res_pixel_values", "flattened_patches",
         # Fuyu keeps its preprocessed images here, beside `input_ids`.
         "image_patches", "image_patches_indices",
+        # Integer side-cars whose dtype reads as plain, so only the name refuses:
+        # Gemma 3 declares `num_crops`, Llama 3.2 Vision `num_tiles`.
+        "num_crops", "num_tiles",
     ))
 
     # Names the text tokenizer owns; a processor half repeating one of these must
