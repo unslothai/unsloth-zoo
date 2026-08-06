@@ -628,6 +628,13 @@ def train_on_responses_only(
         return num_proc
     pass
 
+    # `remove_unused_columns = False` is the user asking for their columns to
+    # survive, and HF's Trainer honours it: a custom `compute_loss` can pop a
+    # `sample_weight` the model itself never declares, so the model-input
+    # keep-lists below would delete the weighting the run depends on.
+    _keep_every_column = not getattr(
+        getattr(trainer, "args", None), "remove_unused_columns", True)
+
     # transformers 5.0+ VLMs skip dataset prep in SFTTrainer.__init__
     # (skip_prepare_dataset=True when _is_vlm), so tokenize before masking.
     def _maybe_tokenize_dataset(dataset):
@@ -660,6 +667,12 @@ def train_on_responses_only(
         if not isinstance(_raw_columns, dict):
             _keep = {"labels"} | _model_forward_parameter_names(
                 getattr(trainer, "model", None))
+            # This strip runs before the keep-list at the end of the function, so
+            # it has to honour the opt-out itself or the column is already gone.
+            # Only the text just tokenized still goes: it is the string the
+            # collator cannot stack, and its tokens replace it.
+            if _keep_every_column:
+                _keep |= set(_raw_columns) - {text_field, "text"}
             _map_kwargs["remove_columns"] = [c for c in _raw_columns if c not in _keep]
         import warnings as _w
         with _w.catch_warnings():
@@ -1511,11 +1524,6 @@ def train_on_responses_only(
             names.discard("self")
             return names
         _keep_columns = _model_input_columns()
-        # `remove_unused_columns = False` is the user asking for their columns to
-        # survive, and HF's Trainer honours it: a custom `compute_loss` can pop a
-        # `sample_weight` the model itself never declares, so the keep-list above
-        # would delete the weighting the run depends on.
-        _keep_every_column = not getattr(trainer.args, "remove_unused_columns", True)
         def _drop_raw_columns(dataset):
             if _keep_every_column: return dataset
             if dataset is None or not hasattr(dataset, "remove_columns"): return dataset

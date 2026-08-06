@@ -1895,3 +1895,36 @@ def test_a_bypassed_self_packing_collator_is_untouched_without_packing():
 
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
 
+
+
+def test_remove_unused_columns_false_survives_raw_text_tokenization():
+    """The opt-out has to hold on the raw path too, not just the pretokenized one.
+
+    Tokenization runs first, and its own strip kept only `labels` and the declared
+    forward parameters, so a `sample_weight` that a custom `compute_loss` pops was
+    already deleted by the time the model-input keep-list consulted the flag.
+    """
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = _raw_text_rows(2).add_column("sample_weight", [0.25, 0.75])
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    columns = set(out.eval_dataset.column_names)
+    assert "sample_weight" in columns, sorted(columns)
+    assert out.eval_dataset[0]["sample_weight"] == 0.25
+    # The text just consumed still goes: no collator can stack a string.
+    assert "text" not in columns, sorted(columns)
+
+
+def test_remove_unused_columns_false_survives_a_raw_train_split():
+    """Same strip, the train side of it, reached with a plain text collator."""
+    rows = _raw_text_rows(2).add_column("sample_weight", [0.25, 0.75])
+    trainer = StubTrainer(DataCollatorForSeq2Seq(tokenizer = StubTokenizer()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    columns = set(out.train_dataset.column_names)
+    assert "sample_weight" in columns, sorted(columns)
+    assert "text" not in columns, sorted(columns)
