@@ -50,6 +50,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gpt_oss",
     "unsloth_zoo.temporary_patches.lfm2_moe",
     "unsloth_zoo.temporary_patches.ministral",
+    "unsloth_zoo.temporary_patches.amd_aiter",
     "unsloth_zoo.temporary_patches.misc",
     "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",

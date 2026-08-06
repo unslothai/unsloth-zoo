@@ -42,8 +42,15 @@ import inspect
 import linecache
 import sys
 import torch
-from .common import TEMPORARY_PATCHES, logger
-from .utils import patch_function, raise_error
+from .common import (
+    TEMPORARY_PATCHES,
+    logger,
+    torch_compile,
+    flatten_for_elementwise_norm,
+    unwrap_norm_weight,
+    publish_to_modeling_module,
+)
+from .utils import compile_with_eager_fallback, patch_function, raise_error
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -278,6 +285,37 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
 
+# Clamp bound so a large residual never becomes inf on the cast back. Module-level
+# keeps `torch.finfo` out of the graph.
+_GEMMA4_FP16_MAX = float(torch.finfo(torch.float16).max)
+
+
+# gemma-4-E2B has 504 RMSNorms sharing this one code object, so its Dynamo cache holds
+# the product of every axis its guards see. A pure tensor kernel instead of a bound
+# method drops three: `with_scale` (own kernel), width (Tensor view) and rank (2D).
+def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    normed_fp32 = x_fp32 * torch.pow(variance + eps, -0.5)
+    normed_fp32 = normed_fp32 * weight_1d.to(torch.float32)
+    return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
+pass
+
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
+# this wrapper latches to eager instead of aborting the run.
+_gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward (scaled)")
+
+
+def _gemma4_rms_norm_unscaled(hidden_states_2d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    normed_fp32 = x_fp32 * torch.pow(variance + eps, -0.5)
+    return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
+pass
+
+_gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward (unscaled)")
+
+
 def patch_Gemma4RMSNorm():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -286,19 +324,30 @@ def patch_Gemma4RMSNorm():
     except Exception as e:
         return raise_error("Gemma4RMSNorm.forward", e)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
-        # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when with_scale.
-        x_fp32 = hidden_states.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        normed_fp32 = x_fp32 * torch.pow(variance + self.eps, -0.5)
-        if self.with_scale:
-            normed_fp32 = normed_fp32 * self.weight.to(torch.float32)
+    publish_to_modeling_module(
+        transformers.models.gemma4.modeling_gemma4,
+        flatten_for_elementwise_norm  = flatten_for_elementwise_norm,
+        unwrap_norm_weight            = unwrap_norm_weight,
+        _gemma4_rms_norm_scaled       = _gemma4_rms_norm_scaled,
+        _gemma4_rms_norm_unscaled     = _gemma4_rms_norm_unscaled,
+    )
 
-        # Clamp to fp16 range before casting back so a large residual never becomes inf.
-        fp16_max = torch.finfo(torch.float16).max
-        return torch.clamp(normed_fp32, min = -fp16_max, max = fp16_max).to(torch.float16)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
+        # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
+        # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
+        hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
+        if self.with_scale:
+            normed = _gemma4_rms_norm_scaled(
+                hidden_states_2d, unwrap_norm_weight(self.weight), self.eps,
+            )
+        else:
+            normed = _gemma4_rms_norm_unscaled(hidden_states_2d, self.eps)
+        return normed.reshape(shape)
     pass
-    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm, "forward", forward, fullgraph = True, match_level = "relaxed")
+    # No `fullgraph`: the kernels are the compiled units; compiling this wrapper too
+    # would put `self` back into the guards. Dynamo inlines it anyway when a caller is
+    # compiled.
+    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm, "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 

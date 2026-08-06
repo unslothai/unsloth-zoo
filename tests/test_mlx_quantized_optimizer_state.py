@@ -258,7 +258,24 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    assert worst == 0.0, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
+    # Tolerance, not equality. MLX documents compiled and uncompiled output as
+    # "the same up to numerical precision", never bit-identical: mx.compile fuses
+    # elementwise chains, so intermediates stay in registers instead of being
+    # rounded to fp32 on every store, and the fused arithmetic reassociates.
+    #
+    # This asserted `== 0.0` and held on macos-14, where the fused kernel happened
+    # to land on the same bits. On macos-15 it does not: the trajectory differs by
+    # 5.96e-08 at worst, which is 2**-24, half an fp32 ULP on an O(1) loss.
+    #
+    # The point of the test is that compiling does not BREAK the quantized
+    # optimizer, and that still holds at this bar. A compiled path that diverged
+    # for real would grow monotonically across steps as the error fed back through
+    # the moments; this one does not compound (steps 1, 3, 4 and 8 match exactly)
+    # and stays ~1e5 times under the int8-vs-fp32 gap the neighbouring tests
+    # already tolerate. 1e-6 is ~8 fp32 ULP here: loose enough for fusion to pick
+    # a different but equally valid kernel, tight enough that real divergence
+    # still fails loudly.
+    assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 
 # 7 ------------------------------------------------------------------------
