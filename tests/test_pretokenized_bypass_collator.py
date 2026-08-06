@@ -1758,3 +1758,27 @@ def test_a_token_classification_collator_keeps_its_padding_settings():
     assert repaired.padding == "max_length", repaired.padding
     assert repaired.max_length == 128, repaired.max_length
     assert repaired.pad_to_multiple_of == 8, repaired.pad_to_multiple_of
+
+
+# --- what the fifth review round found ---------------------------------------
+
+def test_a_raw_eval_split_whose_full_scan_fails_is_refused():
+    """A failed exhaustive scan proves nothing, so it must not read as proof.
+
+    A custom transform that needs a column `select_columns([name])` removed makes
+    the whole-column scan raise, and only the 16 sampled rows were ever checked.
+    Calling the column all-strings there lets the bypass through, and a `None`
+    further down then crashes `_maybe_tokenize_dataset` partway.
+    """
+    def _needs_both(batch):
+        return {"text": [t + str(w) for t, w in zip(batch["text"], batch["weight"])]}
+
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{i}{RESPONSE_PART}a{i}" for i in range(4)],
+        "weight": [1, 2, 3, 4],
+    }).with_transform(_needs_both)
+
+    with pytest.raises(ValueError, match = "does not support response-only") as excinfo:
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "['text']" in str(excinfo.value), "the refusal does not name the column"

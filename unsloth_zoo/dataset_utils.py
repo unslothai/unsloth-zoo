@@ -1055,7 +1055,12 @@ def train_on_responses_only(
                 if not all(isinstance(v, str) for v in batch[name]): return False
             return True
         except Exception:
-            return True
+            # The scan blew up partway (a custom transform needing the columns
+            # `select_columns` just removed), so only the sampled rows were ever
+            # checked and the rest are unproven. Refuse, exactly as the ambiguous
+            # media scan does, rather than call the failure a proof.
+            _unscannable_media_columns.add(name)
+            return False
     pass
 
     def _has_media_column(names, rows, split = None):
