@@ -464,3 +464,46 @@ def test_the_recompile_budget_is_bounded_and_handed_back():
     finally:
         setattr(config, name, before)
         u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = saved_global, saved_orig
+
+
+def test_exhausting_the_budget_takes_the_other_borrowers_with_it():
+    """Wrappers in the same budget crisis must switch together, and only those.
+
+    One checkpointed region routinely spans several patched functions. Letting
+    only the wrapper that ran out go eager leaves the rest of the step half
+    compiled, which is the mismatch this path exists to avoid. A wrapper that
+    never borrowed budget was never in trouble and must stay compiled.
+    """
+    from unsloth_zoo.temporary_patches import utils as u
+
+    borrower_calls = {"c": 0, "e": 0}
+    bystander_calls = {"c": 0, "e": 0}
+
+    def borrower(x):
+        borrower_calls["c"] += 1
+        raise _LIMIT_ERROR("recompile_limit reached")
+
+    def borrower_eager(x):
+        borrower_calls["e"] += 1
+        return x * 2
+
+    b_c, b_e, _ = _pair(_LIMIT_ERROR("recompile_limit reached"), borrower_calls)
+    s_c, s_e, _ = _pair(None, bystander_calls)
+
+    saved_global = u._GLOBAL_BUMPS
+    with _hard_failure(False):
+        first = _fall_back_to_eager_on_recompile_limit(b_c, b_e, "A.forward")
+        second = _fall_back_to_eager_on_recompile_limit(borrower, borrower_eager,
+                                                        "B.forward")
+        bystander = _fall_back_to_eager_on_recompile_limit(s_c, s_e, "C.forward")
+        # Both borrowers exhaust; the bystander never fails.
+        first(1)
+        u._GLOBAL_BUMPS = u._MAX_TOTAL_RECOMPILE_LIMIT_BUMPS   # budget gone
+        second(1)
+
+    assert second._unsloth_fallback_state["eager"] is True
+    # first borrowed budget earlier, so it comes along.
+    assert first._unsloth_fallback_state["eager"] is True
+    # The bystander never bumped, so it stays compiled.
+    assert bystander._unsloth_fallback_state["eager"] is False
+    u._GLOBAL_BUMPS = saved_global

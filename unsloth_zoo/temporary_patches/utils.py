@@ -914,6 +914,34 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # Nothing is a valid return value, so the retry needs its own sentinel.
     _NO_RESULT = object()
 
+    def _latch_all_to_eager():
+        """Give up on the budget, taking the other wrappers in the same crisis.
+
+        Switching only this one leaves the rest of the step with some regions
+        compiled and some eager, which is the mismatch this path exists to avoid;
+        one checkpointed region routinely spans several patched functions.
+
+        Only wrappers that borrowed budget come along. One that never bumped was
+        never in trouble and never changed mode, so knocking it eager would cost
+        compilation for nothing and would break the per-wrapper latch that the
+        rest of this file guarantees.
+
+        Anything already packed compiled earlier in this step is still at risk.
+        Buying budget first is what makes that rare; this is the last resort.
+        """
+        state["eager"] = True
+        state["pending_eager"] = False
+        for ref in _EAGER_FALLBACK_WRAPPERS:
+            w = ref()
+            if w is None:
+                continue
+            st = w._unsloth_fallback_state
+            if not st.get("bumps"):
+                continue
+            st["eager"] = True
+            st["pending_eager"] = False
+        _restore_recompile_limits_if_idle()
+
     def _retry_with_more_budget(args, kwargs):
         """Finish THIS call the way it started, if we can.
 
@@ -963,8 +991,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             result = _retry_with_more_budget(args, kwargs)
             if result is not _NO_RESULT:
                 return result
-            state["eager"] = True
-            _restore_recompile_limits_if_idle()
+            _latch_all_to_eager()
             _warn(
                 f"Unsloth: torch.compile ran out of recompilation cache for "
                 f"{label}; running it eagerly from here. Training is "
@@ -979,7 +1006,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 result = _retry_with_more_budget(args, kwargs)
                 if result is not _NO_RESULT:
                     return result
-                state["eager"] = True
+                _latch_all_to_eager()
                 _warn(
                     f"Unsloth: torch.compile ran out of recompilation cache "
                     f"for {label}; running it eagerly from here. Training is "
