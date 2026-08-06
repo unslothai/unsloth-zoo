@@ -135,13 +135,36 @@ def test_fullgraph_true_is_wrapped():
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
 
+# aot_eager, not inductor. Inductor codegens C++ and shells out to a host
+# compiler, so this raised `Compiler: cl is not found` on the Windows runner --
+# a statement about MSVC being absent, not about the wrapper. What is under test
+# is that the wrapper returns what the eager function returns, and every backend
+# answers that.
+_BACKEND = "aot_eager"
+
+
 def test_the_wrapper_still_computes_the_right_answer():
     def f(x):
         return x * 2 + 1
 
-    wrapped = torch_compile_with_fallback(fullgraph = True)(f)
+    wrapped = torch_compile_with_fallback(fullgraph = True, backend = _BACKEND)(f)
     x = torch.arange(4, dtype = torch.float32)
     assert torch.equal(wrapped(x), f(x))
+
+
+def test_the_helper_takes_a_backend_like_torch_compile_does():
+    """It forwards **compile_kwargs, and the generated decorators rely on that
+    for `dynamic` and `options`; a dropped kwarg would compile the wrong thing."""
+    import inspect
+    sig = inspect.signature(torch_compile_with_fallback)
+    assert any(p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in sig.parameters.values())
+
+    def f(x):
+        return x
+
+    # No host compiler needed, and no exception: the kwarg reached torch.compile.
+    assert torch_compile_with_fallback(fullgraph = True, backend = "eager")(f)(1) == 1
 
 
 def test_a_label_is_recorded_for_the_warning():
