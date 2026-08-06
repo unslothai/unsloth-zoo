@@ -407,10 +407,19 @@ pass
 
 
 def get_compile_folder(use_tempfile=False):
-    location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(
-        2, _get_compile_folder, use_tempfile
+    # tempfile.gettempdir() can differ by node. Never broadcast rank 0's temp
+    # path: every rank has to resolve and create its own node-local directory.
+    if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
+        return _get_compile_folder(use_tempfile=True)
+
+    location, use_temp = distributed_function(
+        2, _get_compile_folder, False
     )
-    return location, UNSLOTH_COMPILE_USE_TEMP
+    # Rank 0 can fall back while creating the persistent cache. The broadcast
+    # tells every rank to switch modes, but its temp path is not portable.
+    if use_temp:
+        return _get_compile_folder(use_tempfile=True)
+    return location, False
 
 
 pass

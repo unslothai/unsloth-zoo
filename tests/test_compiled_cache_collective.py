@@ -53,6 +53,60 @@ def compiler():
         raise
 
 
+def test_explicit_temp_compile_folder_is_resolved_locally(
+    tmp_path, monkeypatch, compiler,
+):
+    """An explicitly requested temp path must not be broadcast from rank 0."""
+    local_temp = tmp_path / "rank1-temp"
+    monkeypatch.setattr(
+        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path / "persistent-cache"),
+    )
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    monkeypatch.setattr(compiler.tempfile, "gettempdir", lambda: str(local_temp))
+    monkeypatch.setattr(
+        compiler,
+        "distributed_function",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an explicit node-local temp path was broadcast"
+        ),
+    )
+
+    location, use_temp = compiler.get_compile_folder(use_tempfile=True)
+
+    assert pathlib.Path(location) == local_temp / "persistent-cache"
+    assert pathlib.Path(location).is_dir()
+    assert use_temp is True
+
+
+def test_rank0_temp_fallback_is_recomputed_locally(
+    tmp_path, monkeypatch, compiler,
+):
+    """The fallback decision is shared, but rank 0's temp path is not."""
+    local_temp = tmp_path / "rank1-temp"
+    rank0_temp = "/rank0-private/tmp/persistent-cache"
+    calls = []
+
+    monkeypatch.setattr(
+        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path / "persistent-cache"),
+    )
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    monkeypatch.setattr(compiler.tempfile, "gettempdir", lambda: str(local_temp))
+
+    def rank0_fell_back(n, function, *args, **kwargs):
+        calls.append((n, function, args, kwargs))
+        return rank0_temp, True
+
+    monkeypatch.setattr(compiler, "distributed_function", rank0_fell_back)
+
+    location, use_temp = compiler.get_compile_folder(use_tempfile=False)
+
+    assert len(calls) == 1
+    assert pathlib.Path(location) == local_temp / "persistent-cache"
+    assert pathlib.Path(location).is_dir()
+    assert location != rank0_temp
+    assert use_temp is True
+
+
 def test_write_guard_is_not_rank_local():
     """The guard's test must come from a collective, not a local os.path.isfile."""
     tree = ast.parse(_compiler_source())
