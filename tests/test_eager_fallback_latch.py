@@ -227,6 +227,30 @@ def test_force_is_idempotent():
     assert U.force_eager_fallback() == U.force_eager_fallback() == 1
 
 
+def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
+    """GRPO's `accumulate_chunk` is built inside the forward, so by the time the
+    backward dies and unsloth calls this, the wrapper that deferred is collected
+    and the pending label is the only surviving evidence. Asking the live
+    wrappers alone returned 0, the caller re-raised the failure this exists to
+    retry past, and the rebuilt wrapper compiled again."""
+    U._PENDING_EAGER_LABELS.add("chunk.f")
+
+    assert U.force_eager_fallback() > 0, "the deferral was not seen"
+    assert "chunk.f" in U._LATCHED_EAGER_LABELS
+    assert not U._PENDING_EAGER_LABELS, "the deferral was left unsettled"
+
+    compiled, eager, calls = _pair(fail_after=100)
+    rebuilt = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "chunk.f")
+    assert rebuilt(1)[0] == "eager", "the rebuilt wrapper compiled again"
+    assert calls["compiled"] == 0
+
+
+def test_force_sees_a_latch_whose_wrapper_is_already_gone():
+    """Same for a label that gave up outright rather than deferring."""
+    U._LATCHED_EAGER_LABELS.add("chunk.f")
+    assert U.force_eager_fallback() > 0
+
+
 def test_the_registry_does_not_keep_dead_wrappers_alive():
     """Weak, so a model that was patched and thrown away is not reported as a
     live compiled forward and cannot inflate the count."""

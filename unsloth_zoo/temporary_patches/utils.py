@@ -1597,9 +1597,9 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     one fallback can strand a checkpointed region spanning several; switching
     them together removes the whole class of mismatch.
 
-    Returns a count of live wrappers, not of changes: the wrapper that caused
-    the trouble has already latched itself, so "how many changed" would be 0 in
-    exactly the case that matters.
+    Returns a count of call sites that are eager, not of changes: the wrapper
+    that caused the trouble has already latched itself, so "how many changed"
+    would be 0 in exactly the case that matters.
 
     `only_if_already_triggered` refuses to switch off compilation for a model
     that never fell back. A caller that gets 0 has learned the checkpoint
@@ -1608,16 +1608,31 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     """
     live = [w for w in (ref() for ref in _EAGER_FALLBACK_WRAPPERS)
             if w is not None]
-    if only_if_already_triggered and not any(
+    # The label sets count too, for the same reason
+    # `apply_pending_eager_fallbacks` consults them: a wrapper built inside a
+    # forward (GRPO's `accumulate_chunk`) is collected before backward, so its
+    # record of having already failed survives only there. Asking the live ones
+    # alone returned 0 and the caller re-raised the very failure this exists to
+    # retry past.
+    if only_if_already_triggered and not (
+            _LATCHED_EAGER_LABELS or _PENDING_EAGER_LABELS or any(
             w._unsloth_fallback_state["eager"]
             or w._unsloth_fallback_state.get("pending_eager")
-            for w in live):
+            for w in live)):
         return 0
     for w in live:
         w._unsloth_fallback_state["eager"] = True
         w._unsloth_fallback_state["pending_eager"] = False
+        _label = getattr(w, "_unsloth_fallback_label", None)
+        if _label is not None: _LATCHED_EAGER_LABELS.add(_label)
+    # Settle the deferrals as well, or the per-call wrapper the retry rebuilds
+    # reads its state from a label that is still only pending and compiles again.
+    _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
+    _PENDING_EAGER_LABELS.clear()
     _restore_recompile_limits()
-    return len(live)
+    # Latched labels, not live objects: a call site with no wrapper alive right
+    # now is still eager, and returning 0 would read as "nothing fell back".
+    return max(len(live), len(_LATCHED_EAGER_LABELS))
 
 
 def patch_function(
