@@ -5,6 +5,13 @@ import pytest
 import torch
 
 from unsloth_zoo.saving_utils import _apply_fused_expert_lora_delta
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
+
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
 
 def _loop_reference(merged, lora_A, lora_B, num_experts, rank, alpha, use_transpose):
@@ -35,24 +42,24 @@ def test_cpu_path_matches_loop(use_transpose):
     assert torch.equal(got, ref)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the baddbmm path")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for the baddbmm path")
 @pytest.mark.parametrize("use_transpose", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_cuda_baddbmm_matches_loop(use_transpose, dtype):
+def test_gpu_baddbmm_matches_loop(use_transpose, dtype):
     # 128 experts, same device: only batching differs, so it must be bitwise-identical.
     E, rank, dim_A, dim_B, alpha = 128, 16, 64, 96, 1.7
-    merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, dtype, "cuda")
+    merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, dtype, DEVICE_TYPE_TORCH)
     ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
     got = _apply_fused_expert_lora_delta(merged.clone(), A, B, E, rank, dim_A, dim_B, alpha, use_transpose)
     assert torch.equal(got, ref), (got - ref).abs().max().item()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the batched path")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for the batched path")
 @pytest.mark.parametrize("use_transpose", [False, True])
 def test_bmm_oom_falls_back_to_loop(monkeypatch, use_transpose):
     """On a batched-delta OOM the helper completes via the per-expert loop (matmul, not bmm)."""
     E, rank, dim_A, dim_B, alpha = 16, 8, 32, 48, 1.3
-    merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, torch.float32, "cuda")
+    merged, A, B = _make(E, rank, dim_A, dim_B, use_transpose, torch.float32, DEVICE_TYPE_TORCH)
     ref = _loop_reference(merged, A, B, E, rank, alpha, use_transpose)
 
     def oom(*a, **k):
@@ -63,11 +70,11 @@ def test_bmm_oom_falls_back_to_loop(monkeypatch, use_transpose):
     assert torch.equal(got, ref), "OOM fallback loop must match the batched result"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for the batched path")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for the batched path")
 def test_non_oom_runtimeerror_propagates(monkeypatch):
     """A non-OOM error from the batched path is a real bug and must not be swallowed."""
     E, rank, dim_A, dim_B, alpha = 4, 4, 8, 8, 1.0
-    merged, A, B = _make(E, rank, dim_A, dim_B, False, torch.float32, "cuda")
+    merged, A, B = _make(E, rank, dim_A, dim_B, False, torch.float32, DEVICE_TYPE_TORCH)
 
     def boom(*a, **k):
         raise RuntimeError("some real shape error")

@@ -11,12 +11,17 @@ import torch
 
 
 def _grouped_mm_ok():
-    if not torch.cuda.is_available():
+    try:
+        from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
+    except Exception:
+        return False
+    gpu = DEVICE_TYPE_TORCH if DEVICE_TYPE_TORCH in ("cuda", "xpu") else None
+    if gpu is None:
         return False
     try:
-        x = torch.randn(2, 8, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(1, 8, 8, device="cuda", dtype=torch.bfloat16)
-        torch._grouped_mm(x, w, offs=torch.tensor([2], dtype=torch.int32, device="cuda"))
+        x = torch.randn(2, 8, device=gpu, dtype=torch.bfloat16)
+        w = torch.randn(1, 8, 8, device=gpu, dtype=torch.bfloat16)
+        torch._grouped_mm(x, w, offs=torch.tensor([2], dtype=torch.int32, device=gpu))
         return True
     except Exception:
         return False
@@ -90,15 +95,16 @@ def test_probe_does_not_perturb_global_rng(monkeypatch):
 
 @pytest.mark.skipif(not _grouped_mm_ok(), reason="torch._grouped_mm unsupported on this device")
 def test_view_matches_copy_forward():
+    from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
     from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
 
     torch.manual_seed(0)
     E, K, N, T = 3, 64, 128, 40
-    inputs = torch.randn(T, K, device="cuda", dtype=torch.bfloat16)
-    base = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)  # (E, out, in) as stored
+    inputs = torch.randn(T, K, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)
+    base = torch.randn(E, N, K, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)  # (E, out, in) as stored
     weight_view = base.transpose(1, 2)          # (E, K, N) non-contiguous view (what the fix keeps)
     weight_copy = weight_view.contiguous()      # what the old path forced
-    offsets = torch.tensor([16, 28, 40], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([16, 28, 40], dtype=torch.int32, device=DEVICE_TYPE_TORCH)
 
     out_view = _grouped_mm_with_backward_fix(inputs, weight_view, offsets)
     out_copy = _grouped_mm_with_backward_fix(inputs, weight_copy, offsets)
@@ -107,15 +113,16 @@ def test_view_matches_copy_forward():
 
 @pytest.mark.skipif(not _grouped_mm_ok(), reason="torch._grouped_mm unsupported on this device")
 def test_view_matches_copy_backward():
+    from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
     from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
 
     torch.manual_seed(0)
     E, K, N, T = 3, 64, 128, 40
-    offsets = torch.tensor([16, 28, 40], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([16, 28, 40], dtype=torch.int32, device=DEVICE_TYPE_TORCH)
 
     def run(force_copy):
-        x = torch.randn(T, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        base = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(T, K, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16, requires_grad=True)
+        base = torch.randn(E, N, K, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16, requires_grad=True)
         torch.manual_seed(1)  # identical draws across both runs
         x.data.normal_(); base.data.normal_()
         w = base.transpose(1, 2)
