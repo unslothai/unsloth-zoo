@@ -435,6 +435,12 @@ def _owns_its_lines(node, lines):
     return not after or after.startswith("#")
 
 
+# Emitted into every rewritten block and checked before rewriting, so a second
+# pass is a no-op. Without it the two SDPA fallbacks this emits are themselves
+# valid matches, and re-running triples the block.
+_AITER_MARKER = "# AMD aiter Flash Attention"
+
+
 def _unique_suffix(source):
     """Pick a name suffix that collides with nothing already in the source."""
     suffix, counter = "", 0
@@ -466,7 +472,8 @@ def replace_sdpa_with_amd_aiter(source):
       5. failures return None from a helper and fall back to SDPA
 
     Selecting on the AST means comments and string literals can never be
-    rewritten, and unparseable source is returned untouched.
+    rewritten, and unparseable source is returned untouched. Idempotent: already
+    rewritten source carries a marker and is returned unchanged.
 
     Known limitation: Unsloth's own compiled SDPA paths emit attn_mask= or
     is_causal=<variable>, which guard 2 correctly rejects, so this only matches
@@ -476,6 +483,12 @@ def replace_sdpa_with_amd_aiter(source):
     """
     from unsloth_zoo.device_type import get_amd_attention_implementation
     if get_amd_attention_implementation() != "amd_aiter":
+        return source
+
+    # Already rewritten, so leave it alone. Compiled sources can be handed back
+    # here (cached modules, repeated compile passes) and this must be a fixed
+    # point, not a second wrap.
+    if _AITER_MARKER in source:
         return source
 
     try:
@@ -516,7 +529,7 @@ def replace_sdpa_with_amd_aiter(source):
             ]
 
         block = [
-            f"{indent}# AMD aiter Flash Attention, requires: pip install amd-aiter (ROCm >= 7.0)",
+            f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
             f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
             f"{indent}{fn_var} = {get_fn}()",
             f"{indent}{ok_var} = (",
