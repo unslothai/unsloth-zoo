@@ -211,6 +211,47 @@ def test_the_pre_2_8_fallback_answers_the_same_as_the_accessor():
                 assert accessor == walked, "the two disagree"
 
 
+def test_a_user_hook_on_top_does_not_hide_the_region():
+    """`saved_tensors_hooks` / `save_on_cpu` entered inside a checkpointed
+    function sits above ours on the hook stack, and the accessor only reports
+    the top one. Reading that as "no region" sends the give-up path eager in
+    exactly the case it exists to refuse."""
+    seen = []
+    def probe(x):
+        seen.append(U._in_non_reentrant_checkpoint())
+        return torch.nn.functional.softmax(x * 2, dim = -1)
+
+    def with_user_hook(x):
+        with torch.autograd.graph.save_on_cpu():
+            return probe(x)
+
+    x = torch.randn(4, 4, requires_grad = True)
+    checkpoint(with_user_hook, x, use_reentrant = False).sum().backward()
+    assert seen and all(s is True for s in seen), seen
+
+
+def test_a_reentrant_region_does_not_hide_an_outer_non_reentrant_one():
+    """The frame walk is all torch 2.4 to 2.7 have. A reentrant checkpoint
+    nested inside a non-reentrant one used to end the walk at the reentrant
+    frames and answer False, while the outer region stays every bit as
+    strandable by a compile-mode flip."""
+    seen = []
+    def probe(x):
+        seen.append((U._in_non_reentrant_checkpoint(), U._walk_for_checkpoint_frame()))
+        return torch.nn.functional.softmax(x * 2, dim = -1)
+
+    def outer(x):
+        return checkpoint(probe, x, use_reentrant = True)
+
+    x = torch.randn(4, 4, requires_grad = True)
+    checkpoint(outer, x, use_reentrant = False).sum().backward()
+    assert seen, "the probe never ran"
+    assert any(walked for _, walked in seen), f"outer region missed: {seen}"
+    for accessor, walked in seen:
+        if accessor is not None:
+            assert accessor == walked, f"the two disagree: {seen}"
+
+
 def test_an_older_torch_falls_through_to_the_frame_walk():
     """Standing in for 2.4 to 2.7, where the accessor does not exist. Returning
     None there would silently restore the pre-fix behaviour."""

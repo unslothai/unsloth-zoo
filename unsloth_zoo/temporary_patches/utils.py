@@ -701,12 +701,25 @@ def _saved_tensor_hook_accessor():
 _REENTRANT_FRAMES = ("forward", "backward")
 
 
+def _frame_local(frame, name):
+    """One local off a live frame, `_UNKNOWN` when it is not there."""
+    try:
+        return frame.f_locals.get(name, _UNKNOWN)
+    except Exception:
+        return _UNKNOWN
+
+
 def _walk_for_checkpoint_frame(_limit = 60):
     """The pre-2.8 answer: is any `torch.utils.checkpoint` frame on the stack?
 
     torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
     there would quietly restore the old behaviour on the releases pyproject
     still supports. The module file is stable across every supported version.
+
+    A reentrant region does not end the walk: reentrant checkpointing nests
+    inside non-reentrant checkpointing, and the outer region is stranded by a
+    mode flip just the same. Its own `torch.utils.checkpoint.checkpoint` frame
+    is the next one outward, so skip that and keep scanning.
     """
     try:
         import sys                              # module-level `_sys` is deleted above
@@ -715,13 +728,28 @@ def _walk_for_checkpoint_frame(_limit = 60):
     except Exception:
         return None
     if not origin: return None
-    frame, seen, found = sys._getframe(1), 0, False
+    frame, seen, reentrant = sys._getframe(1), 0, 0
     while frame is not None and seen < _limit:
         if frame.f_code.co_filename == origin:
-            if frame.f_code.co_name in _REENTRANT_FRAMES: return False
-            found = True
+            name = frame.f_code.co_name
+            if name in _REENTRANT_FRAMES:
+                reentrant += 1
+            elif name == "checkpoint":
+                use_reentrant = _frame_local(frame, "use_reentrant")
+                if use_reentrant is False: return True
+                if reentrant: reentrant -= 1
+                elif use_reentrant is _UNKNOWN: return True
+            else:
+                return True                     # a pack or recompute frame
         frame, seen = frame.f_back, seen + 1
-    return found
+    return False
+
+
+def _is_checkpoint_pack_hook(pack):
+    """Is this `torch.utils.checkpoint`'s own pack hook?"""
+    return (getattr(pack, "__module__", "") == "torch.utils.checkpoint" and
+            getattr(pack, "__qualname__", "").startswith(
+                ("_checkpoint_hook", "_recomputation_hook")))
 
 
 def _in_non_reentrant_checkpoint():
@@ -734,6 +762,11 @@ def _in_non_reentrant_checkpoint():
     keep the old behaviour. Reentrant checkpointing installs no hooks and
     answers False, which is right: it re-differentiates what it recomputes, so
     a mode flip cannot strand it.
+
+    The accessor reports only the top of the hook stack, and a user's own
+    `saved_tensors_hooks`/`save_on_cpu` entered inside the region sits above
+    ours, so an unrecognised hook means "cannot tell from here" rather than
+    "no region": ask the frames instead.
     """
     top = _saved_tensor_hook_accessor()
     if top is not None:
@@ -743,10 +776,7 @@ def _in_non_reentrant_checkpoint():
             hooks = _UNKNOWN
         if hooks is not _UNKNOWN:
             if not hooks: return False
-            pack = hooks[0]
-            if getattr(pack, "__module__", "") != "torch.utils.checkpoint": return False
-            return getattr(pack, "__qualname__", "").startswith(
-                ("_checkpoint_hook", "_recomputation_hook"))
+            if _is_checkpoint_pack_hook(hooks[0]): return True
     return _walk_for_checkpoint_frame()
 
 
