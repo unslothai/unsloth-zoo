@@ -90,16 +90,26 @@ def test_decision_is_broadcast_not_computed_locally(
     monkeypatch.setattr(compiler, "is_distributed", lambda: False)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    monkeypatch.syspath_prepend(str(tmp_path))
 
-    compiler.create_new_function(
-        "pr967_probe", "def pr967_probe_fn(x):\n    return x\n", "pr967", {},
-        overwrite=True,
-    )
-    assert (tmp_path / "pr967_probe.py").is_file(), "probe did not compile into tmp_path"
-    assert "_compiled_cache_decision" in calls, (
-        "the write decision was not routed through distributed_function(); it is "
-        "rank-local again -- regression of PR #967."
-    )
+    name = "pr967_probe"
+    try:
+        module = compiler.create_new_function(
+            name, "def pr967_probe_fn(x):\n    return x\n", "pr967", {},
+            overwrite=True,
+        )
+        assert (tmp_path / f"{name}.py").is_file(), "probe did not compile into tmp_path"
+        assert pathlib.Path(module.__file__).parent == tmp_path, (
+            "a successful persistent-cache import was mistaken for a failure and "
+            "unnecessarily recovered to the tempfile cache"
+        )
+        assert compiler.UNSLOTH_COMPILE_USE_TEMP is False
+        assert "_compiled_cache_decision" in calls, (
+            "the write decision was not routed through distributed_function(); it is "
+            "rank-local again -- regression of PR #967."
+        )
+    finally:
+        sys.modules.pop(name, None)
 
 
 def test_decision_digests_disk_not_generated_source(

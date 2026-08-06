@@ -1312,6 +1312,7 @@ def create_new_function(
     new_module = None
 
     def import_module(compile_folder, name):
+        old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
         # Add directory to sys.path temporarily if it's not already there
