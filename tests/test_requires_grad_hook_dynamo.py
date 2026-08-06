@@ -236,8 +236,13 @@ def test_fullgraph_compiled_module_with_pre_hook_runs():
     model.vision.proj.weight.requires_grad_(True)
     requires_grad_for_gradient_checkpointing(model)
 
+    # aot_eager, like the other compiles in this file. What is under test is
+    # whether Dynamo can trace the hook, not what Inductor emits, and Inductor
+    # needs triton: on Apple Silicon it is stubbed out, so the default backend
+    # fails here with a NotImplementedError that says nothing about the hook.
     compiled = torch.compile(
-        _PreHookModel.forward.__get__(model), fullgraph = True, dynamic = True,
+        _PreHookModel.forward.__get__(model),
+        fullgraph = True, dynamic = True, backend = "aot_eager",
     )
     x = torch.randn(2, 8)
     out = compiled(x)
@@ -253,7 +258,8 @@ def test_fullgraph_compiled_module_with_post_hook_runs():
     requires_grad_for_gradient_checkpointing(model)
 
     compiled = torch.compile(
-        _PostHookModel.forward.__get__(model), fullgraph = True, dynamic = True,
+        _PostHookModel.forward.__get__(model),
+        fullgraph = True, dynamic = True, backend = "aot_eager",
     )
     out = compiled(torch.randn(2, 8))
     assert out.shape == (2, 8)
