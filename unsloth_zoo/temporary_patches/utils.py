@@ -39,6 +39,7 @@ __all__ = [
     "eager_fallback_state",
     "force_eager_fallback",
     "apply_pending_eager_fallbacks",
+    "torch_compile_with_fallback",
 ]
 import functools
 import inspect
@@ -1245,6 +1246,35 @@ def _settle_abandoned_checkpoint_generator():
     _RAISED_INSIDE_CHECKPOINT = False
     _CHECKPOINT_SETTLE_ATTEMPTS = 0
     return True
+
+
+def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
+    """`torch.compile` that survives cache exhaustion under `fullgraph = True`.
+
+    `patch_function` already routes its own `fullgraph = True` compiles through
+    `_fall_back_to_eager_on_recompile_limit`, but the generated modules in
+    `unsloth_compiled_cache` decorate their functions directly and never reach
+    it, so those regions kept the hard failure the wrapper exists to remove.
+    Gemma4 has ten such regions, and the vision tower drives one of them,
+    `Gemma4RMSNorm_forward`, far past the budget:
+
+        FailOnRecompileLimitHit: Hard failure due to fullgraph=True
+
+    raised out of `unsloth_compiled_module_gemma4.py`, ending training at step
+    0. Reproducible on any GPU by lowering `recompile_limit`; a T4 simply
+    reaches it on its own.
+
+    `fullgraph = False` is returned untouched: Dynamo already falls back by
+    itself there, so wrapping would add a layer that can never fire.
+    """
+    def _decorate(func):
+        compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
+        if not fullgraph:
+            return compiled
+        return _fall_back_to_eager_on_recompile_limit(
+            compiled, func, getattr(func, "__qualname__", None) or repr(func),
+        )
+    return _decorate
 
 
 def apply_pending_eager_fallbacks() -> int:
