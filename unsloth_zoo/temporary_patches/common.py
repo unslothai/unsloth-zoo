@@ -194,18 +194,9 @@ else:
 def flatten_for_elementwise_norm(hidden_states):
     """``(..., H)`` -> ``((N, H), original_shape)`` for a compiled norm kernel.
 
-    One compiled RMSNorm/LayerNorm kernel is shared by every norm instance in a
-    model, so its Dynamo cache holds the product of every axis its guards see.
-    Rank is one of those axes: Gemma calls the same norm with ``(B, S, H)``
-    residuals and with ``(B, heads, S, D)`` q/k norms, and the guard reads
-
-        tensor 'hidden_states' rank mismatch. expected 4, actual 3
-
-    Normalisation only ever touches the last dimension, so flattening the
-    leading dimensions makes every caller rank 2 and collapses that axis, along
-    with the per-dimension size guards on the leading dims. The reshape is a
-    view for contiguous inputs and is folded away when the kernel is inlined
-    into a larger compiled region.
+    Norms only touch the last dim, so making every caller rank 2 drops the rank
+    and leading-dim guards from the shared kernel's Dynamo cache (Gemma calls the
+    same norm with ``(B, S, H)`` residuals and ``(B, heads, S, D)`` q/k norms).
     """
     shape = hidden_states.shape
     return hidden_states.reshape(-1, shape[-1]), shape
@@ -215,47 +206,32 @@ pass
 def unwrap_norm_weight(weight):
     """Hand a norm weight to a compiled kernel as a plain Tensor view.
 
-    ``torch._dynamo.utils.is_static_input`` forces a static shape whenever
-    ``type(tensor) is torch.nn.Parameter`` or the tensor comes from an
-    unspecialized-parameter source, regardless of ``dynamic = True``. Reading
-    ``self.weight`` inside a compiled norm therefore pins the hidden size, and
-    every distinct norm width in the model becomes another cache entry:
-
-        tensor 'self._parameters['weight']' size mismatch at index 0.
-        expected 64, actual 768. Guard failed on a parameter, consider using
-        torch._dynamo.config.force_parameter_static_shapes = False
-
-    A view of a Parameter is a plain Tensor, so it takes the normal dynamic
-    shape treatment while autograd still reaches the Parameter. This is local
-    to the norm kernels; it does not relax parameter shapes globally, which
-    would make Inductor give up its static GEMM specialisations everywhere.
+    Dynamo pins a static shape for anything whose ``type`` is ``nn.Parameter``,
+    even under ``dynamic = True``, so reading ``self.weight`` inside a compiled
+    norm makes every distinct norm width another cache entry. A view is a plain
+    Tensor, so it gets dynamic shapes while autograd still reaches the Parameter,
+    without relaxing parameter shapes globally.
     """
     if weight is None: return None
     return weight.reshape(-1)
 pass
 
 def publish_to_modeling_module(modeling_module, **names):
-    """Make helper names referenced by a patched forward importable from the
-    model's modeling module.
+    """Make helper names used by a patched forward importable from the modeling module.
 
-    ``unsloth_zoo.compiler.create_standalone_class`` copies the *source* of
-    whatever ``Cls.forward`` currently is into ``unsloth_compiled_cache`` and
-    resolves that source's free names against ``dir(modeling_file)``, emitting
-    ``from <modeling_file> import (...)``. A patched forward that calls a helper
-    living in unsloth_zoo therefore has to publish it here, or the generated
-    cache module raises NameError on import.
+    ``create_standalone_class`` copies the patched forward's source into
+    ``unsloth_compiled_cache`` and resolves its free names against the modeling
+    module, so helpers living in unsloth_zoo must be published here or the
+    generated module raises NameError on import.
     """
     for name, value in names.items():
         try:
             setattr(modeling_module, name, value)
         except Exception as e:
-            # Say so. Swallowing this silently produces the exact failure this
-            # helper exists to prevent, a NameError raised from generated code in
-            # unsloth_compiled_cache, with nothing pointing back to here.
-            # `warning`, not `warning_once`: the latter is monkeypatched onto
-            # logging.Logger by transformers, so it is not guaranteed to exist
-            # yet here, and an AttributeError inside this handler would hide the
-            # original failure. This path is rare and bounded by the name count.
+            # Log, never swallow: silence reappears as an unexplained NameError from
+            # generated cache code. `warning`, not `warning_once`: the latter is
+            # monkeypatched on by transformers and may not exist yet, and an
+            # AttributeError here would hide the original failure.
             logger.warning(
                 f"Unsloth: could not publish `{name}` to "
                 f"{getattr(modeling_module, '__name__', modeling_module)}: {e}"

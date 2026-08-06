@@ -421,22 +421,21 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
-# Clamp bounds as module-level floats so `torch.finfo` stays out of the graph.
+# Module-level floats so `torch.finfo` stays out of the graph.
 _GEMMA3_FP16_MAX = float(torch.finfo(torch.float16).max)
 _GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
 
 
-# One compiled kernel is shared by every Gemma3 RMSNorm instance (text norms,
-# q/k norms, vision norms), so its Dynamo cache holds the product of every axis
-# its guards see. Taking the weight as a plain Tensor view keeps the norm width
-# dynamic, and taking the input as rank 2 collapses the (B, S, H) vs
-# (B, heads, S, D) rank axis; only dtype, grad mode and requires_grad remain.
+# Every Gemma3 RMSNorm instance shares this one kernel, so its Dynamo cache holds
+# the product of every axis its guards see. A plain Tensor weight view keeps the
+# norm width dynamic and a rank 2 input collapses the rank axis, leaving only
+# dtype, grad mode and requires_grad.
 @torch_compile(fullgraph = True, dynamic = True)
 def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
     hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
-    # weight may be bf16; cast to fp32 for the (1.0 + weight) op.
+    # weight may be bf16; cast for the (1.0 + weight) op.
     output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
     clamped_output_fp32 = torch.clamp(output_fp32, min = _GEMMA3_FP16_MIN, max = _GEMMA3_FP16_MAX)
     return clamped_output_fp32.to(torch.float16) # Output fp16
@@ -473,8 +472,8 @@ def patch_Gemma3RMSNorm():
         out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
         return out.reshape(shape)
     pass
-    # Not `fullgraph = True`: the kernel above is the compiled unit, and
-    # compiling this wrapper as well would put `self` back into the guards.
+    # Not `fullgraph = True`: the kernel is the compiled unit, and compiling this
+    # wrapper too would put `self` back into the guards.
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)

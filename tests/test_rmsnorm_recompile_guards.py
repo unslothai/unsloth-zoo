@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """One compiled RMSNorm code object is shared by every norm instance in a model.
 
-gemma-4-E2B has 504 of them, so that single frame's Dynamo cache holds the
-*product* of every axis its guards can see: parameter width, input rank,
-`self.with_scale`, dtype, grad mode and requires_grad. That reached
-`patch_torch_compile`'s recompile_limit on a T4 and raised
-`FailOnRecompileLimitHit`, which then took activation checkpointing down with it.
+gemma-4-E2B has 504 of them, so that frame's Dynamo cache holds the *product* of
+every axis its guards see (parameter width, input rank, `self.with_scale`, dtype,
+grad mode, requires_grad), which hit the recompile_limit on a T4 and raised
+`FailOnRecompileLimitHit`, taking activation checkpointing down with it.
 
 Compiling a pure tensor kernel instead of a bound method leaves `self` in eager,
-which removes the parameter-width, rank and with_scale axes. These tests pin
-that: the refactor must not change a single output bit, and it must keep the
-cache small enough that a realistic spread of call shapes never trips the limit.
+dropping the width, rank and with_scale axes. These tests pin that: no output bit
+changes, and a realistic spread of call shapes never trips the limit.
 """
 
 import pytest
@@ -22,9 +20,9 @@ pytestmark = pytest.mark.skipif(
     reason = "needs a GPU: these assert on real torch.compile guard behaviour",
 )
 
-# The spread one model actually produces: several norm widths, rank 3 residual
-# norms and rank 4 q/k norms, scaled and unscaled, in each dtype the fp32 patch
-# can see. Deliberately more combinations than the limit below.
+# The spread a real model produces: several norm widths, rank 3 residual norms and
+# rank 4 q/k norms, scaled and unscaled, in every dtype. More combinations than the
+# recompile limit used below.
 CASES = [
     ((2, 7, 64),      64,   True),
     ((2, 7, 768),     768,  True),
@@ -38,7 +36,7 @@ _FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
 def _old_body(hidden_states, weight, eps, with_scale):
-    """The pre-fix maths, verbatim, so equivalence is checked against the real thing."""
+    """The pre-fix maths, verbatim."""
     x_fp32 = hidden_states.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
     normed = x_fp32 * torch.pow(variance + eps, -0.5)
@@ -48,7 +46,7 @@ def _old_body(hidden_states, weight, eps, with_scale):
 
 
 class _OldNorm(torch.nn.Module):
-    """A bound method reading `self.weight` / `self.with_scale`, i.e. the old shape."""
+    """A bound method reading `self.weight` / `self.with_scale`, i.e. the old form."""
 
     def __init__(self, hidden, with_scale, dtype):
         super().__init__()
@@ -83,10 +81,8 @@ def _new(hidden_states, weight, eps, with_scale):
 def _new_eager(hidden_states, weight, eps, with_scale):
     """The refactor's data flow without torch.compile.
 
-    Compiled output legitimately differs from eager by Inductor's float
-    reassociation, and the old code was compiled too, so comparing eager-old to
-    compiled-new would measure the compiler rather than this change. Running the
-    same reshape/unwrap path eagerly isolates the refactor itself.
+    Inductor's float reassociation makes compiled output differ from eager, so
+    comparing eager-old to compiled-new would measure the compiler, not this change.
     """
     from unsloth_zoo.temporary_patches.common import (
         flatten_for_elementwise_norm,
@@ -113,8 +109,8 @@ def test_the_refactor_changes_no_output_bit(dtype, shape, hidden, with_scale):
 
 @pytest.mark.parametrize("with_scale", (True, False))
 def test_gradients_still_reach_the_parameter_through_the_view(with_scale):
-    # unwrap_norm_weight hands the kernel a *view* of the Parameter. If that view
-    # detached, training would silently stop updating every norm in the model.
+    # If unwrap_norm_weight's view detached, training would silently stop updating
+    # every norm in the model.
     torch.manual_seed(0)
     old_x = torch.randn(2, 7, 768, device = "cuda", dtype = torch.float16, requires_grad = True)
     new_x = old_x.detach().clone().requires_grad_(True)
@@ -142,15 +138,15 @@ def _run_every_case(fn):
 
 
 def test_the_old_bound_method_exhausts_a_realistic_recompile_budget():
-    # The regression this fix exists for. A low limit stands in for the real one:
-    # the point is that the old form's cache grows with the product of the axes,
-    # so on a model with hundreds of norms any fixed budget is eventually spent.
+    # The regression this fix exists for. The low limit stands in for the real one:
+    # the old form's cache grows with the product of the axes, so any fixed budget
+    # is eventually spent on a model with hundreds of norms.
     torch._dynamo.reset()
     with torch._dynamo.config.patch(
         recompile_limit = 8,
         fail_on_recompile_limit_hit = True,
-        # unsloth_zoo sets suppress_errors globally, and Dynamo asserts the two
-        # are never both on, so pin it rather than inherit it.
+        # Pinned: unsloth_zoo sets suppress_errors globally and Dynamo asserts it is
+        # never on together with fail_on_recompile_limit_hit.
         suppress_errors = False,
     ):
         compiled = {}
@@ -173,8 +169,8 @@ def test_the_kernels_survive_the_same_budget():
     with torch._dynamo.config.patch(
         recompile_limit = 8,
         fail_on_recompile_limit_hit = True,
-        # unsloth_zoo sets suppress_errors globally, and Dynamo asserts the two
-        # are never both on, so pin it rather than inherit it.
+        # Pinned: unsloth_zoo sets suppress_errors globally and Dynamo asserts it is
+        # never on together with fail_on_recompile_limit_hit.
         suppress_errors = False,
     ):
         _run_every_case(
@@ -184,9 +180,9 @@ def test_the_kernels_survive_the_same_budget():
 
 
 def test_a_parameter_view_is_not_itself_a_parameter():
-    # This is the whole reason the width guard goes away: Dynamo's is_static_input
-    # forces a static shape when `type(t) is torch.nn.Parameter`, and `dynamic=True`
-    # does not override it. A view is a plain Tensor, so it takes dynamic shapes.
+    # Why the width guard goes away: Dynamo forces a static shape when
+    # `type(t) is torch.nn.Parameter`, even under `dynamic=True`. A view is a
+    # plain Tensor, so it takes dynamic shapes.
     from unsloth_zoo.temporary_patches.common import unwrap_norm_weight
 
     weight = torch.nn.Parameter(torch.randn(64))

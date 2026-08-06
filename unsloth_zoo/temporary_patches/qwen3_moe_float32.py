@@ -105,15 +105,14 @@ pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
 
-# Clamp to the fp16 range before casting back so a large residual never becomes
-# inf. A module-level float keeps `torch.finfo` out of the traced graph.
+# Clamp bound so a large residual never becomes inf on the cast back. Module-level
+# float keeps `torch.finfo` out of the traced graph.
 _QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# One compiled kernel is shared by every Qwen3-MoE RMSNorm instance, so its
-# Dynamo cache holds the product of every axis its guards see. Taking the weight
-# as a plain Tensor view and the input as rank 2 drops the norm-width and rank
-# axes; what remains is dtype, grad mode and requires_grad.
+# Every Qwen3-MoE RMSNorm instance shares this one kernel, so its Dynamo cache holds
+# the product of every axis its guards see. A plain Tensor weight view and a rank 2
+# input drop the norm-width and rank axes, leaving dtype, grad mode and requires_grad.
 @torch_compile(fullgraph = True, dynamic = True)
 def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     x_fp32 = hidden_states_2d.to(torch.float32)
@@ -142,7 +141,7 @@ def patch_Qwen3MoeRMSNorm_float32():
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Qwen3 scales by `weight` directly (no 1.0 + weight) with variance_epsilon.
         # `self` stays in eager so the kernel's guards never see the norm width,
-        # the input rank or any Python attribute. See _qwen3_moe_rms_norm below.
+        # the input rank or any Python attribute.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
         normed = _qwen3_moe_rms_norm(
             hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon,
