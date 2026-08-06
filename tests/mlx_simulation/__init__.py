@@ -78,12 +78,29 @@ def simulate_mlx_on_torch(*, fake_apple_silicon: bool = True):
 
 _PLATFORM_SPOOFED = False
 
+# Only these see the fake host. The spoof is process-wide and permanent, so
+# anything collected after an MLX test module inherits it: inductor caches its
+# CPU vector ISA from platform.machine(), and "arm64" on x86_64 yields an empty
+# list, after which every torch.compile emits uncompilable `at::vec` C++.
+#
+# Exact module names, not packages. Allow-listing all of `unsloth_zoo` still lied
+# to unrelated host-sensitive code in it: unsloth_zoo.llama_cpp reads the host to
+# pick a prebuilt archive, so a later llama.cpp call on Linux x86_64 would fetch
+# the macOS arm64 build. These two modules are the only places the MLX gate reads
+# the host; everything downstream of them consumes the cached boolean.
+_SPOOF_CONSUMERS = frozenset({
+    "unsloth",                  # unsloth/__init__.py::_is_mlx_available
+    "unsloth_zoo.mlx.runtime",  # is_mlx_available
+})
+
 
 def _spoof_apple_silicon_platform():
     """Make platform.system()=='Darwin' and platform.machine()=='arm64'.
 
     Idempotent.  PR-B's _IS_MLX gate in unsloth/__init__.py uses these
     to decide between MLX and CUDA dispatch.
+
+    Scoped to the immediate caller: only _SPOOF_CONSUMERS see the lie.
     """
     global _PLATFORM_SPOOFED
     if _PLATFORM_SPOOFED:
@@ -91,9 +108,19 @@ def _spoof_apple_silicon_platform():
     _PLATFORM_SPOOFED = True
 
     import platform
+    import sys
+
+    def _scoped(real, fake):
+        def spoofed():
+            # depth 1 is the real reading module: functools.cache and other
+            # C-level wrappers push no Python frame.
+            name = sys._getframe(1).f_globals.get("__name__", "")
+            return fake if name in _SPOOF_CONSUMERS else real()
+        return spoofed
+
     if not hasattr(platform, "_orig_system_for_mlx_shim"):
         platform._orig_system_for_mlx_shim = platform.system
-        platform.system = lambda: "Darwin"
+        platform.system = _scoped(platform._orig_system_for_mlx_shim, "Darwin")
     if not hasattr(platform, "_orig_machine_for_mlx_shim"):
         platform._orig_machine_for_mlx_shim = platform.machine
-        platform.machine = lambda: "arm64"
+        platform.machine = _scoped(platform._orig_machine_for_mlx_shim, "arm64")

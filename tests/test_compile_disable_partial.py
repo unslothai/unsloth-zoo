@@ -16,11 +16,10 @@
 
 """UNSLOTH_COMPILE_DISABLE=partial must also switch off the temporary patches.
 
-compiler.py reads the flag as `in ("1", "partial")`, but common.py read it as
-`== "1"`, so "partial" left every patch_function(fullgraph = ...) compiling and
-the escape hatch could not work around a compile-only crash.
-
-The flag is read at import, so each value is probed in a subprocess.
+compiler.py reads the flag as `in ("1", "partial")` but common.py read it as `== "1"`,
+so "partial" left every patch_function(fullgraph = ...) compiling and the escape hatch
+could not work around a compile-only crash. The flag is read at import, so each value
+is probed in a subprocess.
 """
 
 import json
@@ -53,8 +52,19 @@ _SCRIPT = textwrap.dedent("""
 """)
 
 
+def _probe_env(value):
+    # Without the `unsloth` package, unsloth_zoo/__init__ raises "Please install Unsloth"
+    # before the probe prints; this env var takes the light import path, same flag.
+    return dict(
+        os.environ,
+        PYTHONPATH = str(ROOT),
+        UNSLOTH_COMPILE_DISABLE = value,
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
+    )
+
+
 def _probe(value):
-    env = dict(os.environ, PYTHONPATH = str(ROOT), UNSLOTH_COMPILE_DISABLE = value)
+    env = _probe_env(value)
     r = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
         capture_output = True, text = True, timeout = 900, env = env,
@@ -64,6 +74,12 @@ def _probe(value):
     out = json.loads(line[0][len("PROBE "):])
     if out["skip"]: pytest.skip("transformers has no gemma3n")
     return out
+
+
+def test_probe_survives_a_zoo_only_checkout():
+    """CI installs `unsloth` with `|| true`, so it can legitimately be absent."""
+    env = _probe_env("0")
+    assert env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] == "1"
 
 
 def test_unset_still_compiles():
