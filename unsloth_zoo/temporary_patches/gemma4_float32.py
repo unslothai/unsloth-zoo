@@ -50,7 +50,7 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import patch_function, raise_error
+from .utils import compile_with_eager_fallback, patch_function, raise_error
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -294,7 +294,6 @@ _GEMMA4_FP16_MAX = float(torch.finfo(torch.float16).max)
 # cache holds the product of every axis its guards see. A pure tensor kernel instead
 # of a bound method drops three: `with_scale` (own kernel), parameter width (plain
 # Tensor view) and input rank (2D). Only dtype, grad mode and requires_grad remain.
-@torch_compile(fullgraph = True, dynamic = True)
 def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -303,14 +302,19 @@ def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
 pass
 
+# Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
+# raise, and only this wrapper latches to eager instead of aborting training.
+_gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward")
 
-@torch_compile(fullgraph = True, dynamic = True)
+
 def _gemma4_rms_norm_unscaled(hidden_states_2d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
     normed_fp32 = x_fp32 * torch.pow(variance + eps, -0.5)
     return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
 pass
+
+_gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward")
 
 
 def patch_Gemma4RMSNorm():

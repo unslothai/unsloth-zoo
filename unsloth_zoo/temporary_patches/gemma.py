@@ -26,6 +26,7 @@ from .common import (
     publish_to_modeling_module,
 )
 from .utils import (
+    compile_with_eager_fallback,
     patch_function,
     process_output_options,
     KWARGS_TYPE,
@@ -430,7 +431,6 @@ _GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
 # the product of every axis its guards see. A plain Tensor weight view keeps the
 # norm width dynamic and a rank 2 input collapses the rank axis, leaving only
 # dtype, grad mode and requires_grad.
-@torch_compile(fullgraph = True, dynamic = True)
 def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -441,8 +441,11 @@ def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
     return clamped_output_fp32.to(torch.float16) # Output fp16
 pass
 
+# Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
+# raise, and only this wrapper latches to eager instead of aborting training.
+_gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward")
 
-@torch_compile(fullgraph = True, dynamic = True)
+
 def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -450,6 +453,8 @@ def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
     output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
     return output_fp32.to(hidden_states_2d.dtype)
 pass
+
+_gemma3_rms_norm_generic = compile_with_eager_fallback(_gemma3_rms_norm_generic, "Gemma3RMSNorm.forward")
 
 
 def patch_Gemma3RMSNorm():

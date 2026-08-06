@@ -49,7 +49,7 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import patch_function, raise_error
+from .utils import compile_with_eager_fallback, patch_function, raise_error
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -113,7 +113,6 @@ _QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
 # Every Qwen3-MoE RMSNorm instance shares this one kernel, so its Dynamo cache holds
 # the product of every axis its guards see. A plain Tensor weight view and a rank 2
 # input drop the norm-width and rank axes, leaving dtype, grad mode and requires_grad.
-@torch_compile(fullgraph = True, dynamic = True)
 def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -121,6 +120,10 @@ def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     normed_fp32 = normed_fp32 * weight_1d.to(torch.float32)
     return torch.clamp(normed_fp32, min = -_QWEN3_MOE_FP16_MAX, max = _QWEN3_MOE_FP16_MAX).to(torch.float16)
 pass
+
+# Compiled here, not via a decorator: `fullgraph = True` makes cache exhaustion
+# raise, and only this wrapper latches to eager instead of aborting training.
+_qwen3_moe_rms_norm = compile_with_eager_fallback(_qwen3_moe_rms_norm, "Qwen3MoeRMSNorm.forward")
 
 
 def patch_Qwen3MoeRMSNorm_float32():

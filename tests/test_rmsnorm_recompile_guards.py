@@ -15,10 +15,44 @@ import pytest
 import torch
 
 
+# Dynamo renamed its cache-limit knobs and its exception in torch 2.7. Everything
+# from 2.6 down carries the cache_size_limit spelling, and `config.patch` raises on
+# a key the installed torch does not define, so select by what is actually there.
+# Same approach as tests/test_recompile_limit_fallback.py.
+_HAS_NEW_NAMES = hasattr(torch._dynamo.config, "recompile_limit")
+_LIMIT_KEY = "recompile_limit" if _HAS_NEW_NAMES else "cache_size_limit"
+_FAIL_KEY = ("fail_on_recompile_limit_hit" if _HAS_NEW_NAMES
+             else "fail_on_cache_limit_hit")
+_LIMIT_ERROR = next(
+    (e for e in (getattr(torch._dynamo.exc, n, None)
+                 for n in ("FailOnRecompileLimitHit", "RecompileLimitExceeded",
+                           "CacheLimitExceeded"))
+     if isinstance(e, type) and issubclass(e, BaseException)),
+    None,
+)
+
+
+def _limit_patch(limit):
+    """`config.patch` kwargs for a hard failure at `limit` recompiles."""
+    return {
+        _LIMIT_KEY: limit,
+        _FAIL_KEY: True,
+        # Pinned: unsloth_zoo sets suppress_errors globally and Dynamo asserts it is
+        # never on together with the fail-on-limit flag.
+        "suppress_errors": False,
+    }
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason = "needs a GPU: these assert on real torch.compile guard behaviour",
 )
+
+if _LIMIT_ERROR is None or not hasattr(torch._dynamo.config, _FAIL_KEY):
+    pytestmark = [
+        pytestmark,
+        pytest.mark.skip(reason = "this torch exposes no hard recompile-limit failure"),
+    ]
 
 # The spread a real model produces: several norm widths, rank 3 residual norms and
 # rank 4 q/k norms, scaled and unscaled, in every dtype. More combinations than the
@@ -142,13 +176,7 @@ def test_the_old_bound_method_exhausts_a_realistic_recompile_budget():
     # the old form's cache grows with the product of the axes, so any fixed budget
     # is eventually spent on a model with hundreds of norms.
     torch._dynamo.reset()
-    with torch._dynamo.config.patch(
-        recompile_limit = 8,
-        fail_on_recompile_limit_hit = True,
-        # Pinned: unsloth_zoo sets suppress_errors globally and Dynamo asserts it is
-        # never on together with fail_on_recompile_limit_hit.
-        suppress_errors = False,
-    ):
+    with torch._dynamo.config.patch(**_limit_patch(8)):
         compiled = {}
 
         def call(hidden_states, weight, with_scale, hidden, dtype):
@@ -160,19 +188,13 @@ def test_the_old_bound_method_exhausts_a_realistic_recompile_budget():
                 compiled[key] = torch.compile(module, fullgraph = True)
             compiled[key](hidden_states)
 
-        with pytest.raises(torch._dynamo.exc.FailOnRecompileLimitHit):
+        with pytest.raises(_LIMIT_ERROR):
             _run_every_case(call)
 
 
 def test_the_kernels_survive_the_same_budget():
     torch._dynamo.reset()
-    with torch._dynamo.config.patch(
-        recompile_limit = 8,
-        fail_on_recompile_limit_hit = True,
-        # Pinned: unsloth_zoo sets suppress_errors globally and Dynamo asserts it is
-        # never on together with fail_on_recompile_limit_hit.
-        suppress_errors = False,
-    ):
+    with torch._dynamo.config.patch(**_limit_patch(8)):
         _run_every_case(
             lambda hidden_states, weight, with_scale, hidden, dtype:
                 _new(hidden_states, weight, 1e-6, with_scale)
@@ -203,3 +225,51 @@ def test_flatten_round_trips_every_rank():
         assert flat.shape[-1] == shape[-1]
         assert tuple(original) == shape
         assert torch.equal(flat.reshape(original), x)
+
+
+def test_the_kernels_fall_back_to_eager_instead_of_aborting():
+    """Cache exhaustion must latch to eager, not kill the run.
+
+    `patch_function` wraps anything it compiles with `fullgraph = True` in
+    `_fall_back_to_eager_on_recompile_limit`. Compiling these kernels with a bare
+    decorator skipped that, so the exact failure this file is about, exhausting the
+    cache under fullgraph, became a hard abort instead of a slow-but-correct run.
+    """
+    from unsloth_zoo.temporary_patches.gemma4_float32 import (
+        _gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
+    )
+    from unsloth_zoo.temporary_patches.gemma import (
+        _gemma3_rms_norm_float32, _gemma3_rms_norm_generic,
+    )
+    from unsloth_zoo.temporary_patches.qwen3_moe_float32 import _qwen3_moe_rms_norm
+
+    kernels = (_gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
+               _gemma3_rms_norm_float32, _gemma3_rms_norm_generic,
+               _qwen3_moe_rms_norm)
+    for kernel in kernels:
+        # The wrapper's own marker. `get_compiler_config` is not a usable signal:
+        # the wrapper deliberately re-exposes it so callers cannot tell the two apart.
+        assert hasattr(kernel, "_unsloth_fallback_state"), (
+            f"{kernel.__name__} is a bare compiled function, so cache exhaustion "
+            f"under fullgraph raises instead of falling back to eager"
+        )
+
+    # And it really does run. Note what is NOT set here: `fail_on_recompile_limit_hit`
+    # is the user explicitly asking for a hard stop, and the wrapper re-raises for it
+    # on purpose. Real runs never set it (unsloth_zoo leaves it commented out), so the
+    # limit alone plus `fullgraph = True` is the configuration that matters.
+    # Widths do not exhaust anything under `dynamic = True`; dtype and grad mode do.
+    torch._dynamo.reset()
+    with torch._dynamo.config.patch(**{_LIMIT_KEY: 1, "suppress_errors": False}):
+        for dtype in DTYPES:
+            for grad in (True, False):
+                with torch.set_grad_enabled(grad):
+                    x = torch.randn(4, 128, device = "cuda", dtype = dtype)
+                    w = torch.randn(128, device = "cuda", dtype = dtype)
+                    out = _gemma4_rms_norm_scaled(x, w, 1e-6)
+                    assert out.shape == x.shape
+                    assert torch.isfinite(out).all()
+
+    assert _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"], (
+        "the cache was never actually exhausted, so this asserted nothing"
+    )

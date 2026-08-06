@@ -16,6 +16,7 @@
 
 __all__ = [
     "patch_function",
+    "compile_with_eager_fallback",
     "patch_function_past_key_values",
     "process_return",
     "process_output_options",
@@ -776,6 +777,22 @@ def _is_our_own_disabled_hook(exc):
         all(part in text for part in signature)
         for signature in _DISABLED_HOOK_SIGNATURES
     )
+
+
+def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
+    """`torch_compile` the function, keeping the eager fallback `patch_function` gives.
+
+    A bare `@torch_compile(fullgraph = True)` on a module-level kernel skips
+    `_fall_back_to_eager_on_recompile_limit`, which only `patch_function` applies,
+    so cache exhaustion aborts training instead of latching to eager. Use this for
+    any standalone kernel compiled with `fullgraph = True`.
+    """
+    from .common import torch_compile
+    compiled = torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
+    if not fullgraph:
+        # Without fullgraph Dynamo already falls back by itself.
+        return compiled
+    return _fall_back_to_eager_on_recompile_limit(compiled, func, label)
 
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
