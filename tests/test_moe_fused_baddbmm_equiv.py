@@ -7,7 +7,12 @@ import torch
 from unsloth_zoo.saving_utils import _apply_fused_expert_lora_delta
 from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 
-gpu_available = DEVICE_TYPE_TORCH in ("cuda", "xpu")
+# DEVICE_TYPE_TORCH names the device, it does not prove one exists: conftest sets
+# UNSLOTH_ALLOW_CPU=1, which makes it report "cuda" on a GPU-less host. Probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
 
 def _loop_reference(merged, lora_A, lora_B, num_experts, rank, alpha, use_transpose):

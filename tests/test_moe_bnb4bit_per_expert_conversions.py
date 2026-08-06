@@ -46,7 +46,12 @@ from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
     _quantstate_absmax_fp32,
 )
 
-gpu_available = DEVICE_TYPE_TORCH in ("cuda", "xpu")
+# DEVICE_TYPE_TORCH names the device, it does not prove one exists: conftest sets
+# UNSLOTH_ALLOW_CPU=1, which makes it report "cuda" on a GPU-less host. Probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
 
 class _StubMerge(ConversionOps):

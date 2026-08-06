@@ -23,9 +23,11 @@ import pytest
 
 
 def get_device_type():
+    # Broad except: a torch that fails on missing driver libs must degrade to a
+    # skip, not error out the whole module during collection.
     try:
         import torch as _torch
-    except ImportError:
+    except Exception:
         return "cpu"
     if hasattr(_torch, "cuda") and _torch.cuda.is_available():
         return "cuda"

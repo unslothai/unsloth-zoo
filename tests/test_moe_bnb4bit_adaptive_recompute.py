@@ -22,13 +22,18 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 bnb = pytest.importorskip("bitsandbytes")
 from bitsandbytes.nn import Params4bit
 
-from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
+# DEVICE_TYPE_TORCH names the device, it does not prove one exists: conftest sets
+# UNSLOTH_ALLOW_CPU=1, which makes it report "cuda" on a GPU-less host. Probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
-gpu_available = DEVICE_TYPE_TORCH in ("cuda", "xpu")
-
+# Skip before importing unsloth_zoo so a CPU-only host stays a clean module skip.
 if not gpu_available:
     pytest.skip("bnb 4-bit dequant needs CUDA or XPU", allow_module_level=True)
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 import unsloth_zoo.temporary_patches.moe_utils as mu
 from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import forward_moe_backend_bnb4bit
 from unsloth_zoo.gradient_checkpointing import _gradient_checkpoint_recompute_marker
