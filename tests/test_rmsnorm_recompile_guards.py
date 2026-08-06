@@ -273,20 +273,30 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
     # on purpose. Real runs never set it (unsloth_zoo leaves it commented out), so the
     # limit alone plus `fullgraph = True` is the configuration that matters.
     # Widths do not exhaust anything under `dynamic = True`; dtype and grad mode do.
-    torch._dynamo.reset()
-    with torch._dynamo.config.patch(**{_LIMIT_KEY: 1, "suppress_errors": False}):
-        for dtype in DTYPES:
-            for grad in (True, False):
-                with torch.set_grad_enabled(grad):
-                    x = torch.randn(4, 128, device = "cuda", dtype = dtype)
-                    w = torch.randn(128, device = "cuda", dtype = dtype)
-                    out = _gemma4_rms_norm_scaled(x, w, 1e-6)
-                    assert out.shape == x.shape
-                    assert torch.isfinite(out).all()
+    # The latch is module-level and permanent, and torch._dynamo.reset() does not
+    # touch it, so leaving it set would silently hand every later test in this
+    # worker the eager kernel and let compile assertions pass without compiling.
+    saved = {k: dict(k._unsloth_fallback_state) for k in kernels}
+    try:
+        torch._dynamo.reset()
+        with torch._dynamo.config.patch(**{_LIMIT_KEY: 1, "suppress_errors": False}):
+            for dtype in DTYPES:
+                for grad in (True, False):
+                    with torch.set_grad_enabled(grad):
+                        x = torch.randn(4, 128, device = "cuda", dtype = dtype)
+                        w = torch.randn(128, device = "cuda", dtype = dtype)
+                        out = _gemma4_rms_norm_scaled(x, w, 1e-6)
+                        assert out.shape == x.shape
+                        assert torch.isfinite(out).all()
 
-    assert _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"], (
-        "the cache was never actually exhausted, so this asserted nothing"
-    )
+        assert _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"], (
+            "the cache was never actually exhausted, so this asserted nothing"
+        )
+    finally:
+        for kernel, state in saved.items():
+            kernel._unsloth_fallback_state.clear()
+            kernel._unsloth_fallback_state.update(state)
+        torch._dynamo.reset()
 
 
 def test_each_kernel_reports_its_own_fallback_state():
