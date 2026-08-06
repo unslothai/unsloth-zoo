@@ -932,6 +932,11 @@ def train_on_responses_only(
         # looked like text on schema alone, so the value was never examined and the
         # images were dropped before training.
         "img", "imgs", "image", "images", "video", "videos", "audio", "audios",
+        # `bytes` is already an unambiguous media key one level down, and the
+        # top-level list did not have it: a flattened base64 payload in a
+        # `bytes` column has a string schema, so it read as text and the
+        # replacement collator dropped it.
+        "bytes",
     ))
 
     # A name that only ever points at media points at media nested too: a turn
@@ -1155,6 +1160,20 @@ def train_on_responses_only(
                      "float", "double", "decimal", "date", "time", "duration",
                      "timestamp")
 
+    def _leaf_dtype_is_float(feature, _depth = 0):
+        """Does this feature bottom out in a float dtype?"""
+        if feature is None or _depth >= 8: return False
+        inner = getattr(feature, "feature", None)
+        if inner is not None: return _leaf_dtype_is_float(inner, _depth + 1)
+        dtype = getattr(feature, "dtype", None)
+        return isinstance(dtype, str) and dtype.startswith(
+            ("float", "double", "half", "bfloat"))
+
+    def _is_numeric_array_feature(feature):
+        """`Array2D`/`Array3D`/`Array4D`/`Array5D`, by shape rather than name."""
+        return (getattr(feature, "shape", None) is not None
+                and isinstance(getattr(feature, "dtype", None), str))
+
     def _feature_is_plain_text(feature, _depth = 0):
         """True only when this column type cannot hold media in any row."""
         if feature is None or _depth >= 8: return False
@@ -1169,8 +1188,19 @@ def train_on_responses_only(
             return True
         if isinstance(feature, (list, tuple)):
             return all(_feature_is_plain_text(f, _depth + 1) for f in feature)
+        # A multi-dimensional numeric block is a tensor, whatever the column is
+        # called: `Array4D(float32)` under `frames` is video, and the leaf dtype
+        # check below called it plain, so the column was marked proven, its
+        # values never read, and the media dropped.
+        if _is_numeric_array_feature(feature): return False
         inner = getattr(feature, "feature", None)           # Sequence/List/LargeList
-        if inner is not None: return _feature_is_plain_text(inner, _depth + 1)
+        if inner is not None:
+            # Same for a float sequence: `Sequence(float32)` under `speech` is a
+            # waveform. Integer sequences stay plain -- that is the shape every
+            # pretokenized column has, and refusing them would refuse the case
+            # this bypass exists for.
+            if _leaf_dtype_is_float(inner): return False
+            return _feature_is_plain_text(inner, _depth + 1)
         # Value/ClassLabel name a primitive dtype. Image is "PIL.Image.Image" and
         # Audio/Video a dict, so anything unrecognised stays unsafe.
         dtype = getattr(feature, "dtype", None)
@@ -1353,6 +1383,23 @@ def train_on_responses_only(
         return any(b.__name__ == "DataCollatorForVisionLanguageModeling"
                    for b in type(collator).__mro__)
 
+    def _refuse_packing_that_will_not_happen(collator, raw_splits):
+        """A raw split taking the bypass gets no packing at all.
+
+        `_maybe_tokenize_dataset` tokenizes each row on its own and the swap
+        below installs a plain DataCollatorForSeq2Seq, so nothing concatenates
+        the examples and nothing builds the packing-specific inputs. That is
+        true even for the collators exempted just above, because the exemption
+        is about who pads, not about who packs.
+        """
+        if not packing_enabled or not raw_splits: return
+        raise ValueError(
+            f"Unsloth: `packing = True` is not supported here. `{type(collator).__name__}` "
+            "holds a processor, so response-only masking is applied at the dataset level, "
+            "and that path tokenizes each row on its own -- nothing packs them. Turn packing "
+            "off, or pre-tokenize the dataset so the trainer's own packing runs."
+        )
+
     def _refuse_packing_with_a_foreign_collator(collator):
         """The case with no right answer: `_is_vision_collator` matches one
         merely holding a processor, and a custom self-packing collator does
@@ -1420,6 +1467,10 @@ def train_on_responses_only(
                 )
             # Fall through to the dataset-level text path below.
             _refuse_packing_with_a_foreign_collator(data_collator)
+            _refuse_packing_that_will_not_happen(
+                data_collator,
+                [d for d in [_train] + _eval_splits
+                 if d is not None and not _dataset_is_pretokenized(d)])
             _bypassed_vision_collator = True
             print(
                 f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "

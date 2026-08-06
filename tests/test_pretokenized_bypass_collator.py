@@ -2028,3 +2028,104 @@ def test_the_default_label_pad_value_is_unchanged():
     trainer = StubTrainer(collator, _text_rows())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert out.data_collator.label_pad_token_id == -100
+
+
+# ---- round N+1: three more Codex items --------------------------------------
+
+def test_a_float_sequence_column_is_not_proven_text():
+    """`Sequence(float32)` under a generic name is a waveform, and the leaf
+    dtype check called it plain, so the column was marked proven, its values
+    were never read, and the audio was dropped before training."""
+    from datasets import Dataset, Features, Sequence, Value
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)],
+         "speech": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]},
+        features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "speech": Sequence(Value("float32")),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_integer_sequence_column_is_still_proven_text():
+    """Every pretokenized column has exactly that shape, so refusing them
+    would refuse the case this bypass exists for."""
+    from datasets import Dataset, Features, Sequence, Value
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)],
+         "position_ids": [[0, 1, 2], [0, 1, 2]]},
+        features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "position_ids": Sequence(Value("int64")),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    assert train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART) is trainer
+
+
+def test_a_multidimensional_numeric_column_is_not_proven_text():
+    """Array4D under `frames` is video however plain its leaf dtype reads."""
+    from datasets import Array2D, Dataset, Features, Sequence, Value
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)],
+         "frames": [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]},
+        features = Features({
+            "input_ids": Sequence(Value("int64")),
+            "frames": Array2D(shape = (2, 2), dtype = "int32"),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_top_level_bytes_column_is_media():
+    """A flattened base64 payload has a string schema, so the name has to say
+    so -- `bytes` is already an unambiguous media key one level down."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "bytes": ["iVBORw0KGgo=", "iVBORw0KGgo="],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_packing_on_a_raw_bypass_is_refused():
+    """The exemption above is about who pads, not who packs. A raw split going
+    through the dataset-level path is tokenized row by row and collated by a
+    plain DataCollatorForSeq2Seq, so `packing = True` silently does nothing."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
+    rows = Dataset.from_dict({"text": ["a" * 4, "b" * 4]})
+    trainer = StubTrainer(collator, rows)
+    trainer.args.packing = True
+    with pytest.raises(ValueError, match = "packing = True` is not supported"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_packing_on_a_pretokenized_bypass_is_unchanged():
+    """Those rows carry their own `input_ids`, so nothing here claims to pack
+    them and the exemption still applies."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
+    trainer = StubTrainer(collator, _text_rows())
+    trainer.args.packing = True
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+
+
+def test_a_raw_bypass_without_packing_is_untouched():
+    """The refusal is gated on packing, not on the split being raw."""
+    from transformers import DataCollatorForTokenClassification
+    collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
+    rows = Dataset.from_dict({"text": [
+        f"{INSTRUCTION_PART}hi{RESPONSE_PART}there",
+        f"{INSTRUCTION_PART}yo{RESPONSE_PART}hello",
+    ]})
+    trainer = StubTrainer(collator, rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
