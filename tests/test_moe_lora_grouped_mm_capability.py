@@ -295,7 +295,8 @@ def test_the_signature_is_one_device_transfer(unsupported):
     with mock.patch.object(torch.Tensor, "cpu", counting_cpu):
         M._routing_signature(torch.randn(12, 8), offsets)
     assert len(calls) == 1, calls
-    assert calls[0] == (4,)     # 3 offsets + the checksum, packed together
+    # 3 offsets + one checksum int per projection, packed into one transfer.
+    assert calls[0] == (3 + M._SIGNATURE_WIDTH,)
 
 
 def test_the_real_checkpoint_replay_shape_is_caught(unsupported):
@@ -346,3 +347,57 @@ def test_it_is_marked_as_not_compilable():
     assert getattr(M._manual_grouped_mm, "_torchdynamo_disable", False) or \
         "disable" in type(M._manual_grouped_mm).__name__.lower() or \
         hasattr(M._manual_grouped_mm, "__wrapped__"), M._manual_grouped_mm
+
+
+def test_the_signature_ignores_autocast(unsupported):
+    """`mv`/`mm` are on the autocast lower-precision list, and only one of the
+    two calls sees it: the forward runs inside `Function.forward` with the
+    caller's autocast live, the backward runs with autocast disabled. FP32
+    inputs under autocast hashed in bf16 one side and fp32 the other, so every
+    backward raised the routing error on routing that had not changed."""
+    inputs = torch.randn(12, 8, dtype = torch.float32)
+    offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
+
+    plain = M._routing_signature(inputs, offsets)
+    with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
+        under = M._routing_signature(inputs, offsets)
+    assert under == plain
+
+
+def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
+    """One dot product per row maps it to a scalar, so every row orthogonal to
+    the projection hashes like the zero row. Swapping such a pair across an
+    expert boundary is a routing change the check has to see."""
+    hidden = 8
+    ramp = torch.linspace(1.0, 2.0, hidden, dtype = torch.float32)
+    p = torch.sin(ramp * M._SIGNATURE_STRIDES[0])
+    orthogonal = torch.zeros(hidden)
+    orthogonal[0], orthogonal[1] = p[1], -p[0]
+    assert torch.isclose(orthogonal.dot(p), torch.tensor(0.0), atol = 1e-6)
+
+    offsets = torch.tensor([1, 2], dtype = torch.int32)
+    before = torch.stack([orthogonal, torch.zeros(hidden)])
+    after = torch.stack([torch.zeros(hidden), orthogonal])
+    assert M._routing_signature(before, offsets) != \
+        M._routing_signature(after, offsets)
+
+
+def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
+    """Under `no_grad` nothing will ever read it, and the cost is a whole
+    `[T, hidden]` projection plus a SYNCHRONOUS device-to-host copy per call --
+    which for the low-rank LoRA matmuls can outweigh the GEMM it guards."""
+    inputs, weight, offsets = _case()
+    taken = []
+    real = M._routing_signature
+    M._routing_signature = lambda *a, **k: (taken.append(1), real(*a, **k))[1]
+    try:
+        with torch.no_grad():
+            out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
+        assert not taken, "signature taken with grad off"
+        assert out.shape == (inputs.shape[0], weight.shape[-1])
+
+        M._grouped_mm_with_backward_fix(
+            inputs.clone().requires_grad_(True), weight, offsets)
+        assert taken, "signature skipped with grad ON"
+    finally:
+        M._routing_signature = real

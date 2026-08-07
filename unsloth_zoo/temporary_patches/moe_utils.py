@@ -168,6 +168,17 @@ def _grouped_matmul_loop(inputs, weight, offsets):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
+# Projection strides for the routing signature. Four, so a row has to be
+# orthogonal to four independent directions to collide; the cost is four columns
+# of a `[T, hidden]` matmul against the grouped GEMM it guards.
+_SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
+
+# How many trailing entries of a packed signature are checksum rather than group
+# boundary. Named, because the offsets are read back by slicing it off and a bare
+# `[:-1]` silently read three checksums as three more experts.
+_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES)
+
+
 def _routing_signature(inputs, offsets):
     """Offsets plus an order-sensitive checksum of the expert-sorted rows.
 
@@ -194,14 +205,31 @@ def _routing_signature(inputs, offsets):
     """
     inputs = inputs.detach()
     hidden = inputs.shape[-1]
-    weights = torch.linspace(
-        1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
-    # Irrational stride: a linear ramp alone still sums to the same value under
-    # a reversal, which is the collision this replaces.
-    weights = torch.sin(weights * 12.9898).to(inputs.dtype)
-    rows = inputs.mv(weights).float()
-    ramp = torch.arange(1, rows.numel() + 1, device = rows.device, dtype = rows.dtype)
-    checksum = torch.dot(rows, ramp).reshape(1)
+    # Autocast off, explicitly. `mv`/`mm` are on the autocast lower-precision
+    # list, and only ONE of the two calls sees it: the forward runs inside
+    # `Function.forward` with the caller's autocast live, the backward runs with
+    # autocast disabled. FP32 inputs under autocast therefore hashed in bf16 one
+    # side and fp32 the other, and every backward raised the routing error below
+    # on routing that had not changed at all.
+    with torch.autocast(device_type = inputs.device.type, enabled = False):
+        weights = torch.linspace(
+            1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
+        # Irrational stride: a linear ramp alone still sums to the same value
+        # under a reversal, which is the collision this replaces.
+        strides = torch.tensor(
+            _SIGNATURE_STRIDES, device = inputs.device, dtype = torch.float32)
+        weights = torch.sin(
+            weights.unsqueeze(1) * strides).to(inputs.dtype)
+        # Several projections, not one. A single dot maps each row to one
+        # scalar, so every row orthogonal to it hashes like the zero row --
+        # `[p[1], -p[0], 0, ...]` and zeros both give exactly 0 -- and swapping
+        # those two across an expert boundary survived the check. Independent
+        # directions have no shared null space, so a row has to be orthogonal to
+        # all of them at once.
+        rows = (inputs @ weights).float()
+        ramp = torch.arange(
+            1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
+        checksum = (rows * ramp.unsqueeze(1)).sum(0)
     packed = torch.cat((
         offsets.detach().reshape(-1).to(torch.int64),
         checksum.view(torch.int32).to(torch.int64),
@@ -249,7 +277,8 @@ class _ManualGroupedMM(torch.autograd.Function):
             # pairing the original `grad_output` with the replay's partition is
             # a gradient for a routing that never produced the loss. Louder than
             # CheckpointError and pointed at the actual cause.
-            were, now = ctx.forward_routing[:-1], routing[:-1]
+            were = ctx.forward_routing[:-_SIGNATURE_WIDTH]
+            now = routing[:-_SIGNATURE_WIDTH]
             how = ("the same experts in a different order"
                    if were == now else f"expert ends {were} then {now}")
             raise RuntimeError(
@@ -259,7 +288,7 @@ class _ManualGroupedMM(torch.autograd.Function):
                 "the loss. Turn gradient checkpointing off for this run, or "
                 "make the router deterministic."
             )
-        bounds = routing[:-1]
+        bounds = routing[:-_SIGNATURE_WIDTH]
         need_x, need_w, _ = ctx.needs_input_grad
         grad_output = grad_output.contiguous()
         # `backward` runs OUTSIDE the forward's autocast region, so a forward
@@ -302,6 +331,13 @@ def _manual_grouped_mm(
     fatal, which is what the eager fallback in `temporary_patches/utils.py` is
     for.
     """
+    # No tape, no replay, so nothing will ever read the signature: skip the
+    # Function entirely rather than pay a `[T, hidden]` projection and a
+    # SYNCHRONOUS device-to-host copy per call on the inference path. That copy
+    # is the expensive half -- it serializes the stream -- and for the low-rank
+    # LoRA matmuls it can outweigh the GEMM it guards.
+    if not torch.is_grad_enabled():
+        return _grouped_matmul_loop(inputs, weight, offsets)
     return _ManualGroupedMM.apply(inputs, weight, offsets)
 
 
