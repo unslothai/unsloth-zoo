@@ -2922,3 +2922,69 @@ def test_a_list_of_media_paths_is_not_proven_text():
         "a string sequence is still not treated like a bare string"
     assert "_looks_like_media_value(value)" in src, \
         "the value scan still weighs only data URIs, not media suffixes"
+
+
+# ── round sixteen: what the TEXT path must not be handed ────────────────────
+
+
+def test_retained_metadata_is_stripped_before_the_text_collator():
+    """The signature whitelist is global, so widening it for the media path
+    kept a benign `url`/`prompt`/`content` column alive for EVERY split. The
+    text collator tensorizes every key it is handed, so the retained string
+    killed the batch that `_has_media` correctly sent its way."""
+    seen = {}
+
+    class Text:
+        def __call__(self, features):
+            seen["keys"] = sorted(features[0].keys())
+            return {"ok": True}
+
+    class Media:
+        def __call__(self, features):
+            seen["media"] = True
+            return {"ok": True}
+
+    from unsloth_zoo.dataset_utils import _MediaAwareCollator
+    d = _MediaAwareCollator(Text(), Media(), {"pixel_values"},
+                            {"url"}, {"prompt", "caption"})
+    row = {"input_ids": [1, 2], "labels": [1, 2],
+           "url": "https://example.com/article", "prompt": "describe it"}
+    d([dict(row)])
+
+    assert "media" not in seen, "a text row went to the vision collator"
+    assert seen["keys"] == ["input_ids", "labels"], seen["keys"]
+    # And the caller's row is untouched: the strip works on copies.
+    assert set(row) == {"input_ids", "labels", "url", "prompt"}
+
+
+def test_the_media_path_still_sees_every_kept_column():
+    """The strip is on the text path only. A media batch needs the prompt that
+    goes with its image, which is why those columns are kept at all."""
+    seen = {}
+
+    class Text:
+        def __call__(self, features): seen["text"] = True
+
+    class Media:
+        def __call__(self, features): seen["keys"] = sorted(features[0].keys())
+
+    from unsloth_zoo.dataset_utils import _MediaAwareCollator
+    d = _MediaAwareCollator(Text(), Media(), {"pixel_values"},
+                            {"url"}, {"prompt"})
+    d([{"input_ids": [1], "pixel_values": [[0.0]], "prompt": "describe it"}])
+
+    assert "text" not in seen
+    assert seen["keys"] == ["input_ids", "pixel_values", "prompt"]
+
+
+def test_a_configured_label_survives_raw_column_removal():
+    """`_keep_media_columns` kept `args.label_names` in the signature while the
+    raw-column keep-list deleted the same columns from the split itself."""
+    from unsloth_zoo import dataset_utils as D
+    import inspect
+
+    src = inspect.getsource(D.train_on_responses_only)
+    body = src[src.index("def _model_input_columns"):]
+    body = body[:body.index("_keep_columns = ")]
+    assert 'label_names' in body, \
+        "the raw-column keep-list still drops a custom trainer's configured labels"
