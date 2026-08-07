@@ -401,3 +401,46 @@ def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
         assert taken, "signature skipped with grad ON"
     finally:
         M._routing_signature = real
+
+
+def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
+    """Four projections leave a common null space of dimension `hidden - 4`, so
+    two rows differing by a vector in it project alike. The squared norm is not
+    linear in the row, so it does not share that null space.
+
+    Asserted structurally rather than by constructing a colliding pair: an exact
+    null-space vector is not representable in the float32 the signature uses, so
+    such a pair separates on rounding noise and the test would pass against a
+    projections-only signature too. What can be checked is that the extra term is
+    there, is the norm, and reaches the packed output.
+    """
+    assert M._SIGNATURE_EXTRA == 1
+    assert M._SIGNATURE_WIDTH == len(M._SIGNATURE_STRIDES) + M._SIGNATURE_EXTRA
+
+    offsets = torch.tensor([2], dtype = torch.int32)
+    hidden = 8
+    # Same direction, different length: the norm separates them on magnitude,
+    # which no linear projection of a single row can be relied on to do once the
+    # row lies in the shared null space.
+    unit = torch.zeros(2, hidden); unit[0, 0] = 1.0; unit[1, 0] = 1.0
+    scaled = unit.clone(); scaled[1, 0] = 4.0
+    assert M._routing_signature(unit, offsets) != \
+        M._routing_signature(scaled, offsets)
+
+    packed = M._routing_signature(unit, offsets)
+    assert len(packed) == 1 + M._SIGNATURE_WIDTH
+
+
+def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
+    """`_routing_signature` packs the offsets into its own single transfer, so
+    re-reading them in the group loop was a second stream synchronization per
+    grouped matmul, multiplied over every layer's base and LoRA projections."""
+    inputs, weight, offsets = _case()
+    calls = []
+    real = torch.Tensor.cpu
+    def counting_cpu(self, *a, **k):
+        calls.append(tuple(self.shape))
+        return real(self, *a, **k)
+    with mock.patch.object(torch.Tensor, "cpu", counting_cpu):
+        M._ManualGroupedMM.apply(inputs.requires_grad_(True), weight, offsets)
+    assert len(calls) == 1, calls

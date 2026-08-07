@@ -155,11 +155,19 @@ def _grouped_mm_with_backward_fix(
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _grouped_matmul_loop(inputs, weight, offsets):
-    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd."""
+def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd.
+
+    `bounds` is the already-decoded group ends. The signature packs the offsets
+    into its own single transfer, so on the grad path they have been on the CPU
+    since before this call and re-reading them here was a second stream
+    synchronization per grouped matmul -- multiplied over the base and LoRA
+    projections of every layer.
+    """
     outputs = []
     start = 0
-    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+    if bounds is None: bounds = offsets.detach().cpu().tolist()
+    for expert_idx, end in enumerate(bounds):
         if start < end:
             outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
         start = end
@@ -168,15 +176,27 @@ def _grouped_matmul_loop(inputs, weight, offsets):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
-# Projection strides for the routing signature. Four, so a row has to be
-# orthogonal to four independent directions to collide; the cost is four columns
-# of a `[T, hidden]` matmul against the grouped GEMM it guards.
+# Projection strides for the routing signature. This is a CHECKSUM, not an
+# identity: any fixed-width digest of a `hidden`-wide row is lossy, and four
+# projections leave a common null space of dimension `hidden - 4`, so two rows
+# differing by a vector in it project alike. An exact identity is not affordable
+# here -- it would need a Python-side copy of the whole `[T, hidden]` input,
+# which is the 512MB transient this file exists to avoid -- so what is bought is
+# a smaller false-negative set, not a proof. The row index weights every term
+# (see the ramp below), so a swap is caught unless the two rows agree on ALL of
+# these AND on the norm below.
 _SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
+
+# Squared row norm, carried beside the projections. It is not linear in the row,
+# so the null-space argument that bounds the projections does not reach it: two
+# rows whose difference lies in their common null space still have to have equal
+# norms to swap unseen.
+_SIGNATURE_EXTRA = 1
 
 # How many trailing entries of a packed signature are checksum rather than group
 # boundary. Named, because the offsets are read back by slicing it off and a bare
 # `[:-1]` silently read three checksums as three more experts.
-_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES)
+_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
 
 
 def _routing_signature(inputs, offsets):
@@ -223,10 +243,12 @@ def _routing_signature(inputs, offsets):
         # Several projections, not one. A single dot maps each row to one
         # scalar, so every row orthogonal to it hashes like the zero row --
         # `[p[1], -p[0], 0, ...]` and zeros both give exactly 0 -- and swapping
-        # those two across an expert boundary survived the check. Independent
-        # directions have no shared null space, so a row has to be orthogonal to
-        # all of them at once.
+        # those two across an expert boundary survived the check.
         rows = (inputs @ weights).float()
+        # Plus the squared norm, which is not linear in the row, so the null
+        # space shared by the projections does not carry over to it.
+        rows = torch.cat(
+            (rows, (inputs.float() * inputs.float()).sum(-1, keepdim = True)), -1)
         ramp = torch.arange(
             1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
         checksum = (rows * ramp.unsqueeze(1)).sum(0)
@@ -266,7 +288,10 @@ class _ManualGroupedMM(torch.autograd.Function):
         ctx.forward_routing = _routing_signature(inputs, offsets)
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
-            return _grouped_matmul_loop(inputs, weight, offsets)
+            return _grouped_matmul_loop(
+                inputs, weight, offsets,
+                ctx.forward_routing[:-_SIGNATURE_WIDTH],
+            )
 
     @staticmethod
     def backward(ctx, grad_output):
