@@ -2794,3 +2794,64 @@ def test_an_ordinary_string_column_is_still_not_base64_media():
         StubTrainer(MyVisionCollator(StubProcessor()), rows),
         INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in out.train_dataset.column_names
+
+
+def test_a_declared_forward_input_survives_the_seeded_signature():
+    """Seeding `_signature_columns` stops the trainer deriving it later, so a
+    fixed list silently dropped anything the model actually declares: a
+    caller-supplied `position_ids` or a custom `sample_weight` was removed
+    before collation and the run trained on different inputs."""
+    class Model:
+        def forward(self, input_ids = None, attention_mask = None, labels = None,
+                    position_ids = None, sample_weight = None, **kw):
+            return None
+
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.model = Model()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    signature = getattr(out, "_signature_columns", None)
+    assert signature, "signature columns were never seeded"
+    for key in ("position_ids", "sample_weight"):
+        assert key in signature, f"{key} is declared by forward and would be stripped"
+    # And the media keys it was seeded for are still there.
+    assert "pixel_values" in signature
+
+
+def test_a_conversation_column_survives_unused_column_removal():
+    """Media in a raw VLM split can live only inside `messages`, which
+    `_has_media` recognises but the dispatch set deliberately excludes. Without
+    it in the kept columns the conversation was stripped before the dispatcher
+    saw it and the batch went to the text collator."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    signature = getattr(out, "_signature_columns", None)
+    assert signature, "signature columns were never seeded"
+    for key in ("messages", "conversations"):
+        assert key in signature, f"{key} would be stripped before the dispatcher"
+
+
+def test_the_conversation_keys_are_still_not_dispatch_keys():
+    """Kept, but not matched on the name alone: `_has_media` requires the value
+    to be a real message list, and widening the dispatch set would drop that
+    check and send any row with a `chat` string to the vision collator."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    dispatcher = out.data_collator
+    assert "messages" not in dispatcher.media_keys
+    assert not dispatcher._has_media([{"messages": "a plain string, not a conversation"}])
+    assert dispatcher._has_media([{"messages": [{"role": "user"}]}])

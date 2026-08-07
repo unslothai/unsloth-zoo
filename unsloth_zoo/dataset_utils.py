@@ -401,12 +401,18 @@ def _keep_media_columns(trainer, keys):
         existing = getattr(trainer, "_signature_columns", None)
         names = sorted(k for k in keys if isinstance(k, str))
         if existing is None:
+            # Seeding it stops the trainer deriving the signature later, so the
+            # model's own forward parameters go in here: a declared
+            # `position_ids` or a custom `sample_weight` outside a fixed list
+            # would otherwise be removed before collation, silently changing
+            # what the model is trained on.
             # `index`/`label`/`label_ids` are what HF always keeps; without them
             # a seeded list would drop the columns the loss itself needs.
-            trainer._signature_columns = names + [
+            declared = _model_forward_parameter_names(getattr(trainer, "model", None))
+            trainer._signature_columns = sorted(set(names) | declared | {
                 "label", "label_ids", "index", "input_ids", "attention_mask",
                 "labels", "completion_mask", "assistant_masks", "token_type_ids",
-            ]
+            })
         else:
             trainer._signature_columns = list(existing) + [
                 n for n in names if n not in existing]
@@ -1870,7 +1876,14 @@ def train_on_responses_only(
             # model's forward, so a later `evaluate`/`predict` split had its
             # media stripped BEFORE the collator ever ran and the dispatcher saw
             # text-only keys: the fallback it advertises could not fire at all.
-            _keep_media_columns(trainer, _dispatch_keys)
+            # Conversation keys too, though they are deliberately NOT dispatch
+            # keys: `_has_media` matches them only when the value is a real
+            # message list, and widening the dispatch set would drop that check.
+            # Media in a raw VLM split can live only inside `messages`, so
+            # without them the conversation was stripped before the dispatcher
+            # ever saw it and the batch went to the text collator.
+            _keep_media_columns(
+                trainer, _dispatch_keys | _MediaAwareCollator._CONVERSATION_KEYS)
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
         # handed, and only pads the few it knows, so any leftover column kills
