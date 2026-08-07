@@ -849,13 +849,17 @@ def _note_packed_under_checkpoint():
         return
     top = _saved_tensor_hook_accessor()
     if top is None:
-        # torch < 2.8 has no accessor, and the frame walk that answers instead
-        # is give-up-only by design, so there is no cheap probe to run here.
-        # Latching anyway marked EVERY call on 2.4-2.7 as packed, and a latched
-        # marker makes `_give_up` rethrow: the one path this wrapper exists to
-        # avoid, on four supported releases. The give-up path still walks the
-        # live stack, so a region open around the failing call is still seen;
-        # only the already-returned earlier layer needs 2.8 to be caught.
+        # torch < 2.8 has no accessor, so ask the frames. Latching regardless
+        # was the other option and it marked EVERY call on 2.4-2.7 as packed,
+        # which makes `_give_up` rethrow: the one path this wrapper exists to
+        # avoid. Dropping the observation was wrong the other way, since the
+        # give-up walk only sees a region open around the FAILING call: a layer
+        # that packed compiled and returned, then a later wrapper exhausting
+        # the budget outside any region, latched the first one to eager after
+        # its activations were packed compiled. Self-limiting, because the flag
+        # latches on the first hit and this returns immediately afterwards.
+        if _walk_for_checkpoint_frame():
+            _PACKED_COMPILED_IN_CHECKPOINT = True
         return
     try:
         hooks = top(True)                       # ignore_is_tracing
@@ -1185,6 +1189,14 @@ _LATCHED_EAGER_LABELS: set = set()
 # so the deferral has to be recorded somewhere that survives it.
 _PENDING_EAGER_LABELS: set = set()
 
+# The same latches, but only since the last settle. `_LATCHED_EAGER_LABELS` is
+# deliberately permanent -- a call site that gave up stays eager however often
+# its wrapper is rebuilt -- which makes it the wrong thing to read as EVIDENCE
+# that something fell back just now: train two models in one process and the
+# first one's labels answer for the second. This set is cleared at every
+# settle, so it says "in this step", which is the question being asked.
+_RECENT_EAGER_LABELS: set = set()
+
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
@@ -1252,6 +1264,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         state["eager"] = True
         state["pending_eager"] = False
         _LATCHED_EAGER_LABELS.add(label)
+        _RECENT_EAGER_LABELS.add(label)
         for ref in _EAGER_FALLBACK_WRAPPERS:
             w = ref()
             if w is None:
@@ -1262,7 +1275,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             st["eager"] = True
             st["pending_eager"] = False
             _wl = getattr(w, "_unsloth_fallback_label", None)
-            if _wl is not None: _LATCHED_EAGER_LABELS.add(_wl)
+            if _wl is not None:
+                _LATCHED_EAGER_LABELS.add(_wl)
+                _RECENT_EAGER_LABELS.add(_wl)
         _restore_recompile_limits_if_idle()
 
     def _release_borrowed_budget():
@@ -1423,6 +1438,16 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     wrapper._unsloth_fallback_state = state
     wrapper._unsloth_fallback_label = label
     _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
+    # GRPO rebuilds and re-wraps `accumulate_chunk` inside every backward, so
+    # the registry gained one entry per step forever and every scan above walked
+    # all of them: quadratic over a long run. Compact when the list has doubled
+    # since the last compaction, which is amortised O(1) per append and keeps
+    # the scans proportional to the wrappers that still exist.
+    global _EAGER_FALLBACK_PRUNE_AT
+    if len(_EAGER_FALLBACK_WRAPPERS) >= _EAGER_FALLBACK_PRUNE_AT:
+        _EAGER_FALLBACK_WRAPPERS[:] = [
+            r for r in _EAGER_FALLBACK_WRAPPERS if r() is not None]
+        _EAGER_FALLBACK_PRUNE_AT = max(64, 2 * len(_EAGER_FALLBACK_WRAPPERS))
     return wrapper
 
 
@@ -1430,6 +1455,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 # keep its functions alive. Weak refs also mean the registry cannot report a
 # switch for something nobody is calling any more.
 _EAGER_FALLBACK_WRAPPERS: list = []
+_EAGER_FALLBACK_PRUNE_AT: int = 64
 
 
 def eager_fallback_state() -> dict[str, bool]:
@@ -1583,6 +1609,7 @@ def apply_pending_eager_fallbacks() -> int:
     # on however often their wrappers are rebuilt.
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
+    _RECENT_EAGER_LABELS.clear()
     # Everything that borrowed headroom is eager now, so hand the budget back
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()
@@ -1615,7 +1642,7 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     # alone returned 0 and the caller re-raised the very failure this exists to
     # retry past.
     if only_if_already_triggered and not (
-            _LATCHED_EAGER_LABELS or _PENDING_EAGER_LABELS or any(
+            _RECENT_EAGER_LABELS or _PENDING_EAGER_LABELS or any(
             w._unsloth_fallback_state["eager"]
             or w._unsloth_fallback_state.get("pending_eager")
             for w in live)):
@@ -1629,6 +1656,7 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     # reads its state from a label that is still only pending and compiles again.
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
+    _RECENT_EAGER_LABELS.clear()
     _restore_recompile_limits()
     # Latched labels, not live objects: a call site with no wrapper alive right
     # now is still eager, and returning 0 would read as "nothing fell back".

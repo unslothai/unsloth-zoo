@@ -59,6 +59,8 @@ def _isolate_registry(monkeypatch):
     # test here reuses "M.forward" / "M.f".
     monkeypatch.setattr(U, "_LATCHED_EAGER_LABELS", set())
     monkeypatch.setattr(U, "_PENDING_EAGER_LABELS", set())
+    monkeypatch.setattr(U, "_RECENT_EAGER_LABELS", set())
+    monkeypatch.setattr(U, "_EAGER_FALLBACK_PRUNE_AT", 64)
 
 
 def _pair(fail_after=0):
@@ -246,8 +248,19 @@ def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
 
 
 def test_force_sees_a_latch_whose_wrapper_is_already_gone():
-    """Same for a label that gave up outright rather than deferring."""
-    U._LATCHED_EAGER_LABELS.add("chunk.f")
+    """Same for a label that gave up outright rather than deferring.
+
+    Through the real give-up, not by writing to `_LATCHED_EAGER_LABELS`: that
+    set is permanent by design, so it also holds a previous model's labels and
+    cannot be the evidence on its own. `_RECENT_EAGER_LABELS` is what says "in
+    this step", and the give-up path writes both."""
+    compiled, eager, _ = _pair(fail_after = 0)
+    w = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "chunk.f")
+    w(1)
+    del w
+    import gc; gc.collect()
+
+    assert "chunk.f" in U._LATCHED_EAGER_LABELS
     assert U.force_eager_fallback() > 0
 
 
@@ -293,3 +306,44 @@ def test_the_recovery_hook_is_declared_public():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_a_previous_models_latch_is_not_evidence_for_the_next():
+    """`_LATCHED_EAGER_LABELS` is permanent on purpose, so it cannot double as
+    "something fell back just now". Train two models in one process and the
+    first one's labels answered for the second, and `force_eager_fallback`
+    reported a compile-mode flip where there had been none -- the caller's cue
+    to retry rather than re-raise a genuine checkpoint failure."""
+    U._LATCHED_EAGER_LABELS.add("model_a.SomeNorm.forward")   # discarded model
+    assert U.force_eager_fallback(only_if_already_triggered = True) == 0
+
+    U._RECENT_EAGER_LABELS.add("model_b.SomeNorm.forward")    # this step
+    assert U.force_eager_fallback(only_if_already_triggered = True) > 0
+
+
+def test_the_settle_clears_the_recent_labels():
+    """One flip is evidence for its own step, not for every step after it."""
+    U._RECENT_EAGER_LABELS.add("x.forward")
+    U.force_eager_fallback(only_if_already_triggered = True)
+    assert U._RECENT_EAGER_LABELS == set()
+    assert U.force_eager_fallback(only_if_already_triggered = True) == 0
+
+
+def test_the_wrapper_registry_does_not_grow_without_bound():
+    """GRPO re-wraps `accumulate_chunk` inside every backward, so one dead weak
+    reference per step accumulated forever and every scan walked them."""
+    def build(n):
+        for i in range(n):
+            compiled, eager, _ = _pair(fail_after = 100)
+            U._fall_back_to_eager_on_recompile_limit(compiled, eager, f"chunk{i}.f")
+
+    # Control: with the compaction threshold out of reach every dead reference
+    # stays, which is exactly what a long GRPO run used to accumulate.
+    U._EAGER_FALLBACK_PRUNE_AT = 10 ** 9
+    build(500)
+    assert len(U._EAGER_FALLBACK_WRAPPERS) == 500
+
+    U._EAGER_FALLBACK_WRAPPERS.clear()
+    U._EAGER_FALLBACK_PRUNE_AT = 64
+    build(4000)
+    assert len(U._EAGER_FALLBACK_WRAPPERS) < 200, len(U._EAGER_FALLBACK_WRAPPERS)
