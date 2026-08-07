@@ -131,12 +131,12 @@ def _grouped_mm_with_backward_fix(
     and backward.
     """
     inputs = inputs.contiguous()
-    # Devices without torch._grouped_mm never reach the kernel. The Triton backend
-    # is picked precisely when the probe says no, but its separated-LoRA delta
-    # still routed through here. torch 2.8 hard-raises unless `dprops->major == 9`
-    # (Blas.cpp, sm90_only), and 2.6/2.7 have no `_grouped_mm` at all, so a LoRA
-    # MoE died on every card but an H100. 2.9 onwards falls back internally, which
-    # is why this only shows up on the older pins. Probe is cached: one global read.
+    # The Triton backend is picked precisely when the probe says no, yet its
+    # separated-LoRA delta still routed here. torch 2.8 hard-raises unless
+    # `dprops->major == 9` (Blas.cpp, sm90_only) and 2.6/2.7 have no
+    # `_grouped_mm` at all, so a LoRA MoE died on every card but an H100; 2.9
+    # falls back internally, which is why only the older pins show it. Probe is
+    # cached, so this is one global read.
     if not _check_torch_grouped_mm_supported():
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
@@ -176,26 +176,22 @@ def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
-# Projection strides for the routing signature. This is a CHECKSUM, not an
-# identity: any fixed-width digest of a `hidden`-wide row is lossy, and four
-# projections leave a common null space of dimension `hidden - 4`, so two rows
-# differing by a vector in it project alike. An exact identity is not affordable
-# here -- it would need a Python-side copy of the whole `[T, hidden]` input,
-# which is the 512MB transient this file exists to avoid -- so what is bought is
-# a smaller false-negative set, not a proof. The row index weights every term
-# (see the ramp below), so a swap is caught unless the two rows agree on ALL of
-# these AND on the norm below.
+# Projection strides for the routing signature. A CHECKSUM, not an identity: four
+# projections of a `hidden`-wide row leave a null space of dimension `hidden - 4`,
+# so rows differing within it project alike. An exact identity would need a copy
+# of the whole `[T, hidden]` input, the 512MB transient this file exists to avoid,
+# so this buys a smaller false-negative set, not a proof. The row index weights
+# every term, so a swap escapes only by matching ALL of these AND the norm below.
 _SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
 
-# Squared row norm, carried beside the projections. It is not linear in the row,
-# so the null-space argument that bounds the projections does not reach it: two
-# rows whose difference lies in their common null space still have to have equal
-# norms to swap unseen.
+# Squared row norm, carried beside the projections. Not linear in the row, so the
+# null-space argument above does not reach it: rows differing within that space
+# must also have equal norms to swap unseen.
 _SIGNATURE_EXTRA = 1
 
-# How many trailing entries of a packed signature are checksum rather than group
-# boundary. Named, because the offsets are read back by slicing it off and a bare
-# `[:-1]` silently read three checksums as three more experts.
+# Trailing entries of a packed signature that are checksum, not group boundary.
+# Named because the offsets are read back by slicing it off, and a bare `[:-1]`
+# silently read three checksums as three more experts.
 _SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
 
 
@@ -225,12 +221,11 @@ def _routing_signature(inputs, offsets):
     """
     inputs = inputs.detach()
     hidden = inputs.shape[-1]
-    # Autocast off, explicitly. `mv`/`mm` are on the autocast lower-precision
-    # list, and only ONE of the two calls sees it: the forward runs inside
-    # `Function.forward` with the caller's autocast live, the backward runs with
-    # autocast disabled. FP32 inputs under autocast therefore hashed in bf16 one
-    # side and fp32 the other, and every backward raised the routing error below
-    # on routing that had not changed at all.
+    # Autocast off, explicitly. `mv`/`mm` are on the autocast lower-precision list
+    # and only ONE of the two calls sees it: the forward runs with the caller's
+    # autocast live, the backward with it disabled. FP32 inputs therefore hashed
+    # in bf16 one side and fp32 the other, and every backward raised the routing
+    # error below on routing that had not changed.
     with torch.autocast(device_type = inputs.device.type, enabled = False):
         weights = torch.linspace(
             1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)

@@ -88,12 +88,10 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     except RuntimeError as e:
         if "strides should be multiple of 16 bytes" not in str(e):
             raise
-        # Shared with moe_utils rather than looped here: the loop puts every
-        # per-group SLICE on the tape, and a slice's shape is the group size,
-        # so non-reentrant checkpointing compares two routings and aborts the
-        # backward. Two of this function's callers are on the tape
-        # (`_grouped_expert_gemm` without recompute, and the cached path), so
-        # the hazard is reachable. The shared one saves what the fused op saves.
+        # Shared with moe_utils rather than looped here: a loop puts every
+        # per-group SLICE on the tape, and a slice's shape is the group size, so
+        # non-reentrant checkpointing compares two routings and aborts the
+        # backward. Two callers are on the tape, so the hazard is reachable.
         try:
             from .moe_utils import _manual_grouped_mm
         except Exception:
