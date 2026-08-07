@@ -2667,3 +2667,39 @@ class _PicklableCollator:
     """Module-level, so the pickling test measures the wrapper and not itself."""
     def __call__(self, features):
         return {"n": len(features)}
+
+
+@pytest.mark.parametrize("key", ["pixel_values", "image_grid_thw", "input_features"])
+def test_an_already_processed_batch_reaches_the_vision_collator(key):
+    """A split that has been through the processor carries the processor's own
+    output keys, not `images`. Those live only in `_MULTIMODAL_COLUMNS`, so a
+    dispatcher told about `_MEDIA_COLUMNS` alone sent a processed `predict`
+    batch to the text collator, which stacks them unpadded or drops them."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    mine = MyVisionCollator(StubProcessor())
+    collator = train_on_responses_only(
+        StubTrainer(mine, rows), INSTRUCTION_PART, RESPONSE_PART).data_collator
+
+    assert collator([{"input_ids": list(ROW), key: object()}]) == {"mine": True}
+
+
+@pytest.mark.parametrize("kind", ["image", "video", "audio"])
+def test_a_data_uri_outside_the_sampled_rows_is_still_media(kind):
+    """`_sample_rows` reads 16 rows. A bare string column got no other value
+    check, so a self-identifying URI anywhere else was invisible and the column
+    was dropped, silently removing that example's media."""
+    n = 400
+    sampled = sorted({i * (n - 1) // 15 for i in range(16)})
+    hidden = next(i for i in range(n) if i not in sampled)
+    notes = ["plain text"] * n
+    notes[hidden] = f"data:{kind}/png;base64,iVBORw0KGgo="
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW)] * n,
+        "image_data": notes,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)

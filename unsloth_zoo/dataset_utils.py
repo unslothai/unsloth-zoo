@@ -1377,6 +1377,15 @@ def train_on_responses_only(
             return False
     pass
 
+    def _is_map_style(split):
+        """Can this split be indexed and scanned, or is it a one-pass stream?"""
+        try:
+            len(split)
+            return True
+        except Exception:
+            return False
+    pass
+
     def _columns_are_provably_text(split, names):
         """`(every column is text, the columns the schema itself proved)`.
 
@@ -1396,8 +1405,21 @@ def train_on_responses_only(
                         getattr(feature, "feature", None) is not None and \
                         _leaf_dtype_is_numeric(feature): return False, proven
                     if not _feature_is_plain_text(feature): return False, proven
-                    if _feature_needs_a_value_scan(feature) and \
-                        not _column_values_are_plain_text(split, name): return False, proven
+                    # Bare strings too, not just the structs the schema cannot
+                    # settle. A `data:image/...` URI identifies itself, and an
+                    # unlisted column holding one on row 5000 is invisible to the
+                    # 16 sampled rows that were the only value check a bare
+                    # string got. The scan is a `startswith` per row.
+                    #
+                    # Map-style only, unlike the struct case. A struct advertises
+                    # its own ambiguity with a `path`/`url`/`type` key, so a
+                    # stream that cannot be scanned is right to be refused; a
+                    # bare `string` advertises nothing, and refusing it would
+                    # refuse every streamed text column there is.
+                    _scan = _feature_needs_a_value_scan(feature) or (
+                        _feature_is_bare_string(feature) and _is_map_style(split))
+                    if _scan and not _column_values_are_plain_text(split, name):
+                        return False, proven
                     # A plain string column is NOT added: `proven` exists so a
                     # numeric column that `with_format` hands back as a tensor is
                     # not re-judged by value, and a string stays a string under
@@ -1776,7 +1798,12 @@ def train_on_responses_only(
         # Only when a media-capable collator was displaced. Everywhere else the
         # replacement is the whole point and there is nothing to fall back to.
         trainer.data_collator = _MediaAwareCollator(
-            _text_collator, _collator, _MEDIA_COLUMNS,
+            # Both sets. `_MEDIA_COLUMNS` names what a user hands in, and a split
+            # that has already been through the processor carries `pixel_values`
+            # / `image_grid_thw` / `input_features` instead: those live only in
+            # `_MULTIMODAL_COLUMNS`, so a processed `predict` batch matched
+            # nothing and went to the text collator that cannot tensorize it.
+            _text_collator, _collator, _MEDIA_COLUMNS | _MULTIMODAL_COLUMNS,
         ) if _bypassed_vision_collator else _text_collator
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
