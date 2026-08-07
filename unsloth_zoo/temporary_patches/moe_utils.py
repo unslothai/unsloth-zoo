@@ -245,10 +245,18 @@ def _routing_signature(inputs, offsets):
         # `[p[1], -p[0], 0, ...]` and zeros both give exactly 0 -- and swapping
         # those two across an expert boundary survived the check.
         rows = (inputs @ weights).float()
-        # Plus the squared norm, which is not linear in the row, so the null
-        # space shared by the projections does not carry over to it.
-        rows = torch.cat(
-            (rows, (inputs.float() * inputs.float()).sum(-1, keepdim = True)), -1)
+        # Plus the norm, which is not linear in the row, so the null space
+        # shared by the projections does not carry over to it. `vector_norm`
+        # accumulates in fp32 from the input's own dtype: `(x.float() *
+        # x.float()).sum(...)` held two fp32 copies AND their product at once,
+        # three concurrent 512MB temporaries at the 32K-by-4096 shape this
+        # fallback targets, which is memory the run does not have.
+        # Promoted, not pinned to fp32: `vector_norm` refuses a dtype that
+        # narrows its input, so a float64 split would raise outright.
+        norm = torch.linalg.vector_norm(
+            inputs, dim = -1, keepdim = True,
+            dtype = torch.promote_types(inputs.dtype, torch.float32))
+        rows = torch.cat((rows, norm.to(rows.dtype)), -1)
         ramp = torch.arange(
             1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
         checksum = (rows * ramp.unsqueeze(1)).sum(0)
@@ -257,6 +265,49 @@ def _routing_signature(inputs, offsets):
         checksum.view(torch.int32).to(torch.int64),
     ))
     return packed.cpu().tolist()
+
+
+# Routing recorded by a REENTRANT checkpoint's forward, so its replay can be
+# compared against the pass that actually produced the loss.
+#
+# `ctx` cannot carry it there. `unsloth_checkpoint` forces the reentrant
+# implementation, whose loss-producing forward runs with grad DISABLED, so
+# `apply` builds no autograd node and the ctx is thrown away. The replay inside
+# `CheckpointFunction.backward` then makes a fresh ctx and compares the replay
+# against itself, which always passes. The non-reentrant path has no such gap:
+# its forward runs with grad on, so the forward's own ctx survives and only its
+# SAVED TENSORS are swapped for the replay's.
+#
+# Keyed on the weight, the one object both passes share: inputs are recomputed
+# and offsets re-derived, but the parameter is the same object. Two records for
+# one weight before its replay is ambiguous and disables the check rather than
+# risk a false alarm on a working run.
+_REENTRANT_ROUTING = {}
+_REENTRANT_SAW_GRAD = False
+_REENTRANT_ROUTING_LIMIT = 512
+
+
+def _record_reentrant_routing(weight, routing):
+    global _REENTRANT_SAW_GRAD
+    if _REENTRANT_SAW_GRAD:
+        # A grad-enabled call ran since the last record, so anything still here
+        # belongs to a forward whose backward has already been and gone. Drop
+        # it: a stale routing consumed by a later replay is a false alarm, and
+        # this is what keeps an eval pass from poisoning the next step.
+        _REENTRANT_ROUTING.clear()
+        _REENTRANT_SAW_GRAD = False
+    if len(_REENTRANT_ROUTING) >= _REENTRANT_ROUTING_LIMIT: return
+    key = id(weight)
+    # The weight is held so its `id()` cannot be reused by a later object.
+    _REENTRANT_ROUTING[key] = (weight, None if key in _REENTRANT_ROUTING else routing)
+
+
+def _take_reentrant_routing(weight):
+    """The forward's routing for this weight, once. None when there is none."""
+    global _REENTRANT_SAW_GRAD
+    _REENTRANT_SAW_GRAD = True
+    entry = _REENTRANT_ROUTING.pop(id(weight), None)
+    return None if entry is None else entry[1]
 
 
 class _ManualGroupedMM(torch.autograd.Function):
@@ -285,13 +336,16 @@ class _ManualGroupedMM(torch.autograd.Function):
         # saved TENSORS with the replay's, so a saved `offsets` tells us what
         # the replay routed, never what the forward routed. This copy survives,
         # and backward uses it to tell the two apart.
-        ctx.forward_routing = _routing_signature(inputs, offsets)
+        routing = _routing_signature(inputs, offsets)
+        # A reentrant checkpoint's forward left its routing on the side, and
+        # THAT is what produced the loss: this call is the replay. The bounds
+        # below still come from `routing`, since they are this pass's own math.
+        stashed = _take_reentrant_routing(weight)
+        ctx.forward_routing = routing if stashed is None else stashed
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
             return _grouped_matmul_loop(
-                inputs, weight, offsets,
-                ctx.forward_routing[:-_SIGNATURE_WIDTH],
-            )
+                inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -356,13 +410,21 @@ def _manual_grouped_mm(
     fatal, which is what the eager fallback in `temporary_patches/utils.py` is
     for.
     """
-    # No tape, no replay, so nothing will ever read the signature: skip the
-    # Function entirely rather than pay a `[T, hidden]` projection and a
-    # SYNCHRONOUS device-to-host copy per call on the inference path. That copy
-    # is the expensive half -- it serializes the stream -- and for the low-rank
-    # LoRA matmuls it can outweigh the GEMM it guards.
-    if not torch.is_grad_enabled():
+    # Nothing is taped and nothing replays it, so skip the Function entirely
+    # rather than pay a `[T, hidden]` projection per call on the inference path.
+    if torch.is_inference_mode_enabled():
         return _grouped_matmul_loop(inputs, weight, offsets)
+    if not torch.is_grad_enabled():
+        # Grad off but not inference. `apply` would build no node here, so the
+        # Function's own ctx cannot reach any backward -- and this is exactly
+        # where a REENTRANT checkpoint runs its loss-producing forward, so the
+        # routing has to be kept on the side for the replay to be checked
+        # against. Grad off is NOT a reason to skip: it is what an autograd
+        # Function's forward always looks like from the inside.
+        routing = _routing_signature(inputs, offsets)
+        _record_reentrant_routing(weight, routing)
+        return _grouped_matmul_loop(
+            inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
     return _ManualGroupedMM.apply(inputs, weight, offsets)
 
 
