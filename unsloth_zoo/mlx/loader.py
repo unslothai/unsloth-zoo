@@ -443,6 +443,51 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
+_MLX_MISSING_ARGS_RE = re.compile(
+    # Anchored on __init__ so mlx-lm signature drift at our own call sites
+    # (e.g. "load_model() missing 1 required positional argument: 'model_path'")
+    # is never mistaken for an incomplete config; this loader deliberately
+    # tolerates that drift and must keep its original traceback.
+    r"\w*\.?__init__\(\) missing \d+ required positional arguments?:(?P<keys>.*)"
+)
+
+
+def _missing_mlx_config_keys(message):
+    """Config keys mlx-lm's ModelArgs required but config.json did not supply.
+
+    mlx-lm builds ModelArgs through ``from_dict``, which filters the config down
+    to fields the dataclass declares. A field with no default that is absent
+    from config.json therefore fails in ``__init__`` with a bare TypeError that
+    names neither the model nor the file. Returns [] for any other TypeError.
+    """
+    match = _MLX_MISSING_ARGS_RE.search(message)
+    if match is None:
+        return []
+    return re.findall(r"'([^']+)'", match.group("keys"))
+
+
+def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
+    """An incomplete config.json is a model-repo problem, not an MLX one.
+
+    Mirroring a checkpoint through a transformers version that does not model
+    every field can silently drop keys the mlx-lm arch still requires (e.g.
+    lfm2's block_ff_dim). The raw TypeError reads like missing Apple Silicon
+    support, so name the actual cause."""
+    keys = _missing_mlx_config_keys(message)
+    if not keys:
+        return
+    listed = ", ".join(repr(key) for key in keys)
+    plural = "keys" if len(keys) > 1 else "key"
+    raise ValueError(
+        f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
+        f"which mlx-lm's '{model_type or 'unknown'}' architecture requires and "
+        f"cannot default. This is an incomplete config.json in the model repo - "
+        f"MLX and Apple Silicon support are not the problem. Compare the config "
+        f"against the upstream repo this model was mirrored from and add the "
+        f"missing {plural}."
+    ) from error
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -809,6 +854,11 @@ def _load_mlx_lm_with_strict_fallback(
             lazy=lazy,
             model_config=model_config,
         )
+    except TypeError as error:
+        # A required ModelArgs field absent from config.json surfaces here, not
+        # as the ValueError the strict fallback below handles.
+        _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
+        raise
     except ValueError as error:
         message = str(error)
         # Active-layer QK-norm weights are load-bearing: never strict=False past
@@ -943,12 +993,20 @@ def _load_mlx_lm_distributed(
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
-            model, config = load_model(
-                metadata_model_path,
-                lazy=True,
-                strict=False,
-                model_config=model_config,
-            )
+            try:
+                model, config = load_model(
+                    metadata_model_path,
+                    lazy=True,
+                    strict=False,
+                    model_config=model_config,
+                )
+            except TypeError as error:
+                # Same incomplete-config failure as the single-device path;
+                # strict=False does not cover a missing ModelArgs field.
+                _raise_if_incomplete_mlx_config(
+                    model_name, model_type, str(error), error
+                )
+                raise
 
             mode = _mlx_distributed_sharding_mode(
                 model,
