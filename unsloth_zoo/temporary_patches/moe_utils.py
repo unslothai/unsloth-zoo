@@ -168,6 +168,25 @@ def _grouped_matmul_loop(inputs, weight, offsets):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
+def _routing_signature(inputs, offsets):
+    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
+
+    The offsets are only the routing histogram, so a replay that swaps two
+    tokens between experts of equal size leaves them identical while `inputs`
+    holds a different sequence. The checksum moves with the rows, so the swap
+    is visible. Bit-cast into the offsets vector, exactly, so the whole thing
+    is one device sync -- the same one the group loop already pays.
+    """
+    rows = inputs.detach().float().sum(dim = -1)
+    ramp = torch.arange(1, rows.numel() + 1, device = rows.device, dtype = rows.dtype)
+    checksum = torch.dot(rows, ramp).reshape(1)
+    packed = torch.cat((
+        offsets.detach().reshape(-1).to(torch.int64),
+        checksum.view(torch.int32).to(torch.int64),
+    ))
+    return packed.cpu().tolist()
+
+
 class _ManualGroupedMM(torch.autograd.Function):
     """The loop above, saving what torch._grouped_mm saves and nothing else.
 
@@ -194,7 +213,7 @@ class _ManualGroupedMM(torch.autograd.Function):
         # saved TENSORS with the replay's, so a saved `offsets` tells us what
         # the replay routed, never what the forward routed. This copy survives,
         # and backward uses it to tell the two apart.
-        ctx.forward_offsets = offsets.detach().cpu().tolist()
+        ctx.forward_routing = _routing_signature(inputs, offsets)
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
             return _grouped_matmul_loop(inputs, weight, offsets)
@@ -202,20 +221,23 @@ class _ManualGroupedMM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         inputs, weight, offsets = ctx.saved_tensors
-        bounds = offsets.detach().cpu().tolist()
-        if bounds != ctx.forward_offsets:
+        routing = _routing_signature(inputs, offsets)
+        if routing != ctx.forward_routing:
             # Shape-stable saves would otherwise let this through silently, and
             # pairing the original `grad_output` with the replay's partition is
             # a gradient for a routing that never produced the loss. Louder than
             # CheckpointError and pointed at the actual cause.
+            were, now = ctx.forward_routing[:-1], routing[:-1]
+            how = ("the same experts in a different order"
+                   if were == now else f"expert ends {were} then {now}")
             raise RuntimeError(
                 "Unsloth: the MoE router assigned tokens differently in the "
-                "activation-checkpoint replay than in the forward "
-                f"(expert ends {ctx.forward_offsets} then {bounds}), so the "
-                "gradients would belong to a routing that never produced the "
-                "loss. Turn gradient checkpointing off for this run, or make "
-                "the router deterministic."
+                f"activation-checkpoint replay than in the forward ({how}), so "
+                "the gradients would belong to a routing that never produced "
+                "the loss. Turn gradient checkpointing off for this run, or "
+                "make the router deterministic."
             )
+        bounds = routing[:-1]
         need_x, need_w, _ = ctx.needs_input_grad
         grad_output = grad_output.contiguous()
         # `backward` runs OUTSIDE the forward's autocast region, so a forward

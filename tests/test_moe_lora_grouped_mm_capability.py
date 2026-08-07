@@ -34,6 +34,8 @@ The guard goes in `_grouped_mm_with_backward_fix`, the one choke point every
 LoRA and base path shares.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -241,20 +243,59 @@ def test_a_routing_change_in_the_replay_is_named_not_swallowed(unsupported):
     That is worse than the CheckpointError it replaced, so the forward's own
     boundaries are kept off the tape and compared.
     """
-    class _Ctx:
-        """What checkpointing hands backward: the REPLAY's saved tensors."""
-        needs_input_grad = (True, True, False)
-        def __init__(self, saved, forward_offsets):
-            self.saved_tensors = saved
-            self.forward_offsets = forward_offsets
-
     inputs = torch.randn(12, 8)
     weight = torch.randn(3, 8, 6)
     replayed = torch.tensor([4, 9, 12], dtype = torch.int32)   # one token over
-    ctx = _Ctx((inputs, weight, replayed), [4, 8, 12])
+    ctx = _ReplayCtx(
+        (inputs, weight, replayed),
+        M._routing_signature(inputs, torch.tensor([4, 8, 12], dtype = torch.int32)),
+    )
 
     with pytest.raises(RuntimeError, match = "assigned tokens differently"):
         M._ManualGroupedMM.backward(ctx, torch.ones(12, 6))
+
+
+class _ReplayCtx:
+    """What checkpointing hands backward: the REPLAY's saved tensors."""
+    needs_input_grad = (True, True, False)
+    def __init__(self, saved, forward_routing):
+        self.saved_tensors = saved
+        self.forward_routing = forward_routing
+
+
+def test_a_count_preserving_reshuffle_is_caught_too(unsupported):
+    """Offsets are the routing histogram, not the assignment.
+
+    Swap two tokens between experts of the same size and every boundary is
+    where it was, so a check that compares only offsets waves the replay
+    through and pairs the original `grad_output` with reordered input rows.
+    """
+    inputs = torch.randn(12, 8)
+    weight = torch.randn(3, 8, 6)
+    offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
+    forward = M._routing_signature(inputs, offsets)
+
+    reshuffled = inputs.clone()
+    reshuffled[3], reshuffled[4] = inputs[4].clone(), inputs[3].clone()
+    assert M._routing_signature(reshuffled, offsets) != forward
+
+    ctx = _ReplayCtx((reshuffled, weight, offsets), forward)
+    with pytest.raises(RuntimeError, match = "the same experts in a different order"):
+        M._ManualGroupedMM.backward(ctx, torch.ones(12, 6))
+
+
+def test_the_signature_is_one_device_transfer(unsupported):
+    """The group loop already pays a sync; the checksum must not add another."""
+    offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
+    calls = []
+    real = torch.Tensor.cpu
+    def counting_cpu(self, *a, **k):
+        calls.append(tuple(self.shape))
+        return real(self, *a, **k)
+    with mock.patch.object(torch.Tensor, "cpu", counting_cpu):
+        M._routing_signature(torch.randn(12, 8), offsets)
+    assert len(calls) == 1, calls
+    assert calls[0] == (4,)     # 3 offsets + the checksum, packed together
 
 
 def test_the_real_checkpoint_replay_shape_is_caught(unsupported):

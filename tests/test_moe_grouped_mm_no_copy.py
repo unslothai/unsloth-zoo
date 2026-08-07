@@ -27,6 +27,14 @@ def _grouped_mm_ok():
         return False
 
 
+@pytest.fixture(autouse=True)
+def _pretend_the_kernel_is_supported(monkeypatch):
+    """These pin what happens AT the kernel, so the capability gate in front of
+    it must not answer for a CPU runner and route the call away first."""
+    from unsloth_zoo.temporary_patches import moe_utils
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
+
+
 def test_no_forced_copy_on_happy_path(monkeypatch):
     """Probe-safe stack: weight kept as a non-contiguous view in one attempt; unproven: copied."""
     from unsloth_zoo.temporary_patches.moe_utils import (
