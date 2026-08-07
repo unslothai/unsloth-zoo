@@ -2,11 +2,9 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """torchvision retired `torchvision.io.video`; say so instead of re-raising it.
 
-Found by running the Kaggle notebook variants: `Kaggle-Llama3.2_(11B)-Vision`
-fails where its Colab twin passes, because the Kaggle install cell takes an
-unpinned torchvision off the cu128 index while Colab keeps the preinstalled one.
-The user sees `Exception: No module named 'torchvision.io.video'` raised from
-`import unsloth`, with nothing pointing at the real cause.
+Found by running `Kaggle-Llama3.2_(11B)-Vision`, which fails where its Colab twin
+passes: the Kaggle install cell takes an unpinned torchvision off the cu128 index.
+The user sees a bare `No module named 'torchvision.io.video'` from `import unsloth`.
 """
 from __future__ import annotations
 
@@ -31,7 +29,7 @@ def test_the_removed_video_module_is_recognised():
     body = _handler_body()
     assert "torchvision.io.video" in body, \
         "a torchvision without io.video still falls through to a bare Exception"
-    # Before the named arms is wrong: the catch-all would swallow it first.
+    # Must precede the catch-all, which would otherwise swallow it.
     assert body.index("torchvision.io.video") < body.index('elif "Unpack" not in e')
 
 
@@ -44,7 +42,7 @@ def test_the_message_is_actionable_and_names_the_cause(message):
     arm = _handler_body()
     assert "torchcodec" in arm, "the message does not say where the module went"
     assert "upgrade transformers" in arm, "the message does not say what to run"
-    # The classifier is a substring test, so both spellings must reach the arm.
+    # Substring test, so both spellings must reach the arm.
     assert re.search(r'"torchvision\.io\.video" in e or "torchvision\.io\._video" in e', arm)
     assert message.split("'")[1].rsplit(".", 1)[0] in ("torchvision.io", "torchvision")
 
@@ -60,8 +58,8 @@ def test_every_named_arm_raises_runtime_error():
     """RuntimeError, not Exception: the caller distinguishes a diagnosis it can
     show the user from an error it could not classify."""
     arm = _handler_body()
-    # Sliced to the next branch, not a fixed window: a comment inside an arm
-    # would otherwise push its `raise` out of view and pass the test blind.
+    # Sliced to the next branch, not a fixed window: a comment in an arm would
+    # otherwise push its `raise` out of view and pass the test blind.
     bounds = [m.start() for m in re.finditer(r"\n    (?:elif |raise )", arm)] + [len(arm)]
     for kind in ("numpy._core.umath", "torchvision::nms", "torchvision.io.video", "PIL"):
         i = arm.index(kind)
