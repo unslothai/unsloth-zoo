@@ -132,6 +132,14 @@ modifications =
           `pip install tilelang`, which cannot work here because the TileLang
           kernels are pruned (below) and _inject_vendored_fla force-sets
           FLA_TILELANG=0.
+          The Hopper test is also widened from upstream's ``IS_NVIDIA_HOPPER``
+          alone, which fla/utils/_device.py freezes at import from device 0, to
+          that OR a probe of ``k.device`` (``_device_is_nvidia_hopper``): the
+          launcher already picks CONST_TILING from ``k.device.index``, so on a
+          mixed host a Hopper card at a nonzero index would otherwise keep the
+          miscompiled tile. The probe uses compute capability 9, not
+          ``check_shared_mem('hopper')``, which is a >=232448-byte shared-memory
+          tier test that Blackwell B200 also passes.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files

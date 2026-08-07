@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -14,6 +16,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import (
+    IS_NVIDIA,
     IS_NVIDIA_HOPPER,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
@@ -23,6 +26,50 @@ from fla.utils import (
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+
+# Unsloth: per-device Hopper probe for the fla #640 tile workaround below.
+#
+# ``IS_NVIDIA_HOPPER`` (fla/utils/_device.py) is a module constant frozen at import
+# time from device 0 only:
+#     IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0)
+#                                        or torch.cuda.get_device_capability()[0] == 9))
+# while chunk_bwd_dqkwg picks CONST_TILING per tensor via ``k.device.index``. On a
+# mixed host (cuda:0 Ada/Blackwell, cuda:1 H100) the global is False even though the
+# tensor lives on Hopper, so the BK=64 step-down would not fire and the miscompiled
+# tile would silently corrupt dk/dg. Probe the tensor's own device instead.
+#
+# Only ever ORed with the global, never used to clear it, so this can add a
+# step-down but never remove one.
+#
+# Capability, not shared memory: ``check_shared_mem('hopper', idx)`` is a
+# shared-memory *tier* test (>= 232448 bytes) that Blackwell B200 also passes, so it
+# is not a Hopper detector. SM90 == Hopper. HIP is excluded because an AMD Instinct
+# reports capability major 9 on a ROCm build without being Hopper, matching how
+# fla_vendor._hopper_dqkwg_suspect gates the bare major==9 signal.
+@functools.lru_cache(maxsize=None)
+def _device_is_nvidia_hopper(index):
+    if not IS_NVIDIA:
+        return False
+    try:
+        if getattr(torch.version, 'hip', None) is not None:
+            return False
+        if index is None:
+            index = torch.cuda.current_device()
+        if torch.cuda.get_device_capability(index)[0] == 9:
+            return True
+        return 'NVIDIA H' in torch.cuda.get_device_name(index)
+    except Exception:
+        return False
+
+
+def _is_hopper_tensor(x):
+    try:
+        if x is None or not x.is_cuda:
+            return False
+        return _device_is_nvidia_hopper(x.device.index)
+    except Exception:
+        return False
 
 
 @triton.heuristics({
@@ -707,8 +754,15 @@ def chunk_bwd_dqkwg(
     # pure-torch layer. Scoped to the gated path (g is not None), matching the
     # upstream guard. Triton >= 3.7.1 fixes the miscompile, so nothing is stepped
     # down there.
+    #
+    # ``IS_NVIDIA_HOPPER`` is frozen at import from device 0, so it misses a Hopper
+    # card at a nonzero index on a mixed host; OR in a probe of the tensor's own
+    # device (see _device_is_nvidia_hopper above). Either signal is enough.
     HOPPER_DQKWG_BROKEN = (
-        g is not None and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1
+        g is not None
+        and (IS_NVIDIA_HOPPER or _is_hopper_tensor(k))
+        and TRITON_ABOVE_3_4_0
+        and not TRITON_ABOVE_3_7_1
     )
     if HOPPER_DQKWG_BROKEN and BK == 64:
         BK = 32

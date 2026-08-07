@@ -50,6 +50,8 @@ __all__ = [
 import os
 import sys
 import functools
+import inspect
+import threading
 import importlib
 import importlib.util
 
@@ -77,11 +79,27 @@ _REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
 # False (keep the pure-torch path) or its modeling module crashes on import.
 _VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
 
-# Every gated-deltanet consumer, not just the vendor-covered ones. Used only by the
-# UNSLOTH_DISABLE_HOPPER_FLA_BWD path: those extra models never bind the *vendored*
-# kernels, but they do bind a user-installed fla's, which carries the same #640
-# miscompile, so they must be unbound too.
-_GATED_DELTA_MODELING = _REPAIR_MODELING + ("kimi_linear", "olmo_hybrid")
+# Every gated-deltanet consumer, not just the vendor-covered ones. Used by the
+# UNSLOTH_DISABLE_HOPPER_FLA_BWD path and the purge path below: the extra models
+# never bind the *vendored* kernels, but they do bind a user-installed fla's, which
+# carries the same #640 miscompile, so they must be unbound too.
+#
+# olmo_hybrid (transformers >= 5.3) is the only one: it imports
+# chunk_gated_delta_rule alongside ShortConvolution. Kimi Linear deliberately is
+# NOT here -- transformers ships no `kimi_linear` model (only `kimi_k25`), the
+# weights run through trust_remote_code as `transformers_modules...modeling_kimi`,
+# and that code calls fla's KDA ops (chunk_kda / fused_recurrent_kda), which have
+# their own kernels and never reach chunk_bwd_dqkwg. Listing it would be a name
+# that can never resolve.
+_GATED_DELTA_MODELING = _REPAIR_MODELING + ("olmo_hybrid",)
+
+# The gated-deltanet consumers the vendored snapshot cannot serve, so
+# _repair_already_imported_modeling can never rebind them onto the fixed kernels.
+# If one of them was imported while a user-installed fla was live and we then purge
+# that install, its module global still points at the unpatched kernel.
+_UNCOVERED_GATED_DELTA = tuple(
+    pkg for pkg in _GATED_DELTA_MODELING if pkg not in _VENDOR_COVERED_MODELS
+)
 
 # Minimum versions declared by fla-core 0.5.1.
 _MIN_TORCH = "2.7"
@@ -618,7 +636,7 @@ def _repair_already_imported_modeling(force_rebind=False):
             logger.info(f"Unsloth: rebound vendored fla kernels onto {modname}.")
 
 
-def _disable_already_imported_gated_delta():
+def _disable_already_imported_gated_delta(packages=_GATED_DELTA_MODELING, why="UNSLOTH_DISABLE_HOPPER_FLA_BWD"):
     """Unbind the miscompiled chunk kernel on gated-delta modeling modules that were
     imported before this ran.
 
@@ -633,7 +651,7 @@ def _disable_already_imported_gated_delta():
     backward-pass bug in the chunked kernel; ``fused_recurrent_gated_delta_rule``
     (decode) and ``FusedRMSNormGated`` are unaffected and stay fast.
     """
-    for pkg in _GATED_DELTA_MODELING:
+    for pkg in packages:
         modname = f"transformers.models.{pkg}.modeling_{pkg}"
         mod = sys.modules.get(modname)
         if mod is None:
@@ -646,12 +664,31 @@ def _disable_already_imported_gated_delta():
             continue
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
-                f"Unsloth: unbound fla chunk_gated_delta_rule on {modname} "
-                "(UNSLOTH_DISABLE_HOPPER_FLA_BWD)."
+                f"Unsloth: unbound fla chunk_gated_delta_rule on {modname} ({why})."
             )
 
 
 _INSTALLED_FLA_PATCH_MARK = "_unsloth_hopper_dqkwg_patched"
+
+# Per-thread override for the installed-fla patch below. NOT a module global that
+# gets saved/mutated/restored around the call: torch's autograd engine runs one
+# worker thread per device ("The engine operates by having a single worker thread
+# per work queue, and every work queue is pinned to a specific device",
+# torch/csrc/autograd/engine.cpp), so a single ``.backward()`` over a model sharded
+# across two GPUs already executes two Python backward bodies concurrently, and
+# every ATen op / Triton launch inside them drops the GIL
+# (``pybind11::gil_scoped_release`` in the generated bindings,
+# ``Py_BEGIN_ALLOW_THREADS`` in Triton's launcher). A save/restore of a module
+# global therefore genuinely interleaves: one call restores the guard flag to True
+# while the other is still inside, which resurrects the RuntimeError mid-backward,
+# or leaves the tile override stuck on for the rest of the process. A
+# threading.local carries the override on the calling thread only, so no lock is
+# needed and multi-GPU backward stays parallel.
+_installed_fla_tls = threading.local()
+
+
+def _installed_fla_forcing_small_tile():
+    return getattr(_installed_fla_tls, "force_small_tile", False)
 
 
 def _patch_installed_fla_dqkwg():
@@ -663,21 +700,32 @@ def _patch_installed_fla_dqkwg():
     their copy instead keeps their kernels and fixes only the miscompiled tile.
 
     Mechanism, chosen so it does not depend on the installed fla's source layout
-    (which differs across versions): wrap ``chunk_bwd_dqkwg`` and, for the
-    duration of a gated call, flip two module globals it reads.
+    (which differs across versions): wrap ``chunk_bwd_dqkwg`` and steer the two
+    module globals it reads. Both are plain ``LOAD_GLOBAL`` reads out of
+    ``fla.ops.common.chunk_o.__dict__`` on every call, so rebinding the module
+    attribute is enough.
 
-      * ``IS_NVIDIA_HOPPER = False`` disables the blanket guard. Inside this
-        function that global is read *only* by the guard; the Hopper autotune
-        restrictions were frozen at import, so nothing else moves.
-      * ``check_shared_mem`` reporting the smallest tier makes the function's own
-        arithmetic pick ``CONST_TILING = 32``, hence ``BK = 32``. Applied only
-        when the unmodified arithmetic would have landed on 64.
+      * ``IS_NVIDIA_HOPPER`` is set to False *once and permanently*. Inside
+        ``chunk_bwd_dqkwg`` that global is read only by the blanket guard; the
+        Hopper autotune restriction (``NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER
+        else ...``) is a module constant frozen into the kernel's config list at
+        import, so a later rebind cannot move it. Setting it permanently rather
+        than per call is what makes this wrapper thread safe (see
+        ``_installed_fla_tls``).
+      * ``check_shared_mem`` is replaced *once and permanently* by a shim that
+        answers False while the calling thread has the small-tile override set,
+        and delegates to fla's real (``@cache``d) implementation otherwise. That
+        makes the function's own arithmetic pick ``CONST_TILING = 32``, hence
+        ``BK = 32``, only for the calls that would otherwise land on 64.
 
     ``BV`` drops to 32 alongside ``BK`` on that path, because both derive from the
     same ``CONST_TILING``. That costs some speed for head dims 33..64 only, and
     the vendored copy (which edits the source directly) keeps the wider ``BV``.
 
-    Returns True if a patch was installed. Best effort: any failure leaves the
+    Returns True if the installed fla is patched, including when a previous call
+    already patched it: this runs once at import and again from TEMPORARY_PATCHES,
+    and reporting idempotence as failure would make the second call shadow the
+    user's fla with the vendored snapshot. Best effort: any real failure leaves the
     installed fla untouched and the caller falls back to shadowing it.
     """
     try:
@@ -687,40 +735,76 @@ def _patch_installed_fla_dqkwg():
         return False
 
     fn = getattr(chunk_o, "chunk_bwd_dqkwg", None)
-    if fn is None or getattr(fn, _INSTALLED_FLA_PATCH_MARK, False):
+    if fn is None:
         return False
+    if getattr(fn, _INSTALLED_FLA_PATCH_MARK, False):
+        return True  # already patched by an earlier call; idempotent success
     if not all(hasattr(chunk_o, a) for a in ("IS_NVIDIA_HOPPER", "check_shared_mem")):
         return False  # unrecognised layout; do not guess
 
     original = fn
 
+    # Every in-tree fla caller passes `g=` / `k=` by keyword, but the signature is
+    # (q, k, v, do, h, dh, w=None, g=None, ...), so a positional caller is possible.
+    # Resolve the positions once; if the signature cannot be read, treat every call
+    # as potentially gated and take the safe tile (costs speed, never correctness).
+    try:
+        _params = list(inspect.signature(original).parameters)
+        _k_pos, _g_pos = _params.index("k"), _params.index("g")
+    except Exception:
+        _k_pos = _g_pos = None
+
+    def _arg(name, pos, args, kwargs, missing):
+        if name in kwargs:
+            return kwargs[name]
+        if pos is not None and len(args) > pos:
+            return args[pos]
+        return missing
+
+    _MISSING = object()
+
+    real_check_shared_mem = chunk_o.check_shared_mem
+    if not getattr(real_check_shared_mem, _INSTALLED_FLA_PATCH_MARK, False):
+        def _check_shared_mem_shim(arch="none", tensor_idx=0):
+            if _installed_fla_forcing_small_tile():
+                return False
+            return real_check_shared_mem(arch, tensor_idx)
+
+        setattr(_check_shared_mem_shim, _INSTALLED_FLA_PATCH_MARK, True)
+        _check_shared_mem_shim.__wrapped__ = real_check_shared_mem
+        chunk_o.check_shared_mem = _check_shared_mem_shim
+    else:
+        real_check_shared_mem = getattr(
+            real_check_shared_mem, "__wrapped__", real_check_shared_mem,
+        )
+
+    # Permanent: the guard is the only runtime reader of this global inside
+    # chunk_bwd_dqkwg, and on this host it would only ever refuse to run.
+    chunk_o.IS_NVIDIA_HOPPER = False
+
     @functools.wraps(original)
     def _patched(*args, **kwargs):
-        g = kwargs.get("g")
-        k = kwargs.get("k")
-        if g is None or k is None:
-            return original(*args, **kwargs)
-        saved_hopper = chunk_o.IS_NVIDIA_HOPPER
-        saved_check = chunk_o.check_shared_mem
-        chunk_o.IS_NVIDIA_HOPPER = False
+        g = _arg("g", _g_pos, args, kwargs, _MISSING)
+        k = _arg("k", _k_pos, args, kwargs, _MISSING)
+        if g is None:
+            return original(*args, **kwargs)  # ungated: the miscompile cannot fire
         try:
-            try:
-                idx = k.device.index
-                if chunk_o.check_shared_mem('hopper', idx):
-                    const_tiling = 128
-                elif chunk_o.check_shared_mem('ada', idx):
-                    const_tiling = 64
-                else:
-                    const_tiling = 32
-                bad_tile = min(max(triton.next_power_of_2(k.shape[-1]), 16), const_tiling) == 64
-            except Exception:
-                bad_tile = True  # unknown shape: take the safe tile
-            if bad_tile:
-                chunk_o.check_shared_mem = lambda arch="none", tensor_idx=0: False
+            idx = k.device.index
+            if real_check_shared_mem('hopper', idx):
+                const_tiling = 128
+            elif real_check_shared_mem('ada', idx):
+                const_tiling = 64
+            else:
+                const_tiling = 32
+            bad_tile = min(max(triton.next_power_of_2(k.shape[-1]), 16), const_tiling) == 64
+        except Exception:
+            bad_tile = True  # unknown shape/args: take the safe tile
+        previous = _installed_fla_forcing_small_tile()
+        _installed_fla_tls.force_small_tile = bad_tile or previous
+        try:
             return original(*args, **kwargs)
         finally:
-            chunk_o.IS_NVIDIA_HOPPER = saved_hopper
-            chunk_o.check_shared_mem = saved_check
+            _installed_fla_tls.force_small_tile = previous
 
     setattr(_patched, _INSTALLED_FLA_PATCH_MARK, True)
     chunk_o.chunk_bwd_dqkwg = _patched
@@ -771,6 +855,48 @@ def _mark_fla_disabled_hopper():
         logger.warning(_FLA_DISABLED_REASON)
 
 
+def _transformers_uses_availability_probe():
+    """Whether this Transformers still selects gated-delta kernels via the
+    ``is_flash_linear_attention_available()`` probe + module globals.
+
+    Transformers PR #47630 ("[Kernels] Refactor all linear attn models & native
+    kernels fallback", merged after v5.14.1) drops that probe entirely: the
+    modeling files now carry
+    ``@use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla")``,
+    which resolves the implementation with ``importlib.import_module`` at
+    decoration time and freezes it into a closure. There is then no probe to answer
+    False and no module global to unbind.
+    """
+    try:
+        import transformers.utils.import_utils as iu
+    except Exception:
+        return True  # cannot tell; assume the old layout and stay quiet
+    return hasattr(iu, "is_flash_linear_attention_available")
+
+
+def _warn_if_hopper_optout_cannot_engage():
+    """Say so loudly when UNSLOTH_DISABLE_HOPPER_FLA_BWD cannot actually take hold.
+
+    Silence would be the dangerous outcome: the user set a *correctness* switch and
+    would reasonably believe gated-delta training had moved off the miscompiled
+    kernel. On a post-#47630 Transformers neither lever we pull exists, so the
+    switch is inert. Their training is still protected -- the vendored
+    chunk_bwd_dqkwg steps around the bad tile and the installed-fla patch does the
+    same one layer down -- but they should know the escape hatch did nothing.
+    """
+    if _transformers_uses_availability_probe():
+        return
+    logger.warning(
+        "Unsloth: UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 could not be applied. This\n"
+        "Transformers selects gated-deltanet kernels through the kernel-hub\n"
+        "decorator (transformers#47630) rather than is_flash_linear_attention_available,\n"
+        "so there is no availability probe to disable and no module global to unbind.\n"
+        "Training is still protected: Unsloth's gated chunk_bwd_dqkwg avoids the\n"
+        "miscompiled block size (fla #640) on Hopper. For the pure-PyTorch path,\n"
+        'install a Triton with the upstream fix instead: pip install -U "triton>=3.7.1"'
+    )
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
@@ -787,6 +913,7 @@ def patch_vendor_fla(phase=None):
         _mark_fla_disabled_hopper()
         _patch_is_available(_unavailable_probe)
         _disable_already_imported_gated_delta()
+        _warn_if_hopper_optout_cannot_engage()
         return
 
     if _flag("UNSLOTH_DISABLE_VENDORED_FLA"):
@@ -821,6 +948,18 @@ def patch_vendor_fla(phase=None):
         injected, replaced_real = _inject_vendored_fla()
         if not injected:
             return
+        if replaced_real and _hopper_dqkwg_suspect_here():
+            # A real fla install was just purged on a host where its
+            # chunk_bwd_dqkwg carries the #640 miscompile.
+            # _repair_already_imported_modeling rebinds the vendor-covered Qwen
+            # packages onto the fixed vendored kernels, but the snapshot cannot
+            # serve olmo_hybrid (it prunes ShortConvolution), so a
+            # module of theirs imported before this ran would keep calling the
+            # purged install's unpatched kernel and silently corrupt dk/dg. Unbind
+            # it and let them take transformers' pure-torch gated-delta path.
+            _disable_already_imported_gated_delta(
+                packages=_UNCOVERED_GATED_DELTA, why="fla #640; vendored tree cannot serve this model",
+            )
 
     _patch_is_available()
     _repair_already_imported_modeling(force_rebind=replaced_real)

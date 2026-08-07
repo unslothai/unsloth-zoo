@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Hopper gated-deltanet policy (unslothai/unsloth#5276, fla #640).
@@ -146,6 +146,57 @@ def test_only_the_bad_tile_is_stepped_down(monkeypatch):
 
     # The grid is derived from the *overridden* BK: NK = cdiv(64, 32) = 2.
     assert hop["grid"][0] == 2
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
+def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
+    """A Hopper card the frozen IS_NVIDIA_HOPPER global cannot see must still get
+    the step-down.
+
+    fla/utils/_device.py computes
+        IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0)
+                                           or torch.cuda.get_device_capability()[0] == 9))
+    once, at import, from device 0 -- while chunk_bwd_dqkwg picks CONST_TILING per
+    tensor via ``k.device.index``. On a mixed host (cuda:0 Ada/Blackwell, cuda:1
+    H100) the global is False for a tensor that really is on Hopper, so without a
+    per-device probe the launcher would keep the miscompiled BK=64 tile and corrupt
+    dk/dg silently. Simulated here by making the tensor's own device report SM90
+    while the module global stays False.
+    """
+    import torch
+
+    chunk_o = _load_vendored_fla()
+    if not (chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
+        pytest.skip("host Triton is outside the affected [3.4.0, 3.7.1) range")
+
+    real_cap, real_name = torch.cuda.get_device_capability, torch.cuda.get_device_name
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability",
+        lambda i=None: (9, 0) if i == 0 else real_cap(i),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name",
+        lambda i=None: "NVIDIA H100 80GB HBM3" if i == 0 else real_name(i),
+    )
+    chunk_o._device_is_nvidia_hopper.cache_clear()
+    try:
+        # hopper=False -> the module global does NOT report Hopper, exactly as on a
+        # host whose device 0 is not Hopper. The tensor's device does.
+        got = _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)
+        assert got["BK"] == 32, (
+            "a Hopper device that the import-time global missed still selected the "
+            "miscompiled BK=64 tile"
+        )
+    finally:
+        chunk_o._device_is_nvidia_hopper.cache_clear()
+
+    # And the probe must not mislabel this host: with the simulation undone the real
+    # devices are not Hopper, so nothing is stepped down. (check_shared_mem('hopper')
+    # is NOT a Hopper test -- a Blackwell B200 also reports 232448 bytes -- so a
+    # probe built on it would wrongly narrow the tile here.)
+    monkeypatch.undo()
+    chunk_o._device_is_nvidia_hopper.cache_clear()
+    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 64
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +435,7 @@ def test_in_place_patch_fixes_an_unpatched_tree(monkeypatch):
     with pytest.raises(RuntimeError):
         run()
 
+    pristine_check = chunk_o.check_shared_mem
     assert fv._patch_installed_fla_dqkwg() is True
     try:
         got = run()
@@ -391,14 +443,184 @@ def test_in_place_patch_fixes_an_unpatched_tree(monkeypatch):
             assert torch.isfinite(b).all(), f"{name} not finite after the in-place patch"
             rel = (a - b).norm() / a.norm().clamp_min(1e-12)
             assert rel < 5e-3, f"{name} diverged after the in-place patch (rel L2 {rel:.3e})"
-        # The globals it swaps must be put back after every call.
-        assert chunk_o.IS_NVIDIA_HOPPER is True
-        assert "fla" in str(chunk_o.check_shared_mem.__module__)
-        # Idempotent.
-        assert fv._patch_installed_fla_dqkwg() is False
+        # The patch must NOT save/mutate/restore module globals around each call:
+        # autograd runs one worker thread per device, so two concurrent gated-delta
+        # backwards would interleave those restores. The guard flag is cleared once
+        # and stays cleared, and the tile override rides on a thread-local that is
+        # empty between calls.
+        assert chunk_o.IS_NVIDIA_HOPPER is False
+        assert fv._installed_fla_forcing_small_tile() is False
+        assert chunk_o.check_shared_mem.__wrapped__ is pristine_check
+        # Idempotent, and idempotence reports success: patch_vendor_fla runs twice
+        # (import + TEMPORARY_PATCHES) and a False here would make the second run
+        # shadow the user's fla with the vendored snapshot.
+        assert fv._patch_installed_fla_dqkwg() is True
     finally:
         chunk_o.chunk_bwd_dqkwg = pristine
         gdc.chunk_bwd_dqkwg = pristine
+        chunk_o.check_shared_mem = pristine_check
+
+
+def _fake_installed_fla(monkeypatch, version="0.9.0"):
+    """A stand-in user-installed fla whose chunk_o has the layout the in-place patch
+    recognises, so the real ``_patch_installed_fla_dqkwg`` runs end to end."""
+    real = types.ModuleType("fla")
+    real.__version__ = version
+    chunk_o = types.ModuleType("fla.ops.common.chunk_o")
+    chunk_o.IS_NVIDIA_HOPPER = True
+    chunk_o.check_shared_mem = lambda arch="none", tensor_idx=0: arch != "nope"
+    chunk_o.chunk_bwd_dqkwg = lambda **kw: "original"
+    for name, mod in (
+        ("fla", real),
+        ("fla.ops", types.ModuleType("fla.ops")),
+        ("fla.ops.common", types.ModuleType("fla.ops.common")),
+        ("fla.ops.common.chunk_o", chunk_o),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return real, chunk_o
+
+
+def test_second_patch_run_does_not_shadow_the_users_fla(monkeypatch):
+    """patch_vendor_fla runs twice (once at import, once from TEMPORARY_PATCHES).
+
+    The second run must recognise that the installed fla is already patched and
+    stop, not read idempotence as failure and fall through to _inject_vendored_fla,
+    which would purge the user's newer upstream and replace it with the pruned
+    vendored snapshot (dropping every model the snapshot does not cover).
+    """
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    real, _chunk_o = _fake_installed_fla(monkeypatch)
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+    monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+    monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+
+    injected = []
+
+    def fake_inject():
+        injected.append(1)
+        sys.modules["fla"] = types.ModuleType("fla")
+        return True, True
+
+    monkeypatch.setattr(fv, "_inject_vendored_fla", fake_inject)
+
+    fv.patch_vendor_fla()
+    assert sys.modules["fla"] is real and not injected
+
+    fv.patch_vendor_fla()
+    assert not injected, "the second run shadowed the user's fla with the snapshot"
+    assert sys.modules["fla"] is real
+
+
+def test_purging_an_installed_fla_unbinds_the_models_we_cannot_rebind(
+    monkeypatch, fake_gated_delta_modeling,
+):
+    """When we shadow a user-installed fla on a suspect Hopper host, every model that
+    was already bound to it must stop using it.
+
+    _repair_already_imported_modeling only visits the three vendor-covered Qwen
+    packages. olmo_hybrid imports symbols the pruned snapshot does not
+    ship, so they cannot be rebound onto the fixed kernels; left alone they keep
+    calling the purged install's unpatched chunk_gated_delta_rule and silently
+    corrupt dk/dg. Before this PR that same host skipped injection entirely and the
+    unpatched kernel raised loudly instead.
+    """
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    real = types.ModuleType("fla")
+    real.__version__ = "0.9.0"
+    monkeypatch.setitem(sys.modules, "fla", real)
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+    monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+    monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+    # Their install has an unrecognised layout, so the in-place patch cannot apply.
+    monkeypatch.setattr(fv, "_patch_installed_fla_dqkwg", lambda: False)
+    monkeypatch.setattr(
+        fv, "_inject_vendored_fla",
+        lambda: (sys.modules.__setitem__("fla", types.ModuleType("fla")), (True, True))[1],
+    )
+
+    fv.patch_vendor_fla()
+
+    for pkg in ("olmo_hybrid",):
+        assert fake_gated_delta_modeling[pkg].chunk_gated_delta_rule is None, (
+            f"{pkg} still points at the purged, unpatched fla kernel"
+        )
+    # The vendor-covered models are rebound onto the fixed kernels instead, so they
+    # must NOT be unbound here.
+    for pkg in fv._REPAIR_MODELING:
+        assert fake_gated_delta_modeling[pkg].chunk_gated_delta_rule is not None, pkg
+
+
+def test_in_place_patch_is_thread_safe(monkeypatch):
+    """Two gated-delta backwards can run at once in one process: torch's autograd
+    engine keeps one worker thread per device, so a single ``.backward()`` over a
+    model sharded across two GPUs already executes two Python backward bodies
+    concurrently, and the ATen/Triton calls inside them release the GIL.
+
+    A wrapper that saved, mutated and restored ``IS_NVIDIA_HOPPER`` per call would
+    therefore restore ``True`` while the other call is still inside, resurrecting
+    the blanket RuntimeError mid-backward. The override must not be a module global
+    that gets put back per call.
+    """
+    import threading
+
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    _real, chunk_o = _fake_installed_fla(monkeypatch)
+
+    fast_entered = threading.Event()
+    slow_inside = threading.Event()
+    fast_done = threading.Event()
+    seen = {}
+
+    def original(**kwargs):
+        tag = kwargs["tag"]
+        if tag == "fast":
+            fast_entered.set()
+            slow_inside.wait(5)
+        else:
+            slow_inside.set()
+            fast_done.wait(5)
+        # What the real kernel launcher reads, at exactly this moment.
+        if chunk_o.IS_NVIDIA_HOPPER:
+            raise RuntimeError(f"{tag}: blanket #640 guard fired mid-call")
+        seen[tag] = 128 if chunk_o.check_shared_mem("hopper", 0) else 32
+        return tag
+
+    chunk_o.chunk_bwd_dqkwg = original
+    assert fv._patch_installed_fla_dqkwg() is True
+    patched = chunk_o.chunk_bwd_dqkwg
+
+    class _K:
+        shape = (1, 128, 2, 64)   # head dim 64 -> the tile that must be stepped down
+        device = types.SimpleNamespace(index=0)
+
+    errors = []
+
+    def call(tag):
+        try:
+            patched(g=object(), k=_K(), tag=tag)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    t_fast = threading.Thread(target=call, args=("fast",))
+    t_fast.start()
+    assert fast_entered.wait(5)
+    t_slow = threading.Thread(target=call, args=("slow",))
+    t_slow.start()
+    t_slow.join(10)
+    fast_done.set()
+    t_fast.join(10)
+
+    assert not errors, errors
+    # Both concurrent calls asked for K=64, so both must get the safe 32-wide tile;
+    # neither may have had its override cancelled by the other's restore.
+    assert seen == {"fast": 32, "slow": 32}, seen
+    # And nothing is left behind on either thread.
+    assert fv._installed_fla_forcing_small_tile() is False
 
 
 # ---------------------------------------------------------------------------
@@ -438,15 +660,21 @@ def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
 
 
 def test_opt_out_covers_models_the_vendored_tree_does_not(monkeypatch):
-    """kimi_linear / olmo_hybrid are not vendor-covered, but a user-installed fla
-    still exposes them to the same miscompile, so the opt-out must unbind them."""
+    """olmo_hybrid is not vendor-covered, but a user-installed fla still exposes it
+    to the same miscompile, so the opt-out must unbind it.
+
+    Kimi Linear is deliberately absent: transformers ships no `kimi_linear` model,
+    its weights load via trust_remote_code, and that code calls fla's KDA ops,
+    which never reach chunk_bwd_dqkwg. A name that can never resolve would be dead
+    weight pinned by a test."""
     from unsloth_zoo.temporary_patches.fla_vendor import (
         _GATED_DELTA_MODELING,
         _REPAIR_MODELING,
     )
 
     assert set(_REPAIR_MODELING) < set(_GATED_DELTA_MODELING)
-    assert {"kimi_linear", "olmo_hybrid"} <= set(_GATED_DELTA_MODELING)
+    assert "olmo_hybrid" in _GATED_DELTA_MODELING
+    assert "kimi_linear" not in _GATED_DELTA_MODELING
 
 
 def test_opt_out_outranks_the_source_preference_flags(monkeypatch, fake_gated_delta_modeling):

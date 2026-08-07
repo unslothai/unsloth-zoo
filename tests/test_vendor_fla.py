@@ -193,7 +193,16 @@ def test_backported_blackwell_hopper_fixes_present():
     assert "for num_warps in [2, 4, 8]" in wy
 
     co = (VENDORED / "ops" / "common" / "chunk_o.py").read_text()
-    assert "IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1" in co
+    # Upstream's guard window, kept intact: [3.4.0, 3.7.1) only.
+    assert "and TRITON_ABOVE_3_4_0\n        and not TRITON_ABOVE_3_7_1" in co
+    # Hopper is detected by BOTH signals. IS_NVIDIA_HOPPER alone is frozen at import
+    # from device 0, so on a mixed host it misses a Hopper card at a nonzero index
+    # while CONST_TILING is chosen from k.device.index.
+    assert "and (IS_NVIDIA_HOPPER or _is_hopper_tensor(k))" in co
+    assert "def _device_is_nvidia_hopper(index):" in co
+    # Capability, not shared memory: check_shared_mem('hopper') is a >=232448-byte
+    # tier test that Blackwell B200 also passes, so it cannot detect Hopper.
+    assert "torch.cuda.get_device_capability(index)[0] == 9" in co
     # fla #640's root cause is BK == 64 on Hopper, so we step the tile down instead
     # of refusing to run. Pin both halves so a re-vendor cannot silently drop them.
     assert "if HOPPER_DQKWG_BROKEN and BK == 64:\n        BK = 32" in co
