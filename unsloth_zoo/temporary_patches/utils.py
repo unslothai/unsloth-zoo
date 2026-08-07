@@ -282,11 +282,10 @@ except ImportError as e:
         )
     elif "torchvision.io.video" in e or "torchvision.io._video" in e:
         # A HALF-INSTALLED torchvision, same class as the nms arm above. No
-        # released torchvision raises this on its own: 0.25 ships `io/video.py`,
-        # and 0.26 dropped the module and the line that imports it together.
-        # Seen when a venv installs over a system torchvision and leaves the
-        # tree partly overwritten, so `io/__init__.py` still imports a `video`
-        # that is gone. Reinstalling is the fix; upgrading anything else is not.
+        # released version raises this alone: 0.25 ships `io/video.py`, and 0.26
+        # dropped the module and its importer together. A venv installing over a
+        # system torchvision leaves the tree partly overwritten, so reinstalling
+        # is the fix and upgrading anything else is not.
         raise RuntimeError(
             f"***** Your torchvision install is incomplete: `torchvision.io` "
             f"imports a `video` module that is not there. Please run "

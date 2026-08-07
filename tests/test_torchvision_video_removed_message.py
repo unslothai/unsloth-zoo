@@ -3,12 +3,10 @@
 """Name a half-installed torchvision instead of re-raising its ImportError.
 
 Found by running `Kaggle-Llama3.2_(11B)-Vision`: a venv installed over the base
-image left `/usr/local/.../torchvision` (0.25.0+cu128) partly overwritten, so
-`torchvision/io/__init__.py` still imports a `video` module that is gone. The
-user sees a bare `No module named 'torchvision.io.video'` from `import unsloth`.
-
-Not a version boundary: 0.25 ships `io/video.py`, and 0.26 removed the module
-and its importer together, so no released torchvision raises this by itself.
+image left torchvision 0.25.0+cu128 partly overwritten, so `io/__init__.py`
+still imports a `video` module that is gone and `import unsloth` dies on a bare
+`No module named 'torchvision.io.video'`. Not a version boundary: 0.25 ships
+`io/video.py` and 0.26 removed it with its importer, so no release raises this.
 """
 from __future__ import annotations
 
@@ -60,11 +58,11 @@ def test_an_unrelated_import_error_still_falls_through():
 
 
 def test_every_named_arm_raises_runtime_error():
-    """RuntimeError, not Exception: the caller distinguishes a diagnosis it can
-    show the user from an error it could not classify."""
+    """RuntimeError, not Exception: the caller tells a diagnosis it can show the
+    user from an error it could not classify."""
     arm = _handler_body()
-    # Sliced to the next branch, not a fixed window: a comment in an arm would
-    # otherwise push its `raise` out of view and pass the test blind.
+    # Sliced to the next branch, not a fixed window, or a comment in an arm
+    # pushes its `raise` out of view and the test passes blind.
     bounds = [m.start() for m in re.finditer(r"\n    (?:elif |raise )", arm)] + [len(arm)]
     for kind in ("numpy._core.umath", "torchvision::nms", "torchvision.io.video", "PIL"):
         i = arm.index(kind)
