@@ -63,8 +63,8 @@ def test_cap_effective_in_4_to_8_gib_band(monkeypatch):
 def test_small_logits_stay_single_chunk(monkeypatch):
     # Configs whose full logits already fit the target keep a single chunk.
     ce = _load_module(monkeypatch, 180 * 1024 ** 3)
-    # 2 GiB of float32 logits (< 4 GiB cap).
-    assert ce.get_chunk_size(1, 8_192, 65_536) == 1
+    # 2.2 GiB footprint at 18 bytes/element (< 4 GiB cap).
+    assert ce.get_chunk_size(1, 2_048, 65_536) == 1
 
 
 def test_cap_bounds_target_independent_of_free(monkeypatch):
