@@ -914,3 +914,64 @@ def test_optout_does_not_patch_the_kernel_on_the_old_layout(monkeypatch, fake_ga
     fv.patch_vendor_fla()
     for mod in fake_gated_delta_modeling.values():
         assert mod.chunk_gated_delta_rule is None
+
+
+def test_degraded_optout_outranks_disable_vendored(monkeypatch, fake_gated_delta_modeling):
+    """UNSLOTH_DISABLE_VENDORED_FLA is a source preference; the Hopper opt-out is a
+    correctness switch. With both set on the post-#47630 layout, returning at the
+    preference flag would leave the kernel-hub decorator resolving an unpatched
+    BK=64 install, so correctness has to win.
+    """
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
+    monkeypatch.setenv("UNSLOTH_DISABLE_VENDORED_FLA", "1")
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: False)
+    monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda: None)
+    monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+    monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+    monkeypatch.setattr(fv, "_vendored_already_injected", lambda: False)
+    monkeypatch.setattr(fv, "_should_defer_to_installed_fla", lambda: False)
+    monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+
+    reached = []
+    monkeypatch.setattr(
+        fv, "_inject_vendored_fla", lambda: (reached.append(True), (True, False))[1],
+    )
+
+    fv.patch_vendor_fla()
+    assert reached, "disable-vendored must not short-circuit the degraded opt-out"
+
+
+def test_disable_vendored_still_returns_without_the_optout(monkeypatch):
+    """The reverse: with only the source-preference flag set, it still returns and
+    leaves a user's own fla exactly as found."""
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    monkeypatch.setenv("UNSLOTH_DISABLE_VENDORED_FLA", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", raising=False)
+
+    def fail_inject():
+        raise AssertionError("disable-vendored must still prevent injection")
+
+    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+    monkeypatch.setattr(fv, "_vendored_already_injected", lambda: False)
+    fv.patch_vendor_fla()
+
+
+def test_degraded_optout_warning_does_not_promise_pure_torch(monkeypatch, caplog):
+    """Upgrading Triton clears the miscompile but makes the opt-out block skip
+    entirely, so the fast kernels are used. The warning must not advertise it as a
+    route to the pure-PyTorch path."""
+    import logging
+
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    with caplog.at_level(logging.WARNING):
+        fv._warn_hopper_optout_degraded()
+    text = caplog.text
+    assert "triton>=3.7.1" in text, "the remediation should still be offered"
+    assert "neither route gives you the pure-PyTorch path" in text, (
+        "the warning must not claim a Triton upgrade reaches the pure-PyTorch path"
+    )

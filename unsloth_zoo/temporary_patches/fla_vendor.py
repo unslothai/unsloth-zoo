@@ -897,6 +897,13 @@ def _warn_hopper_optout_degraded():
     decorator resolves carries the tile fix, but whether that succeeds depends on
     the install it finds -- and asserting "your gradients are correct" here would
     be exactly the wrong thing to say if it did not.
+
+    Note it must not advertise ``triton>=3.7.1`` as a way to reach the pure-PyTorch
+    path either. Upgrading Triton makes ``_hopper_dqkwg_suspect_here()`` False, so
+    this whole block is skipped and the fast kernels are used -- correct gradients,
+    but still not the fallback the user asked for. On this layout there is no lever
+    on our side that forces pure torch; only the absence of an importable ``fla``
+    does that, since the decorator falls back when its import fails.
     """
     logger.warning(
         "Unsloth: UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 could not force the pure-PyTorch\n"
@@ -905,9 +912,12 @@ def _warn_hopper_optout_degraded():
         "is_flash_linear_attention_available, so there is no availability probe to\n"
         "disable and no module global to unbind.\n"
         "Unsloth is instead making the fla that decorator resolves one that avoids\n"
-        "the miscompiled block size (fla #640).\n"
-        "To actually reach the pure-PyTorch path, install a Triton carrying the\n"
-        'upstream fix instead: pip install -U "triton>=3.7.1"'
+        "the miscompiled block size (fla #640), which is what the opt-out was\n"
+        "protecting you from.\n"
+        'Installing a fixed Triton (pip install -U "triton>=3.7.1") also removes the\n'
+        "miscompile, but note neither route gives you the pure-PyTorch path on this\n"
+        "Transformers: that decorator only falls back when fla cannot be imported\n"
+        "at all."
     )
 
 
@@ -923,6 +933,7 @@ def patch_vendor_fla(phase=None):
     # gated-delta path. Bailing out of injection is not enough on its own: an
     # installed fla stays importable, so transformers' own availability probe would
     # answer True and bind the unpatched kernels (unslothai/unsloth#5276).
+    optout_degraded = False
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
         # Sample the layout BEFORE _patch_is_available, which assigns the probe
         # attribute unconditionally and would otherwise make every Transformers
@@ -944,10 +955,17 @@ def patch_vendor_fla(phase=None):
         # _mark_fla_disabled_hopper() -- fla is not disabled on this path, and
         # claiming otherwise would mislead unsloth's loader message.
         _warn_hopper_optout_degraded()
+        optout_degraded = True
 
-    if _flag("UNSLOTH_DISABLE_VENDORED_FLA"):
+    if _flag("UNSLOTH_DISABLE_VENDORED_FLA") and not optout_degraded:
         # Scope is the vendored injection only: a user's own fla install is left as
         # found so Transformers' native availability probe still governs it.
+        #
+        # Skipped when the Hopper opt-out landed in its degraded mode: that flag is
+        # a source *preference* ("prefer your fla over ours"), while
+        # UNSLOTH_DISABLE_HOPPER_FLA_BWD is a *correctness* switch, and returning
+        # here would leave the kernel-hub decorator resolving an unpatched BK=64
+        # install. Correctness outranks the preference, so the protection path runs.
         return
 
     replaced_real = False
