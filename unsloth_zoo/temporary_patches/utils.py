@@ -280,6 +280,21 @@ except ImportError as e:
         raise RuntimeError(
             f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
         )
+    elif "torchvision.io.video" in e or "torchvision.io._video" in e:
+        # torchvision retired its video decoding API in favour of torchcodec, so
+        # a transformers old enough to still import it dies on `import unsloth`
+        # with a bare "No module named 'torchvision.io.video'" and no clue what
+        # to do. Seen on Kaggle, whose install cell takes an unpinned torchvision
+        # off the cu128 index while the Colab twin keeps the preinstalled one --
+        # the same notebook passes there and fails here. UPGRADING is the advice,
+        # not downgrading: newer transformers stopped importing the module.
+        raise RuntimeError(
+            f"***** Your torchvision no longer ships `torchvision.io.video` "
+            f"(it moved to torchcodec), but your transformers still imports it. "
+            f"Please run `pip install --upgrade transformers` -- or pin an older "
+            f"torchvision if you need this transformers -- then restart your "
+            f"runtime/kernel. Original error = {e} *****"
+        )
     elif "PIL" in e or "_Ink" in e or "Pillow" in e:
         raise RuntimeError(
             f"***** Your Pillow (PIL) version is incompatible with torchvision. "
