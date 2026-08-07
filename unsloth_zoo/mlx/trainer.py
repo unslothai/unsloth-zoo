@@ -59,6 +59,8 @@ SUPPORTED_MLX_OPTIMIZERS = (
     # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
     "adamw_8bit", "adam_8bit",
 )
+# The branches _build_optimizer forwards betas/eps to.
+_MLX_ADAM_FAMILY_OPTIMIZERS = ("adamw", "adam", "adamw_8bit", "adam_8bit")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
@@ -816,6 +818,36 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+def _resolve_adam_epsilon(value):
+    """HF's ``adam_epsilon`` as a float, rejecting what PyTorch rejects.
+
+    ``torch/optim/adam.py:60-61`` refuses ``not 0.0 <= eps`` (which also catches
+    NaN, since every comparison with NaN is False), so on CUDA a negative or NaN
+    epsilon stops the run with a clear error. MLX validates nothing --
+    ``mlx/optimizers/optimizers.py:493-504`` stores ``eps`` and adds it straight
+    into the update denominator -- so without this the same config trains to
+    garbage on Metal instead: a negative epsilon can cancel ``sqrt(v)`` and flip
+    the update's sign, and a NaN one poisons every parameter on the first step.
+
+    Numeric strings are accepted because configs round-trip through JSON in
+    Unsloth Studio; anything float() cannot read is named rather than surfacing
+    as a bare "could not convert string to float".
+    """
+    try:
+        epsilon = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be a number, got {value!r}."
+        ) from None
+    if not 0.0 <= epsilon:
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be >= 0, got {value!r}. "
+            "PyTorch rejects the same values (torch/optim/adam.py:60), but MLX "
+            "would accept it and produce NaN or sign-flipped updates."
+        )
+    return epsilon
+
+
 _part_is_norm = _mlx_norm_path_part_is_norm
 _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
@@ -1067,6 +1099,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    "adam_epsilon",
 )
 
 
@@ -1195,6 +1228,19 @@ class MLXTrainingConfig:
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
     logging_dir: str | None = None
     run_name: str | None = None
+
+    # HF TrainingArguments.adam_epsilon (transformers/training_args.py:919,
+    # default 1e-8). Declared LAST for the same positional reason as the fields
+    # above, and listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS so those stay an
+    # exact suffix of the positional fields. None means "not requested" and
+    # leaves the MLX optimizer default (1e-8, mlx/optimizers/optimizers.py:497
+    # and :568 -- the same value HF defaults to) untouched, so this is a no-op
+    # unless it is set. Applies to the Adam family only, matching the CUDA path:
+    # adam / adamw and their 8-bit quantized counterparts, which take the same
+    # scalar eps and hand it to the stock MLX parent. SGD/Muon/Lion take no
+    # epsilon at all, and MLX's Adafactor eps is a 2-tuple with different
+    # meaning (optimizers.py:744), so HF's scalar does not belong there.
+    adam_epsilon: float | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -3453,15 +3499,6 @@ class MLXTrainer:
         wd = self.args.weight_decay
         self._manual_weight_decay = 0.0
         self._coupled_weight_decay = 0.0
-        adam_beta1 = getattr(self.args, "adam_beta1", None)
-        adam_beta2 = getattr(self.args, "adam_beta2", None)
-        adam_kwargs = {}
-        if adam_beta1 is not None or adam_beta2 is not None:
-            adam_kwargs["betas"] = (
-                float(0.9 if adam_beta1 is None else adam_beta1),
-                float(0.999 if adam_beta2 is None else adam_beta2),
-            )
-
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
             unsupported = self._adafactor_unsupported_parameters(self.model)
@@ -3477,6 +3514,28 @@ class MLXTrainer:
                     f"({preview})."
                 )
                 opt_name = "adamw"
+
+        # Built after the Adafactor fallback above, since that fallback lands on
+        # AdamW and has to carry the betas and epsilon with it. Scoped to the
+        # Adam family -- Adam/AdamW and the 8-bit QuantizedMomentAdam{,W}, which
+        # forward eps unchanged to those same parents -- so an epsilon set
+        # alongside optim="sgd" is ignored rather than validated, matching CUDA:
+        # HF builds one adam_kwargs holding betas + eps and applies it only to
+        # the Adam-family branches (transformers/trainer.py:1397-1400).
+        adam_kwargs = {}
+        if opt_name in _MLX_ADAM_FAMILY_OPTIMIZERS:
+            adam_beta1 = getattr(self.args, "adam_beta1", None)
+            adam_beta2 = getattr(self.args, "adam_beta2", None)
+            adam_epsilon = getattr(self.args, "adam_epsilon", None)
+            if adam_beta1 is not None or adam_beta2 is not None:
+                adam_kwargs["betas"] = (
+                    float(0.9 if adam_beta1 is None else adam_beta1),
+                    float(0.999 if adam_beta2 is None else adam_beta2),
+                )
+            # Only forwarded when explicitly set, so MLX's default stays in
+            # force otherwise.
+            if adam_epsilon is not None:
+                adam_kwargs["eps"] = _resolve_adam_epsilon(adam_epsilon)
 
         if opt_name == "adafactor":
             optimizer = optim.Adafactor(
