@@ -848,12 +848,14 @@ def test_optout_layout_probe_is_not_fooled_by_our_own_patch(monkeypatch):
     assert fv._transformers_uses_availability_probe() is False
 
 
-def test_optout_still_protects_the_kernel_on_the_new_layout(monkeypatch, fake_gated_delta_modeling):
+def test_optout_falls_through_to_protection_on_the_new_layout(monkeypatch, fake_gated_delta_modeling):
     """On a post-#47630 Transformers the opt-out cannot force pure torch, so it must
-    fall back to patching the installed kernel rather than returning unprotected.
+    NOT return early -- it has to fall through to the normal path, which makes the
+    fla the kernel-hub decorator resolves one that carries the tile fix.
 
-    Returning early there would make setting the safety switch WORSE than leaving it
-    unset, since the normal path patches that kernel.
+    Returning there would leave a user's unpatched install serving the BK=64
+    backward, i.e. setting the safety switch would make the host less safe than
+    leaving it unset.
     """
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
@@ -862,25 +864,31 @@ def test_optout_still_protects_the_kernel_on_the_new_layout(monkeypatch, fake_ga
     monkeypatch.setattr(fv, "_FLA_DISABLED_REASON", None)
     monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: False)
     monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+    monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+    monkeypatch.setattr(fv, "_should_defer_to_installed_fla", lambda: False)
+    monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+    # A previous test in this process may already have injected the vendored tree,
+    # which legitimately short-circuits the injection decision. Force the
+    # not-yet-injected state so the fall-through is what is under test.
+    monkeypatch.setattr(fv, "_vendored_already_injected", lambda: False)
 
-    called = {}
+    warned = []
+    monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda: warned.append(True))
+
+    reached = []
     monkeypatch.setattr(
-        fv, "_patch_installed_fla_dqkwg", lambda: called.setdefault("patched", True),
+        fv, "_inject_vendored_fla", lambda: (reached.append(True), (True, False))[1],
     )
-    warned = {}
-    monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda ok: warned.setdefault("ok", ok))
-
-    def fail_inject():
-        raise AssertionError("the opt-out must not inject the vendored tree")
-
-    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
 
     fv.patch_vendor_fla()
 
-    assert called.get("patched") is True, (
-        "the installed kernel must still be patched when pure torch is unreachable"
+    assert warned, "the user must be told the opt-out could not force pure torch"
+    assert reached, (
+        "the opt-out must fall through to the normal protection path, not return "
+        "and leave the decorator resolving an unpatched fla"
     )
-    assert warned.get("ok") is True, "the user must be told the opt-out was degraded"
+    # fla is not actually disabled on this path, so the loader must not be told it was.
+    assert fv.fla_unavailable_reason() is None
 
 
 def test_optout_does_not_patch_the_kernel_on_the_old_layout(monkeypatch, fake_gated_delta_modeling):
