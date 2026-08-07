@@ -860,40 +860,54 @@ def _transformers_uses_availability_probe():
     ``is_flash_linear_attention_available()`` probe + module globals.
 
     Transformers PR #47630 ("[Kernels] Refactor all linear attn models & native
-    kernels fallback", merged after v5.14.1) drops that probe entirely: the
-    modeling files now carry
+    kernels fallback", merged after v5.14.1) stops using that probe: the modeling
+    files now carry
     ``@use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla")``,
     which resolves the implementation with ``importlib.import_module`` at
     decoration time and freezes it into a closure. There is then no probe to answer
     False and no module global to unbind.
+
+    Detected by the *presence of the new mechanism*, not the absence of the old
+    name. Two traps make the obvious check wrong:
+
+      * ``is_flash_linear_attention_available`` still exists in
+        ``transformers/utils/import_utils.py`` after #47630 (it is merely unused by
+        the modeling files), so ``hasattr`` on it is True in both layouts.
+      * ``_patch_is_available`` assigns the attribute unconditionally, so once it
+        has run the old name is present even on a Transformers that never had it.
+        Any caller must therefore evaluate this BEFORE ``_patch_is_available``.
     """
     try:
-        import transformers.utils.import_utils as iu
+        from transformers.integrations import hub_kernels
     except Exception:
         return True  # cannot tell; assume the old layout and stay quiet
-    return hasattr(iu, "is_flash_linear_attention_available")
+    return not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback")
 
 
-def _warn_if_hopper_optout_cannot_engage():
-    """Say so loudly when UNSLOTH_DISABLE_HOPPER_FLA_BWD cannot actually take hold.
+def _warn_hopper_optout_degraded(patched_installed):
+    """Say so loudly when UNSLOTH_DISABLE_HOPPER_FLA_BWD cannot force pure torch.
 
     Silence would be the dangerous outcome: the user set a *correctness* switch and
     would reasonably believe gated-delta training had moved off the miscompiled
     kernel. On a post-#47630 Transformers neither lever we pull exists, so the
-    switch is inert. Their training is still protected -- the vendored
-    chunk_bwd_dqkwg steps around the bad tile and the installed-fla patch does the
-    same one layer down -- but they should know the escape hatch did nothing.
+    switch cannot do what it says.
     """
-    if _transformers_uses_availability_probe():
-        return
+    protection = (
+        "Unsloth patched the installed fla's chunk_bwd_dqkwg instead, so the\n"
+        "miscompiled block size is still avoided and your gradients are correct."
+        if patched_installed else
+        "The gated-delta kernels Unsloth ships already avoid the miscompiled block\n"
+        "size, so your gradients are correct."
+    )
     logger.warning(
-        "Unsloth: UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 could not be applied. This\n"
-        "Transformers selects gated-deltanet kernels through the kernel-hub\n"
-        "decorator (transformers#47630) rather than is_flash_linear_attention_available,\n"
-        "so there is no availability probe to disable and no module global to unbind.\n"
-        "Training is still protected: Unsloth's gated chunk_bwd_dqkwg avoids the\n"
-        "miscompiled block size (fla #640) on Hopper. For the pure-PyTorch path,\n"
-        'install a Triton with the upstream fix instead: pip install -U "triton>=3.7.1"'
+        "Unsloth: UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 could not force the pure-PyTorch\n"
+        "path. This Transformers selects gated-deltanet kernels through the\n"
+        "kernel-hub decorator (transformers#47630) rather than\n"
+        "is_flash_linear_attention_available, so there is no availability probe to\n"
+        "disable and no module global to unbind.\n"
+        f"{protection}\n"
+        "To actually reach the pure-PyTorch path, install a Triton carrying the\n"
+        'upstream fix instead: pip install -U "triton>=3.7.1"'
     )
 
 
@@ -910,10 +924,22 @@ def patch_vendor_fla(phase=None):
     # installed fla stays importable, so transformers' own availability probe would
     # answer True and bind the unpatched kernels (unslothai/unsloth#5276).
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
+        # Sample the layout BEFORE _patch_is_available, which assigns the probe
+        # attribute unconditionally and would otherwise make every Transformers
+        # look like the old one.
+        can_force_pure_torch = _transformers_uses_availability_probe()
         _mark_fla_disabled_hopper()
         _patch_is_available(_unavailable_probe)
         _disable_already_imported_gated_delta()
-        _warn_if_hopper_optout_cannot_engage()
+        if not can_force_pure_torch:
+            # The opt-out cannot do what it says here: the kernel-hub decorator
+            # froze the implementation at decoration time, so neither the probe nor
+            # the module globals steer anything. Returning now would leave a
+            # user-installed fla's unpatched BK=64 kernel live -- i.e. setting the
+            # safety switch would make this host LESS safe than not setting it,
+            # since the normal path patches that kernel. Patch it here too, then
+            # say plainly that the pure-torch path was not reachable.
+            _warn_hopper_optout_degraded(_patch_installed_fla_dqkwg())
         return
 
     if _flag("UNSLOTH_DISABLE_VENDORED_FLA"):

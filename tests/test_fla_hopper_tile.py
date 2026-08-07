@@ -815,3 +815,94 @@ def test_this_blackwell_host_is_not_suspect():
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect_here
 
     assert _hopper_dqkwg_suspect_here() is False
+
+
+def test_optout_layout_probe_is_not_fooled_by_our_own_patch(monkeypatch):
+    """`_transformers_uses_availability_probe` must key on the NEW mechanism.
+
+    Two traps make the obvious `hasattr(iu, "is_flash_linear_attention_available")`
+    check wrong: transformers keeps defining that name after #47630 (it is merely
+    unused by the modeling files), and `_patch_is_available` assigns the attribute
+    unconditionally, so once it has run every Transformers looks like the old one.
+    """
+    import transformers.utils.import_utils as iu
+
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    hub = pytest.importorskip("transformers.integrations.hub_kernels")
+
+    # Old layout: no kernel-hub fallback decorator -> the probe still steers things.
+    monkeypatch.delattr(hub, "use_kernel_func_from_hub_with_fallback", raising=False)
+    assert fv._transformers_uses_availability_probe() is True
+
+    # New layout: the decorator exists, so the probe no longer steers anything --
+    # even though the old name is still defined on import_utils, and even after our
+    # own _patch_is_available has re-added it.
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback", lambda *a, **k: (lambda f: f),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        iu, "is_flash_linear_attention_available", lambda: True, raising=False,
+    )
+    assert fv._transformers_uses_availability_probe() is False
+
+
+def test_optout_still_protects_the_kernel_on_the_new_layout(monkeypatch, fake_gated_delta_modeling):
+    """On a post-#47630 Transformers the opt-out cannot force pure torch, so it must
+    fall back to patching the installed kernel rather than returning unprotected.
+
+    Returning early there would make setting the safety switch WORSE than leaving it
+    unset, since the normal path patches that kernel.
+    """
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_FLA_DISABLED_REASON", None)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: False)
+    monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+
+    called = {}
+    monkeypatch.setattr(
+        fv, "_patch_installed_fla_dqkwg", lambda: called.setdefault("patched", True),
+    )
+    warned = {}
+    monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda ok: warned.setdefault("ok", ok))
+
+    def fail_inject():
+        raise AssertionError("the opt-out must not inject the vendored tree")
+
+    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+
+    fv.patch_vendor_fla()
+
+    assert called.get("patched") is True, (
+        "the installed kernel must still be patched when pure torch is unreachable"
+    )
+    assert warned.get("ok") is True, "the user must be told the opt-out was degraded"
+
+
+def test_optout_does_not_patch_the_kernel_on_the_old_layout(monkeypatch, fake_gated_delta_modeling):
+    """The reverse: where the probe does steer selection, the opt-out reaches pure
+    torch and must not touch the installed kernel or warn."""
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_FLA_DISABLED_REASON", None)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: True)
+    monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+
+    def fail_patch():
+        raise AssertionError("pure torch is reachable; do not touch the kernel")
+
+    def fail_warn(ok):
+        raise AssertionError("nothing degraded; do not warn")
+
+    monkeypatch.setattr(fv, "_patch_installed_fla_dqkwg", fail_patch)
+    monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", fail_warn)
+
+    fv.patch_vendor_fla()
+    for mod in fake_gated_delta_modeling.values():
+        assert mod.chunk_gated_delta_rule is None
