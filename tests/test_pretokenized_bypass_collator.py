@@ -2408,3 +2408,39 @@ def test_picture_and_photo_name_media_as_plainly_as_image(column):
     trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_nested_integer_column_is_refused_rather_than_dropped():
+    """A wide-int sequence is the shape every pretokenized column has, so it is
+    allowed. A sequence OF them is not: `Sequence(Sequence(int64))` under
+    `frames` is a numeric block, quantised patches, and the leaf-dtype allowance
+    passed it on its leaf alone. That marked the column schema-proven, so its
+    values were never read and the vision collator it needs was replaced."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "frames": [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_schema_proof_does_not_survive_a_custom_transform():
+    """`with_format("torch")` re-types a column and keeps its meaning, which is
+    why the schema may speak for every row. `with_transform` rewrites the rows:
+    a `string` column can be decoded into an image on the way out, so trusting
+    the stored dtype dropped a column that reaches the collator as media."""
+    Image = pytest.importorskip("PIL.Image")
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "payload": ["cat", "dog"],
+    })
+
+    def _decode(batch):
+        batch["payload"] = [Image.new("RGB", (2, 2)) for _ in batch["payload"]]
+        return batch
+
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          rows.with_transform(_decode))
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)

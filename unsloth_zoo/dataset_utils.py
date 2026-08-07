@@ -1203,8 +1203,12 @@ def train_on_responses_only(
         return (getattr(feature, "shape", None) is not None
                 and isinstance(getattr(feature, "dtype", None), str))
 
-    def _feature_is_plain_text(feature, _depth = 0):
-        """True only when this column type cannot hold media in any row."""
+    def _feature_is_plain_text(feature, _depth = 0, _seq_depth = 0):
+        """True only when this column type cannot hold media in any row.
+
+        `_seq_depth` counts sequence nesting only, so a struct holding a token
+        column stays at the depth its sequence gives it.
+        """
         if feature is None or _depth >= 8: return False
         if isinstance(feature, dict):                       # struct
             for key, value in feature.items():
@@ -1213,10 +1217,12 @@ def train_on_responses_only(
                 # An ambiguous key is settled by the value scan below, not by name.
                 if lower in _MEDIA_KEYS and lower not in _AMBIGUOUS_MEDIA_KEYS:
                     return False
-                if not _feature_is_plain_text(value, _depth + 1): return False
+                if not _feature_is_plain_text(value, _depth + 1, _seq_depth):
+                    return False
             return True
         if isinstance(feature, (list, tuple)):
-            return all(_feature_is_plain_text(f, _depth + 1) for f in feature)
+            return all(_feature_is_plain_text(f, _depth + 1, _seq_depth + 1)
+                       for f in feature)
         # A multi-dimensional numeric block is a tensor, whatever the column is
         # called: `Array4D(float32)` under `frames` is video, and the leaf dtype
         # check below called it plain, so the column was marked proven, its
@@ -1231,11 +1237,18 @@ def train_on_responses_only(
             # refuse the case this bypass exists for.
             if _leaf_dtype_is_float(inner): return False
             if _leaf_dtype_is_narrow_int(inner): return False
-            return _feature_is_plain_text(inner, _depth + 1)
+            return _feature_is_plain_text(inner, _depth + 1, _seq_depth + 1)
         # Value/ClassLabel name a primitive dtype. Image is "PIL.Image.Image" and
         # Audio/Video a dict, so anything unrecognised stays unsafe.
         dtype = getattr(feature, "dtype", None)
         if not isinstance(dtype, str): return False
+        # A sequence OF sequences of integers is a numeric block, not tokens:
+        # `Sequence(Sequence(int64))` under `frames` is quantised video, and the
+        # wide-int allowance above waved it through on its leaf dtype alone,
+        # marking the column proven so its values were never read. A pretokenized
+        # column reaches its integers one sequence down; anything deeper is a
+        # tensor by shape, exactly as `Array2D` is above.
+        if _seq_depth >= 2 and dtype.startswith(("int", "uint")): return False
         return dtype.startswith(_PLAIN_DTYPES)
     pass
 
@@ -1306,6 +1319,23 @@ def train_on_responses_only(
         return not (set(names) - _TEXT_COLUMNS), set()
     pass
 
+    def _has_custom_transform(split):
+        """Does this split rewrite its rows on the way out?
+
+        `with_format("torch")`/`("numpy")` re-type a column and keep its meaning,
+        which is why the schema is allowed to speak for every row. `with_transform`
+        does not: a `Value("string")` column can be decoded into a PIL image at
+        read time, so the schema describes the storage and not what the collator
+        will see. Drop the proof and let the rows be judged on their values.
+        """
+        try:
+            fmt = getattr(split, "format", None)
+            kind = fmt.get("type") if isinstance(fmt, dict) else None
+            return (kind or getattr(split, "_format_type", None)) == "custom"
+        except Exception:
+            return False
+    pass
+
     def _split_views(dataset):
         """`(column names, sampled rows, provably text, schema-proven, split)` per split.
 
@@ -1328,6 +1358,7 @@ def train_on_responses_only(
                 if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
                 names = list(rows[0].keys())
             provable, proven = _columns_are_provably_text(split, names)
+            if _has_custom_transform(split): proven = set()
             views.append((set(names), rows, provable, proven, split))
         return views
     pass
