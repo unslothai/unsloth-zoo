@@ -382,32 +382,47 @@ def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
         M._routing_signature(after, offsets)
 
 
-def test_no_signature_is_taken_under_inference_mode(unsupported):
-    """Nothing is taped and nothing replays it, so the `[T, hidden]` projection
-    is pure cost there. `no_grad` is deliberately NOT this test: an autograd
-    Function's forward always runs with grad off from the inside, which is
-    where a reentrant checkpoint puts the pass that produces the loss."""
+def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
+    """Grad off means `apply` builds no node, so nothing will ever read the
+    signature and the `[T, hidden]` projection is pure cost. The reentrant
+    checkpoint gap this leaves is documented at the call site: it cannot be
+    closed here, and the stash that tried to close it keyed on a weight the
+    LoRA path rebuilds per call, so it both missed the replay AND pinned a
+    fresh GPU tensor on every no-grad decode step."""
     inputs, weight, offsets = _case()
     taken = []
     real = M._routing_signature
     M._routing_signature = lambda *a, **k: (taken.append(1), real(*a, **k))[1]
     try:
-        with torch.inference_mode():
-            out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-        assert not taken, "signature taken under inference mode"
-        assert out.shape == (inputs.shape[0], weight.shape[-1])
+        for ctx in (torch.inference_mode(), torch.no_grad()):
+            taken.clear()
+            with ctx:
+                out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
+            assert not taken, f"signature taken under {type(ctx).__name__}"
+            assert out.shape == (inputs.shape[0], weight.shape[-1])
 
-        with torch.no_grad():
-            M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-        assert taken, "signature skipped with grad off, where reentrant replay needs it"
-
-        taken.clear()
         M._grouped_mm_with_backward_fix(
             inputs.clone().requires_grad_(True), weight, offsets)
         assert taken, "signature skipped with grad ON"
     finally:
         M._routing_signature = real
-        M._REENTRANT_ROUTING.clear()
+
+
+def test_no_grad_decoding_retains_nothing(unsupported):
+    """The stash that was here held a strong reference to each `weight`, and
+    the PEFT extraction path hands over a FRESH contiguous tensor per call, so
+    a long generation accumulated live GPU tensors until a cap it might never
+    reach. Nothing module-level may grow across grad-off calls."""
+    import gc
+
+    inputs, _, offsets = _case()
+    before = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    with torch.no_grad():
+        for _ in range(50):
+            M._grouped_mm_with_backward_fix(inputs, torch.randn(3, 8, 6), offsets)
+    gc.collect()
+    after = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    assert after - before < 20, f"grad-off calls retained {after - before} tensors"
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
@@ -451,97 +466,6 @@ def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
     with mock.patch.object(torch.Tensor, "cpu", counting_cpu):
         M._ManualGroupedMM.apply(inputs.requires_grad_(True), weight, offsets)
     assert len(calls) == 1, calls
-
-
-# ── the reentrant checkpoint's forward, which no ctx can reach ───────────────
-
-
-@pytest.fixture(autouse = True)
-def _clean_reentrant_stash():
-    M._REENTRANT_ROUTING.clear()
-    M._REENTRANT_SAW_GRAD = False
-    yield
-    M._REENTRANT_ROUTING.clear()
-    M._REENTRANT_SAW_GRAD = False
-
-
-def _reentrant_step(inputs, weight, offsets, replay_offsets):
-    """What `unsloth_checkpoint` does: run the segment with grad OFF for the
-    loss, then re-run it with grad ON inside backward and differentiate that."""
-    with torch.no_grad():
-        M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-    replay_in = inputs.clone().requires_grad_(True)
-    out = M._grouped_mm_with_backward_fix(replay_in, weight, replay_offsets)
-    out.sum().backward()
-    return replay_in.grad
-
-
-def test_a_reentrant_replay_that_reroutes_is_caught(unsupported):
-    """The gap Codex found: grad is off in the pass that produces the loss, so
-    `apply` builds no node and the ctx is discarded. The replay then made a
-    fresh ctx and compared its own routing against itself, which always passed
-    -- and the gradients belonged to a routing that never produced the loss."""
-    inputs, weight, offsets = _case()
-    moved = torch.tensor([5, 8, 12], dtype = torch.int32)  # one row across a boundary
-    with pytest.raises(RuntimeError, match = "assigned tokens differently"):
-        _reentrant_step(inputs, weight, offsets, moved)
-
-
-def test_a_reentrant_replay_that_agrees_is_left_alone(unsupported):
-    """The control: same routing both passes, so nothing is raised and the
-    gradients are the replay's own."""
-    inputs, weight, offsets = _case()
-    grad = _reentrant_step(inputs, weight, offsets, offsets)
-    assert grad is not None and grad.shape == inputs.shape
-
-
-def test_a_weight_used_twice_before_its_replay_disables_the_check(unsupported):
-    """Two records under one key have no unambiguous answer, so the check steps
-    aside rather than compare a replay against the wrong forward and raise on a
-    run that is working."""
-    inputs, weight, offsets = _case()
-    other = torch.tensor([5, 8, 12], dtype = torch.int32)
-    with torch.no_grad():
-        M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-        M._grouped_mm_with_backward_fix(inputs, weight, other)
-    replay_in = inputs.clone().requires_grad_(True)
-    M._grouped_mm_with_backward_fix(replay_in, weight, offsets).sum().backward()
-    assert replay_in.grad is not None
-
-
-def test_an_eval_pass_does_not_poison_the_next_step(unsupported):
-    """Grad-off calls whose backward never came would otherwise sit in the stash
-    and be consumed by a later replay, raising on a healthy run. The first
-    record after any grad-enabled call clears what is left."""
-    inputs, weight, offsets = _case()
-    other = torch.tensor([5, 8, 12], dtype = torch.int32)
-    with torch.no_grad():  # an eval forward, routed differently, never replayed
-        M._grouped_mm_with_backward_fix(inputs, weight, other)
-    # A grad-enabled call: end of that generation.
-    M._grouped_mm_with_backward_fix(
-        inputs.clone().requires_grad_(True), weight, offsets)
-    grad = _reentrant_step(inputs, weight, offsets, offsets)
-    assert grad is not None, "a stale eval routing raised on a matching step"
-
-
-def test_the_stash_does_not_grow_without_bound(unsupported):
-    """One entry per weight, and a ceiling: a long grad-off run with no replay
-    must not accumulate a reference to every weight it ever saw."""
-    inputs, _, offsets = _case()
-    with torch.no_grad():
-        for _ in range(M._REENTRANT_ROUTING_LIMIT + 20):
-            weight = torch.randn(3, 8, 6)
-            M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-    assert len(M._REENTRANT_ROUTING) <= M._REENTRANT_ROUTING_LIMIT
-
-
-def test_inference_mode_records_nothing(unsupported):
-    """Nothing replays an inference forward, so it must not leave an entry for a
-    later training replay to consume."""
-    inputs, weight, offsets = _case()
-    with torch.inference_mode():
-        M._grouped_mm_with_backward_fix(inputs, weight, offsets)
-    assert not M._REENTRANT_ROUTING
 
 
 def test_the_norm_does_not_materialize_fp32_copies(unsupported):
