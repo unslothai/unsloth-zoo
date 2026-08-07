@@ -390,6 +390,30 @@ def _model_forward_parameter_names(model):
     return names
 
 
+def _keep_media_columns(trainer, keys):
+    """Stop `remove_unused_columns` stripping media before the collator sees it.
+
+    `_signature_columns` is cached lazily off the model's forward signature, so
+    seeding it here is what a later split reads; the trainer only fills it when
+    still None, and extending an existing list is additive.
+    """
+    try:
+        existing = getattr(trainer, "_signature_columns", None)
+        names = sorted(k for k in keys if isinstance(k, str))
+        if existing is None:
+            # `index`/`label`/`label_ids` are what HF always keeps; without them
+            # a seeded list would drop the columns the loss itself needs.
+            trainer._signature_columns = names + [
+                "label", "label_ids", "index", "input_ids", "attention_mask",
+                "labels", "completion_mask", "assistant_masks", "token_type_ids",
+            ]
+        else:
+            trainer._signature_columns = list(existing) + [
+                n for n in names if n not in existing]
+    except Exception:
+        pass
+
+
 class _MediaAwareCollator:
     """The text collator, falling back to the caller's own when a batch has media.
 
@@ -408,11 +432,24 @@ class _MediaAwareCollator:
         self.media = media
         self.media_keys = frozenset(media_keys)
 
+    # Raw conversational columns. Their images sit INSIDE the value, as
+    # `{"type": "image", ...}` parts, so no top-level key names them and a batch
+    # of them went to the text collator that cannot read the conversation at all,
+    # let alone its images. Routed to the media collator on the column's
+    # presence: that collator handles this TRL format, and the text one cannot.
+    _CONVERSATION_KEYS = frozenset((
+        "messages", "conversations", "conversation", "chat",
+    ))
+
     def _has_media(self, features):
         for feature in features or ():
             keys = feature.keys() if isinstance(feature, dict) else ()
-            if any(isinstance(k, str) and k.lower() in self.media_keys for k in keys):
-                return True
+            for k in keys:
+                if not isinstance(k, str): continue
+                lowered = k.lower()
+                if lowered in self.media_keys: return True
+                if lowered in self._CONVERSATION_KEYS and \
+                    isinstance(feature.get(k), (list, tuple)): return True
         return False
 
     def __call__(self, features):
@@ -1259,6 +1296,17 @@ def train_on_responses_only(
     # as the 16-bit kind, so width cannot settle it and the name has to: the
     # wide-int allowance below exists for pretokenized token ids, and these are
     # not that.
+    # Columns whose NAME says base64 media, whatever the value looks like. A bare
+    # payload carries no `data:` prefix, so the value check cannot see it, and
+    # base64-decoding to sniff magic bytes is neither cheap nor reliable. The
+    # name is the evidence here, the same trade `_RAW_SAMPLE_COLUMNS` makes for
+    # PCM.
+    _BASE64_MEDIA_COLUMNS = frozenset((
+        "image_base64", "img_base64", "image_b64", "img_b64", "image_data",
+        "audio_base64", "audio_b64", "video_base64", "video_b64",
+        "images_base64", "image_bytes", "audio_bytes", "video_bytes",
+    ))
+
     _RAW_SAMPLE_COLUMNS = frozenset((
         "speech", "speeches", "waveform", "waveforms", "pcm",
         "raw_audio", "raw_speech", "audio_array", "audio_arrays",
@@ -1401,6 +1449,8 @@ def train_on_responses_only(
                     # Name plus shape, because `_feature_is_plain_text` never sees
                     # the column name and int32 PCM is indistinguishable from token
                     # ids by dtype alone.
+                    if str(name).lower() in _BASE64_MEDIA_COLUMNS:
+                        return False, proven
                     if str(name).lower() in _RAW_SAMPLE_COLUMNS and \
                         getattr(feature, "feature", None) is not None and \
                         _leaf_dtype_is_numeric(feature): return False, proven
@@ -1797,14 +1847,30 @@ def train_on_responses_only(
         _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
         # Only when a media-capable collator was displaced. Everywhere else the
         # replacement is the whole point and there is nothing to fall back to.
+        # Only when the displaced collator can actually take a media batch. The
+        # `_processor_backed` repair replaces a collator whose "tokenizer" is a
+        # processor with no `.pad`, and that object is broken for EVERY batch,
+        # not just text: keeping it as the fallback would route a later media
+        # batch straight back into the `processor.pad` AttributeError this
+        # repair exists to remove. The bypass flag is the case where the
+        # displaced collator is a working vision collator.
+        _media_capable = _bypassed_vision_collator and not _processor_backed
+        _dispatch_keys = _MEDIA_COLUMNS | _MULTIMODAL_COLUMNS
         trainer.data_collator = _MediaAwareCollator(
             # Both sets. `_MEDIA_COLUMNS` names what a user hands in, and a split
             # that has already been through the processor carries `pixel_values`
             # / `image_grid_thw` / `input_features` instead: those live only in
             # `_MULTIMODAL_COLUMNS`, so a processed `predict` batch matched
             # nothing and went to the text collator that cannot tensorize it.
-            _text_collator, _collator, _MEDIA_COLUMNS | _MULTIMODAL_COLUMNS,
-        ) if _bypassed_vision_collator else _text_collator
+            _text_collator, _collator, _dispatch_keys,
+        ) if _media_capable else _text_collator
+        if _media_capable:
+            # And the keys have to survive `remove_unused_columns`, which is on
+            # by default. The trainer caches its signature columns from the
+            # model's forward, so a later `evaluate`/`predict` split had its
+            # media stripped BEFORE the collator ever ran and the dispatcher saw
+            # text-only keys: the fallback it advertises could not fire at all.
+            _keep_media_columns(trainer, _dispatch_keys)
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
         # handed, and only pads the few it knows, so any leftover column kills

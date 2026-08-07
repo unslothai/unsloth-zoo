@@ -2703,3 +2703,94 @@ def test_a_data_uri_outside_the_sampled_rows_is_still_media(kind):
     trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_repaired_padding_collator_is_not_kept_as_the_media_fallback():
+    """The `_processor_backed` repair replaces a collator whose tokenizer is a
+    processor with no `.pad`. That object is broken for EVERY batch, not just
+    text, so keeping it as the fallback routed a later media batch straight back
+    into the `processor.pad` AttributeError the repair exists to remove."""
+    class _NoPad:
+        pad_token_id = 0
+        def __call__(self, *a, **k): raise AssertionError("should not be called")
+
+    from transformers import DataCollatorWithPadding
+
+    broken = DataCollatorWithPadding(tokenizer = StubProcessor())
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    out = train_on_responses_only(StubTrainer(broken, rows),
+                                  INSTRUCTION_PART, RESPONSE_PART)
+    # A plain text collator, not a dispatcher holding the broken one.
+    assert not hasattr(out.data_collator, "media"), \
+        "the unusable collator was preserved as the media fallback"
+
+
+def test_the_media_keys_survive_unused_column_removal():
+    """`remove_unused_columns` is on by default and the trainer caches its
+    signature columns from the model's forward, so a later `evaluate`/`predict`
+    split had its media stripped BEFORE the collator ran: the fallback the
+    dispatcher advertises could never fire."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert hasattr(out.data_collator, "media"), "no dispatcher was installed"
+    signature = getattr(out, "_signature_columns", None)
+    assert signature, "signature columns were never seeded"
+    for key in ("images", "pixel_values", "input_features"):
+        assert key in signature, f"{key} would be stripped before the collator"
+    # The columns the loss needs are still there.
+    for key in ("input_ids", "labels"):
+        assert key in signature, key
+
+
+def test_a_raw_conversation_batch_reaches_the_media_collator():
+    """A conversation carries its images INSIDE `messages`, as `{"type":
+    "image", ...}` parts, so no top-level key names them and the batch went to
+    the text collator, which cannot read the conversation at all."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    mine = MyVisionCollator(StubProcessor())
+    collator = train_on_responses_only(
+        StubTrainer(mine, rows), INSTRUCTION_PART, RESPONSE_PART).data_collator
+
+    conversation = [{"role": "user", "content": [{"type": "image", "image": object()}]}]
+    assert collator([{"messages": conversation}]) == {"mine": True}
+    # A text batch is unaffected.
+    assert "mine" not in collator([{"input_ids": list(ROW), "labels": list(ROW)}])
+
+
+@pytest.mark.parametrize("column", ["image_base64", "img_b64", "image_bytes"])
+def test_a_bare_base64_payload_under_a_media_name_is_media(column):
+    """A bare payload carries no `data:` prefix, so the value check cannot see
+    it and the column was dropped, training the example without its image.
+    Base64-decoding to sniff magic bytes is neither cheap nor reliable, so the
+    name is the evidence, as it already is for PCM."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: ["iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_ordinary_string_column_is_still_not_base64_media():
+    """The control: the name list must not swallow a normal text column."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "caption": ["a photo of a cat", "a photo of a dog"],
+    })
+    out = train_on_responses_only(
+        StubTrainer(MyVisionCollator(StubProcessor()), rows),
+        INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.train_dataset.column_names
