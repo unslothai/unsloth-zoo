@@ -390,6 +390,43 @@ def _model_forward_parameter_names(model):
     return names
 
 
+class _MediaAwareCollator:
+    """The text collator, falling back to the caller's own when a batch has media.
+
+    The bypass swaps the trainer-wide collator, and that swap outlives
+    construction: `predict(test_dataset = ...)` and an `evaluate` override both
+    build their dataloader from `trainer.data_collator`, so a multimodal split
+    handed over later reached a collator that cannot process images and either
+    failed or trained the modality away. Keeping the original and choosing per
+    batch is the only thing that can answer for a split nobody has seen yet.
+
+    Module level so a DataLoader worker under `spawn` can pickle it, which a
+    closure or a `type()`-built class cannot.
+    """
+    def __init__(self, text, media, media_keys):
+        self.text = text
+        self.media = media
+        self.media_keys = frozenset(media_keys)
+
+    def _has_media(self, features):
+        for feature in features or ():
+            keys = feature.keys() if isinstance(feature, dict) else ()
+            if any(isinstance(k, str) and k.lower() in self.media_keys for k in keys):
+                return True
+        return False
+
+    def __call__(self, features):
+        collator = self.media if self._has_media(features) else self.text
+        return collator(features)
+
+    def __getattr__(self, attribute):
+        # Only for names this class does not define; `text` is set in __init__,
+        # so this cannot recurse through it.
+        if attribute.startswith("__"): raise AttributeError(attribute)
+        return getattr(self.__dict__["text"], attribute)
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -1132,7 +1169,13 @@ def train_on_responses_only(
         would drop the images. So anything the text path cannot encode -- a dict
         naming media, a PIL image, bytes -- is not plain text.
         """
-        if isinstance(value, str) or value is None: return True
+        # A `data:` URI names its own media type, so unlike an extensionless
+        # http URL there is nothing to weigh: it is an image/video/audio payload
+        # wherever it turns up, including a column no name list covers.
+        if isinstance(value, str):
+            return not value[:32].lower().startswith(
+                ("data:image/", "data:video/", "data:audio/"))
+        if value is None: return True
         if isinstance(value, (bool, int, float)): return True
         if _depth >= 6: return False
         if isinstance(value, dict):
@@ -1212,6 +1255,25 @@ def train_on_responses_only(
         return isinstance(dtype, str) and dtype.startswith(
             ("int8", "int16", "uint8", "uint16"))
 
+    # Column names that hold raw audio samples. 32-bit PCM is as much a waveform
+    # as the 16-bit kind, so width cannot settle it and the name has to: the
+    # wide-int allowance below exists for pretokenized token ids, and these are
+    # not that.
+    _RAW_SAMPLE_COLUMNS = frozenset((
+        "speech", "speeches", "waveform", "waveforms", "pcm",
+        "raw_audio", "raw_speech", "audio_array", "audio_arrays",
+        "audio_values", "speech_values",
+    ))
+
+    def _leaf_dtype_is_numeric(feature, _depth = 0):
+        """Does this feature bottom out in any number at all?"""
+        if feature is None or _depth >= 8: return False
+        inner = getattr(feature, "feature", None)
+        if inner is not None: return _leaf_dtype_is_numeric(inner, _depth + 1)
+        dtype = getattr(feature, "dtype", None)
+        return isinstance(dtype, str) and dtype.startswith(
+            ("int", "uint", "float", "double", "half", "bfloat"))
+
     def _is_numeric_array_feature(feature):
         """`Array2D`/`Array3D`/`Array4D`/`Array5D`, by shape rather than name."""
         return (getattr(feature, "shape", None) is not None
@@ -1265,6 +1327,12 @@ def train_on_responses_only(
         if _seq_depth >= 2 and dtype.startswith(("int", "uint")): return False
         return dtype.startswith(_PLAIN_DTYPES)
     pass
+
+    def _feature_is_bare_string(feature):
+        """A top-level `Value("string")`/`large_string`, nothing nested."""
+        if getattr(feature, "feature", None) is not None: return False
+        dtype = getattr(feature, "dtype", None)
+        return isinstance(dtype, str) and dtype.startswith(("string", "large_string"))
 
     def _feature_needs_a_value_scan(feature, _depth = 0):
         """Whether the dtypes alone cannot settle this column.
@@ -1321,10 +1389,22 @@ def train_on_responses_only(
             try:
                 for name, feature in features.items():
                     if name in _TEXT_COLUMNS: continue
+                    # Name plus shape, because `_feature_is_plain_text` never sees
+                    # the column name and int32 PCM is indistinguishable from token
+                    # ids by dtype alone.
+                    if str(name).lower() in _RAW_SAMPLE_COLUMNS and \
+                        getattr(feature, "feature", None) is not None and \
+                        _leaf_dtype_is_numeric(feature): return False, proven
                     if not _feature_is_plain_text(feature): return False, proven
                     if _feature_needs_a_value_scan(feature) and \
                         not _column_values_are_plain_text(split, name): return False, proven
-                    proven.add(name)
+                    # A plain string column is NOT added: `proven` exists so a
+                    # numeric column that `with_format` hands back as a tensor is
+                    # not re-judged by value, and a string stays a string under
+                    # every format. Leaving it out costs nothing -- the sampled
+                    # rows are read either way -- and is what lets a `data:` URI
+                    # in an unlisted column be seen at all.
+                    if not _feature_is_bare_string(feature): proven.add(name)
                 return True, proven
             except Exception:
                 return False, proven
@@ -1692,7 +1772,12 @@ def train_on_responses_only(
             for name in _names
             if (_same_class or _padding_class) and hasattr(_collator, name)
         }
-        trainer.data_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
+        _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
+        # Only when a media-capable collator was displaced. Everywhere else the
+        # replacement is the whole point and there is nothing to fall back to.
+        trainer.data_collator = _MediaAwareCollator(
+            _text_collator, _collator, _MEDIA_COLUMNS,
+        ) if _bypassed_vision_collator else _text_collator
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
         # handed, and only pads the few it knows, so any leftover column kills

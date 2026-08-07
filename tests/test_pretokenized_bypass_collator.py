@@ -104,6 +104,16 @@ class StubTrainer:
         })()
 
 
+def _text_collator_of(collator):
+    """The seq2seq collator the repair installed.
+
+    When a media-capable collator was displaced it is kept alongside, and the
+    trainer holds a dispatcher that picks per batch, so the padding collator is
+    one level in. Everywhere else the dispatcher is not installed at all.
+    """
+    return getattr(collator, "text", collator)
+
+
 def _text_rows():
     return Dataset.from_dict({"input_ids": [list(ROW), list(ROW)]})
 
@@ -157,7 +167,7 @@ def test_a_processor_backed_seq2seq_collator_is_rebuilt():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
     collator = out.data_collator
-    assert isinstance(collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(collator), DataCollatorForSeq2Seq)
     assert hasattr(collator.tokenizer, "pad"), \
         f"still padding through {type(collator.tokenizer).__name__}"
 
@@ -335,7 +345,7 @@ def test_a_collator_holding_only_a_processor_is_repaired():
     trainer = _text_only_trainer()
     trainer.data_collator = DataCollatorForVisionLanguageModeling(processor = StubProcessor())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
     assert hasattr(out.data_collator.tokenizer, "pad")
 
 
@@ -1930,7 +1940,7 @@ def test_a_bypassed_self_packing_collator_is_untouched_without_packing():
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
 
 
 
@@ -2048,7 +2058,7 @@ def test_a_custom_label_pad_value_survives_the_repair():
     )
     trainer = StubTrainer(collator, _text_rows())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
     assert out.data_collator.label_pad_token_id == -1
     assert out.data_collator.padding == "max_length"
     assert out.data_collator.max_length == 32
@@ -2169,7 +2179,7 @@ def test_a_pretokenized_bypass_without_packing_is_still_repaired():
     collator = DataCollatorForTokenClassification(tokenizer = StubProcessor())
     trainer = StubTrainer(collator, _text_rows())
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
 
 
 @pytest.mark.parametrize("dtype", ("int8", "int16", "uint8", "uint16"))
@@ -2252,7 +2262,7 @@ def test_a_raw_bypass_without_packing_is_untouched():
     ]})
     trainer = StubTrainer(collator, rows)
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
+    assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
 
 
 def test_remove_unused_columns_false_still_drops_the_raw_text():
@@ -2544,3 +2554,116 @@ def test_packing_off_does_not_reclassify_every_split():
         f"the split schema was read {reads['n']} times for one call; the "
         f"packing guard is classifying splits it immediately discards"
     )
+
+
+@pytest.mark.parametrize("dtype", ["int16", "int32", "int64"])
+def test_raw_pcm_stays_media_at_every_width(dtype):
+    """32-bit PCM is as much a waveform as the 16-bit kind.
+
+    Only float and sub-32-bit sequences were refused, because a wide integer
+    sequence is the shape every pretokenized column has. `Sequence(int32)` under
+    `speech` is not that, and the name is the only thing that can say so, since
+    `_feature_is_plain_text` never sees it. The column was dropped and the run
+    trained as text with the audio thrown away.
+    """
+    from datasets import Features, Sequence, Value
+
+    rows = Dataset.from_dict(
+        {"input_ids": [list(ROW), list(ROW)], "speech": [[1, 2, 3], [4, 5, 6]]},
+        features = Features({
+            "input_ids": Sequence(Value("int32")),
+            "speech": Sequence(Value(dtype)),
+        }),
+    )
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_wide_int_sequence_under_a_text_name_is_still_plain():
+    """The control. The wide-int allowance exists for token ids, and a numeric
+    auxiliary column must keep passing."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "aux_target": [[1, 2], [3, 4]],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "aux_target" in out.train_dataset.column_names
+
+
+@pytest.mark.parametrize("kind", ["image", "video", "audio"])
+def test_a_data_uri_is_media_whatever_the_column_is_called(kind):
+    """A `data:` URI names its own media type, so unlike an extensionless http
+    URL there is nothing to weigh. `image_data` is on no name list, its schema
+    is `string`, so the column was proven plain and stripped."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "image_data": [f"data:{kind}/png;base64,iVBORw0KGgo="] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_an_ordinary_string_column_is_still_plain():
+    """The control for the data-URI check and for dropping bare string columns
+    from the schema proof: a normal text column must still pass."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "notes": ["some free text", "http://example.com/page"],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.train_dataset.column_names
+
+
+def test_a_later_multimodal_split_still_reaches_the_vision_collator():
+    """The swap outlives construction.
+
+    `predict(test_dataset = ...)` and an `evaluate` override both build their
+    dataloader from `trainer.data_collator`, so a multimodal split handed over
+    after construction met a text collator that cannot process images. The
+    displaced collator is kept and chosen per batch instead.
+    """
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    mine = MyVisionCollator(StubProcessor())
+    trainer = StubTrainer(mine, rows)
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    collator = out.data_collator
+
+    # A text batch still goes the text way.
+    text_batch = collator([{"input_ids": list(ROW), "labels": list(ROW)}])
+    assert "mine" not in text_batch
+
+    # A batch carrying images goes back to the collator that can handle them.
+    assert collator([{"input_ids": list(ROW), "images": [object()]}]) == {"mine": True}
+    assert collator.media is mine, "the displaced collator was thrown away"
+
+
+def test_the_dispatching_collator_is_picklable():
+    """A DataLoader worker under `spawn` pickles the collator by module and
+    qualified name, so it cannot be a closure or a `type()`-built class."""
+    import pickle
+
+    from unsloth_zoo.dataset_utils import _MediaAwareCollator
+
+    assert _MediaAwareCollator.__module__ == "unsloth_zoo.dataset_utils"
+    revived = pickle.loads(pickle.dumps(
+        _MediaAwareCollator(_PicklableCollator(), _PicklableCollator(), {"images"})))
+    assert revived.media_keys == frozenset({"images"})
+
+
+class _PicklableCollator:
+    """Module-level, so the pickling test measures the wrapper and not itself."""
+    def __call__(self, features):
+        return {"n": len(features)}
