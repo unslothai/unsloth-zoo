@@ -10825,6 +10825,29 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _length_grouped_permutation(length, seed):
+    """Seeded permutation backing ``_length_grouped_order``.
+
+    Prefers torch, so a given seed reproduces CUDA's sample order exactly, and
+    falls back to the stdlib RNG when torch is not importable: group_by_length
+    is a stock HF ``TrainingArguments`` knob, but ``unsloth_zoo[mlx]`` does not
+    install torch on Apple Silicon, so routing it through
+    ``_torch_randperm_order`` would make the option unusable on the platform
+    this backend exists for. Only the shuffle differs; the grouping, and so the
+    padding it saves, is the same either way.
+
+    Both branches depend on nothing but the seed, which is what DDP needs --
+    ranks derive the order locally instead of exchanging it.
+    """
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        indices = list(range(length))
+        random.Random(3407 if seed is None else int(seed)).shuffle(indices)
+        return indices
+    return _torch_randperm_order(length, seed)
+
+
 def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
     """Translate fractional epochs into HF-style accumulation windows."""
     accum = max(1, int(grad_accum or 1))
@@ -10904,6 +10927,86 @@ def _finite_batch_schedule(
                 break
         epoch += 1
     return tuple(schedule), cycle_length
+def _text_row_length(row):
+    """Token count of a text plan row, which is ``ids`` when unlabeled and
+    ``(ids, labels)`` once a prompt/completion boundary is known."""
+    if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
+        return len(row[0])
+    return len(row)
+
+
+def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
+    """HF ``group_by_length`` sample order, mirroring transformers'
+    ``get_length_grouped_indices`` (trainer_pt_utils) step for step:
+
+    - permute all indices with a seeded ``torch.randperm``
+    - cut the permutation into mega-batches of ``mega_batch_mult * batch_size``
+    - sort each mega-batch by descending length
+    - swap the globally longest element into the very first slot
+
+    Grouping similar lengths into a batch is what cuts padding; keeping the
+    grouping *inside* a shuffled mega-batch is what preserves epoch-to-epoch
+    randomness, which a plain global length sort destroys. The final swap makes
+    the largest batch run first so an OOM shows up immediately rather than
+    minutes in.
+
+    ``batch_size`` is the unit the mega-batches are cut at; callers should get
+    it from ``_length_grouped_window`` rather than passing a micro-batch.
+
+    With torch installed the permutation is seeded exactly as HF seeds its
+    sampler generator, so for a given seed this reproduces CUDA's order; see
+    ``_length_grouped_permutation`` for the torch-free fallback.
+    """
+    n = len(lengths)
+    if n == 0:
+        return []
+    # HF: 50, or enough for 4 mega-batches, whichever is smaller; never 0.
+    if mega_batch_mult is None:
+        mega_batch_mult = min(n // (batch_size * 4), 50) if batch_size > 0 else 1
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = _length_grouped_permutation(n, seed)
+    megabatch_size = max(1, mega_batch_mult * batch_size)
+    megabatches = [
+        indices[i : i + megabatch_size] for i in range(0, n, megabatch_size)
+    ]
+    megabatches = [
+        sorted(megabatch, key=lambda i: lengths[i], reverse=True)
+        for megabatch in megabatches
+    ]
+
+    # Each mega-batch is sorted descending, so its longest element is at [0];
+    # find the biggest of those and swap it into the very first position.
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = megabatch_maximums.index(max(megabatch_maximums))
+    megabatches[0][0], megabatches[max_idx][0] = (
+        megabatches[max_idx][0], megabatches[0][0],
+    )
+
+    return [i for megabatch in megabatches for i in megabatch]
+
+
+def _length_grouped_window(local_batch_size, comm_group=None, grad_accum=None):
+    """Batch unit ``_length_grouped_order`` cuts its mega-batches at.
+
+    Two factors, and both are load-bearing:
+
+    - ``grad_accum``, because transformers builds its sampler with
+      ``train_batch_size * gradient_accumulation_steps``
+      (``Trainer._get_train_sampler``). The default config accumulates 4, so
+      dropping the factor gives a different row order and padding profile from
+      CUDA for the stock settings.
+    - the world size, because the plan builders consume the order in global
+      micro-batch chunks and hand each rank its slice, so cutting at a rank's
+      local batch would let a consumed chunk straddle two independently sorted
+      mega-batches.
+
+    The product is a multiple of the global micro-batch either way, so folding
+    accumulation in cannot reintroduce that straddle.
+    """
+    global_batch_size = _distributed_global_batch_size(local_batch_size, comm_group)
+    return global_batch_size * max(1, int(grad_accum or 1))
 
 
 def _create_ordered_text_plan(
@@ -11023,6 +11126,14 @@ def _create_ordered_text_plan(
         base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
             return _torch_randperm_order(len(tokenized), base_seed + epoch)
+        if dataset_order == "length_grouped":
+            # Reseeded per epoch like torch_randperm, so the mega-batch shuffle
+            # differs each pass instead of repeating one grouping forever.
+            return _length_grouped_order(
+                [_text_row_length(row) for row in tokenized],
+                _length_grouped_window(batch_size, comm_group, grad_accum),
+                base_seed + epoch,
+            )
         if dataset_order not in (None, "sequential"):
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
