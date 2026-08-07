@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""torchvision retired `torchvision.io.video`; say so instead of re-raising it.
+"""Name a half-installed torchvision instead of re-raising its ImportError.
 
-Found by running `Kaggle-Llama3.2_(11B)-Vision`, which fails where its Colab twin
-passes: the Kaggle install cell takes an unpinned torchvision off the cu128 index.
-The user sees a bare `No module named 'torchvision.io.video'` from `import unsloth`.
+Found by running `Kaggle-Llama3.2_(11B)-Vision`: a venv installed over the base
+image left `/usr/local/.../torchvision` (0.25.0+cu128) partly overwritten, so
+`torchvision/io/__init__.py` still imports a `video` module that is gone. The
+user sees a bare `No module named 'torchvision.io.video'` from `import unsloth`.
+
+Not a version boundary: 0.25 ships `io/video.py`, and 0.26 removed the module
+and its importer together, so no released torchvision raises this by itself.
 """
 from __future__ import annotations
 
@@ -40,8 +44,9 @@ def test_the_removed_video_module_is_recognised():
 def test_the_message_is_actionable_and_names_the_cause(message):
     """A RuntimeError a user can act on, not the original ImportError text."""
     arm = _handler_body()
-    assert "torchcodec" in arm, "the message does not say where the module went"
-    assert "upgrade transformers" in arm, "the message does not say what to run"
+    assert "install is incomplete" in arm, "the message does not name the cause"
+    assert "force-reinstall --no-cache-dir torchvision" in arm, \
+        "the message does not say what to run"
     # Substring test, so both spellings must reach the arm.
     assert re.search(r'"torchvision\.io\.video" in e or "torchvision\.io\._video" in e', arm)
     assert message.split("'")[1].rsplit(".", 1)[0] in ("torchvision.io", "torchvision")

@@ -281,16 +281,17 @@ except ImportError as e:
             f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
         )
     elif "torchvision.io.video" in e or "torchvision.io._video" in e:
-        # torchvision retired video decoding to torchcodec, so an older
-        # transformers dies on `import unsloth` with a bare "No module named
-        # 'torchvision.io.video'". Upgrading transformers is the fix: the newer
-        # ones stopped importing the module.
+        # A HALF-INSTALLED torchvision, same class as the nms arm above. No
+        # released torchvision raises this on its own: 0.25 ships `io/video.py`,
+        # and 0.26 dropped the module and the line that imports it together.
+        # Seen when a venv installs over a system torchvision and leaves the
+        # tree partly overwritten, so `io/__init__.py` still imports a `video`
+        # that is gone. Reinstalling is the fix; upgrading anything else is not.
         raise RuntimeError(
-            f"***** Your torchvision no longer ships `torchvision.io.video` "
-            f"(it moved to torchcodec), but your transformers still imports it. "
-            f"Please run `pip install --upgrade transformers` -- or pin an older "
-            f"torchvision if you need this transformers -- then restart your "
-            f"runtime/kernel. Original error = {e} *****"
+            f"***** Your torchvision install is incomplete: `torchvision.io` "
+            f"imports a `video` module that is not there. Please run "
+            f"`pip install --upgrade --force-reinstall --no-cache-dir torchvision` "
+            f"then restart your runtime/kernel. Original error = {e} *****"
         )
     elif "PIL" in e or "_Ink" in e or "Pillow" in e:
         raise RuntimeError(
