@@ -35,6 +35,17 @@ modifications =
         * PR #983 (issue #640) in ops/common/chunk_o.py (+ TRITON_ABOVE_3_7_1 in
           utils/_compat.py and utils/__init__.py): narrow the Hopper gated
           chunk_bwd_dqkwg guard to Triton [3.4.0, 3.7.1); 3.7.1 fixes the bug.
+          Unsloth goes one step further than upstream here and does not merely
+          narrow the guard, it removes the need for it. Issue #640's own root-cause
+          bisection pins the miscompile to BK == 64 on Hopper (BK 32 and BK 128 both
+          measured clean; the autotune config space was explicitly ruled out), and
+          Hopper's CONST_TILING of 128 only reaches BK 64 for head dims 33..64. So
+          chunk_bwd_dqkwg steps those down to BK 32 and keeps the Triton fast path,
+          and the RuntimeError is retained only as an unreachable fence. Its
+          remediation text was also rewritten: upstream points at
+          `pip install tilelang`, which cannot work here because the TileLang
+          kernels are pruned (below) and _inject_vendored_fla force-sets
+          FLA_TILELANG=0.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files

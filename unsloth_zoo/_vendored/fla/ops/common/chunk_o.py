@@ -680,15 +680,6 @@ def chunk_bwd_dqkwg(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Unsloth: backported from fla PR #983 (issue #640). Triton 3.7.1 fixes the
-    # precision bug, so only block the affected [3.4.0, 3.7.1) range on Hopper.
-    if g is not None and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1:
-        raise RuntimeError(
-            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
-            "gated chunk_bwd_dqkwg (see #640). Please upgrade Triton to >= 3.7.1 or "
-            "install tilelang: `pip install tilelang`"
-        )
-
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
@@ -703,6 +694,38 @@ def chunk_bwd_dqkwg(
         CONST_TILING = 32
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+
+    # Unsloth: extends the fla PR #983 (issue #640) backport. Upstream narrowed the
+    # Hopper guard to Triton [3.4.0, 3.7.1) but still refused to run at all. The
+    # root cause reported in #640 is narrower than that: a Triton codegen bug that
+    # only corrupts dk (and, through it, dg and dbeta) at BK == 64 on Hopper. The
+    # upstream CONST_TILING sweep measured BK 32 and BK 128 clean (< 0.02) and only
+    # BK 64 broken (dk max error 14.65, dg 5.47), and explicitly ruled out the
+    # autotune config space as the trigger. Hopper's CONST_TILING of 128 means the
+    # bad tile is reachable only for head dims 33 <= K <= 64, so step those down to
+    # the measured-clean 32 and keep the fast kernels instead of falling back to a
+    # pure-torch layer. Scoped to the gated path (g is not None), matching the
+    # upstream guard. Triton >= 3.7.1 fixes the miscompile, so nothing is stepped
+    # down there.
+    HOPPER_DQKWG_BROKEN = (
+        g is not None and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1
+    )
+    if HOPPER_DQKWG_BROKEN and BK == 64:
+        BK = 32
+
+    # Unreachable fence: BK can no longer be 64 in the affected range. Kept so a
+    # future edit that reintroduces the bad tile fails loudly instead of silently
+    # training on corrupted gradients.
+    if HOPPER_DQKWG_BROKEN and BK == 64:
+        raise RuntimeError(
+            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
+            "gated chunk_bwd_dqkwg at BK=64 (see fla issue #640). Fix this with: "
+            'pip install -U "triton>=3.7.1"\n'
+            "Note: upstream also suggests `pip install tilelang`, which cannot help "
+            "here because this vendored snapshot prunes the TileLang kernels. To take "
+            "the slower pure-PyTorch path instead, set UNSLOTH_DISABLE_HOPPER_FLA_BWD=1."
+        )
+
     NK = triton.cdiv(K, BK)
     dq = q.new_empty(B, T, HV, K)
     dk = k.new_empty(B, T, HV, K)
