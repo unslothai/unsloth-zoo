@@ -132,10 +132,11 @@ def _grouped_mm_with_backward_fix(
     """
     inputs = inputs.contiguous()
     # Devices without torch._grouped_mm never reach the kernel. The Triton backend
-    # is picked precisely when the probe says no, and its separated-LoRA delta
-    # still routed through here, so a LoRA MoE raised "torch._grouped_mm is only
-    # supported on CUDA devices with compute capability = 9.0" on every card that
-    # is not an H100. The probe is cached, so this costs one global read.
+    # is picked precisely when the probe says no, but its separated-LoRA delta
+    # still routed through here. torch 2.8 hard-raises unless `dprops->major == 9`
+    # (Blas.cpp, sm90_only), and 2.6/2.7 have no `_grouped_mm` at all, so a LoRA
+    # MoE died on every card but an H100. 2.9 onwards falls back internally, which
+    # is why this only shows up on the older pins. Probe is cached: one global read.
     if not _check_torch_grouped_mm_supported():
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():

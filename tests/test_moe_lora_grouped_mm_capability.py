@@ -25,9 +25,13 @@ H100 therefore died at the first step:
     RuntimeError: torch._grouped_mm is only supported on CUDA devices with
     compute capability = 9.0
 
-Found on a B200 running `Qwen3_5_MoE.ipynb` under torch 2.8.0, and reachable on
-an A100 the same way. The guard goes in `_grouped_mm_with_backward_fix`, the one
-choke point every LoRA and base path shares.
+Found on a B200 running `Qwen3_5_MoE.ipynb` under torch 2.8.0, whose check is
+`dprops->major == 9` exactly (Blas.cpp, `sm90_only`), so an A100 is refused the
+same way. torch 2.6 and 2.7 have no `_grouped_mm` at all; 2.9 onwards falls back
+inside torch, which is why only the older pins show this.
+
+The guard goes in `_grouped_mm_with_backward_fix`, the one choke point every
+LoRA and base path shares.
 """
 
 import pytest
