@@ -254,6 +254,9 @@ def _device_index_is_hopper(index):
     fla #640 is Hopper-only, so narrowing the tile for a tensor on an Ada or
     Blackwell card in the same box would cost speed for nothing. HIP excluded, as
     an AMD Instinct reports capability major 9 without being Hopper.
+
+    Returns None when the device cannot be inspected, so callers can fall back to
+    the process-wide answer rather than fail open into the miscompile.
     """
     try:
         import torch
@@ -265,14 +268,24 @@ def _device_index_is_hopper(index):
             return True
         return "NVIDIA H" in torch.cuda.get_device_name(index)
     except Exception:
-        return False
+        return None
 
 
 def _tensor_on_hopper(x):
+    """Whether a call on this tensor needs the #640 workaround.
+
+    Unknown devices fall back to True: the wrapper is only installed at all when
+    ``_hopper_dqkwg_suspect_here()`` already said some visible GPU is Hopper, so on
+    a host we cannot inspect the safe answer is to keep the narrower tile. Being
+    wrong that way costs speed; being wrong the other way corrupts gradients.
+    """
     try:
-        return bool(x is not None and x.is_cuda and _device_index_is_hopper(x.device.index))
+        if x is None or not x.is_cuda:
+            return True
+        answer = _device_index_is_hopper(x.device.index)
+        return True if answer is None else bool(answer)
     except Exception:
-        return False
+        return True
 
 
 # Set once when UNSLOTH_DISABLE_HOPPER_FLA_BWD turns the fast kernels off, so

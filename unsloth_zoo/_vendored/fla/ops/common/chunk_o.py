@@ -60,16 +60,23 @@ def _device_is_nvidia_hopper(index):
             return True
         return 'NVIDIA H' in torch.cuda.get_device_name(index)
     except Exception:
-        return False
+        return None  # unknown, not "no": see _is_hopper_tensor
 
 
 def _is_hopper_tensor(x):
+    """True / False for a CUDA tensor whose device we could inspect, else None.
+
+    The tri-state matters. ``None`` means "could not tell", and the caller then
+    falls back to the import-time global, so an unexpected probe failure on a real
+    Hopper still gets the step-down. Collapsing that into ``False`` would fail open
+    into the miscompile, which is the one direction this must never take.
+    """
     try:
         if x is None or not x.is_cuda:
-            return False
+            return None
         return _device_is_nvidia_hopper(x.device.index)
     except Exception:
-        return False
+        return None
 
 
 @triton.heuristics({
@@ -755,12 +762,20 @@ def chunk_bwd_dqkwg(
     # upstream guard. Triton >= 3.7.1 fixes the miscompile, so nothing is stepped
     # down there.
     #
-    # ``IS_NVIDIA_HOPPER`` is frozen at import from device 0, so it misses a Hopper
-    # card at a nonzero index on a mixed host; OR in a probe of the tensor's own
-    # device (see _device_is_nvidia_hopper above). Either signal is enough.
+    # Whether *this* call runs on Hopper is a per-tensor question, so ask the
+    # tensor's own device first. ``IS_NVIDIA_HOPPER`` is frozen at import from
+    # device 0 and is wrong in both directions on a mixed host: it misses a Hopper
+    # card at a nonzero index, and it also marks a call on an Ada / Ampere /
+    # Blackwell card as affected when device 0 happens to be the Hopper one, which
+    # would narrow BK for a miscompile that cannot occur there. The global is used
+    # only as the fallback for when the probe cannot tell (``None``), so an
+    # unexpected probe failure on a real Hopper still gets the step-down.
+    _on_hopper = _is_hopper_tensor(k)
+    if _on_hopper is None:
+        _on_hopper = IS_NVIDIA_HOPPER
     HOPPER_DQKWG_BROKEN = (
         g is not None
-        and (IS_NVIDIA_HOPPER or _is_hopper_tensor(k))
+        and _on_hopper
         and TRITON_ABOVE_3_4_0
         and not TRITON_ABOVE_3_7_1
     )

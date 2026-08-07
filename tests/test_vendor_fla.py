@@ -195,10 +195,13 @@ def test_backported_blackwell_hopper_fixes_present():
     co = (VENDORED / "ops" / "common" / "chunk_o.py").read_text()
     # Upstream's guard window, kept intact: [3.4.0, 3.7.1) only.
     assert "and TRITON_ABOVE_3_4_0\n        and not TRITON_ABOVE_3_7_1" in co
-    # Hopper is detected by BOTH signals. IS_NVIDIA_HOPPER alone is frozen at import
-    # from device 0, so on a mixed host it misses a Hopper card at a nonzero index
-    # while CONST_TILING is chosen from k.device.index.
-    assert "and (IS_NVIDIA_HOPPER or _is_hopper_tensor(k))" in co
+    # Hopper is decided per tensor, not from the import-time global. That global is
+    # frozen from device 0 and is wrong in both directions on a mixed host: it misses
+    # a Hopper card at a nonzero index, and it marks a call on an Ada/Blackwell card
+    # as affected when device 0 is the Hopper one. It survives only as the fallback
+    # for when the probe cannot tell, so a probe failure never fails open.
+    assert "_on_hopper = _is_hopper_tensor(k)" in co
+    assert "if _on_hopper is None:\n        _on_hopper = IS_NVIDIA_HOPPER" in co
     assert "def _device_is_nvidia_hopper(index):" in co
     # Capability, not shared memory: check_shared_mem('hopper') is a >=232448-byte
     # tier test that Blackwell B200 also passes, so it cannot detect Hopper.

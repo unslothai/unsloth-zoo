@@ -71,7 +71,10 @@ def _load_vendored_fla():
 # ---------------------------------------------------------------------------
 
 
-def _record_bk(chunk_o, K, V, hopper, monkeypatch):
+_KEEP = object()
+
+
+def _record_bk(chunk_o, K, V, hopper, monkeypatch, tensor_hopper=_KEEP):
     """Run chunk_bwd_dqkwg's launcher and capture the BK it selects.
 
     The Triton kernel is swapped for a recorder, so no kernel is compiled or
@@ -90,7 +93,13 @@ def _record_bk(chunk_o, K, V, hopper, monkeypatch):
             return launch
 
     monkeypatch.setattr(chunk_o, "chunk_bwd_kernel_dqkwg", _Recorder())
+    # The guard asks the tensor's device first and only falls back to the global,
+    # so simulating a Hopper host means setting both. `tensor_hopper` lets a test
+    # drive them apart (or pass None for "device could not be inspected"); left
+    # alone, the caller's own patch of _is_hopper_tensor is respected.
     monkeypatch.setattr(chunk_o, "IS_NVIDIA_HOPPER", hopper)
+    if tensor_hopper is not _KEEP:
+        monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x, _h=tensor_hopper: _h)
 
     B, T, H, HV, BT = 1, 128, 2, 2, 64
     dev, dt = "cuda", torch.bfloat16
@@ -119,7 +128,7 @@ def test_bk_64_is_never_selected_on_suspect_hopper(K, monkeypatch):
     if not (chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
         pytest.skip("host Triton is outside the affected [3.4.0, 3.7.1) range")
 
-    got = _record_bk(chunk_o, K=K, V=128, hopper=True, monkeypatch=monkeypatch)
+    got = _record_bk(chunk_o, K=K, V=128, hopper=True, monkeypatch=monkeypatch, tensor_hopper=True)
     assert got["BK"] != 64, f"K={K} selected the miscompiled BK=64 tile"
 
 
@@ -133,15 +142,15 @@ def test_only_the_bad_tile_is_stepped_down(monkeypatch):
 
     # K=128 is what Qwen3-Next / Qwen3.5 use (linear_key_head_dim). Upstream
     # measured BK=128 clean, so it must be untouched.
-    assert _record_bk(chunk_o, K=128, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 128
-    assert _record_bk(chunk_o, K=128, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 128
+    assert _record_bk(chunk_o, K=128, V=128, hopper=True, monkeypatch=monkeypatch, tensor_hopper=True)["BK"] == 128
+    assert _record_bk(chunk_o, K=128, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=False)["BK"] == 128
 
     # K=64 is the only shape family that reaches the bad tile, and only on Hopper.
-    assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 32
-    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 64
+    assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch, tensor_hopper=True)["BK"] == 32
+    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=False)["BK"] == 64
 
     # BV is not implicated by #640 and must not be narrowed (it would cost speed).
-    hop = _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)
+    hop = _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch, tensor_hopper=True)
     assert hop["BV"] == 128
 
     # The grid is derived from the *overridden* BK: NK = cdiv(64, 32) = 2.
@@ -196,7 +205,7 @@ def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
     # probe built on it would wrongly narrow the tile here.)
     monkeypatch.undo()
     chunk_o._device_is_nvidia_hopper.cache_clear()
-    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 64
+    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=False)["BK"] == 64
 
 
 # ---------------------------------------------------------------------------
@@ -1015,3 +1024,63 @@ def test_installed_patch_leaves_non_hopper_tensors_alone(monkeypatch):
     monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: True)
     chunk_o.chunk_bwd_dqkwg(q=k, k=k, v=k, do=k, h=None, dh=None, g=g)
     assert seen["small_tile"] is True, "a Hopper tensor at K=64 must take the override"
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
+def test_vendored_guard_uses_the_tensor_device_not_device_zero(monkeypatch):
+    """The vendored guard must ask the tensor's device, not the import-time global.
+
+    That global is frozen from device 0 and is wrong in BOTH directions on a mixed
+    host: it misses a Hopper at a nonzero index, and it marks a call on an
+    Ada/Blackwell card as affected when device 0 is the Hopper one. Only the
+    unknown case may fall back to it.
+    """
+    chunk_o = _load_vendored_fla()
+    if not (chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
+        pytest.skip("host Triton is outside the affected [3.4.0, 3.7.1) range")
+
+    # Device 0 reported as Hopper, but this call's tensor is not on Hopper: the
+    # normal tile must survive.
+    monkeypatch.setattr(chunk_o, "IS_NVIDIA_HOPPER", True)
+    monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: False)
+    assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 64
+
+    # Tensor on Hopper while the global says otherwise: step down.
+    monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: True)
+    assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 32
+
+    # Undeterminable device: fall back to the global rather than fail open.
+    assert _record_bk(
+        chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch, tensor_hopper=None,
+    )["BK"] == 32
+    assert _record_bk(
+        chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=None,
+    )["BK"] == 64
+
+
+def test_hopper_probes_report_unknown_rather_than_no(monkeypatch):
+    """Both probes must distinguish "not Hopper" from "could not tell", so a probe
+    failure never silently drops the workaround."""
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    chunk_o = _load_vendored_fla()
+
+    class _Boom:
+        is_cuda = True
+
+        @property
+        def device(self):
+            raise RuntimeError("cannot inspect")
+
+    assert chunk_o._is_hopper_tensor(_Boom()) is None
+    assert chunk_o._is_hopper_tensor(None) is None
+    # fla_vendor's variant resolves unknown to True, since its wrapper is only
+    # installed when some visible GPU is already known to be Hopper.
+    assert fv._tensor_on_hopper(_Boom()) is True
+    monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: None)
+
+    class _K:
+        is_cuda = True
+        device = types.SimpleNamespace(index=0)
+
+    assert fv._tensor_on_hopper(_K()) is True
