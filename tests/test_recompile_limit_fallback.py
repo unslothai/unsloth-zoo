@@ -1629,17 +1629,43 @@ def _pre_2_8_probe(walk):
         U._CHECKPOINT_PROBE_MISSES = saved_misses
 
 
-def test_the_probe_does_not_walk_the_stack_with_grad_off():
-    """Nothing is packed under `no_grad`, so this call cannot be the one that
-    strands a region -- and generation is most of the calls in a GRPO run. The
-    walk costs ~15us at stack depth 60 against ~0.1us for the call itself."""
+def test_the_probe_does_not_walk_the_stack_under_inference_mode():
+    """`inference_mode` records no autograd graph at all, so no backward is owed
+    and this call cannot be the one that strands a region. It is also what
+    generation runs under, which is most of the calls in a GRPO run, and the
+    walk costs ~15us at stack depth 60 against ~0.1us for the wrapped call."""
     with _pre_2_8_probe(lambda: True) as (U, calls):
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(8): U._note_packed_under_checkpoint()
         assert calls["n"] == 0
         assert U._PACKED_COMPILED_IN_CHECKPOINT is False
-        U._note_packed_under_checkpoint()               # grad back on
+        U._note_packed_under_checkpoint()
         assert calls["n"] == 1 and U._PACKED_COMPILED_IN_CHECKPOINT is True
+
+
+def test_the_probe_still_fires_with_grad_off_inside_a_function_forward():
+    """`is_grad_enabled()` looked like the exact test and is not.
+    `torch.autograd.Function.forward` runs with grad DISABLED, and Unsloth's
+    gradient checkpointing IS a custom Function, so every patched kernel inside
+    a checkpointed forward sees grad off. Gating on it skipped the probe in the
+    one place it has to fire, and Gemma4_(E2B)-Vision went back to aborting on
+    the checkpoint assert with this branch installed."""
+    with _pre_2_8_probe(lambda: True) as (U, calls):
+
+        class _Region(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                assert not torch.is_grad_enabled(), "premise gone: grad is on here"
+                U._note_packed_under_checkpoint()
+                return x * 2
+
+            @staticmethod
+            def backward(ctx, g):
+                return g
+
+        _Region.apply(torch.randn(4, requires_grad = True)).sum().backward()
+        assert calls["n"] == 1, "the probe never ran inside the Function forward"
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is True
 
 
 def test_the_probe_stops_walking_after_a_step_of_fruitless_walks():

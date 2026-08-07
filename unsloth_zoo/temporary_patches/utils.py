@@ -892,10 +892,16 @@ def _note_packed_under_checkpoint():
     global _PACKED_COMPILED_IN_CHECKPOINT
     if _PACKED_COMPILED_IN_CHECKPOINT or _dynamo_is_tracing():
         return
-    # Nothing is packed with grad off, so no backward is owed and this call
-    # cannot be the one that strands a region. Exact, and it lifts the probe off
-    # generation entirely, which is most of the calls in a GRPO run.
-    if not torch.is_grad_enabled():
+    # Inference mode, NOT `is_grad_enabled()`. Grad-off looked like the exact
+    # test -- nothing is packed, so no backward is owed -- and it is wrong here:
+    # `torch.autograd.Function.forward` runs with grad DISABLED, and Unsloth's
+    # gradient checkpointing is a custom Function, so every patched kernel
+    # inside a checkpointed forward sees grad off. Gating on it skipped the
+    # probe in the one place it has to fire, and Gemma4_(E2B)-Vision went back
+    # to aborting on the checkpoint assert with the branch installed.
+    # `inference_mode` is not entered by an autograd Function and is what
+    # generation runs under, so it keeps the win without the hole.
+    if torch.is_inference_mode_enabled():
         return
     top = _saved_tensor_hook_accessor()
     if top is None:
