@@ -409,6 +409,11 @@ def _keep_media_columns(trainer, keys):
             # `index`/`label`/`label_ids` are what HF always keeps; without them
             # a seeded list would drop the columns the loss itself needs.
             declared = _model_forward_parameter_names(getattr(trainer, "model", None))
+            # Trainer's own derivation does `+= list(set(["label", "label_ids"]
+            # + self.label_names))`, so a custom trainer whose supervision is
+            # consumed by `compute_loss` rather than declared by `forward` had
+            # it dropped here and on every later split.
+            declared |= set(getattr(getattr(trainer, "args", None), "label_names", None) or ())
             trainer._signature_columns = sorted(set(names) | declared | {
                 "label", "label_ids", "index", "input_ids", "attention_mask",
                 "labels", "completion_mask", "assistant_masks", "token_type_ids",
@@ -418,6 +423,48 @@ def _keep_media_columns(trainer, keys):
                 n for n in names if n not in existing]
     except Exception:
         pass
+
+
+# Every suffix a missing entry costs is a VLM row silently trained as text,
+# so cover the modern web formats too (`.avif` is what most image CDNs serve
+# now) and the older spellings of the ones already here.
+_MEDIA_SUFFIXES = (
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
+    ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
+    ".jp2", ".j2k", ".jxl", ".ppm", ".pgm", ".pnm", ".pbm",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v",
+    ".ogv", ".3gp", ".3g2", ".wmv", ".flv", ".m2ts", ".mts",
+    ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
+    ".wma", ".aiff", ".aif", ".aifc", ".amr", ".mka", ".weba",
+)
+
+def _looks_like_media_value(value, _depth = 0):
+    """A string naming an image/video/audio file, by extension or data URI.
+
+    A plural ambiguous column (`urls`, `paths`, `files`) holds a *list* of
+    those strings per row, so recurse rather than call the row safe.
+    """
+    if isinstance(value, (list, tuple)):
+        return _depth < 4 and \
+            any(_looks_like_media_value(v, _depth + 1) for v in value)
+    if not isinstance(value, str): return False
+    text = value.strip().lower()
+    if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
+    # Drop a query string/fragment: `.../cat.jpg?width=64`.
+    for sep in ("?", "#"):
+        text = text.split(sep, 1)[0]
+    return text.endswith(_MEDIA_SUFFIXES)
+
+
+# The prose that goes WITH the media. Tokenizer outputs live in `_TEXT_COLUMNS`;
+# these are the raw columns a vision collator still has to read, and a keep-list
+# that held the image but not its prompt left that collator nothing to tokenize.
+_RAW_TEXT_COMPANION_COLUMNS = frozenset((
+    "text", "texts", "prompt", "prompts", "question", "questions",
+    "caption", "captions", "instruction", "instructions", "input", "inputs",
+    "query", "queries", "answer", "answers", "output", "outputs",
+    "completion", "completions", "response", "responses", "content",
+))
 
 
 class _MediaAwareCollator:
@@ -433,10 +480,13 @@ class _MediaAwareCollator:
     Module level so a DataLoader worker under `spawn` can pickle it, which a
     closure or a `type()`-built class cannot.
     """
-    def __init__(self, text, media, media_keys):
+    def __init__(self, text, media, media_keys, ambiguous_keys = ()):
         self.text = text
         self.media = media
-        self.media_keys = frozenset(media_keys)
+        # Split, not merged: an ambiguous name is decided by its value below,
+        # and folding the two would match `url` on the name alone.
+        self.ambiguous_keys = frozenset(ambiguous_keys)
+        self.media_keys = frozenset(media_keys) - self.ambiguous_keys
 
     # Raw conversational columns. Their images sit INSIDE the value, as
     # `{"type": "image", ...}` parts, so no top-level key names them and a batch
@@ -453,6 +503,13 @@ class _MediaAwareCollator:
             for k in keys:
                 if not isinstance(k, str): continue
                 lowered = k.lower()
+                # An ambiguous name is weighed by its VALUE, the same trade the
+                # initial-split guard makes: `path`/`url` is a media reference
+                # or ordinary provenance, and matching the name alone would send
+                # every row carrying a plain URL to the vision collator.
+                if lowered in self.ambiguous_keys:
+                    if _looks_like_media_value(feature.get(k)): return True
+                    continue
                 if lowered in self.media_keys: return True
                 if lowered in self._CONVERSATION_KEYS and \
                     isinstance(feature.get(k), (list, tuple)): return True
@@ -1072,36 +1129,6 @@ def train_on_responses_only(
     # value: `{"type": "image", "content": "cat.jpg"}` is all `string`.
     _VALUE_SCAN_KEYS = _AMBIGUOUS_MEDIA_KEYS | frozenset(("type",))
 
-    # Every suffix a missing entry costs is a VLM row silently trained as text,
-    # so cover the modern web formats too (`.avif` is what most image CDNs serve
-    # now) and the older spellings of the ones already here.
-    _MEDIA_SUFFIXES = (
-        ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
-        ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
-        ".jp2", ".j2k", ".jxl", ".ppm", ".pgm", ".pnm", ".pbm",
-        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v",
-        ".ogv", ".3gp", ".3g2", ".wmv", ".flv", ".m2ts", ".mts",
-        ".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus",
-        ".wma", ".aiff", ".aif", ".aifc", ".amr", ".mka", ".weba",
-    )
-
-    def _looks_like_media_value(value, _depth = 0):
-        """A string naming an image/video/audio file, by extension or data URI.
-
-        A plural ambiguous column (`urls`, `paths`, `files`) holds a *list* of
-        those strings per row, so recurse rather than call the row safe.
-        """
-        if isinstance(value, (list, tuple)):
-            return _depth < 4 and \
-                any(_looks_like_media_value(v, _depth + 1) for v in value)
-        if not isinstance(value, str): return False
-        text = value.strip().lower()
-        if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
-        # Drop a query string/fragment: `.../cat.jpg?width=64`.
-        for sep in ("?", "#"):
-            text = text.split(sep, 1)[0]
-        return text.endswith(_MEDIA_SUFFIXES)
-    pass
 
     def _feature_holds_strings(feature, _depth = 0):
         """True when this column's values are strings, or lists of them."""
@@ -1216,8 +1243,10 @@ def train_on_responses_only(
         # http URL there is nothing to weigh: it is an image/video/audio payload
         # wherever it turns up, including a column no name list covers.
         if isinstance(value, str):
-            return not value[:32].lower().startswith(
-                ("data:image/", "data:video/", "data:audio/"))
+            # Suffix as well as data URI: `attachments = ["cat.jpg"]` is a media
+            # reference the text path cannot encode, and a scan that only weighed
+            # `data:` called the column proven and dropped it.
+            return not _looks_like_media_value(value)
         if value is None: return True
         if isinstance(value, (bool, int, float)): return True
         if _depth >= 6: return False
@@ -1382,9 +1411,19 @@ def train_on_responses_only(
         return dtype.startswith(_PLAIN_DTYPES)
     pass
 
-    def _feature_is_bare_string(feature):
-        """A top-level `Value("string")`/`large_string`, nothing nested."""
-        if getattr(feature, "feature", None) is not None: return False
+    def _feature_is_bare_string(feature, _depth = 0):
+        """A `Value("string")`/`large_string`, bare or in a list of them.
+
+        `Sequence(Value("string"))` too: `attachments = ["cat.jpg"]` advertises
+        nothing in its dtype, so declaring it proven text skipped the value scan
+        and the column was dropped, training silently without the media.
+        """
+        inner = getattr(feature, "feature", None)
+        if inner is not None:
+            return _depth < 3 and _feature_is_bare_string(inner, _depth + 1)
+        if isinstance(feature, (list, tuple)):
+            return (_depth < 3 and len(feature) == 1
+                    and _feature_is_bare_string(feature[0], _depth + 1))
         dtype = getattr(feature, "dtype", None)
         return isinstance(dtype, str) and dtype.startswith(("string", "large_string"))
 
@@ -1861,14 +1900,19 @@ def train_on_responses_only(
         # repair exists to remove. The bypass flag is the case where the
         # displaced collator is a working vision collator.
         _media_capable = _bypassed_vision_collator and not _processor_backed
-        _dispatch_keys = _MEDIA_COLUMNS | _MULTIMODAL_COLUMNS
+        # Every media form the initial-split guard recognises, not just the two
+        # sets: a later split storing `image_base64`, a `speech` waveform or an
+        # ambiguous `path` matched nothing and went to the text collator.
+        _dispatch_keys = (_MEDIA_COLUMNS | _MULTIMODAL_COLUMNS
+                          | _BASE64_MEDIA_COLUMNS | _AMBIGUOUS_MEDIA_COLUMNS
+                          | _RAW_SAMPLE_COLUMNS)
         trainer.data_collator = _MediaAwareCollator(
             # Both sets. `_MEDIA_COLUMNS` names what a user hands in, and a split
             # that has already been through the processor carries `pixel_values`
             # / `image_grid_thw` / `input_features` instead: those live only in
             # `_MULTIMODAL_COLUMNS`, so a processed `predict` batch matched
             # nothing and went to the text collator that cannot tensorize it.
-            _text_collator, _collator, _dispatch_keys,
+            _text_collator, _collator, _dispatch_keys, _AMBIGUOUS_MEDIA_COLUMNS,
         ) if _media_capable else _text_collator
         if _media_capable:
             # And the keys have to survive `remove_unused_columns`, which is on
@@ -1883,7 +1927,16 @@ def train_on_responses_only(
             # without them the conversation was stripped before the dispatcher
             # ever saw it and the batch went to the text collator.
             _keep_media_columns(
-                trainer, _dispatch_keys | _MediaAwareCollator._CONVERSATION_KEYS)
+                trainer,
+                _dispatch_keys
+                | _MediaAwareCollator._CONVERSATION_KEYS
+                # The prompt that goes WITH the media: a raw `{"text": ...,
+                # "image": ...}` row reached the vision collator with its text
+                # already stripped, so it had nothing to tokenize.
+                | _RAW_TEXT_COMPANION_COLUMNS
+                | {getattr(getattr(trainer, "args", None),
+                           "dataset_text_field", None) or "text"},
+            )
 
         # `tokenizer.pad(..., return_tensors = "pt")` stacks every key it is
         # handed, and only pads the few it knows, so any leftover column kills

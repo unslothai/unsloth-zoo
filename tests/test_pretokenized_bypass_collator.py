@@ -2855,3 +2855,70 @@ def test_the_conversation_keys_are_still_not_dispatch_keys():
     assert "messages" not in dispatcher.media_keys
     assert not dispatcher._has_media([{"messages": "a plain string, not a conversation"}])
     assert dispatcher._has_media([{"messages": [{"role": "user"}]}])
+
+
+# ── round fifteen: what the deferred media collator actually needs ───────────
+
+
+def _r15_bypass(**args):
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    for k, v in args.items(): setattr(trainer.args, k, v)
+    return train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_the_prompt_that_goes_with_the_media_survives():
+    """A raw `{"text": prompt, "image": image}` row kept its image and lost its
+    prompt, so the vision collator had nothing to tokenize."""
+    out = _r15_bypass()
+    signature = getattr(out, "_signature_columns", None)
+    assert signature, "signature columns were never seeded"
+    for key in ("text", "caption", "image"):
+        assert key in signature, f"{key} would be stripped before the collator"
+
+
+def test_a_configured_label_name_survives():
+    """Trainer's own derivation adds `self.label_names`; supervision consumed by
+    a custom `compute_loss` is not declared by `forward` and was dropped."""
+    out = _r15_bypass(label_names = ["expert_score", "aux_target"])
+    signature = getattr(out, "_signature_columns", None)
+    for key in ("expert_score", "aux_target"):
+        assert key in signature, f"{key} is a configured label and would be stripped"
+
+
+@pytest.mark.parametrize("key", ["image_base64", "speech", "path"])
+def test_every_recognized_media_form_is_dispatchable(key):
+    """The guard that refuses the bypass recognises these; the dispatcher did
+    not, so a later split storing one of them went to the text collator."""
+    out = _r15_bypass()
+    dispatcher = out.data_collator
+    keys = dispatcher.media_keys | dispatcher.ambiguous_keys
+    assert key in keys, f"{key} is recognized by the guard but not dispatchable"
+
+
+def test_an_ambiguous_name_is_still_weighed_by_its_value():
+    """`path`/`url` is a media reference or ordinary provenance. Matching the
+    name alone would send every row carrying a plain URL to the vision
+    collator, which is the looseness the conversation keys already avoid."""
+    d = _r15_bypass().data_collator
+    assert "path" in d.ambiguous_keys and "path" not in d.media_keys
+    assert not d._has_media([{"path": "https://example.com/article"}])
+    assert d._has_media([{"path": "https://example.com/cat.jpg?w=64"}])
+    assert d._has_media([{"path": "data:image/png;base64,iVBOR"}])
+
+
+def test_a_list_of_media_paths_is_not_proven_text():
+    """`attachments = ["cat.jpg"]` is a `Sequence(Value("string"))`, which
+    passed the plain-text schema check, so the value scan was skipped and the
+    column was dropped -- training silently without the media."""
+    from unsloth_zoo import dataset_utils as D
+    import inspect
+
+    src = inspect.getsource(D.train_on_responses_only)
+    assert "_feature_is_bare_string(inner, _depth + 1)" in src, \
+        "a string sequence is still not treated like a bare string"
+    assert "_looks_like_media_value(value)" in src, \
+        "the value scan still weighs only data URIs, not media suffixes"
