@@ -126,10 +126,18 @@ def _grouped_mm_with_backward_fix(
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
     but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
     copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
-    vs the always-contiguous path in forward and backward.
+    always-correct copy. Falls back to a per-group matmul when the device has no torch._grouped_mm
+    at all, and on the 16-byte stride error. Bit-exact vs the always-contiguous path in forward
+    and backward.
     """
     inputs = inputs.contiguous()
+    # Devices without torch._grouped_mm never reach the kernel. The Triton backend
+    # is picked precisely when the probe says no, and its separated-LoRA delta
+    # still routed through here, so a LoRA MoE raised "torch._grouped_mm is only
+    # supported on CUDA devices with compute capability = 9.0" on every card that
+    # is not an H100. The probe is cached, so this costs one global read.
+    if not _check_torch_grouped_mm_supported():
+        return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
     try:
