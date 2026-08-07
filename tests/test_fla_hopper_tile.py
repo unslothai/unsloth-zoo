@@ -270,13 +270,44 @@ def test_installed_fla_never_stays_bound_on_suspect_hopper(
     monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
     monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
     monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+    # Their install cannot be patched in place (it is a bare stub module here), so
+    # the vendored snapshot, which has the fix compiled in, must take over.
+    monkeypatch.setattr(fv, "_patch_installed_fla_dqkwg", lambda: False)
 
     fv.patch_vendor_fla()
 
     assert injected.get("yes"), (
-        "a suspect Hopper host must inject the vendored copy, which carries the "
-        "BK tile fix, rather than defer to an unpatched user install"
+        "a suspect Hopper host must fall back to the vendored copy, which carries "
+        "the BK tile fix, rather than leave an unpatched user install in charge"
     )
+
+
+def test_installed_fla_is_patched_in_place_when_possible(monkeypatch):
+    """Preferred outcome on a suspect host: keep the user's own fla and patch only
+    the miscompiled kernel, instead of shadowing their deliberate install."""
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    real = types.ModuleType("fla")
+    real.__version__ = "0.9.0"
+    monkeypatch.setitem(sys.modules, "fla", real)
+    monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_patch_installed_fla_dqkwg", lambda: True)
+
+    def fail_inject():
+        raise AssertionError("must patch the install in place, not shadow it")
+
+    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+
+    def fail_probe(probe=None):
+        raise AssertionError(
+            "must not repoint transformers' probe at the vendored answer when the "
+            "user's own fla is the one in use"
+        )
+
+    monkeypatch.setattr(fv, "_patch_is_available", fail_probe)
+
+    fv.patch_vendor_fla()
+    assert sys.modules["fla"] is real
 
 
 def test_installed_fla_still_wins_on_a_healthy_host(monkeypatch):
@@ -295,6 +326,79 @@ def test_installed_fla_still_wins_on_a_healthy_host(monkeypatch):
     monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
     fv.patch_vendor_fla()
     assert sys.modules["fla"] is real
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
+def test_in_place_patch_fixes_an_unpatched_tree(monkeypatch):
+    """_patch_installed_fla_dqkwg must make an fla that still has the blanket guard
+    both run and produce correct gradients.
+
+    Exercised against the vendored tree with its source-level fix neutralised, so
+    it stands in for a user-installed fla-core that has the guard and no tile fix.
+    """
+    import torch
+
+    chunk_o = _load_vendored_fla()
+    if not (chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
+        pytest.skip("host Triton is outside the affected [3.4.0, 3.7.1) range")
+    if chunk_o.IS_NVIDIA_HOPPER:
+        pytest.skip("needs a non-Hopper host to hold a trustworthy reference")
+
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    import fla.ops.gated_delta_rule.chunk as gdc
+
+    B, T, H, D = 1, 128, 2, 64      # D=64 is the head dim that reaches the bad tile
+
+    def run():
+        torch.manual_seed(0)
+        dev, dt = "cuda", torch.bfloat16
+        mk = lambda: torch.randn(B, T, H, D, device=dev, dtype=dt, requires_grad=True)
+        q, k, v = mk(), mk(), mk()
+        beta = torch.rand(B, T, H, device=dev, dtype=dt, requires_grad=True)
+        g = torch.nn.functional.logsigmoid(
+            torch.rand(B, T, H, device=dev, dtype=torch.float32)).requires_grad_(True)
+        o, _ = chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta, scale=D ** -0.5,
+            use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+        )
+        o.sum().backward()
+        return [t.grad.detach().float() for t in (q, k, v, beta, g)]
+
+    reference = run()
+
+    # Stand in for an unpatched install: restore the old blanket guard, which
+    # refuses every gated call on Hopper regardless of the tile.
+    pristine = chunk_o.chunk_bwd_dqkwg
+
+    def blanket_guard(*args, **kwargs):
+        if (kwargs.get("g") is not None and chunk_o.IS_NVIDIA_HOPPER
+                and chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
+            raise RuntimeError("Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs ...")
+        return pristine(*args, **kwargs)
+
+    monkeypatch.setattr(chunk_o, "chunk_bwd_dqkwg", blanket_guard)
+    monkeypatch.setattr(gdc, "chunk_bwd_dqkwg", blanket_guard)
+    monkeypatch.setattr(chunk_o, "IS_NVIDIA_HOPPER", True)
+
+    with pytest.raises(RuntimeError):
+        run()
+
+    assert fv._patch_installed_fla_dqkwg() is True
+    try:
+        got = run()
+        for name, a, b in zip(("dq", "dk", "dv", "dbeta", "dg"), reference, got):
+            assert torch.isfinite(b).all(), f"{name} not finite after the in-place patch"
+            rel = (a - b).norm() / a.norm().clamp_min(1e-12)
+            assert rel < 5e-3, f"{name} diverged after the in-place patch (rel L2 {rel:.3e})"
+        # The globals it swaps must be put back after every call.
+        assert chunk_o.IS_NVIDIA_HOPPER is True
+        assert "fla" in str(chunk_o.check_shared_mem.__module__)
+        # Idempotent.
+        assert fv._patch_installed_fla_dqkwg() is False
+    finally:
+        chunk_o.chunk_bwd_dqkwg = pristine
+        gdc.chunk_bwd_dqkwg = pristine
 
 
 # ---------------------------------------------------------------------------

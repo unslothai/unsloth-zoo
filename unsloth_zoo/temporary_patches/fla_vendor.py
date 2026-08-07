@@ -49,6 +49,7 @@ __all__ = [
 
 import os
 import sys
+import functools
 import importlib
 import importlib.util
 
@@ -650,6 +651,103 @@ def _disable_already_imported_gated_delta():
             )
 
 
+_INSTALLED_FLA_PATCH_MARK = "_unsloth_hopper_dqkwg_patched"
+
+
+def _patch_installed_fla_dqkwg():
+    """Apply the BK=64 workaround to a *user-installed* fla, in place.
+
+    When a deliberate fla-core install is present on an affected Hopper host we
+    would otherwise have to shadow it with the vendored snapshot to get the tile
+    fix, silently downgrading whatever newer upstream the user chose. Patching
+    their copy instead keeps their kernels and fixes only the miscompiled tile.
+
+    Mechanism, chosen so it does not depend on the installed fla's source layout
+    (which differs across versions): wrap ``chunk_bwd_dqkwg`` and, for the
+    duration of a gated call, flip two module globals it reads.
+
+      * ``IS_NVIDIA_HOPPER = False`` disables the blanket guard. Inside this
+        function that global is read *only* by the guard; the Hopper autotune
+        restrictions were frozen at import, so nothing else moves.
+      * ``check_shared_mem`` reporting the smallest tier makes the function's own
+        arithmetic pick ``CONST_TILING = 32``, hence ``BK = 32``. Applied only
+        when the unmodified arithmetic would have landed on 64.
+
+    ``BV`` drops to 32 alongside ``BK`` on that path, because both derive from the
+    same ``CONST_TILING``. That costs some speed for head dims 33..64 only, and
+    the vendored copy (which edits the source directly) keeps the wider ``BV``.
+
+    Returns True if a patch was installed. Best effort: any failure leaves the
+    installed fla untouched and the caller falls back to shadowing it.
+    """
+    try:
+        import triton
+        import fla.ops.common.chunk_o as chunk_o
+    except Exception:
+        return False
+
+    fn = getattr(chunk_o, "chunk_bwd_dqkwg", None)
+    if fn is None or getattr(fn, _INSTALLED_FLA_PATCH_MARK, False):
+        return False
+    if not all(hasattr(chunk_o, a) for a in ("IS_NVIDIA_HOPPER", "check_shared_mem")):
+        return False  # unrecognised layout; do not guess
+
+    original = fn
+
+    @functools.wraps(original)
+    def _patched(*args, **kwargs):
+        g = kwargs.get("g")
+        k = kwargs.get("k")
+        if g is None or k is None:
+            return original(*args, **kwargs)
+        saved_hopper = chunk_o.IS_NVIDIA_HOPPER
+        saved_check = chunk_o.check_shared_mem
+        chunk_o.IS_NVIDIA_HOPPER = False
+        try:
+            try:
+                idx = k.device.index
+                if chunk_o.check_shared_mem('hopper', idx):
+                    const_tiling = 128
+                elif chunk_o.check_shared_mem('ada', idx):
+                    const_tiling = 64
+                else:
+                    const_tiling = 32
+                bad_tile = min(max(triton.next_power_of_2(k.shape[-1]), 16), const_tiling) == 64
+            except Exception:
+                bad_tile = True  # unknown shape: take the safe tile
+            if bad_tile:
+                chunk_o.check_shared_mem = lambda arch="none", tensor_idx=0: False
+            return original(*args, **kwargs)
+        finally:
+            chunk_o.IS_NVIDIA_HOPPER = saved_hopper
+            chunk_o.check_shared_mem = saved_check
+
+    setattr(_patched, _INSTALLED_FLA_PATCH_MARK, True)
+    chunk_o.chunk_bwd_dqkwg = _patched
+
+    # fla/ops/gated_delta_rule/chunk.py does `from fla.ops.common.chunk_o import
+    # chunk_bwd_dqkwg` at import, so that module global still holds the original.
+    # Rebind every fla module pointing at it, the same way _patch_is_available
+    # rebinds transformers' probe.
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not (name == "fla" or name.startswith("fla.")):
+            continue
+        mod_dict = getattr(mod, "__dict__", None)
+        if not isinstance(mod_dict, dict):
+            continue
+        if mod_dict.get("chunk_bwd_dqkwg") is original:
+            try:
+                setattr(mod, "chunk_bwd_dqkwg", _patched)
+            except Exception:
+                pass
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            "Unsloth: patched the installed fla's chunk_bwd_dqkwg for the Hopper "
+            "BK=64 miscompile (fla #640); keeping your fla install."
+        )
+    return True
+
+
 def _mark_fla_disabled_hopper():
     global _FLA_DISABLED_REASON
     if _FLA_DISABLED_REASON is not None:
@@ -698,15 +796,25 @@ def patch_vendor_fla(phase=None):
 
     replaced_real = False
     if not _vendored_already_injected():
-        # On a host where fla's gated chunk_bwd_dqkwg is miscompiled, prefer the
-        # vendored copy over any user install regardless of version: only ours
-        # carries the BK=64 tile workaround for fla #640. Deferring there is what
-        # left a pip-installed fla-core raising mid-backward on H100s
-        # (unslothai/unsloth#5276).
-        force = _flag("UNSLOTH_FORCE_VENDORED_FLA") or _hopper_dqkwg_suspect_here()
+        force = _flag("UNSLOTH_FORCE_VENDORED_FLA")
         if not force and _should_defer_to_installed_fla():
             # A newer (or unversioned deliberate) user install is present; use it.
-            return
+            # On an affected Hopper host it carries the #640 miscompile, which is
+            # what left a pip-installed fla-core raising mid-backward
+            # (unslothai/unsloth#5276). Patch their copy in place rather than
+            # shadowing it, so they keep the upstream they deliberately chose. If
+            # the patch cannot be applied, fall through to the vendored snapshot,
+            # which has the fix compiled in.
+            if not _hopper_dqkwg_suspect_here():
+                return
+            if _patch_installed_fla_dqkwg():
+                # Deliberately no _patch_is_available() here: their fla is a real
+                # install, so transformers' native probe already finds it, and our
+                # vendored probe would wrongly narrow it to the vendor-covered
+                # models. Rebinding chunk_bwd_dqkwg on the fla modules is enough,
+                # because chunk_gated_delta_rule looks it up as a module global at
+                # call time, so modeling modules imported earlier pick it up too.
+                return
         if not _torch_triton_cuda_supported():
             # Cannot run the Triton kernels here; leave the pure-torch fallback.
             return
