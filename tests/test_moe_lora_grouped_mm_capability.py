@@ -199,3 +199,32 @@ def test_it_survives_non_reentrant_checkpointing(unsupported):
                      inputs, weight, use_reentrant = False)
     out.sum().backward()
     assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+
+
+def test_the_modulelist_stride_fallback_shares_the_same_helper():
+    """`moe_grouped_modulelist._grouped_mm_fix` had its own copy of the loop.
+
+    Two of its callers put the result on the tape, so the same slice-shaped
+    saved tensors were reachable there through the 16-byte stride error.
+    """
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as G
+
+    def _stride_error(*args, **kwargs):
+        raise RuntimeError("strides should be multiple of 16 bytes")
+
+    inputs = torch.randn(12, 8, requires_grad = True)
+    weight = torch.randn(3, 8, 6)
+    offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
+
+    real = getattr(torch, "_grouped_mm", None)
+    torch._grouped_mm = _stride_error
+    try:
+        out = G._grouped_mm_fix(inputs, weight, offsets)
+    finally:
+        if real is None: delattr(torch, "_grouped_mm")
+        else: torch._grouped_mm = real
+
+    saved = out.grad_fn.saved_tensors
+    assert {tuple(t.shape) for t in saved} == {
+        tuple(inputs.shape), tuple(weight.shape), tuple(offsets.shape)}, \
+        [tuple(t.shape) for t in saved]
