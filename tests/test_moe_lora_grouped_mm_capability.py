@@ -228,3 +228,80 @@ def test_the_modulelist_stride_fallback_shares_the_same_helper():
     assert {tuple(t.shape) for t in saved} == {
         tuple(inputs.shape), tuple(weight.shape), tuple(offsets.shape)}, \
         [tuple(t.shape) for t in saved]
+
+
+# --- what the first review round found --------------------------------------
+
+def test_a_routing_change_in_the_replay_is_named_not_swallowed(unsupported):
+    """Shape-stable saves are parity with the fused op, not permission to lie.
+
+    Non-reentrant checkpointing replaces the SAVED tensors with the replay's,
+    so a backward that just uses them pairs the original `grad_output` with the
+    replay's partition: a gradient for a routing that never produced the loss.
+    That is worse than the CheckpointError it replaced, so the forward's own
+    boundaries are kept off the tape and compared.
+    """
+    class _Ctx:
+        """What checkpointing hands backward: the REPLAY's saved tensors."""
+        needs_input_grad = (True, True, False)
+        def __init__(self, saved, forward_offsets):
+            self.saved_tensors = saved
+            self.forward_offsets = forward_offsets
+
+    inputs = torch.randn(12, 8)
+    weight = torch.randn(3, 8, 6)
+    replayed = torch.tensor([4, 9, 12], dtype = torch.int32)   # one token over
+    ctx = _Ctx((inputs, weight, replayed), [4, 8, 12])
+
+    with pytest.raises(RuntimeError, match = "assigned tokens differently"):
+        M._ManualGroupedMM.backward(ctx, torch.ones(12, 6))
+
+
+def test_the_real_checkpoint_replay_shape_is_caught(unsupported):
+    """End to end, with a router that really does route differently on replay."""
+    from torch.utils.checkpoint import checkpoint
+    seen = {"n": 0}
+
+    def region(x, w):
+        seen["n"] += 1
+        ends = [4, 8, 12] if seen["n"] == 1 else [4, 9, 12]
+        offsets = torch.tensor(ends, dtype = torch.int32)
+        return M._grouped_mm_with_backward_fix(x, w, offsets)
+
+    inputs = torch.randn(12, 8, requires_grad = True)
+    weight = torch.randn(3, 8, 6, requires_grad = True)
+    out = checkpoint(region, inputs, weight, use_reentrant = False)
+    with pytest.raises(RuntimeError, match = "assigned tokens differently"):
+        out.sum().backward()
+
+
+def test_the_same_routing_twice_is_not_flagged(unsupported):
+    """The check must not fire on the overwhelmingly common case."""
+    inputs, weight, offsets = _case()
+    inputs = inputs.requires_grad_(True)
+    M._grouped_mm_with_backward_fix(inputs, weight, offsets).sum().backward()
+    assert inputs.grad is not None
+
+
+def test_backward_survives_a_reduced_precision_grad_output(unsupported):
+    """`Function.backward` runs OUTSIDE the forward's autocast region, so a
+    forward that autocast fp32 weights to bf16 hands back a bf16 grad_output
+    while the saved tensors are still fp32. Unaligned, the first matmul raises."""
+    inputs = torch.randn(8, 4, dtype = torch.float32, requires_grad = True)
+    weight = torch.randn(2, 4, 6, dtype = torch.float32, requires_grad = True)
+    offsets = torch.tensor([4, 8], dtype = torch.int32)
+
+    out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
+    out.backward(torch.ones_like(out, dtype = torch.bfloat16))
+
+    assert inputs.grad.dtype == torch.float32
+    assert weight.grad.dtype == torch.float32
+    assert torch.isfinite(inputs.grad).all() and torch.isfinite(weight.grad).all()
+
+
+def test_it_is_marked_as_not_compilable():
+    """A data-dependent group loop cannot be traced; breaking cleanly beats
+    aborting mid-trace, and the tensorized rewrites all cost more than they save."""
+    assert getattr(M._manual_grouped_mm, "_torchdynamo_disable", False) or \
+        "disable" in type(M._manual_grouped_mm).__name__.lower() or \
+        hasattr(M._manual_grouped_mm, "__wrapped__"), M._manual_grouped_mm

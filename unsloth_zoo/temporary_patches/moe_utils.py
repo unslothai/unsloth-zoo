@@ -190,6 +190,11 @@ class _ManualGroupedMM(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, inputs, weight, offsets):
+        # A plain list, NOT a tensor: non-reentrant checkpointing replaces the
+        # saved TENSORS with the replay's, so a saved `offsets` tells us what
+        # the replay routed, never what the forward routed. This copy survives,
+        # and backward uses it to tell the two apart.
+        ctx.forward_offsets = offsets.detach().cpu().tolist()
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
             return _grouped_matmul_loop(inputs, weight, offsets)
@@ -197,18 +202,44 @@ class _ManualGroupedMM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         inputs, weight, offsets = ctx.saved_tensors
+        bounds = offsets.detach().cpu().tolist()
+        if bounds != ctx.forward_offsets:
+            # Shape-stable saves would otherwise let this through silently, and
+            # pairing the original `grad_output` with the replay's partition is
+            # a gradient for a routing that never produced the loss. Louder than
+            # CheckpointError and pointed at the actual cause.
+            raise RuntimeError(
+                "Unsloth: the MoE router assigned tokens differently in the "
+                "activation-checkpoint replay than in the forward "
+                f"(expert ends {ctx.forward_offsets} then {bounds}), so the "
+                "gradients would belong to a routing that never produced the "
+                "loss. Turn gradient checkpointing off for this run, or make "
+                "the router deterministic."
+            )
         need_x, need_w, _ = ctx.needs_input_grad
+        grad_output = grad_output.contiguous()
+        # `backward` runs OUTSIDE the forward's autocast region, so a forward
+        # that autocast fp32 weights to bf16 hands back a bf16 `grad_output`
+        # while the saved tensors are still fp32, and the first matmul raises.
+        # Aligned by hand rather than with `torch.amp.custom_fwd/custom_bwd`,
+        # whose `device_type` is fixed at class definition: this fallback also
+        # runs on CPU and XPU.
+        compute_dtype = grad_output.dtype
         grad_inputs = torch.zeros_like(inputs) if need_x else None
         grad_weight = torch.zeros_like(weight) if need_w else None
-        grad_output = grad_output.contiguous()
         start = 0
-        for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+        for expert_idx, end in enumerate(bounds):
             if start < end:
                 g = grad_output[start:end]
                 if need_x:
-                    grad_inputs[start:end] = g @ weight[expert_idx].transpose(-2, -1)
+                    w = weight[expert_idx]
+                    grad_inputs[start:end] = (
+                        g @ w.to(compute_dtype).transpose(-2, -1)
+                    ).to(inputs.dtype)
                 if need_w:
-                    grad_weight[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
+                    x = inputs[start:end].to(compute_dtype)
+                    grad_weight[expert_idx] = (
+                        x.transpose(-2, -1) @ g).to(weight.dtype)
             start = end
         return grad_inputs, grad_weight, None
 
@@ -216,8 +247,22 @@ class _ManualGroupedMM(torch.autograd.Function):
 def _manual_grouped_mm(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+
+    Not compilable, and marked so. Group boundaries come off a tensor, so
+    `start < end` is a data-dependent branch Dynamo cannot guard, and a
+    tensorized rewrite is worse than the problem: gathering `weight[expert_id]`
+    per row materializes `[T, K, N]`, and masking runs every expert over every
+    row. `torch.compiler.disable` makes a compiled caller break cleanly here
+    rather than abort mid-trace; under `fullgraph = True` a break is still
+    fatal, which is what the eager fallback in `temporary_patches/utils.py` is
+    for.
+    """
     return _ManualGroupedMM.apply(inputs, weight, offsets)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
 
 
 # Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
