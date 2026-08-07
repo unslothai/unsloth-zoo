@@ -1571,6 +1571,13 @@ def apply_pending_eager_fallbacks() -> int:
 
     Safe to call on every step. Nothing pending means nothing happens.
     """
+    # A new step: whatever was packed compiled belonged to the last one. The
+    # marker was only cleared by `_restore_recompile_limits`, which an ordinary
+    # successful step never reaches, so it stayed true for the rest of the run
+    # and made `_give_up` re-raise for a later call that was nowhere near a
+    # checkpoint. Cleared first, before any early return below.
+    global _PACKED_COMPILED_IN_CHECKPOINT
+    _PACKED_COMPILED_IN_CHECKPOINT = False
     _settled = _settle_abandoned_checkpoint_generator()
     if _RAISED_INSIDE_CHECKPOINT and not _settled:
         # The abandoned generator is still rooted, so its saved-tensor hooks are

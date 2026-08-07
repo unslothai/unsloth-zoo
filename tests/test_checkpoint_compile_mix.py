@@ -409,3 +409,16 @@ def test_bump_recompile_limits_raises_whichever_names_torch_uses(dynamo_limits):
     before = getattr(dynamo.config, names[0])
     assert U._bump_recompile_limits(7)
     assert getattr(dynamo.config, names[0]) == before + 7
+
+
+def test_the_packed_marker_does_not_survive_the_step():
+    """`_PACKED_COMPILED_IN_CHECKPOINT` says "this step packed compiled".
+
+    It was only cleared by `_restore_recompile_limits`, which an ordinary
+    successful step never reaches, so once set it stayed true for the rest of
+    the run and a later call nowhere near a checkpoint had `_give_up` re-raise
+    the compiler error instead of taking the safe eager fallback.
+    """
+    U._PACKED_COMPILED_IN_CHECKPOINT = True
+    U.apply_pending_eager_fallbacks()          # nothing pending: still a boundary
+    assert U._PACKED_COMPILED_IN_CHECKPOINT is False
