@@ -1037,6 +1037,7 @@ def _gguf_export_scaffold(monkeypatch, tmp_path):
     calls = {}
 
     def fake_save_merged_model(model, tokenizer, path, dequantize=False):
+        calls["merge_count"] = calls.get("merge_count", 0) + 1
         Path(path).mkdir(parents=True, exist_ok=True)
 
     def fake_download():
@@ -1046,13 +1047,17 @@ def _gguf_export_scaffold(monkeypatch, tmp_path):
 
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
+        calls["convert_count"] = calls.get("convert_count", 0) + 1
         output = Path(
             f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
         )
         output.write_bytes(b"GGUF-intermediate")
 
     def fake_quantize_gguf(**kwargs):
+        # "quantize_kwargs" keeps the last call (pre-existing single-quant
+        # assertions); "quantize_calls" accumulates for multi-quant exports.
         calls["quantize_kwargs"] = kwargs
+        calls.setdefault("quantize_calls", []).append(kwargs)
         Path(kwargs["output_gguf"]).write_bytes(b"GGUF-final")
 
     monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
@@ -1110,6 +1115,435 @@ def test_gguf_default_first_conversion_not_quantized_skips_quantizer(
     )
     assert calls["convert_kwargs"]["quantization_type"] == "bf16"
     assert (out / "EdgeModel.BF16.gguf").exists()
+
+
+# --- Group 11b: multi-quant export (CUDA parity, unsloth/save.py:1323) ---
+
+
+def _export(mutils, out, quantization_method, **kwargs):
+    return mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method=quantization_method,
+        **kwargs,
+    )
+
+
+def test_gguf_list_produces_every_quant_from_one_conversion(monkeypatch, tmp_path):
+    """A list is the documented CUDA contract; before this it raised
+    TypeError: unhashable type: 'list' inside the alias lookup."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["q4_k_m", "q8_0", "q5_k_m"])
+
+    # The expensive steps run once; each extra quant only costs its own pass.
+    assert calls["merge_count"] == 1
+    assert calls["convert_count"] == 1
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == [
+        "q4_k_m", "q8_0", "q5_k_m",
+    ]
+    for name in ("Q4_K_M", "Q8_0", "Q5_K_M"):
+        assert (out / f"EdgeModel.{name}.gguf").exists()
+    # Every quant is produced from the shared intermediate, which is scratch.
+    assert {c["input_gguf"] for c in calls["quantize_calls"]} == {
+        str(out / "EdgeModel.BF16.gguf")
+    }
+    assert not (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_tuple_accepted_and_aliases_resolve_per_element(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ("fast_quantized", "quantized"))
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q8_0", "q4_k_m"]
+
+
+def test_gguf_list_keeps_intermediate_when_it_is_also_requested(monkeypatch, tmp_path):
+    """bf16 alongside a k-quant is a requested artifact, not scratch -- the
+    single-quant path deleted the intermediate unconditionally."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    # bf16 comes straight from convert_hf_to_gguf; only q4_k_m is quantized.
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+
+
+def test_gguf_list_deduplicates_preserving_order(monkeypatch, tmp_path):
+    """Repeats would re-run llama-quantize onto an identical output path."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["q4_k_m", "q8_0", "q4_k_m", "quantized"])
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m", "q8_0"]
+
+
+def test_gguf_rejects_bad_type_before_the_expensive_merge(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(TypeError, match="must be a string"):
+        _export(mutils, out, 4)
+    with pytest.raises(TypeError, match="every quantization_method entry"):
+        _export(mutils, out, ["q4_k_m", 4])
+    with pytest.raises(ValueError, match="empty list"):
+        _export(mutils, out, [])
+    # Argument errors must not cost a LoRA merge or a GGUF conversion.
+    assert "merge_count" not in calls
+    assert "convert_count" not in calls
+
+
+def test_gguf_single_string_behaviour_is_unchanged(monkeypatch, tmp_path):
+    """Regression guard: the scalar path must keep its exact old semantics."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, "q4_k_m")
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    assert not (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_explicit_first_conversion_still_honored_for_a_list(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["q4_k_m", "q8_0"], first_conversion="f32")
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert {c["input_gguf"] for c in calls["quantize_calls"]} == {
+        str(out / "EdgeModel.F32.gguf")
+    }
+    assert not (out / "EdgeModel.F32.gguf").exists()
+
+
+def test_gguf_list_produces_full_precision_targets_that_are_not_the_intermediate(
+    monkeypatch, tmp_path
+):
+    """f16 alongside a k-quant must still be emitted. llama-quantize produces
+    f16/bf16/f32 too, so a full-precision target is only free when it IS the
+    intermediate -- exempting all of them silently drops the request."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f16", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16", "q4_k_m"]
+    assert (out / "EdgeModel.F16.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    # bf16 was only scratch here - it was never requested.
+    assert not (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_two_full_precision_targets_both_land(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "f16"])
+
+    # bf16 is the intermediate and is requested, so only f16 needs a pass.
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+    assert (out / "EdgeModel.F16.gguf").exists()
+
+
+def test_gguf_keeps_intermediate_when_nothing_was_quantized(monkeypatch, tmp_path):
+    """A full-precision target reached via an explicit first_conversion runs no
+    quantize pass, so the converted file IS the export and must survive."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, "not_quantized", first_conversion="f16")
+
+    assert "quantize_calls" not in calls
+    assert (out / "EdgeModel.F16.gguf").exists()
+
+
+# --- Group 11c: quant-spec normalization ------------------------------------
+#
+# Output filenames are derived as `{base}.{quant.upper()}.gguf`, so two spellings
+# of one type name are the SAME artifact on disk. Every downstream decision
+# (which intermediate to convert to, which targets still need a llama-quantize
+# pass, whether the intermediate is scratch) compares quant names as strings, so
+# they must all see one canonical spelling. llama.cpp's own side already works
+# this way: unsloth_zoo/llama_cpp.py:2174 `check_quantization_type` lowercases
+# before validating.
+
+
+def test_gguf_case_variant_target_is_the_same_artifact(monkeypatch, tmp_path):
+    """`["BF16", "q4_k_m"]` is the llama.cpp spelling of `["bf16", "q4_k_m"]`.
+
+    Un-normalized it produced an in-place `llama-quantize BF16.gguf BF16.gguf`
+    pass and then deleted the requested BF16 artifact as if it were scratch.
+    """
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["BF16", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    # BF16 IS the intermediate: it must not be re-quantized onto its own path.
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    for c in calls["quantize_calls"]:
+        assert c["input_gguf"] != c["output_gguf"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+
+
+def test_gguf_case_variant_first_conversion_matches_requested_target(
+    monkeypatch, tmp_path
+):
+    """`first_conversion` is the other half of the same spec and needs the same
+    normalization: spelled `"BF16"` against a requested `"bf16"` it both ran an
+    in-place quantize pass and deleted the requested artifact."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "q4_k_m"], first_conversion="BF16")
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m"]
+    for c in calls["quantize_calls"]:
+        assert c["input_gguf"] != c["output_gguf"]
+    assert (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_dedup_is_case_insensitive_and_strips(monkeypatch, tmp_path):
+    """Dedup exists because repeats re-run llama-quantize onto an identical
+    output path -- which is exactly what case/whitespace variants also do."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["Q4_K_M", "q4_k_m", " q4_k_m ", "Q8_0"])
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q4_k_m", "q8_0"]
+
+
+def test_gguf_case_variant_alias_resolves(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["Fast_Quantized"])
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["q8_0"]
+
+
+def test_gguf_rejects_non_string_first_conversion_before_the_merge(
+    monkeypatch, tmp_path
+):
+    """Same "reject before the expensive merge" contract the quant list has."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(TypeError, match="first_conversion"):
+        _export(mutils, out, ["q4_k_m"], first_conversion=["bf16"])
+    assert "merge_count" not in calls
+    assert "convert_count" not in calls
+
+
+# --- Group 11d: singleton list is a list, not a scalar ----------------------
+
+
+def test_gguf_singleton_list_full_precision_is_still_emitted(monkeypatch, tmp_path):
+    """Upstream runs a llama-quantize pass for every requested method that is not
+    the intermediate, with no full-precision exemption
+    (unslothai/unsloth unsloth/save.py:2067-2070). The scalar carve-out here is a
+    pre-PR MLX behaviour; a singleton LIST is the new list contract and must
+    emit what was asked for."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f16"], first_conversion="bf16")
+
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16"]
+    assert (out / "EdgeModel.F16.gguf").exists()
+    # bf16 was never requested, so the intermediate is scratch.
+    assert not (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_scalar_full_precision_keeps_its_pre_pr_behaviour(monkeypatch, tmp_path):
+    """The scalar form must NOT change: pre-PR a lone full-precision string ran
+    no quantize pass whatever `first_conversion` said."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, "f16", first_conversion="bf16")
+
+    assert "quantize_calls" not in calls
+    assert (out / "EdgeModel.BF16.gguf").exists()
+
+
+# --- Group 11e: intermediate must not down-convert an f32 request -----------
+
+
+def test_gguf_f32_request_converts_directly_to_f32(monkeypatch, tmp_path):
+    """bf16 and f16 both embed exactly in f32, so an f32 intermediate is never a
+    precision regression for the other targets -- but a bf16 intermediate makes
+    the requested F32.gguf f32-shaped bf16 data."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "f16"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f16"]
+    assert (out / "EdgeModel.F32.gguf").exists()
+    assert (out / "EdgeModel.F16.gguf").exists()
+
+
+def test_gguf_f32_request_alongside_a_kquant_still_converts_to_f32(
+    monkeypatch, tmp_path
+):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert {c["input_gguf"] for c in calls["quantize_calls"]} == {
+        str(out / "EdgeModel.F32.gguf")
+    }
+    assert (out / "EdgeModel.F32.gguf").exists()
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+
+
+def test_gguf_without_f32_the_intermediate_stays_bf16(monkeypatch, tmp_path):
+    """Deliberate non-change. f16 and bf16 are not orderable -- bf16 has the
+    wider exponent, f16 the longer mantissa -- so promoting a requested f16 to
+    the intermediate would CLIP the range of a bf16 checkpoint. Only f32, which
+    represents all three exactly, is a safe promotion."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f16", "q4_k_m"])
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+
+
+def test_gguf_two_full_precision_no_f32_keeps_bf16_intermediate(
+    monkeypatch, tmp_path
+):
+    """Companion to the above for the all-full-precision set."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["bf16", "f16"])
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+
+
+def test_gguf_explicit_first_conversion_beats_the_f32_promotion(
+    monkeypatch, tmp_path
+):
+    """An explicit `first_conversion` is always honoured; the derivation only
+    runs when it is None (unslothai/unsloth unsloth/save.py:1953)."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"], first_conversion="bf16")
+    assert calls["convert_kwargs"]["quantization_type"] == "bf16"
+    assert [c["quant_type"] for c in calls["quantize_calls"]] == ["f32", "q4_k_m"]
+
+
+def _shard_the_intermediate(monkeypatch, calls, n_shards=3, return_files=True):
+    """convert_hf_to_gguf writes SHARD_NAME_FORMAT files instead of the plain
+    name once the intermediate crosses --split-max-size."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    def fake_convert_to_gguf(**kwargs):
+        calls["convert_kwargs"] = kwargs
+        calls["convert_count"] = calls.get("convert_count", 0) + 1
+        stem = f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}"
+        files = []
+        for index in range(1, n_shards + 1):
+            path = Path(f"{stem}-{index:05d}-of-{n_shards:05d}.gguf")
+            path.write_bytes(b"GGUF-shard")
+            files.append(str(path))
+        return (files, False) if return_files else None
+
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", fake_convert_to_gguf)
+
+
+def test_gguf_quantizes_from_a_sharded_intermediate(monkeypatch, tmp_path):
+    """A sharded intermediate never creates `{base}.F32.gguf`, so passing that
+    name to llama-quantize fed it a path that does not exist."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls)
+    out = tmp_path / "out"
+    _export(mutils, out, ["f32", "q4_k_m"])
+
+    assert calls["convert_kwargs"]["quantization_type"] == "f32"
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.F32-00001-of-00003.gguf")
+    ]
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    # f32 was requested, so its shards are the export and must survive.
+    assert len(list(out.glob("EdgeModel.F32-*.gguf"))) == 3
+
+
+def test_gguf_sharded_scratch_intermediate_is_removed_whole(monkeypatch, tmp_path):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls, n_shards=2)
+    out = tmp_path / "out"
+    _export(mutils, out, ["q4_k_m", "q8_0"])
+
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.BF16-00001-of-00002.gguf")
+    ] * 2
+    assert list(out.glob("EdgeModel.BF16*.gguf")) == []
+    assert (out / "EdgeModel.Q4_K_M.gguf").exists()
+    assert (out / "EdgeModel.Q8_0.gguf").exists()
+
+
+def test_gguf_shards_resolved_from_disk_without_a_return_value(monkeypatch, tmp_path):
+    """The pre-existing contract is the files on disk, not the return value."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    _shard_the_intermediate(monkeypatch, calls, n_shards=2, return_files=False)
+    out = tmp_path / "out"
+    _export(mutils, out, "q4_k_m")
+
+    assert [c["input_gguf"] for c in calls["quantize_calls"]] == [
+        str(out / "EdgeModel.BF16-00001-of-00002.gguf")
+    ]
+    assert list(out.glob("EdgeModel.BF16*.gguf")) == []
+
+
+def test_mlx_model_method_forwards_a_quant_list(monkeypatch, tmp_path):
+    """The user-facing hop: model.save_pretrained_gguf(...) in loader.py."""
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    seen = {}
+    monkeypatch.setattr(
+        mutils, "save_pretrained_gguf",
+        lambda model, tokenizer, save_directory, **kw: seen.update(kw),
+    )
+    model = types.SimpleNamespace(_tokenizer=object())
+    loader._mlx_save_pretrained_gguf(
+        model, tmp_path / "out", quantization_method=["q4_k_m", "q8_0"],
+    )
+    assert seen["quantization_method"] == ["q4_k_m", "q8_0"]
+
+
+def test_push_to_hub_gguf_forwards_a_quant_list(monkeypatch, tmp_path):
+    mutils, _ = _gguf_export_scaffold(monkeypatch, tmp_path)
+    seen = {}
+    monkeypatch.setattr(
+        mutils, "save_pretrained_gguf",
+        lambda model, tokenizer, save_directory, **kw: seen.update(kw),
+    )
+    monkeypatch.setattr(
+        mutils, "HfApi", None, raising=False,
+    )
+    uploaded = {}
+
+    class _FakeApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, *a, **k):
+            pass
+
+        def upload_folder(self, **k):
+            uploaded.update(k)
+
+        def upload_large_folder(self, **k):
+            uploaded.update(k)
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub",
+        types.SimpleNamespace(HfApi=_FakeApi),
+    )
+    mutils.push_to_hub_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        repo_id="org/EdgeModel",
+        quantization_method=["q4_k_m", "q8_0"],
+    )
+    assert seen["quantization_method"] == ["q4_k_m", "q8_0"]
 
 
 # --- Group 12: concurrency over the patcher env mutation ---
