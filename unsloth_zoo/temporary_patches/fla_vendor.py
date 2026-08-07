@@ -244,6 +244,37 @@ def _hopper_dqkwg_suspect_here():
     return _hopper_dqkwg_suspect(torch, triton)
 
 
+@functools.lru_cache(maxsize=None)
+def _device_index_is_hopper(index):
+    """Whether one CUDA device index is an NVIDIA Hopper (SM90).
+
+    ``_hopper_dqkwg_suspect_here`` deliberately answers for the whole process (any
+    visible Hopper counts), which is right for deciding *whether to install* the
+    workaround. Deciding whether a given call needs it is a per-tensor question:
+    fla #640 is Hopper-only, so narrowing the tile for a tensor on an Ada or
+    Blackwell card in the same box would cost speed for nothing. HIP excluded, as
+    an AMD Instinct reports capability major 9 without being Hopper.
+    """
+    try:
+        import torch
+        if getattr(getattr(torch, "version", None), "hip", None) is not None:
+            return False
+        if index is None:
+            index = torch.cuda.current_device()
+        if torch.cuda.get_device_capability(index)[0] == 9:
+            return True
+        return "NVIDIA H" in torch.cuda.get_device_name(index)
+    except Exception:
+        return False
+
+
+def _tensor_on_hopper(x):
+    try:
+        return bool(x is not None and x.is_cuda and _device_index_is_hopper(x.device.index))
+    except Exception:
+        return False
+
+
 # Set once when UNSLOTH_DISABLE_HOPPER_FLA_BWD turns the fast kernels off, so
 # unsloth's loader can explain *why* the slow path was chosen instead of blaming
 # "no CUDA / torch < 2.7 / triton < 3.3", none of which is true on an H100.
@@ -788,6 +819,12 @@ def _patch_installed_fla_dqkwg():
         k = _arg("k", _k_pos, args, kwargs, _MISSING)
         if g is None:
             return original(*args, **kwargs)  # ungated: the miscompile cannot fire
+        if not _tensor_on_hopper(k):
+            # The wrapper is installed process-wide because *some* visible GPU is
+            # Hopper, but #640 is Hopper-only. A call on an Ada / Ampere / Blackwell
+            # card in the same box must keep its normal tiling, or K=33..64 would
+            # narrow both BK and BV on every backward for no reason.
+            return original(*args, **kwargs)
         try:
             idx = k.device.index
             if real_check_shared_mem('hopper', idx):

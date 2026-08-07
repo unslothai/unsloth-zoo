@@ -570,6 +570,10 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
     _real, chunk_o = _fake_installed_fla(monkeypatch)
+    # The wrapper only overrides the tile for tensors that are actually on Hopper,
+    # so declare the fake tensors' device to be one. Without this the concurrency
+    # path under test is never entered on a non-Hopper CI host.
+    monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: True)
 
     fast_entered = threading.Event()
     slow_inside = threading.Event()
@@ -597,6 +601,7 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
     class _K:
         shape = (1, 128, 2, 64)   # head dim 64 -> the tile that must be stepped down
         device = types.SimpleNamespace(index=0)
+        is_cuda = True            # the wrapper skips non-CUDA tensors outright
 
     errors = []
 
@@ -975,3 +980,38 @@ def test_degraded_optout_warning_does_not_promise_pure_torch(monkeypatch, caplog
     assert "neither route gives you the pure-PyTorch path" in text, (
         "the warning must not claim a Triton upgrade reaches the pure-PyTorch path"
     )
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
+def test_installed_patch_leaves_non_hopper_tensors_alone(monkeypatch):
+    """The installed-fla wrapper is installed process-wide when ANY visible GPU is
+    Hopper, but fla #640 is Hopper-only. A call whose tensors live on an
+    Ada/Ampere/Blackwell card in the same box must keep its normal tiling, or
+    K=33..64 pays a narrowed BK and BV on every backward for nothing.
+    """
+    import torch
+
+    chunk_o = _load_vendored_fla()
+    from unsloth_zoo.temporary_patches import fla_vendor as fv
+
+    seen = {}
+
+    def fake_original(**kwargs):
+        seen["small_tile"] = fv._installed_fla_forcing_small_tile()
+        return None
+
+    monkeypatch.setattr(chunk_o, "chunk_bwd_dqkwg", fake_original)
+    monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: False)
+    assert fv._patch_installed_fla_dqkwg() is True
+
+    k = torch.zeros(1, 8, 1, 64, device="cuda", dtype=torch.bfloat16)
+    g = torch.zeros(1, 8, 1, device="cuda", dtype=torch.float32)
+    chunk_o.chunk_bwd_dqkwg(q=k, k=k, v=k, do=k, h=None, dh=None, g=g)
+    assert seen["small_tile"] is False, (
+        "a non-Hopper tensor must not be forced onto the narrow tile"
+    )
+
+    # Same call on a device reported as Hopper does take the override.
+    monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: True)
+    chunk_o.chunk_bwd_dqkwg(q=k, k=k, v=k, do=k, h=None, dh=None, g=g)
+    assert seen["small_tile"] is True, "a Hopper tensor at K=64 must take the override"
