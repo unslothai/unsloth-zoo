@@ -172,6 +172,7 @@ jobs:
             tests/test_temporary_patches_imports.py \
             tests/test_zoo_history_regressions.py \
             tests/test_pypi_version_sync.py \
+            tests/test_olmoe_moe_routing.py \
             -v
 
   # Real MLX numerics on Linux. mlx-cpu publishes a manylinux x86-64 wheel and
