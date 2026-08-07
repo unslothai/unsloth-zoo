@@ -3062,3 +3062,112 @@ def test_case_variants_survive_a_split_that_refuses_its_columns():
         eval_dataset = None
 
     assert "Image" in _case_variants(Trainer(), {"image"})
+
+
+def test_a_tensorizable_companion_column_survives_the_text_path():
+    """`output`, `response`, `content` are ordinary English words. Under
+    `remove_unused_columns=False` a caller's numeric auxiliary input under one of
+    those names was dropped from every text batch, so its custom `compute_loss`
+    never saw a column it explicitly asked to keep. What the text collator cannot
+    stack is a raw STRING; a number stays."""
+    from unsloth_zoo.dataset_utils import _MediaAwareCollator
+
+    seen = {}
+    def text(features): seen["f"] = features; return "text"
+    collator = _MediaAwareCollator(text, lambda f: "media", {"image"},
+                                   ambiguous_keys = {"url"},
+                                   companion_keys = {"output", "content"})
+    collator([{"input_ids": [1, 2], "output": 0.5, "content": [1, 2], "url": 3}])
+    assert seen["f"][0] == {"input_ids": [1, 2], "output": 0.5,
+                            "content": [1, 2], "url": 3}
+
+
+def test_a_raw_text_companion_column_is_still_stripped():
+    from unsloth_zoo.dataset_utils import _MediaAwareCollator
+
+    seen = {}
+    def text(features): seen["f"] = features; return "text"
+    collator = _MediaAwareCollator(text, lambda f: "media", {"image"},
+                                   ambiguous_keys = {"url"},
+                                   companion_keys = {"output", "content"})
+    collator([{"input_ids": [1], "output": "hello", "url": "a.txt",
+               "content": ["a", "b"]}])
+    assert seen["f"][0] == {"input_ids": [1]}
+
+
+def test_holds_raw_text_sees_through_a_nest():
+    from unsloth_zoo.dataset_utils import _holds_raw_text
+    assert _holds_raw_text("a") is True
+    assert _holds_raw_text([{"c": "a"}]) is True
+    assert _holds_raw_text([[1, 2], [3]]) is False
+    assert _holds_raw_text(0) is False
+    assert _holds_raw_text(None) is False
+
+
+def test_prose_ending_in_a_media_suffix_is_still_text():
+    """A formatted sample whose assistant answer reads `cat.jpg` is prose. The
+    generic suffix check called the whole column a media reference and the split
+    was refused with the vision-collator error, for text the tokenizer handles
+    fine."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}which file{RESPONSE_PART}cat.jpg"],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert "text" not in out.eval_dataset.column_names
+
+
+def test_a_media_suffix_outside_the_text_field_is_still_media():
+    """The exemption is for the configured text field only."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "attachments": ["cat.jpg"],
+    })
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_structured_text_field_is_still_scanned():
+    """Only a BARE string is exempt: a `messages`-style field holding a list of
+    turns can carry inline image parts, and skipping it would drop them."""
+    trainer = _text_only_trainer()
+    trainer.args.dataset_text_field = "messages"
+    trainer.eval_dataset = Dataset.from_dict({"messages": _messages_of_plain_text()})
+
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_scalar_labels_column_on_a_raw_split_is_not_kept_as_supervision():
+    """A raw split can carry a SCALAR `labels` (a class id). Keeping it as
+    token-level supervision sent an int into the masking pass, which calls
+    `len(old_labels)` on it: `TypeError: object of type 'int' has no len()`."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "labels": [3],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert len(out.eval_dataset["labels"][0]) == len(out.eval_dataset["input_ids"][0])
+
+
+def test_a_sized_labels_value_is_still_treated_as_supervision():
+    """The exemption is for SCALARS only. Anything with a length is the caller's
+    own token-level masking, and dropping it would un-mask what they masked."""
+    dataset = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "labels": [list(ROW), list(ROW)],
+    })
+
+    out = _bypass(dataset)
+
+    assert "labels" in out.train_dataset.column_names
+    assert len(out.train_dataset["labels"][0]) == len(ROW)

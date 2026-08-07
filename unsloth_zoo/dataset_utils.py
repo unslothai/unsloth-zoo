@@ -495,6 +495,16 @@ _RAW_TEXT_COMPANION_COLUMNS = frozenset((
 ))
 
 
+def _holds_raw_text(value, _depth = 0):
+    """A string, or a nest of them, that no collator can stack into a tensor."""
+    if isinstance(value, str): return True
+    if isinstance(value, (list, tuple)):
+        return _depth < 4 and any(_holds_raw_text(v, _depth + 1) for v in value)
+    if isinstance(value, dict):
+        return _depth < 4 and any(_holds_raw_text(v, _depth + 1) for v in value.values())
+    return False
+
+
 class _MediaAwareCollator:
     """The text collator, falling back to the caller's own when a batch has media.
 
@@ -557,9 +567,22 @@ class _MediaAwareCollator:
         # batch. Removed here, not from the keep-list: the media path still
         # needs those columns, and this is the only point that knows which path
         # a batch took. Copies, so the caller's rows are left alone.
-        drop = self.media_keys | self.ambiguous_keys | self.companion_keys
+        # By VALUE for the ambiguous and companion names, not by name alone. Both
+        # sets are ordinary English words, so under `remove_unused_columns=False`
+        # a caller's tensorizable auxiliary input called `output` or `content`
+        # was dropped from every text batch and its custom `compute_loss` never
+        # saw it. What the text collator cannot stack is a raw STRING; a number
+        # or a tensor under the same name is a model input and stays.
+        # The media names go on sight: they are never model inputs, and a text
+        # batch is one `_has_media` already declined to call multimodal.
+        maybe = self.ambiguous_keys | self.companion_keys
+        def _keep(key, value):
+            if not isinstance(key, str): return True
+            lower = key.lower()
+            if lower in self.media_keys: return False
+            return not (lower in maybe and _holds_raw_text(value))
         stripped = [
-            {k: v for k, v in f.items() if not (isinstance(k, str) and k.lower() in drop)}
+            {k: v for k, v in f.items() if _keep(k, v)}
             if isinstance(f, dict) else f
             for f in features or ()
         ]
@@ -862,8 +885,20 @@ def train_on_responses_only(
         # which the later model-input keep-list never gets the chance to save.
         _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
         if not isinstance(_raw_columns, dict):
-            _keep = {"labels"} | _model_forward_parameter_names(
-                getattr(trainer, "model", None))
+            _keep = _model_forward_parameter_names(getattr(trainer, "model", None))
+            # `labels` only when it really is token-level. A raw split can carry
+            # a SCALAR `labels` (a class id), and keeping that as supervision
+            # sent an int into `_train_on_responses_only`, which calls
+            # `len(old_labels)` on it: `TypeError: object of type 'int' has no
+            # len()`. A scalar is metadata for the tokenized split and goes with
+            # the other raw columns, unless `forward` asks for it above.
+            _sample_labels = sample.get("labels") if isinstance(sample, dict) else None
+            if _sample_labels is not None and not isinstance(_sample_labels, (str, bytes)):
+                try:
+                    len(_sample_labels)
+                    _keep = _keep | {"labels"}
+                except TypeError:
+                    pass
             # The raw text always goes, whatever else asks for it: it was just
             # turned into `input_ids`, and a `forward` that happens to declare a
             # `text` parameter would otherwise keep the string column for the
@@ -1312,14 +1347,27 @@ def train_on_responses_only(
         return False
     pass
 
+    def _configured_text_field():
+        return getattr(getattr(trainer, "args", None),
+                       "dataset_text_field", None) or "text"
+
     def _row_is_plain_text(row, schema_proven = frozenset()):
         # Tokenizer/model columns are numeric by construction; the rest is what
         # can smuggle in images. A column the schema already proved needs no
         # second opinion: it judged EVERY row, where re-reading it as a value is
         # strictly weaker and misreads the tensor/ndarray `with_format("torch")`
         # and `with_format("numpy")` hand back for an ordinary numeric column.
+        # The configured text field, when it really is a bare string, is prose by
+        # definition and is exempt from the filename-suffix test. Otherwise an
+        # assistant answer that happens to read `cat.jpg` classified the whole
+        # column as a media reference and the text bypass was refused with the
+        # vision-collator error, for a split the tokenizer handles fine. Only a
+        # bare string: a `messages`-style field holding a list of turns can still
+        # carry inline image parts, so that one is scanned as before.
+        field = _configured_text_field()
         return all(_is_plain_text(v) for k, v in row.items()
-                   if k not in _TEXT_COLUMNS and k not in schema_proven)
+                   if k not in _TEXT_COLUMNS and k not in schema_proven
+                   and not (k == field and isinstance(v, str)))
     pass
 
     # A one-row peek calls a mixed split text-only: row 0 holds plain `messages`
@@ -1559,6 +1607,15 @@ def train_on_responses_only(
                     # refuse every streamed text column there is.
                     _scan = _feature_needs_a_value_scan(feature) or (
                         _feature_is_bare_string(feature) and _is_map_style(split))
+                    # Never the configured text field, when its schema says bare
+                    # string. Its contents are prose the tokenizer will encode,
+                    # so weighing them for filename suffixes refused a whole
+                    # split over an assistant answer that read `cat.jpg`. The
+                    # caller still proves the column is all strings separately;
+                    # a STRUCTURED text field is not exempt and is scanned here
+                    # as before, because a list of turns can hold image parts.
+                    if name == _configured_text_field() and _feature_is_bare_string(feature):
+                        _scan = False
                     if _scan and not _column_values_are_plain_text(split, name):
                         return False, proven
                     # A plain string column is NOT added: `proven` exists so a
