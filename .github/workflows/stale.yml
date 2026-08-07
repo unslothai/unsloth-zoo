@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: '30 5 * * *' # Runs at 5:30 UTC every day
 
+# Serialize, never cancel. A cancelled run leaves a half-pinged backlog and no
+# record of where it stopped, and two overlapping runs double-ping the same
+# issues.
+concurrency:
+  group: stale-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   stale:
     runs-on: ubuntu-latest
