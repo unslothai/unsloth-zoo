@@ -943,6 +943,10 @@ def train_on_responses_only(
         # looked like text on schema alone, so the value was never examined and the
         # images were dropped before training.
         "img", "imgs", "image", "images", "video", "videos", "audio", "audios",
+        # `picture`/`photo` name an image as unambiguously as `image` does, and
+        # neither list had them: a pretokenized set keeping "cat.jpg" under
+        # `picture` read as text on schema alone and lost its images.
+        "picture", "pictures", "photo", "photos",
         # `bytes` is already an unambiguous media key one level down, and the
         # top-level list did not have it: a flattened base64 payload in a
         # `bytes` column has a string schema, so it read as text and the
@@ -1710,6 +1714,14 @@ def train_on_responses_only(
                 # numeric `sample_weight` or auxiliary target still comes through.
                 if _keep_every_column:
                     unusable = _text_columns | _untensorizable_columns(dataset)
+                    # `label` is a reserved collator alias, not an extra column:
+                    # DataCollatorForSeq2Seq reads `"label" if "label" in
+                    # features[0] else "labels"`, so a numeric `label` beside the
+                    # response-only `labels` we just built wins, and the masks are
+                    # thrown away. Only when both are present: a set carrying
+                    # `label` alone is supervising with it.
+                    if "labels" in names and "label" in names:
+                        unusable = unusable | {"label"}
                     drop = [c for c in names if c in unusable]
                 else:
                     drop = [c for c in names if c not in _keep_columns]

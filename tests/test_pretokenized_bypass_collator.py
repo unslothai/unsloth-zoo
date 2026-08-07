@@ -2374,3 +2374,37 @@ def test_a_model_input_column_is_never_judged_by_one_row():
 
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "token_type_ids" in out.train_dataset.column_names
+
+
+def test_a_singular_label_alias_is_dropped_beside_the_masked_labels():
+    """`DataCollatorForSeq2Seq` reads `"label" if "label" in features[0] else
+    "labels"`, so a numeric `label` surviving the opt-out wins outright and the
+    response-only masks just built are never used."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
+        "label": [0, 1],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    kept = out.train_dataset.column_names
+    assert "labels" in kept
+    assert "label" not in kept, "the alias would outrank the masks"
+
+
+@pytest.mark.parametrize("column", ("picture", "pictures", "photo", "photos"))
+def test_picture_and_photo_name_media_as_plainly_as_image(column):
+    """A pretokenized VLM set keeping "cat.jpg" under `picture` has a string
+    schema, so only the name can say it is media. `image` was listed and its two
+    commonest synonyms were not, so the bypass replaced the vision collator and
+    dropped the column, training those rows without their images."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        column: ["cat.jpg", "dog.jpg"],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
