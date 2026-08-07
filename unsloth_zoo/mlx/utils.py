@@ -31,6 +31,7 @@ import contextlib
 import copy
 import inspect
 import importlib
+import importlib.util
 import json
 import math
 import numbers
@@ -654,6 +655,209 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
     # In the embedding dtype, as the ids path does: an fp32 product rounded back
     # lands on different bf16 values.
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
+
+
+# Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
+# the module returns, without exposing the factor as an attribute. Named by the
+# base the model type normalizes to, since a tower is reachable as either
+# `gemma3` or `gemma3_text` depending on how the wrapper exposes it.
+_MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
+    "gemma", "gemma2", "gemma3", "gemma3n",
+})
+# Architectures transformers has always scaled inside the embedding, used when
+# the installed transformers cannot be asked because it predates them.
+_SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
+    "gemma3", "gemma3n", "gemma4", "gemma4_unified", "minicpm3",
+})
+
+
+def _model_type_base(model_type):
+    """The spelling both the family sets and the transformers lookup use."""
+    return str(model_type or "").removesuffix("_text")
+
+
+@lru_cache(maxsize=None)
+def _transformers_scales_inside_embedding(model_type):
+    """Whether the installed transformers applies this architecture's embedding
+    multiply inside the embedding module, so its NEFTune hook fires after it.
+
+    Asked rather than assumed: transformers moved gemma and gemma2's multiply
+    into the module partway through the version range this package supports, so
+    a fixed answer would be wrong for one end of it. None when the question
+    cannot be put -- in practice, an installed transformers with no such
+    architecture, since it ships its modeling modules as Python.
+
+    Read through the loader rather than imported: a modeling module needs torch,
+    which this package deliberately does not install on macOS arm64, so
+    importing would fail on a working MLX setup. Source first, then the compiled
+    code, so the answer survives a package shipped without its source.
+    """
+    base = _model_type_base(model_type)
+    if not base:
+        return None
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{base}.modeling_{base}")
+    except Exception:
+        return None
+    if spec is None or spec.loader is None:
+        return None
+    marker = "ScaledWordEmbedding"
+    try:
+        source = spec.loader.get_source(spec.name)
+    except Exception:
+        source = None
+    if source is not None:
+        return marker in source
+    try:
+        code = spec.loader.get_code(spec.name)
+    except Exception:
+        code = None
+    if code is None:
+        return None
+    # A module-level class binds its name, so the flat scan is enough.
+    return any(marker in name for name in code.co_names)
+
+
+def _neftune_embed_scale(model):
+    """The multiply applied after the embedding returns that NEFTune noise has
+    to be divided by, or None when nothing needs correcting.
+
+    MLX multiplies once the embedding module has returned, so noise injected
+    there rides through it; transformers adds its noise after the same multiply
+    wherever it keeps it inside the embedding.
+    """
+    text_model = _get_text_model(model)
+    backbone = getattr(text_model, "model", None)
+    # mlx-lm keeps this on `args`, mlx-vlm on `config`, at either level.
+    holders = (backbone, text_model, getattr(backbone, "args", None),
+               getattr(backbone, "config", None), getattr(text_model, "args", None),
+               getattr(text_model, "config", None))
+
+    def _first(key):
+        for holder in holders:
+            value = None if holder is None else _config_get(holder, key)
+            if value is not None:
+                return value
+        return None
+
+    model_type = str(_first("model_type") or "")
+    base = _model_type_base(model_type)
+    scale = getattr(backbone, "embed_scale", None)      # gemma4, gemma4_unified
+    if not scale:
+        scale = _first("scale_emb")                     # minicpm3, and not a sqrt
+    if not scale and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+        hidden_size = _first("hidden_size")
+        scale = float(hidden_size) ** 0.5 if hidden_size else None
+    if not scale:
+        return None
+    inside = _transformers_scales_inside_embedding(model_type)
+    if inside is None:
+        inside = base in _SCALED_INSIDE_WHEN_UNASKABLE
+    return float(scale) if inside else None
+
+
+def _vlm_compares_embedding_values(model):
+    """Whether the forward finds merged positions by comparing embedding
+    values, which noise redrawn per call invalidates. Read off the scale
+    families so the two cannot drift apart."""
+    return _vlm_embed_scale(model) is not None
+
+
+def _identify_vlm_embedding_module(model):
+    """The module a text-only embedding forward uses to build ``inputs_embeds``.
+
+    Observed, not looked up: wrappers disagree on attribute name and container,
+    some expose none, and an untied ``lm_head`` carries the same weight shape --
+    a quantized embedding carries no such shape at all. Of the modules producing
+    the returned shape, drop those another encloses, which picks an adapter over
+    the embedding it wraps. None means decline, never guess.
+    """
+    calls, stack, swapped, recorders = [], [], [], {}
+    def _recorder(base):
+        cls = recorders.get(base)
+        if cls is None:
+            class _Probe(base):
+                def __call__(self, *args, **kwargs):
+                    stack.append(id(self))
+                    enclosing = frozenset(stack[:-1])
+                    try:
+                        out = base.__call__(self, *args, **kwargs)
+                    finally:
+                        stack.pop()
+                    calls.append((self, getattr(out, "shape", None), enclosing))
+                    return out
+            # The save-window DoRA check reads the class name.
+            _Probe.__name__ = base.__name__
+            _Probe.__qualname__ = getattr(base, "__qualname__", base.__name__)
+            cls = recorders[base] = _Probe
+        return cls
+
+    try:
+        seen = set()
+        for _, module in model.named_modules():
+            # One module can appear under several names; wrapping it per name
+            # stacks recorders and leaves one installed.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            base = type(module)
+            try:
+                module.__class__ = _recorder(base)
+            except TypeError:
+                continue
+            swapped.append((module, base))
+        ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+        try:
+            embed_result = model.get_input_embeddings(ids, None)
+        except TypeError:
+            embed_result = model.get_input_embeddings(ids)
+        merged, _ = _unpack_embed_result(embed_result, model)
+    except Exception:
+        return None
+    finally:
+        for module, base in swapped:
+            module.__class__ = base
+
+    shape = getattr(merged, "shape", None)
+    if shape is None:
+        return None
+    matching = [(m, enclosing) for m, s, enclosing in calls if s == shape]
+    matching_ids = {id(m) for m, _ in matching}
+    outermost = {id(m): m for m, enclosing in matching
+                 if not (enclosing & matching_ids)}
+    if len(outermost) != 1:
+        return None
+    return next(iter(outermost.values()))
+
+
+def _probe_vlm_embedding_module(model):
+    """``_identify_vlm_embedding_module`` with the random stream it consumed put
+    back, where the backend lets it be captured.
+
+    Training mode is deliberately untouched: a quantized-activation layer
+    requantizes its weights on every flip, and shapes do not depend on the mode.
+    """
+    # mx.random.state is the live list every draw rewrites, so holding it
+    # snapshots nothing and rebinding it restores nothing. A stub backend may
+    # not present it as a list at all; identification still runs there, and any
+    # draw it makes stays on the caller's stream rather than raising.
+    rng_state = None
+    try:
+        live = mx.random.state
+        if isinstance(live, list) and live:
+            rng_state = [mx.array(key) for key in live]
+    except Exception:
+        rng_state = None
+    try:
+        return _identify_vlm_embedding_module(model)
+    except Exception:
+        return None
+    finally:
+        if rng_state is not None:
+            try:
+                mx.random.state[:] = rng_state
+            except Exception:
+                pass
 
 
 def _shared_kv_slot_count(model):
