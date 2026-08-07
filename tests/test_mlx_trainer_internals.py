@@ -8125,3 +8125,540 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+# MLXTrainingConfig's positional field order on this PR's merge target, read out
+# of `git show unslothai/main:unsloth_zoo/mlx/trainer.py` rather than re-derived
+# from the current dataclass, so this list cannot drift to match a later mistake.
+_MAIN_MLX_CONFIG_POSITIONAL_FIELDS = (
+    "per_device_train_batch_size", "gradient_accumulation_steps", "max_steps",
+    "num_train_epochs", "warmup_steps", "warmup_ratio", "learning_rate",
+    "lr_scheduler_type", "optim", "weight_decay", "adam_beta1", "adam_beta2",
+    "max_grad_norm", "max_grad_value", "max_grad_leaf_norm", "seed",
+    "lora_plus_ratio", "embedding_learning_rate", "logging_steps", "output_dir",
+    "report_to", "save_steps", "save_total_limit", "eval_steps",
+    "load_best_model_at_end", "metric_for_best_model", "greater_is_better",
+    "early_stopping_patience", "neftune_noise_alpha", "dataset_text_field",
+    "max_seq_length", "packing", "dataset_num_proc", "chat_template", "use_cce",
+    "compile", "compile_mode", "compile_max_variants", "compile_arch_overrides",
+    "compile_backend_overrides", "patch_mode", "compile_auto_tune",
+    "compile_trace", "gradient_checkpointing", "streaming", "dataset_order",
+    "preserve_dataset_order", "memory_limit_gb", "cache_limit_gb",
+    "wired_limit_gb", "disable_memory_limits", "cast_norm_output_to_input_dtype",
+    "append_eos", "train_on_completions", "completion_only_loss",
+    "assistant_only_loss", "assistant_token_id", "vlm_chat_template",
+    "per_device_eval_batch_size", "image_size", "label_smoothing_factor",
+    "report_grad_norm", "max_eval_batches",
+    "streaming_text_length_window_batches", "streaming_prefetch_batches",
+    "logging_dir", "run_name",
+)
+
+# The slot `lr_scheduler_type` has occupied since before this PR. Taken from the
+# merge base (`git show acdf0c83:unsloth_zoo/mlx/trainer.py`); unchanged on main.
+_PRE_PR_LR_SCHEDULER_TYPE_INDEX = 7
+
+
+def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
+    """New scheduler knobs must be append-only in MLXTrainingConfig.
+
+    MLXTrainingConfig.__init__ binds *args to fields in declaration order, so
+    inserting a field mid-dataclass silently re-targets every later positional
+    slot. Declaring these knobs next to lr_scheduler_type moved it from index 7
+    to index 10, so an existing 8-positional call stored "cosine" in
+    lr_scheduler_min_lr_rate and _build_schedule died on float("cosine").
+    """
+    import dataclasses
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS,
+    )
+
+    current = [f.name for f in dataclasses.fields(MLXTrainingConfig) if f.init]
+
+    # 1. This PR is append-only: main's field order is an exact prefix, so no
+    #    existing positional slot moves.
+    assert tuple(current[: len(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS)]) == (
+        _MAIN_MLX_CONFIG_POSITIONAL_FIELDS
+    )
+    assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) == {
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+    }
+
+    # 2. lr_scheduler_type keeps the slot it has held since before this PR.
+    assert current.index("lr_scheduler_type") == _PRE_PR_LR_SCHEDULER_TYPE_INDEX
+
+    # 3. The new knobs are listed in _MLX_CONFIG_OPTIONAL_COPY_FIELDS and that
+    #    tuple stays an exact suffix of the declaration order (main's invariant).
+    for name in (
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+    ):
+        assert name in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert tuple(current[-len(_MLX_CONFIG_OPTIONAL_COPY_FIELDS):]) == tuple(
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    )
+
+    # 4. The exact reported scenario: an 8-slot positional call whose last value
+    #    is the scheduler name must still land on lr_scheduler_type.
+    eight = MLXTrainingConfig(2, 4, 60, -1, 5, 0.0, 3e-4, "cosine")
+    assert eight.lr_scheduler_type == "cosine"
+    assert eight.lr_scheduler_min_lr_rate is None
+
+    # 5. A full positional dump from a current-main install round-trips by name.
+    defaults = MLXTrainingConfig()
+    dump = [getattr(defaults, name) for name in _MAIN_MLX_CONFIG_POSITIONAL_FIELDS]
+    sentinels = {
+        "lr_scheduler_type": "cosine",
+        "learning_rate": 3e-4,
+        "image_size": (128, 256),
+        "optim": "sgd",
+        "seed": 1234,
+        "run_name": "legacy-run",
+    }
+    for name, value in sentinels.items():
+        dump[_MAIN_MLX_CONFIG_POSITIONAL_FIELDS.index(name)] = value
+    positional = MLXTrainingConfig(*dump)
+    for name, value in sentinels.items():
+        assert getattr(positional, name) == value, name
+    assert positional.lr_scheduler_num_cycles is None
+    assert positional.lr_scheduler_power is None
+
+    # 6. The schedule builds instead of raising float("cosine").
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = positional
+    values = [float(trainer._build_schedule(total_steps=8)(s)) for s in range(8)]
+    assert values[0] == pytest.approx(0.0)  # warmup_steps default 5
+    assert max(values) == pytest.approx(3e-4, rel=1e-6)
+
+    # 7. Legacy keyword construction is unaffected either way.
+    assert MLXTrainingConfig(
+        learning_rate=3e-4, lr_scheduler_type="cosine"
+    ).lr_scheduler_type == "cosine"
+
+
+def _mlx_lr_curve(total_steps, **config_kwargs):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(max_steps=total_steps, **config_kwargs)
+    schedule = trainer._build_schedule(total_steps)
+    if not callable(schedule):
+        return [float(schedule)] * total_steps
+    return [float(schedule(step)) for step in range(total_steps)]
+
+
+def test_mlx_schedules_match_transformers_lr_lambdas():
+    """Every ported schedule must track HF's own lambda, not our restatement.
+
+    Ground truth is imported straight out of transformers.optimization so this
+    cannot pass by encoding the same assumption as the implementation.
+    """
+    optimization = pytest.importorskip("transformers.optimization")
+
+    lr, total, warmup = 2e-4, 60, 5
+    cases = [
+        (
+            dict(lr_scheduler_type="cosine", warmup_steps=warmup),
+            optimization._get_cosine_schedule_with_warmup_lr_lambda,
+            dict(num_warmup_steps=warmup, num_training_steps=total, num_cycles=0.5),
+        ),
+        (
+            # HF's own scheduler name for the min-LR cosine must be accepted.
+            dict(
+                lr_scheduler_type="cosine_with_min_lr",
+                warmup_steps=warmup,
+                lr_scheduler_min_lr_rate=0.1,
+            ),
+            optimization._get_cosine_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                num_cycles=0.5,
+                min_lr_rate=0.1,
+            ),
+        ),
+        (
+            dict(
+                lr_scheduler_type="cosine_with_restarts",
+                warmup_steps=warmup,
+                lr_scheduler_num_cycles=3,
+            ),
+            optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda,
+            dict(num_warmup_steps=warmup, num_training_steps=total, num_cycles=3),
+        ),
+        (
+            # No scheduler kwargs at all: HF still decays toward lr_end=1e-7,
+            # so the MLX default floor must be lr_end/lr and not 0.
+            dict(lr_scheduler_type="polynomial", warmup_steps=warmup),
+            optimization._get_polynomial_decay_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                lr_end=1e-7,
+                power=1.0,
+                lr_init=lr,
+            ),
+        ),
+        (
+            dict(
+                lr_scheduler_type="polynomial",
+                warmup_steps=warmup,
+                lr_scheduler_power=2.0,
+            ),
+            optimization._get_polynomial_decay_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                lr_end=1e-7,
+                power=2.0,
+                lr_init=lr,
+            ),
+        ),
+        (
+            # Zero warmup: HF's timescale falls back to 10_000, not to 1.
+            dict(lr_scheduler_type="inverse_sqrt", warmup_steps=0),
+            optimization._get_inverse_sqrt_schedule_lr_lambda,
+            dict(num_warmup_steps=0, timescale=10_000),
+        ),
+        (
+            dict(lr_scheduler_type="inverse_sqrt", warmup_steps=warmup),
+            optimization._get_inverse_sqrt_schedule_lr_lambda,
+            dict(num_warmup_steps=warmup, timescale=warmup),
+        ),
+    ]
+
+    for config_kwargs, hf_lambda, hf_kwargs in cases:
+        got = _mlx_lr_curve(total, learning_rate=lr, **config_kwargs)
+        expected = [lr * hf_lambda(step, **hf_kwargs) for step in range(total)]
+        assert got == pytest.approx(expected, abs=1e-9), config_kwargs
+
+
+def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():
+    """WSD must read HF's knobs: num_decay_steps sizes the window, num_cycles
+    is the cosine wave count (transformers/optimization.py:494-503)."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup, decay = 2e-4, 60, 5, 20
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay",
+    )
+    trainer.args.lr_scheduler_kwargs = {
+        "num_decay_steps": decay,
+        "min_lr_ratio": 0.1,
+    }
+    schedule = trainer._build_schedule(total)
+    got = [float(schedule(step)) for step in range(total)]
+    expected = [
+        lr
+        * optimization._get_wsd_scheduler_lambda(
+            step,
+            num_warmup_steps=warmup,
+            num_stable_steps=total - warmup - decay,
+            num_decay_steps=decay,
+            warmup_type="linear",
+            decay_type="cosine",
+            min_lr_ratio=0.1,
+            num_cycles=0.5,
+        )
+        for step in range(total)
+    ]
+    assert got == pytest.approx(expected, abs=1e-9)
+
+    # The stable phase really is stable, and really is 35 steps long.
+    assert got[warmup:total - decay] == pytest.approx([lr] * (total - warmup - decay))
+    # num_cycles=0.5 is HF's default, so passing it explicitly must not turn
+    # into "decay over half the window".
+    trainer.args.lr_scheduler_kwargs = {"num_decay_steps": decay, "num_cycles": 0.5}
+    trainer.args.lr_scheduler_min_lr_rate = 0.1
+    assert [float(trainer._build_schedule(total)(s)) for s in range(total)] == (
+        pytest.approx(expected, abs=1e-9)
+    )
+
+
+def test_wsd_tail_holds_at_min_lr_ratio():
+    """Past warmup+stable+decay HF returns min_lr_ratio, flat.
+
+    Evaluating the cosine at a clipped local progress of 1 only coincides with
+    that at the default num_cycles=0.5; a full wave lands back on peak LR.
+    """
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup, stable, decay = 2e-4, 60, 5, 10, 20
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay",
+    )
+    for num_cycles in (0.5, 1.0, 1.5):
+        trainer.args.lr_scheduler_kwargs = {
+            "num_stable_steps": stable,
+            "num_decay_steps": decay,
+            "min_lr_ratio": 0.1,
+            "num_cycles": num_cycles,
+        }
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * optimization._get_wsd_scheduler_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_stable_steps=stable,
+                num_decay_steps=decay,
+                warmup_type="linear",
+                decay_type="cosine",
+                min_lr_ratio=0.1,
+                num_cycles=num_cycles,
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), num_cycles
+        tail = got[warmup + stable + decay:]
+        assert tail == pytest.approx([lr * 0.1] * len(tail), abs=1e-9), num_cycles
+
+
+def test_lr_scheduler_kwargs_json_string_must_parse():
+    """A malformed CLI JSON string must raise, not fall back to defaults.
+
+    TrainingArguments parses this field with a bare json.loads
+    (transformers/training_args.py:1604-1612), so dropping an unparseable
+    string trains a curve the user did not ask for.
+    """
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 40
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=5,
+        lr_scheduler_type="cosine_with_restarts",
+    )
+
+    trainer.args.lr_scheduler_kwargs = '{"num_cycles": 3}'
+    from_string = [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 3}
+    assert from_string == pytest.approx(
+        [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    )
+
+    for bad in ('{"num_cycles": 3', "[1, 2]", "3"):
+        trainer.args.lr_scheduler_kwargs = bad
+        with pytest.raises(ValueError, match="lr_scheduler_kwargs"):
+            trainer._build_schedule(total)
+
+    trainer.args.lr_scheduler_kwargs = [("num_cycles", 3)]
+    with pytest.raises(ValueError, match="must be a dict"):
+        trainer._build_schedule(total)
+
+    # An unset field, in either spelling, is still absent rather than an error.
+    for empty in (None, "", "   "):
+        trainer.args.lr_scheduler_kwargs = empty
+        assert callable(trainer._build_schedule(total))
+
+
+def test_build_schedule_reads_hf_lr_scheduler_kwargs():
+    """A ported HF/TRL config carries scheduler knobs in lr_scheduler_kwargs.
+
+    MLXTrainer does not type-check `args`, so a raw TrainingArguments/SFTConfig
+    reaches _build_schedule; reading only the MLX top-level attributes silently
+    trained the default curve.
+    """
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 100
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=0,
+        lr_scheduler_type="cosine_with_restarts",
+    )
+    expected = [
+        lr
+        * optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+            step, num_warmup_steps=0, num_training_steps=total, num_cycles=3
+        )
+        for step in range(total)
+    ]
+
+    for kwargs in ({"num_cycles": 3}, '{"num_cycles": 3}'):
+        trainer.args.lr_scheduler_kwargs = kwargs
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        assert got == pytest.approx(expected, abs=1e-9), kwargs
+
+    # lr_scheduler_kwargs outranks the top-level MLX attribute.
+    trainer.args.lr_scheduler_num_cycles = 1
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 3}
+    got = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert got == pytest.approx(expected, abs=1e-9)
+
+    # An explicit 0.0 survives instead of falling back to a default.
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 0}
+    flat = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert flat == pytest.approx([lr] * total)
+
+
+def test_unsupported_scheduler_kwargs_are_rejected_not_ignored():
+    """Silently dropping a scheduler knob is the bug class; fail loudly."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="warmup_stable_decay"
+    )
+    # Accepted by HF's get_wsd_schedule but not implemented here.
+    trainer.args.lr_scheduler_kwargs = {"decay_type": "1-sqrt"}
+    with pytest.raises(ValueError, match="not supported"):
+        trainer._build_schedule(60)
+    # Not a knob of this schedule at all.
+    trainer.args.lr_scheduler_kwargs = {"power": 2.0}
+    with pytest.raises(ValueError, match="unknown"):
+        trainer._build_schedule(60)
+    # Resume bookkeeping is tolerated.
+    trainer.args.lr_scheduler_kwargs = {"last_epoch": 3}
+    assert callable(trainer._build_schedule(60))
+
+
+def test_cosine_warmup_with_min_lr_is_not_silently_aliased():
+    """HF routes it to a different lambda with an off-by-one warmup ramp
+    (transformers/optimization.py:400-406), so it must not map onto cosine."""
+    from unsloth_zoo.mlx.trainer import _normalize_mlx_scheduler_type
+
+    assert _normalize_mlx_scheduler_type("cosine_with_min_lr") == "cosine"
+    assert _normalize_mlx_scheduler_type("COSINE_WITH_MIN_LR") == "cosine"
+    assert _normalize_mlx_scheduler_type("SchedulerType.cosine_with_min_lr") == "cosine"
+    assert _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr") == (
+        "cosine_warmup_with_min_lr"
+    )
+
+
+def test_cosine_warmup_with_min_lr_matches_its_own_hf_lambda():
+    """Its warmup ramp and progress are both offset by one step relative to
+    every other schedule (transformers/optimization.py:400-406), and it takes a
+    warmup_lr_rate floor no other schedule has."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup = 2e-4, 60, 5
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="cosine_warmup_with_min_lr",
+    )
+    hf_lambda = optimization._get_cosine_with_min_lr_schedule_with_warmup_lr_rate_lambda
+    for kwargs in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5},
+                   {"min_lr_rate": 0.1, "warmup_lr_rate": 0.05},
+                   {"min_lr_rate": 0.1, "num_cycles": 1.5}):
+        trainer.args.lr_scheduler_kwargs = kwargs
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * hf_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                num_cycles=kwargs.get("num_cycles", 0.5),
+                min_lr_rate=kwargs.get("min_lr_rate", kwargs.get("min_lr", 0.0) / lr),
+                warmup_lr_rate=kwargs.get("warmup_lr_rate"),
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), kwargs
+
+    # Aliasing it onto plain cosine would have been off by one step everywhere.
+    trainer.args.lr_scheduler_kwargs = {"min_lr_rate": 0.1}
+    plain = [
+        lr
+        * optimization._get_cosine_schedule_with_warmup_lr_lambda(
+            step,
+            num_warmup_steps=warmup,
+            num_training_steps=total,
+            num_cycles=0.5,
+            min_lr_rate=0.1,
+        )
+        for step in range(total)
+    ]
+    got = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert got != pytest.approx(plain, abs=1e-9)
+
+    # Same floor requirement HF enforces (transformers/optimization.py:454-455).
+    trainer.args.lr_scheduler_kwargs = None
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(total)
+
+
+def test_cosine_with_min_lr_requires_a_floor_like_hf():
+    """HF raises when neither min_lr nor min_lr_rate is given
+    (transformers/optimization.py:374-375). Accepting the name without the
+    floor would train a plain cosine to 0 for a config HF refuses to build."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="cosine_with_min_lr",
+    )
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(60)
+
+    for floor in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5}):
+        trainer.args.lr_scheduler_kwargs = floor
+        assert callable(trainer._build_schedule(60))
+    trainer.args.lr_scheduler_kwargs = None
+    trainer.args.lr_scheduler_min_lr_rate = 0.1
+    assert callable(trainer._build_schedule(60))
+
+    # Plain cosine is unaffected: a floor is optional there.
+    trainer.args.lr_scheduler_type = "cosine"
+    trainer.args.lr_scheduler_min_lr_rate = None
+    assert callable(trainer._build_schedule(60))
+
+
+def test_cosine_with_restarts_does_not_wrap_to_full_lr_past_the_end():
+    """HF returns 0 once progress hits 1 rather than starting a fresh cycle
+    (transformers/optimization.py:181-182). A ragged final epoch can force one
+    extra optimizer update, so step == total_steps is reachable and previously
+    snapped the LR back to its peak on that update."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 60
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=0,
+        lr_scheduler_type="cosine_with_restarts",
+        lr_scheduler_num_cycles=3,
+    )
+    schedule = trainer._build_schedule(total)
+    for step in (total - 1, total, total + 1, total + 30, total * 2):
+        expected = lr * (
+            optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+                step, num_warmup_steps=0, num_training_steps=total, num_cycles=3
+            )
+        )
+        assert float(schedule(step)) == pytest.approx(expected, abs=1e-9), step
+    assert float(schedule(total)) == pytest.approx(0.0)
