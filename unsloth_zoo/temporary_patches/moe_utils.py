@@ -155,10 +155,8 @@ def _grouped_mm_with_backward_fix(
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+def _grouped_matmul_loop(inputs, weight, offsets):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd."""
     outputs = []
     start = 0
     for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
@@ -168,6 +166,58 @@ def _manual_grouped_mm(
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+class _ManualGroupedMM(torch.autograd.Function):
+    """The loop above, saving what torch._grouped_mm saves and nothing else.
+
+    Written as a Function rather than left to autograd because the naive loop
+    puts every per-group SLICE on the tape, and a slice's shape is the group
+    size, which the router decides. Non-reentrant activation checkpointing
+    replays the forward and compares saved metadata, so any routing difference
+    between the two passes surfaces as
+
+        CheckpointError: Recomputed values ... have different metadata
+        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
+
+    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows
+    that because it is one op saving the whole `[T, K]` input, so a fallback
+    that means to be a drop-in has to save the same shape-stable set: inputs,
+    weight, offsets. The slices are rebuilt in backward.
+
+    This does not make routing deterministic, and does not pretend to: it
+    restores the numerics the fused path already has on an H100.
+    """
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        ctx.save_for_backward(inputs, weight, offsets)
+        with torch.no_grad():
+            return _grouped_matmul_loop(inputs, weight, offsets)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weight, offsets = ctx.saved_tensors
+        need_x, need_w, _ = ctx.needs_input_grad
+        grad_inputs = torch.zeros_like(inputs) if need_x else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
+        grad_output = grad_output.contiguous()
+        start = 0
+        for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+            if start < end:
+                g = grad_output[start:end]
+                if need_x:
+                    grad_inputs[start:end] = g @ weight[expert_idx].transpose(-2, -1)
+                if need_w:
+                    grad_weight[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
+            start = end
+        return grad_inputs, grad_weight, None
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+    return _ManualGroupedMM.apply(inputs, weight, offsets)
 
 
 # Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack

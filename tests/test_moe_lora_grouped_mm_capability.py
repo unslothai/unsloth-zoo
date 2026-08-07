@@ -121,3 +121,81 @@ def test_a_supported_device_still_uses_the_kernel(monkeypatch):
     inputs, weight, offsets = _case()
     M._grouped_mm_with_backward_fix(inputs, weight, offsets)
     assert seen.get("called"), "the guard swallowed a device that is supported"
+
+
+# --- what the first live B200 run of Qwen3_5_MoE found ----------------------
+
+def _reference(inputs, weight, offsets):
+    """Plain autograd over per-group matmuls, gradients included."""
+    outs, start = [], 0
+    for g, end in enumerate(offsets.tolist()):
+        if start < end:
+            outs.append(inputs[start:end] @ weight[g])
+        start = end
+    return torch.cat(outs, dim = 0)
+
+
+def test_the_gradients_match_plain_autograd(unsupported):
+    inputs, weight, offsets = _case(dtype = torch.float64)
+    a_in = inputs.clone().requires_grad_(True)
+    a_w = weight.clone().requires_grad_(True)
+    b_in = inputs.clone().requires_grad_(True)
+    b_w = weight.clone().requires_grad_(True)
+    seed = torch.randn(inputs.shape[0], weight.shape[-1], dtype = torch.float64)
+
+    M._grouped_mm_with_backward_fix(a_in, a_w, offsets).backward(seed)
+    _reference(b_in, b_w, offsets).backward(seed)
+
+    torch.testing.assert_close(a_in.grad, b_in.grad)
+    torch.testing.assert_close(a_w.grad, b_w.grad)
+
+
+def test_a_gradient_is_only_produced_where_it_is_wanted(unsupported):
+    """A frozen base stack asks for dX only, and building dW anyway is a
+    full-size allocation per call for nothing."""
+    inputs, weight, offsets = _case()
+    inputs = inputs.requires_grad_(True)
+    M._grouped_mm_with_backward_fix(inputs, weight, offsets).sum().backward()
+    assert inputs.grad is not None
+    assert weight.grad is None
+
+
+def test_an_empty_group_contributes_no_gradient(unsupported):
+    inputs = torch.randn(4, 8, requires_grad = True)
+    weight = torch.randn(3, 8, 6, requires_grad = True)
+    offsets = torch.tensor([0, 4, 4], dtype = torch.int32)
+    M._grouped_mm_with_backward_fix(inputs, weight, offsets).sum().backward()
+    assert torch.count_nonzero(weight.grad[0]) == 0
+    assert torch.count_nonzero(weight.grad[2]) == 0
+    assert torch.count_nonzero(weight.grad[1]) > 0
+
+
+def test_it_saves_only_shape_stable_tensors(unsupported):
+    """The whole point. A per-group slice's shape is the group size, which the
+    router decides, so saving slices made non-reentrant checkpointing compare
+    metadata across two different routings and abort the backward:
+
+        CheckpointError: saved torch.Size([38, 8]) recomputed torch.Size([39, 8])
+
+    Qwen3_5_MoE on a B200 died exactly there once the capability guard let it
+    reach training. Saved shapes must depend on nothing but the inputs.
+    """
+    inputs, weight, offsets = _case()
+    inputs = inputs.requires_grad_(True)
+    out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
+    saved = out.grad_fn.saved_tensors
+    assert {tuple(t.shape) for t in saved} == {
+        tuple(inputs.shape), tuple(weight.shape), tuple(offsets.shape)}, \
+        [tuple(t.shape) for t in saved]
+
+
+def test_it_survives_non_reentrant_checkpointing(unsupported):
+    """End to end: the same call inside a checkpointed region, backward and all."""
+    from torch.utils.checkpoint import checkpoint
+    inputs, weight, offsets = _case()
+    inputs = inputs.requires_grad_(True)
+    weight = weight.requires_grad_(True)
+    out = checkpoint(lambda x, w: M._grouped_mm_with_backward_fix(x, w, offsets),
+                     inputs, weight, use_reentrant = False)
+    out.sum().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
