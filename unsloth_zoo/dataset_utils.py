@@ -390,6 +390,33 @@ def _model_forward_parameter_names(model):
     return names
 
 
+def _case_variants(trainer, keys):
+    """`keys` plus the spellings the trainer's own splits actually use.
+
+    `_has_media` matches by lowercasing a column name, but this whitelist held
+    only the lowercase spellings, so `remove_unused_columns` stripped an `Image`
+    or `IMAGE_URL` column before the dispatcher could see it and the batch went
+    to the text collator that cannot encode it. The observed names are read from
+    the splits the trainer holds; the fixed variants below cover a later split
+    that only reaches us after the signature is already cached.
+    """
+    found = set(keys)
+    for key in keys:
+        found.update((key.upper(), key.title(), key[:1].upper() + key[1:]))
+    lowered = {k.lower() for k in keys}
+    splits = [getattr(trainer, "train_dataset", None), getattr(trainer, "eval_dataset", None)]
+    while splits:
+        split = splits.pop()
+        if isinstance(split, dict):
+            splits.extend(split.values())
+            continue
+        try: names = getattr(split, "column_names", None) or ()
+        except Exception: continue
+        if isinstance(names, dict): names = [n for v in names.values() for n in v or ()]
+        found.update(n for n in names if isinstance(n, str) and n.lower() in lowered)
+    return found
+
+
 def _keep_media_columns(trainer, keys):
     """Stop `remove_unused_columns` stripping media before the collator sees it.
 
@@ -399,7 +426,8 @@ def _keep_media_columns(trainer, keys):
     """
     try:
         existing = getattr(trainer, "_signature_columns", None)
-        names = sorted(k for k in keys if isinstance(k, str))
+        names = sorted(k for k in _case_variants(
+            trainer, {k for k in keys if isinstance(k, str)}))
         if existing is None:
             # Seeding it stops the trainer deriving the signature later, so the
             # model's own forward parameters go in here: a declared

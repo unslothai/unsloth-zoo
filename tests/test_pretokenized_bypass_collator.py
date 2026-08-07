@@ -2988,3 +2988,77 @@ def test_a_configured_label_survives_raw_column_removal():
     body = body[:body.index("_keep_columns = ")]
     assert 'label_names' in body, \
         "the raw-column keep-list still drops a custom trainer's configured labels"
+
+
+def test_case_variant_media_columns_survive_unused_column_removal():
+    """`_has_media` matches by lowercasing a column name, so a split naming its
+    media `Image` or `IMAGE_URL` dispatches correctly -- but only if the column
+    is still there. The signature whitelist held lowercase spellings alone, so
+    `remove_unused_columns` stripped it first and the batch went to the text
+    collator that cannot encode it."""
+    from unsloth_zoo.dataset_utils import _keep_media_columns
+
+    class Split:
+        column_names = ["Image", "IMAGE_URL", "text", "unrelated"]
+
+    class Trainer:
+        _signature_columns = None
+        train_dataset = Split()
+        eval_dataset = None
+        args = None
+        model = None
+
+    trainer = Trainer()
+    _keep_media_columns(trainer, {"image", "image_url"})
+    kept = set(trainer._signature_columns)
+    assert {"Image", "IMAGE_URL", "image", "image_url"} <= kept
+    assert "unrelated" not in kept
+
+
+def test_a_later_split_gets_the_common_case_spellings_anyway():
+    """The signature is cached once, so a split handed to `predict()` afterwards
+    cannot contribute its own column names. Cover the spellings that actually
+    occur rather than leaving that case wholly unprotected."""
+    from unsloth_zoo.dataset_utils import _keep_media_columns
+
+    class Trainer:
+        _signature_columns = None
+        train_dataset = None
+        eval_dataset = None
+        args = None
+        model = None
+
+    trainer = Trainer()
+    _keep_media_columns(trainer, {"image", "image_url"})
+    kept = set(trainer._signature_columns)
+    assert {"Image", "IMAGE", "Image_Url", "IMAGE_URL"} <= kept
+
+
+def test_case_variants_read_every_stored_eval_split():
+    from unsloth_zoo.dataset_utils import _case_variants
+
+    class Split:
+        def __init__(self, names): self.column_names = names
+
+    class Trainer:
+        train_dataset = None
+        eval_dataset = {"a": Split(["Audio"]), "b": Split(["Videos"])}
+
+    found = _case_variants(Trainer(), {"audio", "videos"})
+    assert {"Audio", "Videos"} <= found
+
+
+def test_case_variants_survive_a_split_that_refuses_its_columns():
+    """A custom split with no usable `column_names` must not take the whitelist
+    down with it: the fixed variants are still the answer."""
+    from unsloth_zoo.dataset_utils import _case_variants
+
+    class Angry:
+        @property
+        def column_names(self): raise RuntimeError("no")
+
+    class Trainer:
+        train_dataset = Angry()
+        eval_dataset = None
+
+    assert "Image" in _case_variants(Trainer(), {"image"})
