@@ -615,6 +615,12 @@ def _isolated_budget():
     saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
     saved_bumped = dict(u._BUMPED_RECOMPILE_LIMITS)
     saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
+    # A test that runs a wrapper inside a real checkpoint sets this, and only a
+    # settled step boundary clears it. Left true, `_give_up` re-raises for every
+    # later test in this worker instead of falling back, which reads as a broken
+    # kernel somewhere else entirely.
+    saved_packed = u._PACKED_COMPILED_IN_CHECKPOINT
+    saved_raised = u._RAISED_INSIDE_CHECKPOINT
     u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
     u._BUMPED_RECOMPILE_LIMITS.clear()
     u._EAGER_FALLBACK_WRAPPERS.clear()
@@ -630,6 +636,8 @@ def _isolated_budget():
         u._ORIGINAL_RECOMPILE_LIMITS.update(saved_orig)
         u._EAGER_FALLBACK_WRAPPERS.clear()
         u._EAGER_FALLBACK_WRAPPERS.extend(saved_registry)
+        u._PACKED_COMPILED_IN_CHECKPOINT = saved_packed
+        u._RAISED_INSIDE_CHECKPOINT = saved_raised
 
 
 @pytest.mark.parametrize("boom", [
@@ -738,11 +746,18 @@ def test_a_restore_underneath_an_active_config_patch_keeps_the_debt():
 def test_a_successful_retry_keeps_its_bump():
     """The control for the test above.
 
-    The wrapper is genuinely compiling against the extra headroom until it goes
-    eager, so a retry that succeeded must hold on to its bump; releasing it
-    would take the budget away mid-flight.
+    Inside a checkpointed region the wrapper really does stay compiled for the
+    rest of the step, so a retry that succeeded must hold on to its bump;
+    releasing it would take the budget away mid-flight. Outside one it goes
+    eager immediately and hands the budget back --
+    `test_a_successful_retry_outside_a_checkpoint_settles_itself` covers that,
+    and holding the bump there is the leak it exists to stop.
     """
+    from torch.utils.checkpoint import checkpoint
+
     with _isolated_budget() as (u, config, name, before):
+        if u._in_non_reentrant_checkpoint() is None:
+            pytest.skip("this torch cannot report checkpoint regions")
         calls = {"c": 0}
 
         def compiled(x):
@@ -756,7 +771,8 @@ def test_a_successful_retry_keeps_its_bump():
 
         with _hard_failure(False):
             w = _fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
-            assert w(3) == 6
+            x = torch.randn(2, 2, requires_grad = True)
+            checkpoint(lambda t: w(t).sum(), x, use_reentrant = False).backward()
 
         state = w._unsloth_fallback_state
         assert state["bumps"] == 1 and state["pending_eager"] is True
@@ -1530,3 +1546,63 @@ def test_an_untouched_call_site_is_not_settled_by_someone_elses_boundary():
     c, e, calls = _pair()
     assert _fall_back_to_eager_on_recompile_limit(c, e, "B.forward")(5) == 10
     assert calls == {"c": 1, "e": 0}
+
+
+def test_a_successful_retry_outside_a_checkpoint_settles_itself():
+    """Deferring the switch is for checkpointed training, where flipping
+    mid-step makes a region's pack and recompute disagree. Outside a region
+    there is nothing half-packed and no step boundary coming either -- the only
+    caller of `apply_pending_eager_fallbacks` is the trainer's step hook -- so a
+    compiled inference function kept the borrowed process-global recompile
+    limits raised for the rest of the process and never made the switch it had
+    just announced."""
+    with _isolated_budget() as (u, config, name, before):
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            return x * 2
+
+        def eager(x):
+            return x * 2
+
+        w = u._fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+        assert w(3) == 6, "the retry must still finish this call"
+
+        assert getattr(config, name) == before, "limit left raised for the process"
+        assert u._GLOBAL_BUMPS == 0, "shared bump allowance left spent"
+        assert w._unsloth_fallback_state["eager"] is True, "switch never happened"
+
+        assert w(3) == 6
+        assert calls["c"] == 2, "the compiler was consulted after the switch"
+
+
+def test_a_successful_retry_inside_a_checkpoint_still_defers():
+    """The control. Inside a non-reentrant region the switch must stay deferred:
+    whatever this step already packed compiled is recomputed in backward, and
+    flipping now is exactly the mismatch the deferral exists to avoid."""
+    from torch.utils.checkpoint import checkpoint
+
+    with _isolated_budget() as (u, config, name, before):
+        if u._in_non_reentrant_checkpoint() is None:
+            pytest.skip("this torch cannot report checkpoint regions")
+        calls = {"c": 0}
+
+        def compiled(x):
+            calls["c"] += 1
+            if calls["c"] == 1:
+                raise _LIMIT_ERROR("recompile_limit reached")
+            return x * 2
+
+        def eager(x):
+            return x * 2
+
+        w = u._fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
+        x = torch.randn(2, 2, requires_grad = True)
+        checkpoint(lambda t: w(t).sum(), x, use_reentrant = False).backward()
+
+        state = w._unsloth_fallback_state
+        assert state["pending_eager"] is True, "the debt was not recorded"
+        assert state["eager"] is False, "flipped inside a half-packed region"

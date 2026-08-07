@@ -702,6 +702,12 @@ def _saved_tensor_hook_accessor():
 # cannot strand it, and both phases carry one of these.
 _REENTRANT_FRAMES = ("forward", "backward")
 
+# `checkpoint_sequential` opens no region of its own: it calls `checkpoint` per
+# segment, and deliberately runs the LAST segment outside every one of them. Its
+# frame is not a pack or recompute frame, so the catch-all below must skip it
+# rather than read it as proof of a region.
+_SEQUENTIAL_FRAME = "checkpoint_sequential"
+
 
 def _frame_local(frame, name):
     """One local off a live frame, `_UNKNOWN` when it is not there."""
@@ -741,8 +747,15 @@ def _walk_for_checkpoint_frame():
     while frame is not None:
         if frame.f_code.co_filename == origin:
             name = frame.f_code.co_name
-            if name in _REENTRANT_FRAMES:
-                reentrant += 1
+            if name == _SEQUENTIAL_FRAME:
+                pass                            # keep scanning outward
+            elif name in _REENTRANT_FRAMES:
+                # `checkpoint_sequential`'s per-segment closure is called
+                # `forward` and is defined in this same file, so the name alone
+                # cannot tell it from `CheckpointFunction.forward`. The autograd
+                # Function frames take a `ctx`; the closure takes one tensor.
+                if _frame_local(frame, "ctx") is not _UNKNOWN:
+                    reentrant += 1
             elif name == "checkpoint":
                 use_reentrant = _frame_local(frame, "use_reentrant")
                 if use_reentrant is False: return True
@@ -1351,6 +1364,36 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         # mutation it already made a second time, and would bury the error.
         state["pending_eager"] = True
         _PENDING_EAGER_LABELS.add(label)
+        # Deferring is for checkpointed training, where flipping mid-step makes
+        # the pack and the recompute of one region disagree. Outside a region
+        # nothing is half-packed, and there is no step boundary coming either:
+        # `apply_pending_eager_fallbacks` is called from the trainer's step
+        # hook, so a compiled inference function -- GPT-OSS's module-level
+        # `_torch_compile`d ones -- would keep the borrowed process-global
+        # recompile limits raised for the rest of the process and never make the
+        # switch it just promised. Settle it here instead. Only on a definite
+        # False: None means torch could not say, and guessing "no region" is the
+        # answer that corrupts a backward.
+        if _in_non_reentrant_checkpoint() is False and \
+            not _PACKED_COMPILED_IN_CHECKPOINT:
+            # THIS wrapper only. `apply_pending_eager_fallbacks` takes every live
+            # borrower with it, which is what a step boundary wants and not what
+            # this is: one inference function running out of cache would knock
+            # every patched kernel in the process eager mid-step. Nothing spans
+            # this call the way a checkpointed region spans several functions.
+            state["eager"] = True
+            state["pending_eager"] = False
+            _PENDING_EAGER_LABELS.discard(label)
+            _LATCHED_EAGER_LABELS.add(label)
+            _RECENT_EAGER_LABELS.add(label)
+            while state["bumps"] > 0:
+                _release_borrowed_budget()
+            _warn(
+                f"Unsloth: torch.compile ran out of recompilation cache for "
+                f"{label}; running it eagerly from here. Speed is the only "
+                f"thing affected."
+            )
+            return result
         _warn(
             f"Unsloth: torch.compile ran out of recompilation cache for "
             f"{label}; finishing this step compiled and switching to eager at "

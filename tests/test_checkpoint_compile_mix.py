@@ -422,3 +422,37 @@ def test_the_packed_marker_does_not_survive_the_step():
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     U.apply_pending_eager_fallbacks()          # nothing pending: still a boundary
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+
+
+def _sequential_walk(segments, use_reentrant):
+    """What the frame walk answers inside each module of a sequential run."""
+    from torch.utils.checkpoint import checkpoint_sequential
+
+    seen = []
+
+    class Probe(nn.Module):
+        def forward(self, x):
+            seen.append(U._walk_for_checkpoint_frame())
+            return x * 1.0
+
+    modules = [Probe() for _ in range(4)]
+    x = torch.randn(2, 2, requires_grad = True)
+    checkpoint_sequential(modules, segments, x, use_reentrant = use_reentrant)
+    return seen
+
+
+def test_a_reentrant_sequential_is_not_read_as_a_non_reentrant_region():
+    """`checkpoint_sequential` keeps its own frame in `torch.utils.checkpoint`,
+    and its per-segment closure is called `forward` in that same file. The
+    closure was counted as a `CheckpointFunction` frame and the outer
+    `checkpoint_sequential` frame then hit the pack/recompute catch-all, so a
+    fully reentrant sequence answered "non-reentrant region open" -- which makes
+    `_give_up` re-raise the compiler failure instead of falling back to eager."""
+    assert _sequential_walk(2, True) == [False] * 4
+
+
+def test_the_last_sequential_segment_is_outside_every_region():
+    """The final segment is run directly, not through `checkpoint`, so nothing
+    is packed while it executes and eager is safe there even when the earlier
+    segments are non-reentrant."""
+    assert _sequential_walk(2, False) == [True, True, False, False]
