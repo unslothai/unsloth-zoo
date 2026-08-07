@@ -723,6 +723,14 @@ def patch_vllm_graph_capture():
     import time
     from functools import wraps
 
+    # vLLM may not be installed (e.g. arm64 wheels, CPU-only, or images
+    # built without the vllm extra). Bail out cleanly instead of raising
+    # NameError on the `vllm.__version__` check below.
+    try:
+        import vllm
+    except ImportError:
+        return
+
     @contextmanager
     def suppress_gc_collect():
         original_gc_collect = gc.collect
@@ -2069,6 +2077,17 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    # `vllm_version` only exists when `vllm` was importable at module-load
+    # time (see the find_spec guard near top of file). Raise an actionable
+    # error here instead of NameError, e.g. on the unsloth-blackwell
+    # no-vllm image or on arm64 where no vllm wheel is published.
+    if "vllm_version" not in globals():
+        raise ImportError(
+            "vLLM is required for `load_vllm`/SyntheticDataKit/`fast_inference=True` "
+            "but it is not installed. Install it with `pip install vllm` (CUDA only; "
+            "no wheel exists for arm64/aarch64 as of this writing)."
+        )
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # vLLM standby (sleep mode) corrupts the CuMemAllocator sleep/wake cycle for
     # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
@@ -2282,11 +2301,36 @@ def load_vllm(
                 f"    ninja - pip install ninja\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
-            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
-            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
-                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
+            # Force vLLM off FlashInfer when nvcc/ninja are missing.
+            # Env-var nudging is not enough: `VLLM_ATTENTION_BACKEND` is
+            # not recognised by vllm 0.19.1 (envs.py reports "Unknown
+            # vLLM environment variable detected") and vLLM still picks
+            # FLASHINFER from `['FLASHINFER', 'FLASH_ATTN', 'TRITON_ATTN',
+            # 'FLEX_ATTENTION']` on sm_100/sm_120, then JIT-compiles the
+            # trtllm-gen kernels and crashes inside `vllm.LLM()`. Block
+            # `import flashinfer` at the module level so vLLM's
+            # `try: import flashinfer except ImportError` branch in
+            # `vllm.platforms.cuda.get_attn_backend_cls` picks FLASH_ATTN
+            # instead. Also clear any user-set env vars and propagate to
+            # UNSLOTH_VLLM_NO_FLASHINFER for the rest of unsloth_zoo.
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
+            # Keep clearing an externally forced FLASHINFER selection as well, so
+            # a vLLM old enough to still read VLLM_ATTENTION_BACKEND falls back to
+            # its own default instead of a backend it cannot JIT-compile.
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
+            try:
+                # Drop any cached flashinfer module then mark it None so
+                # `import flashinfer` raises ImportError. None-in-sys.modules
+                # is the documented Python idiom for "this module fails to
+                # import"; see https://docs.python.org/3/reference/import.html.
+                for _name in list(sys.modules):
+                    if _name == "flashinfer" or _name.startswith("flashinfer."):
+                        del sys.modules[_name]
+                sys.modules["flashinfer"] = None
+            except Exception:
+                pass
         else:
             # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
