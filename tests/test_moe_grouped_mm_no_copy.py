@@ -147,3 +147,57 @@ def test_view_matches_copy_backward():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+def test_the_routing_signature_sees_a_same_sum_swap():
+    """Summing a row collapses it to a scalar that ignores WHERE its values
+    sit, so `[1, 0]` and `[0, 1]` reduced alike and swapping them across an
+    expert boundary left the signature unchanged. The guard would then accept a
+    replay whose gradients belong to a different routing, which is the one thing
+    it exists to refuse."""
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([2], dtype = torch.int32)
+    rows = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    assert _routing_signature(rows, offsets) != _routing_signature(rows.flip(0), offsets)
+
+
+def test_the_routing_signature_is_stable_for_the_same_rows():
+    """A false positive here turns a healthy step into a hard error."""
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([8], dtype = torch.int32)
+    rows = torch.randn(8, 32)
+    assert _routing_signature(rows, offsets) == _routing_signature(rows.clone(), offsets)
+
+
+def test_the_routing_signature_sees_an_arbitrary_permutation():
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([64], dtype = torch.int32)
+    rows = torch.randn(64, 128)
+    shuffled = rows[torch.randperm(64)]
+    if torch.equal(rows, shuffled):
+        pytest.skip("permutation happened to be the identity")
+    assert _routing_signature(rows, offsets) != _routing_signature(shuffled, offsets)
+
+
+def test_the_routing_signature_does_not_upcast_the_whole_input():
+    """`.float()` on the way in materialised a whole `[routed_tokens, hidden]`
+    transient to produce one number per row: 512MB at 32K by 4096, on exactly
+    the memory-constrained runs this fallback exists for."""
+    import inspect
+
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    body = inspect.getsource(_routing_signature)
+    assert ".float().sum(" not in body
+    assert ".detach().float()" not in body, "the full-width FP32 copy is back"
+
+
+def test_the_routing_signature_runs_in_half_precision():
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([4], dtype = torch.int32)
+    rows = torch.randn(4, 16).half()
+    assert isinstance(_routing_signature(rows, offsets), list)

@@ -176,8 +176,30 @@ def _routing_signature(inputs, offsets):
     holds a different sequence. The checksum moves with the rows, so the swap
     is visible. Bit-cast into the offsets vector, exactly, so the whole thing
     is one device sync -- the same one the group loop already pays.
+
+    Each row is reduced through a fixed pseudo-random projection, not a plain
+    sum. Summing collapses a row to a scalar that ignores WHERE its values sit,
+    so `[1, 0]` and `[0, 1]` reduce alike and swapping them across an expert
+    boundary left the whole signature unchanged -- the guard would accept a
+    replay whose gradients belong to a different routing. The projection is
+    derived from the hidden size alone, so forward and recompute build the same
+    one without carrying state.
+
+    The matvec also runs in the input's own dtype rather than on an FP32 copy.
+    `.float()` on the way in materialised a whole `[routed_tokens, hidden]`
+    transient -- 512MB at 32K rows by 4096 features -- to produce one number per
+    row, which is a real risk of OOM on exactly the memory-constrained runs this
+    fallback exists for. cuBLAS accumulates a half-precision gemv in FP32
+    internally, and only the small result is upcast.
     """
-    rows = inputs.detach().float().sum(dim = -1)
+    inputs = inputs.detach()
+    hidden = inputs.shape[-1]
+    weights = torch.linspace(
+        1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
+    # Irrational stride: a linear ramp alone still sums to the same value under
+    # a reversal, which is the collision this replaces.
+    weights = torch.sin(weights * 12.9898).to(inputs.dtype)
+    rows = inputs.mv(weights).float()
     ramp = torch.arange(1, rows.numel() + 1, device = rows.device, dtype = rows.dtype)
     checksum = torch.dot(rows, ramp).reshape(1)
     packed = torch.cat((
