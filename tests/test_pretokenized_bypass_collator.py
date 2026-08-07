@@ -1832,7 +1832,9 @@ def test_a_raw_eval_split_whose_full_scan_fails_is_refused():
 
     with pytest.raises(ValueError, match = "does not support response-only") as excinfo:
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
-    assert "['text']" in str(excinfo.value), "the refusal does not name the column"
+    # Named, not an exact list: a custom transform makes every non-tokenizer
+    # column unreadable, so `weight` is reported beside `text` now.
+    assert "'text'" in str(excinfo.value), "the refusal does not name the column"
 
 
 @pytest.mark.parametrize("fmt", ["torch", "numpy"])
@@ -2444,3 +2446,101 @@ def test_a_schema_proof_does_not_survive_a_custom_transform():
                           rows.with_transform(_decode))
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_custom_transform_is_refused_at_an_unsampled_row_too():
+    """Clearing the schema proof was not enough.
+
+    `provable` still said "no column is media in storage", and that is only
+    checked against the sampled rows, so a transform that decodes an image at
+    row 5000 passed both and had its column dropped. Only the sampled prefix is
+    plain text here, and the split must still be refused."""
+    Image = pytest.importorskip("PIL.Image")
+    n = 64
+    # The sample is spread and always includes the first and last row, so the
+    # media has to sit at an index it genuinely never reads or the test proves
+    # only that sampling works.
+    sampled = sorted({i * (n - 1) // 15 for i in range(16)})
+    hidden = next(i for i in range(n) if i not in sampled)
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW)] * n,
+        "payload": [f"row{i}" for i in range(n)],
+    })
+
+    def _decode(batch):
+        batch["payload"] = [
+            Image.new("RGB", (2, 2)) if p == f"row{hidden}" else p
+            for p in batch["payload"]
+        ]
+        return batch
+
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          rows.with_transform(_decode))
+    with pytest.raises(ValueError, match = "does not support response-only"):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+
+def test_a_numpy_formatted_raw_split_reaches_the_tokenizer():
+    """`with_format("numpy")` hands a column back as an ndarray, and
+    `examples.get(field) or examples.get("text", [])` boolean-tested it, so
+    tokenization raised "truth value of an array ... is ambiguous" before a row
+    was read. Presence is the question there, not truthiness."""
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{i}{RESPONSE_PART}a{i}" for i in range(4)],
+    }).with_format("numpy")
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "labels" in out.eval_dataset.column_names
+
+
+def test_a_numpy_formatted_pretokenized_split_is_masked():
+    """Same format, the other path. `input_ids` arrives as an ndarray, and
+    slicing one to compare against a multi-token marker gives an array, so the
+    `if` around that comparison raised. Only `torch.Tensor` was normalised."""
+    class _MultiTokenTokenizer(StubTokenizer):
+        @staticmethod
+        def _ids(text):
+            return {"<<U>>": [7, 8], "<<A>>": [9, 10]}.get(text) or [
+                ord(c) for c in text]
+
+    rows = Dataset.from_dict({
+        "input_ids": [[7, 8, 50, 51, 9, 10, 60, 61]] * 4,
+    }).with_format("numpy")
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.processing_class.tokenizer = _MultiTokenTokenizer()
+
+    out = train_on_responses_only(trainer, "<<U>>", "<<A>>")
+    assert "labels" in out.train_dataset.column_names
+
+
+def test_packing_off_does_not_reclassify_every_split():
+    """The guard returns immediately when packing is off, but its argument was
+    built first: `_dataset_is_pretokenized` ran over every split again, and that
+    performs whole-column scans for ambiguous metadata. `evaluate()` reaches
+    this on each call, so a large corpus was traversed for a thrown-away list."""
+    from unittest.mock import patch
+
+    # `PropertyMock` never sees `self`, so count through a plain property that
+    # delegates to the real one.
+    reads = {"n": 0}
+    real = Dataset.features
+
+    def _counting(self):
+        reads["n"] += 1
+        return real.fget(self)
+
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.packing = False
+
+    with patch.object(Dataset, "features", property(_counting)):
+        train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert reads["n"] <= 4, (
+        f"the split schema was read {reads['n']} times for one call; the "
+        f"packing guard is classifying splits it immediately discards"
+    )

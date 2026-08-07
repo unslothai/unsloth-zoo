@@ -494,12 +494,20 @@ def train_on_responses_only(
         if type(input_ids_) is torch_Tensor:
             use_tensors = True
             input_ids_ = input_ids_.tolist()
+        elif not isinstance(input_ids_, list) and hasattr(input_ids_, "tolist"):
+            # `with_format("numpy")` hands back an ndarray. Slicing one and
+            # comparing it to the marker list gives an array, and the `if` on
+            # that raised "truth value ... is ambiguous" before a single row was
+            # masked. Not `use_tensors`: numpy is a read-side format that
+            # `datasets` re-applies on the way out, so lists are what to return.
+            input_ids_ = input_ids_.tolist()
         if "labels" in examples:
             # Type-check labels the same way input_ids is above: under
             # datasets.map(batched = True) a "labels" column arrives as a plain
             # list of lists, which has no .tolist() and raised AttributeError.
             labels_ = examples["labels"]
-            if type(labels_) is torch_Tensor:
+            if type(labels_) is torch_Tensor or (
+                not isinstance(labels_, list) and hasattr(labels_, "tolist")):
                 labels_ = labels_.tolist()
             assert(len(labels_) == len(input_ids_))
         else:
@@ -651,7 +659,13 @@ def train_on_responses_only(
         max_length = getattr(trainer.args, "max_length", None) or getattr(trainer.args, "max_seq_length", 2048)
         text_field = getattr(trainer.args, "dataset_text_field", "text")
         def _tokenize_fn(examples):
-            texts = examples.get(text_field) or examples.get("text", [])
+            texts = examples.get(text_field)
+            if texts is None: texts = examples.get("text", [])
+            # `or` boolean-tested the column, which under `with_format("numpy")`
+            # is an ndarray and raises "truth value ... is ambiguous". Presence,
+            # not truthiness, is the question, and the tokenizer wants a list.
+            if not isinstance(texts, list) and hasattr(texts, "tolist"):
+                texts = texts.tolist()
             return _tok(texts, truncation=True, max_length=max_length, padding=False)
         _map_kwargs = {"batched": True, "num_proc": _effective_num_proc(dataset)}
         if isinstance(dataset, IterableDataset):
@@ -1358,7 +1372,19 @@ def train_on_responses_only(
                 if not rows: raise ValueError("Unsloth: cannot read the dataset columns")
                 names = list(rows[0].keys())
             provable, proven = _columns_are_provably_text(split, names)
-            if _has_custom_transform(split): proven = set()
+            # `provable` too, not just `proven`. Clearing the proof alone still
+            # left the schema saying "no media in storage", and that is only
+            # checked against the 16 sampled rows: a transform that decodes an
+            # image at row 5000 passed both and the column was dropped. The
+            # whole-column scan cannot settle it either, since it reads through
+            # `select_columns`, which a transform needing the other columns
+            # breaks. So refuse, the way an unscannable stream already is -- and
+            # name the columns, which is what makes that refusal actionable.
+            if _has_custom_transform(split):
+                provable, proven = False, set()
+                _unscannable_media_columns.update(
+                    n for n in names
+                    if isinstance(n, str) and n not in _TEXT_COLUMNS)
             views.append((set(names), rows, provable, proven, split))
         return views
     pass
@@ -1464,6 +1490,10 @@ def train_on_responses_only(
         packing subclass of one, because the exemption is about who pads.
         """
         if not packing_enabled: return
+        # Built here, not by the caller: classifying every split costs whole
+        # column scans, and with packing off the return above threw all of it
+        # away. `predict`/`evaluate` reach this guard on each call.
+        if callable(raw_splits): raw_splits = raw_splits()
         _how = ("tokenizes each row on its own" if raw_splits else
                 "cannot rebuild the packed batch's `position_ids`")
         raise ValueError(
@@ -1543,8 +1573,8 @@ def train_on_responses_only(
             _refuse_packing_with_a_foreign_collator(data_collator)
             _refuse_packing_that_will_not_happen(
                 data_collator,
-                [d for d in [_train] + _eval_splits
-                 if d is not None and not _dataset_is_pretokenized(d)])
+                lambda: [d for d in [_train] + _eval_splits
+                         if d is not None and not _dataset_is_pretokenized(d)])
             _bypassed_vision_collator = True
             print(
                 f"Unsloth: `{type(data_collator).__name__}` holds a processor but the "
