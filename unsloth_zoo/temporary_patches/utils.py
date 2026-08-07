@@ -1600,6 +1600,16 @@ def apply_pending_eager_fallbacks() -> int:
     # `accumulate_chunk`.
     if not _PENDING_EAGER_LABELS and \
         not any(w._unsloth_fallback_state.get("pending_eager") for w in live):
+        # This set means "fell back during THIS step", and only the settle path
+        # below cleared it. A wrapper that gives up OUTSIDE a checkpoint records
+        # its label without creating a pending entry, so every later boundary
+        # took this early return and the label never expired: a genuine
+        # checkpoint failure in some later step -- or in a second model in the
+        # same process -- then read it as evidence of a compile-mode flip,
+        # latched healthy wrappers to eager and asked for a retry instead of
+        # letting the real error through. Cleared here too, so the set says what
+        # its name says.
+        _RECENT_EAGER_LABELS.clear()
         # Nothing to flip, but a borrower that bumped and was then collected
         # (training aborted, or the patched object was replaced) would otherwise
         # leave the process-wide limit raised and its allowance spent forever.

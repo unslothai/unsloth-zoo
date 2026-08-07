@@ -329,6 +329,29 @@ def test_the_settle_clears_the_recent_labels():
     assert U.force_eager_fallback(only_if_already_triggered = True) == 0
 
 
+def test_a_boundary_with_nothing_pending_still_expires_the_recent_labels():
+    """A wrapper that gives up OUTSIDE a checkpoint records its label without
+    creating a pending entry, so every later boundary took the early return and
+    the label never expired. A genuine checkpoint failure in a later step then
+    read it as a compile-mode flip and asked for a retry instead of letting the
+    real error through."""
+    U._RECENT_EAGER_LABELS.add("gave_up_outside_a_checkpoint.forward")
+    # Nothing pending: no wrapper was registered, so this is the early return.
+    assert U.force_eager_fallback() == 0
+    assert U._RECENT_EAGER_LABELS == set(), \
+        "the label survived a step boundary it should not have"
+    assert U.force_eager_fallback(only_if_already_triggered = True) == 0
+
+
+def test_the_boundary_does_not_discard_a_pending_flip():
+    """Clearing on the empty path must not reach the path that has work: the
+    labels are what `_LATCHED_EAGER_LABELS` is updated from."""
+    U._PENDING_EAGER_LABELS.add("real.forward")
+    U._RECENT_EAGER_LABELS.add("real.forward")
+    U.force_eager_fallback()
+    assert "real.forward" in U._LATCHED_EAGER_LABELS
+
+
 def test_the_wrapper_registry_does_not_grow_without_bound():
     """GRPO re-wraps `accumulate_chunk` inside every backward, so one dead weak
     reference per step accumulated forever and every scan walked them."""
