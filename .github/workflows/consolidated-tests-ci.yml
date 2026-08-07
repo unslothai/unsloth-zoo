@@ -114,6 +114,8 @@ jobs:
         # in the mlx-cpu job below and on the Apple Silicon job).
         # test_find_common_token_ids_no_match pins the no-match contract for
         # chat-marker core recovery (stub tokenizer, no weights).
+        # test_rocm_compatibility validates AMD ROCm patch guards using mocks
+        # (no GPU required).
         # test_vllm_direct_lora_loading pins the vLLM direct hot-load slot
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
@@ -153,6 +155,7 @@ jobs:
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_python39_compatibility.py \
+            tests/test_rocm_compatibility.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
