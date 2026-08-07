@@ -720,12 +720,21 @@ def _frame_local(frame, name):
 def _walk_for_checkpoint_frame():
     """The pre-2.8 answer: is any `torch.utils.checkpoint` frame on the stack?
 
-    The whole live chain is walked. A depth cap cannot be read as proof that
-    no region is open: `checkpoint()` sits well over 60 frames above the
-    compiled call under nested module dispatch, and stopping early answered
-    "no region" and switched to eager inside one. This runs only on the
-    give-up path, which the bump caps bound to a handful per process, so the
-    walk is not on any hot path.
+    The whole live chain is walked by default. A depth cap cannot be read as
+    proof that no region is open: `checkpoint()` sits well over 60 frames above
+    the compiled call under nested module dispatch, and stopping early answered
+    "no region" and switched to eager inside one. The decision paths -- the
+    give-up path and `_in_non_reentrant_checkpoint` -- therefore never pass a
+    cap, and the bump caps bound them to a handful of calls per process.
+
+    `max_frames` exists for the ONE caller that is on a hot path: the per-call
+    probe, on a torch with no hook accessor, where this runs on every compiled
+    call. Measured at 14.8us per call at stack depth 60 and 46.9us at depth 200,
+    against 0.13us for the call itself, and `apply_pending_eager_fallbacks`
+    clears the latch every step so it never settles. A capped walk answers False
+    rather than "cannot tell", which for that caller only means it declines to
+    latch an optimistic observation; the give-up path re-derives the same answer
+    with no cap before anything acts on it.
 
     torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
     there would quietly restore the old behaviour on the releases pyproject
@@ -842,6 +851,29 @@ def _dynamo_is_tracing():
     return False
 
 
+# How many fruitless walks the per-call probe pays for in one step before it
+# stops asking. On a torch with no hook accessor the walk is the only signal,
+# and it costs ~15us at stack depth 60 against ~0.1us for the wrapper itself.
+# A run with non-reentrant checkpointing latches on one of its first calls --
+# layer 0 is already inside a region -- so this budget is never spent there. A
+# run without it would otherwise pay that walk on every call forever, so cap
+# the loss at ~1ms per step. Reset with the flag at each step boundary, and a
+# step that does latch clears the counter with it.
+_CHECKPOINT_PROBE_MISSES = 0
+_CHECKPOINT_PROBE_MISS_BUDGET = 64
+
+
+def _probe_walk():
+    """The walk, on this step's remaining budget. False once it is spent."""
+    global _CHECKPOINT_PROBE_MISSES
+    if _CHECKPOINT_PROBE_MISSES >= _CHECKPOINT_PROBE_MISS_BUDGET: return False
+    if _walk_for_checkpoint_frame():
+        _CHECKPOINT_PROBE_MISSES = 0
+        return True
+    _CHECKPOINT_PROBE_MISSES += 1
+    return False
+
+
 def _note_packed_under_checkpoint():
     """Cheap probe, run per compiled call: the hook accessor only, no frame walk.
 
@@ -860,6 +892,11 @@ def _note_packed_under_checkpoint():
     global _PACKED_COMPILED_IN_CHECKPOINT
     if _PACKED_COMPILED_IN_CHECKPOINT or _dynamo_is_tracing():
         return
+    # Nothing is packed with grad off, so no backward is owed and this call
+    # cannot be the one that strands a region. Exact, and it lifts the probe off
+    # generation entirely, which is most of the calls in a GRPO run.
+    if not torch.is_grad_enabled():
+        return
     top = _saved_tensor_hook_accessor()
     if top is None:
         # torch < 2.8 has no accessor, so ask the frames. Latching regardless
@@ -871,8 +908,7 @@ def _note_packed_under_checkpoint():
         # the budget outside any region, latched the first one to eager after
         # its activations were packed compiled. Self-limiting, because the flag
         # latches on the first hit and this returns immediately afterwards.
-        if _walk_for_checkpoint_frame():
-            _PACKED_COMPILED_IN_CHECKPOINT = True
+        if _probe_walk(): _PACKED_COMPILED_IN_CHECKPOINT = True
         return
     try:
         hooks = top(True)                       # ignore_is_tracing
@@ -890,8 +926,7 @@ def _note_packed_under_checkpoint():
     # ask the frames -- the same fallback `_in_non_reentrant_checkpoint` makes.
     # Cheap enough for the per-call probe: it is only reached while a foreign
     # hook is installed, and it latches on the first hit.
-    if _walk_for_checkpoint_frame():
-        _PACKED_COMPILED_IN_CHECKPOINT = True
+    if _probe_walk(): _PACKED_COMPILED_IN_CHECKPOINT = True
 
 
 def _wants_hard_recompile_failure():
@@ -1097,9 +1132,10 @@ def _restore_recompile_limits():
     Called once every wrapper that borrowed headroom has gone eager, so nothing
     still needs it and the process stops carrying a raised limit around.
     """
-    global _GLOBAL_BUMPS, _PACKED_COMPILED_IN_CHECKPOINT
+    global _GLOBAL_BUMPS, _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
+    _CHECKPOINT_PROBE_MISSES = 0
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1619,8 +1655,9 @@ def apply_pending_eager_fallbacks() -> int:
     # successful step never reaches, so it stayed true for the rest of the run
     # and made `_give_up` re-raise for a later call that was nowhere near a
     # checkpoint. Cleared first, before any early return below.
-    global _PACKED_COMPILED_IN_CHECKPOINT
+    global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
     _PACKED_COMPILED_IN_CHECKPOINT = False
+    _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
     _settled = _settle_abandoned_checkpoint_generator()
     if _RAISED_INSIDE_CHECKPOINT and not _settled:
         # The abandoned generator is still rooted, so its saved-tensor hooks are

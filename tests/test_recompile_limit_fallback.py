@@ -1606,3 +1606,76 @@ def test_a_successful_retry_inside_a_checkpoint_still_defers():
         state = w._unsloth_fallback_state
         assert state["pending_eager"] is True, "the debt was not recorded"
         assert state["eager"] is False, "flipped inside a half-packed region"
+
+
+@contextlib.contextmanager
+def _pre_2_8_probe(walk):
+    """The per-call probe on a torch with no hook accessor, counting its walks."""
+    U = _utils()
+    real_accessor, real_walk = U._saved_tensor_hook_accessor, U._walk_for_checkpoint_frame
+    saved_flag, saved_misses = U._PACKED_COMPILED_IN_CHECKPOINT, U._CHECKPOINT_PROBE_MISSES
+    calls = {"n": 0}
+    def _counting():
+        calls["n"] += 1
+        return walk()
+    U._saved_tensor_hook_accessor = lambda: None
+    U._walk_for_checkpoint_frame = _counting
+    U._PACKED_COMPILED_IN_CHECKPOINT, U._CHECKPOINT_PROBE_MISSES = False, 0
+    try:
+        yield U, calls
+    finally:
+        U._saved_tensor_hook_accessor, U._walk_for_checkpoint_frame = real_accessor, real_walk
+        U._PACKED_COMPILED_IN_CHECKPOINT = saved_flag
+        U._CHECKPOINT_PROBE_MISSES = saved_misses
+
+
+def test_the_probe_does_not_walk_the_stack_with_grad_off():
+    """Nothing is packed under `no_grad`, so this call cannot be the one that
+    strands a region -- and generation is most of the calls in a GRPO run. The
+    walk costs ~15us at stack depth 60 against ~0.1us for the call itself."""
+    with _pre_2_8_probe(lambda: True) as (U, calls):
+        with torch.no_grad():
+            for _ in range(8): U._note_packed_under_checkpoint()
+        assert calls["n"] == 0
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is False
+        U._note_packed_under_checkpoint()               # grad back on
+        assert calls["n"] == 1 and U._PACKED_COMPILED_IN_CHECKPOINT is True
+
+
+def test_the_probe_stops_walking_after_a_step_of_fruitless_walks():
+    """A run without non-reentrant checkpointing never latches, so on a torch
+    with no accessor the walk would run on every call for the whole run."""
+    with _pre_2_8_probe(lambda: False) as (U, calls):
+        for _ in range(U._CHECKPOINT_PROBE_MISS_BUDGET * 4):
+            U._note_packed_under_checkpoint()
+        assert calls["n"] == U._CHECKPOINT_PROBE_MISS_BUDGET
+
+
+def test_a_step_boundary_re_arms_the_probe():
+    """The budget bounds one step's loss, not the run's: a model that only
+    reaches its checkpointed layers later must still be seen next step."""
+    with _pre_2_8_probe(lambda: False) as (U, calls):
+        for _ in range(U._CHECKPOINT_PROBE_MISS_BUDGET + 5):
+            U._note_packed_under_checkpoint()
+        spent = calls["n"]
+        U.apply_pending_eager_fallbacks()
+        U._note_packed_under_checkpoint()
+        assert calls["n"] == spent + 1
+
+
+def test_a_latch_clears_the_probe_budget():
+    """Misses spent before the region opened must not count against the next
+    step, which starts from the flag being cleared rather than set."""
+    with _pre_2_8_probe(lambda: U._CHECKPOINT_PROBE_MISSES >= 3) as (U, calls):
+        for _ in range(4): U._note_packed_under_checkpoint()
+        assert U._PACKED_COMPILED_IN_CHECKPOINT is True
+        assert U._CHECKPOINT_PROBE_MISSES == 0
+
+
+def test_the_budget_never_delays_a_checkpointed_run():
+    """Layer 0 is already inside a region, so a run that does checkpoint latches
+    on one of its first calls and never spends the budget at all."""
+    with _pre_2_8_probe(lambda: True) as (U, calls):
+        for _ in range(200): U._note_packed_under_checkpoint()
+        assert calls["n"] == 1                          # latched, then returns early
+        assert U._CHECKPOINT_PROBE_MISSES == 0
