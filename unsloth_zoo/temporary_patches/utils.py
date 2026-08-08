@@ -265,6 +265,11 @@ del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
 
+_TORCHVISION_BROKE = (
+    "***** Please update and reinstall torchvision - it broke! "
+    "`pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
+)
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -277,9 +282,7 @@ except ImportError as e:
             f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
         )
     elif "torchvision::nms does not exist" in e:
-        raise RuntimeError(
-            f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
-        )
+        raise RuntimeError(_TORCHVISION_BROKE)
     elif "torchvision.io.video" in e or "torchvision.io._video" in e:
         # A HALF-INSTALLED torchvision, same class as the nms arm above. No
         # released version raises this alone: 0.25 ships `io/video.py`, and 0.26
@@ -305,6 +308,13 @@ except ImportError as e:
     )
 except Exception as e:
     e_str = str(e)
+    # Same breakage as the ImportError arm, but it does not arrive as one. A
+    # torchvision whose compiled ops do not match torch fails inside
+    # `_meta_registrations`, at `torch.library.register_fake("torchvision::nms")`,
+    # and that raises RuntimeError. So the arm above could never fire for it and
+    # the user got the bare `operator torchvision::nms does not exist`.
+    if "torchvision::nms does not exist" in e_str:
+        raise RuntimeError(_TORCHVISION_BROKE)
     if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
         raise RuntimeError(
             f"***** numpy was likely upgraded mid-session without restarting the kernel. "

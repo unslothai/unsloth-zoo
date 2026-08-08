@@ -68,3 +68,39 @@ def test_every_named_arm_raises_runtime_error():
         i = arm.index(kind)
         end = next(b for b in bounds if b > i)
         assert "RuntimeError" in arm[i:end], f"{kind} does not raise RuntimeError"
+
+
+def _fallback_arm():
+    """The `except Exception` arm, which sees what the ImportError arm cannot.
+
+    Anchored after the Unpack handler, since the file has earlier
+    `except Exception` blocks that have nothing to do with this.
+    """
+    anchor = SOURCE.index("    from transformers.processing_utils import Unpack")
+    start = SOURCE.index("except Exception as e:", anchor)
+    return SOURCE[start:SOURCE.index("KWARGS_TYPE", start)]
+
+
+def test_the_nms_break_is_caught_where_it_actually_lands():
+    """A torchvision whose ops do not match torch fails inside
+    `_meta_registrations` at `register_fake("torchvision::nms")`, which raises
+    RuntimeError. The ImportError arm can never see it."""
+    arm = _fallback_arm()
+    assert "torchvision::nms does not exist" in arm, (
+        "the nms check exists only on the ImportError arm, where this error never arrives"
+    )
+    # And it must be diagnosed before the bare re-raise at the end swallows it.
+    assert arm.index("torchvision::nms") < arm.rindex("raise")
+
+
+def test_both_arms_give_the_same_instruction():
+    """One message, so the two arms cannot drift apart."""
+    assert SOURCE.count("_TORCHVISION_BROKE") >= 3, "the shared message is not used by both arms"
+    assert "force-reinstall --no-cache-dir torchvision" in SOURCE
+
+
+def test_an_unrelated_runtime_error_still_surfaces():
+    arm = _fallback_arm()
+    assert "raise" in arm.split("torchvision::nms")[-1], (
+        "unrecognised errors no longer reach the bare re-raise"
+    )
