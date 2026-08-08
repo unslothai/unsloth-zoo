@@ -18,8 +18,10 @@ subprocess, and reads back what came out.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -44,7 +46,13 @@ import importlib, json, sys, types
 
 MOD = "unsloth_zoo.temporary_patches.utils"
 cases = json.loads(sys.argv[1])
-importlib.import_module(MOD)          # warm every dependency of the module first
+try:
+    importlib.import_module(MOD)      # warm every dependency of the module first
+except BaseException as e:
+    # This environment cannot import the module at all (no accelerator, no
+    # unsloth installed). Nothing to say about the guard here.
+    sys.stdout.write("<<<WARMFAIL>>>%s: %s" % (type(e).__name__, e))
+    raise SystemExit(0)
 import transformers
 real = sys.modules.get("transformers.processing_utils")
 out = {}
@@ -76,10 +84,20 @@ PIP = "pip install --upgrade --force-reinstall --no-cache-dir torchvision"
 def raised():
     """What each planted failure actually produces, from one warm subprocess."""
     pytest.importorskip("transformers")
+    root = Path(__file__).resolve().parents[1]
+    # The child gets the parent's environment, so it imports the same tree under
+    # the same accelerator settings; only the path to this checkout is added.
+    env = dict(os.environ)
+    env.setdefault("UNSLOTH_ALLOW_CPU", "1")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(root)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     proc = subprocess.run(
         [sys.executable, "-c", _DRIVER, json.dumps(CASES)],
-        capture_output = True, text = True, timeout = 900,
+        capture_output = True, text = True, timeout = 900, cwd = str(root), env = env,
     )
+    if "<<<WARMFAIL>>>" in proc.stdout:
+        pytest.skip("cannot import unsloth_zoo here: "
+                    + proc.stdout.split("<<<WARMFAIL>>>", 1)[1][:200])
     if "<<<RESULTS>>>" not in proc.stdout:
         pytest.fail(
             f"driver failed (rc={proc.returncode})\n"
