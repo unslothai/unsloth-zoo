@@ -32,6 +32,21 @@ from transformers import DataCollatorForSeq2Seq, DataCollatorWithPadding
 from unsloth_zoo.dataset_utils import train_on_responses_only
 
 
+@pytest.fixture(scope = "module", autouse = True)
+def _hand_back_a_clean_dynamo():
+    """A few hundred cases here leave torch._dynamo's code cache where they found
+    it plus their own. `test_rmsnorm_recompile_guards` asserts on a realistic
+    recompile budget, and in a full-suite run that accumulation pushed three of
+    its cases over; they pass again with this reset, and in isolation either way.
+    """
+    yield
+    try:
+        import torch
+        torch._dynamo.reset()
+    except Exception:
+        pass
+
+
 INSTRUCTION_PART = "<|user|>"
 RESPONSE_PART = "<|assistant|>"
 USER_ID, ASSISTANT_ID, PAD_ID = 1, 2, 0
@@ -340,6 +355,9 @@ def test_a_collator_holding_only_a_processor_is_repaired():
     """TRL's `DataCollatorForVisionLanguageModeling` keeps the processor under
     `.processor`, not `.tokenizer`, with the same problem. It rebuilds labels
     through that processor, so it is a class we know how to answer for."""
+    # Skipped, not errored, where TRL is absent: the macOS runner has no TRL and
+    # a bare import turned both of these red on a gap in the runner, not the code.
+    pytest.importorskip("trl.trainer.sft_trainer")
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 
     trainer = _text_only_trainer()
@@ -350,6 +368,7 @@ def test_a_collator_holding_only_a_processor_is_repaired():
 
 
 def test_a_collator_holding_only_a_processor_under_packing_is_refused():
+    pytest.importorskip("trl.trainer.sft_trainer")
     from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 
     trainer = _text_only_trainer()
