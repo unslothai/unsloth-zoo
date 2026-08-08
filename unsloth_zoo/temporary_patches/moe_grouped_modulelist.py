@@ -88,12 +88,19 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     except RuntimeError as e:
         if "strides should be multiple of 16 bytes" not in str(e):
             raise
-        outs, start = [], 0
-        for i, end in enumerate(offs.detach().cpu().tolist()):
-            if start < end:
-                outs.append(torch.matmul(x[start:end], w[i]))
-            start = end
-        return torch.cat(outs, 0) if outs else x.new_empty((0, w.shape[-1]))
+        # Shared with moe_utils, not looped here: a loop tapes every per-group SLICE,
+        # whose shape is the router-decided group size, so non-reentrant checkpointing
+        # aborts the backward. Two callers tape this, so the hazard is reachable.
+        try:
+            from .moe_utils import _manual_grouped_mm
+        except Exception:
+            outs, start = [], 0
+            for i, end in enumerate(offs.detach().cpu().tolist()):
+                if start < end:
+                    outs.append(torch.matmul(x[start:end], w[i]))
+                start = end
+            return torch.cat(outs, 0) if outs else x.new_empty((0, w.shape[-1]))
+        return _manual_grouped_mm(x, w, offs)
 
 
 def _expert_weight(lin, dtype):
