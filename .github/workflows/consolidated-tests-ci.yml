@@ -349,6 +349,7 @@ jobs:
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
+            tests/test_torchvision_video_removed_message.py \
             tests/test_upstream_pinned_symbols_trl_vllm.py \
             tests/test_upstream_pinned_symbols_accelerator.py \
             tests/test_zoo_history_regressions_deep.py \
