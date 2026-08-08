@@ -17,6 +17,7 @@ subprocess, and reads back what came out.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -87,10 +88,18 @@ PIP = "pip install --upgrade --force-reinstall --no-cache-dir torchvision"
 def raised():
     """What each planted failure actually produces, from one warm subprocess."""
     pytest.importorskip("transformers")
-    # Skip only where THIS process cannot import it either (no accelerator, no
-    # unsloth installed); the child inherits the environment, so anything the
-    # parent can import the child must too.
-    pytest.importorskip("unsloth_zoo.temporary_patches.utils")
+    # NOT `importorskip` on the module under test: it catches an ImportError
+    # raised while INITIALISING the module too, so a real init regression would
+    # skip all of these and leave the gate this file is listed in green. Skip
+    # only on the two absent-prerequisite guards `unsloth_zoo/__init__.py`
+    # raises; anything else is re-raised and fails.
+    try:
+        importlib.import_module("unsloth_zoo.temporary_patches.utils")
+    except BaseException as exc:
+        text = f"{type(exc).__name__}: {exc}"
+        if "pip install unsloth" in text or "accelerator" in text:
+            pytest.skip("prerequisite absent here -- " + text)
+        raise
     root = Path(__file__).resolve().parents[1]
     # The child gets the parent's environment, so it imports the same tree under
     # the same accelerator settings; only the path to this checkout is added.
