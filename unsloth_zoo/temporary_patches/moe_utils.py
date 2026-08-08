@@ -184,7 +184,7 @@ def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
 # every term, so a swap escapes only by matching ALL of these AND the norm below.
 _SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
 
-# Squared row norm, carried beside the projections. Not linear in the row, so the
+# Row 2-norm, carried beside the projections. Not linear in the row, so the
 # null-space argument above does not reach it: rows differing within that space
 # must also have equal norms to swap unseen.
 _SIGNATURE_EXTRA = 1
