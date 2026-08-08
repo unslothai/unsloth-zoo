@@ -269,6 +269,13 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
     # The latch is module-level, permanent and untouched by reset(), so restore it or
     # every later test in this worker silently gets the eager kernel.
     saved = {k: dict(k._unsloth_fallback_state) for k in kernels}
+    # Exhaustion no longer latches on its own: the wrapper borrows extra budget
+    # and retries compiled, so a limit of 1 becomes 65 and the eight variants
+    # never run out. Deny the loan, which is the state under test: nothing left
+    # to borrow, so eager or abort.
+    import unsloth_zoo.temporary_patches.utils as _U
+    _real_bump = _U._bump_recompile_limits
+    _U._bump_recompile_limits = lambda *a, **k: False
     try:
         torch._dynamo.reset()
         with torch._dynamo.config.patch(**{_LIMIT_KEY: 1, "suppress_errors": False}):
@@ -285,6 +292,7 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
             "the cache was never actually exhausted, so this asserted nothing"
         )
     finally:
+        _U._bump_recompile_limits = _real_bump
         for kernel, state in saved.items():
             kernel._unsloth_fallback_state.clear()
             kernel._unsloth_fallback_state.update(state)

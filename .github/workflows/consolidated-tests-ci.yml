@@ -153,6 +153,7 @@ jobs:
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_python39_compatibility.py \
+            tests/test_checkpoint_modes.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

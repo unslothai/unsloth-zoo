@@ -158,7 +158,9 @@ def test_decorated_forward_keeps_the_disable_classification(tmp_path, monkeypatc
     compiled = compiler.create_standalone_class(
         "FakeGatedDeltaNet", "fake_bare_closure_disable", dir(module), disable = False,
     )
-    assert "@torch.compile(" in compiled
+    # A compile decorator, whichever spelling: fullgraph regions are emitted
+    # as `torch_compile_with_fallback` so cache exhaustion cannot hard-fail.
+    assert "@torch_compile_with_fallback(" in compiled or "@torch.compile(" in compiled
 
 
 def test_decorated_forward_runs_and_fires_the_decorator_exactly_once(tmp_path, monkeypatch):
