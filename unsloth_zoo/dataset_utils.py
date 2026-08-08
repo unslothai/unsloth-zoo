@@ -390,6 +390,52 @@ def _model_forward_parameter_names(model):
     return names
 
 
+def _labels_are_token_level(dataset, sample):
+    """Is a raw split's `labels` column token-level supervision? True / False /
+    None for "cannot tell".
+
+    Judging by the first row's value alone is wrong twice over: a nullable
+    token-level column whose first row is null looks like no column at all, and
+    dropping it makes the masking pass rebuild labels from `input_ids`, silently
+    un-masking exactly what the caller masked. So ask the FEATURE first, then
+    the first NON-null row, then give up.
+
+    Everything here is duck-typed rather than version-gated: `Sequence`, `List`
+    and `LargeList` all expose their element type as `.feature`, a bare `[...]`
+    is the other list spelling, and `Value` / `ClassLabel` are the scalar ones.
+    """
+    features = getattr(dataset, "features", None)
+    feature = None
+    try:
+        if features is not None: feature = features["labels"]
+    except (KeyError, TypeError): feature = None
+    if feature is not None:
+        if isinstance(feature, (list, tuple)) or hasattr(feature, "feature"): return True
+        if type(feature).__name__ in ("Value", "ClassLabel"): return False
+        return None  # some nested/unknown feature: ambiguous, and the caller keeps
+    # No usable features: an in-memory dict-of-lists, or an IterableDataset.
+    value = sample.get("labels") if isinstance(sample, dict) else None
+    if value is None:
+        # Scan for the first non-null row, capped so a streaming or huge split
+        # is not walked end to end for a column verdict.
+        try:
+            for i, row in enumerate(dataset):
+                if i >= 100: break
+                if not isinstance(row, dict): break
+                value = row.get("labels")
+                if value is not None: break
+        except Exception: value = None
+    if value is None: return None
+    # A string/bytes `labels` is a class NAME, not tokens; it can never be
+    # supervision, so it goes with the other raw columns.
+    if isinstance(value, (str, bytes)): return False
+    try:
+        len(value)
+        return True
+    except TypeError:
+        return False
+
+
 def _case_variants(trainer, keys):
     """`keys` plus the spellings the trainer's own splits actually use.
 
@@ -891,14 +937,15 @@ def train_on_responses_only(
             # sent an int into `_train_on_responses_only`, which calls
             # `len(old_labels)` on it: `TypeError: object of type 'int' has no
             # len()`. A scalar is metadata for the tokenized split and goes with
-            # the other raw columns, unless `forward` asks for it above.
-            _sample_labels = sample.get("labels") if isinstance(sample, dict) else None
-            if _sample_labels is not None and not isinstance(_sample_labels, (str, bytes)):
-                try:
-                    len(_sample_labels)
-                    _keep = _keep | {"labels"}
-                except TypeError:
-                    pass
+            # the other raw columns. This has to DISCARD rather than decline to
+            # add: `_keep` already holds every name `forward` declares, and every
+            # causal LM declares `labels`, so the scalar was kept regardless.
+            # Ambiguity resolves to keeping: a kept scalar raises loudly at the
+            # masking pass, while a dropped sequence corrupts the run in silence.
+            if _labels_are_token_level(dataset, sample) is False:
+                _keep = _keep - {"labels"}
+            else:
+                _keep = _keep | {"labels"}
             # The raw text always goes, whatever else asks for it: it was just
             # turned into `input_ids`, and a `forward` that happens to declare a
             # `text` parameter would otherwise keep the string column for the

@@ -3181,3 +3181,65 @@ def test_a_sized_labels_value_is_still_treated_as_supervision():
 
     assert "labels" in out.train_dataset.column_names
     assert len(out.train_dataset["labels"][0]) == len(ROW)
+
+
+class LabelTakingModel:
+    """The ordinary causal-LM signature: `forward` declares `labels`."""
+    def forward(self, input_ids = None, attention_mask = None, labels = None): ...
+
+
+def test_a_scalar_labels_column_is_dropped_even_when_forward_declares_labels():
+    """The keep-list starts from everything `forward` names, and every causal LM
+    names `labels`, so a scalar `labels` was already kept before the scalar check
+    ran -- and that check only ever added. The int reached the masking pass:
+    `TypeError: object of type 'int' has no len()`."""
+    trainer = _text_only_trainer()
+    trainer.model = LabelTakingModel()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"],
+        "labels": [3],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert len(out.eval_dataset["labels"][0]) == len(out.eval_dataset["input_ids"][0])
+
+
+def test_a_nullable_token_level_labels_column_survives_a_null_first_row():
+    """The scalar/sequence verdict was read off row 0 alone. A nullable
+    token-level `labels` column whose first row is null therefore looked absent,
+    the column was dropped, and the masking pass regenerated labels from
+    `input_ids` -- silently un-masking what the caller had masked."""
+    text = f"{INSTRUCTION_PART}ab{RESPONSE_PART}cd"
+    ids = StubTokenizer._ids(text)
+    old = [-100] * len(ids)
+    old[-1] = ids[-1]                    # the caller kept only the final token
+
+    trainer = _text_only_trainer()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [text, text],
+        "labels": [None, list(old)],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert out.eval_dataset[1]["labels"] == old, "the caller's mask was silently dropped"
+
+
+def test_a_nullable_scalar_labels_column_is_still_dropped_on_a_null_first_row():
+    """The mirror of the above, and why the verdict is read off the feature and
+    not just "keep whatever might be a sequence": a nullable class-id column is
+    still a class id, and keeping it walks back into `len(int)`."""
+    trainer = _text_only_trainer()
+    trainer.model = LabelTakingModel()
+    trainer.eval_dataset = Dataset.from_dict({
+        "text": [f"{INSTRUCTION_PART}q{RESPONSE_PART}a"] * 2,
+        "labels": [None, 3],
+    })
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "labels" in out.eval_dataset.column_names
+    assert len(out.eval_dataset["labels"][0]) == len(out.eval_dataset["input_ids"][0])
