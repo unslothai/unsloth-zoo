@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """The wheel must ship unsloth_zoo and nothing else at the top level.
 
 setuptools auto-discovery used to package the repo's tests/ and scripts/ trees,
@@ -43,9 +59,27 @@ def _discover(config):
 
 def test_config_excludes_the_shared_trees():
     config = _find_config()
-    assert config.get("include") == ["unsloth_zoo*"]
+    assert config.get("include") == ["unsloth_zoo", "unsloth_zoo.*"]
     for name in ("tests*", "scripts*"):
         assert name in config.get("exclude", []), f"{name} must stay excluded"
+
+
+def test_a_sibling_of_the_package_is_not_discovered(tmp_path):
+    # "unsloth_zoo*" would match unsloth_zoo_cache/ and ship it as its own
+    # top-level package, which is the shape this whole change exists to stop.
+    from setuptools.discovery import PEP420PackageFinder
+
+    (tmp_path / "unsloth_zoo").mkdir()
+    (tmp_path / "unsloth_zoo" / "__init__.py").touch()
+    (tmp_path / "unsloth_zoo_cache").mkdir()
+    (tmp_path / "unsloth_zoo_cache" / "blob.py").touch()
+    config = _find_config()
+    found = PEP420PackageFinder.find(
+        where = str(tmp_path),
+        include = tuple(config["include"]),
+        exclude = tuple(config["exclude"]),
+    )
+    assert sorted(found) == ["unsloth_zoo"]
 
 
 def test_only_unsloth_zoo_is_discovered():
