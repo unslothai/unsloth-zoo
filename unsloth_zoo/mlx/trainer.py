@@ -584,6 +584,7 @@ from .preference import (
     PreferenceRunContext,
     build_reference_policy,
     create_preference_batch_plan,
+    encode_generation_prompt,
     make_dpo_loss_fn,
     make_orpo_loss_fn,
 )
@@ -884,6 +885,37 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
         return g * scale.astype(g.dtype)
 
     return tree_map(_clip_leaf_norm, grad)
+
+
+def _build_generation_defaults(args):
+    """Build the engine's sampling parameters, validating them as a side effect.
+
+    The engine validates in its own frozen dataclasses, so building them at
+    configuration time turns a crash at the first evaluation into a
+    configuration error. Values stay uncoerced: coercing would hide the type
+    checks this exists to run. Its messages name its own fields, so they are
+    restated against the config field the user set.
+    """
+    from .generate import GenerationDefaults, SamplingParams
+
+    try:
+        sampling = SamplingParams(temperature=args.generation_temperature)
+    except (TypeError, ValueError) as error:
+        raise type(error)(
+            f"Unsloth MLX preference: generation_temperature is invalid: {error}"
+        ) from error
+    try:
+        return GenerationDefaults(max_tokens=args.generation_max_tokens,
+                                  sampling=sampling)
+    except (TypeError, ValueError) as error:
+        raise type(error)(
+            f"Unsloth MLX preference: generation_max_tokens is invalid: {error}"
+        ) from error
+
+
+def _one_line(text, width):
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= width else flat[: width - 1] + "\u2026"
 
 
 def _global_grad_norm_fp32(grad):
@@ -1246,6 +1278,10 @@ class MLXTrainingConfig:
             "disable_dropout",
             "reference_free",
             "label_smoothing",
+            "generate_during_eval",
+            "num_generation_prompts",
+            "generation_max_tokens",
+            "generation_temperature",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1305,6 +1341,13 @@ class MLXORPOConfig(MLXTrainingConfig):
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    # An eval dataset feeds sampling, not scoring: these objectives report no
+    # eval loss. Batched decoding is not batch-invariant, so a prompt can decode
+    # differently depending on what shares its batch.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
 
 
 @dataclass(init=False)
@@ -1315,6 +1358,11 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    # As MLXORPOConfig; a referenced run also samples the frozen base policy.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
 
 
 def _shape_guard_report(
@@ -2085,6 +2133,7 @@ class MLXTrainer:
         # eval (eval_steps=0 or no eval dataset) does not report a prior run's
         # eval_loss/perplexity in its result. Repopulated by _evaluate.
         self._last_eval_metrics = {}
+        self.last_generation_samples = []
         self._early_stopped = False
         self._best_metric = None
         self._best_step = None
@@ -5126,6 +5175,7 @@ class MLXTrainer:
                     f"silently restart from step 0."
                 ) from e
 
+        _sampling_reference = None
         if preference_kind:
             if preference_kind == "orpo":
                 loss_fn = make_orpo_loss_fn(beta=args.beta)
@@ -5144,6 +5194,9 @@ class MLXTrainer:
                     ),
                 )
                 self._preference_reference_provenance = provenance
+                # Sampling borrows this policy's adapter modules so it zeroes
+                # the same ones the loss does. NEFTune is already off in eval.
+                _sampling_reference = reference_policy
                 loss_fn = make_dpo_loss_fn(
                     beta=args.beta,
                     label_smoothing=args.label_smoothing,
@@ -6116,8 +6169,102 @@ class MLXTrainer:
             steps = 0
             train_time = 0
 
+        def _generation_rows():
+            """Yield (split_name, row) — a dict of splits is resolved, not
+            iterated with its keys read as prompts. Positional, so successive
+            evaluations sample the same prompts and drift is readable."""
+            limit = int(args.num_generation_prompts)
+            splits = (
+                self.eval_dataset if isinstance(self.eval_dataset, dict)
+                else {None: self.eval_dataset}
+            )
+            for name, split in splits.items():
+                taken = 0
+                for raw in split:
+                    row = (
+                        self.formatting_func(raw)
+                        if self.formatting_func is not None else raw
+                    )
+                    yield name, row
+                    taken += 1
+                    if taken >= limit:
+                        break
+
+        def _sample_generations(current_step):
+            from .generate import GenerationRequest, generate_batch
+
+            labels, prompts, requests = [], [], []
+            for name, row in _generation_rows():
+                text, prompt_ids = encode_generation_prompt(
+                    self.tokenizer, row,
+                    max_seq_length=args.max_seq_length,
+                    max_new_tokens=args.generation_max_tokens,
+                )
+                labels.append(name)
+                prompts.append(text)
+                requests.append(GenerationRequest(prompt_token_ids=prompt_ids))
+            if not requests:
+                _main_print("  Gen   eval dataset has no rows to sample; skipping.")
+                self.last_generation_samples = []
+                return
+
+            defaults = self._generation_defaults
+            started = time.perf_counter()
+            # A temperature > 0 burst advances the global stream by a
+            # token-count-dependent amount, which would move later NEFTune noise.
+            with _preserved_preprocessing_rng():
+                policy = generate_batch(
+                    model, self.tokenizer, requests, defaults=defaults,
+                )
+                reference = None
+                modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
+                if modules and not self._distributed_should_stop():
+                    scales = [module.scale for module in modules]
+                    try:
+                        for module in modules:
+                            module.scale = 0.0
+                        reference = generate_batch(
+                            model, self.tokenizer, requests, defaults=defaults,
+                        )
+                    finally:
+                        for module, scale in zip(modules, scales):
+                            module.scale = scale
+            elapsed = time.perf_counter() - started
+
+            samples = [
+                {
+                    "split": labels[index],
+                    "prompt": prompts[index],
+                    "policy": item.text,
+                    "reference": None if reference is None else reference[index].text,
+                }
+                for index, item in enumerate(policy)
+            ]
+            self.last_generation_samples = samples
+            sampled = sum(len(item.token_ids) for item in policy)
+            if reference is not None:
+                sampled += sum(len(item.token_ids) for item in reference)
+            _main_print(
+                f"  Gen   {current_step}/{total_steps} | {len(policy)} prompts | "
+                f"{sampled} tokens | {elapsed:.1f}s"
+            )
+            for index, sample in enumerate(samples):
+                tag = "" if sample["split"] is None else f" [{sample['split']}]"
+                _main_print(f"    {index + 1}{tag} {_one_line(sample['prompt'], 96)}")
+                _main_print(f"        policy    {_one_line(sample['policy'], 96)}")
+                if sample["reference"] is not None:
+                    _main_print(
+                        f"        reference {_one_line(sample['reference'], 96)}"
+                    )
+
         def _run_eval(current_step):
             """Run eval and dispatch MLX/HF eval callbacks in DDP lockstep."""
+            if preference_kind and bool(getattr(args, "generate_during_eval", False)):
+                # No eval loss, so this stops before the metric machinery below.
+                if not self._distributed_should_stop():
+                    _sample_generations(current_step)
+                self.control.should_evaluate = False
+                return False
             current_eval_batches = _prepare_eval_batches()
             if not current_eval_batches:
                 self.control.should_evaluate = False
@@ -7458,16 +7605,53 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
+            # Best-model loading and early stopping need an eval loss this
+            # objective never produces. A cadence is optional: a callback can
+            # raise should_evaluate on its own.
+            _sampling_eval = bool(getattr(args, "generate_during_eval", False))
             if (
-                self.eval_dataset is not None
-                or args.eval_steps > 0
-                or args.load_best_model_at_end
+                args.load_best_model_at_end
                 or args.early_stopping_patience > 0
+                or (
+                    not _sampling_eval
+                    and (self.eval_dataset is not None or args.eval_steps > 0)
+                )
             ):
                 raise ValueError(
                     "Unsloth MLX preference: evaluation, best-model loading, "
-                    "and early stopping are not supported yet."
+                    "and early stopping are not supported yet. Set "
+                    "generate_during_eval=True to sample completions from an "
+                    "eval dataset instead of scoring it."
                 )
+            if _sampling_eval:
+                if self.eval_dataset is None:
+                    raise ValueError(
+                        "Unsloth MLX preference: generate_during_eval needs an "
+                        "eval_dataset to sample prompts from."
+                    )
+                if int(args.generation_max_tokens) >= int(args.max_seq_length):
+                    raise ValueError(
+                        "Unsloth MLX preference: generation_max_tokens must be "
+                        "smaller than max_seq_length, or no prompt tokens remain."
+                    )
+                if int(args.num_generation_prompts) < 1:
+                    raise ValueError(
+                        "Unsloth MLX preference: num_generation_prompts must be "
+                        "at least 1."
+                    )
+                self._generation_defaults = _build_generation_defaults(args)
+                if _resolve_interval_steps(args.eval_steps, 1) <= 0:
+                    print(
+                        "Unsloth: generate_during_eval is on but no evaluation "
+                        "cadence is set; sampling runs only when a callback "
+                        "requests an evaluation."
+                    )
+                for _unused in ("per_device_eval_batch_size", "max_eval_batches"):
+                    if getattr(args, _unused, None) is not None:
+                        raise ValueError(
+                            f"Unsloth MLX preference: {_unused} does not apply to "
+                            "generate_during_eval, which runs no eval batches."
+                        )
             if self._batches is not None:
                 raise ValueError(
                     "Unsloth MLX preference: prebuilt SFT or response-masked "
