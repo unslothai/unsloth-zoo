@@ -39,6 +39,9 @@ CASES = [
     ("pillow",        "ImportError",  "cannot import name '_Ink' from 'PIL'"),
     ("numpy_uv",      "ImportError",  "cannot import name '_center' from 'numpy._core.umath'"),
     ("numpy_stale",   "RuntimeError", "numpy.core._multiarray_umath failed to import"),
+    # Same substring, module present: a missing SYMBOL, which reinstalling does not fix.
+    ("video_symbol",  "ImportError",
+     "cannot import name 'read_video' from 'torchvision.io.video'"),
 ]
 
 _DRIVER = r'''
@@ -84,6 +87,10 @@ PIP = "pip install --upgrade --force-reinstall --no-cache-dir torchvision"
 def raised():
     """What each planted failure actually produces, from one warm subprocess."""
     pytest.importorskip("transformers")
+    # Skip only where THIS process cannot import it either (no accelerator, no
+    # unsloth installed); the child inherits the environment, so anything the
+    # parent can import the child must too.
+    pytest.importorskip("unsloth_zoo.temporary_patches.utils")
     root = Path(__file__).resolve().parents[1]
     # The child gets the parent's environment, so it imports the same tree under
     # the same accelerator settings; only the path to this checkout is added.
@@ -96,8 +103,12 @@ def raised():
         capture_output = True, text = True, timeout = 900, cwd = str(root), env = env,
     )
     if "<<<WARMFAIL>>>" in proc.stdout:
-        pytest.skip("cannot import unsloth_zoo here: "
-                    + proc.stdout.split("<<<WARMFAIL>>>", 1)[1][:200])
+        # A FAILURE, not a skip. The parent just imported the module, so a child
+        # that cannot is a real initialization regression -- and a skip reads as
+        # success to the CI gate this file is listed in, which would leave both
+        # handlers unexercised and every required check green.
+        pytest.fail("the child could not import what this process already did: "
+                    + proc.stdout.split("<<<WARMFAIL>>>", 1)[1][:400])
     if "<<<RESULTS>>>" not in proc.stdout:
         pytest.fail(
             f"driver failed (rc={proc.returncode})\n"
@@ -144,6 +155,16 @@ def test_an_unrelated_import_error_still_falls_through(raised):
     got = raised["unrelated_imp"]
     assert got["type"] == "Exception", got
     assert "flash_attn" in got["message"]
+
+
+def test_a_missing_symbol_is_not_called_an_incomplete_install(raised):
+    """`cannot import name 'read_video' from 'torchvision.io.video'` holds the
+    same substring while the module is right there, so the incomplete-install
+    message would be false and its force-reinstall would not fix it."""
+    got = raised["video_symbol"]
+    assert "install is incomplete" not in (got["message"] or "")
+    assert got["type"] == "Exception", got
+    assert "read_video" in got["message"]
 
 
 def test_the_untouched_arms_still_answer(raised):

@@ -283,10 +283,14 @@ except ImportError as e:
         )
     elif "torchvision::nms does not exist" in e:
         raise RuntimeError(_TORCHVISION_BROKE)
-    elif "torchvision.io.video" in e or "torchvision.io._video" in e:
+    elif "No module named 'torchvision.io.video'" in e or \
+         "No module named 'torchvision.io._video'" in e:
         # A half-installed torchvision, like the nms arm above. No release raises
         # this alone (0.25 ships `io/video.py`, 0.26 dropped it with its importer),
         # so only a tree partly overwritten by a venv install gets here.
+        # The MISSING-MODULE form only: `cannot import name 'read_video' from
+        # 'torchvision.io.video'` carries the same substring while the module is
+        # right there, and the message below would then be a lie.
         raise RuntimeError(
             f"***** Your torchvision install is incomplete: `torchvision.io` "
             f"imports a `video` module that is not there. Please run "
