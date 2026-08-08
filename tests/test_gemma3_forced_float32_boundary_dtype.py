@@ -259,9 +259,9 @@ def test_linear_boundary_dtype_reads_the_first_floating_point_projection_weight(
     assert _linear_boundary_dtype(bfloat16_module, *names) == torch.bfloat16
 
     # bitsandbytes 4bit keeps the base weight as a packed uint8 blob, which is not
-    # floating point: fall through to the float16 default this path always used.
+    # floating point: no weight answers, so leave the activation alone.
     quantized_module = _Projections(**{name: _Projections(weight = torch.zeros(8, 1, dtype = torch.uint8)) for name in names})
-    assert _linear_boundary_dtype(quantized_module, *names) == torch.float16
+    assert _linear_boundary_dtype(quantized_module, *names) is None
 
     # A uint8 blob must be skipped rather than end the search: the fp32 weight wins.
     mixed_module = _Projections(
@@ -271,8 +271,112 @@ def test_linear_boundary_dtype_reads_the_first_floating_point_projection_weight(
     assert _linear_boundary_dtype(mixed_module, *names) == torch.float32
 
     # No projections at all, and projections explicitly set to None.
-    assert _linear_boundary_dtype(_Projections(), *names) == torch.float16
-    assert _linear_boundary_dtype(_Projections(**{name: None for name in names}), *names) == torch.float16
+    assert _linear_boundary_dtype(_Projections(), *names) is None
+    assert _linear_boundary_dtype(_Projections(**{name: None for name in names}), *names) is None
+
+
+_FLOAT8_DTYPES = [
+    getattr(torch, name) for name in
+    ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+]
+
+
+@pytest.mark.parametrize("float8_dtype", _FLOAT8_DTYPES, ids = lambda d: str(d).split(".")[-1])
+def test_a_float8_storage_weight_is_not_read_as_an_activation_dtype(float8_dtype):
+    """`torch.float8_e4m3fn.is_floating_point` is True, so a plain floating-point
+    test hands back float8 and the caller casts the hidden states straight to it.
+
+    transformers' FP8Linear / FbgemmFp8Linear take bfloat16 or float16 in and do
+    their own scaled quantization, so an unscaled cast loses values before the
+    scaling meant to preserve them, and the Q/K norm and SDPA downstream get a
+    dtype they do not support.
+    """
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    fp8_module = _Projections(**{
+        name: _Projections(weight = torch.zeros(8, 8).to(float8_dtype)) for name in names
+    })
+    assert float8_dtype.is_floating_point, "the decoy must look like a float to the old test"
+    assert _linear_boundary_dtype(fp8_module, *names) is None
+
+    # It is skipped, not treated as terminal: a real compute dtype further along wins.
+    mixed = _Projections(
+        q_proj = _Projections(weight = torch.zeros(8, 8).to(float8_dtype)),
+        k_proj = torch.nn.Linear(4, 4, bias = False, dtype = torch.bfloat16),
+    )
+    assert _linear_boundary_dtype(mixed, *names) == torch.bfloat16
+
+
+def test_a_bfloat16_activation_survives_a_4bit_model():
+    """The generic (non-forced) path installs on 4bit QLoRA with bfloat16
+    activations. Every projection is a uint8 blob there, so nothing answers, and
+    a float16 fallback would narrow bfloat16 to float16 on a forward the
+    unpatched model passed through untouched, costing exactly the exponent range
+    bfloat16 is chosen for.
+    """
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    quantized = _Projections(**{
+        name: _Projections(weight = torch.zeros(8, 1, dtype = torch.uint8)) for name in names
+    })
+    hidden_states = torch.randn(2, 3, dtype = torch.bfloat16)
+    boundary = _linear_boundary_dtype(quantized, *names)
+    out = _to_boundary_dtype(hidden_states, boundary)
+    assert out is hidden_states, "the activation was copied or narrowed"
+    assert out.dtype == torch.bfloat16
+
+
+def test_every_patch_installing_a_boundary_forward_publishes_the_helpers():
+    """The auto-compiler serializes these forwards into unsloth_compiled_cache and
+    resolves their free names by importing from the modeling module. A helper that
+    lives only in the patch module is not importable there, so the generated
+    forward dies with NameError on its first call.
+
+    Read off the source rather than asserted by name, so adding a fourth patch
+    that uses the helpers without publishing them fails here.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(gemma_patches.__file__).read_text(encoding = "utf-8")
+    tree = ast.parse(source)
+    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype"}
+
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("patch_"):
+            continue
+        called = {
+            n.func.id for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        if not (helpers & called):
+            continue
+        if "_publish_boundary_helpers" not in called:
+            offenders.append(node.name)
+
+    assert not offenders, (
+        f"{offenders} install a forward calling {sorted(helpers)} without calling "
+        f"_publish_boundary_helpers, so the compiled copy raises NameError"
+    )
+
+
+def test_the_publish_check_actually_finds_the_patches():
+    """Guard the guard: if the AST walk stopped matching, the test above would
+    pass with an empty offender list and prove nothing."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(gemma_patches.__file__).read_text(encoding = "utf-8"))
+    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype"}
+    using = [
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("patch_")
+        and (helpers & {
+            n.func.id for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        })
+    ]
+    assert len(using) >= 3, f"expected the MLP and both attention patches, found {using}"
 
 
 def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_matches():

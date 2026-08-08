@@ -47,8 +47,33 @@ import inspect
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
+def _storage_only_float_dtypes():
+    """float8 dtypes, which are a storage format rather than a compute dtype.
+
+    `torch.float8_e4m3fn.is_floating_point` is True, so a plain floating-point
+    test reads an FP8 checkpoint's stored weight as the dtype its Linear wants
+    its activations in. It is not: transformers' `FP8Linear` / `FbgemmFp8Linear`
+    take bfloat16 or float16 in, do their own scaled quantization, and hand back
+    the input dtype. Casting the hidden states straight to unscaled float8 would
+    throw away range before the scaling that exists to preserve it, and leave
+    the Q/K norm and SDPA downstream holding a dtype they do not support.
+
+    Built by lookup rather than hard-coded, so a torch that predates one of
+    these (or adds another) neither raises nor silently stops excluding it.
+    """
+    names = ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz",
+             "float8_e8m0fnu")
+    return frozenset(
+        dtype for dtype in (getattr(torch, name, None) for name in names)
+        if dtype is not None
+    )
+pass
+
+_STORAGE_ONLY_FLOAT_DTYPES = _storage_only_float_dtypes()
+
+
 def _linear_boundary_dtype(module, *attr_names):
-    """Dtype of the activations that the given projections expect.
+    """Dtype of the activations that the given projections expect, or None.
 
     The UNSLOTH_FORCE_FLOAT32 Gemma3 patches run the heavy reductions (RMSNorm
     variance, SwiGLU, attention) in float32 for fp16 overflow safety and hand a
@@ -59,18 +84,26 @@ def _linear_boundary_dtype(module, *attr_names):
     matmul dies with "expected mat1 and mat2 to have the same dtype".
 
     So read the dtype off the weights that will actually do the multiply. The
-    first floating-point weight wins; bitsandbytes stores a 4bit base weight as
-    a uint8 blob, which is not floating point and is therefore skipped, leaving
-    the float16 default that path already used.
+    first ordinary floating-point weight wins.
+
+    None means "no weight answered, so leave the activation alone". It is not
+    float16. bitsandbytes stores a 4bit base weight as a uint8 blob, so on a
+    4bit model every projection is skipped, and a float16 default would narrow
+    a bfloat16 QLoRA activation on the generic (non-forced) path that the
+    unpatched forward passed through untouched -- costing exactly the exponent
+    range bfloat16 is chosen for. Under UNSLOTH_FORCE_FLOAT32 the activation
+    reaching here is already float16 out of RMSNorm, so "leave it alone" and
+    the old float16 default are the same value on that path.
     """
     for name in attr_names:
         module_or_param = getattr(module, name, None)
         if module_or_param is None: continue
         weight = getattr(module_or_param, "weight", module_or_param)
         dtype = getattr(weight, "dtype", None)
-        if dtype is not None and dtype.is_floating_point:
-            return dtype
-    return torch.float16
+        if dtype is None or not dtype.is_floating_point: continue
+        if dtype in _STORAGE_ONLY_FLOAT_DTYPES: continue
+        return dtype
+    return None
 pass
 
 
@@ -80,9 +113,29 @@ def _to_boundary_dtype(x, dtype):
     float16 weights (LoRA / QLoRA) hit the identity branch on every call, so the
     common path keeps exactly the casts it had before and its numerics are
     unchanged. Only the float32 full-finetuning mismatch actually converts.
+    A None dtype is the "no weight answered" case and is also identity.
     """
-    if x.dtype == dtype: return x
+    if dtype is None or x.dtype == dtype: return x
     return x.to(dtype)
+pass
+
+
+def _publish_boundary_helpers(modeling_module):
+    """Make the two boundary helpers importable from the modeling module.
+
+    The auto-compiler serializes a patched forward into unsloth_compiled_cache
+    as source text, and `create_new_function` resolves the free names it finds
+    by importing them from `transformers.models.gemma3.modeling_gemma3`. A
+    helper that lives only in this patch module is not there, so the generated
+    forward raises NameError the first time it runs and compiled Gemma3
+    training dies. The RMSNorm helpers are published for exactly this reason;
+    every forward below references these two, so they need it too.
+    """
+    publish_to_modeling_module(
+        modeling_module,
+        _linear_boundary_dtype = _linear_boundary_dtype,
+        _to_boundary_dtype     = _to_boundary_dtype,
+    )
 pass
 
 
@@ -530,6 +583,8 @@ def patch_Gemma3MLP():
     except Exception as e:
         return raise_error("Gemma3MLP.forward", e)
 
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
     def forward(self, x): # x is fp16 from RMSNorm, or fp32 once full finetuning upcasts
         # RMSNorm always emits fp16. That matches fp16 projection weights (LoRA),
         # but full finetuning upcasts these Linears to fp32, so meet them there.
@@ -562,6 +617,8 @@ def patch_Gemma3Attention():
         from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
@@ -810,6 +867,8 @@ def patch_Gemma3Attention_generic():
         from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
