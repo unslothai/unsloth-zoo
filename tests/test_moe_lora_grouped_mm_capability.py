@@ -535,3 +535,39 @@ def test_writing_in_place_changes_no_gradient(unsupported):
         start = end
     assert torch.equal(x.grad, ref_x)
     assert torch.equal(w.grad, ref_w)
+
+
+def test_higher_order_gradients_still_work(unsupported):
+    """`out=` refuses autograd, so the in-place write has to stand down when the
+    backward itself is being differentiated. `torch._grouped_mm` double-backwards
+    on a supported device (checked on a B200, torch 2.9.1), so a fallback that
+    raised there would make the answer depend on the card."""
+    inputs, weight, offsets = _case()
+    x = inputs.detach().clone().requires_grad_(True)
+    w = weight.detach().clone().requires_grad_(True)
+    out = M._ManualGroupedMM.apply(x, w, offsets)
+    (grad_x,) = torch.autograd.grad(out.sum(), x, create_graph = True)
+    (second,) = torch.autograd.grad(grad_x.sum(), w)
+
+    # Same quantity off plain autograd over the per-group loop.
+    rx = inputs.detach().clone().requires_grad_(True)
+    rw = weight.detach().clone().requires_grad_(True)
+    parts, start = [], 0
+    for expert_idx, end in enumerate(offsets.tolist()):
+        parts.append(rx[start:end] @ rw[expert_idx])
+        start = end
+    (ref_grad_x,) = torch.autograd.grad(
+        torch.cat(parts, 0).sum(), rx, create_graph = True)
+    (ref_second,) = torch.autograd.grad(ref_grad_x.sum(), rw)
+    torch.testing.assert_close(second, ref_second)
+
+
+def test_an_ordinary_backward_still_writes_in_place(unsupported):
+    """The guard above must not cost the common case: the engine runs a plain
+    backward with grad mode off, so `out=` still applies."""
+    inputs, weight, offsets = _case()
+    out = M._ManualGroupedMM.apply(
+        inputs.requires_grad_(True), weight.requires_grad_(True), offsets)
+    assert torch.is_grad_enabled()          # the caller's mode is irrelevant
+    seen = _backward_matmul_out_usage(out, torch.ones_like(out))
+    assert seen and all(seen), seen

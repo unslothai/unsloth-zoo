@@ -309,8 +309,13 @@ class _ManualGroupedMM(torch.autograd.Function):
         # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
         # A cast needs the temporary anyway, and a non-contiguous destination would put
         # the copy back, so both keep the plain path.
+        # Grad mode first: it is off for an ordinary backward and ON only under
+        # `create_graph = True`, where `out=` raises "functions with out=... arguments
+        # don't support automatic differentiation". The fused path double-backwards
+        # fine, so the fallback has to as well; the plain branch is differentiable.
         direct = (
-            inputs.dtype == weight.dtype == compute_dtype
+            not torch.is_grad_enabled()
+            and inputs.dtype == weight.dtype == compute_dtype
             and (grad_inputs is None or grad_inputs.is_contiguous())
             and (grad_weight is None or grad_weight.is_contiguous())
         )
