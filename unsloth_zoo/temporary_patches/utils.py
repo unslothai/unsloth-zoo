@@ -284,11 +284,9 @@ except ImportError as e:
     elif "torchvision::nms does not exist" in e:
         raise RuntimeError(_TORCHVISION_BROKE)
     elif "torchvision.io.video" in e or "torchvision.io._video" in e:
-        # A HALF-INSTALLED torchvision, same class as the nms arm above. No
-        # released version raises this alone: 0.25 ships `io/video.py`, and 0.26
-        # dropped the module and its importer together. A venv installing over a
-        # system torchvision leaves the tree partly overwritten, so reinstalling
-        # is the fix and upgrading anything else is not.
+        # A half-installed torchvision, like the nms arm above. No release raises
+        # this alone (0.25 ships `io/video.py`, 0.26 dropped it with its importer),
+        # so only a tree partly overwritten by a venv install gets here.
         raise RuntimeError(
             f"***** Your torchvision install is incomplete: `torchvision.io` "
             f"imports a `video` module that is not there. Please run "
@@ -308,11 +306,9 @@ except ImportError as e:
     )
 except Exception as e:
     e_str = str(e)
-    # Same breakage as the ImportError arm, but it does not arrive as one. A
+    # The nms arm above, for the case that never arrives as an ImportError: a
     # torchvision whose compiled ops do not match torch fails inside
-    # `_meta_registrations`, at `torch.library.register_fake("torchvision::nms")`,
-    # and that raises RuntimeError. So the arm above could never fire for it and
-    # the user got the bare `operator torchvision::nms does not exist`.
+    # `_meta_registrations` at `register_fake("torchvision::nms")`, a RuntimeError.
     if "torchvision::nms does not exist" in e_str:
         raise RuntimeError(_TORCHVISION_BROKE)
     if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
