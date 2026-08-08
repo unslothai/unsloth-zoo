@@ -888,13 +888,12 @@ def _note_packed_under_checkpoint():
     top = _saved_tensor_hook_accessor()
     if top is None:
         # torch < 2.8 has no accessor, so ask the frames. Latching regardless
-        # marked EVERY call on 2.4-2.7 as packed, which makes `_give_up`
-        # rethrow: the one path this wrapper exists to avoid. Dropping the
-        # observation was wrong the other way, since the give-up walk only sees
-        # a region open around the FAILING call, so a layer that packed compiled
-        # and returned got latched eager by a later wrapper exhausting the
-        # budget outside any region. Self-limiting: the flag latches on the
-        # first hit and this returns immediately afterwards.
+        # marked EVERY call on 2.4-2.7 as packed, making `_give_up` rethrow -- the
+        # one path this wrapper exists to avoid. Dropping the observation was
+        # wrong the other way: the give-up walk only sees a region open around
+        # the FAILING call, so a layer that packed compiled and returned got
+        # latched eager by a later wrapper exhausting the budget outside any
+        # region. Self-limiting: the flag latches on the first hit.
         if _probe_walk(): _PACKED_COMPILED_IN_CHECKPOINT = True
         return
     try:
@@ -1030,11 +1029,9 @@ _MAX_RECOMPILE_LIMIT_BUMPS = 4
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
-# name -> {bumped value: value it was bumped from}. A bump inside
-# `torch._dynamo.config.patch` records the context's temporary value, which the
-# exit restores anyway, so writing a single captured original back later would
-# overwrite it. Restore only a name still holding a value we wrote, back to the
-# baseline THAT value came from: bumps nest and the two orderings need opposite
+# name -> {bumped value: value it was bumped from}. Restore only a name still
+# holding a value we wrote, back to the baseline THAT value came from: bumps nest
+# inside `torch._dynamo.config.patch`, and the two orderings need opposite
 # answers, which one recorded original cannot give.
 #   bump 1024->1040, patch, bump inside, exit  -> dynamo hands back 1040, owes 1024
 #   patch(2), bump 2->18, exit, bump 8->24     -> live 24 owes 8, NOT the scoped 2
@@ -1065,14 +1062,11 @@ def _bump_recompile_limits(extra = _RECOMPILE_LIMIT_BUMP):
                     setattr(_config, name, current + extra)
                 except Exception:
                     continue
-                # Key the baseline by the value we wrote: the two scoped-patch
-                # orderings are indistinguishable at bump time and need opposite
-                # answers, and only the live value at restore time says which
-                # bump is still standing. A stack per value, not one entry,
-                # because a scoped patch can repeat a baseline -- bump 8->24,
-                # patch to 8, bump to 24 again -- and one entry collapsed the
-                # two debts, so the inner restore deleted both and the patch
-                # exit resurrected 24 with nothing left to hand back.
+                # Key the baseline by the value we wrote: only the live value
+                # at restore time says which bump is still standing. A stack per
+                # value, not one entry, because a scoped patch can repeat a
+                # baseline -- bump 8->24, patch to 8, bump to 24 again -- and one
+                # entry collapsed the two debts.
                 _BUMPED_RECOMPILE_LIMITS.setdefault(name, {}).setdefault(
                     current + extra, []).append(current)
                 _ORIGINAL_RECOMPILE_LIMITS.setdefault(name, current)
