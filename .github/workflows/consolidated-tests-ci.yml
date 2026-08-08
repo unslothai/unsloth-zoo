@@ -129,11 +129,22 @@ jobs:
         # so a 3.10-only `match` and a module-level `str | Path` both reached main and
         # made the package un-importable on 3.9. It reads the floor from pyproject, so
         # raising requires-python relaxes it rather than making it lie.
+        #
+        # The two test_mlx_incomplete_config files pin the diagnostic that turns a
+        # bare "ModelArgs/ModelConfig.__init__() missing N required positional
+        # arguments" into a message naming the model, the missing keys and
+        # config.json. Several of their assertions read loader.py's source to prove
+        # every mlx-lm / mlx-vlm load entry point is guarded, so a new load path
+        # added without the guard fails here rather than shipping the raw
+        # TypeError. CPU-pure via the MLX simulation shim, no weights, both files
+        # together run in about two tenths of a second.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_incomplete_config.py \
+            tests/test_mlx_incomplete_config_vlm.py \
             tests/test_hf_xet_fallback.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \

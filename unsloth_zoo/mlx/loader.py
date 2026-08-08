@@ -453,12 +453,18 @@ _MLX_MISSING_ARGS_RE = re.compile(
 
 
 def _missing_mlx_config_keys(message):
-    """Config keys mlx-lm's ModelArgs required but config.json did not supply.
+    """Config keys the arch's config dataclass required but config.json omitted.
 
     mlx-lm builds ModelArgs through ``from_dict``, which filters the config down
     to fields the dataclass declares. A field with no default that is absent
     from config.json therefore fails in ``__init__`` with a bare TypeError that
     names neither the model nor the file. Returns [] for any other TypeError.
+
+    mlx-vlm fails the same way and is matched by the same pattern: its
+    ``BaseModelConfig.from_dict`` (mlx_vlm/models/base.py) filters on
+    ``inspect.signature(cls).parameters`` before constructing, so a missing
+    required field surfaces as e.g. "ModelConfig.__init__() missing 1 required
+    positional argument: 'text_config'".
     """
     match = _MLX_MISSING_ARGS_RE.search(message)
     if match is None:
@@ -466,13 +472,19 @@ def _missing_mlx_config_keys(message):
     return re.findall(r"'([^']+)'", match.group("keys"))
 
 
-def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
+def _raise_if_incomplete_mlx_config(
+    model_name, model_type, message, error, library="mlx-lm",
+):
     """An incomplete config.json is a model-repo problem, not an MLX one.
 
     Mirroring a checkpoint through a transformers version that does not model
-    every field can silently drop keys the mlx-lm arch still requires (e.g.
-    lfm2's block_ff_dim). The raw TypeError reads like missing Apple Silicon
-    support, so name the actual cause."""
+    every field can silently drop keys the arch still requires (e.g. lfm2's
+    block_ff_dim on the text side, or a VLM's text_config / vision_config). The
+    raw TypeError reads like missing Apple Silicon support, so name the actual
+    cause.
+
+    ``library`` names the loader that rejected the config ("mlx-lm" or
+    "mlx-vlm") so the message points at the right project."""
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
@@ -480,7 +492,7 @@ def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
     plural = "keys" if len(keys) > 1 else "key"
     raise ValueError(
         f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
-        f"which mlx-lm's '{model_type or 'unknown'}' architecture requires and "
+        f"which {library}'s '{model_type or 'unknown'}' architecture requires and "
         f"cannot default. This is an incomplete config.json in the model repo - "
         f"MLX and Apple Silicon support are not the problem. Compare the config "
         f"against the upstream repo this model was mirrored from and add the "
@@ -1173,6 +1185,15 @@ def _load_mlx_vlm_with_extra_weight_filter(
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
+    except TypeError as error:
+        # A required config field absent from config.json fails in the arch's
+        # ModelConfig.__init__, not as the ValueError the extra-weight filter
+        # below handles. Only the first load can raise it: the retry runs after
+        # a ValueError, which means the config already constructed.
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, str(error), error, library="mlx-vlm",
+        )
+        raise
     except ValueError as error:
         message = str(error)
         # QK-norm weights are load-bearing: check before the extra-weight filter.
@@ -1298,6 +1319,14 @@ def _load_mlx_vlm_distributed(
         ) from error
     except TypeError as error:
         message = str(error)
+        # Checked first, and it is the precise test: the incomplete-config
+        # pattern is anchored on __init__, so mlx-vlm signature drift at our own
+        # call site ("sharded_load() got an unexpected keyword argument
+        # 'tensor_group'") can never match it and still reaches the drift
+        # branch below.
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, message, error, library="mlx-vlm",
+        )
         if "tensor_group" not in message and "pipeline_group" not in message:
             raise
         raise ImportError(
@@ -7476,6 +7505,17 @@ class FastMLXModel:
                             revision=revision,
                             **extra_kwargs,
                         )
+                    except TypeError as error:
+                        # Same bypass as the ValueError below: this load does not
+                        # go through _load_mlx_vlm_with_extra_weight_filter, so
+                        # the incomplete-config diagnostic has to be repeated
+                        # here or a runtime-quant VLM load keeps the bare
+                        # TypeError.
+                        _raise_if_incomplete_mlx_config(
+                            model_name, model_type, str(error), error,
+                            library="mlx-vlm",
+                        )
+                        raise
                     except ValueError as error:
                         # Pre-quantize load bypasses the extra-weight filter, so
                         # surface the QK-norm version gap here too.
