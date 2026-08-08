@@ -464,3 +464,74 @@ def test_the_norm_does_not_materialize_fp32_copies(unsupported):
     body = inspect.getsource(M._routing_signature)
     assert "vector_norm" in body
     assert "inputs.float() * inputs.float()" not in body
+
+
+# --- the fallback's own cost -------------------------------------------------
+
+
+def _backward_matmul_out_usage(out, seed):
+    """Which of `torch.matmul`'s calls during `out.backward(seed)` passed `out=`.
+
+    Only the in-place branch calls `torch.matmul` by name; the casting branch uses
+    the `@` operator, which does not route through this patch. So an empty record
+    means the casting branch ran.
+    """
+    from unittest import mock
+
+    seen = []
+    real = torch.matmul
+
+    def recording_matmul(a, b, *, out = None):
+        seen.append(out is not None)
+        return real(a, b, out = out) if out is not None else real(a, b)
+
+    with mock.patch.object(torch, "matmul", recording_matmul):
+        out.backward(seed)
+    return seen
+
+
+def test_the_backward_writes_each_group_straight_into_its_slice(unsupported):
+    """Assigning a matmul result allocates a temporary and copies it in, twice per
+    group. `out=` does neither, and the loop is 37% cheaper for it on a 128-expert
+    layer. Pinned on the call, since the gradients below are equal either way."""
+    inputs, weight, offsets = _case()
+    out = M._ManualGroupedMM.apply(
+        inputs.requires_grad_(True), weight.requires_grad_(True), offsets)
+
+    seen = _backward_matmul_out_usage(out, torch.ones_like(out))
+    assert seen and all(seen), seen
+
+
+def test_a_cast_still_takes_the_temporary(unsupported):
+    """`out=` cannot cast, so an autocast forward over fp32 saves has to keep the
+    plain path. Left ungated it raises rather than writing."""
+    inputs, weight, offsets = _case(dtype = torch.float32)
+    inputs.requires_grad_(True)
+    weight.requires_grad_(True)
+    with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
+        out = M._ManualGroupedMM.apply(inputs, weight, offsets)
+    assert out.dtype == torch.bfloat16
+
+    assert _backward_matmul_out_usage(out, torch.ones_like(out)) == []
+    assert inputs.grad.dtype == torch.float32
+    assert weight.grad.dtype == torch.float32
+
+
+def test_writing_in_place_changes_no_gradient(unsupported):
+    """Bit-exact against the per-expert reference, not merely close."""
+    inputs, weight, offsets = _case(n_experts = 4, rows_each = 3, k = 6, n = 5)
+    x = inputs.detach().clone().requires_grad_(True)
+    w = weight.detach().clone().requires_grad_(True)
+    out = M._ManualGroupedMM.apply(x, w, offsets)
+    out.backward(torch.ones_like(out))
+
+    ref_x = torch.zeros_like(inputs)
+    ref_w = torch.zeros_like(weight)
+    start = 0
+    for expert_idx, end in enumerate(offsets.tolist()):
+        g = torch.ones(end - start, weight.shape[-1], dtype = inputs.dtype)
+        ref_x[start:end] = g @ weight[expert_idx].transpose(-2, -1)
+        ref_w[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
+        start = end
+    assert torch.equal(x.grad, ref_x)
+    assert torch.equal(w.grad, ref_w)

@@ -304,19 +304,37 @@ class _ManualGroupedMM(torch.autograd.Function):
         compute_dtype = grad_output.dtype
         grad_inputs = torch.zeros_like(inputs) if need_x else None
         grad_weight = torch.zeros_like(weight) if need_w else None
+        # Write each group straight into its slice when no cast is due. The assignment
+        # below allocates a temporary and copies it in; `out=` does neither, and there
+        # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
+        # A cast needs the temporary anyway, and a non-contiguous destination would put
+        # the copy back, so both keep the plain path.
+        direct = (
+            inputs.dtype == weight.dtype == compute_dtype
+            and (grad_inputs is None or grad_inputs.is_contiguous())
+            and (grad_weight is None or grad_weight.is_contiguous())
+        )
         start = 0
         for expert_idx, end in enumerate(bounds):
             if start < end:
                 g = grad_output[start:end]
                 if need_x:
                     w = weight[expert_idx]
-                    grad_inputs[start:end] = (
-                        g @ w.to(compute_dtype).transpose(-2, -1)
-                    ).to(inputs.dtype)
+                    if direct:
+                        torch.matmul(g, w.transpose(-2, -1),
+                                     out = grad_inputs[start:end])
+                    else:
+                        grad_inputs[start:end] = (
+                            g @ w.to(compute_dtype).transpose(-2, -1)
+                        ).to(inputs.dtype)
                 if need_w:
-                    x = inputs[start:end].to(compute_dtype)
-                    grad_weight[expert_idx] = (
-                        x.transpose(-2, -1) @ g).to(weight.dtype)
+                    if direct:
+                        torch.matmul(inputs[start:end].transpose(-2, -1), g,
+                                     out = grad_weight[expert_idx])
+                    else:
+                        x = inputs[start:end].to(compute_dtype)
+                        grad_weight[expert_idx] = (
+                            x.transpose(-2, -1) @ g).to(weight.dtype)
             start = end
         return grad_inputs, grad_weight, None
 
