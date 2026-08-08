@@ -518,23 +518,38 @@ def test_a_cast_still_takes_the_temporary(unsupported):
 
 
 def test_writing_in_place_changes_no_gradient(unsupported):
-    """Bit-exact against the per-expert reference, not merely close."""
+    """Two references, because one of them cannot be exact everywhere.
+
+    Every group's gradient must land in ITS OWN slice: that is the risk in
+    writing through `out=`, and against a reference written the same way it is
+    bit-exact on any BLAS. Against the allocate-and-assign form it is only
+    numerically equal -- `out=` lets the kernel write the destination directly
+    instead of a fresh contiguous buffer, and the two round differently on some
+    BLAS builds (seen on the ubuntu CPU runner, not on this box or a B200).
+    """
     inputs, weight, offsets = _case(n_experts = 4, rows_each = 3, k = 6, n = 5)
     x = inputs.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)
     out = M._ManualGroupedMM.apply(x, w, offsets)
     out.backward(torch.ones_like(out))
 
-    ref_x = torch.zeros_like(inputs)
-    ref_w = torch.zeros_like(weight)
+    same_form_x, same_form_w = torch.zeros_like(inputs), torch.zeros_like(weight)
+    assign_x, assign_w = torch.zeros_like(inputs), torch.zeros_like(weight)
     start = 0
     for expert_idx, end in enumerate(offsets.tolist()):
         g = torch.ones(end - start, weight.shape[-1], dtype = inputs.dtype)
-        ref_x[start:end] = g @ weight[expert_idx].transpose(-2, -1)
-        ref_w[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
+        torch.matmul(g, weight[expert_idx].transpose(-2, -1),
+                     out = same_form_x[start:end])
+        torch.matmul(inputs[start:end].transpose(-2, -1), g,
+                     out = same_form_w[expert_idx])
+        assign_x[start:end] = g @ weight[expert_idx].transpose(-2, -1)
+        assign_w[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
         start = end
-    assert torch.equal(x.grad, ref_x)
-    assert torch.equal(w.grad, ref_w)
+
+    assert torch.equal(x.grad, same_form_x)
+    assert torch.equal(w.grad, same_form_w)
+    torch.testing.assert_close(x.grad, assign_x)
+    torch.testing.assert_close(w.grad, assign_w)
 
 
 def test_higher_order_gradients_still_work(unsupported):
