@@ -2979,15 +2979,25 @@ def test_the_media_path_still_sees_every_kept_column():
 
 def test_a_configured_label_survives_raw_column_removal():
     """`_keep_media_columns` kept `args.label_names` in the signature while the
-    raw-column keep-list deleted the same columns from the split itself."""
-    from unsloth_zoo import dataset_utils as D
-    import inspect
+    raw-column keep-list deleted the same columns from the split itself.
 
-    src = inspect.getsource(D.train_on_responses_only)
-    body = src[src.index("def _model_input_columns"):]
-    body = body[:body.index("_keep_columns = ")]
-    assert 'label_names' in body, \
-        "the raw-column keep-list still drops a custom trainer's configured labels"
+    Asserted on the resulting split, not on the source. This was a grep for
+    `label_names` in the function body, and the four lines of comment above the
+    line it meant to pin contain that string too, so deleting the line left the
+    test green.
+    """
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW)] * 2,
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "expert_score": [0.5, 0.25],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.label_names = ["expert_score"]
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "expert_score" in out.train_dataset.column_names, (
+        f"configured label dropped from split: {out.train_dataset.column_names}"
+    )
 
 
 def test_case_variant_media_columns_survive_unused_column_removal():
