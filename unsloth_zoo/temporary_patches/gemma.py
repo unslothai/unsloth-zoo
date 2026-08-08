@@ -47,6 +47,45 @@ import inspect
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
+def _linear_boundary_dtype(module, *attr_names):
+    """Dtype of the activations that the given projections expect.
+
+    The UNSLOTH_FORCE_FLOAT32 Gemma3 patches run the heavy reductions (RMSNorm
+    variance, SwiGLU, attention) in float32 for fp16 overflow safety and hand a
+    float16 activation to every Linear. That hard-coded float16 silently assumes
+    the projection weights are float16 too. They are for LoRA / QLoRA, where the
+    base weights stay float16, but full finetuning upcasts the trainable weights
+    to float32, and then a float16 activation meets a float32 weight and the
+    matmul dies with "expected mat1 and mat2 to have the same dtype".
+
+    So read the dtype off the weights that will actually do the multiply. The
+    first floating-point weight wins; bitsandbytes stores a 4bit base weight as
+    a uint8 blob, which is not floating point and is therefore skipped, leaving
+    the float16 default that path already used.
+    """
+    for name in attr_names:
+        module_or_param = getattr(module, name, None)
+        if module_or_param is None: continue
+        weight = getattr(module_or_param, "weight", module_or_param)
+        dtype = getattr(weight, "dtype", None)
+        if dtype is not None and dtype.is_floating_point:
+            return dtype
+    return torch.float16
+pass
+
+
+def _to_boundary_dtype(x, dtype):
+    """Move an activation onto a Linear's dtype, skipping the cast when it already matches.
+
+    float16 weights (LoRA / QLoRA) hit the identity branch on every call, so the
+    common path keeps exactly the casts it had before and its numerics are
+    unchanged. Only the float32 full-finetuning mismatch actually converts.
+    """
+    if x.dtype == dtype: return x
+    return x.to(dtype)
+pass
+
+
 def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
     if attention_mask is None or attention_mask.dim() != 2:
         return attention_mask
@@ -491,7 +530,11 @@ def patch_Gemma3MLP():
     except Exception as e:
         return raise_error("Gemma3MLP.forward", e)
 
-    def forward(self, x): # x is fp16 from RMSNorm
+    def forward(self, x): # x is fp16 from RMSNorm, or fp32 once full finetuning upcasts
+        # RMSNorm always emits fp16. That matches fp16 projection weights (LoRA),
+        # but full finetuning upcasts these Linears to fp32, so meet them there.
+        boundary_dtype = _linear_boundary_dtype(self, "gate_proj", "up_proj", "down_proj")
+        x = _to_boundary_dtype(x, boundary_dtype)
         gate_proj_out = self.gate_proj(x)
         up_proj_out = self.up_proj(x)
 
@@ -501,9 +544,9 @@ def patch_Gemma3MLP():
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
         intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Downcast and down_proj
-        intermediate_fp16 = intermediate_fp32.to(torch.float16)
-        down_proj_out = self.down_proj(intermediate_fp16)
+        # Downcast and down_proj. fp16 weights take the same bare cast as before.
+        intermediate = _to_boundary_dtype(intermediate_fp32, boundary_dtype)
+        down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
@@ -596,7 +639,11 @@ def patch_Gemma3Attention():
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
-        # 1. Projections (q, k, v) in fp16
+        # 1. Projections (q, k, v). RMSNorm hands us fp16, which matches fp16
+        # projection weights (LoRA); full finetuning upcasts them to fp32, so
+        # move the activation onto whatever dtype the weights actually are.
+        boundary_dtype = _linear_boundary_dtype(self, "q_proj", "k_proj", "v_proj", "o_proj")
+        hidden_states = _to_boundary_dtype(hidden_states, boundary_dtype)
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
@@ -709,7 +756,9 @@ def patch_Gemma3Attention():
 
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1)
 
-        attn_output_fp16 = attn_output_fp32.to(torch.float16)
+        # fp16 weights keep the exact bare cast this line always did; fp32
+        # full-finetuning weights leave it in fp32 rather than crashing o_proj.
+        attn_output_fp16 = _to_boundary_dtype(attn_output_fp32, boundary_dtype)
 
         # 8. Output Projection (o_proj) in fp16
         attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
@@ -837,7 +886,11 @@ def patch_Gemma3Attention_generic():
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
-        # 1. Projections (q, k, v) in fp16
+        # 1. Projections (q, k, v). RMSNorm hands us fp16, which matches fp16
+        # projection weights (LoRA); full finetuning upcasts them to fp32, so
+        # move the activation onto whatever dtype the weights actually are.
+        boundary_dtype = _linear_boundary_dtype(self, "q_proj", "k_proj", "v_proj", "o_proj")
+        hidden_states = _to_boundary_dtype(hidden_states, boundary_dtype)
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
