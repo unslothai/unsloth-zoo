@@ -727,14 +727,14 @@ def _walk_for_checkpoint_frame():
     give-up path and `_in_non_reentrant_checkpoint` -- therefore never pass a
     cap, and the bump caps bound them to a handful of calls per process.
 
-    `max_frames` exists for the ONE caller that is on a hot path: the per-call
-    probe, on a torch with no hook accessor, where this runs on every compiled
-    call. Measured at 14.8us per call at stack depth 60 and 46.9us at depth 200,
-    against 0.13us for the call itself, and `apply_pending_eager_fallbacks`
-    clears the latch every step so it never settles. A capped walk answers False
-    rather than "cannot tell", which for that caller only means it declines to
-    latch an optimistic observation; the give-up path re-derives the same answer
-    with no cap before anything acts on it.
+    The one caller on a hot path is the per-call probe, on a torch with no hook
+    accessor, where this runs on every compiled call: 11.2us at stack depth 60
+    and 33.2us at depth 200, against 0.13us for the call itself. That caller
+    does not cap the walk; `_probe_walk` instead spends a per-step budget of 64
+    misses, and `apply_pending_eager_fallbacks` resets it every step. Declining
+    to walk answers False rather than "cannot tell", which for that caller only
+    means it declines to latch an optimistic observation; the give-up path
+    re-derives the same answer, unbudgeted, before anything acts on it.
 
     torch 2.4 to 2.7 expose no saved-tensor-hook accessor, and returning None
     there would quietly restore the old behaviour on the releases pyproject
