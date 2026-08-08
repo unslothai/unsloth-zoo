@@ -74,7 +74,7 @@ def test_library_named_in_the_message():
 
 
 def test_default_library_still_mlx_lm():
-    # #1004's three text-side call sites pass no library; changing their message
+    # #1004's two text-side call sites pass no library; changing their message
     # is out of scope for the VLM change.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
@@ -178,10 +178,17 @@ def test_runtime_quant_vlm_path_is_guarded():
     from unsloth_zoo.mlx import loader
 
     source = inspect.getsource(loader)
-    marker = "Pre-quantize load bypasses the extra-weight filter"
-    assert marker in source
-    window = source[source.index(marker) - 1200:source.index(marker)]
+    # Bound the window semantically rather than by a character count: the
+    # runtime-quant VLM branch opens with this print and its QK-norm guard
+    # carries the marker comment, so a guard call between the two is inside
+    # that branch and nowhere else.
+    branch_start = 'via mlx-vlm (VLM, "'
+    branch_end = "Pre-quantize load bypasses the extra-weight filter"
+    assert source.count(branch_start) == 1
+    assert source.count(branch_end) == 1
+    window = source[source.index(branch_start):source.index(branch_end)]
     assert "_raise_if_incomplete_mlx_config" in window
+    assert 'library="mlx-vlm"' in window
 
 
 def test_every_vlm_load_entry_point_is_guarded():
