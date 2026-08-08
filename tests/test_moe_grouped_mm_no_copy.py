@@ -150,11 +150,9 @@ if __name__ == "__main__":
 
 
 def test_the_routing_signature_sees_a_same_sum_swap():
-    """Summing a row collapses it to a scalar that ignores WHERE its values
-    sit, so `[1, 0]` and `[0, 1]` reduced alike and swapping them across an
-    expert boundary left the signature unchanged. The guard would then accept a
-    replay whose gradients belong to a different routing, which is the one thing
-    it exists to refuse."""
+    """A sum ignores WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike
+    and swapping them across an expert boundary left the signature unchanged: the guard
+    would accept a replay whose gradients belong to a different routing."""
     from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
 
     offsets = torch.tensor([2], dtype = torch.int32)
@@ -183,9 +181,9 @@ def test_the_routing_signature_sees_an_arbitrary_permutation():
 
 
 def test_the_routing_signature_does_not_upcast_the_whole_input():
-    """`.float()` on the way in materialised a whole `[routed_tokens, hidden]`
-    transient to produce one number per row: 512MB at 32K by 4096, on exactly
-    the memory-constrained runs this fallback exists for."""
+    """Upcasting on the way in materialised a whole `[routed_tokens, hidden]` transient
+    for one number per row: 512MB at 32K by 4096, on exactly the memory-constrained
+    runs this fallback exists for."""
     import inspect
 
     from unsloth_zoo.temporary_patches.moe_utils import _routing_signature

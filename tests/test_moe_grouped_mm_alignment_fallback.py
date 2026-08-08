@@ -6,13 +6,9 @@ from unsloth_zoo.temporary_patches import moe_utils as M
 
 @pytest.fixture(autouse=True)
 def _pretend_the_kernel_is_supported(monkeypatch):
-    """These tests are about kernel ERROR handling, so the kernel has to be reached.
-
-    `_grouped_mm_with_backward_fix` now returns early when the device has no
-    usable `torch._grouped_mm`, which on CPU-only CI is always. Without this the
-    monkeypatched kernel below is never called: the differentiability test would
-    pass while exercising nothing, and the re-raise test would fail outright.
-    """
+    """These test kernel ERROR handling, so the kernel has to be reached: the new
+    capability early-return in `_grouped_mm_with_backward_fix` always fires on CPU-only
+    CI, so the monkeypatched kernel below would never be called."""
     monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda: True)
 
 

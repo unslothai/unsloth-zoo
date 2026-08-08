@@ -16,22 +16,20 @@
 
 """A device without torch._grouped_mm must not reach torch._grouped_mm.
 
-`select_moe_backend` already falls to `unsloth_triton` when the probe says the
-kernel is unsupported, but `forward_triton_grouped_gemm` applied its separated
-LoRA delta through `native_moe_grouped_mm`, which calls the primitive the
-backend was chosen to avoid. Training a LoRA MoE on anything that is not an
-H100 therefore died at the first step:
+`select_moe_backend` already falls to `unsloth_triton` when the probe says the kernel
+is unsupported, but `forward_triton_grouped_gemm` applied its separated LoRA delta
+through `native_moe_grouped_mm`, which calls the primitive the backend was chosen to
+avoid, so a LoRA MoE off an H100 died at the first step:
 
     RuntimeError: torch._grouped_mm is only supported on CUDA devices with
     compute capability = 9.0
 
-Found on a B200 running `Qwen3_5_MoE.ipynb` under torch 2.8.0, whose check is
-`dprops->major == 9` exactly (Blas.cpp, `sm90_only`), so an A100 is refused the
-same way. torch 2.6 and 2.7 have no `_grouped_mm` at all; 2.9 onwards falls back
-inside torch, which is why only the older pins show this.
+Found on a B200 under torch 2.8.0, whose check is `dprops->major == 9` exactly
+(Blas.cpp, `sm90_only`), so an A100 is refused the same way. 2.6/2.7 have no
+`_grouped_mm`; 2.9 falls back inside torch, which is why only older pins show this.
 
-The guard goes in `_grouped_mm_with_backward_fix`, the one choke point every
-LoRA and base path shares.
+The guard goes in `_grouped_mm_with_backward_fix`, the choke point every LoRA and
+base path shares.
 """
 
 from unittest import mock
@@ -173,14 +171,14 @@ def test_an_empty_group_contributes_no_gradient(unsupported):
 
 
 def test_it_saves_only_shape_stable_tensors(unsupported):
-    """The whole point. A per-group slice's shape is the group size, which the
-    router decides, so saving slices made non-reentrant checkpointing compare
-    metadata across two different routings and abort the backward:
+    """The whole point. A slice's shape is the router-decided group size, so saving
+    slices made non-reentrant checkpointing compare metadata across two routings and
+    abort the backward:
 
         CheckpointError: saved torch.Size([38, 8]) recomputed torch.Size([39, 8])
 
-    Qwen3_5_MoE on a B200 died exactly there once the capability guard let it
-    reach training. Saved shapes must depend on nothing but the inputs.
+    Qwen3_5_MoE on a B200 died exactly there once the capability guard let it reach
+    training. Saved shapes must depend on nothing but the inputs.
     """
     inputs, weight, offsets = _case()
     inputs = inputs.requires_grad_(True)
@@ -204,11 +202,9 @@ def test_it_survives_non_reentrant_checkpointing(unsupported):
 
 
 def test_the_modulelist_stride_fallback_shares_the_same_helper():
-    """`moe_grouped_modulelist._grouped_mm_fix` had its own copy of the loop.
-
-    Two of its callers put the result on the tape, so the same slice-shaped
-    saved tensors were reachable there through the 16-byte stride error.
-    """
+    """`moe_grouped_modulelist._grouped_mm_fix` had its own copy of the loop, and two
+    of its callers tape the result, so the same slice-shaped saved tensors were
+    reachable there through the 16-byte stride error."""
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as G
 
     def _stride_error(*args, **kwargs):
@@ -237,11 +233,11 @@ def test_the_modulelist_stride_fallback_shares_the_same_helper():
 def test_a_routing_change_in_the_replay_is_named_not_swallowed(unsupported):
     """Shape-stable saves are parity with the fused op, not permission to lie.
 
-    Non-reentrant checkpointing replaces the SAVED tensors with the replay's,
-    so a backward that just uses them pairs the original `grad_output` with the
-    replay's partition: a gradient for a routing that never produced the loss.
-    That is worse than the CheckpointError it replaced, so the forward's own
-    boundaries are kept off the tape and compared.
+    Non-reentrant checkpointing replaces the SAVED tensors with the replay's, so a
+    backward that just uses them pairs the original `grad_output` with the replay's
+    partition: a gradient for a routing that never produced the loss, worse than the
+    CheckpointError it replaced. So the forward's own boundaries are kept off the tape
+    and compared.
     """
     inputs = torch.randn(12, 8)
     weight = torch.randn(3, 8, 6)
@@ -264,12 +260,9 @@ class _ReplayCtx:
 
 
 def test_a_count_preserving_reshuffle_is_caught_too(unsupported):
-    """Offsets are the routing histogram, not the assignment.
-
-    Swap two tokens between experts of the same size and every boundary is
-    where it was, so a check that compares only offsets waves the replay
-    through and pairs the original `grad_output` with reordered input rows.
-    """
+    """Offsets are the routing histogram, not the assignment: swap two tokens between
+    equal-sized experts and every boundary is where it was, so an offsets-only check
+    waves the replay through and pairs `grad_output` with reordered input rows."""
     inputs = torch.randn(12, 8)
     weight = torch.randn(3, 8, 6)
     offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
@@ -326,9 +319,8 @@ def test_the_same_routing_twice_is_not_flagged(unsupported):
 
 
 def test_backward_survives_a_reduced_precision_grad_output(unsupported):
-    """`Function.backward` runs OUTSIDE the forward's autocast region, so a
-    forward that autocast fp32 weights to bf16 hands back a bf16 grad_output
-    while the saved tensors are still fp32. Unaligned, the first matmul raises."""
+    """`Function.backward` runs OUTSIDE the forward's autocast, so grad_output can be
+    bf16 while the saved tensors are still fp32. Unaligned, the first matmul raises."""
     inputs = torch.randn(8, 4, dtype = torch.float32, requires_grad = True)
     weight = torch.randn(2, 4, 6, dtype = torch.float32, requires_grad = True)
     offsets = torch.tensor([4, 8], dtype = torch.int32)
@@ -350,11 +342,9 @@ def test_it_is_marked_as_not_compilable():
 
 
 def test_the_signature_ignores_autocast(unsupported):
-    """`mv`/`mm` are on the autocast lower-precision list, and only one of the
-    two calls sees it: the forward runs inside `Function.forward` with the
-    caller's autocast live, the backward runs with autocast disabled. FP32
-    inputs under autocast hashed in bf16 one side and fp32 the other, so every
-    backward raised the routing error on routing that had not changed."""
+    """`mv`/`mm` are on the autocast lower-precision list and only the forward sees it
+    (backward runs with autocast disabled), so FP32 inputs hashed bf16 one side and
+    fp32 the other and every backward raised the routing error on unchanged routing."""
     inputs = torch.randn(12, 8, dtype = torch.float32)
     offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
 
@@ -365,9 +355,9 @@ def test_the_signature_ignores_autocast(unsupported):
 
 
 def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
-    """One dot product per row maps it to a scalar, so every row orthogonal to
-    the projection hashes like the zero row. Swapping such a pair across an
-    expert boundary is a routing change the check has to see."""
+    """One dot product per row maps it to a scalar, so every row orthogonal to the
+    projection hashes like the zero row; swapping such a pair across an expert boundary
+    is a routing change the check has to see."""
     hidden = 8
     ramp = torch.linspace(1.0, 2.0, hidden, dtype = torch.float32)
     p = torch.sin(ramp * M._SIGNATURE_STRIDES[0])
@@ -383,12 +373,11 @@ def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
 
 
 def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
-    """Grad off means `apply` builds no node, so nothing will ever read the
-    signature and the `[T, hidden]` projection is pure cost. The reentrant
-    checkpoint gap this leaves is documented at the call site: it cannot be
-    closed here, and the stash that tried to close it keyed on a weight the
-    LoRA path rebuilds per call, so it both missed the replay AND pinned a
-    fresh GPU tensor on every no-grad decode step."""
+    """Grad off means `apply` builds no node, so nothing will ever read the signature
+    and the `[T, hidden]` projection is pure cost. The reentrant-checkpoint gap this
+    leaves is documented at the call site: the stash that tried to close it keyed on a
+    weight the LoRA path rebuilds per call, so it missed the replay AND pinned a fresh
+    GPU tensor on every no-grad decode step."""
     inputs, weight, offsets = _case()
     taken = []
     real = M._routing_signature
@@ -409,10 +398,9 @@ def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
 
 
 def test_no_grad_decoding_retains_nothing(unsupported):
-    """The stash that was here held a strong reference to each `weight`, and
-    the PEFT extraction path hands over a FRESH contiguous tensor per call, so
-    a long generation accumulated live GPU tensors until a cap it might never
-    reach. Nothing module-level may grow across grad-off calls."""
+    """The stash that was here held a strong reference to each `weight`, and the PEFT
+    extraction path hands over a FRESH contiguous tensor per call, so a long generation
+    accumulated live GPU tensors. Nothing module-level may grow across grad-off calls."""
     import gc
 
     inputs, _, offsets = _case()
@@ -426,24 +414,23 @@ def test_no_grad_decoding_retains_nothing(unsupported):
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
-    """Four projections leave a common null space of dimension `hidden - 4`, so
-    two rows differing by a vector in it project alike. The norm is not linear
-    in the row, so it does not share that null space.
+    """Four projections leave a common `hidden - 4` null space, so two rows differing
+    by a vector in it project alike. The norm is not linear in the row, so it does not
+    share that null space.
 
-    Asserted structurally rather than by constructing a colliding pair: an exact
-    null-space vector is not representable in the float32 the signature uses, so
-    such a pair separates on rounding noise and the test would pass against a
-    projections-only signature too. What can be checked is that the extra term is
-    there, is the norm, and reaches the packed output.
+    Asserted structurally, not by constructing a colliding pair: an exact null-space
+    vector is not representable in the float32 the signature uses, so such a pair
+    separates on rounding noise and the test would pass against a projections-only
+    signature too. What can be checked is that the extra term is there, is the norm,
+    and reaches the packed output.
     """
     assert M._SIGNATURE_EXTRA == 1
     assert M._SIGNATURE_WIDTH == len(M._SIGNATURE_STRIDES) + M._SIGNATURE_EXTRA
 
     offsets = torch.tensor([2], dtype = torch.int32)
     hidden = 8
-    # Same direction, different length: the norm separates them on magnitude,
-    # which no linear projection of a single row can be relied on to do once the
-    # row lies in the shared null space.
+    # Same direction, different length: the norm separates them on magnitude, which no
+    # linear projection can be relied on to do inside the shared null space.
     unit = torch.zeros(2, hidden); unit[0, 0] = 1.0; unit[1, 0] = 1.0
     scaled = unit.clone(); scaled[1, 0] = 4.0
     assert M._routing_signature(unit, offsets) != \
@@ -454,9 +441,9 @@ def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
 
 
 def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
-    """`_routing_signature` packs the offsets into its own single transfer, so
-    re-reading them in the group loop was a second stream synchronization per
-    grouped matmul, multiplied over every layer's base and LoRA projections."""
+    """`_routing_signature` packs the offsets into its own transfer, so re-reading them
+    in the group loop was a second stream sync per grouped matmul, over every layer's
+    base and LoRA projections."""
     inputs, weight, offsets = _case()
     calls = []
     real = torch.Tensor.cpu
@@ -469,9 +456,9 @@ def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
 
 
 def test_the_norm_does_not_materialize_fp32_copies(unsupported):
-    """`(x.float() * x.float()).sum(...)` held two fp32 copies and their product
-    at once. Asserted on the source, since the temporaries are freed before any
-    allocator snapshot a CPU test could take."""
+    """`(x.float() * x.float()).sum(...)` held two fp32 copies and their product at
+    once. Asserted on the source: the temporaries are freed before any allocator
+    snapshot a CPU test could take."""
     import inspect
 
     body = inspect.getsource(M._routing_signature)
