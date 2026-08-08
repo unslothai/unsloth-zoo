@@ -7,100 +7,130 @@ image left torchvision 0.25.0+cu128 partly overwritten, so `io/__init__.py`
 still imports a `video` module that is gone and `import unsloth` dies on a bare
 `No module named 'torchvision.io.video'`. Not a version boundary: 0.25 ships
 `io/video.py` and 0.26 removed it with its importer, so no release raises this.
+
+These tests drive the real guard, they do not read the source. The source-grep
+version of this file passed with the whole feature deleted, because the prose
+explaining an arm contains every string the arm does. So each case plants a
+`transformers.processing_utils` whose `Unpack` raises the exact error a broken
+install raises, re-imports `unsloth_zoo.temporary_patches.utils` in a
+subprocess, and reads back what came out.
 """
 from __future__ import annotations
 
-import inspect
-import re
-from pathlib import Path
+import json
+import subprocess
+import sys
 
 import pytest
 
-SOURCE = (Path(__file__).resolve().parents[1]
-          / "unsloth_zoo" / "temporary_patches" / "utils.py").read_text(encoding = "utf-8")
+# (case name, exception class to raise, message)
+CASES = [
+    ("io_video",      "ImportError",  "No module named 'torchvision.io.video'"),
+    ("io_video_priv", "ImportError",  "No module named 'torchvision.io._video'"),
+    ("nms_import",    "ImportError",  "operator torchvision::nms does not exist"),
+    ("nms_runtime",   "RuntimeError",
+     "Failed to register operator torchvision::nms. operator torchvision::nms does not exist"),
+    ("unrelated_rt",  "RuntimeError", "cuBLAS workspace allocation failed"),
+    ("unrelated_imp", "ImportError",  "No module named 'flash_attn'"),
+    ("unpack_moved",  "ImportError",
+     "cannot import name 'Unpack' from 'transformers.processing_utils'"),
+    ("pillow",        "ImportError",  "cannot import name '_Ink' from 'PIL'"),
+    ("numpy_uv",      "ImportError",  "cannot import name '_center' from 'numpy._core.umath'"),
+    ("numpy_stale",   "RuntimeError", "numpy.core._multiarray_umath failed to import"),
+]
+
+_DRIVER = r'''
+import importlib, json, sys, types
+
+MOD = "unsloth_zoo.temporary_patches.utils"
+cases = json.loads(sys.argv[1])
+importlib.import_module(MOD)          # warm every dependency of the module first
+import transformers
+real = sys.modules.get("transformers.processing_utils")
+out = {}
+for name, kind, message in cases:
+    sys.modules.pop(MOD, None)
+    fake = types.ModuleType("transformers.processing_utils")
+    def _raise(attr, _m = message, _e = {"ImportError": ImportError,
+                                         "RuntimeError": RuntimeError}[kind]):
+        raise _e(_m)
+    fake.__getattr__ = _raise
+    sys.modules["transformers.processing_utils"] = fake
+    transformers.processing_utils = fake
+    try:
+        importlib.import_module(MOD)
+        out[name] = {"type": None, "message": None}
+    except BaseException as e:
+        out[name] = {"type": type(e).__name__, "message": str(e)}
+    finally:
+        if real is not None:
+            sys.modules["transformers.processing_utils"] = real
+            transformers.processing_utils = real
+sys.stdout.write("<<<RESULTS>>>" + json.dumps(out))
+'''
+
+PIP = "pip install --upgrade --force-reinstall --no-cache-dir torchvision"
 
 
-def _handler_body():
-    """The ImportError arm that classifies a failed `Unpack` import."""
-    start = SOURCE.index("    from transformers.processing_utils import Unpack")
-    end = SOURCE.index("except Exception as e:", start)
-    return SOURCE[start:end]
+@pytest.fixture(scope = "module")
+def raised():
+    """What each planted failure actually produces, from one warm subprocess."""
+    pytest.importorskip("transformers")
+    proc = subprocess.run(
+        [sys.executable, "-c", _DRIVER, json.dumps(CASES)],
+        capture_output = True, text = True, timeout = 900,
+    )
+    if "<<<RESULTS>>>" not in proc.stdout:
+        pytest.fail(
+            f"driver failed (rc={proc.returncode})\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+        )
+    return json.loads(proc.stdout.split("<<<RESULTS>>>", 1)[1])
 
 
-def test_the_removed_video_module_is_recognised():
-    body = _handler_body()
-    assert "torchvision.io.video" in body, \
-        "a torchvision without io.video still falls through to a bare Exception"
-    # Must precede the catch-all, which would otherwise swallow it.
-    assert body.index("torchvision.io.video") < body.index('elif "Unpack" not in e')
-
-
-@pytest.mark.parametrize("message", [
-    "No module named 'torchvision.io.video'",
-    "No module named 'torchvision.io._video'",
+@pytest.mark.parametrize("case, missing", [
+    ("io_video",      "torchvision.io.video"),
+    ("io_video_priv", "torchvision.io._video"),
 ])
-def test_the_message_is_actionable_and_names_the_cause(message):
-    """A RuntimeError a user can act on, not the original ImportError text."""
-    arm = _handler_body()
-    assert "install is incomplete" in arm, "the message does not name the cause"
-    assert "force-reinstall --no-cache-dir torchvision" in arm, \
-        "the message does not say what to run"
-    # Substring test, so both spellings must reach the arm.
-    assert re.search(r'"torchvision\.io\.video" in e or "torchvision\.io\._video" in e', arm)
-    assert message.split("'")[1].rsplit(".", 1)[0] in ("torchvision.io", "torchvision")
+def test_a_missing_io_video_is_named_as_an_incomplete_install(raised, case, missing):
+    got = raised[case]
+    assert got["type"] == "RuntimeError", got
+    assert "install is incomplete" in got["message"]
+    assert PIP in got["message"]
+    # The original text is kept, so the report still shows what was missing.
+    assert missing in got["message"]
 
 
-def test_an_unrelated_import_error_still_falls_through():
-    """The new arm must not swallow errors it does not explain."""
-    arm = _handler_body()
-    assert 'elif "Unpack" not in e' in arm, "the catch-all arm was removed"
-    assert "raise Exception(e)" in arm, "unrecognised errors no longer surface"
+def test_a_mismatched_torchvision_is_caught_on_the_runtimeerror_arm(raised):
+    """`register_fake("torchvision::nms")` raises RuntimeError, not ImportError,
+    so the ImportError arm could never fire for it."""
+    got = raised["nms_runtime"]
+    assert got["type"] == "RuntimeError", got
+    assert "reinstall torchvision" in got["message"]
+    assert PIP in got["message"]
+    # Not the bare error the user used to see.
+    assert "does not exist" not in got["message"]
 
 
-def test_every_named_arm_raises_runtime_error():
-    """RuntimeError, not Exception: the caller tells a diagnosis it can show the
-    user from an error it could not classify."""
-    arm = _handler_body()
-    # Sliced to the next branch, not a fixed window, or a comment in an arm
-    # pushes its `raise` out of view and the test passes blind.
-    bounds = [m.start() for m in re.finditer(r"\n    (?:elif |raise )", arm)] + [len(arm)]
-    for kind in ("numpy._core.umath", "torchvision::nms", "torchvision.io.video", "PIL"):
-        i = arm.index(kind)
-        end = next(b for b in bounds if b > i)
-        assert "RuntimeError" in arm[i:end], f"{kind} does not raise RuntimeError"
+def test_both_arms_give_the_same_instruction(raised):
+    assert raised["nms_runtime"]["message"] == raised["nms_import"]["message"]
 
 
-def _fallback_arm():
-    """The `except Exception` arm, which sees what the ImportError arm cannot.
-
-    Anchored after the Unpack handler, since the file has earlier
-    `except Exception` blocks that have nothing to do with this.
-    """
-    anchor = SOURCE.index("    from transformers.processing_utils import Unpack")
-    start = SOURCE.index("except Exception as e:", anchor)
-    return SOURCE[start:SOURCE.index("KWARGS_TYPE", start)]
+def test_an_unrelated_runtime_error_is_re_raised_untouched(raised):
+    got = raised["unrelated_rt"]
+    assert got["type"] == "RuntimeError"
+    assert got["message"] == "cuBLAS workspace allocation failed"
 
 
-def test_the_nms_break_is_caught_where_it_actually_lands():
-    """A torchvision whose ops do not match torch fails inside
-    `_meta_registrations` at `register_fake("torchvision::nms")`, which raises
-    RuntimeError. The ImportError arm can never see it."""
-    arm = _fallback_arm()
-    assert "torchvision::nms does not exist" in arm, (
-        "the nms check exists only on the ImportError arm, where this error never arrives"
-    )
-    # And it must be diagnosed before the bare re-raise at the end swallows it.
-    assert arm.index("torchvision::nms") < arm.rindex("raise")
+def test_an_unrelated_import_error_still_falls_through(raised):
+    got = raised["unrelated_imp"]
+    assert got["type"] == "Exception", got
+    assert "flash_attn" in got["message"]
 
 
-def test_both_arms_give_the_same_instruction():
-    """One message, so the two arms cannot drift apart."""
-    assert SOURCE.count("_TORCHVISION_BROKE") >= 3, "the shared message is not used by both arms"
-    assert "force-reinstall --no-cache-dir torchvision" in SOURCE
-
-
-def test_an_unrelated_runtime_error_still_surfaces():
-    arm = _fallback_arm()
-    assert "raise" in arm.split("torchvision::nms")[-1], (
-        "unrecognised errors no longer reach the bare re-raise"
-    )
+def test_the_untouched_arms_still_answer(raised):
+    """The diagnoses that were already here must be unchanged."""
+    assert "Unpack has been moved" in raised["unpack_moved"]["message"]
+    assert "Pillow (PIL) version is incompatible" in raised["pillow"]["message"]
+    assert "they broke numpy" in raised["numpy_uv"]["message"]
+    assert "numpy C extensions cannot be reloaded" in raised["numpy_stale"]["message"]
