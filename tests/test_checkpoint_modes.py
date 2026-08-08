@@ -38,9 +38,10 @@ None of this was pinned by a test, so a future move of Unsloth's own
 checkpointer toward the pack/unpack model would silently fall outside the guard
 with nothing going red.
 
-Answers checked on torch 2.6.0, 2.9.1, 2.11.0 and 2.12.0. 2.6.0 matters because
-it predates the saved-tensor-hook accessor and takes the frame-walk fallback,
-and it agrees with the three that do not.
+Answers checked on torch 2.6.0, 2.7.1, 2.8.0, 2.9.1, 2.10.0, 2.11.0 and 2.12.0,
+identical on every one. 2.6 and 2.7 matter: they predate
+`_top_saved_tensors_default_hooks` and answer via the frame walk, so both halves
+of `_in_non_reentrant_checkpoint` are covered rather than only the fast one.
 """
 
 import torch
