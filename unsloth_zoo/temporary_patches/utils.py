@@ -267,6 +267,11 @@ del _ROCmTorchaoLoader, _ROCmTorchaoFinder
 del _MetaPathFinder, _Loader, _ModuleSpec, _sys_rocm_stub, _types_rocm_stub
 del _is_windows_rocm
 
+_TORCHVISION_BROKE = (
+    "***** Please update and reinstall torchvision - it broke! "
+    "`pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
+)
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -279,8 +284,20 @@ except ImportError as e:
             f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
         )
     elif "torchvision::nms does not exist" in e:
+        raise RuntimeError(_TORCHVISION_BROKE)
+    elif "No module named 'torchvision.io.video'" in e or \
+         "No module named 'torchvision.io._video'" in e:
+        # A half-installed torchvision, like the nms arm above. No release raises
+        # this alone (0.25 ships `io/video.py`, 0.26 dropped it with its importer),
+        # so only a tree partly overwritten by a venv install gets here.
+        # The MISSING-MODULE form only: `cannot import name 'read_video' from
+        # 'torchvision.io.video'` carries the same substring while the module is
+        # right there, and the message below would then be a lie.
         raise RuntimeError(
-            f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
+            f"***** Your torchvision install is incomplete: `torchvision.io` "
+            f"imports a `video` module that is not there. Please run "
+            f"`pip install --upgrade --force-reinstall --no-cache-dir torchvision` "
+            f"then restart your runtime/kernel. Original error = {e} *****"
         )
     elif "PIL" in e or "_Ink" in e or "Pillow" in e:
         raise RuntimeError(
@@ -295,6 +312,11 @@ except ImportError as e:
     )
 except Exception as e:
     e_str = str(e)
+    # The nms arm above, for the case that never arrives as an ImportError: a
+    # torchvision whose compiled ops do not match torch fails inside
+    # `_meta_registrations` at `register_fake("torchvision::nms")`, a RuntimeError.
+    if "torchvision::nms does not exist" in e_str:
+        raise RuntimeError(_TORCHVISION_BROKE)
     if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
         raise RuntimeError(
             f"***** numpy was likely upgraded mid-session without restarting the kernel. "
