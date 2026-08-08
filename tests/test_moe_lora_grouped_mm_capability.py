@@ -518,14 +518,15 @@ def test_a_cast_still_takes_the_temporary(unsupported):
 
 
 def test_writing_in_place_changes_no_gradient(unsupported):
-    """Two references, because one of them cannot be exact everywhere.
+    """Every group's gradient lands in ITS OWN slice, against both reference forms.
 
-    Every group's gradient must land in ITS OWN slice: that is the risk in
-    writing through `out=`, and against a reference written the same way it is
-    bit-exact on any BLAS. Against the allocate-and-assign form it is only
-    numerically equal -- `out=` lets the kernel write the destination directly
-    instead of a fresh contiguous buffer, and the two round differently on some
-    BLAS builds (seen on the ubuntu CPU runner, not on this box or a B200).
+    Closeness, not `torch.equal`: bit-exactness is not portable here. The ubuntu
+    CPU runner disagreed in the last bit against BOTH references, the `out=` one
+    included, while this box and a B200 matched exactly -- `out=` lets the kernel
+    write the destination directly rather than a fresh contiguous buffer, and how
+    that rounds is the BLAS build's business. The bug this guards against is a
+    gradient written into the wrong slice, which moves values by whole
+    magnitudes, so tolerance costs nothing here.
     """
     inputs, weight, offsets = _case(n_experts = 4, rows_each = 3, k = 6, n = 5)
     x = inputs.detach().clone().requires_grad_(True)
@@ -546,8 +547,8 @@ def test_writing_in_place_changes_no_gradient(unsupported):
         assign_w[expert_idx] = inputs[start:end].transpose(-2, -1) @ g
         start = end
 
-    assert torch.equal(x.grad, same_form_x)
-    assert torch.equal(w.grad, same_form_w)
+    torch.testing.assert_close(x.grad, same_form_x)
+    torch.testing.assert_close(w.grad, same_form_w)
     torch.testing.assert_close(x.grad, assign_x)
     torch.testing.assert_close(w.grad, assign_w)
 
