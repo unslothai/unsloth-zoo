@@ -3262,3 +3262,53 @@ def test_a_nullable_scalar_labels_column_is_still_dropped_on_a_null_first_row():
 
     assert "labels" in out.eval_dataset.column_names
     assert len(out.eval_dataset["labels"][0]) == len(out.eval_dataset["input_ids"][0])
+
+
+# ---- the keep-lists, round 3 ----------------------------------------------
+
+def _raw_text_split(**extra):
+    rows = {"text": ["<|user|>q0<|assistant|>a0", "<|user|>q1<|assistant|>a1"]}
+    rows.update(extra)
+    return Dataset.from_dict(rows)
+
+
+def test_a_scalar_labels_column_is_dropped_even_under_the_opt_out():
+    """`remove_unused_columns = False` re-added every raw column, which undid the
+    scalar-`labels` discard and sent an int into the masking pass:
+    `TypeError: object of type 'int' has no len()`."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          _raw_text_split(labels = [3, 7]))
+    trainer.args.remove_unused_columns = False
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    labels = out.train_dataset[0]["labels"]
+    assert isinstance(labels, list), f"scalar labels survived as {labels!r}"
+
+
+def test_a_configured_label_name_survives_raw_tokenization():
+    """A label consumed by a custom `compute_loss` is not declared by `forward`,
+    and `remove_columns` here deletes it for good, so the later keep-lists that
+    do honour `label_names` never see it."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          _raw_text_split(my_reward = [0.5, 1.5]))
+    trainer.args.label_names = ["my_reward"]
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert "my_reward" in out.train_dataset.column_names, \
+        "the configured label was tokenized away"
+
+
+def test_index_is_not_seeded_into_the_signature():
+    """Trainer's own derivation is `+= list(set(["label", "label_ids"] +
+    self.label_names))` on transformers 4.57 through 5.14 -- no `index`. Seeding it
+    keeps a metadata column through unused-column removal, and the text collator
+    then tensorizes it into an `index =` argument `forward` never declared."""
+    trainer = _text_only_trainer()
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    seeded = getattr(out, "_signature_columns", None) or []
+    assert "index" not in seeded, seeded
+    # The columns HF really does always keep are still there.
+    assert {"label", "label_ids", "input_ids", "labels"} <= set(seeded)

@@ -480,8 +480,11 @@ def _keep_media_columns(trainer, keys):
             # `position_ids` or a custom `sample_weight` outside a fixed list
             # would otherwise be removed before collation, silently changing
             # what the model is trained on.
-            # `index`/`label`/`label_ids` are what HF always keeps; without them
-            # a seeded list would drop the columns the loss itself needs.
+            # `label`/`label_ids` are what HF always keeps; without them a seeded
+            # list would drop the columns the loss itself needs. NOT `index`:
+            # Trainer's derivation is `+= list(set(["label", "label_ids"] +
+            # self.label_names))` on 4.57 through 5.14, so keeping `index` would
+            # hand a metadata column to the collator and then to `forward`.
             declared = _model_forward_parameter_names(getattr(trainer, "model", None))
             # Trainer's own derivation does `+= list(set(["label", "label_ids"]
             # + self.label_names))`, so a custom trainer whose supervision is
@@ -489,7 +492,7 @@ def _keep_media_columns(trainer, keys):
             # it dropped here and on every later split.
             declared |= set(getattr(getattr(trainer, "args", None), "label_names", None) or ())
             trainer._signature_columns = sorted(set(names) | declared | {
-                "label", "label_ids", "index", "input_ids", "attention_mask",
+                "label", "label_ids", "input_ids", "attention_mask",
                 "labels", "completion_mask", "assistant_masks", "token_type_ids",
             })
         else:
@@ -932,6 +935,12 @@ def train_on_responses_only(
         _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
         if not isinstance(_raw_columns, dict):
             _keep = _model_forward_parameter_names(getattr(trainer, "model", None))
+            # `args.label_names` too, as the keep-lists further down already do:
+            # supervision consumed by a custom `compute_loss` is not declared by
+            # `forward`, and `remove_columns` here deletes it for good, so those
+            # later lists never get the chance to save it.
+            _keep |= set(
+                getattr(getattr(trainer, "args", None), "label_names", None) or ())
             # `labels` only when it really is token-level. A raw split can carry
             # a SCALAR `labels` (a class id), and keeping that as supervision
             # sent an int into `_train_on_responses_only`, which calls
@@ -957,6 +966,11 @@ def train_on_responses_only(
             # collator cannot stack, and its tokens replace it.
             if _keep_every_column:
                 _keep |= set(_raw_columns) - {text_field, "text"}
+                # Minus the scalar `labels` again: this union re-added every raw
+                # column, so it undid the discard above and sent an int into
+                # `_train_on_responses_only`, which calls `len(old_labels)` on it.
+                if _labels_are_token_level(dataset, sample) is False:
+                    _keep -= {"labels"}
             _map_kwargs["remove_columns"] = [c for c in _raw_columns if c not in _keep]
         import warnings as _w
         with _w.catch_warnings():
