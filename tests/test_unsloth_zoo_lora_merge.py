@@ -16,7 +16,7 @@
 
 """Tier 0 LoRA merge correctness tests for unsloth_zoo/saving_utils.py.
 
-Run on Linux+CUDA without an MLX shim. Cover _active_merge_device(), _merge_lora
+Run on Linux+CUDA/XPU without an MLX shim. Cover _active_merge_device(), _merge_lora
 (base merge, vocab-resize, non-finite guard), and the 5 MoE expert-merge variants
 against a numpy reference.
 """
@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 from unsloth_zoo.saving_utils import (
     LoraStats,
     _active_merge_device,
@@ -38,6 +39,11 @@ from unsloth_zoo.saving_utils import (
     _merge_moe_up_expert,
 )
 
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
 SEED = 1234
 
@@ -50,10 +56,10 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
 # 1. _active_merge_device — recent fix that replaced the W-based helper.
 # ---------------------------------------------------------------------------
 
-def test_active_merge_device_returns_string_on_cuda_host():
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    assert _active_merge_device() == "cuda"
+def test_active_merge_device_returns_string_on_gpu():
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
+    assert _active_merge_device() == DEVICE_TYPE_TORCH
 
 
 def test_active_merge_device_takes_no_args():
@@ -104,14 +110,16 @@ def test_merge_lora_moves_cpu_inputs_to_active_device():
     The W-based helper returned an indexless torch.device('cuda') for CPU W
     (unreliable on multi-GPU); the fix returns the string 'cuda' instead.
     """
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     torch.manual_seed(SEED)
     W = torch.randn(64, 32, dtype=torch.bfloat16)
     lora_A = torch.randn(8, 32, dtype=torch.bfloat16) * 0.05
     lora_B = torch.randn(64, 8, dtype=torch.bfloat16) * 0.05
     out = _merge_lora(W.clone(), _ls(lora_A, lora_B, alpha=16.0), name="cpu_input")
-    assert out.is_cuda, "expected merge result on CUDA after _active_merge_device()"
+    assert out.device.type == DEVICE_TYPE_TORCH, (
+        f"expected merge result on {DEVICE_TYPE_TORCH} after _active_merge_device(), got {out.device}"
+    )
 
 
 def test_merge_lora_vocab_resize():

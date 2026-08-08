@@ -14,6 +14,8 @@
 
 __all__ = [
     "is_hip",
+    "get_amd_attention_implementation",
+    "get_amd_flash_attn_func",
     "get_device_type",
     "DEVICE_TYPE",
     "DEVICE_TYPE_TORCH",
@@ -24,6 +26,7 @@ __all__ = [
     "device_empty_cache",
     "device_is_bf16_supported",
     "is_mlx_available",
+    "get_recommended_attn_implementation",
 ]
 
 import functools
@@ -213,6 +216,137 @@ def is_hip():
     return bool(getattr(getattr(torch, "version", None), "hip", None))
 pass
 
+
+@functools.cache
+def _detect_gfx_arch():
+    """Return the GPU architecture string (e.g. 'gfx942') or None if undetectable.
+
+    Uses the PyTorch-active device first so that HIP_VISIBLE_DEVICES and multi-arch
+    hosts are handled correctly. Subprocess probes (rocminfo, hipconfig) scan
+    system-wide output and may return a different arch than the active device.
+    """
+    import re as _re
+    # Active device first: right arch for the GPU torch is using, and it
+    # respects HIP_VISIBLE_DEVICES.
+    try:
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            arch = torch.cuda.get_device_properties(dev).gcnArchName
+            # gcnArchName may include suffixes e.g. "gfx942:sramecc+:xnack-"
+            m = _re.match(r"gfx[0-9a-f]+", arch)
+            if m:
+                return m.group(0)
+    except Exception:
+        pass
+    # Subprocess fallbacks for unusual builds where PyTorch cannot query the device.
+    import subprocess
+    try:
+        r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["hipconfig", "--full"], capture_output=True, text=True, timeout=10)
+        m = _re.search(r"gfx[0-9a-f]+", r.stdout)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    return None
+pass
+
+
+@functools.cache
+def get_amd_attention_implementation():
+    """
+    Return the best available attention implementation for AMD ROCm.
+
+    Priority:
+    1. "amd_aiter": AMD aiter (pip install amd-aiter, ROCm >= 7.0 required)
+    2. "sdpa": PyTorch SDPA via MIOpen (always available on ROCm)
+
+    Returns: "amd_aiter" | "sdpa"
+    """
+    if not is_hip():
+        return "sdpa"
+
+    # Gate on ROCm >= 7.0 (amd-aiter has hard ABI dep on libamdhip64.so.7).
+    # Prefer torch.version.hip: always present in ROCm wheels. rocm-smi
+    # reports the kernel driver version, which can differ from the runtime.
+    try:
+        _hip_ver = getattr(torch.version, "hip", None)
+        if _hip_ver is not None:
+            _hip_major = int(str(_hip_ver).split(".")[0])
+            if _hip_major < 7:
+                return "sdpa"
+        else:
+            # Fallback for unusual builds without torch.version.hip
+            rocm_version = _detect_rocm_major_minor()
+            if rocm_version is not None:
+                if int(rocm_version.split(".")[0]) < 7:
+                    return "sdpa"
+    except Exception:
+        return "sdpa"
+
+    # aiter's CK/ASM kernels are CDNA-only: gfx942 (MI300X/MI325X) and gfx950
+    # (MI355X). flash_attn_func imports on all archs but only runs on these two.
+    try:
+        _gfx = _detect_gfx_arch()
+        _AITER_SUPPORTED_ARCHS = ("gfx942", "gfx950")  # CDNA3, CDNA4
+        if _gfx not in _AITER_SUPPORTED_ARCHS:
+            return "sdpa"
+    except Exception:
+        return "sdpa"
+
+    # Check for amd-aiter (AMD AI Tensor Engine for ROCm)
+    try:
+        import importlib.util  # must import submodule explicitly (not bare importlib)
+        if importlib.util.find_spec("aiter") is not None:
+            import aiter as _aiter
+            # Validate: AMD AI tensor engine exposes the functional flash_attn_func API.
+            # FlashAttnFunc (class API) requires 13+ positional args and cannot be
+            # wrapped safely; only accept the simpler flash_attn_func functional API.
+            if hasattr(_aiter, "flash_attn_func"):
+                return "amd_aiter"
+    except Exception:
+        pass
+
+    return "sdpa"
+
+
+@functools.cache
+def get_amd_flash_attn_func():
+    """
+    Return the amd-aiter flash attention function, or None if unavailable.
+
+    Only the functional API `flash_attn_func` (aiter >= 0.7) is accepted. The
+    class API `FlashAttnFunc` is deliberately not wrapped, so environments with
+    only that one get None and fall back to SDPA.
+
+    Call signature: func(q, k, v, causal=True)
+    Shapes: q/k/v = (batch, seqlen, nheads, headdim), float16 or bfloat16
+    Returns: output tensor, same shape as q
+    """
+    if get_amd_attention_implementation() != "amd_aiter":
+        return None
+    try:
+        import aiter as _aiter
+        if hasattr(_aiter, "flash_attn_func"):
+            return _aiter.flash_attn_func
+        # FlashAttnFunc is a torch.autograd.Function whose .apply() requires 13+
+        # positional arguments (dropout_p, softmax_scale, causal, window_size,
+        # bias, alibi_slopes, deterministic, return_lse, return_softmax,
+        # is_grad_enabled, ...), see ROCm/aiter:aiter/ops/mha.py.
+        # We cannot safely wrap it without knowing the required defaults for the
+        # installed aiter version.  Return None so callers fall back to SDPA.
+        # (FlashAttnFunc environments should expose flash_attn_func in aiter >= 0.7)
+    except Exception:
+        pass
+    return None
+
+
 @functools.cache
 def get_device_type():
     if _IS_MLX:
@@ -313,4 +447,19 @@ def device_is_bf16_supported():
             if hasattr(torch.xpu, "is_bf16_supported"):
                 return torch.xpu.is_bf16_supported()
     return False
+pass
+
+
+def get_recommended_attn_implementation():
+    """
+    Return "sdpa" on AMD ROCm, None elsewhere (no override, keep your default).
+
+    Callers MUST check the resolved model class first. 43 causal LM
+    architectures on transformers 4.57 (GptOss, Mamba, Bloom, GPT-J, MPT, ...)
+    set `_supports_sdpa = False` and `from_config` raises ValueError for them:
+    `AutoModelForCausalLM._model_mapping[type(config)]._supports_sdpa`.
+    """
+    if is_hip():
+        return "sdpa"
+    return None
 pass

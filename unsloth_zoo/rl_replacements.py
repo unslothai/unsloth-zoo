@@ -26,11 +26,16 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import (
+    torch_compile_options,
+    _maybe_compile,
+)
+
+
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -40,7 +45,7 @@ def selective_log_softmax(logits, index):
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
@@ -67,7 +72,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -79,6 +84,12 @@ def chunked_hidden_states_selective_log_softmax(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
+    # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
+    # cannot have its row count silently rewritten and instead fails at the
+    # matmul below, which prints both operands. Do not swap in a bare
+    # torch._check: it reports only "Expected cond to be True", naming neither
+    # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
+    # the width first -- see `compute_logprobs_chunk` and the packed path.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
 
@@ -595,8 +606,11 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
+    f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -663,13 +677,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
-            accumulate_chunk,
+        from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
+        accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )
+        )(accumulate_chunk)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
@@ -1156,11 +1170,23 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
-                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
-                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                    )[0]
+                    # `.logits` carries hidden states only when the forward is the
+                    # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                    # otherwise it is real [T, vocab] logits and the lm_head matmul
+                    # dies. Dispatch on width, as the padded path already does.
+                    _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
+                    _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                    if _pack_h.shape[-1] == lm_head.shape[1]:
+                        _pack_sel = chunked_hidden_states_selective_log_softmax(
+                            _pack_h, lm_head, _pack_tid, _pack_chunks,
+                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                        )[0]
+                    else:
+                        # Raw logits: the forward already applied scale/softcap.
+                        _pack_sel = chunked_selective_log_softmax(
+                            _pack_h, _pack_tid,
+                            temperature = temperature, chunks = _pack_chunks,
+                        )[0]
                 # GPT-OSS offload race guard (matches the padded loop)
                 device_synchronize()
                 # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
@@ -1186,10 +1212,19 @@ def grpo_accumulated_loss(
                             _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                             _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                             _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
-                            _pack_rsel = chunked_hidden_states_selective_log_softmax(
-                                _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
-                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            )[0]
+                            # same width dispatch as the packed call above: this forward
+                            # returns raw logits whenever that one did, and the first
+                            # packed batch always lands here
+                            if _pack_rh.shape[-1] == lm_head.shape[1]:
+                                _pack_rsel = chunked_hidden_states_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                )[0]
+                            else:
+                                _pack_rsel = chunked_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], _pack_real[:, 1:],
+                                    temperature = temperature, chunks = 1,
+                                )[0]
                             _pack_rcols = _pack_rmask.nonzero(as_tuple = False).squeeze(1)[1:] - (_pack_L - _pack_W)
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
