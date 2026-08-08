@@ -606,8 +606,8 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
-# Same eager fallback as every other fullgraph region: a bare decorator makes
-# cache exhaustion fatal under fullgraph, which is the failure this is not.
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
     f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\

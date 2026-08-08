@@ -19,16 +19,16 @@
 `unsloth_compiled_cache` decorate their functions directly and never reach it,
 so every one of those regions kept the failure the wrapper exists to remove.
 
-Gemma4 has ten. Its vision tower drives `Gemma4RMSNorm_forward` past the
-budget and training stops at step 0 with
+Gemma4 has ten. Its vision tower drives `Gemma4RMSNorm_forward` past the budget
+and training stops at step 0 with
 
     FailOnRecompileLimitHit: Hard failure due to fullgraph=True
 
-raised from `unsloth_compiled_module_gemma4.py`. Measured on the real notebook
-path with `recompile_limit = 2`: released zoo and this branch without the fix
-both die at step 0; with it, all 7 steps run and the loss falls 3.187 -> 1.202.
-Lowering the limit is what makes the failure reachable on any GPU -- a T4
-reaches it unaided, a B200 at the default never does.
+from `unsloth_compiled_module_gemma4.py`. Measured on the real notebook path
+with `recompile_limit = 2`: released zoo and this branch without the fix both
+die at step 0; with it all 7 steps run and the loss falls 3.187 -> 1.202.
+Lowering the limit makes the failure reachable on any GPU -- a T4 gets there
+unaided, a B200 at the default never does.
 """
 
 import re
@@ -41,10 +41,9 @@ from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
 ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 COMPILER = ZOO / "compiler.py"
-# Every module that hands torch a fullgraph region, not just the compiler. The
+# Every module that hands torch a fullgraph region, not just the compiler: the
 # first pass scanned compiler.py alone and passed while GRPO's own
-# `grpo_compute_loss_slow` and `accumulate_chunk` still carried bare
-# decorators, so cache exhaustion there stayed fatal.
+# `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
 FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
 
@@ -55,9 +54,8 @@ def test_no_emitter_writes_a_bare_fullgraph_compile():
     """Every emitted `fullgraph` decorator has to carry the fallback.
 
     Source-level because the alternative is generating a module per model, and
-    a single missed emitter is exactly how the cross-entropy template kept its
-    bare decorator after the first four were fixed.
-    """
+    one missed emitter is how the cross-entropy template kept its bare decorator
+    after the first four were fixed."""
     bare = []
     for path in FULLGRAPH_SITES:
         for line in path.read_text().splitlines():
@@ -135,11 +133,10 @@ def test_fullgraph_true_is_wrapped():
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
 
-# aot_eager, not inductor. Inductor codegens C++ and shells out to a host
-# compiler, so this raised `Compiler: cl is not found` on the Windows runner --
-# a statement about MSVC being absent, not about the wrapper. What is under test
-# is that the wrapper returns what the eager function returns, and every backend
-# answers that.
+# aot_eager, not inductor: inductor shells out to a host compiler, so this
+# raised `Compiler: cl is not found` on the Windows runner, a statement about
+# MSVC and not about the wrapper. Any backend answers what is under test, that
+# the wrapper returns what the eager function returns.
 _BACKEND = "aot_eager"
 
 
@@ -192,9 +189,8 @@ def _bare_fullgraph_alias_sites():
 
     The scan above reads three named files and only recognises a literal
     `torch.compile`, so the alias sites in gpt_oss / qwen3_vl_moe / gemma sat
-    outside it: `torch_compile` was `functools.partial(torch.compile)` and went
-    straight to Dynamo, where cache exhaustion under fullgraph is fatal.
-    """
+    outside it: `torch_compile` was `functools.partial(torch.compile)`, straight
+    to Dynamo, where cache exhaustion under fullgraph is fatal."""
     import re
     pattern = re.compile(r"\b_?torch_compile\s*\([^)]*fullgraph\s*=\s*True", re.S)
     found = []
@@ -211,19 +207,17 @@ def _bare_fullgraph_alias_sites():
 
 
 def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
-    """They are not rewritten one by one; the alias routes them.
-
-    Fixing ten decorators leaves the eleventh, so `torch_compile` and
-    `_torch_compile` now go through `_compile_or_fall_back`, which hands any
-    fullgraph compile to `torch_compile_with_fallback`.
-    """
+    """They are not rewritten one by one; the alias routes them. Fixing ten
+    decorators leaves the eleventh, so `torch_compile` and `_torch_compile` go
+    through `_compile_or_fall_back`, which hands any fullgraph compile to
+    `torch_compile_with_fallback`."""
     sites = _bare_fullgraph_alias_sites()
     assert sites, "the scan found no alias sites at all; has the spelling changed?"
 
     common = (ZOO / "temporary_patches" / "common.py").read_text(encoding = "utf-8")
     assert "def _compile_or_fall_back" in common
     assert "torch_compile_with_fallback" in common
-    # By line, not by substring: `_torch_compile = ...` is itself a substring of
+    # By line, not by substring: `_torch_compile = ...` is a substring of
     # `_raw_torch_compile = ...`, which deliberately DOES partial torch.compile
     # (compile_with_eager_fallback applies the wrapper itself, and wrapping a
     # wrapper leaves the inner one swallowing the exhaustion).

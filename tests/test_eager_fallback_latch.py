@@ -54,9 +54,8 @@ def _isolate_registry(monkeypatch):
     monkeypatch.setattr(U, "_EAGER_FALLBACK_WRAPPERS", [])
     monkeypatch.setattr(U, "_recompile_limit_errors", lambda: (Boom,))
     monkeypatch.setattr(U, "_disabled_hook_graph_break_error", lambda: ())
-    # The give-up decision is kept by LABEL now, so a wrapper built inside a
-    # forward keeps it across rebuilds. That also outlives a test, and every
-    # test here reuses "M.forward" / "M.f".
+    # The give-up decision is kept by LABEL, so it survives rebuilds -- and
+    # tests, which all reuse "M.forward" / "M.f".
     monkeypatch.setattr(U, "_LATCHED_EAGER_LABELS", set())
     monkeypatch.setattr(U, "_PENDING_EAGER_LABELS", set())
     monkeypatch.setattr(U, "_RECENT_EAGER_LABELS", set())
@@ -231,10 +230,10 @@ def test_force_is_idempotent():
 
 def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
     """GRPO's `accumulate_chunk` is built inside the forward, so by the time the
-    backward dies and unsloth calls this, the wrapper that deferred is collected
-    and the pending label is the only surviving evidence. Asking the live
-    wrappers alone returned 0, the caller re-raised the failure this exists to
-    retry past, and the rebuilt wrapper compiled again."""
+    backward dies the wrapper that deferred is collected and the pending label
+    is the only evidence. Asking the live wrappers alone returned 0, the caller
+    re-raised the failure this exists to retry past, and the rebuilt wrapper
+    compiled again."""
     U._PENDING_EAGER_LABELS.add("chunk.f")
 
     assert U.force_eager_fallback() > 0, "the deferral was not seen"
@@ -250,10 +249,10 @@ def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
 def test_force_sees_a_latch_whose_wrapper_is_already_gone():
     """Same for a label that gave up outright rather than deferring.
 
-    Through the real give-up, not by writing to `_LATCHED_EAGER_LABELS`: that
-    set is permanent by design, so it also holds a previous model's labels and
-    cannot be the evidence on its own. `_RECENT_EAGER_LABELS` is what says "in
-    this step", and the give-up path writes both."""
+    Through the real give-up, not by writing `_LATCHED_EAGER_LABELS`: that set
+    is permanent by design, holds a previous model's labels, and cannot be the
+    evidence alone. `_RECENT_EAGER_LABELS` says "in this step"; give-up writes
+    both."""
     compiled, eager, _ = _pair(fail_after = 0)
     w = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "chunk.f")
     w(1)
@@ -310,10 +309,10 @@ if __name__ == "__main__":
 
 def test_a_previous_models_latch_is_not_evidence_for_the_next():
     """`_LATCHED_EAGER_LABELS` is permanent on purpose, so it cannot double as
-    "something fell back just now". Train two models in one process and the
-    first one's labels answered for the second, and `force_eager_fallback`
-    reported a compile-mode flip where there had been none -- the caller's cue
-    to retry rather than re-raise a genuine checkpoint failure."""
+    "something fell back just now": train two models in one process and the
+    first one's labels answered for the second, so `force_eager_fallback`
+    reported a compile-mode flip where there was none -- the caller's cue to
+    retry rather than re-raise a genuine checkpoint failure."""
     U._LATCHED_EAGER_LABELS.add("model_a.SomeNorm.forward")   # discarded model
     assert U.force_eager_fallback(only_if_already_triggered = True) == 0
 
@@ -330,11 +329,10 @@ def test_the_settle_clears_the_recent_labels():
 
 
 def test_a_boundary_with_nothing_pending_still_expires_the_recent_labels():
-    """A wrapper that gives up OUTSIDE a checkpoint records its label without
-    creating a pending entry, so every later boundary took the early return and
-    the label never expired. A genuine checkpoint failure in a later step then
-    read it as a compile-mode flip and asked for a retry instead of letting the
-    real error through."""
+    """A wrapper giving up OUTSIDE a checkpoint records its label with no
+    pending entry, so every later boundary took the early return and the label
+    never expired -- a genuine checkpoint failure in a later step then read it
+    as a compile-mode flip and asked for a retry."""
     U._RECENT_EAGER_LABELS.add("gave_up_outside_a_checkpoint.forward")
     # Nothing pending: no wrapper was registered, so this is the early return.
     assert U.force_eager_fallback() == 0
@@ -360,8 +358,8 @@ def test_the_wrapper_registry_does_not_grow_without_bound():
             compiled, eager, _ = _pair(fail_after = 100)
             U._fall_back_to_eager_on_recompile_limit(compiled, eager, f"chunk{i}.f")
 
-    # Control: with the compaction threshold out of reach every dead reference
-    # stays, which is exactly what a long GRPO run used to accumulate.
+    # Control: with the threshold out of reach every dead reference stays,
+    # exactly what a long GRPO run used to accumulate.
     U._EAGER_FALLBACK_PRUNE_AT = 10 ** 9
     build(500)
     assert len(U._EAGER_FALLBACK_WRAPPERS) == 500

@@ -1172,7 +1172,7 @@ def create_new_function(
     imports += "from torch.nn import functional as F\n"
     if "torch_compile_with_fallback" in new_source:
         # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
-        # name has to resolve in the generated module.
+        # name must resolve in the generated module.
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"

@@ -180,16 +180,15 @@ pass
 def _compile_or_fall_back(*args, **kwargs):
     """`torch.compile`, routed through the eager fallback under fullgraph.
 
-    The alias below is what the bare decorators use -- gpt_oss, qwen3_vl_moe and
-    gemma each have `@torch_compile(..., fullgraph = True)` regions -- and a
+    The alias below is what the bare decorators use (gpt_oss, qwen3_vl_moe and
+    gemma each have `@torch_compile(..., fullgraph = True)` regions), and a
     `functools.partial(torch.compile)` reaches Dynamo directly, so cache
     exhaustion there stayed fatal while `patch_function`'s did not. Fixed here
-    rather than at each call site so a new one cannot miss it.
+    rather than per call site so a new one cannot miss it.
 
     Both spellings are in use: `@torch_compile(...)` as a decorator factory, and
-    `torch_compile(fn, ...)` applied directly (gemma.py, gpt_oss.py).
-    Imported lazily: utils imports this module.
-    """
+    `torch_compile(fn, ...)` applied directly (gemma.py, gpt_oss.py). Imported
+    lazily: utils imports this module."""
     if not kwargs.get("fullgraph"):
         return torch.compile(*args, **kwargs)
     from .utils import torch_compile_with_fallback
@@ -201,8 +200,8 @@ def _compile_or_fall_back(*args, **kwargs):
 
 if UNSLOTH_COMPILE_DISABLE:
     torch_compile = noop
-    # For the one caller that applies the fallback itself, so the alias's own
-    # routing does not wrap it a second time.
+    # For the one caller that applies the fallback itself, so the alias's
+    # routing does not wrap it twice.
     _raw_torch_compile = noop
 else:
     torch_compile = functools.partial(
@@ -281,7 +280,6 @@ def _maybe_compile(**kwargs):
     if not kwargs.get("fullgraph"):
         return torch.compile(**kwargs)
     # Under fullgraph Dynamo makes cache exhaustion fatal, so these regions get
-    # the same eager fallback `patch_function` applies. Imported lazily: utils
-    # imports this module.
+    # `patch_function`'s eager fallback. Lazy import: utils imports this module.
     from .utils import torch_compile_with_fallback
     return torch_compile_with_fallback(**kwargs)
