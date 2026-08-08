@@ -25,6 +25,7 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
+    "_raw_torch_compile",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
     "publish_to_modeling_module",
@@ -176,10 +177,38 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
+def _compile_or_fall_back(*args, **kwargs):
+    """`torch.compile`, routed through the eager fallback under fullgraph.
+
+    The alias below is what the bare decorators use (gpt_oss, qwen3_vl_moe and
+    gemma each have `@torch_compile(..., fullgraph = True)` regions), and a
+    `functools.partial(torch.compile)` reaches Dynamo directly, so cache
+    exhaustion there stayed fatal while `patch_function`'s did not. Fixed here
+    rather than per call site so a new one cannot miss it.
+
+    Both spellings are in use: `@torch_compile(...)` as a decorator factory, and
+    `torch_compile(fn, ...)` applied directly (gemma.py, gpt_oss.py). Imported
+    lazily: utils imports this module."""
+    if not kwargs.get("fullgraph"):
+        return torch.compile(*args, **kwargs)
+    from .utils import torch_compile_with_fallback
+    decorate = torch_compile_with_fallback(**kwargs)
+    if args and callable(args[0]):
+        return decorate(args[0])
+    return decorate
+
+
 if UNSLOTH_COMPILE_DISABLE:
     torch_compile = noop
+    # For the one caller that applies the fallback itself, so the alias's
+    # routing does not wrap it twice.
+    _raw_torch_compile = noop
 else:
     torch_compile = functools.partial(
+        _compile_or_fall_back,
+        options = torch_compile_options,
+    )
+    _raw_torch_compile = functools.partial(
         torch.compile,
         options = torch_compile_options,
     )
@@ -188,7 +217,7 @@ if UNSLOTH_COMPILE_DISABLE:
     _torch_compile = noop
 else:
     _torch_compile = functools.partial(
-        torch.compile,
+        _compile_or_fall_back,
     )
 
 def flatten_for_elementwise_norm(hidden_states):
@@ -248,4 +277,9 @@ def _maybe_compile(**kwargs):
     """
     if UNSLOTH_COMPILE_DISABLE or UNSLOTH_COMPILE_DISABLE_PARTIAL:
         return lambda fn: fn
-    return torch.compile(**kwargs)
+    if not kwargs.get("fullgraph"):
+        return torch.compile(**kwargs)
+    # Under fullgraph Dynamo makes cache exhaustion fatal, so these regions get
+    # `patch_function`'s eager fallback. Lazy import: utils imports this module.
+    from .utils import torch_compile_with_fallback
+    return torch_compile_with_fallback(**kwargs)

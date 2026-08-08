@@ -126,10 +126,17 @@ def _grouped_mm_with_backward_fix(
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
     but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
     copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
-    vs the always-contiguous path in forward and backward.
+    always-correct copy. Falls back to a per-group matmul when the device has no
+    torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
+    path in forward and backward.
     """
     inputs = inputs.contiguous()
+    # The Triton backend is picked precisely when the probe says no, yet its separated
+    # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
+    # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
+    # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
+    if not _check_torch_grouped_mm_supported():
+        return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
     try:
@@ -146,19 +153,229 @@ def _grouped_mm_with_backward_fix(
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd.
+
+    `bounds` is the already-decoded group ends: the signature packs the offsets into
+    its own transfer, so re-reading them here was a second stream synchronization per
+    grouped matmul, over every layer's base and LoRA projections.
+    """
     outputs = []
     start = 0
-    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+    if bounds is None: bounds = offsets.detach().cpu().tolist()
+    for expert_idx, end in enumerate(bounds):
         if start < end:
             outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
         start = end
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+# Projection strides for the routing signature. A CHECKSUM, not an identity: four
+# projections leave a `hidden - 4` null space, so rows differing within it project
+# alike; an exact identity means copying the whole `[T, hidden]` input, the 512MB
+# transient this file avoids. A swap escapes only by matching ALL of these AND the
+# norm below, each term weighted by the row index.
+_SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
+
+# Row 2-norm, carried beside the projections. Not linear in the row, so that null
+# space does not reach it: rows differing within it must also match norms to swap unseen.
+_SIGNATURE_EXTRA = 1
+
+# Trailing checksum entries of a packed signature, not group boundaries. Named because
+# offsets are read back by slicing it off, and a bare `[:-1]` read checksums as experts.
+_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
+
+
+def _routing_signature(inputs, offsets):
+    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
+
+    Offsets are only the routing histogram, so a replay swapping two tokens between
+    equal-sized experts leaves them identical while `inputs` holds a different
+    sequence; the checksum moves with the rows, so the swap is visible. Bit-cast into
+    the offsets vector so the whole thing is one device sync, the one the group loop
+    already pays.
+
+    Rows reduce through a fixed pseudo-random projection, not a sum: a sum ignores
+    WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike and a swap across
+    an expert boundary went unseen, letting the guard accept gradients from a different
+    routing. The projection derives from the hidden size alone, so forward and
+    recompute build the same one without carrying state.
+
+    The matvec runs in the input's own dtype, not an FP32 copy: upcasting on the way in
+    materialised a whole `[routed_tokens, hidden]` transient, 512MB at 32K by 4096, to
+    produce one number per row -- an OOM risk on exactly the memory-constrained runs
+    this fallback exists for. cuBLAS accumulates a half-precision gemv in FP32 anyway.
+    """
+    inputs = inputs.detach()
+    hidden = inputs.shape[-1]
+    # Autocast off, explicitly: `mv`/`mm` are on the autocast lower-precision list and
+    # only ONE of the two calls sees it (forward with the caller's autocast live,
+    # backward with it disabled), so FP32 inputs hashed bf16 one side and fp32 the
+    # other and every backward raised the routing error below on unchanged routing.
+    with torch.autocast(device_type = inputs.device.type, enabled = False):
+        weights = torch.linspace(
+            1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
+        # Irrational stride: a linear ramp alone sums the same under a reversal.
+        strides = torch.tensor(
+            _SIGNATURE_STRIDES, device = inputs.device, dtype = torch.float32)
+        weights = torch.sin(
+            weights.unsqueeze(1) * strides).to(inputs.dtype)
+        # Several projections, not one: a single dot maps each row to one scalar, so
+        # rows orthogonal to it hash like the zero row (`[p[1], -p[0], 0, ...]` and
+        # zeros both give exactly 0) and swapping that pair across an expert boundary
+        # survived the check.
+        rows = (inputs @ weights).float()
+        # Plus the norm, not linear in the row, so the projections' shared null space
+        # does not reach it. `vector_norm` accumulates in fp32 from the input's own
+        # dtype; `(x.float() * x.float()).sum(...)` held three concurrent 512MB
+        # temporaries at the 32K-by-4096 shape this fallback targets. Promoted, not
+        # pinned to fp32: `vector_norm` refuses a dtype that narrows its input.
+        norm = torch.linalg.vector_norm(
+            inputs, dim = -1, keepdim = True,
+            dtype = torch.promote_types(inputs.dtype, torch.float32))
+        rows = torch.cat((rows, norm.to(rows.dtype)), -1)
+        ramp = torch.arange(
+            1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
+        checksum = (rows * ramp.unsqueeze(1)).sum(0)
+    packed = torch.cat((
+        offsets.detach().reshape(-1).to(torch.int64),
+        checksum.view(torch.int32).to(torch.int64),
+    ))
+    return packed.cpu().tolist()
+
+
+class _ManualGroupedMM(torch.autograd.Function):
+    """The loop above, saving what torch._grouped_mm saves and nothing else.
+
+    A Function rather than plain autograd because the naive loop tapes every per-group
+    SLICE, whose shape is the group size the router decides. Non-reentrant checkpointing
+    replays the forward and compares saved metadata, so any routing difference between
+    the two passes surfaces as
+
+        CheckpointError: Recomputed values ... have different metadata
+        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
+
+    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows that:
+    it is one op saving the whole `[T, K]` input, so a drop-in has to save the same
+    shape-stable set (inputs, weight, offsets) and rebuild the slices in backward.
+
+    This does not make routing deterministic, and does not pretend to: it restores the
+    numerics the fused path already has on an H100.
+    """
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        # A plain list, NOT a tensor: non-reentrant checkpointing swaps the saved
+        # TENSORS for the replay's, so a saved `offsets` reports the replay's routing,
+        # never the forward's. This copy survives, and backward compares the two.
+        ctx.forward_routing = routing = _routing_signature(inputs, offsets)
+        ctx.save_for_backward(inputs, weight, offsets)
+        with torch.no_grad():
+            return _grouped_matmul_loop(
+                inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weight, offsets = ctx.saved_tensors
+        routing = _routing_signature(inputs, offsets)
+        if routing != ctx.forward_routing:
+            # Shape-stable saves would let this through silently, and pairing the
+            # original `grad_output` with the replay's partition is a gradient for a
+            # routing that never produced the loss. Louder than CheckpointError.
+            were = ctx.forward_routing[:-_SIGNATURE_WIDTH]
+            now = routing[:-_SIGNATURE_WIDTH]
+            how = ("the same experts in a different order"
+                   if were == now else f"expert ends {were} then {now}")
+            raise RuntimeError(
+                "Unsloth: the MoE router assigned tokens differently in the "
+                f"activation-checkpoint replay than in the forward ({how}), so "
+                "the gradients would belong to a routing that never produced "
+                "the loss. Turn gradient checkpointing off for this run, or "
+                "make the router deterministic."
+            )
+        bounds = routing[:-_SIGNATURE_WIDTH]
+        need_x, need_w, _ = ctx.needs_input_grad
+        grad_output = grad_output.contiguous()
+        # `backward` runs OUTSIDE the forward's autocast, so `grad_output` can be bf16
+        # while the saved tensors are still fp32 and the first matmul raises. Aligned
+        # by hand, not with `torch.amp.custom_fwd/custom_bwd`, whose `device_type` is
+        # fixed at class definition: this fallback also runs on CPU and XPU.
+        compute_dtype = grad_output.dtype
+        grad_inputs = torch.zeros_like(inputs) if need_x else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
+        # Write each group straight into its slice when no cast is due. The assignment
+        # below allocates a temporary and copies it in; `out=` does neither, and there
+        # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
+        # A cast needs the temporary anyway, and a non-contiguous destination would put
+        # the copy back, so both keep the plain path.
+        # Grad mode first: it is off for an ordinary backward and ON only under
+        # `create_graph = True`, where `out=` raises "functions with out=... arguments
+        # don't support automatic differentiation". The fused path double-backwards
+        # fine, so the fallback has to as well; the plain branch is differentiable.
+        direct = (
+            not torch.is_grad_enabled()
+            and inputs.dtype == weight.dtype == compute_dtype
+            and (grad_inputs is None or grad_inputs.is_contiguous())
+            and (grad_weight is None or grad_weight.is_contiguous())
+        )
+        start = 0
+        for expert_idx, end in enumerate(bounds):
+            if start < end:
+                g = grad_output[start:end]
+                if need_x:
+                    w = weight[expert_idx]
+                    if direct:
+                        torch.matmul(g, w.transpose(-2, -1),
+                                     out = grad_inputs[start:end])
+                    else:
+                        grad_inputs[start:end] = (
+                            g @ w.to(compute_dtype).transpose(-2, -1)
+                        ).to(inputs.dtype)
+                if need_w:
+                    if direct:
+                        torch.matmul(inputs[start:end].transpose(-2, -1), g,
+                                     out = grad_weight[expert_idx])
+                    else:
+                        x = inputs[start:end].to(compute_dtype)
+                        grad_weight[expert_idx] = (
+                            x.transpose(-2, -1) @ g).to(weight.dtype)
+            start = end
+        return grad_inputs, grad_weight, None
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+
+    Not compilable, and marked so: group boundaries come off a tensor, so `start < end`
+    is a data-dependent branch Dynamo cannot guard, and a tensorized rewrite is worse
+    (gathering `weight[expert_id]` per row materializes `[T, K, N]`; masking runs every
+    expert over every row). `torch.compiler.disable` makes a compiled caller break
+    cleanly here rather than abort mid-trace; under `fullgraph = True` a break is still
+    fatal, which is what the eager fallback in `temporary_patches/utils.py` is for.
+    """
+    # Grad off means `apply` builds no autograd node, so nothing will ever read the
+    # signature: skip the Function rather than pay a `[T, hidden]` projection per call.
+    # Covers `inference_mode` and `no_grad` alike.
+    #
+    # KNOWN GAP, deliberately not closed here. A REENTRANT checkpoint also runs its
+    # loss-producing forward with grad off and its replay with grad ON, so the replay
+    # compares its own routing against itself and a reroute passes silently. Not
+    # fixable from inside this function: `ctx` cannot cross a reentrant boundary, and a
+    # side channel keyed on the weight fails too because
+    # `_canonical_lora_weights_for_grouped_mm` rebuilds a contiguous tensor per call.
+    # It needs `unsloth_checkpoint` to announce its region and call order. The
+    # non-reentrant path is unaffected: its forward runs with grad on, so the forward
+    # ctx survives and only its SAVED TENSORS are swapped.
+    if not torch.is_grad_enabled():
+        return _grouped_matmul_loop(inputs, weight, offsets)
+    return _ManualGroupedMM.apply(inputs, weight, offsets)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
 
 
 # Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack

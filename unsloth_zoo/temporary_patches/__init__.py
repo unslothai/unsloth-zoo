@@ -48,4 +48,8 @@ from .flex_attention_bwd import *
 # The eager-fallback recovery hook unsloth calls when a backward dies inside
 # activation checkpointing. Named rather than star-imported: `utils` also
 # exports names this package has never re-exported.
-from .utils import eager_fallback_state, force_eager_fallback
+from .utils import (
+    eager_fallback_state,
+    force_eager_fallback,
+    apply_pending_eager_fallbacks,
+)

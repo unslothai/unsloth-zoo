@@ -15,7 +15,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Latest-only on branches, never on main. Pushes to main land in bursts, so
+  # cancelling superseded runs there throws away the run that would have
+  # reported a regression, and the run that writes the shared caches.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -129,6 +132,8 @@ jobs:
         # so a 3.10-only `match` and a module-level `str | Path` both reached main and
         # made the package un-importable on 3.9. It reads the floor from pyproject, so
         # raising requires-python relaxes it rather than making it lie.
+        # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
+        # nothing else; collect-only would let the packaging config regress.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -150,6 +155,8 @@ jobs:
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_python39_compatibility.py \
+            tests/test_checkpoint_modes.py \
+            tests/test_wheel_top_level_packages.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -346,6 +353,7 @@ jobs:
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
+            tests/test_torchvision_video_removed_message.py \
             tests/test_upstream_pinned_symbols_trl_vllm.py \
             tests/test_upstream_pinned_symbols_accelerator.py \
             tests/test_zoo_history_regressions_deep.py \

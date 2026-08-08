@@ -606,8 +606,11 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
+    f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -674,13 +677,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
-            accumulate_chunk,
+        from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
+        accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )
+        )(accumulate_chunk)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)

@@ -1117,7 +1117,7 @@ def create_new_function(
 
     if add_torch_compile:
         new_source = (
-            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
+            "@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
             f"{new_source}"
         )
     pass
@@ -1170,6 +1170,10 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    if "torch_compile_with_fallback" in new_source:
+        # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
+        # name must resolve in the generated module.
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -1713,7 +1717,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1864,8 +1868,9 @@ pass
 
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
+from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -5072,7 +5077,7 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -5136,7 +5141,7 @@ def unsloth_compile_transformers(
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(

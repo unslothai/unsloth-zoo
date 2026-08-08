@@ -27,6 +27,14 @@ def _grouped_mm_ok():
         return False
 
 
+@pytest.fixture(autouse=True)
+def _pretend_the_kernel_is_supported(monkeypatch):
+    """These pin what happens AT the kernel, so the capability gate in front of
+    it must not answer for a CPU runner and route the call away first."""
+    from unsloth_zoo.temporary_patches import moe_utils
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
+
+
 def test_no_forced_copy_on_happy_path(monkeypatch):
     """Probe-safe stack: weight kept as a non-contiguous view in one attempt; unproven: copied."""
     from unsloth_zoo.temporary_patches.moe_utils import (
@@ -139,3 +147,55 @@ def test_view_matches_copy_backward():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+def test_the_routing_signature_sees_a_same_sum_swap():
+    """A sum ignores WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike
+    and swapping them across an expert boundary left the signature unchanged: the guard
+    would accept a replay whose gradients belong to a different routing."""
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([2], dtype = torch.int32)
+    rows = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    assert _routing_signature(rows, offsets) != _routing_signature(rows.flip(0), offsets)
+
+
+def test_the_routing_signature_is_stable_for_the_same_rows():
+    """A false positive here turns a healthy step into a hard error."""
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([8], dtype = torch.int32)
+    rows = torch.randn(8, 32)
+    assert _routing_signature(rows, offsets) == _routing_signature(rows.clone(), offsets)
+
+
+def test_the_routing_signature_sees_an_arbitrary_permutation():
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([64], dtype = torch.int32)
+    rows = torch.randn(64, 128)
+    shuffled = rows[torch.randperm(64)]
+    if torch.equal(rows, shuffled):
+        pytest.skip("permutation happened to be the identity")
+    assert _routing_signature(rows, offsets) != _routing_signature(shuffled, offsets)
+
+
+def test_the_routing_signature_does_not_upcast_the_whole_input():
+    """Upcasting on the way in materialised a whole `[routed_tokens, hidden]` transient
+    for one number per row: 512MB at 32K by 4096, on exactly the memory-constrained
+    runs this fallback exists for."""
+    import inspect
+
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    body = inspect.getsource(_routing_signature)
+    assert ".float().sum(" not in body
+    assert ".detach().float()" not in body, "the full-width FP32 copy is back"
+
+
+def test_the_routing_signature_runs_in_half_precision():
+    from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
+
+    offsets = torch.tensor([4], dtype = torch.int32)
+    rows = torch.randn(4, 16).half()
+    assert isinstance(_routing_signature(rows, offsets), list)
