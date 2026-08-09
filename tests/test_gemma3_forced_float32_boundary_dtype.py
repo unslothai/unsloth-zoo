@@ -494,3 +494,107 @@ def test_to_forced_output_dtype_defaults_to_float16_and_is_not_identity_on_none(
     # Already fp16 with no answer: same tensor back, no pointless copy.
     float16_reduction = torch.randn(2, 3, dtype = torch.float16)
     assert _to_forced_output_dtype(float16_reduction, None) is float16_reduction
+
+
+class _QuantizedWeight(torch.Tensor):
+    """A tensor that carries a `quant_state`, the way `Params4bit` does.
+
+    bitsandbytes only fills `quant_state` in once the parameter has been moved
+    to an accelerator, so a CPU-only test cannot build a real packed weight.
+    What the helper actually reads is just `.dtype` and `.quant_state`, so a
+    tensor subclass carrying both reproduces the case exactly and keeps this
+    test running everywhere. The GPU test below asserts the same thing against
+    a real `Params4bit`.
+    """
+
+    quant_state = None
+
+    @staticmethod
+    def __new__(cls, data, quant_state):
+        instance = torch.Tensor._make_subclass(cls, data, False)
+        instance.quant_state = quant_state
+        return instance
+
+
+_QUANT_STORAGE_DTYPES = [torch.uint8, torch.bfloat16, torch.float16, torch.float32]
+
+
+@pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
+                         ids = lambda d: str(d).split(".")[-1])
+def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_dtype):
+    """`bnb_4bit_quant_storage` is a public knob, and it is not the compute dtype.
+
+    It defaults to uint8, which is not floating point and so was already
+    skipped. But FSDP can only shard float dtypes, so FSDP-QLoRA users are
+    told to set it to bfloat16, and `vllm_utils` and the bnb MoE loaders plumb
+    the configured value through. Then `Params4bit.weight.dtype` is bfloat16
+    while the tensor is still packed 4bit, and a plain floating-point test
+    reads a storage container as the activation dtype. `Linear4bit` returns
+    the caller's input dtype, so answering here would change QLoRA forward and
+    gradient numerics on a weight that is still quantized.
+    """
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    quantized = _Projections(**{
+        name: _Projections(weight = _QuantizedWeight(
+            torch.zeros(8, 1, dtype = storage_dtype), quant_state = object(),
+        )) for name in names
+    })
+    assert _linear_boundary_dtype(quantized, *names) is None
+
+    # Skipped, not terminal: a real unquantized compute dtype further along wins.
+    mixed = _Projections(
+        q_proj = _Projections(weight = _QuantizedWeight(
+            torch.zeros(8, 1, dtype = storage_dtype), quant_state = object(),
+        )),
+        k_proj = torch.nn.Linear(4, 4, bias = False, dtype = torch.float32),
+    )
+    assert _linear_boundary_dtype(mixed, *names) == torch.float32
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32],
+                         ids = lambda d: str(d).split(".")[-1])
+def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_dtype):
+    """The discriminator, asserted from the other side.
+
+    Skipping quantized weights must key off `quant_state`, not off the dtype.
+    A bfloat16 weight with no `quant_state` is an ordinary LoRA / QLoRA base
+    weight or a bf16 full finetune, and it must still answer, or a float32 full
+    finetune goes back to the "expected mat1 and mat2 to have the same dtype"
+    crash this helper exists to fix.
+    """
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+    module = _Projections(**{
+        name: torch.nn.Linear(4, 4, bias = False, dtype = weight_dtype) for name in names
+    })
+    assert getattr(module.q_proj.weight, "quant_state", None) is None
+    assert _linear_boundary_dtype(module, *names) == weight_dtype
+
+    # A plain nn.Parameter has no `quant_state` attribute at all: getattr, not
+    # hasattr-then-read, so this stays a no-op on any non-bitsandbytes backend.
+    bare = _Projections(**{name: torch.nn.Parameter(torch.zeros(4, 4, dtype = weight_dtype))
+                           for name in names})
+    assert _linear_boundary_dtype(bare, *names) == weight_dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs an accelerator to quantize")
+@pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
+                         ids = lambda d: str(d).split(".")[-1])
+def test_a_real_bitsandbytes_params4bit_never_answers(storage_dtype):
+    """The same assertion against real bitsandbytes, not a stand-in.
+
+    bitsandbytes quantizes on the move to the accelerator, so this is where a
+    genuine packed `Params4bit` exists and where its dtype really does report
+    the storage container.
+    """
+    bnb = pytest.importorskip("bitsandbytes")
+    names = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+    weight = bnb.nn.Params4bit(
+        torch.randn(64, 64, dtype = torch.float16),
+        quant_type = "nf4", quant_storage = storage_dtype, requires_grad = False,
+    ).cuda()
+    assert weight.quant_state is not None, "bitsandbytes did not quantize"
+    assert weight.dtype == storage_dtype, "quant_storage is meant to set the storage dtype"
+
+    module = _Projections(**{name: _Projections(weight = weight) for name in names})
+    assert _linear_boundary_dtype(module, *names) is None

@@ -86,19 +86,35 @@ def _linear_boundary_dtype(module, *attr_names):
     So read the dtype off the weights that will actually do the multiply. The
     first ordinary floating-point weight wins.
 
+    A weight carrying a `quant_state` is quantized and never answers, whatever
+    its dtype says. bitsandbytes packs a 4bit weight into a blob of
+    `bnb_4bit_quant_storage`, which defaults to uint8 but is a public knob:
+    FSDP can only shard float dtypes, so FSDP-QLoRA setups are told to set it
+    to bfloat16, and `vllm_utils` / the bnb MoE loaders plumb the configured
+    value straight through. That makes `Params4bit.weight.dtype` bfloat16 while
+    the tensor is still packed 4bit, so a plain floating-point test reads a
+    storage container as the activation dtype. `Linear4bit` dequantizes to its
+    own compute dtype and hands back the caller's input dtype, so answering
+    here would cast activations and forced outputs to the storage dtype and
+    change QLoRA forward and gradient numerics. `quant_state` is the only
+    reliable discriminator, and is read with getattr so a plain `nn.Parameter`
+    or a non-bitsandbytes backend is unaffected.
+
     None means "no weight answered, so leave the activation alone". It is not
-    float16. bitsandbytes stores a 4bit base weight as a uint8 blob, so on a
-    4bit model every projection is skipped, and a float16 default would narrow
-    a bfloat16 QLoRA activation on the generic (non-forced) path that the
-    unpatched forward passed through untouched -- costing exactly the exponent
-    range bfloat16 is chosen for. Under UNSLOTH_FORCE_FLOAT32 the activation
-    reaching here is already float16 out of RMSNorm, so "leave it alone" and
-    the old float16 default are the same value on that path.
+    float16. On a 4bit model every projection is skipped, and a float16 default
+    would narrow a bfloat16 QLoRA activation on the generic (non-forced) path
+    that the unpatched forward passed through untouched -- costing exactly the
+    exponent range bfloat16 is chosen for. Under UNSLOTH_FORCE_FLOAT32 the
+    activation reaching here is already float16 out of RMSNorm, so "leave it
+    alone" and the old float16 default are the same value on that path.
     """
     for name in attr_names:
         module_or_param = getattr(module, name, None)
         if module_or_param is None: continue
         weight = getattr(module_or_param, "weight", module_or_param)
+        # Quantized weights describe storage, not the activation dtype. Must be
+        # tested before the dtype checks, which a float quant_storage passes.
+        if getattr(weight, "quant_state", None) is not None: continue
         dtype = getattr(weight, "dtype", None)
         if dtype is None or not dtype.is_floating_point: continue
         if dtype in _STORAGE_ONLY_FLOAT_DTYPES: continue
@@ -133,7 +149,7 @@ def _to_forced_output_dtype(x, dtype):
     incoming activation is the explicitly upcast float32 SwiGLU / attention
     reduction rather than a float16 RMSNorm output. Those lines used to be a
     bare `.to(torch.float16)`, so "no weight answered" must still mean float16,
-    not identity: on 4bit QLoRA every projection weight is a packed uint8 blob
+    not identity: on 4bit QLoRA every projection weight is a packed 4bit blob
     and nothing answers, and bitsandbytes `Linear4bit` returns its caller's
     input dtype, so an identity here would make `down_proj` / `o_proj` hand back
     float32 and change the forward and gradient dtypes of the common QLoRA path.
