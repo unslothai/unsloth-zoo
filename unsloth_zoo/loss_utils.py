@@ -25,6 +25,7 @@ from triton import __version__ as triton_version
 from . import DEVICE_TYPE
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
+import re
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -236,6 +237,51 @@ from transformers.training_args import ParallelMode
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
+# Trainers that set model_accepts_loss_kwargs = False on purpose to *enable* the
+# grad-accum division (DPO, KTO, GRPO, RLOO, Reward, CPO, ORPO, BCO and friends).
+# Their loss is not token normalised, so they must keep num_items_in_batch = None.
+_ASSIGNS_ACCEPTS_FALSE = re.compile(r"self\s*\.\s*model_accepts_loss_kwargs\s*=\s*False")
+_TRAINER_DISABLES_CACHE = {}
+
+def _trainer_explicitly_disables_loss_kwargs(trainer):
+    cls = type(trainer)
+    if cls in _TRAINER_DISABLES_CACHE: return _TRAINER_DISABLES_CACHE[cls]
+    # Conservative default: if we cannot read the source, assume deliberate.
+    result = True
+    try:
+        from transformers import Trainer as _BaseTrainer
+        result = False
+        for klass in cls.__mro__:
+            if klass is _BaseTrainer or klass is object: continue
+            # Base Trainer also assigns False, but by signature inference, not intent.
+            init = klass.__dict__.get("__init__")
+            if init is None: continue
+            try: source = inspect.getsource(init)
+            except (OSError, TypeError): continue
+            if _ASSIGNS_ACCEPTS_FALSE.search(source):
+                result = True
+                break
+    except Exception:
+        pass
+    _TRAINER_DISABLES_CACHE[cls] = result
+    return result
+pass
+
+def _reconcile_loss_normalization(trainer, num_items_in_batch):
+    # Nothing counted, or a compute_loss_func already suppresses the division.
+    if num_items_in_batch is None: return num_items_in_batch
+    if getattr(trainer, "compute_loss_func", None) is not None: return num_items_in_batch
+    if getattr(trainer, "model_accepts_loss_kwargs", True): return num_items_in_batch
+
+    if _trainer_explicitly_disables_loss_kwargs(trainer):
+        # Trainer wants the /GA division, so give it the stock input for that.
+        return None
+    # Flag came from the model class, but the loss is token normalised, so tell
+    # training_step to skip its own division instead of double counting.
+    trainer.model_accepts_loss_kwargs = True
+    return num_items_in_batch
+pass
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -335,6 +381,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+
+    # We decide num_items_in_batch from the forward signature, but training_step
+    # decides whether to divide by grad-accum from self.model_accepts_loss_kwargs.
+    # A loss that divides by num_items_in_batch (ours, and TRL's chunked_nll) plus
+    # a model class setting accepts_loss_kwargs = False (gemma3, qwen-vl, paligemma,
+    # glm4v) normalises twice, silently scaling loss and grads by 1/GA. Reconcile.
+    num_items_in_batch = _reconcile_loss_normalization(self, num_items_in_batch)
+
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     
