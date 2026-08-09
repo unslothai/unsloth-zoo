@@ -60,6 +60,7 @@ from unsloth_zoo.temporary_patches import utils as patch_utils
 from unsloth_zoo.temporary_patches.gemma import (
     _linear_boundary_dtype,
     _to_boundary_dtype,
+    _to_forced_output_dtype,
 )
 
 requires_gemma3 = pytest.mark.skipif(not HAS_GEMMA3, reason="transformers gemma3 not installed")
@@ -339,7 +340,7 @@ def test_every_patch_installing_a_boundary_forward_publishes_the_helpers():
 
     source = pathlib.Path(gemma_patches.__file__).read_text(encoding = "utf-8")
     tree = ast.parse(source)
-    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype"}
+    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype", "_to_forced_output_dtype"}
 
     offenders = []
     for node in tree.body:
@@ -367,7 +368,7 @@ def test_the_publish_check_actually_finds_the_patches():
     import pathlib
 
     tree = ast.parse(pathlib.Path(gemma_patches.__file__).read_text(encoding = "utf-8"))
-    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype"}
+    helpers = {"_linear_boundary_dtype", "_to_boundary_dtype", "_to_forced_output_dtype"}
     using = [
         node.name for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name.startswith("patch_")
@@ -394,3 +395,102 @@ def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_mat
         _to_boundary_dtype(float16_activation, torch.float32),
         float16_activation.to(torch.float32),
     )
+
+
+class _FakeLinear4bit(torch.nn.Module):
+    """A stand-in for bitsandbytes `Linear4bit`, in the two ways that matter here.
+
+    bitsandbytes stores the base weight as a packed `uint8` blob
+    (`Params4bit(quant_storage=torch.uint8)`), so `_linear_boundary_dtype` finds
+    no floating-point weight and answers None. And its forward ends in
+    `bnb.matmul_4bit(...).to(inp_dtype)`, so the result carries the caller's
+    input dtype straight back out. Together those two facts are what turn a
+    float32 activation at a forced output boundary into a float32 `down_proj` /
+    `o_proj` result, and thus into changed QLoRA forward and gradient dtypes.
+    """
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.register_buffer("weight", torch.zeros(out_features * in_features // 2, 1, dtype = torch.uint8))
+        self.register_buffer("_dequantized", torch.randn(out_features, in_features, dtype = torch.float16))
+
+    def forward(self, x):
+        inp_dtype = x.dtype
+        return (x.to(torch.float16) @ self._dequantized.T).to(inp_dtype)
+
+
+def _quantize_projections(module, names):
+    for name in names:
+        linear = getattr(module, name)
+        setattr(module, name, _FakeLinear4bit(linear.in_features, linear.out_features))
+pass
+
+
+@requires_gemma3
+def test_forced_float32_mlp_downcasts_to_float16_when_4bit_weights_cannot_answer(forced_float32_patches):
+    """4bit QLoRA: no projection weight is floating point, so the boundary dtype
+    is None. The forced output boundary must still fall back to the float16 the
+    bare `.to(torch.float16)` always produced, or `down_proj` receives float32
+    and hands float32 back.
+    """
+    torch.manual_seed(0)
+    mlp = gemma3.Gemma3MLP(_text_config()).to(torch.float16)
+    _quantize_projections(mlp, ("gate_proj", "up_proj", "down_proj"))
+    assert _linear_boundary_dtype(mlp, "gate_proj", "up_proj", "down_proj") is None
+
+    gate_seen = _record_input_dtypes(mlp.gate_proj)
+    down_seen = _record_input_dtypes(mlp.down_proj)
+    x = torch.randn(2, 3, HIDDEN_SIZE, dtype = torch.float16)
+
+    out = mlp(x)
+
+    assert gate_seen == [torch.float16], "the fp16 input boundary must stay fp16"
+    assert down_seen == [torch.float16], "the forced output boundary leaked the fp32 reduction"
+    assert out.dtype == torch.float16, "Linear4bit returns the caller's dtype, so down_proj went fp32"
+
+
+@requires_gemma3
+def test_forced_float32_attention_downcasts_to_float16_when_4bit_weights_cannot_answer(forced_float32_patches):
+    """Same forced output boundary, on `o_proj` at the attention exit."""
+    torch.manual_seed(0)
+    attention = gemma3.Gemma3Attention(_text_config(), layer_idx = 0).to(torch.float16)
+    _quantize_projections(attention, ("q_proj", "k_proj", "v_proj", "o_proj"))
+    assert _linear_boundary_dtype(attention, "q_proj", "k_proj", "v_proj", "o_proj") is None
+
+    q_seen = _record_input_dtypes(attention.q_proj)
+    o_seen = _record_input_dtypes(attention.o_proj)
+    hidden_states = torch.randn(1, 4, HIDDEN_SIZE, dtype = torch.float16)
+    cos = torch.randn(1, 4, HEAD_DIM, dtype = torch.float32)
+    sin = torch.randn(1, 4, HEAD_DIM, dtype = torch.float32)
+
+    attn_output, _attn_weights = attention(
+        hidden_states,
+        position_embeddings = (cos, sin),
+        attention_mask = None,
+    )
+
+    assert q_seen == [torch.float16], "the fp16 input boundary must stay fp16"
+    assert o_seen == [torch.float16], "the forced output boundary leaked the fp32 reduction"
+    assert attn_output.dtype == torch.float16, "Linear4bit returns the caller's dtype, so o_proj went fp32"
+
+
+def test_to_forced_output_dtype_defaults_to_float16_and_is_not_identity_on_none():
+    """The whole distinction between the two helpers, asserted directly."""
+    float32_reduction = torch.randn(2, 3, dtype = torch.float32)
+
+    # No weight answered: the forced output boundary is the old bare fp16 cast...
+    assert _to_forced_output_dtype(float32_reduction, None).dtype == torch.float16
+    assert torch.equal(
+        _to_forced_output_dtype(float32_reduction, None),
+        float32_reduction.to(torch.float16),
+    )
+    # ...while the generic input helper is deliberately identity on None.
+    assert _to_boundary_dtype(float32_reduction, None) is float32_reduction
+
+    # A weight that did answer still wins over the fp16 default.
+    assert _to_forced_output_dtype(float32_reduction, torch.float32) is float32_reduction
+    assert _to_forced_output_dtype(float32_reduction, torch.bfloat16).dtype == torch.bfloat16
+
+    # Already fp16 with no answer: same tensor back, no pointless copy.
+    float16_reduction = torch.randn(2, 3, dtype = torch.float16)
+    assert _to_forced_output_dtype(float16_reduction, None) is float16_reduction

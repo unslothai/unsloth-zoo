@@ -108,20 +108,47 @@ pass
 
 
 def _to_boundary_dtype(x, dtype):
-    """Move an activation onto a Linear's dtype, skipping the cast when it already matches.
+    """Move an *already correctly typed* activation onto a Linear's dtype.
 
+    For the input boundaries only, where x arrives as float16 out of RMSNorm.
     float16 weights (LoRA / QLoRA) hit the identity branch on every call, so the
     common path keeps exactly the casts it had before and its numerics are
     unchanged. Only the float32 full-finetuning mismatch actually converts.
-    A None dtype is the "no weight answered" case and is also identity.
+
+    A None dtype means "no weight answered" and is identity, which is safe here
+    precisely because x is already the float16 these lines used to hard-code.
+    Do NOT use this at a forced output boundary, where x is a deliberately
+    upcast float32 reduction and identity would leak that float32 into the
+    projection -- use `_to_forced_output_dtype` there.
     """
     if dtype is None or x.dtype == dtype: return x
     return x.to(dtype)
 pass
 
 
+def _to_forced_output_dtype(x, dtype):
+    """Downcast a forced-float32 reduction before its output projection.
+
+    The counterpart of `_to_boundary_dtype` for the two boundaries where the
+    incoming activation is the explicitly upcast float32 SwiGLU / attention
+    reduction rather than a float16 RMSNorm output. Those lines used to be a
+    bare `.to(torch.float16)`, so "no weight answered" must still mean float16,
+    not identity: on 4bit QLoRA every projection weight is a packed uint8 blob
+    and nothing answers, and bitsandbytes `Linear4bit` returns its caller's
+    input dtype, so an identity here would make `down_proj` / `o_proj` hand back
+    float32 and change the forward and gradient dtypes of the common QLoRA path.
+
+    Kept as a separate name, rather than a default argument on the helper above,
+    so the two kinds of boundary cannot be confused at the call site.
+    """
+    if dtype is None: dtype = torch.float16
+    if x.dtype == dtype: return x
+    return x.to(dtype)
+pass
+
+
 def _publish_boundary_helpers(modeling_module):
-    """Make the two boundary helpers importable from the modeling module.
+    """Make the three boundary helpers importable from the modeling module.
 
     The auto-compiler serializes a patched forward into unsloth_compiled_cache
     as source text, and `create_new_function` resolves the free names it finds
@@ -133,8 +160,9 @@ def _publish_boundary_helpers(modeling_module):
     """
     publish_to_modeling_module(
         modeling_module,
-        _linear_boundary_dtype = _linear_boundary_dtype,
-        _to_boundary_dtype     = _to_boundary_dtype,
+        _linear_boundary_dtype  = _linear_boundary_dtype,
+        _to_boundary_dtype      = _to_boundary_dtype,
+        _to_forced_output_dtype = _to_forced_output_dtype,
     )
 pass
 
@@ -599,8 +627,9 @@ def patch_Gemma3MLP():
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
         intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Downcast and down_proj. fp16 weights take the same bare cast as before.
-        intermediate = _to_boundary_dtype(intermediate_fp32, boundary_dtype)
+        # Downcast and down_proj. Forced output boundary: intermediate_fp32 is the
+        # upcast reduction, so a weight that does not answer still means fp16.
+        intermediate = _to_forced_output_dtype(intermediate_fp32, boundary_dtype)
         down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
@@ -813,9 +842,10 @@ def patch_Gemma3Attention():
 
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1)
 
-        # fp16 weights keep the exact bare cast this line always did; fp32
-        # full-finetuning weights leave it in fp32 rather than crashing o_proj.
-        attn_output_fp16 = _to_boundary_dtype(attn_output_fp32, boundary_dtype)
+        # Forced output boundary: fp16 (and a 4bit weight that cannot answer)
+        # keep the exact bare cast this line always did; fp32 full-finetuning
+        # weights leave it in fp32 rather than crashing o_proj.
+        attn_output_fp16 = _to_forced_output_dtype(attn_output_fp32, boundary_dtype)
 
         # 8. Output Projection (o_proj) in fp16
         attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
