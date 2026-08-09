@@ -31,7 +31,11 @@ Lowering the limit makes the failure reachable on any GPU -- a T4 gets there
 unaided, a B200 at the default never does.
 """
 
+import os
 import re
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -46,6 +50,27 @@ COMPILER = ZOO / "compiler.py"
 # `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
 FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
+
+
+def _run_with_compile_enabled(body):
+    """Run `body` in a fresh interpreter with UNSLOTH_COMPILE_DISABLE cleared.
+
+    `common.py` reads that variable once at import and collapses both
+    `torch_compile` and `_maybe_compile` to a no-op when it is set, so the two
+    routing assertions below cannot hold in-process under it. unsloth's
+    consolidated CI runs this whole suite with `UNSLOTH_COMPILE_DISABLE=1` at
+    the job level, which is what made them fail there and pass locally. A
+    subprocess, not `importlib.reload`, because reloading the module mid-session
+    rebinds objects other tests in the same run already hold.
+    """
+    env = dict(os.environ)
+    env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    done = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(body)],
+        capture_output = True, text = True, env = env,
+        cwd = str(ZOO.parent),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
 
 
 # ---- what the compiler emits ---------------------------------------------
@@ -91,12 +116,16 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback():
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
 
-    def f(x):
-        return x
-    wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
-    assert hasattr(wrapped, "_unsloth_fallback_state")
-    plain = common._maybe_compile(dynamic = True)(f)
-    assert not hasattr(plain, "_unsloth_fallback_state")
+    _run_with_compile_enabled("""
+        from unsloth_zoo.temporary_patches import common
+
+        def f(x):
+            return x
+        wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
+        assert hasattr(wrapped, "_unsloth_fallback_state")
+        plain = common._maybe_compile(dynamic = True)(f)
+        assert not hasattr(plain, "_unsloth_fallback_state")
+    """)
 
 
 def test_the_generated_preamble_imports_the_helper():
@@ -235,21 +264,26 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
     assert raw, "the raw alias compile_with_eager_fallback needs is gone"
 
 
-def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
-    from unsloth_zoo.temporary_patches import common as C
-    seen = {}
+def test_the_alias_routes_a_fullgraph_compile_through_the_fallback():
+    _run_with_compile_enabled("""
+        import unsloth_zoo.temporary_patches.utils as U
+        seen = {}
 
-    def _fake(**kwargs):
-        seen.update(kwargs)
-        return lambda fn: fn
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return lambda fn: fn
 
-    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
-                        "torch_compile_with_fallback", _fake)
+        # `common` imports the helper lazily inside the call, so patching the
+        # attribute on utils before the decorator runs is enough.
+        U.torch_compile_with_fallback = _fake
 
-    @C.torch_compile(dynamic = True, fullgraph = True)
-    def _f(x): return x
+        from unsloth_zoo.temporary_patches import common as C
 
-    assert seen.get("fullgraph") is True
+        @C.torch_compile(dynamic = True, fullgraph = True)
+        def _f(x): return x
+
+        assert seen.get("fullgraph") is True, seen
+    """)
 
 
 def test_the_alias_still_accepts_a_function_positionally():
