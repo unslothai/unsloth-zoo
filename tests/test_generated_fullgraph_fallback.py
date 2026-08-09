@@ -31,7 +31,13 @@ Lowering the limit makes the failure reachable on any GPU -- a T4 gets there
 unaided, a B200 at the default never does.
 """
 
+import json
+import os
 import re
+import subprocess
+import sys
+import textwrap
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -81,22 +87,16 @@ def test_the_grpo_loss_regions_are_wrapped():
         "accumulate_chunk is still compiled bare"
 
 
-def test_maybe_compile_routes_fullgraph_through_the_fallback():
+def test_maybe_compile_asks_for_the_fallback_only_under_fullgraph():
     """Three more fullgraph regions go through this one helper, so wiring it
-    covers them without touching each decorator."""
-    from unsloth_zoo.temporary_patches import common
+    covers them without touching each decorator. What it does at runtime is in
+    `test_every_fullgraph_entry_point_carries_the_fallback` below, which has to
+    pick the compile switch's position rather than inherit the runner's."""
     src = (ZOO / "temporary_patches" / "common.py").read_text()
     body = src.split("def _maybe_compile(", 1)[1].split("\ndef ", 1)[0]
     assert "torch_compile_with_fallback" in body
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
-
-    def f(x):
-        return x
-    wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
-    assert hasattr(wrapped, "_unsloth_fallback_state")
-    plain = common._maybe_compile(dynamic = True)(f)
-    assert not hasattr(plain, "_unsloth_fallback_state")
 
 
 def test_the_generated_preamble_imports_the_helper():
@@ -235,26 +235,12 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
     assert raw, "the raw alias compile_with_eager_fallback needs is gone"
 
 
-def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
-    from unsloth_zoo.temporary_patches import common as C
-    seen = {}
-
-    def _fake(**kwargs):
-        seen.update(kwargs)
-        return lambda fn: fn
-
-    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
-                        "torch_compile_with_fallback", _fake)
-
-    @C.torch_compile(dynamic = True, fullgraph = True)
-    def _f(x): return x
-
-    assert seen.get("fullgraph") is True
-
-
 def test_the_alias_still_accepts_a_function_positionally():
     """`prepare = torch_compile(prepare, fullgraph = True)` is how gemma.py and
-    gpt_oss.py call it, and a kwargs-only helper would TypeError there."""
+    gpt_oss.py call it, and a kwargs-only helper would TypeError there.
+
+    True in either position of the compile switch: with it off the alias is
+    `noop`, which takes a function positionally too."""
     from unsloth_zoo.temporary_patches import common as C
 
     def _f(x): return x * 2
@@ -263,20 +249,141 @@ def test_the_alias_still_accepts_a_function_positionally():
     assert wrapped(3) == 6
 
 
-def test_a_non_fullgraph_compile_is_left_alone(monkeypatch):
-    """Dynamo already falls back by itself without fullgraph, so wrapping there
-    would add a layer that can never fire."""
+# ---- routing, with the compile switch put in each position -----------------
+# `UNSLOTH_COMPILE_DISABLE` is read into module constants at import, and both
+# the alias and `_maybe_compile` short-circuit on it, so anything checked in
+# this process only ever sees the position the runner happened to start in.
+# unsloth's consolidated-tests-ci.yml pins the flag to 1 for the whole job,
+# where the two runtime checks that used to live here read a correct no-op as a
+# missing fallback and went red on every unsloth PR. Set the position in a
+# subprocess instead, same shape as tests/test_rl_replacements_compile_disable.py,
+# and assert both halves of the contract: routed when compiling, nothing
+# compiled at all when the escape hatch is on.
+
+_ROUTING_SCRIPT = textwrap.dedent("""
+    import json
     from unsloth_zoo.temporary_patches import common as C
-    called = {"n": 0}
 
-    def _boom(**kwargs):
-        called["n"] += 1
-        return lambda fn: fn
-
-    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
-                        "torch_compile_with_fallback", _boom)
-
-    @C.torch_compile(dynamic = True)
     def _f(x): return x
 
-    assert called["n"] == 0
+    # `torch_compile_with_fallback` is the only thing that stamps this on, so
+    # its presence is the routing, not a spelling of it.
+    def _routed(fn): return hasattr(fn, "_unsloth_fallback_state")
+    def _dynamo_off(fn): return getattr(fn, "_torchdynamo_disable", False) is True
+
+    out = {"flag": bool(C.UNSLOTH_COMPILE_DISABLE)}
+    for name, alias in (("torch_compile", C.torch_compile),
+                        ("_torch_compile", C._torch_compile)):
+        out[name + "_fullgraph"]     = _routed(alias(dynamic = True, fullgraph = True)(_f))
+        out[name + "_positional"]    = _routed(alias(_f, dynamic = True, fullgraph = True))
+        out[name + "_plain"]         = _routed(alias(dynamic = True)(_f))
+        out[name + "_fullgraph_off"] = _dynamo_off(alias(dynamic = True, fullgraph = True)(_f))
+    out["maybe_fullgraph"]  = _routed(C._maybe_compile(fullgraph = True, dynamic = True)(_f))
+    out["maybe_plain"]      = _routed(C._maybe_compile(dynamic = True)(_f))
+    out["maybe_identity"]   = C._maybe_compile(fullgraph = True, dynamic = True)(_f) is _f
+    # `_raw_torch_compile` deliberately does NOT route: compile_with_eager_fallback
+    # applies the wrapper itself and wrapping a wrapper leaves the inner one
+    # swallowing the exhaustion.
+    out["raw_fullgraph"] = _routed(C._raw_torch_compile(_f, fullgraph = True))
+
+    # `_unsloth_fallback_state` is stamped on only under fullgraph, so it cannot
+    # tell a non-fullgraph compile that wrongly went through the helper from one
+    # that did not: `torch_compile_with_fallback(fullgraph = False)` hands back a
+    # plain compiled object either way. Record the calls instead. Both routers
+    # resolve the name off `utils` at call time, so rebinding it is enough.
+    import unsloth_zoo.temporary_patches.utils as U
+    calls = []
+    _real = U.torch_compile_with_fallback
+    def _record(**kwargs):
+        calls.append(kwargs)
+        return lambda fn: fn
+    U.torch_compile_with_fallback = _record
+    try:
+        for name, alias in (("torch_compile", C.torch_compile),
+                            ("_torch_compile", C._torch_compile)):
+            for label, kw in (("plain", dict(dynamic = True)),
+                              ("fullgraph", dict(dynamic = True, fullgraph = True))):
+                calls.clear()
+                alias(**kw)(_f)
+                out[f"{name}_{label}_reached_helper"] = bool(calls)
+        for label, kw in (("plain", dict(dynamic = True)),
+                          ("fullgraph", dict(fullgraph = True, dynamic = True))):
+            calls.clear()
+            C._maybe_compile(**kw)(_f)
+            out[f"maybe_{label}_reached_helper"] = bool(calls)
+        calls.clear()
+        C._raw_torch_compile(_f, fullgraph = True)
+        out["raw_reached_helper"] = bool(calls)
+    finally:
+        U.torch_compile_with_fallback = _real
+    print("PROBE " + json.dumps(out))
+""")
+
+
+@lru_cache(maxsize = None)
+def _routing_probe(value):
+    env = dict(
+        os.environ,
+        # Prepend, never replace: the checkout has to win over an installed
+        # copy, but the parent process may be carrying paths the import needs.
+        PYTHONPATH = os.pathsep.join(
+            [str(ZOO.parent)] + [p for p in [os.environ.get("PYTHONPATH", "")] if p]
+        ),
+        UNSLOTH_COMPILE_DISABLE = value,
+        # unsloth_zoo/__init__ calls get_device_type() at import and raises on a
+        # GPU-less runner; same escape the sibling compile-disable probe uses.
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1",
+    )
+    r = subprocess.run([sys.executable, "-c", _ROUTING_SCRIPT],
+                       capture_output = True, text = True, timeout = 900, env = env)
+    line = [l for l in r.stdout.splitlines() if l.startswith("PROBE ")]
+    assert line, (r.stdout[-2000:], r.stderr[-3000:])
+    return json.loads(line[0][len("PROBE "):])
+
+
+def test_every_fullgraph_entry_point_carries_the_fallback():
+    """`torch_compile`, `_torch_compile` and `_maybe_compile` are the three ways
+    a fullgraph region is built, and all three have to reach the wrapper. The
+    decorator and positional spellings are both in use (gemma.py, gpt_oss.py)."""
+    got = _routing_probe("0")
+    assert got["flag"] is False, got
+    for key in ("torch_compile_fullgraph", "torch_compile_positional",
+                "_torch_compile_fullgraph", "_torch_compile_positional",
+                "maybe_fullgraph"):
+        assert got[key] is True, f"{key} does not reach torch_compile_with_fallback: {got}"
+
+
+def test_a_non_fullgraph_compile_is_left_alone():
+    """Dynamo already falls back by itself without fullgraph, so wrapping there
+    would add a layer that can never fire. `_raw_torch_compile` is excluded on
+    purpose; its one caller applies the wrapper itself."""
+    got = _routing_probe("0")
+    # Positive control first: without it every assertion below passes for free
+    # the moment the call recorder stops recording.
+    for key in ("torch_compile_fullgraph_reached_helper",
+                "_torch_compile_fullgraph_reached_helper",
+                "maybe_fullgraph_reached_helper"):
+        assert got[key] is True, f"the recorder never saw {key}: {got}"
+    for key in ("torch_compile_plain_reached_helper",
+                "_torch_compile_plain_reached_helper",
+                "maybe_plain_reached_helper", "raw_reached_helper"):
+        assert got[key] is False, f"{key} was wrapped and cannot ever fire: {got}"
+    for key in ("torch_compile_plain", "_torch_compile_plain", "maybe_plain",
+                "raw_fullgraph"):
+        assert got[key] is False, f"{key} carries a fallback state it cannot use: {got}"
+
+
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_the_escape_hatch_still_turns_compilation_off(value):
+    """The routing must not become a way back in. With the flag set nothing is
+    compiled: the aliases hand back a Dynamo-disabled callable and
+    `_maybe_compile` hands back the function itself, so no wrapper is stamped
+    on. This is the position unsloth's Core job runs the whole suite in."""
+    got = _routing_probe(value)
+    assert got["flag"] is True, got
+    for key in ("torch_compile_fullgraph", "_torch_compile_fullgraph",
+                "maybe_fullgraph"):
+        assert got[key] is False, f"{key} routed with compilation disabled: {got}"
+    for key in ("torch_compile_fullgraph_off", "_torch_compile_fullgraph_off"):
+        assert got[key] is True, f"{key} still reaches Dynamo: {got}"
+    assert got["maybe_identity"] is True, got
