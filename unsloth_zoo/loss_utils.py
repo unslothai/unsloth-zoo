@@ -237,71 +237,6 @@ from transformers.training_args import ParallelMode
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
-# Trainers that set model_accepts_loss_kwargs = False on purpose to *enable* the
-# grad-accum division (DPO, KTO, GRPO, RLOO, Reward, CPO, ORPO, BCO and friends).
-# Their loss is not token normalised, so they must keep num_items_in_batch = None.
-_ASSIGNS_ACCEPTS_FALSE = re.compile(r"self\s*\.\s*model_accepts_loss_kwargs\s*=\s*False")
-_TRAINER_DISABLES_CACHE = {}
-
-def _trainer_explicitly_disables_loss_kwargs(trainer):
-    cls = type(trainer)
-    if cls in _TRAINER_DISABLES_CACHE: return _TRAINER_DISABLES_CACHE[cls]
-    # Conservative default: if we cannot read the source, assume deliberate.
-    result = True
-    try:
-        from transformers import Trainer as _BaseTrainer
-        result = False
-        for klass in cls.__mro__:
-            if klass is _BaseTrainer or klass is object: continue
-            # Base Trainer also assigns False, but by signature inference, not intent.
-            init = klass.__dict__.get("__init__")
-            if init is None: continue
-            try: source = inspect.getsource(init)
-            except (OSError, TypeError): continue
-            if _ASSIGNS_ACCEPTS_FALSE.search(source):
-                result = True
-                break
-    except Exception:
-        pass
-    _TRAINER_DISABLES_CACHE[cls] = result
-    return result
-pass
-
-def _loss_consumes_num_items(trainer):
-    # TRL's chunked_nll patches the lm_head and divides by num_items_in_batch
-    # itself, outside the model_accepts_loss_kwargs gate. That is the only path
-    # that normalises while the flag says False, so it is the only one for which
-    # skipping training_step's division is correct.
-    try:
-        import trl.trainer.sft_trainer as _sft
-    except Exception:
-        return False
-    if not hasattr(_sft, "_patch_chunked_ce_lm_head"): return False
-    args = getattr(trainer, "args", None)
-    if args is None: return False
-    if getattr(args, "use_liger_kernel", False): return False  # forces loss_type="nll"
-    return getattr(args, "loss_type", None) in (None, "chunked_nll")
-pass
-
-def _reconcile_loss_normalization(trainer, num_items_in_batch):
-    # Nothing counted, or a compute_loss_func already suppresses the division.
-    if num_items_in_batch is None: return num_items_in_batch
-    if getattr(trainer, "compute_loss_func", None) is not None: return num_items_in_batch
-    if getattr(trainer, "model_accepts_loss_kwargs", True): return num_items_in_batch
-
-    # Trainer set the flag False on purpose to get the /GA division (DPO, KTO,
-    # GRPO and friends). Never override that; give it the stock input instead.
-    if _trainer_explicitly_disables_loss_kwargs(trainer): return None
-
-    if _loss_consumes_num_items(trainer):
-        # Already token normalised, so let training_step skip its division.
-        trainer.model_accepts_loss_kwargs = True
-        return num_items_in_batch
-    # Nothing downstream will divide by the count, so training_step's /GA is the
-    # correct and only normalisation. Passing a count would suppress it.
-    return None
-pass
-
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -403,11 +338,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
 
     # We decide num_items_in_batch from the forward signature, but training_step
-    # decides whether to divide by grad-accum from self.model_accepts_loss_kwargs.
-    # A loss that divides by num_items_in_batch (ours, and TRL's chunked_nll) plus
-    # a model class setting accepts_loss_kwargs = False (gemma3, qwen-vl, paligemma,
-    # glm4v) normalises twice, silently scaling loss and grads by 1/GA. Reconcile.
-    num_items_in_batch = _reconcile_loss_normalization(self, num_items_in_batch)
+    # divides by grad-accum based on self.model_accepts_loss_kwargs. Returning a
+    # count while that flag is False normalises the loss twice (TRL's chunked_nll
+    # and our fused CE both divide by it), silently scaling loss and grads by 1/GA.
+    # Mirror stock Trainer._get_num_items_in_batch: only count when someone will
+    # consume it. Every such loss falls back to a mean when it is None.
+    if (num_items_in_batch is not None
+            and not getattr(self, "model_accepts_loss_kwargs", True)
+            and getattr(self, "compute_loss_func", None) is None):
+        num_items_in_batch = None
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
