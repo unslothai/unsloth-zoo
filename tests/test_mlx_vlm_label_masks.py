@@ -2707,6 +2707,8 @@ def test_qualified_families_carry_their_probed_requirements():
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
         "gemma3n": versions("0.4.4", "0.6.4"),
         "gemma4": versions("0.6.2", "0.6.4"),
+        "gemma4_unified": versions("0.6.10", "0.6.10"),
+        "nemotron_h_nano_omni": versions("0.6.10", "0.6.10"),
         "phi4mm": versions("0.4.4", "0.6.4"),
         "minicpmo": versions("0.4.4", "0.6.4"),
     }
@@ -2820,25 +2822,36 @@ def test_only_a_published_final_release_is_inside_the_window():
     assert gemma4.admits("0.6.5") is False
 
 
-def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
-    """mlx-vlm 0.6.3 added `gemma4_unified` beside `gemma4`, so a gemma 4
-    checkpoint can present under a family key this gate never qualified.
-    Refusing it as simply unrecognised tells the user nothing they can act on;
-    the refusal names the entry they are actually looking for."""
+def test_new_audio_families_are_qualified_only_on_the_measured_release(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
 
     unified = type("Gemma4UnifiedProcessor", (), {})
     unified.__module__ = "mlx_vlm.models.gemma4_unified.processing_gemma4_unified"
     assert mlx_utils._audio_family_from_processor(unified()) == "gemma4_unified"
+    nemotron = type("NemotronProcessor", (), {})
+    nemotron.__module__ = (
+        "mlx_vlm.models.nemotron_h_nano_omni.processing_nemotron_h_nano_omni"
+    )
+    for processor, family in ((unified(), "gemma4_unified"),
+                              (nemotron(), "nemotron_h_nano_omni")):
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.10",
+        )
+        assert mlx_utils._check_audio_family_gate(processor) == family
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.9",
+        )
+        with pytest.raises(NotImplementedError, match="only been verified"):
+            mlx_utils._check_audio_family_gate(processor)
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        mlx_utils._check_audio_family_gate(unified())
-    message = str(excinfo.value)
-    assert "gemma4_unified" in message and "'gemma4'" in message
-    # Read the window off the table: the refusal must name whatever gemma4 is
-    # currently qualified for, and that moves when it is re-probed.
-    window = str(mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"])
-    assert window in message, "the version to pin is not named"
+
+def test_diffusion_gemma_audio_refusal_names_the_missing_native_modality():
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = type("DiffusionGemmaProcessor", (), {})
+    processor.__module__ = "mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma"
+    with pytest.raises(NotImplementedError, match="no native audio modality"):
+        mlx_utils._check_audio_family_gate(processor())
 
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
@@ -3482,6 +3495,13 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
+def test_nemotron_declares_its_sampling_rate_on_the_processor():
+    from unsloth_zoo.mlx.utils import audio_extractor_sampling_rate
+
+    processor = type("NemotronProcessor", (), {"audio_sampling_rate": 16000})()
+    assert audio_extractor_sampling_rate(processor) == 16000
+
+
 def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
     """A row that is itself a list of messages is a supported shape, which
     _collate_vlm_batch normalizes. The pre-formatter scan has to see it too:
@@ -3739,6 +3759,25 @@ def test_the_projection_after_the_audio_tower_is_frozen_too():
         "audio_tower", "audio_projection_layer",
     }
     assert model.audio_tower.frozen and model.audio_projection_layer.frozen
+
+
+def test_nemotron_sound_encoder_and_projection_are_frozen():
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    class _Module:
+        def __init__(self):
+            self.frozen = False
+
+        def freeze(self, recurse=False):
+            self.frozen = recurse
+
+    model = type("Nemotron", (), {
+        "sound_encoder": _Module(), "sound_projection": _Module(),
+    })()
+    assert set(freeze_audio_modules(model)) == {
+        "sound_encoder", "sound_projection",
+    }
+    assert model.sound_encoder.frozen and model.sound_projection.frozen
 
 
 def test_stated_spans_refuse_the_left_padding_repair():
@@ -4004,6 +4043,23 @@ def test_clips_of_unequal_duration_all_reach_the_model():
     assert tuple(stacked.shape) == (2, 80, 300)
 
 
+def test_nemotron_sound_clips_stay_a_list_even_when_shapes_match():
+    """Nemotron's extractor interprets a stacked matrix as one multichannel
+    clip, so equal-length waveforms must retain the list contract too."""
+    from unsloth_zoo.mlx.utils import (
+        _assert_audio_features_present, _to_mx_vlm_batch,
+        _vlm_batch_carries_audio,
+    )
+
+    inputs = {"sound_clips": [np.zeros(1600, np.float32),
+                              np.ones(1600, np.float32)]}
+    _assert_audio_features_present(inputs, 2, _FakeProcessor())
+    clips = _to_mx_vlm_batch(inputs)["sound_clips"]
+    assert isinstance(clips, list) and len(clips) == 2
+    assert all(tuple(clip.shape) == (1600,) for clip in clips)
+    assert _vlm_batch_carries_audio({"sound_clips": clips}) is True
+
+
 def test_nested_audio_rows_are_paired_clip_by_clip():
     """A processor that wants ``(samples, rate)`` pairs may also want its audio
     nested per row (MiniCPM-o). Pairing the payload as though its entries were
@@ -4211,6 +4267,7 @@ def test_an_empty_audio_payload_is_not_audio():
     # audio than an empty array is.
     assert not _vlm_batch_carries_audio({"input_audio_embeds": []})
     assert _vlm_batch_carries_audio({"input_audio_embeds": [object()]})
+    assert not _vlm_batch_carries_audio({"sound_clips": []})
 
 
 def test_audio_spans_are_checked_against_attended_positions():
@@ -4596,7 +4653,8 @@ def test_audio_modules_are_found_wherever_the_family_nests_them():
 
     for names in (("audio_tower", "embed_audio"),
                   ("audio_tower", "audio_projection_layer"),
-                  ("embed_tokens_extend.audio_embed.audio_encoder",)):
+                  ("embed_tokens_extend.audio_embed.audio_encoder",),
+                  ("sound_encoder", "sound_projection")):
         verdict = audio_input_capability(_AudioModel(names), _ProbeProcessor())
         assert verdict.model_ok is True and verdict.capable is True, names
     absent = audio_input_capability(
@@ -4778,6 +4836,40 @@ def test_shielding_the_audio_side_leaves_the_text_side_flat():
         all_audio=[[np.zeros(16000, np.float32)]],
     )
     assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_processor_forwarding_kwargs_to_its_tokenizer_drops_audio_shield():
+    """Gemma 4 consumes audio itself but forwards every remaining keyword to
+    its tokenizer, where the modality-only `audio_kwargs` shield is invalid."""
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+
+    class _Gemma4Style(_FakeProcessor):
+        feature_extractor = type("_Extractor", (), {"sampling_rate": 16000})()
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "audio_kwargs" in kwargs:
+                raise TypeError(
+                    "PreTrainedTokenizerFast._batch_encode_plus() got an "
+                    "unexpected keyword argument 'audio_kwargs'"
+                )
+            return {
+                "input_ids": np.ones((len(text), 4), np.int32),
+                "attention_mask": np.ones((len(text), 4), np.int32),
+                "input_features": np.ones((len(audio), 8, 4), np.float32),
+            }
+
+    processor = _Gemma4Style()
+    result = _processor_vlm_inputs(
+        processor, ["prompt"], [[]], 128, all_audio=[[_CLIP]],
+    )
+    assert result["input_features"].shape[0] == 1
+    assert len(processor.calls) == 2
+    assert processor.calls[1]["max_length"] == 128
+    assert "audio_kwargs" not in processor.calls[1]
 
 
 def test_a_text_only_batch_is_collated_exactly_as_before():

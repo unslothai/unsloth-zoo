@@ -5682,15 +5682,23 @@ class _AudioVersions(NamedTuple):
 # made sanitize unconditional, double-transposing pre-converted convs -- but
 # loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
 # fixed it in 0.6.5 (#1523). The ceiling is 0.6.4 only for the transformers cap.
+# Gemma 4 Unified and Nemotron Omni are separate implementations first qualified
+# against the release environment's 0.6.10 contract; fail closed on either side.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
     "gemma4": _AudioVersions("0.6.2", "0.6.4"),
+    "gemma4_unified": _AudioVersions("0.6.10", "0.6.10"),
+    "nemotron_h_nano_omni": _AudioVersions("0.6.10", "0.6.10"),
     "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }
 
-# Names upstream renamed, so a refusal can point at the qualified entry.
-_AUDIO_FAMILY_RENAMES = {"gemma4_unified": "gemma4"}
+_AUDIO_UNSUPPORTED_REASONS = {
+    "diffusion_gemma": (
+        "the published checkpoint has no native audio modality, processor "
+        "path, audio configuration, or audio weights"
+    ),
+}
 
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
@@ -5966,16 +5974,11 @@ def _check_audio_family_gate(processor):
     if probed and probed.admits(installed):
         _check_audio_transformers_floor(family)
         return family
-    renamed = _AUDIO_FAMILY_RENAMES.get(family)
-    if renamed and renamed in _AUDIO_QUALIFIED_FAMILIES:
-        # The old name's entry says nothing about the renamed implementation.
+    unsupported = _AUDIO_UNSUPPORTED_REASONS.get(family)
+    if unsupported:
         raise NotImplementedError(
-            f"Unsloth MLX: audio training is not supported for '{family}'. "
-            f"mlx-vlm {installed or 'unknown'} loads this checkpoint as "
-            f"'{family}', which is a different implementation from the "
-            f"'{renamed}' this package qualified on mlx-vlm "
-            f"{_AUDIO_QUALIFIED_FAMILIES[renamed]}. Pin that version to train "
-            f"on audio with this model."
+            f"Unsloth MLX: audio training is not supported for '{family}': "
+            f"{unsupported}. Train on its text and image modalities instead."
         )
     if not _AUDIO_QUALIFIED_FAMILIES:
         raise NotImplementedError(
@@ -6010,6 +6013,8 @@ def audio_extractor_sampling_rate(processor):
         processor,
     ):
         rate = getattr(holder, "sampling_rate", None)
+        if rate is None and holder is processor:
+            rate = getattr(processor, "audio_sampling_rate", None)
         if rate:
             try:
                 return int(rate)
@@ -6156,7 +6161,12 @@ def _model_carries_audio_modules(model):
         return False
     for entry in walk():
         name = entry[0] if isinstance(entry, tuple) else entry
-        if "audio" in str(name).lower():
+        lowered = str(name).lower()
+        if (
+            "audio" in lowered
+            or lowered.startswith("sound_")
+            or ".sound_" in lowered
+        ):
             return True
     return False
 
@@ -6436,7 +6446,7 @@ def _extract_vlm_audio(item, messages, processor):
 
 # Payload keys only: masks and size vectors can survive a dropped payload.
 _AUDIO_FEATURE_PAYLOAD_KEYS = (
-    "input_features", "input_audio_embeds", "audio_features",
+    "input_features", "input_audio_embeds", "audio_features", "sound_clips",
 )
 
 
@@ -7043,6 +7053,14 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
+        if key == "sound_clips" and isinstance(value, (list, tuple)):
+            # Nemotron's outer list is the clip axis. Stacking equal lengths
+            # turns it into one 2-D clip, which its extractor downmixes.
+            batch[key] = [
+                x if isinstance(x, mx.array) else mx.array(np.asarray(x))
+                for x in value
+            ]
+            continue
         if key in _VLM_PER_ROW_MEDIA_KEYS and isinstance(value, (list, tuple)):
             batch[key] = [mx.array(np.asarray(row)) for row in value]
             continue
@@ -7366,6 +7384,24 @@ def _processor_vlm_inputs(
             try:
                 return _call_vlm_processor(processor, (), proc_kwargs)
             except TypeError as exc:
+                if (
+                    "audio_kwargs" in str(exc)
+                    and "unexpected keyword argument" in str(exc)
+                    and "audio_kwargs" in proc_kwargs
+                ):
+                    # Gemma 4 handles audio itself, then forwards remaining
+                    # kwargs to its tokenizer. It therefore rejects the
+                    # modality shield used by ProcessorMixin-based families;
+                    # its feature extractor never sees the flat text cap.
+                    proc_kwargs.pop("audio_kwargs")
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
                 if (
                     "add_special_tokens" in str(exc)
                     # Bound twice, or not accepted: both mean drop and retry.
@@ -8530,7 +8566,7 @@ def _audio_fixed_budget(processor, config=None):
 
 _AUDIO_TOWER_ATTRS = (
     "audio_tower", "embed_audio", "audio_encoder", "audio_projection",
-    "audio_projection_layer",
+    "audio_projection_layer", "sound_encoder", "sound_projection",
 )
 
 

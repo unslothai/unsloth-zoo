@@ -5453,6 +5453,25 @@ def _ensure_vlm_prompt_utils_patched():
     ):
         config_data = config if isinstance(config, dict) else config.__dict__
         model_type = config_data["model_type"]
+        model_config = getattr(prompt_utils, "MODEL_CONFIG", {})
+        if isinstance(model_type, str) and model_type not in model_config:
+            folded = model_type.casefold()
+            canonical = next(
+                (
+                    key for key in model_config
+                    if isinstance(key, str) and key.casefold() == folded
+                ),
+                None,
+            )
+            if canonical is not None:
+                # Some published configs capitalize model_type even though
+                # mlx-vlm's routing table uses lowercase keys. Passing the
+                # canonical key keeps media-count formatting from falling
+                # through to the text-only path.
+                config_data = dict(config_data)
+                config_data["model_type"] = canonical
+                config = config_data
+                model_type = canonical
 
         if not isinstance(prompt, (dict, list)):
             return _original_vlm_apply_chat_template(

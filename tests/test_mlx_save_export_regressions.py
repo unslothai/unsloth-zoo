@@ -528,6 +528,38 @@ def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
     assert outsider.apply_chat_template is original
 
 
+def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkeypatch):
+    """Nemotron publishes a capitalized model_type while mlx-vlm's routing
+    table stores its lowercase spelling. Media counts must still reach the
+    configured formatter so audio markers are not silently dropped."""
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    configured = "nemotronh_nano_omni_reasoning_v3"
+    calls = []
+
+    def original(_processor, config, prompt, **kwargs):
+        model_type = config["model_type"]
+        calls.append((model_type, prompt, kwargs.get("num_audios")))
+        return "configured" if model_type in prompt_utils.MODEL_CONFIG else "text-only"
+
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(prompt_utils, "MODEL_CONFIG", {configured: object()}, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+    rendered = prompt_utils.apply_chat_template(
+        object(),
+        {"model_type": "NemotronH_Nano_Omni_Reasoning_V3"},
+        "Transcribe this audio.",
+        num_audios=1,
+    )
+
+    assert rendered == "configured"
+    assert calls == [(configured, "Transcribe this audio.", 1)]
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj
