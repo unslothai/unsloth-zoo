@@ -463,6 +463,24 @@ def _case_variants(trainer, keys):
     return found
 
 
+def _configured_label_names(trainer):
+    """Every supervision column the trainer itself will look for.
+
+    Trainer resolves `args.label_names` once in `__init__` (defaulting to
+    `find_labels(model)`) and every later derivation reads the RESOLVED
+    `self.label_names`, so a trainer that fills or extends the attribute
+    directly -- TRL's `RewardTrainer` sets it, and a custom `compute_loss`
+    declares its targets there -- must be honoured too, or the keep-lists below
+    drop a column the loss needs.
+    """
+    names = set()
+    for source in (getattr(getattr(trainer, "args", None), "label_names", None),
+                   getattr(trainer, "label_names", None)):
+        try: names.update(n for n in source or () if isinstance(n, str))
+        except TypeError: pass
+    return names
+
+
 def _keep_media_columns(trainer, keys):
     """Stop `remove_unused_columns` stripping media before the collator sees it.
 
@@ -489,8 +507,10 @@ def _keep_media_columns(trainer, keys):
             # Trainer's own derivation does `+= list(set(["label", "label_ids"]
             # + self.label_names))`, so a custom trainer whose supervision is
             # consumed by `compute_loss` rather than declared by `forward` had
-            # it dropped here and on every later split.
-            declared |= set(getattr(getattr(trainer, "args", None), "label_names", None) or ())
+            # it dropped here and on every later split. It reads the RESOLVED
+            # attribute, so seeding from `args.label_names` alone still lost a
+            # trainer that fills `self.label_names` itself.
+            declared |= _configured_label_names(trainer)
             trainer._signature_columns = sorted(set(names) | declared | {
                 "label", "label_ids", "input_ids", "attention_mask",
                 "labels", "completion_mask", "assistant_masks", "token_type_ids",
@@ -573,7 +593,12 @@ class _MediaAwareCollator:
         self.media = media
         # Kept so the media collator can read the prompt beside its image, and
         # stripped again on the text path, which cannot tensorize a raw string.
-        self.companion_keys = frozenset(companion_keys)
+        # Lowercased: `_keep` below tests `key.lower()`, and unlike the other two
+        # sets this one carries the caller's own `dataset_text_field`. A
+        # mixed-case one (`Body`) never matched, so the raw string it names
+        # survived into a text batch and `DataCollatorForSeq2Seq` died on it.
+        self.companion_keys = frozenset(
+            k.lower() if isinstance(k, str) else k for k in companion_keys)
         # Split, not merged: an ambiguous name is decided by its value below,
         # and folding the two would match `url` on the name alone.
         self.ambiguous_keys = frozenset(ambiguous_keys)
@@ -935,12 +960,11 @@ def train_on_responses_only(
         _raw_columns = getattr(dataset, "column_names", None) or list(sample.keys())
         if not isinstance(_raw_columns, dict):
             _keep = _model_forward_parameter_names(getattr(trainer, "model", None))
-            # `args.label_names` too, as the keep-lists further down already do:
+            # The label names too, as the keep-lists further down already do:
             # supervision consumed by a custom `compute_loss` is not declared by
             # `forward`, and `remove_columns` here deletes it for good, so those
             # later lists never get the chance to save it.
-            _keep |= set(
-                getattr(getattr(trainer, "args", None), "label_names", None) or ())
+            _keep |= _configured_label_names(trainer)
             # `labels` only when it really is token-level. A raw split can carry
             # a SCALAR `labels` (a class id), and keeping that as supervision
             # sent an int into `_train_on_responses_only`, which calls
@@ -1191,6 +1215,17 @@ def train_on_responses_only(
         names -= set(getattr(tokenizer, "model_input_names", None) or ())
         return frozenset(names - _TEXT_COLUMNS)
     pass
+
+    # A previous call already swapped in the dispatcher, so unwrap it back to
+    # the collator the caller actually built. Nothing below recognises the
+    # wrapper: its attributes forward to the TEXT half, so `_is_vision_collator`
+    # sees a plain text tokenizer and the swap at the end replaces the whole
+    # dispatcher with a bare text collator -- and a later multimodal
+    # `evaluate`/`predict` loses the media fallback. Restoring the original
+    # instead makes a repeated call reproduce the first one. Before
+    # `_derive_multimodal_columns` runs, which reads the collator's processor.
+    if isinstance(getattr(trainer, "data_collator", None), _MediaAwareCollator):
+        trainer.data_collator = trainer.data_collator.media
 
     try:
         _MULTIMODAL_COLUMNS = _MULTIMODAL_COLUMNS | _derive_multimodal_columns()
@@ -2064,8 +2099,16 @@ def train_on_responses_only(
         # repair exists to remove. The bypass flag is the case where the
         # displaced collator is a working vision collator.
         _media_capable = _bypassed_vision_collator and not _processor_backed
-        # The training text column is NOT a companion to strip: it is what the
-        # text collator is there to read.
+        # The training text column is kept for the MEDIA path -- a raw
+        # `{"text": ..., "image": ...}` row needs its prompt -- and stripped on
+        # the text path with the other companions: the text collator is a
+        # `DataCollatorForSeq2Seq`, which pads through `tokenizer.pad` and never
+        # tokenizes, so a retained string kills the batch ("Unable to create
+        # tensor ... Perhaps your features (`text` ...)"). The keep-list below
+        # is what holds the column alive past `remove_unused_columns` for a
+        # pretokenized split handed to a later `predict`/`evaluate`. Stripped by
+        # VALUE like every other companion, so a tensorizable column that merely
+        # shares the name stays.
         _text_field = getattr(getattr(trainer, "args", None),
                               "dataset_text_field", None) or "text"
         # Every media form the initial-split guard recognises, not just the two
@@ -2081,7 +2124,7 @@ def train_on_responses_only(
             # `_MULTIMODAL_COLUMNS`, so a processed `predict` batch matched
             # nothing and went to the text collator that cannot tensorize it.
             _text_collator, _collator, _dispatch_keys, _AMBIGUOUS_MEDIA_COLUMNS,
-            _RAW_TEXT_COMPANION_COLUMNS - {_text_field},
+            _RAW_TEXT_COMPANION_COLUMNS | {_text_field},
         ) if _media_capable else _text_collator
         if _media_capable:
             # And the keys have to survive `remove_unused_columns`, which is on
@@ -2127,11 +2170,11 @@ def train_on_responses_only(
                 except Exception: pass
             # Unwrap PEFT/compile wrappers: their own forward hides pixel_values.
             names.update(_model_forward_parameter_names(getattr(trainer, "model", None)))
-            # `args.label_names` too, exactly as `_keep_media_columns` does and
+            # The label names too, exactly as `_keep_media_columns` does and
             # as Trainer's own signature derivation does. Supervision consumed
             # by a custom `compute_loss` is not declared by `forward`, so the
             # signature kept it while THIS list deleted it from the split.
-            names.update(getattr(getattr(trainer, "args", None), "label_names", None) or ())
+            names.update(_configured_label_names(trainer))
             names.discard("self")
             # Same reason as the tokenizing strip above: a `forward` declaring
             # `text` must not keep a raw string column no collator can tensorize.

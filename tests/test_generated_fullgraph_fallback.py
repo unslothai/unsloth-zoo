@@ -31,7 +31,11 @@ Lowering the limit makes the failure reachable on any GPU -- a T4 gets there
 unaided, a B200 at the default never does.
 """
 
+import os
 import re
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -46,6 +50,52 @@ COMPILER = ZOO / "compiler.py"
 # `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
 FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
+
+
+def _run_in_fresh_interpreter(body, compile_disable):
+    """Run `body` in a new interpreter with UNSLOTH_COMPILE_DISABLE pinned.
+
+    `None` clears the variable, a string sets it. unsloth's consolidated CI runs
+    this whole suite with `UNSLOTH_COMPILE_DISABLE=1` at the job level, so a test
+    that needs the other setting cannot get it from the ambient environment.
+
+    `common.py` reacts to that variable in two different ways, and only one of
+    them needs this:
+
+    * **Bound at import.** `torch_compile`, `_torch_compile` and
+      `_raw_torch_compile` are assigned under a module-level
+      `if UNSLOTH_COMPILE_DISABLE:` and are already `noop` function objects by
+      the time any test runs. Rebinding `common.UNSLOTH_COMPILE_DISABLE`
+      afterwards cannot undo that, so asserting on these three needs a fresh
+      interpreter.
+    * **Read per call.** `_maybe_compile` reads `UNSLOTH_COMPILE_DISABLE` and
+      `UNSLOTH_COMPILE_DISABLE_PARTIAL` in its own body on every call.
+      `monkeypatch.setattr` on the module attributes is enough there, and is
+      what the `_maybe_compile` tests below use; a subprocess would only buy a
+      five second package import per assertion.
+
+    A subprocess, not `importlib.reload`, because reloading the module
+    mid-session rebinds objects other tests in the same run already hold.
+    """
+    env = dict(os.environ)
+    if compile_disable is None:
+        env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    else:
+        env["UNSLOTH_COMPILE_DISABLE"] = compile_disable
+    done = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(body)],
+        capture_output = True, text = True, env = env,
+        cwd = str(ZOO.parent),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def _run_with_compile_enabled(body):
+    _run_in_fresh_interpreter(body, None)
+
+
+def _run_with_compile_disabled(body):
+    _run_in_fresh_interpreter(body, "1")
 
 
 # ---- what the compiler emits ---------------------------------------------
@@ -81,7 +131,7 @@ def test_the_grpo_loss_regions_are_wrapped():
         "accumulate_chunk is still compiled bare"
 
 
-def test_maybe_compile_routes_fullgraph_through_the_fallback():
+def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     """Three more fullgraph regions go through this one helper, so wiring it
     covers them without touching each decorator."""
     from unsloth_zoo.temporary_patches import common
@@ -91,12 +141,77 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback():
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
 
+    # In process, unlike the alias below: `_maybe_compile` reads both switches
+    # in its own body on every call, so pinning the module attributes is exact
+    # and the assertion then holds in every configuration the suite runs under.
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
+
     def f(x):
         return x
     wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
     assert hasattr(wrapped, "_unsloth_fallback_state")
-    plain = common._maybe_compile(dynamic = True)(f)
-    assert not hasattr(plain, "_unsloth_fallback_state")
+
+    # The other direction needs a second observable. `_unsloth_fallback_state`
+    # is stamped on only under fullgraph (utils.py returns the plain compiled
+    # object before it), so its absence cannot tell a non-fullgraph compile that
+    # wrongly went through the helper from one that did not. Record the call
+    # instead: `_maybe_compile` resolves the name off `utils` at call time, so
+    # rebinding the attribute is enough. Verified by replacing the guard's body
+    # with `pass`, which the `hasattr` form did not notice in any switch
+    # position and this does.
+    import unsloth_zoo.temporary_patches.utils as U
+    calls = []
+
+    def _record(**kwargs):
+        calls.append(kwargs)
+        return lambda fn: fn
+
+    monkeypatch.setattr(U, "torch_compile_with_fallback", _record)
+    common._maybe_compile(fullgraph = True, dynamic = True)(f)
+    assert calls, "the recorder never saw the fullgraph compile, so it proves nothing"
+    calls.clear()
+    common._maybe_compile(dynamic = True)(f)
+    assert not calls, f"a non-fullgraph compile was wrapped: {calls}"
+
+
+@pytest.mark.parametrize("flag", ["UNSLOTH_COMPILE_DISABLE",
+                                  "UNSLOTH_COMPILE_DISABLE_PARTIAL"])
+def test_maybe_compile_is_a_no_op_when_compilation_is_switched_off(monkeypatch, flag):
+    """The other half of the switch. Turning compilation off has to drop the
+    fallback wrapper as well, or torch is still handed a fullgraph region by the
+    one helper three of them go through.
+
+    Monkeypatch, again because the read is per call: setting the variable in the
+    environment instead would do nothing to an already imported module, and a
+    subprocess would be spelling `False -> True` the long way round."""
+    from unsloth_zoo.temporary_patches import common
+
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
+    monkeypatch.setattr(common, flag, True)
+
+    def f(x):
+        return x
+    assert common._maybe_compile(fullgraph = True, dynamic = True)(f) is f, \
+        f"{flag} did not switch the fullgraph wrapper off"
+
+
+def test_the_alias_is_the_no_op_when_compilation_is_switched_off():
+    """The same half of the switch for the import-bound side.
+
+    Nothing else pins this: the source scan below only recognises the enabled
+    spelling, `functools.partial(...)`, so a disabled branch that bound bare
+    `torch.compile` would pass every other test in this file while handing
+    unsloth's CPU CI job the fullgraph regions it asked not to have. Needs a
+    fresh interpreter for the reason in `_run_in_fresh_interpreter`: these three
+    names are bound once, at import."""
+    _run_with_compile_disabled("""
+        from unsloth_zoo.temporary_patches import common
+
+        for name in ("torch_compile", "_torch_compile", "_raw_torch_compile"):
+            assert getattr(common, name) is common.noop, name
+    """)
 
 
 def test_the_generated_preamble_imports_the_helper():
@@ -235,21 +350,26 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
     assert raw, "the raw alias compile_with_eager_fallback needs is gone"
 
 
-def test_the_alias_routes_a_fullgraph_compile_through_the_fallback(monkeypatch):
-    from unsloth_zoo.temporary_patches import common as C
-    seen = {}
+def test_the_alias_routes_a_fullgraph_compile_through_the_fallback():
+    _run_with_compile_enabled("""
+        import unsloth_zoo.temporary_patches.utils as U
+        seen = {}
 
-    def _fake(**kwargs):
-        seen.update(kwargs)
-        return lambda fn: fn
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return lambda fn: fn
 
-    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
-                        "torch_compile_with_fallback", _fake)
+        # `common` imports the helper lazily inside the call, so patching the
+        # attribute on utils before the decorator runs is enough.
+        U.torch_compile_with_fallback = _fake
 
-    @C.torch_compile(dynamic = True, fullgraph = True)
-    def _f(x): return x
+        from unsloth_zoo.temporary_patches import common as C
 
-    assert seen.get("fullgraph") is True
+        @C.torch_compile(dynamic = True, fullgraph = True)
+        def _f(x): return x
+
+        assert seen.get("fullgraph") is True, seen
+    """)
 
 
 def test_the_alias_still_accepts_a_function_positionally():
@@ -263,20 +383,55 @@ def test_the_alias_still_accepts_a_function_positionally():
     assert wrapped(3) == 6
 
 
-def test_a_non_fullgraph_compile_is_left_alone(monkeypatch):
+def test_a_non_fullgraph_compile_is_left_alone():
     """Dynamo already falls back by itself without fullgraph, so wrapping there
-    would add a layer that can never fire."""
-    from unsloth_zoo.temporary_patches import common as C
-    called = {"n": 0}
+    would add a layer that can never fire.
 
-    def _boom(**kwargs):
-        called["n"] += 1
-        return lambda fn: fn
+    In a fresh interpreter, because in process this asserted nothing whenever
+    the switch was off, which is the position unsloth's Core job runs the whole
+    suite in: the alias is `noop` there, so the helper is unreachable and the
+    recorder stays at zero however the routing is written. Removing the
+    `if not kwargs.get("fullgraph")` guard from `_compile_or_fall_back` left the
+    in-process form green under `UNSLOTH_COMPILE_DISABLE=1` and `partial`.
 
-    monkeypatch.setattr("unsloth_zoo.temporary_patches.utils."
-                        "torch_compile_with_fallback", _boom)
+    `_torch_compile` comes along for free here; nothing else ran it. A positive
+    control first, or every assertion below passes the moment the recorder
+    stops recording."""
+    _run_with_compile_enabled("""
+        import unsloth_zoo.temporary_patches.utils as U
+        calls = []
 
-    @C.torch_compile(dynamic = True)
-    def _f(x): return x
+        def _record(**kwargs):
+            calls.append(kwargs)
+            return lambda fn: fn
 
-    assert called["n"] == 0
+        # Both aliases import the helper lazily inside the call, so rebinding
+        # the attribute on utils before the decorator runs is enough.
+        U.torch_compile_with_fallback = _record
+
+        from unsloth_zoo.temporary_patches import common as C
+
+        def _f(x): return x
+
+        for name in ("torch_compile", "_torch_compile"):
+            calls.clear()
+            getattr(C, name)(dynamic = True, fullgraph = True)(_f)
+            assert calls, f"the recorder never saw {name} under fullgraph"
+            calls.clear()
+            # `is _f` because the recorder's decorator is the identity: reaching
+            # the helper is not enough, the function has to be handed to it
+            # rather than the undecorated decorator returned to the caller.
+            assert getattr(C, name)(_f, dynamic = True, fullgraph = True) is _f, \
+                f"positional {name} did not apply the decorator"
+            assert calls, f"the recorder never saw positional {name}"
+            calls.clear()
+            getattr(C, name)(dynamic = True)(_f)
+            assert not calls, f"{name} wrapped a non-fullgraph compile: {calls}"
+
+        # `_raw_torch_compile` is excluded on purpose: its one caller,
+        # compile_with_eager_fallback, applies the wrapper itself, and wrapping a
+        # wrapper leaves the inner one swallowing the exhaustion.
+        calls.clear()
+        C._raw_torch_compile(_f, fullgraph = True)
+        assert not calls, calls
+    """)

@@ -3312,3 +3312,196 @@ def test_index_is_not_seeded_into_the_signature():
     assert "index" not in seeded, seeded
     # The columns HF really does always keep are still there.
     assert {"label", "label_ids", "input_ids", "labels"} <= set(seeded)
+
+
+# ── round seventeen: the resolved label names, the text field, repeat calls ──
+
+
+def test_the_resolved_label_names_survive_unused_column_removal():
+    """Trainer resolves `args.label_names` into `self.label_names` in
+    `__init__` and its signature derivation reads the RESOLVED attribute, so a
+    trainer that fills it directly (TRL's `RewardTrainer` does) had its
+    supervision seeded out of `_signature_columns` and stripped from every
+    later `evaluate`/`predict` split before `compute_loss` could read it."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.label_names = ["expert_score", "aux_target"]  # not on `args`
+    assert getattr(trainer.args, "label_names", None) is None
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    seeded = getattr(out, "_signature_columns", None) or []
+    for key in ("expert_score", "aux_target"):
+        assert key in seeded, f"{key} is a resolved label and would be stripped"
+
+
+def test_a_resolved_label_survives_raw_column_removal():
+    """Same divergence one list further on: the keep-list that prunes the split
+    itself asked `args` alone, so the column the trainer resolved was deleted
+    from the dataset even when the signature kept it."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW)] * 2,
+        "attention_mask": [[1] * len(ROW)] * 2,
+        "expert_score": [0.5, 0.25],
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.label_names = ["expert_score"]
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "expert_score" in out.train_dataset.column_names, (
+        f"resolved label dropped from split: {out.train_dataset.column_names}"
+    )
+
+
+def test_a_resolved_label_survives_raw_tokenization():
+    """And one list earlier: `remove_columns` at tokenization deletes it for
+    good, so the two lists above never get the chance to save it."""
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()),
+                          _raw_text_split(my_reward = [0.5, 1.5]))
+    trainer.label_names = ["my_reward"]
+
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+    assert "my_reward" in out.train_dataset.column_names, \
+        "the resolved label was tokenized away"
+
+
+def test_a_retained_text_column_is_stripped_before_the_text_collator():
+    """The keep-list holds the configured text field alive past
+    `remove_unused_columns` so the media path keeps the prompt beside its
+    image. A later `predict(test_dataset = ...)` of pretokenized rows that also
+    kept that raw column then handed the string to `DataCollatorForSeq2Seq`,
+    whose `tokenizer.pad(..., return_tensors = "pt")` tensorizes every key it is
+    given: `ValueError: Unable to create tensor ... Perhaps your features
+    (`text` ...)`."""
+    seen = {}
+
+    class Text:
+        def __call__(self, features):
+            seen["keys"] = sorted(features[0].keys())
+            return {"ok": True}
+
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    dispatcher = out.data_collator
+    assert "text" in (getattr(out, "_signature_columns", None) or []), \
+        "the column never survives removal, so there is nothing to strip"
+    dispatcher.text = Text()
+    dispatcher([{"input_ids": list(ROW), "labels": list(ROW), "text": "hello"}])
+    assert seen["keys"] == ["input_ids", "labels"], seen["keys"]
+
+
+def test_a_configured_text_field_is_stripped_under_its_own_name():
+    """`dataset_text_field` renames the column, and the keep-list keeps
+    whatever it is called, so the strip has to follow the same name."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.dataset_text_field = "body"
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    dispatcher = out.data_collator
+    assert "body" in (getattr(out, "_signature_columns", None) or [])
+    seen = {}
+    dispatcher.text = lambda features: seen.setdefault(
+        "keys", sorted(features[0].keys()))
+    dispatcher([{"input_ids": list(ROW), "body": "hello"}])
+    assert seen["keys"] == ["input_ids"], seen["keys"]
+
+
+def test_a_mixed_case_text_field_is_stripped_too():
+    """The keep-list holds `Body` alive for the media path with its own casing,
+    but the strip tests `key.lower()` against the companion names, so a
+    `dataset_text_field` carrying an uppercase letter matched nothing: the raw
+    string stayed in the text batch and `DataCollatorForSeq2Seq` raised `Unable
+    to create tensor ... Perhaps your features (`Body` in this case)`. The
+    field is the caller's to name, and Hub datasets do ship capitalised text
+    columns: `ought/raft` has `Sentence`, a StackExchange dump has `Body`."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.dataset_text_field = "Body"
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    dispatcher = out.data_collator
+    assert "Body" in (getattr(out, "_signature_columns", None) or []), \
+        "the column never survives removal, so there is nothing to strip"
+    seen = {}
+    dispatcher.text = lambda features: seen.setdefault(
+        "keys", sorted(features[0].keys()))
+    dispatcher([{"input_ids": list(ROW), "Body": "hello"}])
+    assert seen["keys"] == ["input_ids"], seen["keys"]
+
+
+def test_the_media_path_still_gets_the_text_field():
+    """Stripped on the text path only: a raw `{"text": ..., "image": ...}` row
+    is exactly why the column is kept, and the vision collator tokenizes it."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    out = train_on_responses_only(
+        StubTrainer(MyVisionCollator(StubProcessor()), rows),
+        INSTRUCTION_PART, RESPONSE_PART)
+
+    seen = {}
+    out.data_collator.media = lambda features: seen.setdefault(
+        "keys", sorted(features[0].keys()))
+    out.data_collator([{"input_ids": list(ROW), "images": [object()],
+                        "text": "describe it"}])
+    assert seen["keys"] == ["images", "input_ids", "text"], seen["keys"]
+
+
+def test_a_tensorizable_text_column_still_reaches_the_text_collator():
+    """The strip is by VALUE, like every other companion: a numeric column that
+    merely shares the configured name is a model input and stays."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    out = train_on_responses_only(
+        StubTrainer(MyVisionCollator(StubProcessor()), rows),
+        INSTRUCTION_PART, RESPONSE_PART)
+
+    seen = {}
+    out.data_collator.text = lambda features: seen.setdefault(
+        "keys", sorted(features[0].keys()))
+    out.data_collator([{"input_ids": list(ROW), "text": [1, 2, 3]}])
+    assert seen["keys"] == ["input_ids", "text"], seen["keys"]
+
+
+def test_a_repeated_masking_call_keeps_the_dispatcher():
+    """Calling `train_on_responses_only` twice met a dispatcher that no guard
+    recognises -- its attributes forward to the TEXT half, so
+    `_is_vision_collator` saw a plain text tokenizer -- and the second call
+    replaced the whole thing with a bare text collator, losing the media
+    fallback a later multimodal `evaluate`/`predict` needs."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    mine = MyVisionCollator(StubProcessor())
+    once = train_on_responses_only(StubTrainer(mine, rows),
+                                   INSTRUCTION_PART, RESPONSE_PART)
+    assert once.data_collator.media is mine
+
+    twice = train_on_responses_only(once, INSTRUCTION_PART, RESPONSE_PART)
+
+    assert hasattr(twice.data_collator, "media"), \
+        "the second call threw the dispatcher away"
+    assert twice.data_collator.media is mine, "the media fallback was replaced"
+    assert twice.data_collator([{"input_ids": list(ROW),
+                                 "images": [object()]}]) == {"mine": True}
+    assert "mine" not in twice.data_collator(
+        [{"input_ids": list(ROW), "labels": list(ROW)}])

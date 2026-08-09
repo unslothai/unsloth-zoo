@@ -89,7 +89,8 @@ def chunked_hidden_states_selective_log_softmax(
     # matmul below, which prints both operands. Do not swap in a bare
     # torch._check: it reports only "Expected cond to be True", naming neither
     # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
-    # the width first -- see `compute_logprobs_chunk` and the packed path.
+    # the width first -- see `compute_logprobs_chunk`, the packed path and
+    # `_pg_grad_forward`.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
 
@@ -1285,8 +1286,21 @@ def grpo_accumulated_loss(
                 prefix_seg_info = _pg_layout.prefix_seg_info,
                 use_cache = False,
             ).logits
+            # Same width dispatch as the packed path and compute_logprobs_chunk.
+            # `.logits` carries hidden states only when the forward is the Unsloth
+            # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
+            # real [T, vocab] logits. extract_logps always calls its helper as
+            # (hidden, lm_head, ids, chunks, ...), so pass a raw-logits helper with
+            # that same signature, which skips the lm_head matmul and the scale /
+            # softcap the forward already applied.
+            _pg_fn = chunked_hidden_states_selective_log_softmax
+            if _h.shape[-1] != lm_head.shape[1]:
+                def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
+                    return chunked_selective_log_softmax(
+                        _pg_h, _pg_ids, temperature = _pg_t, chunks = _pg_n,
+                    )
             _pg_lp = _pg_layout.extract_logps(
-                _h, lm_head, chunked_hidden_states_selective_log_softmax,
+                _h, lm_head, _pg_fn,
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad

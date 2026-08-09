@@ -262,6 +262,18 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
             f"under fullgraph raises instead of falling back to eager"
         )
 
+    # The half above holds in any configuration; the half below cannot. These
+    # kernels are built by `compile_with_eager_fallback`, which compiles through
+    # `_raw_torch_compile`, and that name is bound to `noop` at import when
+    # `UNSLOTH_COMPILE_DISABLE` is set. The wrapper is still there, so the marker
+    # assertions above still mean something, but nothing underneath it ever
+    # compiles, so the cache cannot be exhausted and the latch cannot fire. Not
+    # rebindable in process, for the reason set out in
+    # tests/test_generated_fullgraph_fallback.py::_run_in_fresh_interpreter.
+    from unsloth_zoo.temporary_patches import common
+    if common.UNSLOTH_COMPILE_DISABLE:
+        pytest.skip("compilation is off, so there is no cache left to exhaust")
+
     # And it really does run. `fail_on_recompile_limit_hit` is deliberately NOT set:
     # that flag is the user asking for a hard stop and the wrapper re-raises for it,
     # while real runs leave it off, so limit plus `fullgraph = True` is the case that
