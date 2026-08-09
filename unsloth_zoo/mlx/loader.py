@@ -5203,6 +5203,29 @@ def _first_media_user_message_index(messages):
     return -1
 
 
+def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwargs):
+    """Put Qwen's counted media before text without losing formatter metadata."""
+    if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+        return message
+    content = message["content"]
+    videos = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") == "video"
+    ]
+    trailing = [
+        item for item in content
+        if not isinstance(item, dict)
+        or item.get("type") not in ("image", "audio", "video")
+    ]
+    images = audios = []
+    if message.get("role") == "user":
+        if not videos and not kwargs.get("skip_image_token"):
+            images = [{"type": "image"}] * num_images
+        if not kwargs.get("skip_audio_token"):
+            audios = [{"type": "audio"}] * num_audios
+    return {**message, "content": videos + images + audios + trailing}
+
+
 def _anchor_conversation_media_to_first_user_turn(
     prompt_utils_module,
     model_type,
@@ -5229,16 +5252,37 @@ def _anchor_conversation_media_to_first_user_turn(
             message.get("content", "")
         )
         is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
+        message_kwargs = dict(kwargs)
+        skip_image_token = (
+            bool(message_kwargs.pop("skip_image_token", False)) or not is_target
+        )
+        skip_audio_token = (
+            bool(message_kwargs.pop("skip_audio_token", False)) or not is_target
+        )
+        message_kwargs.pop("role", None)
+        if not is_target:
+            message_kwargs.pop("video", None)
         rendered = prompt_utils_module.get_message_json(
             model_type,
             content,
             role,
-            skip_image_token=not is_target,
-            skip_audio_token=not is_target,
+            skip_image_token=skip_image_token,
+            skip_audio_token=skip_audio_token,
             num_images=num_images,
             num_audios=num_audios,
-            **kwargs,
+            **message_kwargs,
         )
+        if model_type == "qwen3_omni_moe":
+            rendered = _normalize_qwen3_omni_counted_message(
+                rendered,
+                num_images if is_target else 0,
+                num_audios if is_target else 0,
+                {
+                    **message_kwargs,
+                    "skip_image_token": skip_image_token,
+                    "skip_audio_token": skip_audio_token,
+                },
+            )
         if isinstance(message, dict):
             if isinstance(rendered, dict):
                 rendered = {**message, **rendered}
@@ -5406,11 +5450,13 @@ def _render_vlm_template_or_fallback(
         # mlx-vlm's wrapper injects `enable_thinking=False`, but Qwen3 Omni
         # Instruct only transcribes correctly when that optional argument is
         # omitted. Delegate directly and preserve explicit caller overrides.
+        native_kwargs = dict(kwargs)
+        tokenize = native_kwargs.pop("tokenize", False)
         rendered = processor.apply_chat_template(
             messages,
-            tokenize=False,
+            tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
-            **kwargs,
+            **native_kwargs,
         )
     else:
         rendered = prompt_utils_module.get_chat_template(
@@ -5494,12 +5540,17 @@ def _ensure_vlm_prompt_utils_patched():
             # Qwen's published input contract is image/audio/video followed by
             # user text. mlx-vlm's generic count renderer puts audio last,
             # which keeps the marker but makes the Thinker ignore the speech.
-            content = (
-                [{"type": "image"}] * num_images
-                + [{"type": "audio"}] * num_audios
-                + [{"type": "text", "text": str(prompt)}]
+            message = prompt_utils.get_message_json(
+                model_type,
+                str(prompt),
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
             )
-            messages = [{"role": "user", "content": content}]
+            message = _normalize_qwen3_omni_counted_message(
+                message, num_images, num_audios, kwargs
+            )
+            messages = [message]
             if return_messages:
                 return messages
             return _render_vlm_template_or_fallback(

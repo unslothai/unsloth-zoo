@@ -3782,23 +3782,49 @@ def test_the_projection_after_the_audio_tower_is_frozen_too():
     assert model.audio_tower.frozen and model.audio_projection_layer.frozen
 
 
+class _FrozenAudioModule:
+    def __init__(self):
+        self.frozen = False
+
+    def freeze(self, recurse=False):
+        self.frozen = recurse
+
+
 def test_nemotron_sound_encoder_and_projection_are_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
 
-    class _Module:
-        def __init__(self):
-            self.frozen = False
-
-        def freeze(self, recurse=False):
-            self.frozen = recurse
-
     model = type("Nemotron", (), {
-        "sound_encoder": _Module(), "sound_projection": _Module(),
+        "sound_encoder": _FrozenAudioModule(),
+        "sound_projection": _FrozenAudioModule(),
     })()
     assert set(freeze_audio_modules(model)) == {
         "sound_encoder", "sound_projection",
     }
     assert model.sound_encoder.frozen and model.sound_projection.frozen
+
+
+def test_qwen3_omni_nested_audio_tower_is_frozen():
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    audio_tower = _FrozenAudioModule()
+    model = type("Qwen3Omni", (), {
+        "thinker": type("Thinker", (), {"audio_tower": audio_tower})(),
+    })()
+
+    assert freeze_audio_modules(model) == ["audio_tower"]
+    assert audio_tower.frozen
+
+
+def test_qwen3_omni_audio_output_modules_are_frozen():
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    model = type("Qwen3Omni", (), {
+        "talker": _FrozenAudioModule(),
+        "code2wav": _FrozenAudioModule(),
+    })()
+
+    assert set(freeze_audio_modules(model)) == {"talker", "code2wav"}
+    assert model.talker.frozen and model.code2wav.frozen
 
 
 def test_stated_spans_refuse_the_left_padding_repair():

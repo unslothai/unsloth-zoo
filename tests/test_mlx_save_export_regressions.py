@@ -528,10 +528,31 @@ def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
     assert outsider.apply_chat_template is original
 
 
+def _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader, **overrides):
+    attrs = {
+        "apply_chat_template": lambda *_args, **_kwargs: "count-rendered",
+        "get_message_json": lambda _model, text, role="user", **_kwargs: {
+            "role": role, "content": [{"type": "text", "text": text}],
+        },
+        "_get_role_content": lambda item: (item["role"], item["content"]),
+        "extract_text_from_content": lambda content: content,
+        "MODEL_CONFIG": {"qwen3_omni_moe": object()},
+        **overrides,
+    }
+    for name, value in attrs.items():
+        monkeypatch.setattr(prompt_utils, name, value, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+
+def _render_qwen(prompt_utils, prompt, processor=None, **kwargs):
+    processor = object() if processor is None else processor
+    return prompt_utils.apply_chat_template(
+        processor, {"model_type": "qwen3_omni_moe"}, prompt, **kwargs)
+
+
 def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkeypatch):
-    """Nemotron publishes a capitalized model_type while mlx-vlm's routing
-    table stores its lowercase spelling. Media counts must still reach the
-    configured formatter so audio markers are not silently dropped."""
     import mlx_vlm.prompt_utils as prompt_utils
     import unsloth_zoo.mlx.loader as loader
 
@@ -561,8 +582,6 @@ def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkey
 
 
 def test_vlm_prompt_patch_places_counted_qwen3_omni_audio_before_text(monkeypatch):
-    """Qwen's published contract is media then text, while mlx-vlm's generic
-    count renderer appends audio after text and produces broken inference."""
     import mlx_vlm.prompt_utils as prompt_utils
     import unsloth_zoo.mlx.loader as loader
 
@@ -575,33 +594,76 @@ def test_vlm_prompt_patch_places_counted_qwen3_omni_audio_before_text(monkeypatc
         rendered_messages.append(messages)
         return "structured-rendered"
 
-    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
-    monkeypatch.setattr(prompt_utils, "get_chat_template", render, raising=False)
-    monkeypatch.setattr(
-        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        apply_chat_template=original,
+        get_chat_template=render,
     )
-    monkeypatch.setattr(
-        prompt_utils,
-        "_get_role_content",
-        lambda item: (item["role"], item["content"]),
-        raising=False,
-    )
-    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
-    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
-    loader._ensure_vlm_prompt_utils_patched()
 
-    result = prompt_utils.apply_chat_template(
-        object(),
-        {"model_type": "qwen3_omni_moe"},
-        "Transcribe the audio into text.",
-        num_audios=1,
+    result = _render_qwen(
+        prompt_utils, "Transcribe the audio into text.", num_audios=1,
     )
 
     assert result == "structured-rendered"
-    assert [item["type"] for item in rendered_messages[0][0]["content"]] == [
-        "audio",
-        "text",
-    ]
+    types = [item["type"] for item in rendered_messages[0][0]["content"]]
+    assert types == ["audio", "text"]
+
+
+def test_vlm_prompt_patch_preserves_qwen3_omni_video_with_audio(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_message_json=lambda _model_type, text, **kwargs: {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": kwargs["video"],
+                    "fps": kwargs["fps"],
+                },
+                {"type": "text", "text": text},
+            ],
+        },
+    )
+
+    messages = _render_qwen(
+        prompt_utils, "Describe both inputs.",
+        return_messages=True,
+        num_audios=1,
+        video="clip.mp4",
+        fps=2,
+    )
+
+    types = [item["type"] for item in messages[0]["content"]]
+    assert types == ["video", "audio", "text"]
+    assert messages[0]["content"][0]["video"] == "clip.mp4"
+    assert messages[0]["content"][0]["fps"] == 2
+
+
+def test_vlm_prompt_patch_honors_qwen3_omni_media_suppression(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader)
+
+    text = "Describe the input."
+    counted = {"role": "user", "content": text}
+    cases = (
+        (text, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (text, {"skip_image_token": True}, "user", ["audio", "text"]),
+        (text, {"role": "assistant"}, "assistant", ["text"]),
+        (counted, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (counted, {"skip_image_token": True}, "user", ["audio", "text"]),
+    )
+    for prompt, options, role, expected_types in cases:
+        message = _render_qwen(
+            prompt_utils, prompt, return_messages=True, num_images=1,
+            num_audios=1, **options,
+        )[0]
+        assert message["role"] == role
+        assert [item["type"] for item in message["content"]] == expected_types
 
 
 def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatch):
@@ -610,31 +672,18 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
 
     rendered_messages = []
 
-    monkeypatch.setattr(
-        prompt_utils,
-        "apply_chat_template",
-        lambda *_args, **_kwargs: "count-rendered",
-        raising=False,
+    def counted_message(_model, text, role="user", **kwargs):
+        videos = [{"type": "video", "video": kwargs["video"]}] if kwargs.get("video") else []
+        return {"role": role, "content": videos + [{"type": "text", "text": text}]}
+
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=(
+            lambda _processor, messages, _add_generation_prompt, **_kwargs:
+                rendered_messages.append(messages) or "structured-rendered"
+        ),
+        get_message_json=counted_message,
     )
-    monkeypatch.setattr(
-        prompt_utils,
-        "get_chat_template",
-        lambda _processor, messages, _add_generation_prompt, **_kwargs:
-            rendered_messages.append(messages) or "structured-rendered",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
-    )
-    monkeypatch.setattr(
-        prompt_utils,
-        "_get_role_content",
-        lambda item: (item["role"], item["content"]),
-        raising=False,
-    )
-    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
-    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
-    loader._ensure_vlm_prompt_utils_patched()
     messages = [
         {
             "role": "user",
@@ -645,66 +694,68 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
         }
     ]
 
-    result = prompt_utils.apply_chat_template(
-        object(),
-        {"model_type": "qwen3_omni_moe"},
-        messages,
+    result = _render_qwen(prompt_utils, messages, num_audios=1)
+    counted = {"role": "user", "content": "Transcribe the audio."}
+    for prompt in (counted, [counted]):
+        _render_qwen(prompt_utils, prompt, num_audios=1)
+    conversation = [
+        {"role": "system", "content": "Follow instructions."},
+        {"role": "user", "content": "Describe both inputs."},
+        {"role": "assistant", "content": "Ready."},
+    ]
+    anchored = _render_qwen(
+        prompt_utils, conversation,
+        return_messages=True,
         num_audios=1,
+        video="clip.mp4",
     )
 
     assert result == "structured-rendered"
-    assert rendered_messages == [messages]
+    assert rendered_messages[0] == messages
+    assert len(rendered_messages) == 3
+    for rendered in rendered_messages[1:]:
+        assert [item["type"] for item in rendered[0]["content"]] == ["audio", "text"]
+    assert [[item["type"] for item in turn["content"]] for turn in anchored] == [
+        ["text"], ["video", "audio", "text"], ["text"],
+    ]
 
 
 def test_vlm_prompt_patch_uses_qwen3_omni_native_non_thinking_template(monkeypatch):
     import mlx_vlm.prompt_utils as prompt_utils
     import unsloth_zoo.mlx.loader as loader
 
-    native_kwargs = []
+    native_calls = []
 
     class Processor:
         def apply_chat_template(
             self, _messages, *, tokenize, add_generation_prompt, **kwargs,
         ):
-            native_kwargs.append(kwargs)
+            native_calls.append((tokenize, kwargs))
             return "native-rendered"
 
-    monkeypatch.setattr(
-        prompt_utils,
-        "apply_chat_template",
-        lambda *_args, **_kwargs: "count-rendered",
-        raising=False,
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=lambda *_args, **_kwargs: "generic-rendered",
     )
-    monkeypatch.setattr(
-        prompt_utils,
-        "get_chat_template",
-        lambda *_args, **_kwargs: "generic-rendered",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
-    )
-    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
-    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
-    loader._ensure_vlm_prompt_utils_patched()
 
-    result = prompt_utils.apply_chat_template(
-        Processor(),
-        {"model_type": "qwen3_omni_moe"},
-        "Transcribe the audio into text.",
-        num_audios=1,
+    result = _render_qwen(
+        prompt_utils, "Transcribe the audio into text.", Processor(), num_audios=1,
     )
-    explicit_result = prompt_utils.apply_chat_template(
-        Processor(),
-        {"model_type": "qwen3_omni_moe"},
-        "Transcribe the audio into text.",
+    explicit_result = _render_qwen(
+        prompt_utils, "Transcribe the audio into text.", Processor(),
         num_audios=1,
         enable_thinking=True,
+    )
+    tokenized_result = _render_qwen(
+        prompt_utils, "Transcribe the audio into text.", Processor(),
+        num_audios=1,
+        tokenize=True,
     )
 
     assert result == "native-rendered"
     assert explicit_result == "native-rendered"
-    assert native_kwargs == [{}, {"enable_thinking": True}]
+    assert tokenized_result == "native-rendered"
+    assert native_calls == [(False, {}), (False, {"enable_thinking": True}), (True, {})]
 
 
 def test_vlm_generate_hf_kwargs(monkeypatch):

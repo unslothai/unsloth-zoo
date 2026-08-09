@@ -8557,6 +8557,7 @@ _AUDIO_TOWER_ATTRS = (
     "audio_tower", "embed_audio", "audio_encoder", "audio_projection",
     "audio_projection_layer", "sound_encoder", "sound_projection",
 )
+_AUDIO_OUTPUT_ATTRS = ("talker", "code2wav")
 
 
 _AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
@@ -8725,19 +8726,24 @@ def _masked_scatter_rowwise(embeds, mask, source):
 
 
 def freeze_audio_modules(model):
-    """Freeze the audio tower and its projection.
+    """Freeze audio-input towers/projections and audio-output modules.
 
     Audio towers are inference-only here: their encoders carry fp32 promotions,
     long cumulative reductions and host-synchronizing guards that make them
     poor training subjects, and the model-side merge assumes their output is a
-    fixed function of the clip. LoRA runs freeze everything by default, but a
-    full fine-tune would otherwise pull these parameters into the optimizer.
+    fixed function of the clip. Audio-output modules are outside this input-only
+    training path. LoRA runs freeze everything by default, but a full fine-tune
+    would otherwise pull all of these parameters into the optimizer.
 
     Returns the names of the modules that were frozen.
     """
     frozen = []
-    for attr in _AUDIO_TOWER_ATTRS:
-        for owner in (model, getattr(model, "language_model", None)):
+    for attr in _AUDIO_TOWER_ATTRS + _AUDIO_OUTPUT_ATTRS:
+        for owner in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "thinker", None),
+        ):
             module = getattr(owner, attr, None) if owner is not None else None
             if module is None or not hasattr(module, "freeze"):
                 continue
