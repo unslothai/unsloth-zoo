@@ -2297,7 +2297,7 @@ def _qualify(monkeypatch, processor=None, version=None):
         processor or _FakeGemmaAudioProcessor())
     pinned = version or mlx_utils._installed_mlx_vlm_version()
     monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES",
-                        {family: mlx_utils._AudioVersions(pinned, pinned)})
+                        {family: mlx_utils._AudioVersions(pinned)})
 
 
 @pytest.mark.parametrize("gate,message", [
@@ -2695,23 +2695,21 @@ def test_audio_merge_compacts_valid_features_per_row():
 def test_qualified_families_carry_their_probed_requirements():
     """The table itself: which families, over which mlx-vlm releases.
 
-    Bounded at both ends, so an unreleased version is refused rather than
-    assumed good. Gemma 4 starts higher than the rest because below 0.6.2
-    mlx-vlm cannot load the checkpoint at all: E2B's KV-shared layers ship no
-    k_proj/v_proj/k_norm, and mlx-vlm built those modules regardless until
-    Blaizzy/mlx-vlm#1301.
+    Gemma 4 starts higher than the rest because below 0.6.2 mlx-vlm cannot load
+    the checkpoint at all: E2B's KV-shared layers ship no k_proj/v_proj/k_norm,
+    and mlx-vlm built those modules regardless until Blaizzy/mlx-vlm#1301.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     versions = mlx_utils._AudioVersions
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
-        "gemma3n": versions("0.4.4", "0.6.4"),
-        "gemma4": versions("0.6.2", "0.6.4"),
-        "gemma4_unified": versions("0.6.1", "0.6.10"),
-        "nemotron_h_nano_omni": versions("0.5.0", "0.6.10"),
-        "qwen3_omni_moe": versions("0.6.0", "0.6.10"),
-        "phi4mm": versions("0.4.4", "0.6.4"),
-        "minicpmo": versions("0.4.4", "0.6.4"),
+        "gemma3n": versions("0.4.4"),
+        "gemma4": versions("0.6.2"),
+        "gemma4_unified": versions("0.6.1"),
+        "nemotron_h_nano_omni": versions("0.5.0"),
+        "qwen3_omni_moe": versions("0.6.0"),
+        "phi4mm": versions("0.4.4"),
+        "minicpmo": versions("0.4.4"),
     }
 
 
@@ -2723,11 +2721,11 @@ def test_qualified_families_carry_their_probed_requirements():
     ("0.6.2", True),         # #1301: KV-shared layers stop building k/v proj
     ("0.6.3", True),
     ("0.6.4", True),         # double conv transpose, undone by loader.py (PR 879)
-    ("0.6.5", False),        # needs transformers>=5.14, capped at 5.5.0
+    ("0.6.5", True),         # later compatible final releases follow the floor
     ("0.6.2.post1", False),  # post-releases and prereleases were not probed
     ("0.6.2rc1", False),
 ])
-def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
+def test_gemma4_admits_final_releases_from_the_loadable_floor(
         installed, admitted):
     """The boundary, measured rather than argued.
 
@@ -2736,24 +2734,22 @@ def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
     against what the audio tower returns, and two clips giving two losses.
     0.6.1 red, 0.6.2 green.
 
-    The other rows are policy, not measurement. 0.6.5 cannot be installed
-    beside this package (it needs transformers>=5.14, capped at 5.5.0), and
-    mlx-vlm has published no post-release or prerelease to run.
+    Later compatible final releases follow the package resolver policy.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
-    assert window.admits(installed) is admitted, installed
+    floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
+    assert floor.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,admitted", [
     ("0.4.3", False),        # below the probed floor
     ("0.4.4", True),         # the probed version
     ("0.5.0", True),
-    ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
-    ("0.6.5", False),        # which this package caps at 5.5.0
-    ("0.6.9", False),
-    ("0.5.0rc1", False),     # prereleases inside the window: never qualified
+    ("0.6.4", True),
+    ("0.6.5", True),
+    ("99.0.0", True),        # no manually maintained release ceiling
+    ("0.5.0rc1", False),     # prereleases above the floor: never qualified
     ("0.4.5.dev0", False),
     ("0.4.4.post1", False),  # nor post-releases or local builds
     ("0.6.4.post1", False),
@@ -2761,11 +2757,11 @@ def test_gemma4_admits_only_the_versions_that_can_load_the_checkpoint(
     ("", False),             # unreadable: not evidence of anything
     ("not-a-version", False),
 ])
-def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
+def test_the_gate_admits_final_releases_at_or_above_its_floor(installed, admitted):
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma3n"]
-    assert window.admits(installed) is admitted, installed
+    floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma3n"]
+    assert floor.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,allowed", [
@@ -2775,16 +2771,14 @@ def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
     ("0.5.0", True),
     ("0.5.0rc1", False),
     ("0.6.4", True),
-    ("0.6.5", False),
-    ("0.6.9", False),
+    ("0.6.5", True),
+    ("99.0.0", True),
 ])
-def test_the_gate_itself_honours_the_range_not_just_the_range_object(
+def test_the_gate_itself_honours_the_floor_not_just_the_version_object(
         monkeypatch, installed, allowed):
     """Drives `_check_audio_family_gate`, not `_AudioVersions.admits`.
 
-    Asserting the range object alone would pass just as happily with the gate
-    still comparing strings, which is the whole defect. Whether an audio row
-    trains or is refused is decided here.
+    Whether an audio row trains or is refused is decided here.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
@@ -2801,7 +2795,7 @@ def test_the_gate_itself_honours_the_range_not_just_the_range_object(
             mlx_utils._check_audio_family_gate(gemma3n_like())
 
 
-def test_only_a_published_final_release_is_inside_the_window():
+def test_only_a_published_final_release_is_at_or_above_the_floor():
     """The qualification covers published final releases and nothing else.
 
     A post-release is conventionally the same code repackaged, but nothing
@@ -2817,37 +2811,30 @@ def test_only_a_published_final_release_is_inside_the_window():
     for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
                         "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor either side. 0.6.1 measured red; 0.6.5 is refused for being
-    # uninstallable here, not for failing.
+    # The measured floor stays closed while later compatible finals stay open.
     assert gemma4.admits("0.6.1") is False
-    assert gemma4.admits("0.6.5") is False
+    assert gemma4.admits("99.0.0") is True
 
 
 def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
-
-    unified = type("Gemma4UnifiedProcessor", (), {})
-    unified.__module__ = "mlx_vlm.models.gemma4_unified.processing_gemma4_unified"
-    assert mlx_utils._audio_family_from_processor(unified()) == "gemma4_unified"
-    nemotron = type("NemotronProcessor", (), {})
-    nemotron.__module__ = (
-        "mlx_vlm.models.nemotron_h_nano_omni.processing_nemotron_h_nano_omni"
-    )
-    qwen3_omni = type("Qwen3OmniProcessor", (), {})
-    qwen3_omni.__module__ = (
-        "mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe"
-    )
+    def make_processor(module):
+        cls = type("Processor", (), {})
+        cls.__module__ = f"mlx_vlm.models.{module}.processing_{module}"
+        return cls()
+    unified = make_processor("gemma4_unified")
+    assert mlx_utils._audio_family_from_processor(unified) == "gemma4_unified"
     for processor, family, floor, below in (
-        (unified(), "gemma4_unified", "0.6.1", "0.6.0"),
-        (nemotron(), "nemotron_h_nano_omni", "0.5.0", "0.4.4"),
-        (qwen3_omni(), "qwen3_omni_moe", "0.6.0", "0.5.0"),
+        (unified, "gemma4_unified", "0.6.1", "0.6.0"),
+        (make_processor("nemotron_h_nano_omni"), "nemotron_h_nano_omni", "0.5.0", "0.4.4"),
+        (make_processor("qwen3_omni_moe"), "qwen3_omni_moe", "0.6.0", "0.5.0"),
     ):
         monkeypatch.setattr(
             mlx_utils, "_installed_mlx_vlm_version", lambda floor=floor: floor,
         )
         assert mlx_utils._check_audio_family_gate(processor) == family
         monkeypatch.setattr(
-            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.9",
+            mlx_utils, "_installed_mlx_vlm_version", lambda: "99.0.0",
         )
         assert mlx_utils._check_audio_family_gate(processor) == family
         monkeypatch.setattr(
@@ -2855,16 +2842,10 @@ def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
         )
         with pytest.raises(NotImplementedError, match="only been verified"):
             mlx_utils._check_audio_family_gate(processor)
-        monkeypatch.setattr(
-            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.11",
-        )
-        with pytest.raises(NotImplementedError, match="only been verified"):
-            mlx_utils._check_audio_family_gate(processor)
 
 
 def test_diffusion_gemma_uses_the_generic_unsupported_family_refusal():
     from unsloth_zoo.mlx import utils as mlx_utils
-
     processor = type("DiffusionGemmaProcessor", (), {})
     processor.__module__ = "mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma"
     with pytest.raises(
@@ -3130,8 +3111,8 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
     monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
     _here = mlx_utils._installed_mlx_vlm_version()
     monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {
-        "gemma4": mlx_utils._AudioVersions(_here, _here),
-        "fakegemmaaudio": mlx_utils._AudioVersions(_here, _here),
+        "gemma4": mlx_utils._AudioVersions(_here),
+        "fakegemmaaudio": mlx_utils._AudioVersions(_here),
     })
     processor = Gemma4Processor(_Gemma4Extractor(True))
     assert mlx_utils._check_audio_family_gate(processor) == "gemma4"
@@ -3518,7 +3499,6 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
 
 def test_nemotron_declares_its_sampling_rate_on_the_processor():
     from unsloth_zoo.mlx.utils import audio_extractor_sampling_rate
-
     processor = type("NemotronProcessor", (), {"audio_sampling_rate": 16000})()
     assert audio_extractor_sampling_rate(processor) == 16000
 
@@ -3785,14 +3765,12 @@ def test_the_projection_after_the_audio_tower_is_frozen_too():
 class _FrozenAudioModule:
     def __init__(self):
         self.frozen = False
-
     def freeze(self, recurse=False):
         self.frozen = recurse
 
 
 def test_nemotron_sound_encoder_and_projection_are_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
-
     model = type("Nemotron", (), {
         "sound_encoder": _FrozenAudioModule(),
         "sound_projection": _FrozenAudioModule(),
@@ -3805,24 +3783,20 @@ def test_nemotron_sound_encoder_and_projection_are_frozen():
 
 def test_qwen3_omni_nested_audio_tower_is_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
-
     audio_tower = _FrozenAudioModule()
     model = type("Qwen3Omni", (), {
         "thinker": type("Thinker", (), {"audio_tower": audio_tower})(),
     })()
-
     assert freeze_audio_modules(model) == ["audio_tower"]
     assert audio_tower.frozen
 
 
 def test_qwen3_omni_audio_output_modules_are_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
-
     model = type("Qwen3Omni", (), {
         "talker": _FrozenAudioModule(),
         "code2wav": _FrozenAudioModule(),
     })()
-
     assert set(freeze_audio_modules(model)) == {"talker", "code2wav"}
     assert model.talker.frozen and model.code2wav.frozen
 
@@ -4091,13 +4065,11 @@ def test_clips_of_unequal_duration_all_reach_the_model():
 
 
 def test_nemotron_sound_clips_stay_a_list_even_when_shapes_match():
-    """Nemotron's extractor interprets a stacked matrix as one multichannel
-    clip, so equal-length waveforms must retain the list contract too."""
+    """Equal-length Nemotron waveforms must retain the list contract."""
     from unsloth_zoo.mlx.utils import (
         _assert_audio_features_present, _to_mx_vlm_batch,
         _vlm_batch_carries_audio,
     )
-
     inputs = {"sound_clips": [np.zeros(1600, np.float32),
                               np.ones(1600, np.float32)]}
     _assert_audio_features_present(inputs, 2, _FakeProcessor())
@@ -4886,16 +4858,12 @@ def test_shielding_the_audio_side_leaves_the_text_side_flat():
 
 
 def test_processor_forwarding_kwargs_to_its_tokenizer_drops_audio_shield():
-    """Gemma 4 consumes audio itself but forwards every remaining keyword to
-    its tokenizer, where the modality-only `audio_kwargs` shield is invalid."""
+    """Drop Gemma 4's modality shield before its tokenizer sees it."""
     from unsloth_zoo.mlx.utils import _processor_vlm_inputs
-
     class _Gemma4Style(_FakeProcessor):
         feature_extractor = type("_Extractor", (), {"sampling_rate": 16000})()
-
         def __init__(self):
             self.calls = []
-
         def __call__(self, text, audio=None, **kwargs):
             self.calls.append(dict(kwargs))
             if "audio_kwargs" in kwargs:
@@ -4908,7 +4876,6 @@ def test_processor_forwarding_kwargs_to_its_tokenizer_drops_audio_shield():
                 "attention_mask": np.ones((len(text), 4), np.int32),
                 "input_features": np.ones((len(audio), 8, 4), np.float32),
             }
-
     processor = _Gemma4Style()
     result = _processor_vlm_inputs(
         processor, ["prompt"], [[]], 128, all_audio=[[_CLIP]],

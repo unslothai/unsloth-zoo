@@ -5447,9 +5447,8 @@ def _render_vlm_template_or_fallback(
     if model_type == "qwen3_omni_moe" and hasattr(
         processor, "apply_chat_template"
     ):
-        # mlx-vlm's wrapper injects `enable_thinking=False`, but Qwen3 Omni
-        # Instruct only transcribes correctly when that optional argument is
-        # omitted. Delegate directly and preserve explicit caller overrides.
+        # Qwen3 Omni Instruct transcribes only when the wrapper's implicit
+        # `enable_thinking=False` is omitted; preserve explicit overrides.
         native_kwargs = dict(kwargs)
         tokenize = native_kwargs.pop("tokenize", False)
         rendered = processor.apply_chat_template(
@@ -5523,10 +5522,7 @@ def _ensure_vlm_prompt_utils_patched():
                 None,
             )
             if canonical is not None:
-                # Some published configs capitalize model_type even though
-                # mlx-vlm's routing table uses lowercase keys. Passing the
-                # canonical key keeps media-count formatting from falling
-                # through to the text-only path.
+                # Published configs may capitalize mlx-vlm's lowercase key.
                 config_data = dict(config_data)
                 config_data["model_type"] = canonical
                 config = config_data
@@ -5537,9 +5533,7 @@ def _ensure_vlm_prompt_utils_patched():
             and not isinstance(prompt, (dict, list))
             and num_audios > 0
         ):
-            # Qwen's published input contract is image/audio/video followed by
-            # user text. mlx-vlm's generic count renderer puts audio last,
-            # which keeps the marker but makes the Thinker ignore the speech.
+            # Qwen requires media before text; mlx-vlm renders audio last.
             message = prompt_utils.get_message_json(
                 model_type,
                 str(prompt),

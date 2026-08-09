@@ -5626,16 +5626,9 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
 )
 
 class _AudioVersions(NamedTuple):
-    """The mlx-vlm releases a family's audio path is qualified for.
-
-    Bounded at both ends on purpose. An unreleased version is refused rather
-    than assumed good, which is the property the whole gate exists for: a wrong
-    "yes" here trains against misaligned features and fails silently, where a
-    wrong "no" only asks someone to pin.
-    """
+    """The first mlx-vlm release containing a family's qualified audio path."""
 
     minimum: str
-    maximum: str
 
     def admits(self, installed):
         if not installed:
@@ -5646,22 +5639,19 @@ class _AudioVersions(NamedTuple):
             # no prerelease, post-release or local build in 73 releases.
             if found.is_prerelease or found.is_postrelease or found.local:
                 return False
-            return _Version(self.minimum) <= found <= _Version(self.maximum)
+            return _Version(self.minimum) <= found
         except Exception:
             # An unparseable version is not evidence; refusing beats raising.
             return False
 
     def __str__(self):
-        if self.minimum == self.maximum:
-            return self.minimum
-        return f"{self.minimum} to {self.maximum}"
+        return f">={self.minimum}"
 
 
 # Families and the mlx-vlm releases their audio path is qualified for.
 #
 # Probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a byte-identical
-# processor from 0.4.4 through 0.6.9; the 0.6.4 ceiling is only because mlx-vlm
-# 0.6.5+ requires transformers>=5.14, which this package caps at 5.5.0.
+# processor from 0.4.4 through 0.6.9.
 #
 # Gemma 4 starts at 0.6.2, not 0.4.4: below that mlx-vlm cannot load the
 # checkpoint at all. E2B's KV-shared layers reuse an earlier layer's K/V and
@@ -5676,23 +5666,22 @@ class _AudioVersions(NamedTuple):
 # Measured on macos-14 against mlx-community/gemma-4-e2b-it-4bit @ 2387675275,
 # 0.4.4 through 0.6.4: load, placeholder count vs the positions `audio_tower`
 # returns at 0.5s/1.0s/2.0s/3.7s, two clips giving two losses. 0.6.1 red,
-# 0.6.2-0.6.4 green. 0.6.5+ was never run: it cannot be installed here.
+# 0.6.2-0.6.4 green.
 #
-# 0.6.4 is in deliberately. Raw mlx-vlm 0.6.4 fails on these weights -- #1498
+# Raw mlx-vlm 0.6.4 fails on these weights -- #1498
 # made sanitize unconditional, double-transposing pre-converted convs -- but
 # loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
-# fixed it in 0.6.5 (#1523). The ceiling is 0.6.4 only for the transformers cap.
-# Gemma 4 Unified, Nemotron Omni, and Qwen3 Omni are separate implementations.
-# Their floors are the first upstream releases containing working native audio
-# paths; 0.6.10 remains the latest release exercised by the real-model gate.
+# fixed it in 0.6.5 (#1523).
+# These three omni implementations use their first working native-audio release
+# as the floor; 0.6.10 remains the latest exercised by the real-model gate.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
-    "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
-    "gemma4": _AudioVersions("0.6.2", "0.6.4"),
-    "gemma4_unified": _AudioVersions("0.6.1", "0.6.10"),
-    "nemotron_h_nano_omni": _AudioVersions("0.5.0", "0.6.10"),
-    "qwen3_omni_moe": _AudioVersions("0.6.0", "0.6.10"),
-    "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
-    "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
+    "gemma3n": _AudioVersions("0.4.4"),
+    "gemma4": _AudioVersions("0.6.2"),
+    "gemma4_unified": _AudioVersions("0.6.1"),
+    "nemotron_h_nano_omni": _AudioVersions("0.5.0"),
+    "qwen3_omni_moe": _AudioVersions("0.6.0"),
+    "phi4mm": _AudioVersions("0.4.4"),
+    "minicpmo": _AudioVersions("0.4.4"),
 }
 
 # Families probed only on a newer transformers than this package pins, at the
