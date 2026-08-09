@@ -1251,7 +1251,12 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     # fallback itself, so wrapping its result again would leave the inner
     # wrapper swallowing the exhaustion under a label nobody looks up, and the
     # outer one returned here never latching.
-    from .common import _raw_torch_compile
+    from .common import _raw_torch_compile, unwrap_already_compiled
+    # No-op for the plain module-level functions every caller passes today, and
+    # the thing that keeps torch 2.11's bare
+    # `assert not hasattr(compile_wrapper, "get_compiler_config")` out of reach
+    # if one ever passes a callable that has already been through here.
+    func = unwrap_already_compiled(func)
     compiled = _raw_torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
     # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
