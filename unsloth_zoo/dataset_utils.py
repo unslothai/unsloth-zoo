@@ -593,7 +593,12 @@ class _MediaAwareCollator:
         self.media = media
         # Kept so the media collator can read the prompt beside its image, and
         # stripped again on the text path, which cannot tensorize a raw string.
-        self.companion_keys = frozenset(companion_keys)
+        # Lowercased: `_keep` below tests `key.lower()`, and unlike the other two
+        # sets this one carries the caller's own `dataset_text_field`. A
+        # mixed-case one (`Body`) never matched, so the raw string it names
+        # survived into a text batch and `DataCollatorForSeq2Seq` died on it.
+        self.companion_keys = frozenset(
+            k.lower() if isinstance(k, str) else k for k in companion_keys)
         # Split, not merged: an ambiguous name is decided by its value below,
         # and folding the two would match `url` on the name alone.
         self.ambiguous_keys = frozenset(ambiguous_keys)

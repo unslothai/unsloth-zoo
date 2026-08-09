@@ -3418,6 +3418,32 @@ def test_a_configured_text_field_is_stripped_under_its_own_name():
     assert seen["keys"] == ["input_ids"], seen["keys"]
 
 
+def test_a_mixed_case_text_field_is_stripped_too():
+    """The keep-list holds `Body` alive for the media path with its own casing,
+    but the strip tests `key.lower()` against the companion names, so a
+    `dataset_text_field` carrying an uppercase letter matched nothing: the raw
+    string stayed in the text batch and `DataCollatorForSeq2Seq` raised `Unable
+    to create tensor ... Perhaps your features (`Body` in this case)`. The
+    field is the caller's to name, and Hub datasets do ship capitalised text
+    columns: `ought/raft` has `Sentence`, a StackExchange dump has `Body`."""
+    rows = Dataset.from_dict({
+        "input_ids": [list(ROW), list(ROW)],
+        "attention_mask": [[1] * len(ROW)] * 2,
+    })
+    trainer = StubTrainer(MyVisionCollator(StubProcessor()), rows)
+    trainer.args.dataset_text_field = "Body"
+    out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
+
+    dispatcher = out.data_collator
+    assert "Body" in (getattr(out, "_signature_columns", None) or []), \
+        "the column never survives removal, so there is nothing to strip"
+    seen = {}
+    dispatcher.text = lambda features: seen.setdefault(
+        "keys", sorted(features[0].keys()))
+    dispatcher([{"input_ids": list(ROW), "Body": "hello"}])
+    assert seen["keys"] == ["input_ids"], seen["keys"]
+
+
 def test_the_media_path_still_gets_the_text_field():
     """Stripped on the text path only: a raw `{"text": ..., "image": ...}` row
     is exactly why the column is kept, and the vision collator tokenizes it."""
