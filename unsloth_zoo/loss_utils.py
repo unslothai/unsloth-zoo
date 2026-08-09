@@ -267,19 +267,39 @@ def _trainer_explicitly_disables_loss_kwargs(trainer):
     return result
 pass
 
+def _loss_consumes_num_items(trainer):
+    # TRL's chunked_nll patches the lm_head and divides by num_items_in_batch
+    # itself, outside the model_accepts_loss_kwargs gate. That is the only path
+    # that normalises while the flag says False, so it is the only one for which
+    # skipping training_step's division is correct.
+    try:
+        import trl.trainer.sft_trainer as _sft
+    except Exception:
+        return False
+    if not hasattr(_sft, "_patch_chunked_ce_lm_head"): return False
+    args = getattr(trainer, "args", None)
+    if args is None: return False
+    if getattr(args, "use_liger_kernel", False): return False  # forces loss_type="nll"
+    return getattr(args, "loss_type", None) in (None, "chunked_nll")
+pass
+
 def _reconcile_loss_normalization(trainer, num_items_in_batch):
     # Nothing counted, or a compute_loss_func already suppresses the division.
     if num_items_in_batch is None: return num_items_in_batch
     if getattr(trainer, "compute_loss_func", None) is not None: return num_items_in_batch
     if getattr(trainer, "model_accepts_loss_kwargs", True): return num_items_in_batch
 
-    if _trainer_explicitly_disables_loss_kwargs(trainer):
-        # Trainer wants the /GA division, so give it the stock input for that.
-        return None
-    # Flag came from the model class, but the loss is token normalised, so tell
-    # training_step to skip its own division instead of double counting.
-    trainer.model_accepts_loss_kwargs = True
-    return num_items_in_batch
+    # Trainer set the flag False on purpose to get the /GA division (DPO, KTO,
+    # GRPO and friends). Never override that; give it the stock input instead.
+    if _trainer_explicitly_disables_loss_kwargs(trainer): return None
+
+    if _loss_consumes_num_items(trainer):
+        # Already token normalised, so let training_step skip its division.
+        trainer.model_accepts_loss_kwargs = True
+        return num_items_in_batch
+    # Nothing downstream will divide by the count, so training_step's /GA is the
+    # correct and only normalisation. Passing a count would suppress it.
+    return None
 pass
 
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):

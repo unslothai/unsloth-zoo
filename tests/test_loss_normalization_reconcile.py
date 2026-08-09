@@ -7,10 +7,14 @@ whether to divide by grad-accum from self.model_accepts_loss_kwargs. When a loss
 divides by num_items_in_batch (ours, and TRL's chunked_nll) and the model class
 sets accepts_loss_kwargs = False, both fire and the gradients are scaled 1/GA.
 
-Two cases need opposite treatment, so both are pinned here:
-  * flag False because the model class says so -> flip the flag, keep the count.
-  * flag False because the trainer asked for it (DPO, GRPO, KTO and friends)
-    -> drop the count, leave the flag.
+The reconcile keys off whether the ACTIVE loss consumes the count, not off where
+the False came from. Three cases, pinned here:
+  * chunked_nll divides by the count itself -> flip the flag, keep the count.
+  * plain nll does not -> drop the count so training_step's /GA still runs.
+  * trainer asked for the divide (DPO, GRPO, KTO) -> drop the count, keep flag.
+
+The second case is a regression guard: an earlier revision keyed off the origin
+of the False and left gradients 4x too large under nll at GA=4.
 
 CPU only, no model downloads.
 """
@@ -28,15 +32,23 @@ def _fn(name):
     return fn
 
 
+class _Args:
+    def __init__(self, loss_type="chunked_nll", use_liger_kernel=False):
+        self.loss_type = loss_type
+        self.use_liger_kernel = use_liger_kernel
+
+
 class _ModelDerived:
     """Trainer that never assigns the flag itself."""
     compute_loss_func = None
-    def __init__(self, accepts): self.model_accepts_loss_kwargs = accepts
+    def __init__(self, accepts, loss_type="chunked_nll"):
+        self.model_accepts_loss_kwargs = accepts
+        self.args = _Args(loss_type)
 
 
 class _Deliberate(_ModelDerived):
-    def __init__(self, accepts):
-        super().__init__(accepts)
+    def __init__(self, accepts, loss_type="chunked_nll"):
+        super().__init__(accepts, loss_type)
         self.model_accepts_loss_kwargs = False
 
 
@@ -47,9 +59,40 @@ def test_flag_true_is_untouched():
     assert t.model_accepts_loss_kwargs is True
 
 
-def test_model_derived_false_flips_flag_and_keeps_count():
+def test_chunked_nll_flips_flag_and_keeps_count():
+    """chunked_nll divides by the count itself, so training_step must not."""
     reconcile = _fn("_reconcile_loss_normalization")
-    t = _ModelDerived(False)
+    t = _ModelDerived(False, loss_type="chunked_nll")
+    assert reconcile(t, 100) == 100
+    assert t.model_accepts_loss_kwargs is True
+
+
+def test_plain_nll_suppresses_count_and_leaves_flag():
+    """Regression for the 4x-too-large gradients this file originally shipped.
+
+    Under loss_type="nll" nothing downstream consumes num_items_in_batch, so
+    flipping the flag would suppress the only normalisation there is and leave
+    gradients GA times too large. Measured 4.166698 vs 1.041674 at GA=4.
+    """
+    reconcile = _fn("_reconcile_loss_normalization")
+    t = _ModelDerived(False, loss_type="nll")
+    assert reconcile(t, 100) is None
+    assert t.model_accepts_loss_kwargs is False
+
+
+def test_liger_kernel_suppresses_count():
+    """use_liger_kernel forces loss_type="nll" regardless of the setting."""
+    reconcile = _fn("_reconcile_loss_normalization")
+    t = _ModelDerived(False, loss_type="chunked_nll")
+    t.args.use_liger_kernel = True
+    assert reconcile(t, 100) is None
+    assert t.model_accepts_loss_kwargs is False
+
+
+def test_unset_loss_type_is_treated_as_chunked_nll():
+    """TRL leaves loss_type None until __post_init__ resolves it."""
+    reconcile = _fn("_reconcile_loss_normalization")
+    t = _ModelDerived(False, loss_type=None)
     assert reconcile(t, 100) == 100
     assert t.model_accepts_loss_kwargs is True
 
