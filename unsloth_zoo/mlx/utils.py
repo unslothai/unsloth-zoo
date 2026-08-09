@@ -5682,22 +5682,16 @@ class _AudioVersions(NamedTuple):
 # made sanitize unconditional, double-transposing pre-converted convs -- but
 # loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
 # fixed it in 0.6.5 (#1523). The ceiling is 0.6.4 only for the transformers cap.
-# Gemma 4 Unified and Nemotron Omni are separate implementations first qualified
-# against the release environment's 0.6.10 contract; fail closed on either side.
+# Gemma 4 Unified and Nemotron Omni are separate implementations. Their floors
+# are the first upstream releases containing those native audio paths; 0.6.10
+# remains the latest release exercised by the real-model qualification gate.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
     "gemma4": _AudioVersions("0.6.2", "0.6.4"),
-    "gemma4_unified": _AudioVersions("0.6.10", "0.6.10"),
-    "nemotron_h_nano_omni": _AudioVersions("0.6.10", "0.6.10"),
+    "gemma4_unified": _AudioVersions("0.6.1", "0.6.10"),
+    "nemotron_h_nano_omni": _AudioVersions("0.5.0", "0.6.10"),
     "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
-}
-
-_AUDIO_UNSUPPORTED_REASONS = {
-    "diffusion_gemma": (
-        "the published checkpoint has no native audio modality, processor "
-        "path, audio configuration, or audio weights"
-    ),
 }
 
 # Families probed only on a newer transformers than this package pins, at the
@@ -5974,12 +5968,6 @@ def _check_audio_family_gate(processor):
     if probed and probed.admits(installed):
         _check_audio_transformers_floor(family)
         return family
-    unsupported = _AUDIO_UNSUPPORTED_REASONS.get(family)
-    if unsupported:
-        raise NotImplementedError(
-            f"Unsloth MLX: audio training is not supported for '{family}': "
-            f"{unsupported}. Train on its text and image modalities instead."
-        )
     if not _AUDIO_QUALIFIED_FAMILIES:
         raise NotImplementedError(
             f"Unsloth MLX: audio inputs were found in this dataset, but audio "

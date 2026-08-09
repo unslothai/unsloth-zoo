@@ -2707,8 +2707,8 @@ def test_qualified_families_carry_their_probed_requirements():
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
         "gemma3n": versions("0.4.4", "0.6.4"),
         "gemma4": versions("0.6.2", "0.6.4"),
-        "gemma4_unified": versions("0.6.10", "0.6.10"),
-        "nemotron_h_nano_omni": versions("0.6.10", "0.6.10"),
+        "gemma4_unified": versions("0.6.1", "0.6.10"),
+        "nemotron_h_nano_omni": versions("0.5.0", "0.6.10"),
         "phi4mm": versions("0.4.4", "0.6.4"),
         "minicpmo": versions("0.4.4", "0.6.4"),
     }
@@ -2822,7 +2822,7 @@ def test_only_a_published_final_release_is_inside_the_window():
     assert gemma4.admits("0.6.5") is False
 
 
-def test_new_audio_families_are_qualified_only_on_the_measured_release(monkeypatch):
+def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
 
     unified = type("Gemma4UnifiedProcessor", (), {})
@@ -2832,26 +2832,41 @@ def test_new_audio_families_are_qualified_only_on_the_measured_release(monkeypat
     nemotron.__module__ = (
         "mlx_vlm.models.nemotron_h_nano_omni.processing_nemotron_h_nano_omni"
     )
-    for processor, family in ((unified(), "gemma4_unified"),
-                              (nemotron(), "nemotron_h_nano_omni")):
+    for processor, family, floor, below in (
+        (unified(), "gemma4_unified", "0.6.1", "0.6.0"),
+        (nemotron(), "nemotron_h_nano_omni", "0.5.0", "0.4.4"),
+    ):
         monkeypatch.setattr(
-            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.10",
+            mlx_utils, "_installed_mlx_vlm_version", lambda floor=floor: floor,
         )
         assert mlx_utils._check_audio_family_gate(processor) == family
         monkeypatch.setattr(
             mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.9",
         )
+        assert mlx_utils._check_audio_family_gate(processor) == family
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda below=below: below,
+        )
+        with pytest.raises(NotImplementedError, match="only been verified"):
+            mlx_utils._check_audio_family_gate(processor)
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda: "0.6.11",
+        )
         with pytest.raises(NotImplementedError, match="only been verified"):
             mlx_utils._check_audio_family_gate(processor)
 
 
-def test_diffusion_gemma_audio_refusal_names_the_missing_native_modality():
+def test_diffusion_gemma_uses_the_generic_unsupported_family_refusal():
     from unsloth_zoo.mlx import utils as mlx_utils
 
     processor = type("DiffusionGemmaProcessor", (), {})
     processor.__module__ = "mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma"
-    with pytest.raises(NotImplementedError, match="no native audio modality"):
+    with pytest.raises(
+        NotImplementedError,
+        match="audio training is not supported for 'diffusion_gemma'",
+    ) as excinfo:
         mlx_utils._check_audio_family_gate(processor())
+    assert "published checkpoint" not in str(excinfo.value)
 
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
