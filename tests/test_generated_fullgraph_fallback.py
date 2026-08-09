@@ -52,25 +52,50 @@ FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
 
 
-def _run_with_compile_enabled(body):
-    """Run `body` in a fresh interpreter with UNSLOTH_COMPILE_DISABLE cleared.
+def _run_in_fresh_interpreter(body, compile_disable):
+    """Run `body` in a new interpreter with UNSLOTH_COMPILE_DISABLE pinned.
 
-    `common.py` reads that variable once at import and collapses both
-    `torch_compile` and `_maybe_compile` to a no-op when it is set, so the two
-    routing assertions below cannot hold in-process under it. unsloth's
-    consolidated CI runs this whole suite with `UNSLOTH_COMPILE_DISABLE=1` at
-    the job level, which is what made them fail there and pass locally. A
-    subprocess, not `importlib.reload`, because reloading the module mid-session
-    rebinds objects other tests in the same run already hold.
+    `None` clears the variable, a string sets it. unsloth's consolidated CI runs
+    this whole suite with `UNSLOTH_COMPILE_DISABLE=1` at the job level, so a test
+    that needs the other setting cannot get it from the ambient environment.
+
+    `common.py` reacts to that variable in two different ways, and only one of
+    them needs this:
+
+    * **Bound at import.** `torch_compile`, `_torch_compile` and
+      `_raw_torch_compile` are assigned under a module-level
+      `if UNSLOTH_COMPILE_DISABLE:` and are already `noop` function objects by
+      the time any test runs. Rebinding `common.UNSLOTH_COMPILE_DISABLE`
+      afterwards cannot undo that, so asserting on these three needs a fresh
+      interpreter.
+    * **Read per call.** `_maybe_compile` reads `UNSLOTH_COMPILE_DISABLE` and
+      `UNSLOTH_COMPILE_DISABLE_PARTIAL` in its own body on every call.
+      `monkeypatch.setattr` on the module attributes is enough there, and is
+      what the `_maybe_compile` tests below use; a subprocess would only buy a
+      five second package import per assertion.
+
+    A subprocess, not `importlib.reload`, because reloading the module
+    mid-session rebinds objects other tests in the same run already hold.
     """
     env = dict(os.environ)
-    env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    if compile_disable is None:
+        env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    else:
+        env["UNSLOTH_COMPILE_DISABLE"] = compile_disable
     done = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(body)],
         capture_output = True, text = True, env = env,
         cwd = str(ZOO.parent),
     )
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def _run_with_compile_enabled(body):
+    _run_in_fresh_interpreter(body, None)
+
+
+def _run_with_compile_disabled(body):
+    _run_in_fresh_interpreter(body, "1")
 
 
 # ---- what the compiler emits ---------------------------------------------
@@ -106,7 +131,7 @@ def test_the_grpo_loss_regions_are_wrapped():
         "accumulate_chunk is still compiled bare"
 
 
-def test_maybe_compile_routes_fullgraph_through_the_fallback():
+def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     """Three more fullgraph regions go through this one helper, so wiring it
     covers them without touching each decorator."""
     from unsloth_zoo.temporary_patches import common
@@ -116,15 +141,56 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback():
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
 
-    _run_with_compile_enabled("""
+    # In process, unlike the alias below: `_maybe_compile` reads both switches
+    # in its own body on every call, so pinning the module attributes is exact
+    # and the assertion then holds in every configuration the suite runs under.
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
+
+    def f(x):
+        return x
+    wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
+    assert hasattr(wrapped, "_unsloth_fallback_state")
+    plain = common._maybe_compile(dynamic = True)(f)
+    assert not hasattr(plain, "_unsloth_fallback_state")
+
+
+@pytest.mark.parametrize("flag", ["UNSLOTH_COMPILE_DISABLE",
+                                  "UNSLOTH_COMPILE_DISABLE_PARTIAL"])
+def test_maybe_compile_is_a_no_op_when_compilation_is_switched_off(monkeypatch, flag):
+    """The other half of the switch. Turning compilation off has to drop the
+    fallback wrapper as well, or torch is still handed a fullgraph region by the
+    one helper three of them go through.
+
+    Monkeypatch, again because the read is per call: setting the variable in the
+    environment instead would do nothing to an already imported module, and a
+    subprocess would be spelling `False -> True` the long way round."""
+    from unsloth_zoo.temporary_patches import common
+
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
+    monkeypatch.setattr(common, flag, True)
+
+    def f(x):
+        return x
+    assert common._maybe_compile(fullgraph = True, dynamic = True)(f) is f, \
+        f"{flag} did not switch the fullgraph wrapper off"
+
+
+def test_the_alias_is_the_no_op_when_compilation_is_switched_off():
+    """The same half of the switch for the import-bound side.
+
+    Nothing else pins this: the source scan below only recognises the enabled
+    spelling, `functools.partial(...)`, so a disabled branch that bound bare
+    `torch.compile` would pass every other test in this file while handing
+    unsloth's CPU CI job the fullgraph regions it asked not to have. Needs a
+    fresh interpreter for the reason in `_run_in_fresh_interpreter`: these three
+    names are bound once, at import."""
+    _run_with_compile_disabled("""
         from unsloth_zoo.temporary_patches import common
 
-        def f(x):
-            return x
-        wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
-        assert hasattr(wrapped, "_unsloth_fallback_state")
-        plain = common._maybe_compile(dynamic = True)(f)
-        assert not hasattr(plain, "_unsloth_fallback_state")
+        for name in ("torch_compile", "_torch_compile", "_raw_torch_compile"):
+            assert getattr(common, name) is common.noop, name
     """)
 
 
