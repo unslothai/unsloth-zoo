@@ -6439,6 +6439,11 @@ _AUDIO_FEATURE_PAYLOAD_KEYS = (
     "input_features", "input_audio_embeds", "audio_features",
 )
 
+# Some image processors keep one tensor per image when aspect-ratio-dependent
+# preprocessing produces different spatial shapes. Their vision tower consumes
+# that ragged list directly; collapsing to value[0] silently drops later images.
+_VLM_RAGGED_MEDIA_PAYLOAD_KEYS = (*_AUDIO_FEATURE_PAYLOAD_KEYS, "pixel_values")
+
 
 def _assert_audio_features_present(inputs, expected, processor):
     """Fail when a row carried clips but the processor returned no audio tensors.
@@ -7057,13 +7062,11 @@ def _to_mx_vlm_batch(inputs):
                     for x in value
                 ])
             except Exception:
-                if key in _AUDIO_FEATURE_PAYLOAD_KEYS and len(value) > 1:
-                    # Clips of unequal duration do not stack, and dropping to
-                    # value[0] would leave one clip behind ids, placeholder runs
-                    # and labels for all of them -- the pairing
-                    # `_assert_audio_features_present` just verified. Kept entry
-                    # by entry so the count survives; ragged audio never reaches
-                    # the compiled path, so there is no signature to hold.
+                if key in _VLM_RAGGED_MEDIA_PAYLOAD_KEYS and len(value) > 1:
+                    # Unequal media shapes do not stack, and dropping to value[0]
+                    # would leave one payload behind ids, placeholder runs and
+                    # labels for all of them. Keep every entry so model-specific
+                    # eager paths can apply their own ragged handling.
                     batch[key] = [
                         x if isinstance(x, mx.array) else mx.array(np.asarray(x))
                         for x in value
