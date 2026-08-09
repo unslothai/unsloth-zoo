@@ -2709,6 +2709,7 @@ def test_qualified_families_carry_their_probed_requirements():
         "gemma4": versions("0.6.2", "0.6.4"),
         "gemma4_unified": versions("0.6.1", "0.6.10"),
         "nemotron_h_nano_omni": versions("0.5.0", "0.6.10"),
+        "qwen3_omni_moe": versions("0.6.0", "0.6.10"),
         "phi4mm": versions("0.4.4", "0.6.4"),
         "minicpmo": versions("0.4.4", "0.6.4"),
     }
@@ -2832,9 +2833,14 @@ def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
     nemotron.__module__ = (
         "mlx_vlm.models.nemotron_h_nano_omni.processing_nemotron_h_nano_omni"
     )
+    qwen3_omni = type("Qwen3OmniProcessor", (), {})
+    qwen3_omni.__module__ = (
+        "mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe"
+    )
     for processor, family, floor, below in (
         (unified(), "gemma4_unified", "0.6.1", "0.6.0"),
         (nemotron(), "nemotron_h_nano_omni", "0.5.0", "0.4.4"),
+        (qwen3_omni(), "qwen3_omni_moe", "0.6.0", "0.5.0"),
     ):
         monkeypatch.setattr(
             mlx_utils, "_installed_mlx_vlm_version", lambda floor=floor: floor,

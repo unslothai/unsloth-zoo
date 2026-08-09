@@ -560,6 +560,153 @@ def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkey
     assert calls == [(configured, "Transcribe this audio.", 1)]
 
 
+def test_vlm_prompt_patch_places_counted_qwen3_omni_audio_before_text(monkeypatch):
+    """Qwen's published contract is media then text, while mlx-vlm's generic
+    count renderer appends audio after text and produces broken inference."""
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    rendered_messages = []
+
+    def original(*_args, **_kwargs):
+        return "count-rendered"
+
+    def render(_processor, messages, _add_generation_prompt, **_kwargs):
+        rendered_messages.append(messages)
+        return "structured-rendered"
+
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(prompt_utils, "get_chat_template", render, raising=False)
+    monkeypatch.setattr(
+        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils,
+        "_get_role_content",
+        lambda item: (item["role"], item["content"]),
+        raising=False,
+    )
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+    result = prompt_utils.apply_chat_template(
+        object(),
+        {"model_type": "qwen3_omni_moe"},
+        "Transcribe the audio into text.",
+        num_audios=1,
+    )
+
+    assert result == "structured-rendered"
+    assert [item["type"] for item in rendered_messages[0][0]["content"]] == [
+        "audio",
+        "text",
+    ]
+
+
+def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    rendered_messages = []
+
+    monkeypatch.setattr(
+        prompt_utils,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "count-rendered",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils,
+        "get_chat_template",
+        lambda _processor, messages, _add_generation_prompt, **_kwargs:
+            rendered_messages.append(messages) or "structured-rendered",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils,
+        "_get_role_content",
+        lambda item: (item["role"], item["content"]),
+        raising=False,
+    )
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio"},
+                {"type": "text", "text": "Transcribe the audio into text."},
+            ],
+        }
+    ]
+
+    result = prompt_utils.apply_chat_template(
+        object(),
+        {"model_type": "qwen3_omni_moe"},
+        messages,
+        num_audios=1,
+    )
+
+    assert result == "structured-rendered"
+    assert rendered_messages == [messages]
+
+
+def test_vlm_prompt_patch_uses_qwen3_omni_native_non_thinking_template(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    native_kwargs = []
+
+    class Processor:
+        def apply_chat_template(
+            self, _messages, *, tokenize, add_generation_prompt, **kwargs,
+        ):
+            native_kwargs.append(kwargs)
+            return "native-rendered"
+
+    monkeypatch.setattr(
+        prompt_utils,
+        "apply_chat_template",
+        lambda *_args, **_kwargs: "count-rendered",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils,
+        "get_chat_template",
+        lambda *_args, **_kwargs: "generic-rendered",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt_utils, "MODEL_CONFIG", {"qwen3_omni_moe": object()}, raising=False,
+    )
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+    result = prompt_utils.apply_chat_template(
+        Processor(),
+        {"model_type": "qwen3_omni_moe"},
+        "Transcribe the audio into text.",
+        num_audios=1,
+    )
+    explicit_result = prompt_utils.apply_chat_template(
+        Processor(),
+        {"model_type": "qwen3_omni_moe"},
+        "Transcribe the audio into text.",
+        num_audios=1,
+        enable_thinking=True,
+    )
+
+    assert result == "native-rendered"
+    assert explicit_result == "native-rendered"
+    assert native_kwargs == [{}, {"enable_thinking": True}]
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj

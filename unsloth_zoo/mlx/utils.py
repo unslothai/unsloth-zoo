@@ -5682,14 +5682,15 @@ class _AudioVersions(NamedTuple):
 # made sanitize unconditional, double-transposing pre-converted convs -- but
 # loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
 # fixed it in 0.6.5 (#1523). The ceiling is 0.6.4 only for the transformers cap.
-# Gemma 4 Unified and Nemotron Omni are separate implementations. Their floors
-# are the first upstream releases containing those native audio paths; 0.6.10
-# remains the latest release exercised by the real-model qualification gate.
+# Gemma 4 Unified, Nemotron Omni, and Qwen3 Omni are separate implementations.
+# Their floors are the first upstream releases containing working native audio
+# paths; 0.6.10 remains the latest release exercised by the real-model gate.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4", "0.6.4"),
     "gemma4": _AudioVersions("0.6.2", "0.6.4"),
     "gemma4_unified": _AudioVersions("0.6.1", "0.6.10"),
     "nemotron_h_nano_omni": _AudioVersions("0.5.0", "0.6.10"),
+    "qwen3_omni_moe": _AudioVersions("0.6.0", "0.6.10"),
     "phi4mm": _AudioVersions("0.4.4", "0.6.4"),
     "minicpmo": _AudioVersions("0.4.4", "0.6.4"),
 }

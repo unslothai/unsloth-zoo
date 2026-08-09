@@ -5400,12 +5400,25 @@ def _render_vlm_template_or_fallback(
     kwargs,
 ):
     """Render a message list, falling back only when the upstream template is empty."""
-    rendered = prompt_utils_module.get_chat_template(
-        processor,
-        messages,
-        add_generation_prompt,
-        **kwargs,
-    )
+    if model_type == "qwen3_omni_moe" and hasattr(
+        processor, "apply_chat_template"
+    ):
+        # mlx-vlm's wrapper injects `enable_thinking=False`, but Qwen3 Omni
+        # Instruct only transcribes correctly when that optional argument is
+        # omitted. Delegate directly and preserve explicit caller overrides.
+        rendered = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+    else:
+        rendered = prompt_utils_module.get_chat_template(
+            processor,
+            messages,
+            add_generation_prompt,
+            **kwargs,
+        )
     if isinstance(rendered, str) and rendered.strip():
         return rendered
 
@@ -5473,6 +5486,31 @@ def _ensure_vlm_prompt_utils_patched():
                 config = config_data
                 model_type = canonical
 
+        if (
+            model_type == "qwen3_omni_moe"
+            and not isinstance(prompt, (dict, list))
+            and num_audios > 0
+        ):
+            # Qwen's published input contract is image/audio/video followed by
+            # user text. mlx-vlm's generic count renderer puts audio last,
+            # which keeps the marker but makes the Thinker ignore the speech.
+            content = (
+                [{"type": "image"}] * num_images
+                + [{"type": "audio"}] * num_audios
+                + [{"type": "text", "text": str(prompt)}]
+            )
+            messages = [{"role": "user", "content": content}]
+            if return_messages:
+                return messages
+            return _render_vlm_template_or_fallback(
+                prompt_utils,
+                model_type,
+                processor,
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                kwargs=kwargs,
+            )
+
         if not isinstance(prompt, (dict, list)):
             return _original_vlm_apply_chat_template(
                 processor,
@@ -5499,6 +5537,7 @@ def _ensure_vlm_prompt_utils_patched():
             not return_messages
             and not kwargs.get("video")
             and not _prompt_has_tool_metadata(prompt)
+            and model_type != "qwen3_omni_moe"
             and model_type in getattr(prompt_utils, "MODEL_CONFIG", {})
             and _structured_media_matches_count_renderer(
                 normalized_messages, num_images, num_audios
