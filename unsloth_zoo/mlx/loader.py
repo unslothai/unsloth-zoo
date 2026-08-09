@@ -5218,7 +5218,7 @@ def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwarg
         or item.get("type") not in ("image", "audio", "video")
     ]
     images = audios = []
-    if message.get("role") == "user":
+    if str(message.get("role", "user")).lower() == "user":
         if not videos and not kwargs.get("skip_image_token"):
             images = [{"type": "image"}] * num_images
         if not kwargs.get("skip_audio_token"):

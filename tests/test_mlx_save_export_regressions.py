@@ -647,7 +647,7 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
         _render_qwen(prompt_utils, prompt, num_audios=1)
     conversation = [
         {"role": "system", "content": "Follow instructions."},
-        {"role": "user", "content": "Describe both inputs."},
+        {"role": "User", "content": "Describe both inputs."},
         {"role": "assistant", "content": "Ready."},
     ]
     anchored = _render_qwen(prompt_utils, conversation, return_messages=True,
