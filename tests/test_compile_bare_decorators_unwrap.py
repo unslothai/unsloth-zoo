@@ -47,7 +47,6 @@ than on the raise. That holds on every torch from 2.6 up, not only on the ones
 where handing over the wrapper happens to be fatal.
 """
 
-import functools
 import os
 import subprocess
 import sys
@@ -220,8 +219,16 @@ def test_patch_function_keeps_a_bound_method_bound():
     and so does `unwrap_already_compiled`; the hand-rolled hop did not.
 
     torch 2.11+ then refuses to compile the bound method it was handed, which is
-    what the eager guard is for: the patch installs, uncompiled, and the receiver
-    is still attached.
+    what the eager guard is for: the load survives, and what the guard hands on
+    is still bound to its own receiver.
+
+    `can_safely_patch` then declines the patch, because a bound `(x)` cannot
+    stand in for the target's `(self, x)`, and this test asserts only on the
+    receiver, not on the install. Declining is the right answer: installing a
+    bound method as a class attribute would route every instance of the target
+    through the ORIGINAL receiver. Before the fix, one `.__wrapped__` hop
+    reached the unbound original, so the signatures matched, the patch went in
+    and every call raised on the wrong `self`.
     """
     _run("""
         import torch
