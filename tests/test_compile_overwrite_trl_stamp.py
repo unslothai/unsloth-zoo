@@ -18,8 +18,6 @@ The second test is the counterweight: the hatch has to keep working when
 nothing moved, or hand-edited caches stop being editable.
 """
 
-import os
-
 import pytest
 
 from unsloth_zoo import compiler
@@ -28,16 +26,25 @@ PROBE_NAME = "UnslothCompileStampProbe"
 PROBE_SOURCE = "def _unsloth_stamp_probe():\n    return 1\n"
 
 
-def _emit(tmp_path, monkeypatch, overwrite):
-    """Run create_new_function against an isolated cache dir, return the path."""
+_OMIT = object()
+
+
+def _emit(tmp_path, monkeypatch, overwrite=_OMIT):
+    """Run create_new_function against an isolated cache dir, return the path.
+
+    Leaving `overwrite` out exercises the default-argument call sites, which
+    read the cache down a different path than the explicit `overwrite=False`
+    ones and so have to be covered separately.
+    """
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    kwargs = {} if overwrite is _OMIT else {"overwrite": overwrite}
     compiler.create_new_function(
         PROBE_NAME,
         PROBE_SOURCE,
         "torch",
         [],
-        overwrite=overwrite,
+        **kwargs,
     )
     return tmp_path / f"{PROBE_NAME}.py"
 
@@ -48,15 +55,19 @@ def _stamp_lines(path):
     return [line.strip() for line in header.strip().strip('"').split("\n") if line.strip()]
 
 
-def _rewrite_trl_stamp(path, version):
-    """Doctor only the trl line, leaving transformers and the body alone."""
+def _rewrite_stamp(path, index, version):
+    """Doctor one stamp line, leaving the other entries and the body alone."""
     text = path.read_text()
     lines = _stamp_lines(path)
-    assert len(lines) > 3, lines
-    old = lines[3]
+    assert len(lines) > index, lines
+    old = lines[index]
     head, sep, tail = text.partition("__UNSLOTH_VERSIONING__")
     assert sep, "no version stamp written"
     return path.write_text(head.replace(f"\n{old}\n", f"\n{version}\n", 1) + sep + tail)
+
+
+def _rewrite_trl_stamp(path, version):
+    return _rewrite_stamp(path, 3, version)
 
 
 def test_a_changed_trl_stamp_forces_a_recompile(tmp_path, monkeypatch):
@@ -97,6 +108,73 @@ def test_the_warning_names_the_library_that_moved(tmp_path, monkeypatch, caplog)
         _emit(tmp_path, monkeypatch, overwrite=False)
 
     assert f"trl 0.0.1-stale -> {stale_trl}" in caplog.text
+
+
+def test_a_default_overwrite_caller_is_invalidated_too(tmp_path, monkeypatch):
+    """The zoo's own peft and combined-module caches omit the argument.
+
+    Those callers never populated `file_source`, so the stamp comparison was
+    unreachable for them and the hatch kept the cache whatever had moved.
+    """
+    path = _emit(tmp_path, monkeypatch, overwrite=True)
+    installed_trl = _stamp_lines(path)[3]
+    _rewrite_trl_stamp(path, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch)
+
+    assert _stamp_lines(path)[3] == installed_trl
+
+
+def test_the_transformers_half_reaches_default_callers_too(tmp_path, monkeypatch):
+    """Same gap, older half of the check: a transformers bump was ignored."""
+    path = _emit(tmp_path, monkeypatch, overwrite=True)
+    installed_tf = _stamp_lines(path)[2]
+    _rewrite_stamp(path, 2, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch)
+
+    assert _stamp_lines(path)[2] == installed_tf
+
+
+def test_an_unchanged_stamp_leaves_a_default_callers_cache_alone(tmp_path, monkeypatch):
+    """Reading the cache must not turn the hatch into an unconditional rebuild."""
+    path = _emit(tmp_path, monkeypatch, overwrite=True)
+    marker = "# hand edited, do not clobber\n"
+    path.write_text(path.read_text() + marker)
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch)
+    _emit(tmp_path, monkeypatch)
+
+    assert marker in path.read_text()
+
+
+def test_a_stamp_that_predates_the_trl_entry_is_replaced(tmp_path, monkeypatch):
+    """A short stamp reads as trl "0", which differs from any installed trl."""
+    path = _emit(tmp_path, monkeypatch, overwrite=True)
+    installed_trl = _stamp_lines(path)[3]
+    if installed_trl == "0":
+        pytest.skip("trl is not installed, so a short stamp is not stale")
+    text = path.read_text()
+    head, sep, tail = text.partition("__UNSLOTH_VERSIONING__")
+    path.write_text(head.replace(f"\n{installed_trl}\n", "\n", 1) + sep + tail)
+    assert len(_stamp_lines(path)) == 3
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch, overwrite=False)
+
+    assert _stamp_lines(path)[3] == installed_trl
+
+
+def test_a_first_run_with_no_cache_still_writes_the_file(tmp_path, monkeypatch):
+    """Nothing to compare against must not mean nothing gets written."""
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    path = _emit(tmp_path, monkeypatch)
+
+    assert path.is_file()
+    assert len(_stamp_lines(path)) == 4
 
 
 if __name__ == "__main__":

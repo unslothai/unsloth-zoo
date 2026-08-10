@@ -1282,6 +1282,17 @@ def create_new_function(
         # to TRL's own untouched trainer) or forwards arguments that TRL has
         # since retired. Checking transformers alone let a TRL 0.25 cache be
         # reused on TRL 1.9 and reinstated the very TypeError it was fixed for.
+        if file_source is None and os.path.isfile(function_location):
+            # Callers that leave overwrite at its default never took the read
+            # above, so without this the comparison below is dead code for them
+            # and the hatch pins whatever is on disk no matter which library
+            # moved. On a read failure we fall back to None, which lands on the
+            # same "leave it alone" branch as before.
+            try:
+                with open(function_location, "r", encoding="utf-8") as f:
+                    file_source = f.read()
+            except Exception:
+                file_source = None
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
