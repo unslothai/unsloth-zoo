@@ -1274,16 +1274,29 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        # Even with OVERWRITE disabled, force recompile on a library version
+        # mismatch. TRL counts as much as transformers here: the generated RL
+        # trainers mirror the installed TRL config signature and import symbols
+        # straight out of trl.trainer.<x>_trainer, so a cache built against a
+        # different TRL either fails to import (and Unsloth silently falls back
+        # to TRL's own untouched trainer) or forwards arguments that TRL has
+        # since retired. Checking transformers alone let a TRL 0.25 cache be
+        # reused on TRL 1.9 and reinstated the very TypeError it was fixed for.
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            cached_trl_version = cached_lines[3] if len(cached_lines) > 3 else "0"
+            changed = []
             if cached_tf_version != transformers_version:
+                changed.append(f"transformers {cached_tf_version} -> {transformers_version}")
+            if cached_trl_version != trl_version:
+                changed.append(f"trl {cached_trl_version} -> {trl_version}")
+            if changed:
                 logger.warning_once(
-                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
-                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but "
+                    f"{' and '.join(changed)}. Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
             else:
