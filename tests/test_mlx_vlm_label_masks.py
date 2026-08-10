@@ -3763,22 +3763,20 @@ def test_the_projection_after_the_audio_tower_is_frozen_too():
 
 
 class _FrozenAudioModule:
-    def __init__(self):
-        self.frozen = False
+    frozen = False
     def freeze(self, recurse=False):
         self.frozen = recurse
 
 
-def test_nemotron_sound_encoder_and_projection_are_frozen():
+def test_nemotron_sound_modules_are_frozen_and_not_quantized():
+    import unsloth_zoo.mlx.loader as mlx_loader
     from unsloth_zoo.mlx.utils import freeze_audio_modules
-    model = type("Nemotron", (), {
-        "sound_encoder": _FrozenAudioModule(),
-        "sound_projection": _FrozenAudioModule(),
-    })()
-    assert set(freeze_audio_modules(model)) == {
-        "sound_encoder", "sound_projection",
-    }
-    assert model.sound_encoder.frozen and model.sound_projection.frozen
+    names = ("sound_encoder", "sound_projection")
+    model = type("Nemotron", (), {name: _FrozenAudioModule() for name in names})()
+    assert set(freeze_audio_modules(model)) == set(names)
+    assert all(getattr(model, name).frozen for name in names)
+    predicate = mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    assert all(not predicate(name, object()) for name in names)
 
 
 def test_qwen3_omni_nested_audio_tower_is_frozen():

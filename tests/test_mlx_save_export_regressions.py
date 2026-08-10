@@ -647,18 +647,18 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
         _render_qwen(prompt_utils, prompt, num_audios=1)
     conversation = [
         {"role": "system", "content": "Follow instructions."},
-        {"role": "User", "content": "Describe both inputs."},
+        {"role": "HuMaN", "content": "Describe all inputs."},
         {"role": "assistant", "content": "Ready."},
     ]
     anchored = _render_qwen(prompt_utils, conversation, return_messages=True,
-                            num_audios=1, video="clip.mp4")
+                            num_images=1, num_audios=1, video="clip.mp4")
     assert result == "structured-rendered"
     assert rendered_messages[0] == messages
     assert len(rendered_messages) == 3
     for rendered in rendered_messages[1:]:
         assert [item["type"] for item in rendered[0]["content"]] == ["audio", "text"]
     assert [[item["type"] for item in turn["content"]] for turn in anchored] == [
-        ["text"], ["video", "audio", "text"], ["text"],
+        ["text"], ["video", "image", "audio", "text"], ["text"],
     ]
 
 

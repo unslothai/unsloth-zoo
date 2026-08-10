@@ -3296,7 +3296,7 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "projector",
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
-    "audio_encoder", "audio_projection", "embed_audio",
+    "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
 )
 
 _MLX_QUANT_MODE_DEFAULTS = {
@@ -5218,8 +5218,8 @@ def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwarg
         or item.get("type") not in ("image", "audio", "video")
     ]
     images = audios = []
-    if str(message.get("role", "user")).lower() == "user":
-        if not videos and not kwargs.get("skip_image_token"):
+    if str(message.get("role", "user")).lower() not in _NON_USER_ROLES:
+        if not kwargs.get("skip_image_token"):
             images = [{"type": "image"}] * num_images
         if not kwargs.get("skip_audio_token"):
             audios = [{"type": "audio"}] * num_audios
