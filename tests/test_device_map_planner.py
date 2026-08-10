@@ -35,6 +35,7 @@ from unsloth_zoo.device_map_planner import (
     _from_config_remote_aware,
     _split_units,
     _keep_in_fp32_modules,
+    _runtime_quantization_config,
     logit_headroom_bytes,
     plan_device_map,
     resolve_head_width,
@@ -968,3 +969,117 @@ def test_fp32_loader_exceptions_apply_without_a_quantizer():
     assert upcast["norm"] == plain["norm"] * 2
     assert upcast["layers"] == plain["layers"]
     assert upcast[""] == plain[""] + plain["norm"]
+
+
+def test_the_balanced_reserve_is_derived_per_head_candidate():
+    """The cap depends on which card pays the headroom, so deriving it once
+    against the smallest budget clamped the reserve using a card that will not
+    hold the head, and the balanced policy stopped balancing."""
+    model = _meta(hidden = 512, vocab = 8192, layers = 8)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 3 * _GiB, 1: 16 * _GiB},
+        headroom_bytes = (5 * _GiB) // 2,
+        prefer_head_device = 1,
+    )
+    assert plan.head_device == 1
+    kept = plan.activation_reserve_by_device
+    # cuda:0 does not hold the head, so its cap is its own 3 GiB less the weight
+    # share (about 2.98 GiB). The shared cap charged it the 2.5 GiB of headroom
+    # as well and left it under 0.5 GiB.
+    assert kept[0] > 1 * _GiB
+    for device, reserve in kept.items():
+        head_extra = plan.headroom_bytes if device == plan.head_device else 0
+        assert plan.weight_bytes[device] + reserve + head_extra <= plan.raw_budgets[device]
+
+
+def test_runtime_quantization_options_build_a_quantizer(monkeypatch):
+    """`load_in_4bit=True` on a full-precision checkpoint creates no serialized
+    `config.quantization_config`, so inspecting the config alone sized it at full
+    precision and skipped the quantiser's budget adjustment."""
+    kwargs = {"load_in_4bit": True, "trust_remote_code": False}
+    qcfg = _runtime_quantization_config(kwargs)
+    assert qcfg is not None and qcfg.load_in_4bit is True
+    # Popped, so they never reach AutoConfig as stray attributes.
+    assert kwargs == {"trust_remote_code": False}
+
+    explicit = object()
+    assert _runtime_quantization_config({"quantization_config": explicit}) is explicit
+    assert _runtime_quantization_config({}) is None
+    assert _runtime_quantization_config({"load_in_8bit": True}).load_in_8bit is True
+
+    # The loader consumes every BitsAndBytesConfig option from its kwargs, and
+    # `llm_int8_skip_modules` becomes `modules_to_not_convert`: ignoring it sizes
+    # whole modules at the quantised width that the loader keeps full precision.
+    kwargs = {"load_in_8bit": True, "llm_int8_skip_modules": ["lm_head"],
+              "trust_remote_code": True}
+    qcfg = _runtime_quantization_config(kwargs)
+    assert qcfg.llm_int8_skip_modules == ["lm_head"]
+    assert kwargs.get("trust_remote_code") is True
+    assert "llm_int8_skip_modules" not in kwargs
+
+    kwargs = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}
+    assert _runtime_quantization_config(kwargs).bnb_4bit_quant_type == "nf4"
+
+    # The same contradiction `from_pretrained` refuses.
+    with pytest.raises(ValueError, match = "not both"):
+        _runtime_quantization_config({"load_in_4bit": True, "quantization_config": explicit})
+
+
+def test_the_pretrained_helper_forwards_the_no_split_override(monkeypatch):
+    """Routed through `**config_kwargs` the override would go to `AutoConfig`,
+    so the plan silently used the model's detected classes and the convenience
+    API refused a model the planner itself can place."""
+    import unsloth_zoo.device_map_planner as planner
+
+    with torch.device("meta"):
+        model = _FatBlockModel()
+    monkeypatch.setattr(planner, "build_meta_model", lambda *a, **k: (model, None, None))
+    monkeypatch.setattr(planner, "_usable_devices", lambda max_memory: [0, 1])
+
+    budgets = {0: 7 * _MiB, 1: 7 * _MiB}
+    with pytest.raises(DeviceMapInfeasible):
+        planner.plan_device_map_for_pretrained(
+            "x", max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
+        )
+    plan = planner.plan_device_map_for_pretrained(
+        "x", max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
+        no_split_module_classes = [],
+    )
+    assert plan.no_split_module_classes == []
+
+
+class _OneFatBlock(nn.Module):
+    """A single atomic block that fits on no card except beside the head."""
+
+    _no_split_modules = ["_Block"]
+
+    def __init__(self, hidden = 1024):
+        super().__init__()
+        self.layers = nn.ModuleList([_Block(hidden)])
+        self.lm_head = nn.Linear(hidden, 64, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_the_auto_reserve_relaxes_on_the_head_as_a_last_resort():
+    """The relaxation loop only ever took the reserve off the OTHER cards, so an
+    atomic unit that fits nowhere else could miss the head's card by less than
+    the reserve and the plan was refused. An auto-derived reserve is documented
+    as relaxable; the logit headroom is still never touched."""
+    with torch.device("meta"):
+        model = _OneFatBlock()
+    block = 1024 * 1024 * 4          # 4 MiB
+    head = 1024 * 64 * 4             # 0.25 MiB
+    headroom = 1 * _MiB
+    plan = plan_device_map(
+        model,
+        max_memory = {0: block - 1, 1: block + head + headroom + (_MiB // 2)},
+        headroom_bytes = headroom,
+        prefer_head_device = 1,
+    )
+    assert plan.head_device == 1
+    assert plan.device_map["layers.0"] == 1
+    # The headroom survives in full; only the activation reserve gave way.
+    assert plan.raw_budgets[1] - plan.weight_bytes[1] >= headroom
