@@ -24,6 +24,7 @@ from .gemma4 import *
 from .gemma4_float32 import *
 from .gemma4_banded_attention import *
 from .gemma4_flash_sliding import *
+from .muse_glimmer_banded_attention import *
 from .gpt_oss import *
 from .qwen3_moe import *
 from .qwen3_moe_float32 import *
