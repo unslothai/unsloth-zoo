@@ -392,6 +392,39 @@ def _model_dtype(model: nn.Module) -> Any:
     return None
 
 
+def _keep_in_fp32_modules(model: nn.Module, hf_quantizer: Any = None) -> list[str]:
+    """Modules the loader will leave in float32, mirroring transformers.
+
+    ``from_pretrained`` hands this list to ``preprocess_model`` so the quantiser
+    skips those modules and they keep the load dtype. Passing ``[]`` instead
+    sizes them at the quantised width while the loader keeps them wide, which
+    undercounts the weights of a tight plan and OOMs during loading. Both
+    bitsandbytes quantisers set ``use_keep_in_fp32_modules``, and real
+    checkpoints do declare the list (gpt-oss keeps its layer norms, the T5
+    family keeps `wo`), so this is not a rare path.
+
+    The gate is the same as ``modeling_utils``: the plain list applies under
+    float16 or when the quantiser asks for it, the strict list under float16 or
+    bfloat16, both against the dtype the quantiser resolved.
+    """
+    dtype = _model_dtype(model)
+    update = getattr(hf_quantizer, "update_dtype", None)
+    if callable(update):
+        try:
+            dtype = update(dtype)
+        except Exception:
+            pass
+    keep: list[str] = []
+    plain = getattr(model, "_keep_in_fp32_modules", None)
+    if plain and (dtype == torch.float16 or
+                  getattr(hf_quantizer, "use_keep_in_fp32_modules", False)):
+        keep.extend(plain)
+    strict = getattr(model, "_keep_in_fp32_modules_strict", None)
+    if strict and dtype in (torch.float16, torch.bfloat16):
+        keep.extend(strict)
+    return list(dict.fromkeys(keep))
+
+
 def _quantized_size_kwargs(model: nn.Module, hf_quantizer: Any) -> dict[str, Any]:
     """`dtype` / `special_dtypes` for `compute_module_sizes`, quantiser-aware.
 
@@ -599,10 +632,14 @@ def _split_units(
             sizes.get(f"{prefix}.{child_name}" if prefix else child_name, 0)
             for child_name, _ in children
         )
+        # Emit the unit whenever direct state exists, even at zero bytes: a
+        # tensor tied to one counted elsewhere weighs nothing here, and dropping
+        # its unit would leave the parameter uncovered and fail the coverage
+        # check at the end of `plan_device_map`.
         own = max(0, size - child_bytes) if own_tensors else 0
-        if own and prefix:
+        if own_tensors and prefix:
             units.append((prefix, own))
-        elif own:
+        elif own_tensors:
             # State registered directly on the ROOT module. There is no module
             # name to hang it on -- the prefix is "" -- and accelerate reads ""
             # as a catch-all default for everything unlisted, which would fight
@@ -737,9 +774,14 @@ def plan_device_map(
 
     if softcapped is None:
         cfg = getattr(model, "config", None)
+        # `logits_soft_cap` is the RecurrentGemma spelling of the same knob, and
+        # the repository's own `_detect_logit_softcap` already treats them as
+        # aliases. Missing it drops the tanh temporary and the retained soft-cap
+        # buffer from the headroom, so the head's card is under-reserved.
         softcapped = any(
-            bool(getattr(h, "final_logit_softcapping", None))
+            bool(getattr(h, name, None))
             for h in (cfg, getattr(cfg, "text_config", None))
+            for name in ("final_logit_softcapping", "logits_soft_cap")
         )
 
     if headroom_bytes is None:
@@ -1084,8 +1126,13 @@ def plan_device_map(
 
     assign, weight_bytes, budgets = result
     # Sanity: the map must cover every parameter and buffer.
+    # `remove_duplicate=False`, because accelerate's own `check_device_map`
+    # walks `state_dict()`, which lists a tied tensor under every name it has.
+    # Covering only the deduplicated names lets a map through that accelerate
+    # then rejects with "does not give any device for the following parameters".
     uncovered = []
-    for pname, _ in list(model.named_parameters()) + list(model.named_buffers()):
+    for pname, _ in list(model.named_parameters(remove_duplicate=False)) + \
+                    list(model.named_buffers(remove_duplicate=False)):
         if not any(pname == k or pname.startswith(k + ".") for k in assign):
             uncovered.append(pname)
     if uncovered:
@@ -1144,7 +1191,10 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         # Swap in the quantised Linear classes so the size table matches the
         # bytes the loader will really allocate.
         try:
-            hf_quantizer.preprocess_model(model=model, device_map=None, keep_in_fp32_modules=[])
+            hf_quantizer.preprocess_model(
+                model=model, device_map=None,
+                keep_in_fp32_modules=_keep_in_fp32_modules(model, hf_quantizer),
+            )
         except Exception:
             pass
     return model, hf_quantizer, config

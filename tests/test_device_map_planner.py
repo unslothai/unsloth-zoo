@@ -34,6 +34,7 @@ from unsloth_zoo.device_map_planner import (
     _compute_module_sizes,
     _from_config_remote_aware,
     _split_units,
+    _keep_in_fp32_modules,
     logit_headroom_bytes,
     plan_device_map,
     resolve_head_width,
@@ -676,3 +677,91 @@ def test_remote_code_construction_gets_the_hub_options(monkeypatch):
 
     assert _from_config_remote_aware(AutoModelForCausalLM, Plain(), {"token": "t"}) == "auto-model"
     assert seen["fallback"] == {"trust_remote_code": True}
+
+
+class _Composite(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.inner = nn.Linear(hidden, hidden, bias = False)
+
+
+class _TiedDirectState(nn.Module):
+    """A composite module whose own parameter is tied to one counted earlier."""
+
+    def __init__(self, hidden = 16, vocab = 64):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.trunk = _Composite(hidden)
+        self.lm_head = nn.Linear(hidden, vocab, bias = False)
+        # Registered after `embed_tokens`, so sizing counts the tensor there and
+        # this module's own share of the size table is zero.
+        self.trunk.shadow = self.embed_tokens.weight
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+def test_zero_byte_direct_state_still_gets_a_unit():
+    """Sizing counts a shared tensor once, so a direct parameter tied to one
+    counted elsewhere weighs nothing. Its unit still has to exist or the
+    parameter is uncovered and the coverage check raises."""
+    with torch.device("meta"):
+        model = _TiedDirectState()
+    assert _compute_module_sizes(model)["trunk"] == 16 * 16 * 4
+    assert ("trunk", 0) in _split_units(model, [], _compute_module_sizes(model))
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
+    # accelerate's own `check_device_map` walks `state_dict()`, which lists a
+    # tied tensor under every name it has, so the map has to cover those too.
+    for name in model.state_dict():
+        assert any(name == k or name.startswith(k + ".") for k in plan.device_map), name
+
+
+def test_recurrentgemma_softcap_alias_is_detected():
+    """`logits_soft_cap` is the same knob under a different name, and the
+    repository's own `_detect_logit_softcap` already treats them as aliases.
+    Missing it drops the tanh temporary and the retained soft-cap buffer, so the
+    head's card is under-reserved."""
+    class Cfg:
+        logits_soft_cap = 30.0
+
+    model = _meta()
+    model.config = Cfg()
+    capped = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"},
+                             retained_rows = 256)
+    uncapped = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"},
+                               retained_rows = 256, softcapped = False)
+    assert capped.headroom_bytes > uncapped.headroom_bytes
+
+
+def test_keep_in_fp32_modules_mirror_the_loader():
+    """`from_pretrained` hands this list to `preprocess_model`; passing `[]`
+    quantises modules the loader keeps in float32 and undercounts the weights."""
+    model = _meta()
+
+    class Cfg:
+        dtype = torch.bfloat16
+
+    model.config = Cfg()
+    model._keep_in_fp32_modules = ["norm"]
+    model._keep_in_fp32_modules_strict = ["lm_head"]
+
+    class Bnb:
+        use_keep_in_fp32_modules = True
+
+        def update_dtype(self, dtype):
+            return dtype
+
+    class Other:
+        use_keep_in_fp32_modules = False
+
+        def update_dtype(self, dtype):
+            return dtype
+
+    # bfloat16: the strict list always applies, the plain one only because the
+    # quantiser asks for it.
+    assert _keep_in_fp32_modules(model, Bnb()) == ["norm", "lm_head"]
+    assert _keep_in_fp32_modules(model, Other()) == ["lm_head"]
+    assert _keep_in_fp32_modules(model, None) == ["lm_head"]
