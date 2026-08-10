@@ -5204,12 +5204,22 @@ def _first_media_user_message_index(messages):
 
 
 def _qwen3_omni_media_counts(content):
+    """Count top-level media items rendered by Qwen3 Omni's native template."""
     counts = [0, 0, 0]
     for item in content if isinstance(content, list) else ():
-        if not isinstance(item, dict): continue
+        if not isinstance(item, dict):
+            continue
         kind = str(item.get("type", "")).lower()
-        index = 0 if kind == "image" or "image" in item or "image_url" in item else 1 if kind == "audio" or "audio" in item or "audio_url" in item else 2 if kind == "video" or "video" in item else None
-        if index is not None: counts[index] += 1
+        if kind == "image" or "image" in item or "image_url" in item:
+            index = 0
+        elif kind == "audio" or "audio" in item or "audio_url" in item:
+            index = 1
+        elif kind == "video" or "video" in item:
+            index = 2
+        else:
+            index = None
+        if index is not None:
+            counts[index] += 1
     return tuple(counts)
 
 
@@ -5279,8 +5289,17 @@ def _anchor_conversation_media_to_first_user_turn(
             **message_kwargs,
         )
         if model_type == "qwen3_omni_moe":
-            options = {**message_kwargs, "skip_image_token": skip_image_token, "skip_audio_token": skip_audio_token}
-            rendered = _normalize_qwen3_omni_counted_message(rendered, num_images if is_target else 0, num_audios if is_target else 0, options)
+            options = {
+                **message_kwargs,
+                "skip_image_token": skip_image_token,
+                "skip_audio_token": skip_audio_token,
+            }
+            rendered = _normalize_qwen3_omni_counted_message(
+                rendered,
+                num_images if is_target else 0,
+                num_audios if is_target else 0,
+                options,
+            )
         if isinstance(message, dict):
             if isinstance(rendered, dict):
                 rendered = {**message, **rendered}
@@ -5412,17 +5431,44 @@ def _prepare_vlm_template_messages(
     has_structured_multimodal = _messages_have_structured_multimodal_content(
         normalized_messages
     )
-    if model_type == "qwen3_omni_moe": has_structured_multimodal |= any(any(_qwen3_omni_media_counts(message.get("content", ""))) for message in normalized_messages)
+    if model_type == "qwen3_omni_moe":
+        has_structured_multimodal |= any(
+            any(_qwen3_omni_media_counts(message.get("content", "")))
+            for message in normalized_messages
+        )
     needs_media_anchor = (
         not has_structured_multimodal and (num_images > 0 or num_audios > 0)
     )
 
     template_messages = normalized_messages
-    if model_type == "qwen3_omni_moe" and has_structured_multimodal and (num_images > 0 or num_audios > 0) and (target_idx := _first_media_user_message_index(normalized_messages)) >= 0:
-        counts = [_qwen3_omni_media_counts(message.get("content", "")) for message in normalized_messages]
-        if any(missing := (0 if kwargs.get("skip_image_token") else max(0, num_images - sum(x[0] for x in counts)), 0 if kwargs.get("skip_audio_token") else max(0, num_audios - sum(x[1] for x in counts)))):
+    if (
+        model_type == "qwen3_omni_moe"
+        and has_structured_multimodal
+        and (num_images > 0 or num_audios > 0)
+        and (
+            target_idx := _first_media_user_message_index(normalized_messages)
+        ) >= 0
+    ):
+        counts = [
+            _qwen3_omni_media_counts(message.get("content", ""))
+            for message in normalized_messages
+        ]
+        missing = (
+            0
+            if kwargs.get("skip_image_token")
+            else max(0, num_images - sum(item[0] for item in counts)),
+            0
+            if kwargs.get("skip_audio_token")
+            else max(0, num_audios - sum(item[1] for item in counts)),
+        )
+        if any(missing) or any(counts[target_idx]):
             template_messages = list(normalized_messages)
-            template_messages[target_idx] = _normalize_qwen3_omni_counted_message(template_messages[target_idx], counts[target_idx][0] + missing[0], counts[target_idx][1] + missing[1], kwargs)
+            template_messages[target_idx] = _normalize_qwen3_omni_counted_message(
+                template_messages[target_idx],
+                counts[target_idx][0] + missing[0],
+                counts[target_idx][1] + missing[1],
+                kwargs,
+            )
     elif needs_media_anchor:
         template_messages = _anchor_conversation_media_to_first_user_turn(
             prompt_utils_module,
