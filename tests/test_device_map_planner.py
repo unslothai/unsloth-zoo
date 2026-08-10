@@ -22,6 +22,8 @@ finding the decoder block class, honouring tied embeddings, the headroom
 arithmetic, and refusing rather than silently spilling when a request cannot
 fit.
 """
+import sys
+
 import pytest
 import torch
 import torch.nn as nn
@@ -142,12 +144,28 @@ def test_quantised_sizes_use_the_storage_dtype():
     from accelerate.utils import CustomDtype
 
     class Q:
+        """Both quantiser protocols at once.
+
+        transformers' own `compute_module_sizes` asks for `param_element_size`;
+        accelerate's has no quantiser argument and takes a storage dtype plus the
+        not-converted modules. Which one the planner reaches depends on the
+        installed transformers, so the double implements both and the test pins
+        the same answer either way."""
         modules_to_not_convert = ["lm_head"]
+
+        def _skipped(self, name):
+            return any(m in name for m in self.modules_to_not_convert)
+
+        # transformers >= the release that added hf_quantizer support
+        def param_element_size(self, model, name, param):
+            return 2 if self._skipped(name) else 0.5
+
+        # accelerate
         def adjust_target_dtype(self, dtype):
             return CustomDtype.INT4
+
         def get_special_dtypes_update(self, model, dtype):
-            return {n: dtype for n, _ in model.named_parameters()
-                    if any(m in n for m in self.modules_to_not_convert)}
+            return {n: dtype for n, _ in model.named_parameters() if self._skipped(n)}
 
     class Cfg:
         dtype = torch.bfloat16
@@ -376,3 +394,49 @@ def test_an_unusable_prefer_head_device_says_so():
     model = _meta()
     with pytest.raises(ValueError, match = "prefer_head_device"):
         plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"}, prefer_head_device = 7)
+
+
+def test_each_backend_is_called_with_the_arguments_it_accepts(monkeypatch):
+    """transformers' `compute_module_sizes(model, hf_quantizer=...)` and
+    accelerate's `compute_module_sizes(model, dtype=..., special_dtypes=...)`
+    do not accept each other's arguments, and the wrong pair does not fail
+    loudly: it falls through to the plain walk, which measures a 4-bit
+    checkpoint at several times its real size. So dispatch on the signature."""
+    import types
+
+    seen = {}
+
+    def transformers_style(model, hf_quantizer = None, buffers_only = False, only_modules = True):
+        seen["transformers"] = hf_quantizer
+        return {"": 1234}, {}
+
+    def accelerate_style(model, dtype = None, special_dtypes = None, buffers_only = False):
+        seen["accelerate"] = (dtype, special_dtypes)
+        return {"": 5678}
+
+    class Q:
+        modules_to_not_convert = ["lm_head"]
+        def adjust_target_dtype(self, dtype):
+            return torch.int8
+        def get_special_dtypes_update(self, model, dtype):
+            return {}
+
+    class Cfg:
+        dtype = torch.bfloat16
+
+    model = _meta()
+    model.config = Cfg()
+
+    fake = types.ModuleType("transformers.integrations.accelerate")
+    fake.compute_module_sizes = transformers_style
+    monkeypatch.setitem(sys.modules, "transformers.integrations.accelerate", fake)
+    assert _compute_module_sizes(model, Q())[""] == 1234
+    assert isinstance(seen["transformers"], Q)
+
+    # Same call with only accelerate's older signature available.
+    seen.clear()
+    fake2 = types.ModuleType("transformers.integrations.accelerate")
+    fake2.compute_module_sizes = accelerate_style
+    monkeypatch.setitem(sys.modules, "transformers.integrations.accelerate", fake2)
+    assert _compute_module_sizes(model, Q())[""] == 5678
+    assert seen["accelerate"][0] is torch.int8

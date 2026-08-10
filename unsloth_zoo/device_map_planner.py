@@ -127,6 +127,7 @@ Nothing here is specific to one architecture:
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
@@ -425,19 +426,51 @@ def _quantized_size_kwargs(model: nn.Module, hf_quantizer: Any) -> dict[str, Any
 def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[str, int]:
     """Bytes per module subtree. Uses transformers'/accelerate's version when
     available so quantised (bnb / Params4bit) sizes match what the loader will
-    actually allocate; otherwise falls back to a plain walk."""
+    actually allocate; otherwise falls back to a plain walk.
+
+    The two available implementations take the quantiser differently and neither
+    tolerates the other's arguments, so dispatch on the signature:
+
+    * ``transformers.integrations.accelerate.compute_module_sizes(model,
+      hf_quantizer=...)`` asks the quantiser for the element size of each
+      parameter, which is exact. It returns a 2-tuple.
+    * ``accelerate.utils.modeling.compute_module_sizes(model, dtype=...,
+      special_dtypes=...)`` has no quantiser argument, so it gets the storage
+      dtype and the not-converted modules instead (see
+      :func:`_quantized_size_kwargs`).
+
+    Passing the wrong pair is not a near miss. ``hf_quantizer`` in accelerate's
+    second positional slot is read as a dtype and raises, and a ``dtype`` keyword
+    on the transformers version is unexpected, so either mistake ends in the
+    plain walk below -- which measures a preprocessed meta ``Params4bit`` at the
+    full unpacked shape in float32, several times the real size of a 4-bit
+    checkpoint.
+    """
     size_kwargs = _quantized_size_kwargs(model, hf_quantizer)
     for mod_path in ("transformers.integrations.accelerate", "accelerate.utils.modeling"):
         try:
             module = __import__(mod_path, fromlist=["compute_module_sizes"])
             fn = getattr(module, "compute_module_sizes")
+            accepted = inspect.signature(fn).parameters
         except Exception:
             continue
-        # Drop the extras one at a time rather than all at once: an older
-        # accelerate without `special_dtypes` still gets the storage dtype,
-        # which is the term that actually moves the number.
-        for kwargs in ([size_kwargs] if size_kwargs else []) + \
-                      ([{"dtype": size_kwargs["dtype"]}] if "special_dtypes" in size_kwargs else []) + [{}]:
+        attempts: list[dict[str, Any]] = []
+        if hf_quantizer is not None and "hf_quantizer" in accepted:
+            attempts.append({"hf_quantizer": hf_quantizer})
+        elif size_kwargs:
+            supported = {k: v for k, v in size_kwargs.items() if k in accepted}
+            # Drop the extras one at a time rather than all at once: an older
+            # accelerate without `special_dtypes` still gets the storage dtype,
+            # which is the term that actually moves the number.
+            if supported:
+                attempts.append(supported)
+            if "dtype" in supported and len(supported) > 1:
+                attempts.append({"dtype": supported["dtype"]})
+        # Last resort. Correct for an unquantised model, an over-estimate for a
+        # quantised one -- which refuses rather than OOMs, so it is the safe way
+        # to be wrong.
+        attempts.append({})
+        for kwargs in attempts:
             try:
                 out = fn(model, **kwargs)
             except Exception:
