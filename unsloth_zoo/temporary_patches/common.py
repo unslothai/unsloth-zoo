@@ -213,6 +213,12 @@ def unwrap_already_compiled(function):
     """
     seen = set()
     while callable(function) and hasattr(function, "get_compiler_config"):
+        # A bound method forwards attribute lookups to the function underneath it,
+        # so `__wrapped__` here is the UNBOUND original and following it would drop
+        # the receiver. torch's own `innermost_fn` stops on a bound method for that
+        # exact reason ("id(bound_method) != id(wrapper_function), so we won't
+        # unwrap through __func__ and lose the self binding").
+        if getattr(function, "__self__", None) is not None: break
         inner = getattr(function, "__wrapped__", None)
         # No `__wrapped__` (an OptimizedModule, say) or a cycle: leave it be and
         # let the caller's guard deal with whatever torch makes of it.
@@ -249,6 +255,13 @@ def _compile_or_fall_back(*args, **kwargs):
     Both spellings are in use: `@torch_compile(...)` as a decorator factory, and
     `torch_compile(fn, ...)` applied directly (gemma.py, gpt_oss.py). Imported
     lazily: utils imports this module."""
+    # `torch.compile`'s first parameter is named `model`, so `torch_compile(model = fn)`
+    # is a third legal spelling. Take it out of the compile kwargs, where it would
+    # collide with the function passed positionally, and treat it as that function.
+    function = args[0] if args and callable(args[0]) else None
+    if function is None and callable(kwargs.get("model")):
+        function = kwargs.pop("model")
+
     if kwargs.get("fullgraph"):
         from .utils import torch_compile_with_fallback
         _compile = torch_compile_with_fallback(**kwargs)
@@ -272,8 +285,8 @@ def _compile_or_fall_back(*args, **kwargs):
                     f"from speed. ({type(exception).__name__}: {exception})"
                 )
             return function
-    if args and callable(args[0]):
-        return decorate(args[0])
+    if function is not None:
+        return decorate(function)
     return decorate
 
 

@@ -129,6 +129,31 @@ def test_unwrap_already_compiled_survives_a_carrier_with_no_wrapped():
     unwrap_already_compiled(a)
 
 
+def test_unwrap_already_compiled_keeps_a_bound_method_bound():
+    """`__wrapped__` on a bound method is the UNBOUND original.
+
+    A bound method forwards attribute lookups to `__func__`, so following
+    `__wrapped__` would hand back a function that still wants `self` and turn the
+    receiver into the first user argument. torch's own `innermost_fn` stops on a
+    bound method for the same reason, so stop here too and let the caller's guard
+    take it from there.
+    """
+    from unsloth_zoo.temporary_patches.common import unwrap_already_compiled
+
+    class Model:
+        def forward(self, x): return x + 1
+
+    model = Model()
+    compiled_forward = torch.compile(Model.forward)
+    Model.forward = compiled_forward
+    bound = model.forward
+
+    assert hasattr(bound, "get_compiler_config"), \
+        "the bound method stopped forwarding the compiled marker"
+    assert bound.__wrapped__ is not bound
+    assert unwrap_already_compiled(bound) is bound
+
+
 # ---- the funnel -----------------------------------------------------------
 
 def test_torch_compile_hands_torch_the_eager_function():
@@ -243,6 +268,32 @@ def test_a_refused_decoration_falls_back_to_eager_without_fullgraph():
         print("FELL_BACK")
     """)
     assert "FELL_BACK" in out
+
+
+def test_the_model_keyword_spelling_compiles_the_function():
+    """`torch.compile(model = fn)` is the signature's own spelling of `(fn)`.
+
+    Left in `kwargs` it is not the positional function, so the funnel handed back
+    the undecorated `decorate` and then, when the caller called that, compiled its
+    first ARGUMENT: `torch_compile(model = fn)(tensor)` returned the tensor.
+    """
+    _run_with_compile_enabled("""
+        import torch
+        from unsloth_zoo.temporary_patches import common as C
+
+        def eager(x): return x + 1
+
+        for name in ("torch_compile", "_torch_compile"):
+            for kwargs in ({}, {"fullgraph": True, "dynamic": True}):
+                out = getattr(C, name)(model = eager, **kwargs)
+                assert out is not eager, f"{name} {kwargs} returned the eager function"
+                assert getattr(out, "__wrapped__", None) is eager \\
+                    or getattr(out, "_torchdynamo_orig_callable", None) is eager, (
+                    f"{name} {kwargs} did not compile the model keyword "
+                    f"(got {out!r})"
+                )
+        print("MODEL_KW_OK")
+    """)
 
 
 def test_a_working_compile_is_still_compiled():
