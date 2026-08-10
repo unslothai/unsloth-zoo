@@ -968,3 +968,48 @@ def test_fp32_loader_exceptions_apply_without_a_quantizer():
     assert upcast["norm"] == plain["norm"] * 2
     assert upcast["layers"] == plain["layers"]
     assert upcast[""] == plain[""] + plain["norm"]
+
+
+def test_fp32_exceptions_survive_a_transformers_that_only_takes_a_quantizer(monkeypatch):
+    """Signature support has to decide the ORDER, not just the arguments.
+
+    `transformers.integrations.accelerate.compute_module_sizes` is preferred and
+    takes only `hf_quantizer`, so on an unquantised model it cannot express the
+    fp32 loader exceptions at all. Returning its answer anyway dropped them and
+    charged an fp16 T5's `wo` half; the local environment happened not to ship
+    that implementation, so only the cross-platform runners caught it."""
+    import types
+
+    pytest.importorskip("accelerate")
+    calls = []
+
+    def quantizer_only(model, hf_quantizer = None, buffers_only = False, only_modules = True):
+        """Newer transformers: no dtype, no special_dtypes."""
+        calls.append("transformers")
+        sizes = {}
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+            parts = name.split(".")
+            for i in range(len(parts) + 1):
+                key = ".".join(parts[:i])
+                sizes[key] = sizes.get(key, 0) + tensor.numel() * tensor.element_size()
+        sizes.setdefault("", 0)
+        return sizes, {}
+
+    fake = types.ModuleType("transformers.integrations.accelerate")
+    fake.compute_module_sizes = quantizer_only
+    monkeypatch.setitem(sys.modules, "transformers.integrations.accelerate", fake)
+
+    class Cfg:
+        dtype = torch.float16
+
+    with torch.device("meta"):
+        model = _Tiny(hidden = 64, vocab = 512, layers = 4)
+    model.half()
+    model.config = Cfg()
+    plain = _compute_module_sizes(model)
+    model._keep_in_fp32_modules = ["norm"]
+    upcast = _compute_module_sizes(model)
+
+    assert calls, "the preferred implementation should still be tried first"
+    assert upcast["norm"] == plain["norm"] * 2
+    assert upcast["layers"] == plain["layers"]
