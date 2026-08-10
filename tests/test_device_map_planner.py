@@ -32,6 +32,8 @@ from unsloth_zoo.device_map_planner import (
     DeviceMapInfeasible,
     _auto_class_for,
     _compute_module_sizes,
+    _from_config_remote_aware,
+    _split_units,
     logit_headroom_bytes,
     plan_device_map,
     resolve_head_width,
@@ -579,3 +581,98 @@ def test_every_shared_parameter_is_co_located():
         activation_reserve_bytes = 0,
     )
     assert plan.device_map["projA"] == plan.device_map["projB"]
+
+
+def test_reported_budgets_cover_the_pinned_head_weights():
+    """`budgets` means "budget available to weights after every reserve", and
+    `weight_bytes` counts the pinned head units, so the head device must not be
+    reported holding more weight than its own budget allows."""
+    model = _meta(tie = True)
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
+    for device, budget in plan.budgets.items():
+        assert plan.weight_bytes[device] <= budget, (device, plan.describe())
+    assert plan.budgets[plan.head_device] <= plan.raw_budgets[plan.head_device]
+
+
+class _OwnStateBlock(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(hidden))
+        self.mlp = nn.Linear(hidden, hidden, bias = False)
+
+
+class _OwnState(nn.Module):
+    _no_split_modules = []
+
+    def __init__(self, hidden = 64, vocab = 512):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.layers = nn.ModuleList([_OwnStateBlock(hidden) for _ in range(4)])
+        self.lm_head = nn.Linear(hidden, vocab, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_directly_owned_tensors_use_the_quantizer_aware_sizes():
+    """A composite module's own parameters were measured with the live tensor's
+    `element_size()`, which is exactly the number the quantiser-aware table
+    exists to replace: the units then stop summing to the total and the planner
+    refuses a model that fits (or overcommits one that does not)."""
+    with torch.device("meta"):
+        model = _OwnState()
+    # A quantiser that halves every parameter, the shape of a 4-bit checkpoint
+    # whose meta tensors still report the unpacked float32 size.
+    sizes = {k: v // 2 for k, v in _compute_module_sizes(model).items()}
+    units = _split_units(model, [], sizes)
+    assert sum(size for _, size in units) == sizes[""]
+    own = dict(units)["layers.0"]
+    assert own == sizes["layers.0"] - sizes["layers.0.mlp"]
+
+
+def test_remote_code_construction_gets_the_hub_options(monkeypatch):
+    """Resolving a dynamic model class is a second Hub lookup. Handing the Hub
+    options to `from_config` is not an option -- it forwards leftovers to
+    `cls(config, **kwargs)`, so `token=...` is a TypeError on every ordinary
+    checkpoint -- so the class is resolved explicitly instead."""
+    import transformers.dynamic_module_utils as dyn
+
+    seen = {}
+
+    class _Remote:
+        @classmethod
+        def _from_config(cls, config):
+            return "remote-model"
+
+    def fake_get_class(class_reference, repo, **kwargs):
+        seen["ref"] = (class_reference, repo)
+        seen["kwargs"] = kwargs
+        return _Remote
+
+    monkeypatch.setattr(dyn, "get_class_from_dynamic_module", fake_get_class)
+
+    class Cfg:
+        auto_map = {"AutoModelForCausalLM": "org/repo--modeling_x.XForCausalLM"}
+        _name_or_path = "org/repo"
+
+    class AutoModelForCausalLM:
+        @staticmethod
+        def from_config(config, **kwargs):
+            seen["fallback"] = kwargs
+            return "auto-model"
+
+    out = _from_config_remote_aware(
+        AutoModelForCausalLM, Cfg(),
+        {"trust_remote_code": True, "token": "t", "code_revision": "abc", "dtype": "bfloat16"},
+    )
+    assert out == "remote-model"
+    assert seen["ref"] == ("modeling_x.XForCausalLM", "org/repo")
+    assert seen["kwargs"] == {"token": "t", "code_revision": "abc"}
+    assert "fallback" not in seen
+
+    # No auto_map entry, or no Hub options to carry: plain from_config.
+    class Plain:
+        auto_map = {}
+
+    assert _from_config_remote_aware(AutoModelForCausalLM, Plain(), {"token": "t"}) == "auto-model"
+    assert seen["fallback"] == {"trust_remote_code": True}

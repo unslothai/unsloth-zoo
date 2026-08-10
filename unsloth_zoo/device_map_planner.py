@@ -121,7 +121,9 @@ Nothing here is specific to one architecture:
 * the head comes from ``model.get_output_embeddings()`` resolved back to its
   module name by identity,
 * tied embeddings are detected from the config *and* by parameter identity, and
-  the tied input embedding is pinned to the head's device,
+  the tied input embedding is pinned to the head's device; any other group of
+  modules sharing a parameter is placed as one unit, since the size table counts
+  a shared tensor once,
 * vision towers / multimodal projectors / final norms are just ordinary split
   units and are placed by the same greedy walk.
 """
@@ -129,9 +131,8 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
-import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -222,7 +223,7 @@ class DeviceMapPlan:
     budgets: dict[int, int]
     """Per-device budget actually available to weights (after every reserve)."""
     raw_budgets: dict[int, int]
-    """Per-device budget as requested by the caller, before any reserve."""
+    """Per-device budget before any reserve, after the quantiser's own haircut."""
     weight_bytes: dict[int, int]
     activation_reserve_bytes: int
     total_weight_bytes: int
@@ -587,7 +588,18 @@ def _split_units(
         # to travel with the module itself, so keep them as their own unit.
         own_tensors = list(module.named_parameters(recurse=False)) + \
                       list(module.named_buffers(recurse=False))
-        own = sum(t.numel() * t.element_size() for _, t in own_tensors)
+        # Size direct state from the same quantiser-aware table as everything
+        # else, by subtracting the children from the subtree. `element_size()` on
+        # the live tensor is the number this module exists to avoid: a
+        # preprocessed meta `Params4bit` reports the full unpacked shape in
+        # float32, so the units would stop summing to `total_weight_bytes` and
+        # the planner would refuse a model that fits (or overcommit one that
+        # does not).
+        child_bytes = sum(
+            sizes.get(f"{prefix}.{child_name}" if prefix else child_name, 0)
+            for child_name, _ in children
+        )
+        own = max(0, size - child_bytes) if own_tensors else 0
         if own and prefix:
             units.append((prefix, own))
         elif own:
@@ -602,7 +614,9 @@ def _split_units(
             # raises, so a model with a root-level scale or bias could not be
             # planned at all.
             for tensor_name, tensor in own_tensors:
-                units.append((tensor_name, tensor.numel() * tensor.element_size()))
+                units.append((tensor_name, sizes.get(
+                    tensor_name, tensor.numel() * tensor.element_size()
+                )))
         for child_name, child in children:
             walk(f"{prefix}.{child_name}" if prefix else child_name, child)
 
@@ -932,7 +946,14 @@ def plan_device_map(
             assign[p] = head_device
             used[head_device] += unit_size[p]
         weight_bytes = {d: used[d] for d in devices}
-        return assign, weight_bytes, {d: budget[d] for d in devices}
+        # `budget` is the *remaining* capacity the packing walks were allowed to
+        # use, so the head device has already paid for the pinned units. The
+        # public field means "budget available to weights after every reserve"
+        # and `weight_bytes` counts those same pinned units, so hand the pinned
+        # bytes back or the head device reports weights above its own budget.
+        public_budgets = {d: budget[d] for d in devices}
+        public_budgets[head_device] += pinned_bytes
+        return assign, weight_bytes, public_budgets
 
     def _walk_in_order(free, budget):
         used = dict.fromkeys(devices, 0)
@@ -1116,8 +1137,8 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         # the same Hub repo and `from_config` only fetches it when it is allowed
         # to, so without this a remote-code checkpoint raises instead of
         # honouring the option the caller already passed.
-        model = auto_cls.from_config(config, trust_remote_code=True) if trust_remote_code \
-            else auto_cls.from_config(config)
+        model = _from_config_remote_aware(auto_cls, config, from_pretrained_kwargs) \
+            if trust_remote_code else auto_cls.from_config(config)
     model.eval()
     if hf_quantizer is not None:
         # Swap in the quantised Linear classes so the size table matches the
@@ -1127,6 +1148,44 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         except Exception:
             pass
     return model, hf_quantizer, config
+
+
+_HUB_KWARGS = (
+    "cache_dir", "force_download", "proxies", "token", "revision",
+    "local_files_only", "code_revision", "repo_type",
+)
+
+
+def _from_config_remote_aware(auto_cls: Any, config: Any, from_pretrained_kwargs: Mapping[str, Any]):
+    """``from_config`` for a remote-code checkpoint, with the Hub options applied.
+
+    Resolving a dynamic model class is a second Hub lookup, and the config's own
+    options do not travel with it: a private repo then fails to authenticate,
+    ``code_revision`` is ignored and ``local_files_only`` is violated.
+
+    They cannot simply be handed to ``from_config``. It forwards its leftover
+    kwargs to ``_from_config``, which passes them straight to ``cls(config,
+    **kwargs)``, and a model ``__init__`` takes the config alone -- so
+    ``token=...`` there is a ``TypeError`` on every ordinary checkpoint. Resolve
+    the class explicitly instead, and fall back to plain ``from_config`` for
+    anything that is not a dynamic class.
+    """
+    hub_kwargs = {k: from_pretrained_kwargs[k] for k in _HUB_KWARGS
+                  if k in from_pretrained_kwargs}
+    auto_map = getattr(config, "auto_map", None)
+    class_ref = auto_map.get(auto_cls.__name__) if isinstance(auto_map, Mapping) else None
+    if class_ref and hub_kwargs:
+        try:
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+            repo_id, _, ref = class_ref.rpartition("--")
+            model_cls = get_class_from_dynamic_module(
+                ref, repo_id or config._name_or_path, **hub_kwargs
+            )
+            return model_cls._from_config(config)
+        except Exception:
+            pass
+    return auto_cls.from_config(config, trust_remote_code=True)
 
 
 def _auto_class_for(config: Any, trust_remote_code: bool = False):
