@@ -457,12 +457,23 @@ def _quantized_size_kwargs(model: nn.Module, hf_quantizer: Any) -> dict[str, Any
     full unpacked shape in float32, so measuring the modules directly reports a
     4-bit checkpoint at roughly four times its real size, and the planner then
     refuses or badly partitions exactly the quantised models it exists for.
+
+    The fp32 exceptions apply with no quantiser at all: an fp16 checkpoint whose
+    class declares ``_keep_in_fp32_modules`` (the T5 family keeps ``wo`` that
+    way) has those tensors loaded as float32 while the meta model still holds
+    them in the config dtype, so without this the planner charges half.
     """
-    if hf_quantizer is None:
-        return {}
     dtype = _model_dtype(model)
     if dtype is None:
         return {}
+    fp32_modules = _keep_in_fp32_modules(model, hf_quantizer)
+    fp32_dtypes = {
+        name: torch.float32
+        for name, _ in model.named_parameters()
+        if any(m in name for m in fp32_modules)
+    } if fp32_modules else {}
+    if hf_quantizer is None:
+        return {"dtype": dtype, "special_dtypes": fp32_dtypes} if fp32_dtypes else {}
     kwargs: dict[str, Any] = {}
     adjust = getattr(hf_quantizer, "adjust_target_dtype", None)
     if callable(adjust):
@@ -628,7 +639,15 @@ def _split_units(
     units: list[tuple[str, int]] = []
 
     def walk(prefix: str, module: nn.Module) -> None:
-        children = list(module.named_children())
+        # `_modules`, not `named_children()`: that helper drops repeated
+        # registrations of the SAME object, so `nn.ModuleList([block] * n)`
+        # yields one name and the aliases never become placement units. The
+        # coverage check enumerates parameters with `remove_duplicate=False`, so
+        # the missing aliases were then reported as an internal failure on a
+        # model that fits. Sizing counts the shared tensors once, so an alias
+        # unit is zero bytes, and the tied-parameter grouping below co-locates
+        # it with the name that carries the weight.
+        children = [(n, m) for n, m in module._modules.items() if m is not None]
         size = sizes.get(prefix, 0)
         if prefix and (type(module).__name__ in no_split or not children or size == 0):
             units.append((prefix, size))
@@ -997,7 +1016,7 @@ def plan_device_map(
         budget[head_device] -= pinned_bytes
         if any(b < 0 for b in budget.values()):
             return None
-        used, assign = _walk_in_order(free_groups, budget)
+        used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
             # The in-order walk is next-fit with a first-fit rescue, and neither
             # backtracks, so it can run out of room while a valid assignment
@@ -1032,14 +1051,22 @@ def plan_device_map(
         public_budgets[head_device] += pinned_bytes
         return assign, weight_bytes, public_budgets, kept
 
-    def _walk_in_order(free, budget):
+    def _walk_in_order(free, budget, head_device: int):
+        # `head_max` means "push as much weight off the head's card as possible".
+        # Walking plain device order defeats that whenever the head is not the
+        # last device -- `prefer_head_device = 0`, or a higher-index candidate
+        # that could not hold the pinned head -- because the walk then fills the
+        # head's card first and leaves the later GPUs empty.
+        order = devices
+        if free_space_policy == "head_max":
+            order = [d for d in devices if d != head_device] + [head_device]
         used = dict.fromkeys(devices, 0)
         assign: dict[str, int] = {}
         cursor = 0
         for names, size in free:
             placed = False
-            while cursor < len(devices):
-                d = devices[cursor]
+            while cursor < len(order):
+                d = order[cursor]
                 if used[d] + size <= budget[d]:
                     assign.update(dict.fromkeys(names, d))
                     used[d] += size
@@ -1049,7 +1076,7 @@ def plan_device_map(
             if not placed:
                 # Sequential cursor exhausted: try any earlier device that still
                 # has room rather than falling off to CPU.
-                for d in devices:
+                for d in order:
                     if used[d] + size <= budget[d]:
                         assign.update(dict.fromkeys(names, d))
                         used[d] += size
@@ -1143,7 +1170,8 @@ def plan_device_map(
             chosen = cand
             break
     if result is None:
-        slack = sum(raw_budgets.values()) - total - activation_reserve_bytes * len(devices)
+        reserved_total = sum(reserve.values())
+        slack = sum(raw_budgets.values()) - total - reserved_total
         raise DeviceMapInfeasible(
             "Cannot place the model and keep "
             f"{headroom / _GiB:.3f} GiB free on the output head's device.\n"
@@ -1151,7 +1179,9 @@ def plan_device_map(
             f"  budgets                 : "
             + ", ".join(f"cuda:{d}={raw_budgets[d] / _GiB:.2f} GiB" for d in devices)
             + "\n"
-            f"  per-device act. reserve : {activation_reserve_bytes / _GiB:.3f} GiB\n"
+            "  per-device act. reserve : "
+            + ", ".join(f"cuda:{d}={reserve[d] / _GiB:.3f} GiB" for d in devices)
+            + f" ({reserved_total / _GiB:.3f} GiB total)\n"
             f"  slack after weights     : {slack / _GiB:.3f} GiB\n"
             f"  head headroom needed    : {headroom / _GiB:.3f} GiB\n"
             "Reduce rows_per_chunk, reduce retained_rows (run the log-softmax under "

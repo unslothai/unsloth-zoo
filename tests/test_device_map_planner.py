@@ -885,3 +885,86 @@ def test_the_plan_reports_the_reserve_each_device_kept():
         head_extra = plan.headroom_bytes if device == plan.head_device else 0
         assert plan.weight_bytes[device] + kept + head_extra <= plan.raw_budgets[device]
     assert "1.000 GiB" in plan.describe()
+
+
+class _SharedLayerStack(nn.Module):
+    """The same block object registered under several names."""
+
+    def __init__(self, hidden = 64, vocab = 512):
+        super().__init__()
+        block = _Block(hidden)
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.layers = nn.ModuleList([block] * 4)
+        self.lm_head = nn.Linear(hidden, vocab, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_repeated_module_registrations_are_planned():
+    """`named_children()` drops repeated registrations of the same object, so
+    the aliases never became placement units while the coverage check still
+    enumerated them, and a model that fits was reported as an internal error."""
+    with torch.device("meta"):
+        model = _SharedLayerStack()
+    assert len(model.layers) == 4
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
+    for name, _ in model.named_parameters(remove_duplicate = False):
+        assert any(name == k or name.startswith(k + ".") for k in plan.device_map), name
+    # One shared object, so every alias has to land on the same device.
+    assert len({plan.device_map[f"layers.{i}"] for i in range(4)}) == 1
+
+
+def test_infeasible_reports_each_devices_reserve():
+    """The message promises exact numbers, so a per-device mapping cannot be
+    collapsed to its maximum and multiplied by the device count: 1 GiB and
+    3 GiB reserved is 4 GiB, not 6 GiB."""
+    model = _meta(hidden = 256, vocab = 4096, layers = 16)
+    with pytest.raises(DeviceMapInfeasible) as excinfo:
+        plan_device_map(
+            model,
+            max_memory = {0: "2GiB", 1: "2GiB"},
+            headroom_bytes = 8 * _GiB,
+            activation_reserve_bytes = {0: 1 * _GiB, 1: 3 * _GiB},
+        )
+    message = str(excinfo.value)
+    assert "cuda:0=1.000 GiB, cuda:1=3.000 GiB" in message
+    assert "(4.000 GiB total)" in message
+
+
+def test_head_max_fills_the_other_cards_before_a_low_index_head():
+    """`head_max` exists to push weight off the head's card. Walking plain
+    device order filled the head's own card first whenever the head was not the
+    last device."""
+    model = _meta(layers = 8)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: "8GiB", 1: "8GiB"},
+        free_space_policy = "head_max",
+        prefer_head_device = 0,
+    )
+    assert plan.head_device == 0
+    assert plan.weight_bytes[1] > 0
+    assert plan.weight_bytes[1] >= plan.weight_bytes[0]
+
+
+def test_fp32_loader_exceptions_apply_without_a_quantizer():
+    """An fp16 checkpoint whose class declares `_keep_in_fp32_modules` (the T5
+    family keeps `wo` that way) has those tensors loaded as float32, while the
+    meta model still holds them in the config dtype."""
+    pytest.importorskip("accelerate")
+
+    class Cfg:
+        dtype = torch.float16
+
+    with torch.device("meta"):
+        model = _Tiny(hidden = 64, vocab = 512, layers = 4)
+    model.half()
+    model.config = Cfg()
+    plain = _compute_module_sizes(model)
+    model._keep_in_fp32_modules = ["norm"]
+    upcast = _compute_module_sizes(model)
+    # The norm doubles from float16 to float32; nothing else moves.
+    assert upcast["norm"] == plain["norm"] * 2
+    assert upcast["layers"] == plain["layers"]
+    assert upcast[""] == plain[""] + plain["norm"]
