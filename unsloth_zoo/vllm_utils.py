@@ -2063,6 +2063,32 @@ _EXPANDABLE_SEGMENTS_MARKERS = (
     "expandable_segments are not compatible",
 )
 
+# vLLM profiles memory by taking a free-VRAM snapshot, running a dummy forward
+# pass, and taking a second snapshot. It then asserts free memory went *down*:
+#
+#   assert self.init_snapshot.free_memory > free_gpu_memory, (
+#       "Error in memory profiling. "
+#       f"Initial free memory {...} GiB, current free memory {...} GiB. ...")
+#
+# (vllm/v1/worker/gpu_worker.py, and the same opening phrase in xpu_worker.py
+# with a different second half). It fires when *another* tenant on a shared GPU
+# frees memory mid-profile, so free memory rises. That is a transient race, not
+# an out of memory condition: the load usually succeeds when simply repeated.
+#
+# The marker has to be checked before the out of memory markers, because the
+# message quotes "free memory" twice and would otherwise be reported as an OOM
+# and answered with three fixes that cannot help. The opening phrase is the
+# distinctive part, so match on that alone; the rest of the sentence differs
+# between the CUDA and XPU workers and across vLLM versions.
+_MEMORY_PROFILING_RACE_MARKERS = (
+    "error in memory profiling",
+)
+
+# How many times to reload after a profiling race. The race is timing dependent
+# and clears on its own, so unlike a real OOM there is nothing to tune between
+# attempts and repeating the identical load is the whole remedy.
+_MEMORY_PROFILING_RACE_MAX_TRIALS = 3
+
 # Genuine out of memory signatures. Deliberately specific: a bare "alloc" or
 # "memory" substring also matches allocator *configuration* errors (which carry
 # words like PYTORCH_CUDA_ALLOC_CONF or "memory pool") and would mislabel them.
@@ -2072,6 +2098,11 @@ _OUT_OF_MEMORY_MARKERS = (
     "insufficient memory",
     "not enough memory",
     "no available memory",
+    # Kept on purpose. vLLM's real startup shortfall (v1/worker/utils.py) reads
+    # "Free memory on device (78.68/79.15 GiB) on startup is less than desired
+    # GPU memory utilization ...", and nothing else in it says "out of memory".
+    # The profiling race quotes the same words, so it is excluded by name below
+    # rather than by weakening this marker.
     "free memory",
     "available kv cache memory",
     "kv cache is needed",
@@ -2086,10 +2117,25 @@ _OUT_OF_MEMORY_MARKERS = (
 )
 
 
+def _is_memory_profiling_race_error(error_text):
+    # Another process on a shared GPU freed memory while vLLM was profiling.
+    # Transient, and retryable by repeating the identical load.
+    error_text = str(error_text).lower()
+    return any(marker in error_text for marker in _MEMORY_PROFILING_RACE_MARKERS)
+
+
 def _is_out_of_memory_error(error_text):
     # A real out of memory condition, as opposed to anything that merely
     # contains the letters "alloc" or the word "memory".
     error_text = str(error_text).lower()
+    # The profiling race wins over the out of memory markers, the opposite of
+    # the precedence used for the expandable segments clash below. The rule in
+    # both cases is that the more specific phrase decides: torch's OOM text only
+    # *suggests* expandable segments, so OOM wins there, whereas "Error in
+    # memory profiling" is emitted by exactly one assert and can only ever mean
+    # the race, however much free memory arithmetic it happens to quote.
+    if _is_memory_profiling_race_error(error_text):
+        return False
     return any(marker in error_text for marker in _OUT_OF_MEMORY_MARKERS)
 
 
@@ -2140,6 +2186,44 @@ def _expandable_segments_standby_message(error):
         f"`os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''` (`PYTORCH_HIP_ALLOC_CONF` on AMD ROCm, "
         f"`PYTORCH_ALLOC_CONF` on torch >= 2.10)\n"
         f"  3. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+        f"Original error: {error}"
+    )
+
+
+def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = False):
+    # Deliberately none of the out of memory advice. Free VRAM went *up* during
+    # profiling, so there was never a shortage: a smaller model, 4bit weights or
+    # a lower gpu_memory_utilization change nothing about the assert, which only
+    # compares two free-memory snapshots taken around the profiling forward pass.
+    attempts = ""
+    if trials > 1:
+        attempts = f"Unsloth already tried loading {trials} times.\n"
+    standby_note = ""
+    if unsloth_vllm_standby:
+        # Standby keeps weights inside vLLM's CuMemAllocator, a process wide
+        # singleton, and Unsloth runs the engine in this same process
+        # (VLLM_ENABLE_V1_MULTIPROCESSING=0), so the failed attempt's pool is
+        # still live here and reloading on top of it is not safe. A fresh
+        # process is the reliable retry.
+        standby_note = (
+            "Standby mode is on, so Unsloth cannot safely reload inside this process: "
+            "vLLM's CuMemAllocator is a process wide singleton that still holds the failed "
+            "attempt's weights. Re-run the script, or restart the notebook kernel, and load again.\n"
+        )
+    return (
+        f"Unsloth: vLLM could not finish memory profiling because another process sharing this GPU "
+        f"released memory while vLLM was measuring it.\n"
+        f"This is a transient race on a shared GPU, NOT an out of memory error. Free VRAM went up "
+        f"during profiling rather than down, so lowering `gpu_memory_utilization`, using 4bit or "
+        f"picking a smaller model will not help.\n"
+        f"{attempts}"
+        f"{standby_note}"
+        f"Try one of these fixes:\n"
+        f"  1. Load the model again. The race is timing dependent and usually clears by itself\n"
+        f"  2. Load when the GPU is not shared, for example by pinning one to this process with "
+        f"CUDA_VISIBLE_DEVICES\n"
+        f"  3. Skip profiling altogether by fixing the KV cache size, for example "
+        f"kv_cache_memory_bytes=64_000_000_000\n"
         f"Original error: {error}"
     )
 
@@ -2755,6 +2839,7 @@ def load_vllm(
 
     # Keep trying until success (2 times)
     trials = 0
+    race_trials = 0
     while True:
         try:
             if use_async:
@@ -2766,7 +2851,6 @@ def load_vllm(
             pass
             break
         except Exception as error:
-            trials += 1
             # Cleanup
             for _ in range(3):
                 gc.collect()
@@ -2781,6 +2865,31 @@ def load_vllm(
             # reported it as an OOM and sent users to fixes that cannot work.
             if _is_expandable_segments_error(error):
                 raise RuntimeError(_expandable_segments_standby_message(error))
+            # A profiling race is transient: another tenant on this GPU freed
+            # memory mid-profile. Retry the *identical* load rather than falling
+            # through to the generic "memory" branch below, which would shrink
+            # gpu_memory_utilization and max_num_seqs for the rest of the run
+            # even though neither had anything to do with the failure. Standby
+            # is excluded from the in-process retry because CuMemAllocator is a
+            # singleton and the engine runs in this process, so a second load
+            # would stack on the failed attempt's pool. It is counted separately
+            # from `trials` so a race does not spend the budget below: a race
+            # followed by a genuine OOM must still get its shrink-and-retry.
+            if _is_memory_profiling_race_error(error):
+                race_trials += 1
+                if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                    print(
+                        f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
+                        f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                        f"Error:\n{error}"
+                    )
+                    continue
+                raise RuntimeError(_memory_profiling_race_message(
+                    error,
+                    trials = race_trials,
+                    unsloth_vllm_standby = unsloth_vllm_standby,
+                ))
+            trials += 1
             if trials >= 2 or unsloth_vllm_standby:
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
