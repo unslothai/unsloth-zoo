@@ -2,17 +2,18 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Head-aware multi-GPU device map planner.
 
 Why this exists
@@ -149,6 +150,10 @@ _GiB = 1024 ** 3
 
 class DeviceMapInfeasible(RuntimeError):
     """The model plus the requested head headroom does not fit on the GPUs."""
+
+
+class _SearchExhausted(Exception):
+    """Internal: the bounded exact-packing search hit its node budget."""
 
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +494,71 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
     return sizes
 
 
+def _adjust_budgets_for_quantizer(
+    raw_budgets: Mapping[int, int], hf_quantizer: Any
+) -> tuple[dict[int, int], str | None]:
+    """Apply the quantiser's own budget haircut, exactly as transformers does.
+
+    ``transformers.modeling_utils._get_device_map`` runs
+    ``hf_quantizer.adjust_max_memory(max_memory)`` before it infers a device map,
+    and the bitsandbytes quantisers hold back 10% of every budget for the buffers
+    they allocate while quantising. An explicit device map skips that whole path,
+    so without this the planner hands out memory the loader still needs and a plan
+    that measured as feasible OOMs while the checkpoint loads.
+
+    Only ever lowers a budget: a quantiser that hands back more than was asked for
+    cannot talk the planner into overcommitting a card.
+    """
+    budgets = dict(raw_budgets)
+    adjust = getattr(hf_quantizer, "adjust_max_memory", None)
+    if not callable(adjust):
+        return budgets, None
+    try:
+        adjusted = adjust(dict(raw_budgets))
+    except Exception:
+        return budgets, None
+    if not isinstance(adjusted, Mapping):
+        return budgets, None
+    lowered: list[int] = []
+    for d in raw_budgets:
+        if d not in adjusted:
+            continue
+        try:
+            value = _parse_size(adjusted[d])
+        except (TypeError, ValueError):
+            continue
+        value = min(int(value), raw_budgets[d])
+        if value < budgets[d]:
+            budgets[d] = value
+            lowered.append(d)
+    if not lowered:
+        return budgets, None
+    note = (
+        f"{type(hf_quantizer).__name__}.adjust_max_memory lowered the budget on "
+        + ", ".join(
+            f"cuda:{d} {raw_budgets[d] / _GiB:.3f} -> {budgets[d] / _GiB:.3f} GiB"
+            for d in sorted(lowered)
+        )
+        + " (memory the quantiser keeps for its own load-time buffers)"
+    )
+    return budgets, note
+
+
+def _tied_parameter_groups(model: nn.Module) -> list[list[str]]:
+    """Names of every tensor that is one shared object under several names.
+
+    ``compute_module_sizes`` counts a shared tensor once, so two modules that
+    share a parameter are only correctly sized when they land on the same device.
+    Grouping by object identity (rather than ``data_ptr``) is what makes this work
+    on a meta model, where every tensor reports the same null pointer.
+    """
+    by_object: dict[int, list[str]] = {}
+    for name, tensor in list(model.named_parameters(remove_duplicate=False)) + \
+                        list(model.named_buffers(remove_duplicate=False)):
+        by_object.setdefault(id(tensor), []).append(name)
+    return [names for names in by_object.values() if len(names) > 1]
+
+
 def _split_units(
     model: nn.Module,
     no_split_classes: Sequence[str],
@@ -605,7 +675,9 @@ def plan_device_map(
             which maximises head free space but can starve GPU 0.
         hf_quantizer: pass the model's ``HfQuantizer`` so quantised sizes are
             exact.
-        no_split_module_classes: override the detected block classes.
+        no_split_module_classes: override the detected block classes. ``[]``
+            removes every no-split constraint, so blocks may be split at their
+            children; ``None`` (default) detects the classes from the model.
         prefer_head_device: force the head onto this device index.
 
     Returns:
@@ -619,6 +691,8 @@ def plan_device_map(
     if len(devices) < 2:
         return None
 
+    notes: list[str] = []
+
     raw_budgets: dict[int, int] = {}
     for d in devices:
         if max_memory is not None:
@@ -627,8 +701,16 @@ def plan_device_map(
         else:
             free, _total = torch.cuda.mem_get_info(d)
             raw_budgets[d] = int(free)
+    raw_budgets, quantizer_note = _adjust_budgets_for_quantizer(raw_budgets, hf_quantizer)
+    if quantizer_note is not None:
+        notes.append(quantizer_note)
 
-    no_split = list(no_split_module_classes) if no_split_module_classes else resolve_no_split_classes(model)
+    # `[]` is a real override -- "split anywhere, no block is atomic" -- and is
+    # not the same request as `None`, which means "detect the block classes".
+    no_split = (
+        list(no_split_module_classes) if no_split_module_classes is not None
+        else resolve_no_split_classes(model)
+    )
     sizes = _compute_module_sizes(model, hf_quantizer)
     units = _split_units(model, no_split, sizes)
     total = sizes.get("", sum(s for _, s in units))
@@ -661,8 +743,6 @@ def plan_device_map(
     if free_space_policy not in ("balanced", "head_max"):
         raise ValueError(f"free_space_policy must be 'balanced' or 'head_max', got {free_space_policy!r}")
 
-    notes: list[str] = []
-
     # Units that must travel with the head. Resolved BEFORE the reserve is
     # derived: the head's device pays for them on top of the headroom, so the
     # reserve cap below cannot be computed without knowing how big they are.
@@ -693,7 +773,67 @@ def plan_device_map(
     pinned = list(dict.fromkeys(
         u for p in pinned for u, _ in units if u == p or u.startswith(p + ".")
     ))
+
+    # Co-locate every group of units that shares a parameter, not just the
+    # input/output embedding pair. `compute_module_sizes` counts a shared tensor
+    # once, so splitting its owners across devices makes accelerate materialise a
+    # second copy that `weight_bytes` never accounted for, and a plan that
+    # measured as feasible OOMs during dispatch. Encoder/decoder models that tie
+    # `shared` to both embedding tables are the common case.
+    unit_names = [u for u, _ in units]
+    parent = {u: u for u in unit_names}
+
+    def _root(u: str) -> str:
+        while parent[u] != u:
+            parent[u] = parent[parent[u]]
+            u = parent[u]
+        return u
+
+    def _owning_unit(param_name: str) -> str | None:
+        best = None
+        for u in unit_names:
+            if (param_name == u or param_name.startswith(u + ".")) and \
+               (best is None or len(u) > len(best)):
+                best = u
+        return best
+
+    for shared_names in _tied_parameter_groups(model):
+        owners = list(dict.fromkeys(
+            u for u in (_owning_unit(n) for n in shared_names) if u is not None
+        ))
+        for other in owners[1:]:
+            a, b = _root(owners[0]), _root(other)
+            if a != b:
+                parent[a] = b
+
+    # A tied group that touches the head travels with the head; the rest just
+    # have to stay together.
+    pinned_roots = {_root(p) for p in pinned}
+    tied_with_head = [u for u in unit_names if u not in pinned and _root(u) in pinned_roots]
+    if tied_with_head:
+        pinned.extend(tied_with_head)
+        tied_to_head.extend(u for u in tied_with_head if u not in tied_to_head)
+        notes.append(
+            "tied parameters: " + ", ".join(tied_with_head) +
+            " share storage with the head's group and are pinned to its device"
+        )
     pinned_bytes = sum(unit_size[p] for p in pinned)
+
+    # Placement items: one per co-location group, in first-appearance order, so
+    # the walks below cannot separate units that share a tensor.
+    free_groups: list[tuple[tuple[str, ...], int]] = []
+    _group_index: dict[str, int] = {}
+    for name, size in units:
+        if name in pinned:
+            continue
+        root = _root(name)
+        if root in _group_index:
+            at = _group_index[root]
+            names, total_size = free_groups[at]
+            free_groups[at] = (names + (name,), total_size + size)
+        else:
+            _group_index[root] = len(free_groups)
+            free_groups.append(((name,), size))
 
     # A reserve the caller measured is a constraint; a reserve we guessed is a
     # heuristic. Only the guess may be relaxed to make a placement fit (see
@@ -766,8 +906,7 @@ def plan_device_map(
         budget[head_device] -= pinned_bytes
         if any(b < 0 for b in budget.values()):
             return None
-        free = [(name, size) for name, size in units if name not in pinned]
-        used, assign = _walk_in_order(free, budget)
+        used, assign = _walk_in_order(free_groups, budget)
         if used is None:
             # The in-order walk is next-fit with a first-fit rescue, and neither
             # backtracks, so it can run out of room while a valid assignment
@@ -780,7 +919,13 @@ def plan_device_map(
             # failed, so a plan that already worked is never rewritten: layout
             # in definition order keeps consecutive layers together, which
             # costs fewer cross-device hops than a size-sorted one.
-            used, assign = _best_fit(free, budget)
+            used, assign = _best_fit(free_groups, budget)
+        if used is None:
+            # Best-fit is not exact either: capacities 10 and 10 with units
+            # 6, 5, 3, 2, 2, 2 pack 6+3 and 5+2+2 and then reject the last 2,
+            # although 6+2+2 and 5+3+2 both fit. Last resort before refusing a
+            # model that demonstrably fits.
+            used, assign = _exact_fit(free_groups, budget)
         if used is None:
             return None
         for p in pinned:
@@ -793,12 +938,12 @@ def plan_device_map(
         used = dict.fromkeys(devices, 0)
         assign: dict[str, int] = {}
         cursor = 0
-        for name, size in free:
+        for names, size in free:
             placed = False
             while cursor < len(devices):
                 d = devices[cursor]
                 if used[d] + size <= budget[d]:
-                    assign[name] = d
+                    assign.update(dict.fromkeys(names, d))
                     used[d] += size
                     placed = True
                     break
@@ -808,7 +953,7 @@ def plan_device_map(
                 # has room rather than falling off to CPU.
                 for d in devices:
                     if used[d] + size <= budget[d]:
-                        assign[name] = d
+                        assign.update(dict.fromkeys(names, d))
                         used[d] += size
                         placed = True
                         break
@@ -820,15 +965,66 @@ def plan_device_map(
         """Largest unit first into the device it leaves least room on."""
         used = dict.fromkeys(devices, 0)
         assign: dict[str, int] = {}
-        for name, size in sorted(free, key=lambda item: -item[1]):
+        for names, size in sorted(free, key=lambda item: -item[1]):
             room = [(budget[d] - used[d] - size, d) for d in devices
                     if used[d] + size <= budget[d]]
             if not room:
                 return None, None
             _, d = min(room)
-            assign[name] = d
+            assign.update(dict.fromkeys(names, d))
             used[d] += size
         return used, assign
+
+    def _exact_fit(free, budget, node_budget=20000, max_units=512):
+        """Bounded depth-first packing, largest unit first.
+
+        Runs only after both heuristics have failed, so it can turn a refusal
+        into a plan and can never rewrite one that already worked. Two prunes
+        keep it cheap: at each depth a device whose remaining capacity was
+        already tried is skipped (interchangeable), and the whole search gives up
+        after ``node_budget`` placements rather than exploring an exponential
+        tree. Deep unit lists (a fine-grained ``no_split_module_classes = []``)
+        are left to the heuristics, which handle uniform units well.
+        """
+        order = sorted(free, key=lambda item: -item[1])
+        if not order or len(order) > max_units:
+            return None, None
+        if sum(size for _, size in order) > sum(budget[d] for d in devices):
+            return None, None
+        remaining = {d: budget[d] for d in devices}
+        assign: dict[str, int] = {}
+        visited = 0
+
+        def place(i: int) -> bool:
+            nonlocal visited
+            if i == len(order):
+                return True
+            visited += 1
+            if visited > node_budget:
+                raise _SearchExhausted
+            names, size = order[i]
+            tried: set[int] = set()
+            for d in devices:
+                room = remaining[d]
+                if size > room or room in tried:
+                    continue
+                tried.add(room)
+                remaining[d] -= size
+                assign.update(dict.fromkeys(names, d))
+                if place(i + 1):
+                    return True
+                remaining[d] += size
+                for n in names:
+                    assign.pop(n, None)
+            return False
+
+        try:
+            fitted = place(0)
+        except (_SearchExhausted, RecursionError):
+            return None, None
+        if not fitted:
+            return None, None
+        return {d: budget[d] - remaining[d] for d in devices}, assign
 
     if prefer_head_device is not None and prefer_head_device not in devices:
         # Otherwise the candidate loop below skips every option and the failure

@@ -440,3 +440,142 @@ def test_each_backend_is_called_with_the_arguments_it_accepts(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers.integrations.accelerate", fake2)
     assert _compute_module_sizes(model, Q())[""] == 5678
     assert seen["accelerate"][0] is torch.int8
+
+
+# --------------------------------------------------------------------------- #
+# budgets, packing and shared parameters
+# --------------------------------------------------------------------------- #
+_MiB = 1024 ** 2
+
+
+def test_quantizer_budget_haircut_is_applied():
+    """`transformers.modeling_utils._get_device_map` runs
+    `hf_quantizer.adjust_max_memory(...)` before it infers a device map, and the
+    bitsandbytes quantisers hold 10% of every budget back for the buffers they
+    allocate while quantising. An explicit map skips that path, so without this
+    the planner hands out memory the loader still needs."""
+
+    class Q:
+        def adjust_max_memory(self, max_memory):
+            return {k: v * 0.90 for k, v in max_memory.items()}
+
+    model = _meta()
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"}, hf_quantizer = Q())
+    assert plan.raw_budgets[0] == int(8 * _GiB * 0.90)
+    assert plan.raw_budgets[1] == int(8 * _GiB * 0.90)
+    assert any("adjust_max_memory" in n for n in plan.notes)
+
+    # A quantiser that asks for more must not talk the planner into overcommitting.
+    class Greedy:
+        def adjust_max_memory(self, max_memory):
+            return {k: v * 4 for k, v in max_memory.items()}
+
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"}, hf_quantizer = Greedy())
+    assert plan.raw_budgets == {0: 8 * _GiB, 1: 8 * _GiB}
+
+
+class _Uneven(nn.Module):
+    """Unit sizes 2, 2, 2, 3, 5, 6 MiB plus a 20 MiB head."""
+
+    def __init__(self):
+        super().__init__()
+        self.u1 = nn.Linear(256, 2048, bias = False)
+        self.u2 = nn.Linear(256, 2048, bias = False)
+        self.u3 = nn.Linear(256, 2048, bias = False)
+        self.u4 = nn.Linear(256, 3072, bias = False)
+        self.u5 = nn.Linear(256, 5120, bias = False)
+        self.u6 = nn.Linear(256, 6144, bias = False)
+        self.lm_head = nn.Linear(256, 20480, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_heterogeneous_units_are_packed_exactly():
+    """Both heuristics reject this one: the in-order walk builds 2+2+2+3 then
+    stalls, and best-fit packs 6+3 and 5+2+2 before rejecting the last 2, even
+    though 6+2+2 and 5+3+2 fill both cards exactly."""
+    with torch.device("meta"):
+        model = _Uneven()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 10 * _MiB, 1: 10 * _MiB, 2: 20 * _MiB},
+        headroom_bytes = 0,
+        activation_reserve_bytes = 0,
+    )
+    assert plan.device_map["lm_head"] == 2
+    for device, budget in plan.raw_budgets.items():
+        assert plan.weight_bytes[device] <= budget
+    for name, _ in model.named_parameters():
+        assert any(name == k or name.startswith(k + ".") for k in plan.device_map), name
+
+
+class _FatBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(256, 6144, bias = False)   # 6 MiB
+        self.b = nn.Linear(256, 6144, bias = False)   # 6 MiB
+
+
+class _FatBlockModel(nn.Module):
+    _no_split_modules = ["_FatBlock"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_FatBlock()])
+        self.lm_head = nn.Linear(256, 1024, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_empty_no_split_override_is_honoured():
+    """`[]` means "nothing is atomic, split anywhere" and is not the same
+    request as `None` ("detect the block classes"). A truthiness test threw the
+    override away, so a model whose whole block is larger than any single card
+    was reported infeasible even though its children fit."""
+    with torch.device("meta"):
+        model = _FatBlockModel()
+    budgets = {0: 7 * _MiB, 1: 7 * _MiB}
+    with pytest.raises(DeviceMapInfeasible):
+        plan_device_map(model, max_memory = budgets, headroom_bytes = 0,
+                        activation_reserve_bytes = 0)
+    plan = plan_device_map(model, max_memory = budgets, headroom_bytes = 0,
+                           activation_reserve_bytes = 0,
+                           no_split_module_classes = [])
+    assert plan.no_split_module_classes == []
+    assert plan.device_map["layers.0.a"] != plan.device_map["layers.0.b"]
+
+
+class _SharedProj(nn.Module):
+    """A parameter shared by two modules outside the embedding pair."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(1024, 256)
+        self.projA = nn.Linear(256, 4096, bias = False)
+        self.filler = nn.Linear(256, 4096, bias = False)
+        self.projB = nn.Linear(256, 4096, bias = False)
+        self.projB.weight = self.projA.weight
+        self.lm_head = nn.Linear(256, 1024, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+def test_every_shared_parameter_is_co_located():
+    """Module sizing counts a shared tensor once, so splitting its owners across
+    devices makes accelerate materialise a copy that `weight_bytes` never
+    accounted for and a "feasible" plan OOMs during dispatch."""
+    with torch.device("meta"):
+        model = _SharedProj()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 8 * _MiB, 1: 8 * _MiB},
+        headroom_bytes = 0,
+        activation_reserve_bytes = 0,
+    )
+    assert plan.device_map["projA"] == plan.device_map["projB"]
