@@ -342,3 +342,37 @@ def test_a_normal_config_is_unaffected_by_the_auto_map_branch():
                                             num_hidden_layers = 1, num_attention_heads = 1)
     assert _auto_class_for(cfg) is transformers.AutoModelForCausalLM
     assert _auto_class_for(cfg, trust_remote_code = True) is transformers.AutoModelForCausalLM
+
+
+class _BigHead(nn.Module):
+    """Four small blocks and an output head larger than half the weights."""
+    _no_split_modules = ["_Block"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_Block(32) for _ in range(4)])
+        self.output = nn.Linear(32, 256, bias = False)
+
+
+def test_a_model_that_trivially_fits_is_not_refused():
+    """The auto reserve is capped by the smallest budget less the headroom and
+    less the weight the head's device has to hold. Using only an average share
+    of the weights understates that whenever the pinned units are bigger than
+    the share, and since `attempt` relaxes the reserve on the OTHER cards only,
+    the head's budget stays negative and every step fails. Four 4 KiB blocks and
+    a 32 KiB head (share 24 KiB) were refused on 2 x 8 GiB."""
+    with torch.device("meta"):
+        model = _BigHead()
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
+    assert set(plan.device_map.values()) <= {0, 1}
+    assert plan.device_map["output"] == plan.head_device
+    for name, _ in list(model.named_parameters()) + list(model.named_buffers()):
+        assert any(name == k or name.startswith(k + ".") for k in plan.device_map), name
+
+
+def test_an_unusable_prefer_head_device_says_so():
+    """It used to fall through the candidate loop and report a memory
+    shortfall, which points at entirely the wrong problem."""
+    model = _meta()
+    with pytest.raises(ValueError, match = "prefer_head_device"):
+        plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"}, prefer_head_device = 7)

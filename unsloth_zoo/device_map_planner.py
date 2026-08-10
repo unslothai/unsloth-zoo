@@ -629,45 +629,10 @@ def plan_device_map(
         raise ValueError(f"free_space_policy must be 'balanced' or 'head_max', got {free_space_policy!r}")
 
     notes: list[str] = []
-    # A reserve the caller measured is a constraint; a reserve we guessed is a
-    # heuristic. Only the guess may be relaxed to make a placement fit (see
-    # `attempt`), otherwise a per-device mapping built from measurements -- the
-    # documented answer to the asymmetric-activation caveat above -- could be
-    # quietly reduced to zero and the run would OOM on a card the plan still
-    # claimed had the reserve free.
-    reserve_is_explicit = activation_reserve_bytes is not None
-    if activation_reserve_bytes is None:
-        if free_space_policy == "balanced":
-            # Give every device the same activation budget, then hand the head's
-            # device the logit headroom on top.
-            #
-            # This equal split is a heuristic and it is only right when the
-            # per-device activation demand is symmetric. It is NOT symmetric for
-            # a vision-LM whose GPU 0 also carries the vision tower, the input
-            # embedding and the generation KV cache: a measured GRPO step
-            # (4 x 640 completion tokens, a 30B 4-bit model, 2 x 14.56 GiB) OOMs on
-            # GPU 0 under the equal split while succeeding under accelerate's
-            # own layout. Pass a per-device mapping when you have measurements.
-            slack = sum(raw_budgets.values()) - total
-            activation_reserve_bytes = int(max(0, (slack - headroom) // len(devices)))
-            # The head's device pays the headroom on top of its share, so an
-            # equal split of the global slack can exceed that one device's own
-            # budget even when the totals fit. Cap by the smallest budget less
-            # the headroom and less that device's expected share of the weights,
-            # otherwise a model that trivially fits is refused.
-            share = -(-total // len(devices))
-            per_device_cap = min(raw_budgets.values()) - headroom - share
-            activation_reserve_bytes = int(max(0, min(activation_reserve_bytes, per_device_cap)))
-        else:
-            # Mirror accelerate: reserve the largest single placement unit.
-            activation_reserve_bytes = max((s for _, s in units), default=0)
-    if isinstance(activation_reserve_bytes, Mapping):
-        reserve = {d: _parse_size(activation_reserve_bytes.get(d, 0)) for d in devices}
-    else:
-        reserve = dict.fromkeys(devices, int(activation_reserve_bytes))
-    activation_reserve_bytes = max(reserve.values()) if reserve else 0
 
-    # Units that must travel with the head.
+    # Units that must travel with the head. Resolved BEFORE the reserve is
+    # derived: the head's device pays for them on top of the headroom, so the
+    # reserve cap below cannot be computed without knowing how big they are.
     pinned: list[str] = []
     if head_name is not None:
         pinned.append(head_name)
@@ -696,6 +661,51 @@ def plan_device_map(
         u for p in pinned for u, _ in units if u == p or u.startswith(p + ".")
     ))
     pinned_bytes = sum(unit_size[p] for p in pinned)
+
+    # A reserve the caller measured is a constraint; a reserve we guessed is a
+    # heuristic. Only the guess may be relaxed to make a placement fit (see
+    # `attempt`), otherwise a per-device mapping built from measurements -- the
+    # documented answer to the asymmetric-activation caveat above -- could be
+    # quietly reduced to zero and the run would OOM on a card the plan still
+    # claimed had the reserve free.
+    reserve_is_explicit = activation_reserve_bytes is not None
+    if activation_reserve_bytes is None:
+        if free_space_policy == "balanced":
+            # Give every device the same activation budget, then hand the head's
+            # device the logit headroom on top.
+            #
+            # This equal split is a heuristic and it is only right when the
+            # per-device activation demand is symmetric. It is NOT symmetric for
+            # a vision-LM whose GPU 0 also carries the vision tower, the input
+            # embedding and the generation KV cache: a measured GRPO step
+            # (4 x 640 completion tokens, a 30B 4-bit model, 2 x 14.56 GiB) OOMs on
+            # GPU 0 under the equal split while succeeding under accelerate's
+            # own layout. Pass a per-device mapping when you have measurements.
+            slack = sum(raw_budgets.values()) - total
+            activation_reserve_bytes = int(max(0, (slack - headroom) // len(devices)))
+            # The head's device pays the headroom on top of its share, so an
+            # equal split of the global slack can exceed that one device's own
+            # budget even when the totals fit. Cap by the smallest budget less
+            # the headroom and less the weight that device has to hold,
+            # otherwise a model that trivially fits is refused.
+            #
+            # That weight is at least the pinned units, which the head's device
+            # takes whole. An average share alone is not enough: `attempt` only
+            # relaxes the reserve on the OTHER cards, so once the head's budget
+            # goes negative every step fails and the plan is refused. A four-layer
+            # model whose head is larger than half the weights (share 24 KiB,
+            # head 32 KiB) was rejected on 2 x 8 GiB for exactly that reason.
+            share = max(-(-total // len(devices)), pinned_bytes)
+            per_device_cap = min(raw_budgets.values()) - headroom - share
+            activation_reserve_bytes = int(max(0, min(activation_reserve_bytes, per_device_cap)))
+        else:
+            # Mirror accelerate: reserve the largest single placement unit.
+            activation_reserve_bytes = max((s for _, s in units), default=0)
+    if isinstance(activation_reserve_bytes, Mapping):
+        reserve = {d: _parse_size(activation_reserve_bytes.get(d, 0)) for d in devices}
+    else:
+        reserve = dict.fromkeys(devices, int(activation_reserve_bytes))
+    activation_reserve_bytes = max(reserve.values()) if reserve else 0
 
     def attempt(head_device: int):
         """Try progressively smaller activation reserves on the non-head devices.
@@ -787,6 +797,14 @@ def plan_device_map(
             used[d] += size
         return used, assign
 
+    if prefer_head_device is not None and prefer_head_device not in devices:
+        # Otherwise the candidate loop below skips every option and the failure
+        # is reported as a memory shortfall, which sends the caller looking in
+        # entirely the wrong place.
+        raise ValueError(
+            f"prefer_head_device={prefer_head_device} is not one of the usable "
+            f"devices {devices}"
+        )
     order = [prefer_head_device] if prefer_head_device is not None else list(reversed(devices))
     result = None
     chosen = None
