@@ -26,6 +26,7 @@ __all__ = [
     "torch_compile",
     "_torch_compile",
     "_raw_torch_compile",
+    "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
     "publish_to_modeling_module",
@@ -177,6 +178,63 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
+def unwrap_already_compiled(function):
+    """Hand `torch.compile` the eager original when given an already-compiled one.
+
+    `torch.compile` builds its wrapper with `functools.wraps(fn)`, which copies
+    `fn.__dict__`, and then asserts the copy did not bring `get_compiler_config`
+    along:
+
+        torch/_dynamo/eval_frame.py: assert not hasattr(compile_wrapper, "get_compiler_config")
+
+    a bare assert, so it surfaces as `AssertionError:` with no message at all.
+    Dynamo unwraps its OWN wrappers before that point (`innermost_fn`), so the
+    assert can only be reached through a wrapper that carries
+    `get_compiler_config` without being a Dynamo wrapper. That is exactly what
+    `_fall_back_to_eager_on_recompile_limit` returns: it forwards
+    `get_compiler_config` and `_torchdynamo_orig_callable` on purpose, so that
+    "is this compiled?" checks keep answering yes after the fallback is
+    installed.
+
+    Up to torch 2.10 `innermost_fn` followed `_torchdynamo_orig_callable`
+    unconditionally and unwrapped those too, so recompiling one was harmless.
+    torch 2.11 additionally requires `_torchdynamo_wrapper_id == id(fn)`,
+    which a `functools.wraps` copy cannot satisfy by construction, and the
+    assert became reachable. Under GPT-OSS it is: the generated
+    `unsloth_compiled_module_gpt_oss.py` installs a fullgraph-fallback
+    `apply_rotary_pos_emb` onto the modeling module during `pre_compile`, and
+    `patch_GptOssAttention` re-compiles that same name during `post_compile`.
+
+    `patch_function` has always done this unwrap by hand before compiling.
+    Doing it in the shared funnel covers the bare decorators too. `__wrapped__`
+    is what `functools.wraps` sets, and it is the eager original for both the
+    fallback wrapper and a plain `torch.compile` result, so compiling it
+    reproduces the pre-2.11 outcome exactly rather than degrading to eager.
+    """
+    seen = set()
+    while callable(function) and hasattr(function, "get_compiler_config"):
+        # A bound method forwards attribute lookups to the function underneath it,
+        # so `__wrapped__` here is the UNBOUND original and following it would drop
+        # the receiver. torch's own `innermost_fn` stops on a bound method for that
+        # exact reason ("id(bound_method) != id(wrapper_function), so we won't
+        # unwrap through __func__ and lose the self binding").
+        if getattr(function, "__self__", None) is not None: break
+        inner = getattr(function, "__wrapped__", None)
+        # No `__wrapped__` (an OptimizedModule, say) or a cycle: leave it be and
+        # let the caller's guard deal with whatever torch makes of it.
+        if not callable(inner) or id(inner) in seen: break
+        seen.add(id(function))
+        function = inner
+    return function
+pass
+
+
+# Warn once per call site, not once per compile attempt: the temporary patches
+# re-run at every phase and for every model, so an unwarned repeat would print
+# the same line several times per load.
+_UNCOMPILED_CALL_SITES: set = set()
+
+
 def _compile_or_fall_back(*args, **kwargs):
     """`torch.compile`, routed through the eager fallback under fullgraph.
 
@@ -186,15 +244,54 @@ def _compile_or_fall_back(*args, **kwargs):
     exhaustion there stayed fatal while `patch_function`'s did not. Fixed here
     rather than per call site so a new one cannot miss it.
 
+    The same goes for the compile call itself. `fullgraph = False` used to go
+    straight to `torch.compile` with nothing around it, so a compiler that
+    refuses to decorate at all (see `unwrap_already_compiled`) took the whole
+    model load down. Decorating is the only thing guarded here: it either hands
+    back the compiled callable it always did, or, if torch declines to build
+    one, the eager function. Compilation itself still happens on the first
+    call, so a setup where compile works keeps working, at the same speed.
+
     Both spellings are in use: `@torch_compile(...)` as a decorator factory, and
     `torch_compile(fn, ...)` applied directly (gemma.py, gpt_oss.py). Imported
     lazily: utils imports this module."""
-    if not kwargs.get("fullgraph"):
-        return torch.compile(*args, **kwargs)
-    from .utils import torch_compile_with_fallback
-    decorate = torch_compile_with_fallback(**kwargs)
-    if args and callable(args[0]):
-        return decorate(args[0])
+    # `torch.compile`'s first parameter is named `model`, so `torch_compile(model = fn)`
+    # is a third legal spelling. Take it out of the compile kwargs, where it would
+    # collide with the function passed positionally, and treat it as that function.
+    # Popped whether or not it is callable: `torch_compile(model = None, ...)` is the
+    # decorator-factory spelling, and a `model` left behind collides with the function
+    # `_compile` passes positionally, which the guard below would then swallow as a
+    # refusal to compile.
+    function = args[0] if args and callable(args[0]) else None
+    if function is None and "model" in kwargs:
+        model = kwargs.pop("model")
+        if callable(model): function = model
+
+    if kwargs.get("fullgraph"):
+        from .utils import torch_compile_with_fallback
+        _compile = torch_compile_with_fallback(**kwargs)
+    else:
+        def _compile(function):
+            return torch.compile(function, **kwargs)
+
+    def decorate(function):
+        function = unwrap_already_compiled(function)
+        try:
+            return _compile(function)
+        except Exception as exception:
+            # Never fatal: a temporary patch that cannot be compiled is a
+            # performance problem, and the uncompiled function is still correct.
+            label = getattr(function, "__qualname__", None) or repr(function)
+            if label not in _UNCOMPILED_CALL_SITES:
+                _UNCOMPILED_CALL_SITES.add(label)
+                logger.warning(
+                    f"Unsloth: torch.compile refused to wrap {label}; running "
+                    f"it eagerly. Training and inference are unaffected apart "
+                    f"from speed. ({type(exception).__name__}: {exception})"
+                )
+            return function
+    if function is not None:
+        return decorate(function)
     return decorate
 
 
