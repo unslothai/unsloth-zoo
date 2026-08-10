@@ -852,3 +852,36 @@ def test_an_atomic_ancestor_of_the_head_is_pinned():
     )
     assert plan.head_module == "language_model.lm_head"
     assert plan.device_map["language_model"] == plan.head_device
+
+
+def test_logit_scaling_adds_one_chunk_buffer():
+    """`chunk_logits * logit_scale_multiply` and `/ logit_scale_divide` are both
+    out of place, so one more buffer of the chunk shape in the logit dtype is
+    live before the float32 copy."""
+    plain = logit_headroom_bytes(200000, 128, softcapped = False, safety_bytes = 0)
+    scaled = logit_headroom_bytes(200000, 128, softcapped = False, logit_scaled = True,
+                                  safety_bytes = 0)
+    s = torch.empty((), dtype = torch.bfloat16).element_size()
+    assert scaled - plain == 128 * 200000 * s
+
+    model = _meta()
+    budgets = {0: "8GiB", 1: "8GiB"}
+    assert (plan_device_map(model, max_memory = budgets, logit_scaled = True).headroom_bytes >
+            plan_device_map(model, max_memory = budgets).headroom_bytes)
+
+
+def test_the_plan_reports_the_reserve_each_device_kept():
+    """A per-device mapping is not one number, and the auto reserve is relaxed on
+    the non-head cards, so a single scalar promised headroom the accepted
+    packing had not kept."""
+    model = _meta()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: "8GiB", 1: "8GiB"},
+        activation_reserve_bytes = {0: 1 * _GiB, 1: 3 * _GiB},
+    )
+    assert plan.activation_reserve_by_device == {0: 1 * _GiB, 1: 3 * _GiB}
+    for device, kept in plan.activation_reserve_by_device.items():
+        head_extra = plan.headroom_bytes if device == plan.head_device else 0
+        assert plan.weight_bytes[device] + kept + head_extra <= plan.raw_budgets[device]
+    assert "1.000 GiB" in plan.describe()

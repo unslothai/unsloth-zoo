@@ -65,6 +65,7 @@ per-device mapping built from measurements instead of trusting the equal split.
 Formula (see :func:`logit_headroom_bytes`), with ``s = logit dtype itemsize``::
 
     per_chunk = rows_per_chunk * vocab * (s + 4)          # logits + float32 copy
+              + rows_per_chunk * vocab * s   if logit_scaled      # scaled copy
               + rows_per_chunk * vocab * s   if softcapped        # tanh temporary
               + rows_per_chunk * vocab * 4   if temperature != 1  # 2nd fp32 buffer
               + rows_per_chunk * vocab * 4   if retained_rows      # backward grad buffer
@@ -74,6 +75,8 @@ Formula (see :func:`logit_headroom_bytes`), with ``s = logit dtype itemsize``::
 * ``rows_per_chunk * vocab * s`` is ``chunk_hidden @ lm_head.T``.
 * ``+ 4`` bytes/element is the ``chunk_logits.to(torch.float32)`` copy, which is
   live at the same time as the low-precision tensor it was copied from.
+* the scaling term is the out-of-place ``chunk_logits * logit_scale_multiply``
+  (or ``/ logit_scale_divide``), which is live alongside the tensor it reads.
 * the softcap term is the ``logit_softcapping * tanh(x / logit_softcapping)``
   temporary, which is also the tensor autograd saves for the tanh backward.
 * ``retained_rows`` is the autograd case: when the log-softmax is
@@ -167,6 +170,7 @@ def logit_headroom_bytes(
     logit_dtype: torch.dtype = torch.bfloat16,
     retained_rows: int = 0,
     softcapped: bool = True,
+    logit_scaled: bool = False,
     temperature_scaled: bool = False,
     safety_bytes: int = 256 * 1024 ** 2,
 ) -> int:
@@ -184,6 +188,9 @@ def logit_headroom_bytes(
             differentiated, because autograd keeps every chunk's saved tensors.
         softcapped: the caller passes a non-zero ``logit_softcapping``, adding a
             ``tanh`` temporary of the chunk shape (also saved for backward).
+        logit_scaled: the caller passes a non-zero ``logit_scale_multiply`` or
+            ``logit_scale_divide``. Both are out-of-place, so one more buffer of
+            the chunk shape in the logit dtype is live before the float32 copy.
         temperature_scaled: the caller passes ``temperature != 1``, adding one
             more float32 buffer of the chunk shape.
         safety_bytes: allocator fragmentation / cuBLAS workspace slack. The
@@ -197,6 +204,8 @@ def logit_headroom_bytes(
         return int(safety_bytes)
     s = torch.empty((), dtype=logit_dtype).element_size()
     per_chunk = rows_per_chunk * vocab_size * (s + 4)
+    if logit_scaled:
+        per_chunk += rows_per_chunk * vocab_size * s
     if softcapped:
         per_chunk += rows_per_chunk * vocab_size * s
     if temperature_scaled:
@@ -226,8 +235,13 @@ class DeviceMapPlan:
     """Per-device budget before any reserve, after the quantiser's own haircut."""
     weight_bytes: dict[int, int]
     activation_reserve_bytes: int
+    """Largest reserve asked for. See ``activation_reserve_by_device`` for what
+    the accepted packing actually kept, which is smaller wherever a per-device
+    mapping was passed or an auto-derived reserve had to be relaxed."""
     total_weight_bytes: int
     no_split_module_classes: list[str]
+    activation_reserve_by_device: dict[int, int] = field(default_factory=dict)
+    """Reserve the accepted packing really kept free, per device."""
     tied_to_head: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -242,16 +256,18 @@ class DeviceMapPlan:
             f"no_split classes   : {sorted(self.no_split_module_classes)}",
             f"output head        : {self.head_module} -> cuda:{self.head_device}",
             f"head headroom      : {self.headroom_bytes / _GiB:.3f} GiB",
-            f"activation reserve : {self.activation_reserve_bytes / _GiB:.3f} GiB per device",
+            f"activation reserve : {self.activation_reserve_bytes / _GiB:.3f} GiB requested",
         ]
         if self.tied_to_head:
             lines.append(f"tied to head       : {self.tied_to_head}")
         for d in sorted(self.raw_budgets):
             w = self.weight_bytes.get(d, 0)
+            kept = self.activation_reserve_by_device.get(d)
             lines.append(
                 f"  cuda:{d}  budget {self.raw_budgets[d] / _GiB:6.2f} GiB"
                 f"  weights {w / _GiB:6.3f} GiB"
                 f"  free {(self.raw_budgets[d] - w) / _GiB:6.3f} GiB"
+                + (f"  reserve {kept / _GiB:6.3f} GiB" if kept is not None else "")
                 + ("   <- output head" if d == self.head_device else "")
             )
         lines.extend(f"note: {n}" for n in self.notes)
@@ -685,6 +701,7 @@ def plan_device_map(
     vocab_size: int | None = None,
     logit_dtype: torch.dtype | None = None,
     softcapped: bool | None = None,
+    logit_scaled: bool = False,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,
@@ -706,7 +723,10 @@ def plan_device_map(
         vocab_size: override the detected head width.
         logit_dtype: dtype of the logits; defaults to the head's dtype.
         softcapped: whether a non-zero ``logit_softcapping`` is in play.
-            ``None`` (default) reads ``final_logit_softcapping`` off the config.
+            ``None`` (default) reads ``final_logit_softcapping`` (or its
+            RecurrentGemma alias ``logits_soft_cap``) off the config.
+        logit_scaled: whether the caller passes a non-zero
+            ``logit_scale_multiply`` or ``logit_scale_divide``.
         temperature_scaled: whether the caller divides by a temperature != 1.
         headroom_bytes: bypass the formula entirely.
         safety_bytes: slack added to the headroom.
@@ -793,6 +813,7 @@ def plan_device_map(
             logit_dtype=logit_dtype,
             retained_rows=retained_rows,
             softcapped=softcapped,
+            logit_scaled=logit_scaled,
             temperature_scaled=temperature_scaled,
             safety_bytes=safety_bytes,
         )
@@ -963,9 +984,14 @@ def plan_device_map(
         return None
 
     def _fill(head_device: int, other_reserve: int):
+        # What this attempt really keeps free per device, which is what the plan
+        # reports: a per-device mapping is not one number, and `attempt` relaxes
+        # the reserve on the non-head cards, so a single scalar would promise
+        # headroom the accepted packing did not keep.
+        kept = {d: reserve[d] if d == head_device else min(reserve[d], other_reserve)
+                for d in devices}
         budget = {
-            d: raw_budgets[d] - (reserve[d] + headroom if d == head_device
-                                 else min(reserve[d], other_reserve))
+            d: raw_budgets[d] - (kept[d] + headroom if d == head_device else kept[d])
             for d in devices
         }
         budget[head_device] -= pinned_bytes
@@ -1004,7 +1030,7 @@ def plan_device_map(
         # bytes back or the head device reports weights above its own budget.
         public_budgets = {d: budget[d] for d in devices}
         public_budgets[head_device] += pinned_bytes
-        return assign, weight_bytes, public_budgets
+        return assign, weight_bytes, public_budgets, kept
 
     def _walk_in_order(free, budget):
         used = dict.fromkeys(devices, 0)
@@ -1133,7 +1159,7 @@ def plan_device_map(
             "to CPU/disk: bitsandbytes cannot load a partially offloaded 4-bit model."
         )
 
-    assign, weight_bytes, budgets = result
+    assign, weight_bytes, budgets, reserve_kept = result
     # Sanity: the map must cover every parameter and buffer.
     # `remove_duplicate=False`, because accelerate's own `check_device_map`
     # walks `state_dict()`, which lists a tied tensor under every name it has.
@@ -1161,6 +1187,7 @@ def plan_device_map(
         activation_reserve_bytes=activation_reserve_bytes,
         total_weight_bytes=total,
         no_split_module_classes=no_split,
+        activation_reserve_by_device=reserve_kept,
         tied_to_head=tied_to_head,
         notes=notes,
     )
@@ -1314,6 +1341,7 @@ def plan_device_map_for_pretrained(
     retained_rows: int = 0,
     vocab_size: int | None = None,
     softcapped: bool | None = None,
+    logit_scaled: bool = False,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,
@@ -1340,6 +1368,7 @@ def plan_device_map_for_pretrained(
         retained_rows=retained_rows,
         vocab_size=vocab_size,
         softcapped=softcapped,
+        logit_scaled=logit_scaled,
         temperature_scaled=temperature_scaled,
         headroom_bytes=headroom_bytes,
         safety_bytes=safety_bytes,
