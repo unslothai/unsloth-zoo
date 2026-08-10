@@ -765,3 +765,60 @@ def test_keep_in_fp32_modules_mirror_the_loader():
     assert _keep_in_fp32_modules(model, Bnb()) == ["norm", "lm_head"]
     assert _keep_in_fp32_modules(model, Other()) == ["lm_head"]
     assert _keep_in_fp32_modules(model, None) == ["lm_head"]
+
+
+def test_seq2seq_checkpoints_get_their_conditional_generation_class():
+    """T5 and mT5 are registered only under `AutoModelForSeq2SeqLM`, so the walk
+    fell through to the bare `AutoModel`: a meta model with no output head, an
+    undercounted weight total and the headroom reserved around some unrelated
+    linear."""
+    transformers = pytest.importorskip("transformers")
+    cfg = transformers.T5Config(vocab_size = 32, d_model = 8, num_layers = 1,
+                                num_heads = 1, d_ff = 16)
+    assert _auto_class_for(cfg) is transformers.AutoModelForSeq2SeqLM
+
+    # A config in two mappings is decided by the checkpoint's `architectures`.
+    bart = transformers.BartConfig(vocab_size = 32, d_model = 8,
+                                   encoder_layers = 1, decoder_layers = 1,
+                                   encoder_attention_heads = 1,
+                                   decoder_attention_heads = 1)
+    assert _auto_class_for(bart) is transformers.AutoModelForCausalLM
+    bart.architectures = ["BartForConditionalGeneration"]
+    assert _auto_class_for(bart) is transformers.AutoModelForSeq2SeqLM
+
+
+def test_model_declaring_an_empty_no_split_list_is_believed():
+    """`[]` is the model saying nothing is atomic, which camembert, colpali,
+    colqwen2, efficientnet and fuyu all do. Only `None` means "not declared"."""
+    model = _meta()
+    model._no_split_modules = []
+    assert resolve_no_split_classes(model) == []
+    model._no_split_modules = None
+    assert "_Block" in resolve_no_split_classes(model)
+
+
+def test_a_failed_dynamic_resolution_keeps_the_hub_restrictions(monkeypatch):
+    """Retrying through `from_config` after a failed lookup would go to the
+    network under `local_files_only`, drop the token, or take a different code
+    revision, so the failure has to surface instead."""
+    import transformers.dynamic_module_utils as dyn
+
+    def boom(class_reference, repo, **kwargs):
+        raise OSError("not found in the local cache")
+
+    monkeypatch.setattr(dyn, "get_class_from_dynamic_module", boom)
+
+    class Cfg:
+        auto_map = {"AutoModelForCausalLM": "org/repo--modeling_x.XForCausalLM"}
+        _name_or_path = "org/repo"
+
+    class AutoModelForCausalLM:
+        @staticmethod
+        def from_config(config, **kwargs):
+            raise AssertionError("must not retry without the Hub options")
+
+    with pytest.raises(OSError, match = "local cache"):
+        _from_config_remote_aware(
+            AutoModelForCausalLM, Cfg(),
+            {"trust_remote_code": True, "local_files_only": True},
+        )

@@ -296,7 +296,10 @@ def _name_of_module(model: nn.Module, target: nn.Module) -> str | None:
 def resolve_no_split_classes(model: nn.Module) -> list[str]:
     """Decoder / encoder block classes that must not be split across devices."""
     classes = getattr(model, "_no_split_modules", None)
-    if classes:
+    # `[]` is the model declaring that nothing is atomic, which several
+    # transformers models do (camembert, colpali, colqwen2, efficientnet, fuyu).
+    # Only `None`, the base-class default, means "not declared, go and detect".
+    if classes is not None:
         return sorted(str(c) for c in classes)
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
@@ -1219,6 +1222,11 @@ def _from_config_remote_aware(auto_cls: Any, config: Any, from_pretrained_kwargs
     ``token=...`` there is a ``TypeError`` on every ordinary checkpoint. Resolve
     the class explicitly instead, and fall back to plain ``from_config`` for
     anything that is not a dynamic class.
+
+    The fallback is chosen before the lookup, never after it: retrying a *failed*
+    resolution without the options would go to the network under
+    ``local_files_only``, drop the token, or take a different ``code_revision``
+    than the caller asked for, so a genuine Hub failure is raised as is.
     """
     hub_kwargs = {k: from_pretrained_kwargs[k] for k in _HUB_KWARGS
                   if k in from_pretrained_kwargs}
@@ -1227,14 +1235,14 @@ def _from_config_remote_aware(auto_cls: Any, config: Any, from_pretrained_kwargs
     if class_ref and hub_kwargs:
         try:
             from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-            repo_id, _, ref = class_ref.rpartition("--")
-            model_cls = get_class_from_dynamic_module(
-                ref, repo_id or config._name_or_path, **hub_kwargs
-            )
+        except ImportError:
+            get_class_from_dynamic_module = None
+        repo_id, _, ref = class_ref.rpartition("--")
+        repo_id = repo_id or getattr(config, "_name_or_path", None) \
+            or getattr(config, "name_or_path", None)
+        if get_class_from_dynamic_module is not None and repo_id:
+            model_cls = get_class_from_dynamic_module(ref, repo_id, **hub_kwargs)
             return model_cls._from_config(config)
-        except Exception:
-            pass
     return auto_cls.from_config(config, trust_remote_code=True)
 
 
@@ -1243,6 +1251,7 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
     from transformers import (
         AutoModelForCausalLM,
         AutoModelForImageTextToText,
+        AutoModelForSeq2SeqLM,
         AutoModel,
     )
 
@@ -1253,10 +1262,18 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
     # looks the model class up under exactly that name, so pick the matching one.
     auto_map = getattr(config, "auto_map", None)
     if trust_remote_code and isinstance(auto_map, Mapping):
-        for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM, AutoModel):
+        for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM,
+                         AutoModelForSeq2SeqLM, AutoModel):
             if auto_cls.__name__ in auto_map:
                 return auto_cls
-    for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM):
+    # Seq2Seq is in the walk because an encoder-decoder checkpoint (T5, mT5) is
+    # registered ONLY under `AutoModelForSeq2SeqLM`; without it the walk fell
+    # through to the bare `AutoModel`, whose meta model has no output head at
+    # all, so the plan reserved the logit headroom around some unrelated linear
+    # and undercounted the weights the loader would really place.
+    first_hit = None
+    for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM,
+                     AutoModelForSeq2SeqLM):
         mapping = getattr(auto_cls, "_model_mapping", None)
         if mapping is None:
             continue
@@ -1267,10 +1284,14 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
         names = {model_cls.__name__} if not isinstance(model_cls, (list, tuple)) else {
             c.__name__ for c in model_cls
         }
-        if not archs or names & set(archs):
+        # A config can appear in two mappings -- BART is both `BartForCausalLM`
+        # and `BartForConditionalGeneration` -- so let the checkpoint's own
+        # `architectures` break the tie, and keep the first hit otherwise.
+        if archs and names & set(archs):
             return auto_cls
-        return auto_cls
-    return AutoModel
+        if first_hit is None:
+            first_hit = auto_cls
+    return first_hit if first_hit is not None else AutoModel
 
 
 def plan_device_map_for_pretrained(
