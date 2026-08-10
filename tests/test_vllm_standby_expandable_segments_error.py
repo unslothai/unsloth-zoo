@@ -39,11 +39,10 @@ A third failure is mislabelled the same way. vLLM asserts that free VRAM went
     container release GPU memory while vLLM is profiling during initialization.
 
 when another tenant on a shared GPU frees memory mid-profile. Free memory went
-*up*, so nothing ran out; but the text says "free memory", which is a genuine
-out of memory marker (vLLM's real startup shortfall reads "Free memory on
-device ... is less than desired GPU memory utilization"), so it too was reported
-as an OOM. It is transient and clears on a plain retry. Seen twice on a shared
-8x B200 with 178.4 GB per GPU.
+*up*, so nothing ran out, but "free memory" is itself a genuine OOM marker
+(vLLM's real shortfall reads "Free memory on device ... is less than desired
+GPU memory utilization"), so this was reported as an OOM too. It is transient
+and clears on a plain retry. Seen twice on a shared 8x B200, 178.4 GB per GPU.
 
 These tests pin the classification (config clash vs profiling race vs real
 OOM), the wording of the new messages, and the wiring inside `load_vllm`.
@@ -221,9 +220,8 @@ def test_message_lists_all_three_env_vars_when_none_are_visible():
 
 @pytest.mark.parametrize("error", (_PROFILING_RACE, _PROFILING_RACE_XPU))
 def test_profiling_race_is_not_an_oom(error):
-    # The bug: "free memory" appears twice in this text, so the OOM markers
-    # matched and the user was told their 178 GB GPU ran out of memory while
-    # 138.8 GiB of it was free.
+    # The bug: "free memory" appears twice here, so the OOM markers matched and
+    # a 178 GB GPU was reported out of memory with 138.8 GiB of it free.
     assert "free memory" in error.lower()
     assert vllm_utils._is_memory_profiling_race_error(error) is True
     assert vllm_utils._is_out_of_memory_error(error) is False
@@ -240,8 +238,8 @@ def test_profiling_race_and_kv_cache_oom_classify_differently():
 
 
 def test_free_memory_marker_still_covers_the_real_startup_shortfall():
-    # Removing the "free memory" marker would be the easy way to stop matching
-    # the profiling race, and it would silently drop this genuine one, whose
+    # Dropping the "free memory" marker is the easy way to stop matching the
+    # profiling race, and it would silently lose this genuine shortfall, whose
     # text never says "out of memory" (vllm/v1/worker/utils.py request_memory).
     shortfall = (
         "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
