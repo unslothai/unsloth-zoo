@@ -5203,27 +5203,37 @@ def _first_media_user_message_index(messages):
     return -1
 
 
+def _qwen3_omni_media_counts(content):
+    counts = [0, 0, 0]
+    for item in content if isinstance(content, list) else ():
+        if not isinstance(item, dict): continue
+        kind = str(item.get("type", "")).lower()
+        index = 0 if kind == "image" or "image" in item or "image_url" in item else 1 if kind == "audio" or "audio" in item or "audio_url" in item else 2 if kind == "video" or "video" in item else None
+        if index is not None: counts[index] += 1
+    return tuple(counts)
+
+
 def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwargs):
     """Put Qwen's counted media before text without losing formatter metadata."""
-    if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+    if not isinstance(message, dict):
         return message
     content = message["content"]
-    videos = [
-        item for item in content
-        if isinstance(item, dict) and item.get("type") == "video"
-    ]
-    trailing = [
-        item for item in content
-        if not isinstance(item, dict)
-        or item.get("type") not in ("image", "audio", "video")
-    ]
-    images = audios = []
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    elif not isinstance(content, list):
+        return message
+    groups = [[], [], [], []]
+    for item in content:
+        counts = _qwen3_omni_media_counts([item])
+        group = 0 if counts[2] else 1 if counts[0] else 2 if counts[1] else 3
+        groups[group].append(item)
+    counts = _qwen3_omni_media_counts(content)
     if str(message.get("role", "user")).lower() not in _NON_USER_ROLES:
         if not kwargs.get("skip_image_token"):
-            images = [{"type": "image"}] * num_images
+            groups[1] += [{"type": "image"}] * max(0, num_images - counts[0])
         if not kwargs.get("skip_audio_token"):
-            audios = [{"type": "audio"}] * num_audios
-    return {**message, "content": videos + images + audios + trailing}
+            groups[2] += [{"type": "audio"}] * max(0, num_audios - counts[1])
+    return {**message, "content": sum(groups, [])}
 
 
 def _anchor_conversation_media_to_first_user_turn(
@@ -5253,12 +5263,8 @@ def _anchor_conversation_media_to_first_user_turn(
         )
         is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
         message_kwargs = dict(kwargs)
-        skip_image_token = (
-            bool(message_kwargs.pop("skip_image_token", False)) or not is_target
-        )
-        skip_audio_token = (
-            bool(message_kwargs.pop("skip_audio_token", False)) or not is_target
-        )
+        skip_image_token = bool(message_kwargs.pop("skip_image_token", False)) or not is_target
+        skip_audio_token = bool(message_kwargs.pop("skip_audio_token", False)) or not is_target
         message_kwargs.pop("role", None)
         if not is_target:
             message_kwargs.pop("video", None)
@@ -5273,16 +5279,8 @@ def _anchor_conversation_media_to_first_user_turn(
             **message_kwargs,
         )
         if model_type == "qwen3_omni_moe":
-            rendered = _normalize_qwen3_omni_counted_message(
-                rendered,
-                num_images if is_target else 0,
-                num_audios if is_target else 0,
-                {
-                    **message_kwargs,
-                    "skip_image_token": skip_image_token,
-                    "skip_audio_token": skip_audio_token,
-                },
-            )
+            options = {**message_kwargs, "skip_image_token": skip_image_token, "skip_audio_token": skip_audio_token}
+            rendered = _normalize_qwen3_omni_counted_message(rendered, num_images if is_target else 0, num_audios if is_target else 0, options)
         if isinstance(message, dict):
             if isinstance(rendered, dict):
                 rendered = {**message, **rendered}
@@ -5414,12 +5412,18 @@ def _prepare_vlm_template_messages(
     has_structured_multimodal = _messages_have_structured_multimodal_content(
         normalized_messages
     )
+    if model_type == "qwen3_omni_moe": has_structured_multimodal |= any(any(_qwen3_omni_media_counts(message.get("content", ""))) for message in normalized_messages)
     needs_media_anchor = (
         not has_structured_multimodal and (num_images > 0 or num_audios > 0)
     )
 
     template_messages = normalized_messages
-    if needs_media_anchor:
+    if model_type == "qwen3_omni_moe" and has_structured_multimodal and (num_images > 0 or num_audios > 0) and (target_idx := _first_media_user_message_index(normalized_messages)) >= 0:
+        counts = [_qwen3_omni_media_counts(message.get("content", "")) for message in normalized_messages]
+        if any(missing := (0 if kwargs.get("skip_image_token") else max(0, num_images - sum(x[0] for x in counts)), 0 if kwargs.get("skip_audio_token") else max(0, num_audios - sum(x[1] for x in counts)))):
+            template_messages = list(normalized_messages)
+            template_messages[target_idx] = _normalize_qwen3_omni_counted_message(template_messages[target_idx], counts[target_idx][0] + missing[0], counts[target_idx][1] + missing[1], kwargs)
+    elif needs_media_anchor:
         template_messages = _anchor_conversation_media_to_first_user_turn(
             prompt_utils_module,
             model_type,
@@ -5444,19 +5448,11 @@ def _render_vlm_template_or_fallback(
     kwargs,
 ):
     """Render a message list, falling back only when the upstream template is empty."""
-    if model_type == "qwen3_omni_moe" and hasattr(
-        processor, "apply_chat_template"
-    ):
-        # Qwen3 Omni Instruct transcribes only when the wrapper's implicit
-        # `enable_thinking=False` is omitted; preserve explicit overrides.
+    if model_type == "qwen3_omni_moe" and hasattr(processor, "apply_chat_template"):
+        # Omit Qwen Instruct's implicit `enable_thinking=False`; keep explicit overrides.
         native_kwargs = dict(kwargs)
         tokenize = native_kwargs.pop("tokenize", False)
-        rendered = processor.apply_chat_template(
-            messages,
-            tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt,
-            **native_kwargs,
-        )
+        rendered = processor.apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt, **native_kwargs)
     else:
         rendered = prompt_utils_module.get_chat_template(
             processor,
@@ -5514,13 +5510,7 @@ def _ensure_vlm_prompt_utils_patched():
         model_config = getattr(prompt_utils, "MODEL_CONFIG", {})
         if isinstance(model_type, str) and model_type not in model_config:
             folded = model_type.casefold()
-            canonical = next(
-                (
-                    key for key in model_config
-                    if isinstance(key, str) and key.casefold() == folded
-                ),
-                None,
-            )
+            canonical = next((key for key in model_config if isinstance(key, str) and key.casefold() == folded), None)
             if canonical is not None:
                 # Published configs may capitalize mlx-vlm's lowercase key.
                 config_data = dict(config_data)

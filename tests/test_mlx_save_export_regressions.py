@@ -638,10 +638,17 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
         get_message_json=counted_message,
     )
     messages = [{"role": "user", "content": [
-        {"type": "audio"},
+        {"type": "input_video", "video": "clip.mp4"}, {"type": "video"},
+        {"type": "image", "image": "frame.png"}, {"type": "image"},
+        {"type": "input_audio", "audio": "first.wav"}, {"audio": "key-only.wav"}, {"type": "audio"}, {"type": "group", "content": [{"type": "input_audio", "audio": "nested.wav"}]},
         {"type": "text", "text": "Transcribe the audio into text."},
-    ]}]
-    result = _render_qwen(prompt_utils, messages, num_audios=1)
+    ]}, {"role": "user", "content": [{"type": "input_image", "image": "second.png"}, {"type": "input_audio", "audio": "second.wav"}, {"type": "text", "text": "Continue."}]}]
+    result = _render_qwen(prompt_utils, messages, num_images=4, num_audios=5)
+    plain, key_only = _render_qwen(prompt_utils, plain_prompt := [{"role": "user", "content": "First."}, messages[1]], return_messages=True, num_images=2, num_audios=2), _render_qwen(prompt_utils, key_only_prompt := [{"role": "user", "content": [{"audio": "only.wav", "metadata": {"source": "fixture"}}, {"audio_url": "second.wav"}, {"type": "text", "text": "Keep me."}]}], return_messages=True, num_audios=2)
+    assert [item["type"] for item in plain[0]["content"]] == ["image", "audio", "text"] and plain[0]["content"][-1]["text"] == "First." and plain[1] == messages[1] and key_only == key_only_prompt
+    nested = _render_qwen(prompt_utils, [{"role": "user", "content": messages[0]["content"][4:5] + messages[0]["content"][7:]}], return_messages=True, num_audios=2)
+    assert [item["type"] for item in nested[0]["content"]] == ["input_audio", "audio", "group", "text"]
+    assert _render_qwen(prompt_utils, plain_prompt, return_messages=True, num_images=1, num_audios=1) == plain_prompt and _render_qwen(prompt_utils, plain_prompt, return_messages=True, num_images=2, num_audios=2, skip_image_token=True, skip_audio_token=True) == plain_prompt
     counted = {"role": "user", "content": "Transcribe the audio."}
     for prompt in (counted, [counted]):
         _render_qwen(prompt_utils, prompt, num_audios=1)
@@ -653,7 +660,8 @@ def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatc
     anchored = _render_qwen(prompt_utils, conversation, return_messages=True,
                             num_images=1, num_audios=1, video="clip.mp4")
     assert result == "structured-rendered"
-    assert rendered_messages[0] == messages
+    assert rendered_messages[0][0]["content"] == messages[0]["content"][:4] + [{"type": "image"}] + messages[0]["content"][4:7] + [{"type": "audio"}] + messages[0]["content"][7:]
+    assert rendered_messages[0][1] == messages[1]
     assert len(rendered_messages) == 3
     for rendered in rendered_messages[1:]:
         assert [item["type"] for item in rendered[0]["content"]] == ["audio", "text"]
