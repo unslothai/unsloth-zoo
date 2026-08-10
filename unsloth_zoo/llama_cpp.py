@@ -2476,6 +2476,7 @@ def convert_to_gguf(
             "`config.json` was not changed."
         )
     _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _no_mtp = _mtp_declared and not _keep_mtp
     _strip_keys = (
         ("unsloth_fixed_mtp",)
         if _keep_mtp
@@ -2546,6 +2547,8 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
+        if _no_mtp:
+            text_args["--no-mtp"] = ""
         runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
@@ -2582,6 +2585,8 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
+        if _no_mtp:
+            args["--no-mtp"] = ""
         runs_to_do.append((args, final_output, "model", True))
 
     # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable

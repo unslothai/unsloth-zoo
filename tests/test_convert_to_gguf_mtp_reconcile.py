@@ -95,24 +95,38 @@ def test_has_mtp_weight_tensors_matches_converter_index_precedence(llama_cpp, tm
 
 def _write_converter(path: Path) -> Path:
     converter = path / "fake_convert.py"
+    command_log = path / "converter_commands.jsonl"
     converter.write_text(
         textwrap.dedent(
-            """
+            f"""
             import argparse
+            import json
+            import sys
             from pathlib import Path
 
             parser = argparse.ArgumentParser()
             parser.add_argument("--outfile")
             parser.add_argument("--outtype")
             parser.add_argument("--split-max-size")
+            parser.add_argument("--no-mtp", action="store_true")
+            parser.add_argument("--mmproj", action="store_true")
             parser.add_argument("model_dir")
             args = parser.parse_args()
+            with Path({str(command_log)!r}).open("a", encoding="utf-8") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
             Path(args.outfile).write_bytes(b"GGUF")
             """
         ),
         encoding = "utf-8",
     )
     return converter
+
+
+def _read_converter_commands(path: Path) -> list[list[str]]:
+    return [
+        json.loads(line)
+        for line in (path / "converter_commands.jsonl").read_text(encoding = "utf-8").splitlines()
+    ]
 
 
 @pytest.mark.parametrize("has_mtp", (False, True))
@@ -154,6 +168,42 @@ def test_convert_to_gguf_reconciles_mtp_config_to_index(llama_cpp, tmp_path, has
     assert "unsloth_fixed_mtp" not in updated["text_config"]
     assert ("mtp_num_hidden_layers" in updated) is has_mtp
     assert ("mtp_num_hidden_layers" in updated["text_config"]) is has_mtp
+    command, = _read_converter_commands(tmp_path)
+    assert ("--no-mtp" in command) is not has_mtp
+
+
+def test_convert_to_gguf_disables_missing_mtp_only_for_vlm_text(llama_cpp, tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "mtp_num_hidden_layers": 1,
+                "text_config": {
+                    "num_hidden_layers": 24,
+                    "mtp_num_hidden_layers": 1,
+                },
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.language_model.layers.23.self_attn.q_proj.weight")
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(tmp_path / "output.gguf"),
+        input_folder = str(model_dir),
+        converter_location = str(_write_converter(tmp_path)),
+        supported_vision_archs = {"Qwen3_5ForConditionalGeneration"},
+        quantization_type = "bf16",
+        is_vlm = True,
+    )
+
+    text_command, mmproj_command = _read_converter_commands(tmp_path)
+    assert "--no-mtp" in text_command
+    assert "--mmproj" not in text_command
+    assert "--no-mtp" not in mmproj_command
+    assert "--mmproj" in mmproj_command
 
 
 def test_convert_to_gguf_always_removes_null_internal_marker(llama_cpp, tmp_path):
