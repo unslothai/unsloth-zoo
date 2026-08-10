@@ -371,29 +371,81 @@ def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
     return hw is not None and iw is not None and hw is iw
 
 
+def _model_dtype(model: nn.Module) -> Any:
+    """The dtype the checkpoint will be loaded in, as the config declares it."""
+    cfg = getattr(model, "config", None)
+    for holder in (cfg, getattr(cfg, "text_config", None)):
+        for attr in ("dtype", "torch_dtype"):
+            d = getattr(holder, attr, None)
+            if isinstance(d, torch.dtype):
+                return d
+    for t in model.parameters():
+        if t.dtype.is_floating_point:
+            return t.dtype
+    return None
+
+
+def _quantized_size_kwargs(model: nn.Module, hf_quantizer: Any) -> dict[str, Any]:
+    """`dtype` / `special_dtypes` for `compute_module_sizes`, quantiser-aware.
+
+    Mirrors what ``transformers.modeling_utils._get_device_map`` does before it
+    calls ``infer_auto_device_map``: the quantiser turns the load dtype into the
+    storage dtype it will really allocate (``CustomDtype.INT4`` for bnb-4bit,
+    half a byte per element), and names the modules it will NOT convert so those
+    keep the load dtype.
+
+    This matters a lot. ``preprocess_model`` leaves a meta ``Params4bit`` at the
+    full unpacked shape in float32, so measuring the modules directly reports a
+    4-bit checkpoint at roughly four times its real size, and the planner then
+    refuses or badly partitions exactly the quantised models it exists for.
+    """
+    if hf_quantizer is None:
+        return {}
+    dtype = _model_dtype(model)
+    if dtype is None:
+        return {}
+    kwargs: dict[str, Any] = {}
+    adjust = getattr(hf_quantizer, "adjust_target_dtype", None)
+    if callable(adjust):
+        try:
+            target = adjust(dtype)
+        except Exception:
+            target = None
+        if target is not None:
+            kwargs["dtype"] = target
+    special = getattr(hf_quantizer, "get_special_dtypes_update", None)
+    if callable(special) and getattr(hf_quantizer, "modules_to_not_convert", None):
+        try:
+            kwargs["special_dtypes"] = dict(special(model, dtype))
+        except Exception:
+            pass
+    return kwargs
+
+
 def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[str, int]:
     """Bytes per module subtree. Uses transformers'/accelerate's version when
     available so quantised (bnb / Params4bit) sizes match what the loader will
     actually allocate; otherwise falls back to a plain walk."""
+    size_kwargs = _quantized_size_kwargs(model, hf_quantizer)
     for mod_path in ("transformers.integrations.accelerate", "accelerate.utils.modeling"):
         try:
             module = __import__(mod_path, fromlist=["compute_module_sizes"])
             fn = getattr(module, "compute_module_sizes")
         except Exception:
             continue
-        try:
-            out = fn(model, hf_quantizer) if hf_quantizer is not None else fn(model)
-        except TypeError:
+        # Drop the extras one at a time rather than all at once: an older
+        # accelerate without `special_dtypes` still gets the storage dtype,
+        # which is the term that actually moves the number.
+        for kwargs in ([size_kwargs] if size_kwargs else []) + \
+                      ([{"dtype": size_kwargs["dtype"]}] if "special_dtypes" in size_kwargs else []) + [{}]:
             try:
-                out = fn(model)
+                out = fn(model, **kwargs)
             except Exception:
                 continue
-        except Exception:
-            continue
-        if isinstance(out, tuple):
-            out = out[0]
-        if isinstance(out, Mapping) and "" in out:
-            return {k: int(v) for k, v in out.items()}
+            if isinstance(out, tuple):
+                out = out[0]
+            if isinstance(out, Mapping) and "" in out:
+                return {k: int(v) for k, v in out.items()}
     sizes: dict[str, int] = {}
     for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
         nbytes = tensor.numel() * tensor.element_size()
@@ -430,12 +482,24 @@ def _split_units(
             return
         # Direct parameters/buffers owned by this module (not by a child) have
         # to travel with the module itself, so keep them as their own unit.
-        own = sum(
-            t.numel() * t.element_size()
-            for t in list(module.parameters(recurse=False)) + list(module.buffers(recurse=False))
-        )
+        own_tensors = list(module.named_parameters(recurse=False)) + \
+                      list(module.named_buffers(recurse=False))
+        own = sum(t.numel() * t.element_size() for _, t in own_tensors)
         if own and prefix:
             units.append((prefix, own))
+        elif own:
+            # State registered directly on the ROOT module. There is no module
+            # name to hang it on -- the prefix is "" -- and accelerate reads ""
+            # as a catch-all default for everything unlisted, which would fight
+            # the explicit entries this planner exists to produce. So name each
+            # tensor instead: accelerate's lookup walks a parameter name up to
+            # its longest present prefix and tries the full name first, so an
+            # exact key matches immediately. Without this the coverage check at
+            # the end of plan_device_map reports the state as unplaced and
+            # raises, so a model with a root-level scale or bias could not be
+            # planned at all.
+            for tensor_name, tensor in own_tensors:
+                units.append((tensor_name, tensor.numel() * tensor.element_size()))
         for child_name, child in children:
             walk(f"{prefix}.{child_name}" if prefix else child_name, child)
 
@@ -494,7 +558,11 @@ def plan_device_map(
             sets it per device, which is what you want when one card also holds
             a vision tower or the generation KV cache. Kept free on *every* device for ordinary
             activations, on top of the head headroom on the head's device.
-            Defaults follow ``free_space_policy``.
+            Defaults follow ``free_space_policy``. A value you pass is a **hard
+            constraint**: if the model cannot be placed while keeping it free,
+            :class:`DeviceMapInfeasible` is raised rather than a plan that
+            quietly leaves less room than you asked for. Only the default,
+            auto-derived reserve is relaxed to make a placement fit.
         free_space_policy: how the leftover memory is shared.
             ``"balanced"`` (default) gives every device an equal activation
             budget ``(total_slack - headroom) / n_devices`` and hands the head's
@@ -561,6 +629,13 @@ def plan_device_map(
         raise ValueError(f"free_space_policy must be 'balanced' or 'head_max', got {free_space_policy!r}")
 
     notes: list[str] = []
+    # A reserve the caller measured is a constraint; a reserve we guessed is a
+    # heuristic. Only the guess may be relaxed to make a placement fit (see
+    # `attempt`), otherwise a per-device mapping built from measurements -- the
+    # documented answer to the asymmetric-activation caveat above -- could be
+    # quietly reduced to zero and the run would OOM on a card the plan still
+    # claimed had the reserve free.
+    reserve_is_explicit = activation_reserve_bytes is not None
     if activation_reserve_bytes is None:
         if free_space_policy == "balanced":
             # Give every device the same activation budget, then hand the head's
@@ -610,7 +685,16 @@ def plan_device_map(
             )
 
     unit_size = dict(units)
-    pinned = [p for p in pinned if p in unit_size]
+    # Expand each pinned module to every placement unit at or below it. A head
+    # that is a plain nn.Linear is a leaf and is its own unit, so this is a
+    # no-op there; a composite head is split by `_split_units` into descendants
+    # like `lm_head.proj` and the head's own name never appears as a unit, so an
+    # exact-name filter dropped it from `pinned` entirely and the greedy walk was
+    # free to put it on a card that is not `head_device` -- leaving the logit
+    # headroom reserved on the wrong GPU.
+    pinned = list(dict.fromkeys(
+        u for p in pinned for u, _ in units if u == p or u.startswith(p + ".")
+    ))
     pinned_bytes = sum(unit_size[p] for p in pinned)
 
     def attempt(head_device: int):
@@ -619,8 +703,12 @@ def plan_device_map(
         The head device always keeps ``activation_reserve + headroom`` free; when
         block granularity makes the ideal split infeasible we take the slack out
         of the *other* cards, never out of the head's logit headroom.
+
+        Only an auto-derived reserve is relaxed. A caller-supplied one is a hard
+        constraint, so an explicit reserve either fits or the plan is refused.
         """
-        for step in range(21):
+        steps = 1 if reserve_is_explicit else 21
+        for step in range(steps):
             r = _fill(head_device, max(reserve.values()) * (20 - step) // 20)
             if r is not None:
                 return r
@@ -635,12 +723,34 @@ def plan_device_map(
         budget[head_device] -= pinned_bytes
         if any(b < 0 for b in budget.values()):
             return None
+        free = [(name, size) for name, size in units if name not in pinned]
+        used, assign = _walk_in_order(free, budget)
+        if used is None:
+            # The in-order walk is next-fit with a first-fit rescue, and neither
+            # backtracks, so it can run out of room while a valid assignment
+            # exists: capacities 10 and 10 with units 7, 6, 3, 2, 2 build loads
+            # of 9 and 9 and then reject the last unit, although 7+3 and 6+2+2
+            # both fit. Differently sized units -- a vision tower, a projector
+            # and decoder blocks in one model -- produce exactly that shape. So
+            # before giving up, repack largest-first into the tightest device
+            # that still fits. This runs ONLY after the in-order walk has
+            # failed, so a plan that already worked is never rewritten: layout
+            # in definition order keeps consecutive layers together, which
+            # costs fewer cross-device hops than a size-sorted one.
+            used, assign = _best_fit(free, budget)
+        if used is None:
+            return None
+        for p in pinned:
+            assign[p] = head_device
+            used[head_device] += unit_size[p]
+        weight_bytes = {d: used[d] for d in devices}
+        return assign, weight_bytes, {d: budget[d] for d in devices}
+
+    def _walk_in_order(free, budget):
         used = dict.fromkeys(devices, 0)
         assign: dict[str, int] = {}
         cursor = 0
-        for name, size in units:
-            if name in pinned:
-                continue
+        for name, size in free:
             placed = False
             while cursor < len(devices):
                 d = devices[cursor]
@@ -660,12 +770,22 @@ def plan_device_map(
                         placed = True
                         break
             if not placed:
-                return None
-        for p in pinned:
-            assign[p] = head_device
-            used[head_device] += unit_size[p]
-        weight_bytes = {d: used[d] for d in devices}
-        return assign, weight_bytes, {d: budget[d] for d in devices}
+                return None, None
+        return used, assign
+
+    def _best_fit(free, budget):
+        """Largest unit first into the device it leaves least room on."""
+        used = dict.fromkeys(devices, 0)
+        assign: dict[str, int] = {}
+        for name, size in sorted(free, key=lambda item: -item[1]):
+            room = [(budget[d] - used[d] - size, d) for d in devices
+                    if used[d] + size <= budget[d]]
+            if not room:
+                return None, None
+            _, d = min(room)
+            assign[name] = d
+            used[d] += size
+        return used, assign
 
     order = [prefer_head_device] if prefer_head_device is not None else list(reversed(devices))
     result = None
@@ -735,7 +855,8 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
-    auto_cls = _auto_class_for(config)
+    trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
+    auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
     qcfg = getattr(config, "quantization_config", None)
     if qcfg is not None:
@@ -743,7 +864,13 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
 
         hf_quantizer = AutoHfQuantizer.from_config(qcfg)
     with init_empty_weights():
-        model = auto_cls.from_config(config)
+        # `trust_remote_code` has to travel to `from_config` too. AutoConfig can
+        # resolve a dynamic config on its own, but the model class then lives in
+        # the same Hub repo and `from_config` only fetches it when it is allowed
+        # to, so without this a remote-code checkpoint raises instead of
+        # honouring the option the caller already passed.
+        model = auto_cls.from_config(config, trust_remote_code=True) if trust_remote_code \
+            else auto_cls.from_config(config)
     model.eval()
     if hf_quantizer is not None:
         # Swap in the quantised Linear classes so the size table matches the
@@ -755,7 +882,7 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     return model, hf_quantizer, config
 
 
-def _auto_class_for(config: Any):
+def _auto_class_for(config: Any, trust_remote_code: bool = False):
     """Pick the right Auto* class without hardcoding an architecture."""
     from transformers import (
         AutoModelForCausalLM,
@@ -764,6 +891,15 @@ def _auto_class_for(config: Any):
     )
 
     archs = list(getattr(config, "architectures", None) or [])
+    # A dynamic (remote-code) config is not in any `_model_mapping`, so the
+    # mapping walk below always falls through to AutoModel and construction
+    # fails. The repo says which Auto class it registered for; `from_config`
+    # looks the model class up under exactly that name, so pick the matching one.
+    auto_map = getattr(config, "auto_map", None)
+    if trust_remote_code and isinstance(auto_map, Mapping):
+        for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM, AutoModel):
+            if auto_cls.__name__ in auto_map:
+                return auto_cls
     for auto_cls in (AutoModelForImageTextToText, AutoModelForCausalLM):
         mapping = getattr(auto_cls, "_model_mapping", None)
         if mapping is None:
