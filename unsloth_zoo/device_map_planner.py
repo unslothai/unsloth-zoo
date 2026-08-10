@@ -1016,6 +1016,18 @@ def plan_device_map(
             r = _fill(head_device, reserve, max(reserve.values()) * (20 - step) // 20)
             if r is not None:
                 return r
+        if reserve_is_explicit:
+            return None
+        # Last resort: relax the head's own activation reserve too. An
+        # auto-derived reserve is documented as relaxable and the loop above only
+        # ever took it off the OTHER cards, so a single atomic unit that fits
+        # nowhere else could miss the head's card by less than the reserve and
+        # the plan was refused. The logit headroom is never touched.
+        for step in range(1, 21):
+            scaled = {d: v * (20 - step) // 20 for d, v in reserve.items()}
+            r = _fill(head_device, scaled, max(scaled.values()))
+            if r is not None:
+                return r
         return None
 
     def _fill(head_device: int, reserve: dict[int, int], other_reserve: int):
@@ -1253,8 +1265,14 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     serialized ``config.quantization_config``, so inspecting the config alone
     left the quantiser as ``None``: the planner then sized the checkpoint at
     full precision and skipped the quantiser's budget adjustment, refusing
-    models the matching ``from_pretrained`` loads happily. Mirrors the loader,
-    which builds a ``BitsAndBytesConfig`` from these flags.
+    models the matching ``from_pretrained`` loads happily.
+
+    Built the way the loader builds it, through
+    ``BitsAndBytesConfig.from_dict(..., return_unused_kwargs=True)`` over the
+    remaining kwargs. The two booleans alone are not enough: the loader also
+    consumes options like ``llm_int8_skip_modules``, which becomes
+    ``modules_to_not_convert`` and keeps whole modules at full precision, so
+    ignoring them sizes those modules small and the map OOMs on load.
 
     Pops rather than reads: these are loader options, not config options, and
     ``AutoConfig`` would otherwise set them as stray config attributes.
@@ -1262,14 +1280,26 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     explicit = kwargs.pop("quantization_config", None)
     load_in_4bit = kwargs.pop("load_in_4bit", False)
     load_in_8bit = kwargs.pop("load_in_8bit", False)
-    if explicit is not None:
+    if not (load_in_4bit or load_in_8bit):
         return explicit
-    if load_in_4bit or load_in_8bit:
-        from transformers import BitsAndBytesConfig
+    if explicit is not None:
+        # Same contradiction `from_pretrained` refuses, raised here rather than
+        # silently planning for one of the two.
+        raise ValueError(
+            "Pass either `quantization_config` or `load_in_4bit` / `load_in_8bit`, "
+            "not both."
+        )
+    from transformers import BitsAndBytesConfig
 
-        return BitsAndBytesConfig(load_in_4bit=bool(load_in_4bit),
-                                  load_in_8bit=bool(load_in_8bit))
-    return None
+    accepted = inspect.signature(BitsAndBytesConfig).parameters
+    config_dict = {k: v for k, v in kwargs.items() if k in accepted}
+    config_dict.update(load_in_4bit=bool(load_in_4bit), load_in_8bit=bool(load_in_8bit))
+    quantization_config, unused = BitsAndBytesConfig.from_dict(
+        config_dict=config_dict, return_unused_kwargs=True, **kwargs
+    )
+    kwargs.clear()
+    kwargs.update(unused)
+    return quantization_config
 
 
 def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
@@ -1294,14 +1324,20 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     if runtime_qcfg is not None or serialized_qcfg is not None:
         from transformers.quantizers import AutoHfQuantizer
 
-        # An explicit request wins over the checkpoint's own, as in the loader.
         # `pre_quantized` says whether the weights on disk are ALREADY quantised:
         # false for runtime quantisation of a full-precision checkpoint, which is
         # also what stops a calibration-free quantiser taking the wrong path.
-        if runtime_qcfg is not None and serialized_qcfg is None:
+        if serialized_qcfg is None:
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
         else:
-            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg or serialized_qcfg)
+            # The checkpoint's own method wins and the runtime config only
+            # overlays its loading attributes -- an 8-bit checkpoint handed a
+            # 4-bit runtime config still loads as 8-bit, so sizing it as 4-bit
+            # would underestimate it. `merge_quantization_configs` is the
+            # loader's own rule, including the mismatched-class error.
+            merge = getattr(AutoHfQuantizer, "merge_quantization_configs", None)
+            qcfg = merge(serialized_qcfg, runtime_qcfg) if callable(merge) else serialized_qcfg
+            hf_quantizer = AutoHfQuantizer.from_config(qcfg)
     with init_empty_weights():
         # `trust_remote_code` has to travel to `from_config` too. AutoConfig can
         # resolve a dynamic config on its own, but the model class then lives in

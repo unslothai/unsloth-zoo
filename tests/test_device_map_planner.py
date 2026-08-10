@@ -1008,6 +1008,23 @@ def test_runtime_quantization_options_build_a_quantizer(monkeypatch):
     assert _runtime_quantization_config({}) is None
     assert _runtime_quantization_config({"load_in_8bit": True}).load_in_8bit is True
 
+    # The loader consumes every BitsAndBytesConfig option from its kwargs, and
+    # `llm_int8_skip_modules` becomes `modules_to_not_convert`: ignoring it sizes
+    # whole modules at the quantised width that the loader keeps full precision.
+    kwargs = {"load_in_8bit": True, "llm_int8_skip_modules": ["lm_head"],
+              "trust_remote_code": True}
+    qcfg = _runtime_quantization_config(kwargs)
+    assert qcfg.llm_int8_skip_modules == ["lm_head"]
+    assert kwargs.get("trust_remote_code") is True
+    assert "llm_int8_skip_modules" not in kwargs
+
+    kwargs = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}
+    assert _runtime_quantization_config(kwargs).bnb_4bit_quant_type == "nf4"
+
+    # The same contradiction `from_pretrained` refuses.
+    with pytest.raises(ValueError, match = "not both"):
+        _runtime_quantization_config({"load_in_4bit": True, "quantization_config": explicit})
+
 
 def test_the_pretrained_helper_forwards_the_no_split_override(monkeypatch):
     """Routed through `**config_kwargs` the override would go to `AutoConfig`,
@@ -1030,3 +1047,39 @@ def test_the_pretrained_helper_forwards_the_no_split_override(monkeypatch):
         no_split_module_classes = [],
     )
     assert plan.no_split_module_classes == []
+
+
+class _OneFatBlock(nn.Module):
+    """A single atomic block that fits on no card except beside the head."""
+
+    _no_split_modules = ["_Block"]
+
+    def __init__(self, hidden = 1024):
+        super().__init__()
+        self.layers = nn.ModuleList([_Block(hidden)])
+        self.lm_head = nn.Linear(hidden, 64, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_the_auto_reserve_relaxes_on_the_head_as_a_last_resort():
+    """The relaxation loop only ever took the reserve off the OTHER cards, so an
+    atomic unit that fits nowhere else could miss the head's card by less than
+    the reserve and the plan was refused. An auto-derived reserve is documented
+    as relaxable; the logit headroom is still never touched."""
+    with torch.device("meta"):
+        model = _OneFatBlock()
+    block = 1024 * 1024 * 4          # 4 MiB
+    head = 1024 * 64 * 4             # 0.25 MiB
+    headroom = 1 * _MiB
+    plan = plan_device_map(
+        model,
+        max_memory = {0: block - 1, 1: block + head + headroom + (_MiB // 2)},
+        headroom_bytes = headroom,
+        prefer_head_device = 1,
+    )
+    assert plan.head_device == 1
+    assert plan.device_map["layers.0"] == 1
+    # The headroom survives in full; only the activation reserve gave way.
+    assert plan.raw_budgets[1] - plan.weight_bytes[1] >= headroom
