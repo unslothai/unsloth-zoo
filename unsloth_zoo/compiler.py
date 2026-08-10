@@ -2021,6 +2021,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -2100,6 +2113,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -2210,6 +2236,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 else:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
