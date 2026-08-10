@@ -93,7 +93,7 @@ def test_has_mtp_weight_tensors_matches_converter_index_precedence(llama_cpp, tm
     assert llama_cpp._has_mtp_weight_tensors(tmp_path, 24) is True
 
 
-def _write_converter(path: Path) -> Path:
+def _write_converter(path: Path, *, supports_no_mtp: bool = True) -> Path:
     converter = path / "fake_convert.py"
     command_log = path / "converter_commands.jsonl"
     converter.write_text(
@@ -108,7 +108,7 @@ def _write_converter(path: Path) -> Path:
             parser.add_argument("--outfile")
             parser.add_argument("--outtype")
             parser.add_argument("--split-max-size")
-            parser.add_argument("--no-mtp", action="store_true")
+            {('parser.add_argument("--no-mtp", action="store_true")' if supports_no_mtp else '')}
             parser.add_argument("--mmproj", action="store_true")
             parser.add_argument("model_dir")
             args = parser.parse_args()
@@ -204,6 +204,32 @@ def test_convert_to_gguf_disables_missing_mtp_only_for_vlm_text(llama_cpp, tmp_p
     assert "--mmproj" not in text_command
     assert "--no-mtp" not in mmproj_command
     assert "--mmproj" in mmproj_command
+
+
+def test_convert_to_gguf_omits_no_mtp_for_legacy_converter(llama_cpp, tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "mtp_num_hidden_layers": 1,
+                "num_hidden_layers": 24,
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.layers.23.self_attn.q_proj.weight")
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(tmp_path / "output.gguf"),
+        input_folder = str(model_dir),
+        converter_location = str(_write_converter(tmp_path, supports_no_mtp = False)),
+        quantization_type = "bf16",
+    )
+
+    command, = _read_converter_commands(tmp_path)
+    assert "--no-mtp" not in command
 
 
 def test_convert_to_gguf_always_removes_null_internal_marker(llama_cpp, tmp_path):

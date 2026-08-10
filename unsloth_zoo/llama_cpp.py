@@ -2318,6 +2318,19 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     return False
 
 
+def _converter_supports_no_mtp(converter_location):
+    """Return whether the selected converter declares the `--no-mtp` option."""
+    try:
+        source = Path(converter_location).read_bytes()
+    except OSError:
+        return False
+    return re.search(
+        rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
+        source,
+        flags = re.DOTALL,
+    ) is not None
+
+
 def _find_bitsandbytes_quantization(config, _path = "config.json"):
     """Where a bitsandbytes `quantization_config` sits, or None.
 
@@ -2476,7 +2489,11 @@ def convert_to_gguf(
             "`config.json` was not changed."
         )
     _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
-    _no_mtp = _mtp_declared and not _keep_mtp
+    _no_mtp = (
+        _mtp_declared
+        and not _keep_mtp
+        and _converter_supports_no_mtp(converter_location)
+    )
     _strip_keys = (
         ("unsloth_fixed_mtp",)
         if _keep_mtp
