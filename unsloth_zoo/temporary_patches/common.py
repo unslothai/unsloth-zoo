@@ -258,9 +258,14 @@ def _compile_or_fall_back(*args, **kwargs):
     # `torch.compile`'s first parameter is named `model`, so `torch_compile(model = fn)`
     # is a third legal spelling. Take it out of the compile kwargs, where it would
     # collide with the function passed positionally, and treat it as that function.
+    # Popped whether or not it is callable: `torch_compile(model = None, ...)` is the
+    # decorator-factory spelling, and a `model` left behind collides with the function
+    # `_compile` passes positionally, which the guard below would then swallow as a
+    # refusal to compile.
     function = args[0] if args and callable(args[0]) else None
-    if function is None and callable(kwargs.get("model")):
-        function = kwargs.pop("model")
+    if function is None and "model" in kwargs:
+        model = kwargs.pop("model")
+        if callable(model): function = model
 
     if kwargs.get("fullgraph"):
         from .utils import torch_compile_with_fallback

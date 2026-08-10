@@ -296,6 +296,27 @@ def test_the_model_keyword_spelling_compiles_the_function():
     """)
 
 
+def test_the_explicit_model_none_decorator_factory_still_compiles():
+    """`torch_compile(model = None, ...)` is the factory spelling of the same
+    signature. Left in `kwargs`, `model = None` collides with the function passed
+    positionally to `torch.compile`, and the eager guard swallows the resulting
+    `TypeError` as "the compiler refused", turning compilation off for good.
+    """
+    _run_with_compile_enabled("""
+        import torch
+        from unsloth_zoo.temporary_patches import common as C
+
+        def eager(x): return x + 1
+
+        for name in ("torch_compile", "_torch_compile"):
+            for kwargs in ({}, {"fullgraph": True, "dynamic": True}):
+                out = getattr(C, name)(model = None, **kwargs)(eager)
+                assert out is not eager, (
+                    f"{name} {kwargs} with an explicit model = None fell back to eager"
+                )
+    """)
+
+
 def test_a_working_compile_is_still_compiled():
     """The fallback must engage only on failure. Silently running eager where
     compile succeeds is a performance regression, not a fix.
