@@ -1,0 +1,197 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Regression tests for vLLM load-failure classification with standby mode.
+
+`load_vllm` used to classify a failed vLLM load as an out of memory condition
+with `("memory" in error.lower() or "alloc" in error.lower())`. The bare
+`"alloc"` substring also matches the deterministic *configuration* assertion
+raised by `CuMemAllocator.__init__`:
+
+    Standby mode is not supported with expandable segments.
+    Please set environment variable PYTORCH_CUDA_ALLOC_CONF without
+    `expandable_segments:True`.
+
+because that text contains `PYTORCH_CUDA_ALLOC_CONF`. Upstream vLLM's own
+wording ("Expandable segments are not compatible with memory pool.") collides
+with the `"memory"` half instead. Either way the user was told their GPU ran
+out of memory and offered three fixes, two of which cannot possibly help. This
+was reproduced on a 183 GB B200 with roughly 180 GB free.
+
+These tests pin the classification (config clash vs real OOM), the wording of
+the new message, and the wiring inside `load_vllm`.
+"""
+
+from __future__ import annotations
+
+import inspect
+import re
+from unittest import mock
+
+import pytest
+
+from unsloth_zoo import vllm_utils
+
+
+# The message our patched CuMemAllocator.__init__ asserts with, per env var.
+def _unsloth_assertion(env_var = "PYTORCH_CUDA_ALLOC_CONF"):
+    return (
+        "Standby mode is not supported with expandable segments.\n"
+        f"Please set environment variable {env_var} without `expandable_segments:True`.\n"
+    )
+
+
+# Upstream vLLM's own wording (vllm/device_allocator/cumem.py).
+_VLLM_ASSERTION = (
+    "Expandable segments are not compatible with memory pool. "
+    "Please track https://github.com/pytorch/pytorch/issues/147851 "
+    "for the latest updates."
+)
+
+_REAL_OOM_ERRORS = (
+    # torch. Captured verbatim from torch 2.9.1+cu128. Note it recommends
+    # expandable segments, so classification must not key off that phrase alone.
+    "CUDA out of memory. Tried to allocate 37252.90 GiB. GPU 0 has a total capacity of "
+    "178.35 GiB of which 177.06 GiB is free. Process 597697 has 692.00 MiB memory in use. "
+    "Including non-PyTorch memory, this process has 612.00 MiB memory in use. Of the "
+    "allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch "
+    "but unallocated. If reserved but unallocated memory is large try setting "
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See "
+    "documentation for Memory Management  "
+    "(https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+    "CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of "
+    "79.15 GiB of which 1.06 GiB is free.",
+    "torch.OutOfMemoryError: CUDA out of memory.",
+    # ROCm / HIP
+    "HIP out of memory. Tried to allocate 512.00 MiB",
+    # vLLM engine-side
+    "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
+    "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory used "
+    "by other processes.",
+    "No available memory for the cache blocks. Try increasing `gpu_memory_utilization`.",
+    "To serve at least one request with the model's max seq len (8192), (18.00 GiB KV cache "
+    "is needed, which is larger than the available KV cache memory (4.00 GiB).",
+    # C++ level
+    "std::bad_alloc",
+)
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"),
+)
+def test_expandable_segments_assertion_is_not_an_oom(env_var):
+    # The bug: this returned True via the bare "alloc" substring (and via
+    # "memory" for the upstream wording), so a config clash was raised as
+    # MemoryError("Your GPU ran out of memory").
+    error = _unsloth_assertion(env_var)
+    assert vllm_utils._is_expandable_segments_error(error) is True
+    assert vllm_utils._is_out_of_memory_error(error) is False
+
+
+def test_upstream_vllm_expandable_segments_assertion_is_not_an_oom():
+    assert vllm_utils._is_expandable_segments_error(_VLLM_ASSERTION) is True
+    assert vllm_utils._is_out_of_memory_error(_VLLM_ASSERTION) is False
+
+
+@pytest.mark.parametrize("error", _REAL_OOM_ERRORS)
+def test_real_oom_is_still_classified_as_oom(error):
+    assert vllm_utils._is_out_of_memory_error(error) is True
+    assert vllm_utils._is_expandable_segments_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        "ValueError: Model architecture FooForCausalLM is not supported.",
+        "Could not find nvcc, please install the CUDA toolkit",
+        "",
+    ),
+)
+def test_unrelated_errors_are_neither(error):
+    assert vllm_utils._is_out_of_memory_error(error) is False
+    assert vllm_utils._is_expandable_segments_error(error) is False
+
+
+def test_torch_oom_hint_about_expandable_segments_is_not_a_config_clash():
+    # torch's genuine OOM text ends with "try setting
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation",
+    # so the config-clash markers must be full phrases, not a bare substring,
+    # or a real OOM would be routed to the configuration message.
+    torch_oom = _REAL_OOM_ERRORS[0]
+    assert "expandable_segments:True" in torch_oom
+    assert vllm_utils._is_out_of_memory_error(torch_oom) is True
+    assert vllm_utils._is_expandable_segments_error(torch_oom) is False
+
+
+def test_classifiers_accept_exception_objects_not_just_strings():
+    error = AssertionError(_unsloth_assertion())
+    assert vllm_utils._is_expandable_segments_error(error) is True
+    assert vllm_utils._is_out_of_memory_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"),
+)
+def test_message_names_the_offending_env_var_on_every_platform(env_var):
+    # PYTORCH_HIP_ALLOC_CONF is the ROCm/AMD one, PYTORCH_ALLOC_CONF the unified
+    # torch >= 2.10 one. Whichever actually carries the setting must be named.
+    cleared = {k: "" for k in vllm_utils._ALLOC_CONF_ENV_VARS}
+    cleared[env_var] = "expandable_segments:True,roundup_power2_divisions:[32:256]"
+    with mock.patch.dict(vllm_utils.os.environ, cleared, clear = False):
+        assert vllm_utils._expandable_segments_env_vars() == [env_var]
+        message = vllm_utils._expandable_segments_standby_message(_unsloth_assertion(env_var))
+    assert env_var in message
+    # Never claim the GPU ran out of memory for a config clash.
+    assert "ran out of memory" not in message
+    assert "NOT an out of memory error" in message
+    # The remedy that actually works must be present, the useless ones absent.
+    assert "expandable_segments" in message
+    assert "load_in_4bit" not in message
+    assert "gpu_memory_utilization=0.6" not in message
+    # Preserve the underlying error for debugging.
+    assert "Original error:" in message
+    assert "Standby mode is not supported with expandable segments." in message
+
+
+def test_message_lists_all_three_env_vars_when_none_are_visible():
+    cleared = {k: "" for k in vllm_utils._ALLOC_CONF_ENV_VARS}
+    with mock.patch.dict(vllm_utils.os.environ, cleared, clear = False):
+        assert vllm_utils._expandable_segments_env_vars() == []
+        message = vllm_utils._expandable_segments_standby_message(_VLLM_ASSERTION)
+    for env_var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        assert env_var in message
+    assert "Original error:" in message
+
+
+def test_load_vllm_retry_handler_is_wired_to_the_precise_classifiers():
+    # Guards the raise site itself: the loose substring test must be gone, the
+    # config clash must be checked before the MemoryError, and the OOM branch
+    # must keep `Original error:`.
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert '"alloc" in error.lower()' not in source
+    assert not re.search(r'\(\s*"memory" in error\.lower\(\)', source)
+
+    config_at = source.index("_is_expandable_segments_error(error)")
+    oom_at = source.index("_is_out_of_memory_error(error)")
+    memory_error_at = source.index("raise MemoryError(")
+    assert config_at < memory_error_at
+    assert oom_at < memory_error_at
+
+    oom_block = source[memory_error_at:]
+    assert "Your GPU ran out of memory loading vLLM with standby mode enabled" in oom_block
+    assert "Original error:" in oom_block

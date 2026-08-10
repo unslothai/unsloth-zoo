@@ -2036,6 +2036,114 @@ def _clear_flashinfer_env_on_hip():
     return True
 
 
+# Allocator config env vars. PYTORCH_CUDA_ALLOC_CONF is the legacy NVIDIA one,
+# PYTORCH_HIP_ALLOC_CONF the legacy AMD/ROCm one, PYTORCH_ALLOC_CONF the unified
+# one read from torch 2.10 onwards. All three must be checked on every platform.
+_ALLOC_CONF_ENV_VARS = (
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
+)
+
+# CuMemAllocator (standby / sleep mode) refuses to start when the caching
+# allocator runs with expandable segments. Both our patched __init__ and the
+# upstream vLLM one raise a deterministic AssertionError; match either wording.
+# This is a configuration failure, never an out of memory condition.
+#
+# The phrases are full ones on purpose. Torch's genuine OOM message *also*
+# mentions expandable segments ("... try setting
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation"), so
+# a bare "expandable_segments" test would mislabel real OOMs the other way.
+_EXPANDABLE_SEGMENTS_MARKERS = (
+    # unsloth_zoo.vllm_utils.patch_vllm_enable_sleep_mode
+    "not supported with expandable segments",
+    "not supported with expandable_segments",
+    # vllm/device_allocator/cumem.py
+    "expandable segments are not compatible",
+    "expandable_segments are not compatible",
+)
+
+# Genuine out of memory signatures. Deliberately specific: a bare "alloc" or
+# "memory" substring also matches allocator *configuration* errors (which carry
+# words like PYTORCH_CUDA_ALLOC_CONF or "memory pool") and would mislabel them.
+_OUT_OF_MEMORY_MARKERS = (
+    "out of memory",
+    "outofmemoryerror",
+    "insufficient memory",
+    "not enough memory",
+    "no available memory",
+    "free memory",
+    "available kv cache memory",
+    "kv cache is needed",
+    "std::bad_alloc",
+    "bad_alloc",
+    "failed to allocate",
+    "allocation failed",
+    "cudaerrormemoryallocation",
+    "hiperroroutofmemory",
+    "cannot allocate memory",
+    "unable to allocate",
+)
+
+
+def _is_out_of_memory_error(error_text):
+    # A real out of memory condition, as opposed to anything that merely
+    # contains the letters "alloc" or the word "memory".
+    error_text = str(error_text).lower()
+    return any(marker in error_text for marker in _OUT_OF_MEMORY_MARKERS)
+
+
+def _is_expandable_segments_error(error_text):
+    # Standby mode + `expandable_segments:True` is a config clash, not an OOM.
+    # A real OOM wins: torch's OOM text suggests expandable segments as a fix,
+    # so it must never be routed to the configuration message.
+    error_text = str(error_text).lower()
+    if _is_out_of_memory_error(error_text):
+        return False
+    return any(marker in error_text for marker in _EXPANDABLE_SEGMENTS_MARKERS)
+
+
+def _expandable_segments_env_vars():
+    # Which allocator env vars actually carry expandable_segments:True right now.
+    return [
+        key for key in _ALLOC_CONF_ENV_VARS
+        if "expandable_segments:true" in os.environ.get(key, "").lower()
+    ]
+
+
+def _expandable_segments_standby_message(error):
+    # Note on why this is a message and not an automatic fix: torch parses the
+    # allocator config once (a process-wide singleton, read at torch import on
+    # 2.10+ and at first allocation before that), so clearing the env var here
+    # would NOT turn expandable segments off. Existing segments stay expandable
+    # (torch.cuda.memory_snapshot() still reports is_expandable=True), and we
+    # would have silenced the guard while the incompatibility remains, trading a
+    # deterministic assertion for a crash (pytorch/pytorch#147851). The variable
+    # has to be right before `import unsloth`, so we say exactly that.
+    offenders = _expandable_segments_env_vars()
+    if len(offenders) == 0:
+        # Not currently visible in this process (child process env, or already
+        # cleared), so name all three rather than guessing.
+        offenders = list(_ALLOC_CONF_ENV_VARS)
+        which = "your allocator config (" + ", ".join(offenders) + ")"
+    else:
+        which = ", ".join(offenders)
+    return (
+        f"Unsloth: vLLM standby mode cannot start because `expandable_segments:True` is set in {which}.\n"
+        f"This is a configuration clash, NOT an out of memory error, so lowering "
+        f"`gpu_memory_utilization` or using 4bit will not help.\n"
+        f"Standby mode uses vLLM's CuMemAllocator, which is incompatible with expandable segments.\n"
+        f"Try one of these fixes:\n"
+        f"  1. Set `os.environ['UNSLOTH_VLLM_STANDBY'] = '1'` BEFORE `import unsloth`, so Unsloth "
+        f"removes `expandable_segments` for you (in notebooks, restart and run the cells in order)\n"
+        f"  2. Remove `expandable_segments:True` yourself before importing unsloth, for example "
+        f"`os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''` (`PYTORCH_HIP_ALLOC_CONF` on AMD ROCm, "
+        f"`PYTORCH_ALLOC_CONF` on torch >= 2.10)\n"
+        f"  3. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+        f"Original error: {error}"
+    )
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -2665,10 +2773,18 @@ def load_vllm(
                 torch.cuda.empty_cache()
             pass
             error = str(error)
+            # `expandable_segments:True` + sleep/standby mode is a deterministic
+            # config clash raised by CuMemAllocator.__init__, not an OOM, and
+            # retrying with a smaller gpu_memory_utilization can never clear it.
+            # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
+            # (upstream vLLM), so a loose "alloc" / "memory" substring test
+            # reported it as an OOM and sent users to fixes that cannot work.
+            if _is_expandable_segments_error(error):
+                raise RuntimeError(_expandable_segments_standby_message(error))
             if trials >= 2 or unsloth_vllm_standby:
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
-                if unsloth_vllm_standby and ("memory" in error.lower() or "alloc" in error.lower()):
+                if unsloth_vllm_standby and _is_out_of_memory_error(error):
                     raise MemoryError(
                         f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
                         f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
