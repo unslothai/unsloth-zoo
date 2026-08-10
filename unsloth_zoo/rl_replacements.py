@@ -82,6 +82,23 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    # Rows per chunk cap. Read HERE, in the default, not in the body: the body
+    # is traced with fullgraph = True, and `os.environ` is an unsupported op
+    # there on torch 2.4 -- Dynamo raises
+    #   torch._dynamo.exc.Unsupported: const method call bytes.decode
+    # from os._Environ.__getitem__, which the eager fallback does not catch
+    # (it only catches recompile-limit and disabled-hook breaks), so the very
+    # first call would die even with the variable unset. A default is evaluated
+    # once when the def runs, which is import time, outside any traced region.
+    # It is also a plain int argument, so Dynamo guards on it instead of
+    # constant-folding an unguarded read (2.7+ never notice a later change).
+    # A non-numeric value is ignored rather than raised on, so a typo cannot
+    # break the import. 0 keeps the previous chunk boundaries exactly.
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
@@ -97,14 +114,13 @@ def chunked_hidden_states_selective_log_softmax(
     # Each chunk materialises rows x vocab logits and then a float32 copy of
     # them, all on the device holding the output head. With a large vocabulary
     # and a fixed chunk count that grows with the batch, so the peak scales with
-    # the batch rather than staying bounded. Setting
-    # UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK caps the rows per chunk instead, which is
-    # pure loop splitting: more, smaller chunks, same concatenated result.
-    # Unset (the default) keeps the previous chunk boundaries exactly.
-    max_rows = int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0"))
-    if max_rows > 0:
+    # the batch rather than staying bounded. max_rows_per_chunk caps the rows
+    # per chunk instead, which is pure loop splitting: more, smaller chunks,
+    # same concatenated result. 0 (the default) keeps the previous chunk
+    # boundaries exactly.
+    if max_rows_per_chunk > 0:
         n_rows = flat_hidden_states.shape[0]
-        chunks = max(chunks, -(-n_rows // max_rows))
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
