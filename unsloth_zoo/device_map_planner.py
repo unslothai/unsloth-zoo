@@ -947,43 +947,58 @@ def plan_device_map(
     # quietly reduced to zero and the run would OOM on a card the plan still
     # claimed had the reserve free.
     reserve_is_explicit = activation_reserve_bytes is not None
-    if activation_reserve_bytes is None:
-        if free_space_policy == "balanced":
-            # Give every device the same activation budget, then hand the head's
-            # device the logit headroom on top.
-            #
-            # This equal split is a heuristic and it is only right when the
-            # per-device activation demand is symmetric. It is NOT symmetric for
-            # a vision-LM whose GPU 0 also carries the vision tower, the input
-            # embedding and the generation KV cache: a measured GRPO step
-            # (4 x 640 completion tokens, a 30B 4-bit model, 2 x 14.56 GiB) OOMs on
-            # GPU 0 under the equal split while succeeding under accelerate's
-            # own layout. Pass a per-device mapping when you have measurements.
-            slack = sum(raw_budgets.values()) - total
-            activation_reserve_bytes = int(max(0, (slack - headroom) // len(devices)))
-            # The head's device pays the headroom on top of its share, so an
-            # equal split of the global slack can exceed that one device's own
-            # budget even when the totals fit. Cap by the smallest budget less
-            # the headroom and less the weight that device has to hold,
-            # otherwise a model that trivially fits is refused.
-            #
-            # That weight is at least the pinned units, which the head's device
-            # takes whole. An average share alone is not enough: `attempt` only
-            # relaxes the reserve on the OTHER cards, so once the head's budget
-            # goes negative every step fails and the plan is refused. A four-layer
-            # model whose head is larger than half the weights (share 24 KiB,
-            # head 32 KiB) was rejected on 2 x 8 GiB for exactly that reason.
-            share = max(-(-total // len(devices)), pinned_bytes)
-            per_device_cap = min(raw_budgets.values()) - headroom - share
-            activation_reserve_bytes = int(max(0, min(activation_reserve_bytes, per_device_cap)))
-        else:
-            # Mirror accelerate: reserve the largest single placement unit.
-            activation_reserve_bytes = max((s for _, s in units), default=0)
-    if isinstance(activation_reserve_bytes, Mapping):
-        reserve = {d: _parse_size(activation_reserve_bytes.get(d, 0)) for d in devices}
-    else:
-        reserve = dict.fromkeys(devices, int(activation_reserve_bytes))
-    activation_reserve_bytes = max(reserve.values()) if reserve else 0
+    requested_reserve = activation_reserve_bytes
+
+    def reserve_for(head_device: int) -> dict[int, int]:
+        """The per-device reserve to try for this head candidate.
+
+        Derived PER CANDIDATE, because the cap below depends on which card pays
+        the headroom. Computing it once against the smallest budget clamped the
+        reserve using a card that will not hold the head: with 8 and 16 GiB
+        budgets, 10 GiB of weights and 2 GiB of headroom the equal share is
+        6 GiB but the shared cap cut it to 1 GiB, so the balanced policy stopped
+        balancing and the packing could fill the small card to within 1 GiB.
+        """
+        value = requested_reserve
+        if value is None:
+            if free_space_policy == "balanced":
+                # Give every device the same activation budget, then hand the
+                # head's device the logit headroom on top.
+                #
+                # This equal split is a heuristic and it is only right when the
+                # per-device activation demand is symmetric. It is NOT symmetric
+                # for a vision-LM whose GPU 0 also carries the vision tower, the
+                # input embedding and the generation KV cache: a measured GRPO
+                # step (4 x 640 completion tokens, a 30B 4-bit model,
+                # 2 x 14.56 GiB) OOMs on GPU 0 under the equal split while
+                # succeeding under accelerate's own layout. Pass a per-device
+                # mapping when you have measurements.
+                slack = sum(raw_budgets.values()) - total
+                value = max(0, (slack - headroom) // len(devices))
+                # The head's device pays the headroom on top of its share, so an
+                # equal split of the global slack can exceed that one device's
+                # own budget even when the totals fit. Cap by each device's own
+                # budget less the weight it has to hold, and less the headroom
+                # only on the card that will carry it, otherwise a model that
+                # trivially fits is refused.
+                #
+                # That weight is at least the pinned units, which the head's
+                # device takes whole. An average share alone is not enough:
+                # `attempt` only relaxes the reserve on the OTHER cards, so once
+                # the head's budget goes negative every step fails and the plan
+                # is refused. A four-layer model whose head is larger than half
+                # the weights (share 24 KiB, head 32 KiB) was rejected on
+                # 2 x 8 GiB for exactly that reason.
+                share = max(-(-total // len(devices)), pinned_bytes)
+                cap = min(raw_budgets[d] - share - (headroom if d == head_device else 0)
+                          for d in devices)
+                value = int(max(0, min(value, cap)))
+            else:
+                # Mirror accelerate: reserve the largest single placement unit.
+                value = max((s for _, s in units), default=0)
+        if isinstance(value, Mapping):
+            return {d: _parse_size(value.get(d, 0)) for d in devices}
+        return dict.fromkeys(devices, int(value))
 
     def attempt(head_device: int):
         """Try progressively smaller activation reserves on the non-head devices.
@@ -995,14 +1010,15 @@ def plan_device_map(
         Only an auto-derived reserve is relaxed. A caller-supplied one is a hard
         constraint, so an explicit reserve either fits or the plan is refused.
         """
+        reserve = reserve_for(head_device)
         steps = 1 if reserve_is_explicit else 21
         for step in range(steps):
-            r = _fill(head_device, max(reserve.values()) * (20 - step) // 20)
+            r = _fill(head_device, reserve, max(reserve.values()) * (20 - step) // 20)
             if r is not None:
                 return r
         return None
 
-    def _fill(head_device: int, other_reserve: int):
+    def _fill(head_device: int, reserve: dict[int, int], other_reserve: int):
         # What this attempt really keeps free per device, which is what the plan
         # reports: a per-device mapping is not one number, and `attempt` relaxes
         # the reserve on the non-head cards, so a single scalar would promise
@@ -1170,6 +1186,9 @@ def plan_device_map(
             chosen = cand
             break
     if result is None:
+        # Report the reserve of the first candidate actually tried; it is what
+        # the failing arithmetic used.
+        reserve = reserve_for(next((c for c in order if c in devices), devices[0]))
         reserved_total = sum(reserve.values())
         slack = sum(raw_budgets.values()) - total - reserved_total
         raise DeviceMapInfeasible(
@@ -1190,6 +1209,7 @@ def plan_device_map(
         )
 
     assign, weight_bytes, budgets, reserve_kept = result
+    activation_reserve_bytes = max(reserve_kept.values()) if reserve_kept else 0
     # Sanity: the map must cover every parameter and buffer.
     # `remove_duplicate=False`, because accelerate's own `check_device_map`
     # walks `state_dict()`, which lists a tied tensor under every name it has.
@@ -1226,24 +1246,62 @@ def plan_device_map(
 # --------------------------------------------------------------------------- #
 # pre-load convenience
 # --------------------------------------------------------------------------- #
+def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
+    """The quantisation the CALLER asked for, popped out of the loader kwargs.
+
+    A full-precision checkpoint loaded with ``load_in_4bit=True`` has no
+    serialized ``config.quantization_config``, so inspecting the config alone
+    left the quantiser as ``None``: the planner then sized the checkpoint at
+    full precision and skipped the quantiser's budget adjustment, refusing
+    models the matching ``from_pretrained`` loads happily. Mirrors the loader,
+    which builds a ``BitsAndBytesConfig`` from these flags.
+
+    Pops rather than reads: these are loader options, not config options, and
+    ``AutoConfig`` would otherwise set them as stray config attributes.
+    """
+    explicit = kwargs.pop("quantization_config", None)
+    load_in_4bit = kwargs.pop("load_in_4bit", False)
+    load_in_8bit = kwargs.pop("load_in_8bit", False)
+    if explicit is not None:
+        return explicit
+    if load_in_4bit or load_in_8bit:
+        from transformers import BitsAndBytesConfig
+
+        return BitsAndBytesConfig(load_in_4bit=bool(load_in_4bit),
+                                  load_in_8bit=bool(load_in_8bit))
+    return None
+
+
 def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     """Instantiate the model on the meta device, quantiser included.
 
     Returns ``(model, hf_quantizer, config)``. Costs no GPU memory and no weight
     IO, so the plan can be computed before ``from_pretrained``.
+
+    ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
+    the way the loader honours them, so runtime quantisation of a full-precision
+    checkpoint is sized as it will really be loaded.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
+    runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
     config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
-    qcfg = getattr(config, "quantization_config", None)
-    if qcfg is not None:
+    serialized_qcfg = getattr(config, "quantization_config", None)
+    if runtime_qcfg is not None or serialized_qcfg is not None:
         from transformers.quantizers import AutoHfQuantizer
 
-        hf_quantizer = AutoHfQuantizer.from_config(qcfg)
+        # An explicit request wins over the checkpoint's own, as in the loader.
+        # `pre_quantized` says whether the weights on disk are ALREADY quantised:
+        # false for runtime quantisation of a full-precision checkpoint, which is
+        # also what stops a calibration-free quantiser taking the wrong path.
+        if runtime_qcfg is not None and serialized_qcfg is None:
+            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
+        else:
+            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg or serialized_qcfg)
     with init_empty_weights():
         # `trust_remote_code` has to travel to `from_config` too. AutoConfig can
         # resolve a dynamic config on its own, but the model class then lives in
@@ -1377,6 +1435,7 @@ def plan_device_map_for_pretrained(
     safety_bytes: int = 256 * 1024 ** 2,
     activation_reserve_bytes: int | Mapping[int, Any] | None = None,
     free_space_policy: str = "balanced",
+    no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
     trust_remote_code: bool = False,
     **config_kwargs: Any,
@@ -1385,6 +1444,15 @@ def plan_device_map_for_pretrained(
 
     Builds the model on the meta device, so this is cheap and touches no GPU.
     Returns ``None`` when fewer than two GPUs are usable.
+
+    Takes the same ``no_split_module_classes`` override as :func:`plan_device_map`
+    (``[]`` to allow splitting inside a block that fits on no single card). It has
+    to be declared here: routed through ``**config_kwargs`` it would go to
+    ``AutoConfig`` instead, and the plan would silently use the detected classes.
+
+    ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
+    :func:`build_meta_model`, so a full-precision checkpoint you intend to load
+    quantised is sized as it will really be loaded.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None
@@ -1405,5 +1473,6 @@ def plan_device_map_for_pretrained(
         activation_reserve_bytes=activation_reserve_bytes,
         free_space_policy=free_space_policy,
         hf_quantizer=hf_quantizer,
+        no_split_module_classes=no_split_module_classes,
         prefer_head_device=prefer_head_device,
     )
