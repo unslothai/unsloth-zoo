@@ -2705,9 +2705,9 @@ def test_qualified_families_carry_their_probed_requirements():
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
         "gemma3n": versions("0.4.4"),
         "gemma4": versions("0.6.2"),
-        "gemma4_unified": versions("0.6.1"),
+        "gemma4_unified": versions("0.6.5"),
         "nemotron_h_nano_omni": versions("0.5.0"),
-        "qwen3_omni_moe": versions("0.6.0"),
+        "qwen3_omni_moe": versions("0.6.7"),
         "phi4mm": versions("0.4.4"),
         "minicpmo": versions("0.4.4"),
     }
@@ -2816,7 +2816,7 @@ def test_only_a_published_final_release_is_at_or_above_the_floor():
     assert gemma4.admits("99.0.0") is True
 
 
-def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
+def test_new_audio_families_start_at_their_complete_audio_implementation(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
     def make_processor(module):
         cls = type("Processor", (), {})
@@ -2825,9 +2825,9 @@ def test_new_audio_families_start_at_their_upstream_introduction(monkeypatch):
     unified = make_processor("gemma4_unified")
     assert mlx_utils._audio_family_from_processor(unified) == "gemma4_unified"
     for processor, family, floor, below in (
-        (unified, "gemma4_unified", "0.6.1", "0.6.0"),
+        (unified, "gemma4_unified", "0.6.5", "0.6.4"),
         (make_processor("nemotron_h_nano_omni"), "nemotron_h_nano_omni", "0.5.0", "0.4.4"),
-        (make_processor("qwen3_omni_moe"), "qwen3_omni_moe", "0.6.0", "0.5.0"),
+        (make_processor("qwen3_omni_moe"), "qwen3_omni_moe", "0.6.7", "0.6.6"),
     ):
         monkeypatch.setattr(
             mlx_utils, "_installed_mlx_vlm_version", lambda floor=floor: floor,

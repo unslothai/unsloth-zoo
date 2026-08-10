@@ -5672,14 +5672,14 @@ class _AudioVersions(NamedTuple):
 # made sanitize unconditional, double-transposing pre-converted convs -- but
 # loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
 # fixed it in 0.6.5 (#1523).
-# These three omni implementations use their first working native-audio release
-# as the floor; 0.6.10 remains the latest exercised by the real-model gate.
+# Unified needs 0.6.5's processor/audio-layout fix; Qwen needs 0.6.7's batched
+# mel input and sample-domain length fixes. 0.6.10 is the latest real-model gate.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
-    "gemma4_unified": _AudioVersions("0.6.1"),
+    "gemma4_unified": _AudioVersions("0.6.5"),
     "nemotron_h_nano_omni": _AudioVersions("0.5.0"),
-    "qwen3_omni_moe": _AudioVersions("0.6.0"),
+    "qwen3_omni_moe": _AudioVersions("0.6.7"),
     "phi4mm": _AudioVersions("0.4.4"),
     "minicpmo": _AudioVersions("0.4.4"),
 }
