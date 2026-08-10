@@ -85,7 +85,7 @@ Formula (see :func:`logit_headroom_bytes`), with ``s = logit dtype itemsize``::
 
 Usage
 -----
-    from device_map_planner import plan_device_map_for_pretrained
+    from unsloth_zoo.device_map_planner import plan_device_map_for_pretrained
 
     plan = plan_device_map_for_pretrained(
         "unsloth/Qwen3-14B-unsloth-bnb-4bit",
@@ -829,8 +829,14 @@ def plan_device_map(
     # exact-name filter dropped it from `pinned` entirely and the greedy walk was
     # free to put it on a card that is not `head_device` -- leaving the logit
     # headroom reserved on the wrong GPU.
+    # ... and up as well as down. When the head sits inside a module whose class
+    # is in `no_split_module_classes`, the unit is that atomic ANCESTOR and the
+    # head's own name never appears, so a descendants-only filter emptied
+    # `pinned` and the greedy walk was free to put the head's card's contents
+    # anywhere -- headroom reserved on a GPU that does not hold the head.
     pinned = list(dict.fromkeys(
-        u for p in pinned for u, _ in units if u == p or u.startswith(p + ".")
+        u for p in pinned for u, _ in units
+        if u == p or u.startswith(p + ".") or p.startswith(u + ".")
     ))
 
     # Co-locate every group of units that shares a parameter, not just the
@@ -1237,11 +1243,17 @@ def _from_config_remote_aware(auto_cls: Any, config: Any, from_pretrained_kwargs
             from transformers.dynamic_module_utils import get_class_from_dynamic_module
         except ImportError:
             get_class_from_dynamic_module = None
-        repo_id, _, ref = class_ref.rpartition("--")
-        repo_id = repo_id or getattr(config, "_name_or_path", None) \
-            or getattr(config, "name_or_path", None)
-        if get_class_from_dynamic_module is not None and repo_id:
-            model_cls = get_class_from_dynamic_module(ref, repo_id, **hub_kwargs)
+        # Hand over the reference UNSPLIT, with the model's own path. The
+        # `repo--module.Class` form names a separate code repository, and
+        # `get_class_from_dynamic_module` compares the two before deciding
+        # anything: `if code_revision is None and pretrained_model_name_or_path
+        # == repo_id: code_revision = revision`. Splitting it here and passing
+        # the code repo as the path makes those two always equal, so a model
+        # `revision` would be looked for as a branch of the unrelated code repo.
+        model_path = getattr(config, "_name_or_path", None) \
+            or getattr(config, "name_or_path", None) or ""
+        if get_class_from_dynamic_module is not None and (model_path or "--" in class_ref):
+            model_cls = get_class_from_dynamic_module(class_ref, model_path, **hub_kwargs)
             return model_cls._from_config(config)
     return auto_cls.from_config(config, trust_remote_code=True)
 

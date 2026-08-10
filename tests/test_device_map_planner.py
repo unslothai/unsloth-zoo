@@ -667,7 +667,7 @@ def test_remote_code_construction_gets_the_hub_options(monkeypatch):
         {"trust_remote_code": True, "token": "t", "code_revision": "abc", "dtype": "bfloat16"},
     )
     assert out == "remote-model"
-    assert seen["ref"] == ("modeling_x.XForCausalLM", "org/repo")
+    assert seen["ref"] == ("org/repo--modeling_x.XForCausalLM", "org/repo")
     assert seen["kwargs"] == {"token": "t", "code_revision": "abc"}
     assert "fallback" not in seen
 
@@ -822,3 +822,33 @@ def test_a_failed_dynamic_resolution_keeps_the_hub_restrictions(monkeypatch):
             AutoModelForCausalLM, Cfg(),
             {"trust_remote_code": True, "local_files_only": True},
         )
+
+
+class _Wrapped(nn.Module):
+    """The head lives inside a module the caller declares atomic."""
+
+    def __init__(self, hidden = 64, vocab = 512):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+        self.layers = nn.ModuleList([_Block(hidden) for _ in range(4)])
+        self.language_model = nn.Module()
+        self.language_model.norm = nn.LayerNorm(hidden)
+        self.language_model.lm_head = nn.Linear(hidden, vocab, bias = False)
+
+    def get_output_embeddings(self):
+        return self.language_model.lm_head
+
+
+def test_an_atomic_ancestor_of_the_head_is_pinned():
+    """`_split_units` emits the atomic ancestor, not the nested head name, so a
+    descendants-only filter left `pinned` empty and the logit headroom was
+    reserved on a card that need not hold the head at all."""
+    with torch.device("meta"):
+        model = _Wrapped()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: "8GiB", 1: "8GiB"},
+        no_split_module_classes = ["Module", "_Block"],
+    )
+    assert plan.head_module == "language_model.lm_head"
+    assert plan.device_map["language_model"] == plan.head_device
