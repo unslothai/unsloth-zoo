@@ -514,8 +514,17 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
     plain walk below -- which measures a preprocessed meta ``Params4bit`` at the
     full unpacked shape in float32, several times the real size of a 4-bit
     checkpoint.
+
+    Signature support decides the ORDER, not just the arguments. The transformers
+    implementation is preferred, but it takes only ``hf_quantizer``, so on an
+    unquantised model with fp32 loader exceptions it cannot express them at all:
+    picking it there silently dropped the exceptions and charged an fp16 T5's
+    ``wo`` half. An implementation that cannot carry everything
+    :func:`_quantized_size_kwargs` asked for is therefore kept only as a
+    fallback, and the walk continues to one that can.
     """
     size_kwargs = _quantized_size_kwargs(model, hf_quantizer)
+    fallback: dict[str, int] | None = None
     for mod_path in ("transformers.integrations.accelerate", "accelerate.utils.modeling"):
         try:
             module = __import__(mod_path, fromlist=["compute_module_sizes"])
@@ -523,23 +532,24 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
             accepted = inspect.signature(fn).parameters
         except Exception:
             continue
-        attempts: list[dict[str, Any]] = []
+        # (kwargs, carries everything we needed to say)
+        attempts: list[tuple[dict[str, Any], bool]] = []
         if hf_quantizer is not None and "hf_quantizer" in accepted:
-            attempts.append({"hf_quantizer": hf_quantizer})
+            attempts.append(({"hf_quantizer": hf_quantizer}, True))
         elif size_kwargs:
             supported = {k: v for k, v in size_kwargs.items() if k in accepted}
             # Drop the extras one at a time rather than all at once: an older
             # accelerate without `special_dtypes` still gets the storage dtype,
             # which is the term that actually moves the number.
             if supported:
-                attempts.append(supported)
+                attempts.append((supported, supported.keys() >= size_kwargs.keys()))
             if "dtype" in supported and len(supported) > 1:
-                attempts.append({"dtype": supported["dtype"]})
-        # Last resort. Correct for an unquantised model, an over-estimate for a
-        # quantised one -- which refuses rather than OOMs, so it is the safe way
-        # to be wrong.
-        attempts.append({})
-        for kwargs in attempts:
+                attempts.append(({"dtype": supported["dtype"]}, False))
+        # Last resort. Correct for an unquantised model with nothing to say, an
+        # over-estimate for a quantised one -- which refuses rather than OOMs, so
+        # it is the safe way to be wrong.
+        attempts.append(({}, hf_quantizer is None and not size_kwargs))
+        for kwargs, complete in attempts:
             try:
                 out = fn(model, **kwargs)
             except Exception:
@@ -547,7 +557,14 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
             if isinstance(out, tuple):
                 out = out[0]
             if isinstance(out, Mapping) and "" in out:
-                return {k: int(v) for k, v in out.items()}
+                sizes = {k: int(v) for k, v in out.items()}
+                if complete:
+                    return sizes
+                if fallback is None:
+                    fallback = sizes
+                break
+    if fallback is not None:
+        return fallback
     sizes: dict[str, int] = {}
     for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
         nbytes = tensor.numel() * tensor.element_size()
