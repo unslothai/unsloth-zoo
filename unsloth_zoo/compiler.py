@@ -1299,10 +1299,25 @@ def create_new_function(
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
             cached_trl_version = cached_lines[3] if len(cached_lines) > 3 else "0"
+            # Only a cache generated from TRL can go stale when TRL moves. The
+            # combined model modules and the peft/torch forward patches come
+            # from transformers, peft and torch source and never import trl, so
+            # regenerating them on a TRL bump would only destroy the hand edit
+            # this escape hatch exists to protect. Deliberately over-inclusive,
+            # because a false positive costs one extra rewrite while a false
+            # negative silently keeps a broken trainer: model_location covers
+            # the normal path, including trl.experimental once TRL relocates a
+            # trainer, and the cached body is the backstop for a model_location
+            # that ever resolves outside trl, since every generated trainer
+            # carries both a `from trl` import and `_tag_names = ["trl", ...]`.
+            trl_dependent = (
+                str(model_location).split(".", 1)[0] == "trl"
+                or re.search(r"\btrl\b", file_source) is not None
+            )
             changed = []
             if cached_tf_version != transformers_version:
                 changed.append(f"transformers {cached_tf_version} -> {transformers_version}")
-            if cached_trl_version != trl_version:
+            if trl_dependent and cached_trl_version != trl_version:
                 changed.append(f"trl {cached_trl_version} -> {trl_version}")
             if changed:
                 logger.warning_once(

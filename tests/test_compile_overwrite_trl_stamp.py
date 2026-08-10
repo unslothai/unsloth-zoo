@@ -30,8 +30,10 @@ trainer, and the user is back to
 
 with none of Unsloth's patching applied.
 
-The second test is the counterweight: the hatch has to keep working when
-nothing moved, or hand-edited caches stop being editable.
+The counterweights are that the hatch has to keep working when nothing moved,
+or hand-edited caches stop being editable, and that a TRL bump must not reach
+caches TRL had no hand in: the combined model modules and the peft/torch
+forward patches are generated from transformers, peft and torch source.
 """
 
 import pytest
@@ -41,11 +43,15 @@ from unsloth_zoo import compiler
 PROBE_NAME = "UnslothCompileStampProbe"
 PROBE_SOURCE = "def _unsloth_stamp_probe():\n    return 1\n"
 
+# What unsloth/models/rl.py passes for a generated RL trainer, and what the
+# zoo's own peft / combined-module call sites pass.
+TRL_LOCATION = "trl.trainer.sft_trainer"
+NON_TRL_LOCATION = "transformers.models.qwen2.modeling_qwen2"
 
 _OMIT = object()
 
 
-def _emit(tmp_path, monkeypatch, overwrite=_OMIT):
+def _emit(tmp_path, monkeypatch, overwrite=_OMIT, model_location=TRL_LOCATION, source=PROBE_SOURCE):
     """Run create_new_function against an isolated cache dir, return the path.
 
     Leaving `overwrite` out exercises the default-argument call sites, which
@@ -57,8 +63,8 @@ def _emit(tmp_path, monkeypatch, overwrite=_OMIT):
     kwargs = {} if overwrite is _OMIT else {"overwrite": overwrite}
     compiler.create_new_function(
         PROBE_NAME,
-        PROBE_SOURCE,
-        "torch",
+        source,
+        model_location,
         [],
         **kwargs,
     )
@@ -179,7 +185,7 @@ def test_a_stamp_that_predates_the_trl_entry_is_replaced(tmp_path, monkeypatch):
     assert len(_stamp_lines(path)) == 3
 
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
-    _emit(tmp_path, monkeypatch, overwrite=False)
+    _emit(tmp_path, monkeypatch)
 
     assert _stamp_lines(path)[3] == installed_trl
 
@@ -191,6 +197,96 @@ def test_a_first_run_with_no_cache_still_writes_the_file(tmp_path, monkeypatch):
 
     assert path.is_file()
     assert len(_stamp_lines(path)) == 4
+
+
+def test_a_trl_bump_leaves_a_non_trl_cache_alone(tmp_path, monkeypatch):
+    """A combined model module cannot go stale because TRL moved.
+
+    It is generated from transformers source and never imports trl, so
+    regenerating it here would destroy the hand edit for nothing.
+    """
+    path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=NON_TRL_LOCATION)
+    marker = "# hand edited, do not clobber\n"
+    path.write_text(path.read_text() + marker)
+    _rewrite_trl_stamp(path, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch, model_location=NON_TRL_LOCATION)
+
+    assert marker in path.read_text()
+    assert _stamp_lines(path)[3] == "0.0.1-stale"
+
+
+def test_a_transformers_bump_still_reaches_a_non_trl_cache(tmp_path, monkeypatch):
+    """The narrowing is for the TRL half only; transformers stays unconditional."""
+    path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=NON_TRL_LOCATION)
+    installed_tf = _stamp_lines(path)[2]
+    _rewrite_stamp(path, 2, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch, model_location=NON_TRL_LOCATION)
+
+    assert _stamp_lines(path)[2] == installed_tf
+
+
+def test_a_trl_body_is_invalidated_even_from_a_non_trl_location(tmp_path, monkeypatch):
+    """Backstop for a model_location that ever resolves outside trl.
+
+    Missing an invalidation is the expensive direction: the stale trainer fails
+    to import and Unsloth silently falls back to TRL's own untouched trainer.
+    Every generated trainer body carries the marker even if the path does not.
+    """
+    trl_body = 'def _unsloth_stamp_probe():\n    _tag_names = ["trl", "sft"]\n    return 1\n'
+    path = _emit(
+        tmp_path, monkeypatch, overwrite=True,
+        model_location="somewhere.else.weird_trainer", source=trl_body,
+    )
+    installed_trl = _stamp_lines(path)[3]
+    _rewrite_trl_stamp(path, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(
+        tmp_path, monkeypatch,
+        model_location="somewhere.else.weird_trainer", source=trl_body,
+    )
+
+    assert _stamp_lines(path)[3] == installed_trl
+
+
+def test_a_relocated_experimental_trainer_is_still_invalidated(tmp_path, monkeypatch):
+    """TRL moves trainers to trl.experimental, and rl.py follows them there.
+
+    On trl 0.25.1 BCO already resolves to trl.experimental.bco.bco_trainer, so
+    the dependency signal keys on the top-level package rather than a
+    `trl.trainer.` prefix, which would skip exactly the trainers that moved.
+    """
+    location = "trl.experimental.bco.bco_trainer"
+    path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=location)
+    installed_trl = _stamp_lines(path)[3]
+    _rewrite_trl_stamp(path, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch, overwrite=False, model_location=location)
+
+    assert _stamp_lines(path)[3] == installed_trl
+
+
+def test_the_trl_marker_is_matched_as_a_whole_word(tmp_path, monkeypatch):
+    """`ctrl` in a body must not make a non-TRL cache look TRL-dependent."""
+    ctrl_body = 'def _unsloth_stamp_probe():\n    ctrl = 1  # ctrl, not trl\n    return ctrl\n'
+    path = _emit(
+        tmp_path, monkeypatch, overwrite=True,
+        model_location=NON_TRL_LOCATION, source=ctrl_body,
+    )
+    # The body comment above deliberately contains a real whole-word `trl`;
+    # strip it so only `ctrl` remains, which must not trip the backstop.
+    path.write_text(path.read_text().replace("# ctrl, not trl", "# ctrl only"))
+    _rewrite_trl_stamp(path, "0.0.1-stale")
+
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    _emit(tmp_path, monkeypatch, model_location=NON_TRL_LOCATION, source=ctrl_body)
+
+    assert _stamp_lines(path)[3] == "0.0.1-stale"
 
 
 if __name__ == "__main__":
