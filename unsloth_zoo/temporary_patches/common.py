@@ -375,8 +375,15 @@ def _maybe_compile(**kwargs):
     if UNSLOTH_COMPILE_DISABLE or UNSLOTH_COMPILE_DISABLE_PARTIAL:
         return lambda fn: fn
     if not kwargs.get("fullgraph"):
-        return torch.compile(**kwargs)
+        # `unwrap_already_compiled` for the same reason the funnel needs it:
+        # `torch.compile(**kwargs)` is Dynamo's own decorator, and handing it a
+        # `functools.wraps` copy of a compiled function is a bare AssertionError
+        # on torch 2.11+.
+        def decorate(function):
+            return torch.compile(unwrap_already_compiled(function), **kwargs)
+        return decorate
     # Under fullgraph Dynamo makes cache exhaustion fatal, so these regions get
-    # `patch_function`'s eager fallback. Lazy import: utils imports this module.
+    # `patch_function`'s eager fallback, which unwraps on its own. Lazy import:
+    # utils imports this module.
     from .utils import torch_compile_with_fallback
     return torch_compile_with_fallback(**kwargs)
