@@ -14125,6 +14125,12 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
 
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
+    try:
+        from unsloth_zoo.saving_utils import sanitize_tokenizer_class_in_config
+
+        sanitize_tokenizer_class_in_config(tokenizer, path)
+    except Exception:
+        pass
 
     src_path = _get_src_path(model)
     if src_path is not None:
@@ -14412,6 +14418,9 @@ def save_pretrained_merged(
             save_lora_adapters(model, save_directory)
         try:
             tokenizer.save_pretrained(str(save_directory))
+            from unsloth_zoo.saving_utils import sanitize_tokenizer_class_in_config
+
+            sanitize_tokenizer_class_in_config(tokenizer, save_directory)
         except Exception:
             pass
     else:

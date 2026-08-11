@@ -2814,6 +2814,62 @@ def _remove_transformers_version(config_path: Path):
     pass
 pass
 
+_UNLOADABLE_TOKENIZER_CLASSES = frozenset({"TokenizersBackend"})
+
+
+def _exportable_tokenizer_class(tokenizer, saved_folder):
+    """Return a HuggingFace-loadable tokenizer_class for tokenizer_config.json."""
+    source = tokenizer
+    if tokenizer is not None and hasattr(tokenizer, "tokenizer"):
+        source = tokenizer.tokenizer
+    if source is not None:
+        class_name = type(source).__name__
+        if class_name not in _UNLOADABLE_TOKENIZER_CLASSES:
+            return class_name
+
+    saved_folder = str(saved_folder)
+    if os.path.isfile(os.path.join(saved_folder, "tokenizer.json")):
+        return "PreTrainedTokenizerFast"
+    return None
+
+
+def sanitize_tokenizer_class_in_config(tokenizer, saved_folder, filename_prefix = None):
+    """Rewrite internal tokenizer_class names that AutoTokenizer cannot load.
+
+    Transformers 5.x fast tokenizers can serialize as ``TokenizersBackend``, which is
+    an internal wrapper rather than a registered tokenizer class. Downstream tools
+    (``AutoTokenizer``, llama.cpp, mlx_lm) need a loadable value such as
+    ``PreTrainedTokenizerFast`` when ``tokenizer.json`` is present.
+    """
+    if saved_folder is None:
+        return
+
+    tokenizer_config_name = (
+        f"{filename_prefix}-tokenizer_config.json" if filename_prefix else "tokenizer_config.json"
+    )
+    tokenizer_config_path = os.path.join(str(saved_folder), tokenizer_config_name)
+    if not os.path.isfile(tokenizer_config_path):
+        return
+
+    replacement = _exportable_tokenizer_class(tokenizer, saved_folder)
+    if replacement is None:
+        return
+
+    try:
+        with open(tokenizer_config_path, "r", encoding = "utf-8") as file:
+            config = json.load(file)
+        if config.get("tokenizer_class") not in _UNLOADABLE_TOKENIZER_CLASSES:
+            return
+        if config.get("tokenizer_class") == replacement:
+            return
+        config["tokenizer_class"] = replacement
+        with open(tokenizer_config_path, "w", encoding = "utf-8") as file:
+            json.dump(config, file, indent = 2, ensure_ascii = False)
+            file.write("\n")
+    except Exception:
+        pass
+
+
 def fix_tokenizer_config_json(tokenizer, saved_folder):
     # Add "chat_template" to tokenizer_config.json
     tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
@@ -2842,6 +2898,7 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
         except:
             pass
     pass
+    sanitize_tokenizer_class_in_config(tokenizer, saved_folder)
     # Fix config.json using torch_dtype / dtype
     config_file_path = os.path.join(saved_folder, "config.json")
     if os.path.exists(config_file_path):
