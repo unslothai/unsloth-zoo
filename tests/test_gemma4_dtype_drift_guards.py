@@ -796,10 +796,20 @@ def _merge_result_is_used(forward, call):
     UNCHANGED `inputs_embeds` - the features silently never reach the model, with
     every dtype canary in this file green. So follow the result forward instead:
     it must flow, directly or through temporaries, into `inputs_embeds` or into a
-    `return`. The in-place `masked_scatter_` writes through the receiver's
-    storage and needs no result at all.
+    `return`.
+
+    The in-place `masked_scatter_` needs no result ONLY when its receiver is
+    `inputs_embeds` itself, because that is the one spelling whose write lands in
+    the embeddings `forward` goes on to use. On a transformed receiver -
+    `inputs_embeds.clone().masked_scatter_(...)`, or the device-changing
+    `inputs_embeds.to(...).masked_scatter_(...)`, both of which
+    `_receiver_preserves_embeds_dtype` accepts as dtype-safe - the mutation lands
+    in a temporary and `forward` still returns the unchanged `inputs_embeds`. So
+    only skip the result-flow analysis for a receiver that is guaranteed to alias
+    the original embeddings; anything else has to hand its result back like the
+    out-of-place spelling does (`masked_scatter_` returns the receiver, so it can).
     """
-    if call.func.attr.endswith("_"):
+    if call.func.attr.endswith("_") and _is_embeds_tensor(call.func.value):
         return True
     statements = _statements_after(forward, call)
     if statements is None:
@@ -1387,6 +1397,12 @@ _RESULT_USE_CONTROLS = [
      "return inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
+    # `masked_scatter_` returns its receiver, so a transformed in-place receiver
+    # that hands the result back is exactly as safe as the out-of-place spelling.
+    ("in-place merge into a clone whose result is assigned back",
+     "inputs_embeds = inputs_embeds.clone().masked_scatter_(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
 ]
 
 
@@ -1512,6 +1528,17 @@ _DISCARDED_RESULT_HOLES = [
      "collected = [inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")]"),
+    # `masked_scatter_` is in place in the RECEIVER's storage. On a clone or a
+    # device-changed copy that storage is a temporary, so the discarded result is
+    # the whole merge: `forward` returns the unchanged `inputs_embeds`.
+    ("in-place merge into a clone of the embeddings",
+     "inputs_embeds.clone().masked_scatter_(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("in-place merge into a device-changed copy of the embeddings",
+     "inputs_embeds.to('cuda').masked_scatter_(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
 ]
 
 
