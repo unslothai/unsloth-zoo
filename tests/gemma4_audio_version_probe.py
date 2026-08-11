@@ -407,7 +407,7 @@ def main():
     from unsloth_zoo.mlx import utils as U
     U._AUDIO_QUALIFIED_FAMILIES = dict(
         U._AUDIO_QUALIFIED_FAMILIES,
-        gemma4=U._AudioVersions(version, version),
+        gemma4=U._AudioVersions(version),
     )
     U._AUDIO_MIN_TRANSFORMERS = {}
 

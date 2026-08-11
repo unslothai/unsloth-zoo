@@ -55,7 +55,7 @@ except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
 from ..utils import Version
-from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
+from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger, unwrap_already_compiled
 
 EMPTY = inspect._empty
 
@@ -1640,8 +1640,16 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
 
     `fullgraph = False` is returned untouched: Dynamo already falls back by
     itself there, so wrapping would add a layer that can never fire.
+
+    This is a BARE decorator: `compiler.py` writes it into every generated
+    `unsloth_compiled_cache` module and `rl_replacements.py` applies it directly,
+    so it reaches `torch.compile` without passing through `_compile_or_fall_back`
+    and needs its own `unwrap_already_compiled`. What it returns is a
+    `functools.wraps` copy of a compiled function, which is precisely the shape
+    torch 2.11+ refuses to compile again.
     """
     def _decorate(func):
+        func = unwrap_already_compiled(func)
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if not fullgraph:
             return compiled
@@ -1790,25 +1798,42 @@ def patch_function(
 
     # torch.compile if requested.
     if fullgraph is not None and type(fullgraph) is bool and not UNSLOTH_COMPILE_DISABLE:
-        # Unwrap already-compiled functions.
-        if hasattr(new_func, "get_compiler_config"):
-            new_func = new_func.__wrapped__
-        if hasattr(original_func, "get_compiler_config"):
-            original_func = original_func.__wrapped__
+        # Unwrap already-compiled functions. The shared helper rather than a
+        # bare `.__wrapped__`: a carrier without one (an `OptimizedModule`, say)
+        # raised `AttributeError` here, a bound method's `__wrapped__` is the
+        # UNBOUND original and silently dropped the receiver, and one hop is not
+        # always enough to reach the eager function.
+        new_func = unwrap_already_compiled(new_func)
+        original_func = unwrap_already_compiled(original_func)
         _eager_func = new_func
-        new_func = torch.compile(
-            new_func,
-            fullgraph = fullgraph,
-            dynamic = dynamic,
-            options = torch_compile_options,
-        )
-        if fullgraph:
-            # Only fullgraph turns cache exhaustion into a raise; without it
-            # Dynamo already falls back on its own.
-            new_func = _fall_back_to_eager_on_recompile_limit(
-                new_func, _eager_func,
-                f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+        # The compile is guarded the way `_compile_or_fall_back` guards its own,
+        # and for the same reason: a patch that cannot be compiled is a
+        # performance problem, and the eager function is still correct, so it
+        # must not end the model load. Reachable on torch 2.11+ for whatever
+        # `unwrap_already_compiled` deliberately leaves alone -- a compiled BOUND
+        # method keeps its receiver, and torch refuses to compile it again.
+        try:
+            new_func = torch.compile(
+                new_func,
+                fullgraph = fullgraph,
+                dynamic = dynamic,
+                options = torch_compile_options,
             )
+        except Exception as exception:
+            _label = f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}"
+            logger.warning(
+                f"Unsloth: torch.compile refused to wrap {_label}; running it "
+                f"eagerly. ({type(exception).__name__}: {exception})"
+            )
+            new_func = _eager_func
+        else:
+            if fullgraph:
+                # Only fullgraph turns cache exhaustion into a raise; without it
+                # Dynamo already falls back on its own.
+                new_func = _fall_back_to_eager_on_recompile_limit(
+                    new_func, _eager_func,
+                    f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+                )
     pass
 
     # Stash original under a unique name for later restoration.
