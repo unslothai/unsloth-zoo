@@ -334,9 +334,32 @@ def _is_dtype_guard(test, feature):
     )
 
 
+def _bound_names(target):
+    """Every plain name an assignment target binds.
+
+    Recurses through destructuring targets, because
+    `image_features, feature_lens = self.pack_image_features(...)` (the
+    llava_next / llava_onevision / llava_next_video spelling) rebinds
+    `image_features` just as much as a bare `image_features = ...` does. Missing
+    it lets an earlier aligned assignment keep proving alignment for a tensor
+    that has since been replaced by an unpacked, possibly mismatched one.
+
+    `image_features[0] = ...` (Subscript) and `self.image_features = ...`
+    (Attribute) are deliberately NOT name rebindings: the name still refers to
+    the same object afterwards.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for elt in target.elts for name in _bound_names(elt)]
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    return []
+
+
 def _assigns_feature(stmt, feature):
     targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-    return any(isinstance(t, ast.Name) and t.id == feature for t in targets)
+    return any(feature in _bound_names(t) for t in targets)
 
 
 _ASSIGN_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
@@ -362,12 +385,20 @@ def _rebinding_alignment(stmt, feature):
     # `if <feature>.dtype != inputs_embeds.dtype: <feature> = <feature>.to(...)`
     # is a cast-if-needed idiom (transformers spells it in blip_2 / granite_speech):
     # the untaken branch is aligned by definition, so it counts as unconditional.
+    #
+    # Both branches still have to be analysed as PATHS, not as a bag of
+    # rebindings whose textually last one wins. `if enabled: <feature> =
+    # <feature>.to(inputs_embeds.dtype)` nested inside the guard, or an aligned
+    # `else` after an unaligned body, would otherwise report the whole guard
+    # aligned while the mismatch path leaves the feature un-cast.
     if isinstance(stmt, ast.If) and _is_dtype_guard(stmt.test, feature):
-        inner = _feature_rebindings(stmt, feature)
-        if inner:
-            last = max(inner, key = lambda s: s.lineno)
-            value = getattr(last, "value", None)
-            return value is not None and _casts_to_inputs_embeds_dtype(value)
+        if _feature_rebindings(stmt, feature):
+            # Body runs only on a mismatch (starts unaligned); `orelse` only when
+            # the dtypes already agree (starts aligned). Both ends must be aligned.
+            return (
+                _sequence_alignment(stmt.body, feature, False)
+                and _sequence_alignment(stmt.orelse, feature, True)
+            )
     # Any OTHER compound statement that rebinds the feature is still a rebinding
     # on the path to the merge and must not be skipped, or an earlier aligned
     # assignment would keep proving alignment for a value that has since been
@@ -395,6 +426,22 @@ def _rebinding_alignment(stmt, feature):
         if value is None or not _casts_to_inputs_embeds_dtype(value):
             return False
     return None
+
+
+def _sequence_alignment(block, feature, initial):
+    """Alignment of `<feature>` after running `block` top to bottom.
+
+    `initial` is the state on entry to the block. Statements that say nothing
+    about the feature (`_rebinding_alignment` -> `None`, which includes a
+    conditional rebinding that only ever casts to `inputs_embeds.dtype`, since
+    it may not run) leave the running state alone.
+    """
+    state = initial
+    for stmt in block:
+        aligned = _rebinding_alignment(stmt, feature)
+        if aligned is not None:
+            state = aligned
+    return state
 
 
 def _dominating_alignment(forward, feature, merge_arg):
@@ -580,3 +627,164 @@ def test_audio_compiler_transform_still_fixes_the_device_only_spelling():
         "fix_gemma4_audio_feature_dtype no longer rewrites the device-only audio "
         "cast shipped by transformers 5.5.0-5.14.1."
     )
+
+
+# ---------------------------------------------------------------------------
+# Tracer unit tests. The canaries above are only as good as `_merge_dtype_alignment`,
+# and a hole in it is invisible: it reports GREEN on a source that crashes. These
+# feed the tracer a minimal synthetic `Gemma4Model.forward` (no transformers
+# needed, so they run on every supported version) and pin the verdict on the
+# spellings that used to slip through.
+# ---------------------------------------------------------------------------
+def _synthetic_forward(body):
+    """Minimal `Gemma4Model.forward` with `body` between the features and the merge."""
+    indented = "\n".join("            " + line if line else "" for line in body.strip("\n").split("\n"))
+    return (
+        "class Gemma4Model:\n"
+        "    def forward(self, inputs_embeds, pixel_values, image_mask):\n"
+        "        if pixel_values is not None:\n"
+        "            image_features = self.get_image_features(pixel_values)\n"
+        f"{indented}\n"
+        "            inputs_embeds = inputs_embeds.masked_scatter(\n"
+        "                image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)\n"
+        "            )\n"
+        "        return inputs_embeds\n"
+    )
+
+
+_ALIGNED_ASSIGN = "image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)"
+
+
+# Every path inside a `<feature>.dtype != inputs_embeds.dtype` guard has to end
+# aligned. Taking the textually last rebinding inside the guard instead reports
+# aligned for a guard whose MISMATCH path leaves the feature un-cast, which is
+# exactly one reachable `masked_scatter_: expected self and source to have same
+# dtypes`.
+_GUARD_HOLES = [
+    ("cast nested under a second condition",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     "    if self.config.cast_vision_features:\n"
+     f"        {_ALIGNED_ASSIGN}"),
+    ("unaligned body, aligned else (textually last)",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     "    image_features = image_features.to(inputs_embeds.device)\n"
+     "else:\n"
+     f"    {_ALIGNED_ASSIGN}"),
+    ("aligned cast then a conditional rebinding that undoes it",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     f"    {_ALIGNED_ASSIGN}\n"
+     "    if self.config.upcast_vision_features:\n"
+     "        image_features = image_features.float()"),
+    ("aligned else only, mismatch path rebinds nothing aligned",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     "    image_features = image_features.reshape(-1, inputs_embeds.shape[-1])\n"
+     "else:\n"
+     f"    {_ALIGNED_ASSIGN}"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body", _GUARD_HOLES, ids = [case[0] for case in _GUARD_HOLES],
+)
+def test_conditional_cast_inside_a_dtype_guard_is_not_alignment(label, body):
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found, f"{label}: the synthetic merge site itself was not found"
+    assert not aligned, (
+        f"{label}: the tracer reports `image_features` dtype-aligned, but the "
+        f"dtype-mismatch path reaches masked_scatter with no `inputs_embeds.dtype` "
+        f"cast. A real upstream source spelled this way would keep every canary in "
+        f"this file green while the merge crashed."
+    )
+
+
+_GUARD_CONTROLS = [
+    ("plain cast-if-needed (blip_2 / granite_speech idiom)",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     f"    {_ALIGNED_ASSIGN}"),
+    ("dtype-only cast-if-needed, device carried at the merge",
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     "    image_features = image_features.to(inputs_embeds.dtype)"),
+    ("reversed operand order",
+     "if inputs_embeds.dtype != image_features.dtype:\n"
+     f"    {_ALIGNED_ASSIGN}"),
+    ("aligned assign then a guard that only raises",
+     f"{_ALIGNED_ASSIGN}\n"
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     "    raise ValueError('dtype mismatch')"),
+    ("aligned assign then a guard that casts again",
+     f"{_ALIGNED_ASSIGN}\n"
+     "if image_features.dtype != inputs_embeds.dtype:\n"
+     f"    {_ALIGNED_ASSIGN}"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body", _GUARD_CONTROLS, ids = [case[0] for case in _GUARD_CONTROLS],
+)
+def test_cast_if_needed_guards_still_count_as_alignment(label, body):
+    # Controls for the test above: these are dtype-safe on every path and must
+    # NOT turn red, or the canaries start failing on a healthy upstream.
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
+
+
+# A destructuring assignment rebinds the feature name just like a plain one.
+# `image_features, feature_lens = self.pack_image_features(...)` is upstream's
+# own spelling in llava_next / llava_next_video / llava_onevision; skipping it
+# lets an earlier aligned assignment keep proving alignment for a tensor that
+# has since been replaced.
+_UNPACK_HOLES = [
+    ("tuple unpack",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features, feature_lens = self.pack_image_features(image_features)"),
+    ("starred unpack",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features, *feature_lens = self.pack_image_features(image_features)"),
+    ("list-target unpack",
+     f"{_ALIGNED_ASSIGN}\n"
+     "[image_features, feature_lens] = self.pack_image_features(image_features)"),
+    ("nested tuple unpack",
+     f"{_ALIGNED_ASSIGN}\n"
+     "(image_features, feature_lens), image_sizes = self.pack_image_features(image_features)"),
+    ("conditional tuple unpack",
+     f"{_ALIGNED_ASSIGN}\n"
+     "if self.config.pack_image_features:\n"
+     "    image_features, feature_lens = self.pack_image_features(image_features)"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body", _UNPACK_HOLES, ids = [case[0] for case in _UNPACK_HOLES],
+)
+def test_destructuring_rebindings_of_the_feature_are_not_skipped(label, body):
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found, f"{label}: the synthetic merge site itself was not found"
+    assert not aligned, (
+        f"{label}: the tracer still credits the earlier aligned assignment even "
+        f"though `image_features` was rebound by an unpack whose value carries no "
+        f"`inputs_embeds.dtype` cast. The unpacked tensor reaches masked_scatter."
+    )
+
+
+_UNPACK_CONTROLS = [
+    ("unpack whose value casts dtype",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features, feature_lens = self.pack_image_features(\n"
+     "    image_features.to(inputs_embeds.device, inputs_embeds.dtype))"),
+    ("unpack binding other names only",
+     f"{_ALIGNED_ASSIGN}\n"
+     "feature_lens, image_sizes = self.pack_image_features(image_features)"),
+    ("subscript and attribute targets are not name rebindings",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features[0] = image_features[0]\n"
+     "self.image_features = image_features"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body", _UNPACK_CONTROLS, ids = [case[0] for case in _UNPACK_CONTROLS],
+)
+def test_non_rebinding_targets_do_not_break_alignment(label, body):
+    # Controls for the test above.
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
