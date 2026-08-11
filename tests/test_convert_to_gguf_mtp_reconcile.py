@@ -299,3 +299,109 @@ def test_convert_to_gguf_rejects_malformed_layer_count_before_rewrite(llama_cpp,
         )
 
     assert json.loads(config_path.read_text(encoding = "utf-8")) == config
+
+
+@pytest.mark.parametrize(
+    "location",
+    [None, 123, "", "\x00bad"],
+    ids = ["none", "not-a-path", "empty", "nul-byte"],
+)
+def test_converter_support_probe_never_raises_on_an_unusable_location(llama_cpp, location):
+    """The probe answers "can I prove --no-mtp is supported", so anything it
+    cannot read is False. Only OSError was caught, so a None location raised
+    TypeError out of convert_to_gguf instead of degrading to today's behaviour."""
+    assert llama_cpp._converter_supports_no_mtp(location) is False
+
+
+def test_converter_support_probe_reads_a_directory_as_unsupported(llama_cpp, tmp_path):
+    assert llama_cpp._converter_supports_no_mtp(str(tmp_path)) is False
+
+
+def _write_arch_gated_converter(path: Path) -> Path:
+    """A converter that declares `--no-mtp` but refuses it for this architecture.
+
+    llama.cpp `25558268` added the flag and its architecture allowlist in the
+    same commit, so "the option exists" never implies "this model may use it".
+    """
+    converter = path / "arch_gated_convert.py"
+    command_log = path / "converter_commands.jsonl"
+    converter.write_text(
+        textwrap.dedent(
+            f"""
+            import argparse
+            import json
+            import sys
+            from pathlib import Path
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--outfile")
+            parser.add_argument("--outtype")
+            parser.add_argument("--split-max-size")
+            parser.add_argument("--no-nextn", "--no-mtp", dest="no_mtp", action="store_true")
+            parser.add_argument("--mmproj", action="store_true")
+            parser.add_argument("model_dir")
+            args = parser.parse_args()
+            with Path({str(command_log)!r}).open("a", encoding="utf-8") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
+            if args.no_mtp:
+                sys.stderr.write(
+                    "ERROR:hf-to-gguf:--mtp / --no-nextn are not supported "
+                    "for LlamaForCausalLM\\n"
+                )
+                raise SystemExit(1)
+            Path(args.outfile).write_bytes(b"GGUF")
+            """
+        ),
+        encoding = "utf-8",
+    )
+    return converter
+
+
+def test_convert_to_gguf_drops_no_mtp_when_the_architecture_refuses_it(llama_cpp, tmp_path):
+    """A declared-but-unsupported MTP key must not break a conversion that worked.
+
+    `_mtp_declared` reads config.json only, so a checkpoint that carries
+    `mtp_num_hidden_layers` while its architecture has no MTP block (Qwen3.5
+    weights republished under `Qwen3ForCausalLM`, for instance) would send
+    `--no-mtp` to a converter that hard-rejects it. Before the retry, that turned
+    a working export into a failure citing a flag the caller never passed.
+    """
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "mtp_num_hidden_layers": 1,
+                "unsloth_fixed_mtp": True,
+                "num_hidden_layers": 24,
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.layers.23.self_attn.q_proj.weight")
+    output = tmp_path / "output.gguf"
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(output),
+        input_folder = str(model_dir),
+        converter_location = str(_write_arch_gated_converter(tmp_path)),
+        quantization_type = "bf16",
+    )
+
+    first, second = _read_converter_commands(tmp_path)
+    assert "--no-mtp" in first        # tried, because the option is declared
+    assert "--no-mtp" not in second   # retried without it once refused
+    assert output.read_bytes() == b"GGUF"
+
+
+def test_convert_to_gguf_does_not_retry_an_unrelated_converter_failure(llama_cpp, tmp_path):
+    """The retry is keyed on the architecture refusal, not on any failure."""
+    assert llama_cpp._converter_rejected_no_mtp(
+        "ERROR:hf-to-gguf:--mtp / --no-nextn are not supported for LlamaForCausalLM"
+    ) is True
+    assert llama_cpp._converter_rejected_no_mtp("MemoryError: out of memory") is False
+    assert llama_cpp._converter_rejected_no_mtp("INFO: exporting with --no-mtp") is False
+    assert llama_cpp._converter_rejected_no_mtp("") is False
+    assert llama_cpp._drop_no_mtp(["x", "--no-mtp", "y"]) == ["x", "y"]
+    assert llama_cpp._drop_no_mtp(["x", "y"]) is None

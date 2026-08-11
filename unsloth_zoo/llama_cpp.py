@@ -2322,7 +2322,11 @@ def _converter_supports_no_mtp(converter_location):
     """Return whether the selected converter declares the `--no-mtp` option."""
     try:
         source = Path(converter_location).read_bytes()
-    except OSError:
+    except (OSError, TypeError, ValueError):
+        # OSError covers a missing path, a directory and an unreadable file;
+        # TypeError/ValueError cover None and a path carrying a NUL. Every one of
+        # them means "cannot prove support", which is the safe answer: omitting
+        # --no-mtp only restores the pre-existing behaviour.
         return False
     return re.search(
         rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
@@ -2361,6 +2365,24 @@ def _converter_was_oom_killed(exc):
     if getattr(exc, "returncode", None) in (-9, 137):
         return True
     return "sigkill" in f"{exc}".lower()
+
+
+def _converter_rejected_no_mtp(text):
+    """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
+    if not text: return False
+    for line in text.splitlines():
+        low = line.lower()
+        if "--mtp" not in low and "--no-mtp" not in low and "--no-nextn" not in low:
+            continue
+        if "not supported" in low or "only supported" in low:
+            return True
+    return False
+
+
+def _drop_no_mtp(command):
+    """The same command without `--no-mtp`, or None when it has none to drop."""
+    if "--no-mtp" not in command: return None
+    return [token for token in command if token != "--no-mtp"]
 
 
 def _retry_with_temp_file(command):
@@ -2647,6 +2669,7 @@ def convert_to_gguf(
         # is broken. No cost on the happy path.
         attempted_repair = False
         attempted_temp_file = False
+        attempted_no_mtp_drop = False
         repair_note = ""
         optional_failed = False
         while True:
@@ -2680,6 +2703,17 @@ def convert_to_gguf(
                         repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                # The `--no-mtp` gate is an architecture allowlist, so a
+                # config key alone cannot prove the flag is accepted. Drop it
+                # and retry once: that is exactly the pre-existing behaviour,
+                # which is correct for an arch with no MTP block to strip.
+                if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
+                    retry = _drop_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_drop = True
+                        command = retry
+                        continue
 
                 # OOM-killed: retry once spooling to disk, the one resource
                 # these machines have. Only for a kill, so a converter that
