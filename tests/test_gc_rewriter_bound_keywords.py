@@ -109,6 +109,11 @@ _TOY_REPLACE = """hidden_states = layer(
                 extra=extra,
                 **kwargs,
             )"""
+# Same call site with no keyword expansion left at all.
+_TOY_REPLACE_NO_KWARGS = """hidden_states = layer(
+                hidden_states,
+                extra=extra,
+            )"""
 
 
 def _rewrite_toy(monkeypatch, entry):
@@ -130,12 +135,36 @@ def _for_loop_body(forward_source):
     raise AssertionError("no for-loop in the rewritten forward")
 
 
-def test_rewriter_two_tuple_entries_are_unchanged(monkeypatch):
-    """A 2-tuple entry declares no bound keywords, so nothing about the emitted
-    code may change - every entry that shipped before is a 2-tuple."""
+def test_rewriter_two_tuple_entries_declare_no_bound_keyword(monkeypatch):
+    """A 2-tuple entry declares no bound keywords, so no extra keyword appears.
+
+    The layer's own ``**kwargs`` expansion still has to move into the callable:
+    it is a keyword expansion like any other, and leaving it in the argument
+    list hands the layer's runtime keywords to the checkpoint function."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE))
-    assert "functools.partial" not in forward
     assert "sentinel" not in forward
+    branch = _for_loop_body(forward).body[0]
+    checkpointed = branch.body[0].value
+    assert [kw.arg for kw in checkpointed.keywords] == []
+    callable_arg = checkpointed.args[0]
+    assert ast.unparse(callable_arg.func) == "functools.partial"
+    assert [
+        (kw.arg, ast.unparse(kw.value)) for kw in callable_arg.keywords
+    ] == [(None, "kwargs")]
+    ast.parse(textwrap.dedent(forward))
+
+
+def test_rewriter_leaves_a_kwargless_call_site_alone(monkeypatch):
+    """No ``**kwargs`` at the call site and no declared keyword means no
+    ``functools.partial`` at all - the pre-existing zero-overhead emission."""
+    forward = _rewrite_toy(
+        monkeypatch, (_TOY_FIND, _TOY_REPLACE_NO_KWARGS),
+    )
+    assert "functools.partial" not in forward
+    branch = _for_loop_body(forward).body[0]
+    checkpointed = branch.body[0].value
+    assert ast.unparse(checkpointed.args[0]) == "layer.__call__"
+    assert checkpointed.keywords == []
     ast.parse(textwrap.dedent(forward))
 
 
@@ -153,18 +182,21 @@ def test_rewriter_binds_declared_keyword_into_the_callable(monkeypatch, declarat
     checkpointed = branch.body[0].value
     assert isinstance(checkpointed, ast.Call)
     assert ast.unparse(checkpointed.func) == "self._gradient_checkpointing_func"
-    # Nothing may be left as a keyword on the checkpoint function itself.
-    assert [kw.arg for kw in checkpointed.keywords] == [None], (
-        "only the layer's own **kwargs may reach _gradient_checkpointing_func; "
+    # NOTHING may be left as a keyword on the checkpoint function itself - not
+    # the declared keyword and not the layer's own **kwargs expansion, which is
+    # empty often enough to look harmless and then raises `Unexpected keyword
+    # arguments` the first time a caller passes anything.
+    assert [kw.arg for kw in checkpointed.keywords] == [], (
+        "no keyword may reach _gradient_checkpointing_func; "
         f"got {[kw.arg for kw in checkpointed.keywords]}"
     )
     callable_arg = checkpointed.args[0]
     assert isinstance(callable_arg, ast.Call)
     assert ast.unparse(callable_arg.func) == "functools.partial"
     assert ast.unparse(callable_arg.args[0]) == "layer.__call__"
-    assert {kw.arg: ast.unparse(kw.value) for kw in callable_arg.keywords} == {
-        "sentinel": "sentinel",
-    }
+    assert [
+        (kw.arg, ast.unparse(kw.value)) for kw in callable_arg.keywords
+    ] == [("sentinel", "sentinel"), (None, "kwargs")]
 
     direct = branch.orelse[0].value
     assert isinstance(direct, ast.Call)
@@ -179,7 +211,7 @@ def test_rewriter_bound_keyword_supports_a_custom_expression(monkeypatch):
     forward = _rewrite_toy(
         monkeypatch, (_TOY_FIND, _TOY_REPLACE, {"sentinel": "extra"}),
     )
-    assert "functools.partial(layer.__call__, sentinel = extra)" in forward
+    assert "functools.partial(layer.__call__, sentinel = extra, **kwargs)" in forward
     ast.parse(textwrap.dedent(forward))
 
 
@@ -193,12 +225,56 @@ def test_rewriter_both_branches_call_the_layer_identically(monkeypatch):
 
     positional = [ast.unparse(a) for a in checkpointed.args[1:]]
     assert positional == [ast.unparse(a) for a in direct.args]
-    assert (
-        {kw.arg: ast.unparse(kw.value) for kw in checkpointed.args[0].keywords}
-        == {kw.arg: ast.unparse(kw.value) for kw in direct.keywords if kw.arg}
+    # Every keyword the direct branch passes - named or expanded - has to be on
+    # the partial instead, and none of them on the checkpoint function.
+    assert sorted(
+        (str(kw.arg), ast.unparse(kw.value)) for kw in checkpointed.args[0].keywords
+    ) == sorted(
+        (str(kw.arg), ast.unparse(kw.value)) for kw in direct.keywords
     )
-    assert [kw.arg for kw in checkpointed.keywords] == \
-        [kw.arg for kw in direct.keywords if kw.arg is None]
+    assert checkpointed.keywords == []
+
+
+def test_rewritten_forward_survives_non_empty_runtime_kwargs(monkeypatch):
+    """Executed proof, not just emitted text.
+
+    With an EMPTY ``**kwargs`` the old emission worked by accident, which is how
+    the leak survived review. Give the forward one real runtime keyword and the
+    reentrant ``torch.utils.checkpoint.checkpoint`` raises ``ValueError:
+    Unexpected keyword arguments`` instead of ever reaching the layer."""
+    forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE, ("sentinel",)))
+
+    seen = []
+
+    class _Layer(torch.nn.Module):
+        def forward(self, hidden_states, extra, **kwargs):
+            seen.append(dict(kwargs))
+            return hidden_states * extra
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([_Layer(), _Layer()])
+            self.gradient_checkpointing = True
+            self._gradient_checkpointing_func = functools.partial(
+                torch.utils.checkpoint.checkpoint, use_reentrant = True,
+            )
+
+    namespace = {"torch": torch, "functools": functools, "sentinel": 7}
+    exec(compile(textwrap.dedent(forward), "<rewritten>", "exec"), namespace)
+    _Model.forward = namespace["forward"]
+
+    model = _Model()
+    model.train()
+    hidden_states = torch.randn(4, requires_grad = True)
+    out = model(hidden_states, torch.tensor(2.0), probe = "delivered")
+    out.sum().backward()
+
+    assert seen, "the layer was never called"
+    for kwargs in seen:
+        assert kwargs["sentinel"] == 7, "declared keyword lost"
+        assert kwargs["probe"] == "delivered", "runtime keyword never reached the layer"
+    assert hidden_states.grad is not None
 
 
 def test_qwen2_vl_5x_entry_declares_max_seqlen():
