@@ -5214,8 +5214,9 @@ def _qwen3_omni_media_counts(content):
             index = 0
         elif kind == "audio" or "audio" in item or "audio_url" in item:
             index = 1
-        # `video_url` carries no "video" key, so match the type too or it groups
-        # as text and renders after the audio Qwen needs it before.
+        # `video_url` carries no "video" key. Grouped with video so this agrees
+        # with `_structured_multimodal_counts`; the native template renders no
+        # placeholder for that shape either way, so ordering is unaffected.
         elif kind in ("video", "video_url") or "video" in item or "video_url" in item:
             index = 2
         else:

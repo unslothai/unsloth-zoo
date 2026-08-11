@@ -4946,8 +4946,9 @@ def test_a_text_only_batch_is_collated_exactly_as_before():
 
 
 def test_qwen3_omni_counts_video_url_as_video():
-    """`video_url` carries no "video" key, so it grouped as text and rendered
-    after the audio Qwen requires it to precede."""
+    """`video_url` carries no "video" key, so the two counters disagreed on an
+    alias one of them accepts. Grouping only; the native template renders no
+    placeholder for this shape, verified against its own chat_template.jinja."""
     from unsloth_zoo.mlx.loader import (
         _qwen3_omni_media_counts,
         _normalize_qwen3_omni_counted_message,
