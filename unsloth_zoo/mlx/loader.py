@@ -5214,7 +5214,9 @@ def _qwen3_omni_media_counts(content):
             index = 0
         elif kind == "audio" or "audio" in item or "audio_url" in item:
             index = 1
-        elif kind == "video" or "video" in item:
+        # `video_url` carries no "video" key, so match the type too or it groups
+        # as text and renders after the audio Qwen needs it before.
+        elif kind in ("video", "video_url") or "video" in item or "video_url" in item:
             index = 2
         else:
             index = None
@@ -5465,14 +5467,27 @@ def _prepare_vlm_template_messages(
             if kwargs.get("skip_audio_token")
             else max(0, num_audios - sum(item[1] for item in counts)),
         )
-        if any(missing) or any(counts[target_idx]):
-            template_messages = list(normalized_messages)
-            template_messages[target_idx] = _normalize_qwen3_omni_counted_message(
-                template_messages[target_idx],
-                counts[target_idx][0] + missing[0],
-                counts[target_idx][1] + missing[1],
+        # Every user-like turn the renderer sees, not just the anchor: a later
+        # turn ordered `text, audio` keeps that order otherwise, and audio
+        # rendered last loses Thinker conditioning. Only the anchor takes the
+        # conversation-wide deficit.
+        rebuilt = list(normalized_messages)
+        changed = False
+        for index, message in enumerate(normalized_messages):
+            if str(message.get("role", "user")).lower() in _NON_USER_ROLES:
+                continue
+            extra = missing if index == target_idx else (0, 0)
+            if not (any(counts[index]) or any(extra)):
+                continue
+            rebuilt[index] = _normalize_qwen3_omni_counted_message(
+                message,
+                counts[index][0] + extra[0],
+                counts[index][1] + extra[1],
                 kwargs,
             )
+            changed = True
+        if changed:
+            template_messages = rebuilt
     elif needs_media_anchor:
         template_messages = _anchor_conversation_media_to_first_user_turn(
             prompt_utils_module,

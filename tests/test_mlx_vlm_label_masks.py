@@ -4943,3 +4943,70 @@ def test_a_text_only_batch_is_collated_exactly_as_before():
     processor = _TruncationDivertingAudioProcessor()
     mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
     assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_qwen3_omni_counts_video_url_as_video():
+    """`video_url` carries no "video" key, so it grouped as text and rendered
+    after the audio Qwen requires it to precede."""
+    from unsloth_zoo.mlx.loader import (
+        _qwen3_omni_media_counts,
+        _normalize_qwen3_omni_counted_message,
+        _structured_multimodal_counts,
+    )
+
+    item = {"type": "video_url", "video_url": "v.mp4"}
+    assert _qwen3_omni_media_counts([item]) == (0, 0, 1)
+    # Agrees with the structured counter, which already accepted the alias.
+    assert _structured_multimodal_counts(item) == (0, 0, 1)
+
+    message = {"role": "user", "content": [item, {"type": "text", "text": "describe"}]}
+    ordered = _normalize_qwen3_omni_counted_message(message, 0, 1, {})
+    assert [part.get("type") for part in ordered["content"]] == ["video_url", "audio", "text"]
+
+
+def test_qwen3_omni_normalizes_media_turns_after_the_first():
+    """Only the anchor was normalized, so a later turn ordered `text, audio`
+    kept that order and the audio lost Thinker conditioning."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 1, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[2]["content"]] == ["audio", "text"]
+    # The assistant turn is left alone and the caller's list is not mutated.
+    assert [part.get("type") for part in template[1]["content"]] == ["text"]
+    assert [part.get("type") for part in messages[2]["content"]] == ["text", "audio"]
+
+
+def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
+    """Normalizing every turn must not scatter the conversation-wide deficit."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "one"},
+            {"type": "image", "image": "i.png"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "two"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 1, num_audios = 2, kwargs = {},
+    )
+
+    # One audio is missing conversation-wide; it goes to the anchor only.
+    assert [part.get("type") for part in template[0]["content"]] == ["image", "audio", "text"]
+    assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
