@@ -55,7 +55,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from unsloth_zoo.temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 
 try:

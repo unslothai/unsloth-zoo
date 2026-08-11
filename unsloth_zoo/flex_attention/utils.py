@@ -35,7 +35,7 @@ __all__ = [
 
 import torch
 import functools
-from ..temporary_patches.common import torch_compile, _torch_compile
+from unsloth_zoo.temporary_patches.common import torch_compile, _torch_compile
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:

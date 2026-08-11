@@ -24,7 +24,7 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
 # Import each independently: convert_moe_packed_tensors_cpu is injected at runtime by Unsloth's
