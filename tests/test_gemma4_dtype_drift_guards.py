@@ -215,6 +215,20 @@ def _gemma4_modeling_source():
 # so a cast stranded in a branch the merge does not run under does not count), plus
 # a receiver that is still AT `inputs_embeds.dtype` and a result that is actually
 # used (masked_scatter is out-of-place).
+# Known, deliberate limits of the trace, none of which any transformers 5.5.0
+# to 5.15.0 source hits (checked against every gemma4-bearing release, and the
+# spellings themselves against all 503 model families of 5.15.0):
+#   * names bound by `match`/`case` patterns are not tracked - no transformers
+#     modeling file contains a `match` statement;
+#   * the merged result only has to REACH `inputs_embeds`; a later statement
+#     overwriting it again is not modelled. Requiring survival to the end
+#     instead trades this for a false red on "merge, use, then release the
+#     name", which needs a use-before-overwrite analysis to tell apart;
+#   * `.to(other_tensor)` counts as alignment here but not in the eager patch's
+#     own matcher (unsloth_zoo/temporary_patches/gemma4.py), which reads only
+#     the `.to(inputs_embeds.device[, inputs_embeds.dtype])` spelling upstream
+#     actually ships. Upstream adopting the overload would surface as a drift
+#     warning telling us to update the patch, which is the intended signal.
 def _is_attr(node, owner, attr):
     """`<owner>.<attr>` as an AST node, e.g. `inputs_embeds.dtype`."""
     return (
