@@ -2322,11 +2322,9 @@ def _converter_supports_no_mtp(converter_location):
     """Return whether the selected converter declares the `--no-mtp` option."""
     try:
         source = Path(converter_location).read_bytes()
+    # Missing/unreadable path, or None and NUL-bearing ones: all mean "cannot
+    # prove support", and omitting --no-mtp just restores the old behaviour.
     except (OSError, TypeError, ValueError):
-        # OSError covers a missing path, a directory and an unreadable file;
-        # TypeError/ValueError cover None and a path carrying a NUL. Every one of
-        # them means "cannot prove support", which is the safe answer: omitting
-        # --no-mtp only restores the pre-existing behaviour.
         return False
     return re.search(
         rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
@@ -2704,10 +2702,9 @@ def convert_to_gguf(
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
 
-                # The `--no-mtp` gate is an architecture allowlist, so a
-                # config key alone cannot prove the flag is accepted. Drop it
-                # and retry once: that is exactly the pre-existing behaviour,
-                # which is correct for an arch with no MTP block to strip.
+                # `--no-mtp` is architecture-gated, so a config key alone cannot
+                # prove it is accepted. Retry once without it: the pre-existing
+                # behaviour, and correct for an arch with no MTP block to strip.
                 if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
                     retry = _drop_no_mtp(command)
                     if retry is not None:

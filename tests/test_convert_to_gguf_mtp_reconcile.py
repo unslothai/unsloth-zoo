@@ -307,9 +307,8 @@ def test_convert_to_gguf_rejects_malformed_layer_count_before_rewrite(llama_cpp,
     ids = ["none", "not-a-path", "empty", "nul-byte"],
 )
 def test_converter_support_probe_never_raises_on_an_unusable_location(llama_cpp, location):
-    """The probe answers "can I prove --no-mtp is supported", so anything it
-    cannot read is False. Only OSError was caught, so a None location raised
-    TypeError out of convert_to_gguf instead of degrading to today's behaviour."""
+    """Anything unreadable is False. Only OSError was caught, so a None
+    location raised TypeError out of convert_to_gguf."""
     assert llama_cpp._converter_supports_no_mtp(location) is False
 
 
@@ -318,11 +317,8 @@ def test_converter_support_probe_reads_a_directory_as_unsupported(llama_cpp, tmp
 
 
 def _write_arch_gated_converter(path: Path) -> Path:
-    """A converter that declares `--no-mtp` but refuses it for this architecture.
-
-    llama.cpp `25558268` added the flag and its architecture allowlist in the
-    same commit, so "the option exists" never implies "this model may use it".
-    """
+    """Declares `--no-mtp` but refuses it for this architecture: llama.cpp
+    25558268 added the flag and its allowlist in the same commit."""
     converter = path / "arch_gated_convert.py"
     command_log = path / "converter_commands.jsonl"
     converter.write_text(
@@ -358,14 +354,9 @@ def _write_arch_gated_converter(path: Path) -> Path:
 
 
 def test_convert_to_gguf_drops_no_mtp_when_the_architecture_refuses_it(llama_cpp, tmp_path):
-    """A declared-but-unsupported MTP key must not break a conversion that worked.
-
-    `_mtp_declared` reads config.json only, so a checkpoint that carries
-    `mtp_num_hidden_layers` while its architecture has no MTP block (Qwen3.5
-    weights republished under `Qwen3ForCausalLM`, for instance) would send
-    `--no-mtp` to a converter that hard-rejects it. Before the retry, that turned
-    a working export into a failure citing a flag the caller never passed.
-    """
+    """`_mtp_declared` reads config.json only, so Qwen3.5 weights republished
+    under `Qwen3ForCausalLM` sent `--no-mtp` to a converter that rejects it,
+    turning a working export into a failure citing a flag nobody passed."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(
