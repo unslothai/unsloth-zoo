@@ -674,3 +674,67 @@ def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
     assert torch.allclose(x.grad, torch.full_like(x, 2.0))
     # d(loss)/d(leaf) = 3 * (1 from the block + 1 from side.sum())
     assert torch.allclose(leaf.grad, torch.full_like(leaf, 6.0))
+
+
+# ---------------------------------------------------------------------------
+# A frozen first activation next to a differentiable later input
+# ---------------------------------------------------------------------------
+# UnslothCheckpointFunction decided "this Function has a gradient to produce"
+# from positional input zero alone. Autograd calls backward whenever ANY input
+# requires grad, so a frozen activation zero next to a differentiable later
+# input reached the early return and the engine got a single None where it
+# wanted one gradient per input. torch's own reentrant CheckpointFunction has no
+# such gate - it saves unconditionally - so this was a divergence from the
+# function these shims stand in for.
+
+
+def _frozen_first_input(checkpoint_fn, as_keyword):
+    """activation 0 does not require grad; the second input does."""
+    def block(hidden_states, side):
+        return hidden_states * 2.0 + side * 3.0
+
+    def block_kw(hidden_states, side = None):
+        return block(hidden_states, side)
+
+    torch.manual_seed(3)
+    frozen = torch.randn(4)
+    side   = torch.randn(4, requires_grad = True)
+    if checkpoint_fn is None:
+        out = block(frozen, side)
+    elif as_keyword:
+        out = checkpoint_fn(block_kw, frozen, side = side)
+    else:
+        out = checkpoint_fn(block, frozen, side)
+    out.sum().backward()
+    return side.grad
+
+
+@pytest.mark.parametrize("as_keyword", [False, True])
+@pytest.mark.parametrize(
+    "checkpoint_fn", [unsloth_checkpoint, unsloth_gradient_checkpoint],
+)
+def test_frozen_first_activation_still_propagates(
+    checkpoint_fn, as_keyword, cpu_offload_globals,
+):
+    reference = _frozen_first_input(None, as_keyword)
+    got = _frozen_first_input(checkpoint_fn, as_keyword)
+    assert got is not None, "the differentiable input received no gradient"
+    assert torch.equal(got, reference)
+
+
+def test_frozen_first_activation_matches_torchs_own_reentrant_checkpoint(
+        cpu_offload_globals):
+    """The behaviour above is not an Unsloth invention: pristine torch, on the
+    reentrant path these shims force, already propagates here."""
+    pristine = getattr(
+        torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None,
+    ) or torch.utils.checkpoint.checkpoint
+
+    def block(hidden_states, side):
+        return hidden_states * 2.0 + side * 3.0
+
+    torch.manual_seed(3)
+    frozen = torch.randn(4)
+    side   = torch.randn(4, requires_grad = True)
+    pristine(block, frozen, side, use_reentrant = True).sum().backward()
+    assert torch.equal(side.grad, _frozen_first_input(unsloth_checkpoint, False))

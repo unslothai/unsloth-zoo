@@ -730,10 +730,25 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         ctx.tensor_indices = []
         tensor_inputs = []
         ctx._requires_gradient = False
+        # Read unconditionally in backward, so it needs a value on every path
+        # that never takes the offload branch below.
+        ctx._saved_metadata = (None, None, None, None, None, None, None,)
         use_gpu_buffer = False
 
         for i, arg in enumerate(args):
             if torch.is_tensor(arg):
+                # ANY differentiable input means this Function has a gradient to
+                # produce, exactly as torch's own reentrant CheckpointFunction
+                # (which saves unconditionally) does. Keying this off input zero
+                # alone made backward bail out early - and it is reached, since
+                # autograd only calls backward when some input requires grad -
+                # so the engine got a single None instead of one gradient per
+                # input and raised `returned an incorrect number of gradients`.
+                # A frozen first activation next to a differentiable later one
+                # is ordinary: an untrained embedding feeding layer 0 alongside
+                # a learned positional/query tensor, or a tensor keyword routed
+                # positionally by _bind_checkpoint_kwargs.
+                if arg.requires_grad: ctx._requires_gradient = True
 
                 if i == 0 and arg.requires_grad:
                     global FIRST_PASS
@@ -747,7 +762,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    ctx._requires_gradient = True
                     new_size = arg.numel()
 
                     global MINIMUM_SIZE
