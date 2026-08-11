@@ -426,10 +426,17 @@ def test_compiler_cross_entropy_find_3_shift_logits_pattern():
 
 
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
-    """``unsloth_zoo/compiler.py:2192-2207`` pins the Qwen2-VL multiline
-    raw string ``hidden_states = blk(\\n hidden_states,\\n
-    cu_seqlens=cu_seqlens,\\n position_embeddings=position_embeddings,\\n
-    **kwargs,\\n )``. A re-indent silently no-ops."""
+    """``unsloth_zoo/compiler.py:2779-2848`` pins the Qwen2-VL multiline
+    raw strings ``hidden_states = blk(\\n hidden_states,\\n
+    cu_seqlens=cu_seqlens,\\n [max_seqlen=max_seqlen,\\n]
+    position_embeddings=position_embeddings,\\n **kwargs,\\n )``.
+    A re-indent silently no-ops.
+
+    transformers 4.x and 5.x spell the call differently: 5.x added
+    ``max_seqlen=max_seqlen`` (cu_seqlens/max_seqlen moved into
+    ``get_vision_attention_seqlens``) and dropped ``rotary_pos_emb`` from
+    ``Qwen2VLVisionBlock.forward``. The rewriter carries one entry per
+    spelling; pass if either is still present, fail if neither is."""
     pytest.importorskip("transformers")
     try:
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
@@ -438,7 +445,7 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
     except ImportError:
         pytest.skip("Qwen2VisionTransformerPretrainedModel not in this build")
     src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
-    needle = (
+    needle_4x = (
         "hidden_states = blk(\n"
         "                hidden_states,\n"
         "                cu_seqlens=cu_seqlens,\n"
@@ -446,11 +453,57 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
         "                **kwargs,\n"
         "            )"
     )
-    _assert_in_source(
-        needle, src,
-        "unsloth_zoo/compiler.py:2194-2199 (custom_gradient_checkpointing_replacements[0])",
-        "transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VisionTransformerPretrainedModel.forward",
+    needle_5x = (
+        "hidden_states = blk(\n"
+        "                hidden_states,\n"
+        "                cu_seqlens=cu_seqlens,\n"
+        "                max_seqlen=max_seqlen,\n"
+        "                position_embeddings=position_embeddings,\n"
+        "                **kwargs,\n"
+        "            )"
     )
+    if not any(n in src for n in (needle_4x, needle_5x)):
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join((needle_4x, needle_5x)),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            "Qwen2VisionTransformerPretrainedModel.forward",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
+    """The rewriter in ``unsloth_zoo/compiler.py:2779-2848`` demotes every
+    ``arg=arg`` keyword to a positional, so the rewritten ``blk(...)`` call
+    only works if ``Qwen2VLVisionBlock.forward`` still takes
+    ``(hidden_states, cu_seqlens, [rotary_pos_emb,] position_embeddings)``
+    in that order. A reorder / rename binds arguments to the wrong
+    parameters instead of no-op'ing, so guard it separately from the
+    call-site string."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2VLVisionBlock not in this build")
+    params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
+    accepted = (
+        # transformers 4.x
+        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+         "position_embeddings", "kwargs"],
+        # transformers 5.x -- rotary_pos_emb dropped, max_seqlen rides in kwargs
+        ["self", "hidden_states", "cu_seqlens", "position_embeddings",
+         "kwargs"],
+    )
+    if params not in accepted:
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join(str(a) for a in accepted),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            f"Qwen2VLVisionBlock.forward signature (got {params})",
+        )
 
 
 def test_compiler_moe_routing_weights_cast_pattern():

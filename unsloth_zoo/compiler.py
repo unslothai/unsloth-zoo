@@ -2744,6 +2744,38 @@ pass
 
 # We need to manually replace some items
 # For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+#
+# patch_gradient_checkpointing() below rewrites `hidden_states = blk(...)` into
+# a `self._gradient_checkpointing_func(blk.__call__, ...)` call, and on the way
+# it demotes every `arg=arg` keyword to a positional (the
+# `re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", ...)` a few lines further down). So the
+# rewritten argument list has to line up positionally with the vision block's
+# own signature, and anything the block only accepts through **kwargs has to
+# stay a keyword.
+#
+# transformers <= 4.57 spells the block as
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              rotary_pos_emb=None, position_embeddings=None,
+#                              **kwargs)
+# while the caller passes only cu_seqlens + position_embeddings, so
+# `rotary_pos_emb=rotary_pos_emb` is injected to fill the third positional slot
+# (that is the "missing None" HF 4.53.1 broke).
+#
+# transformers >= 5.0 dropped `rotary_pos_emb` from the block signature
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              position_embeddings=None, **kwargs)
+# and added `max_seqlen=max_seqlen` to the call site (transformers 5.x moved the
+# cu_seqlens/max_seqlen computation into get_vision_attention_seqlens()).
+# `max_seqlen` is NOT a named parameter of the block - it rides along in
+# **kwargs down to the attention. Left alone the `arg=arg` demotion would turn
+# it into the third positional and it would silently be bound to
+# `position_embeddings`, so it is rewritten into an explicit
+# `**{"max_seqlen": max_seqlen}` mapping, which has no `arg=arg` spelling for
+# the demotion regex to match and therefore stays a keyword. The mapping is kept
+# inside the call (rather than hoisted into `kwargs` before the loop) so the
+# `for ... in ...:\n<spaces>hidden_states = <layer>(...)` finder regex below,
+# which requires the call to be the first statement of the loop body, still
+# matches.
 custom_gradient_checkpointing_replacements = [
     (
         """hidden_states = blk(
@@ -2774,6 +2806,42 @@ custom_gradient_checkpointing_replacements = [
                 rotary_pos_emb=rotary_pos_emb,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
+                **kwargs,
+            )""",
+    ),
+    # transformers >= 5.0 spellings. `max_seqlen` is a **kwargs-only argument of
+    # the vision block, so it must survive as a keyword.
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **{"max_seqlen": max_seqlen},
+                **kwargs,
+            )""",
+    ),
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **{"max_seqlen": max_seqlen},
                 **kwargs,
             )""",
     ),
