@@ -674,13 +674,23 @@ def _is_gemma4_attr(node, owner, attr):
 def _gemma4_audio_merge_casts(forward_node):
     """Split the audio `masked_scatter` source casts this patch can act on.
 
-    Returns `(buggy_casts, fixed_casts)`: `masked_scatter(mask, audio_features.to(
-    inputs_embeds.device[, inputs_embeds.dtype]))` argument nodes, split by whether
-    the dtype is already carried. Anything else (a wrapped or reshaped source
-    argument, a different call shape) matches NEITHER list, which is exactly when
-    this patch silently no-ops - so the drift canary in
+    Returns `(buggy_casts, fixed_casts)`: `inputs_embeds.masked_scatter(mask,
+    audio_features.to(inputs_embeds.device[, inputs_embeds.dtype]))` argument
+    nodes, split by whether the dtype is already carried. Anything else (a wrapped
+    or reshaped source argument, a different call shape) matches NEITHER list,
+    which is exactly when this patch silently no-ops - so the drift canary in
     tests/test_gemma4_dtype_drift_guards.py calls this same matcher on the real
     transformers source rather than re-deriving it.
+
+    The receiver has to reference `inputs_embeds`: only the embedding merge can
+    make audio features reach the model, so a `masked_scatter` onto any other
+    tensor is a different op whose dtype says nothing about ours. Accepting any
+    receiver let an already-aligned merge on some scratch tensor land in
+    `fixed_casts`, which reads to the caller as "upstream fixed it" - it sets the
+    patched marker and returns without touching a real, still-device-only
+    `inputs_embeds` merge. Discovery stays loose about HOW the receiver mentions
+    the name (`inputs_embeds.to(...).masked_scatter(...)` is still the embedding
+    merge), so a transformed receiver is not silently dropped.
     """
     buggy_casts = []
     fixed_casts = []
@@ -690,6 +700,11 @@ def _gemma4_audio_merge_casts(forward_node):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "masked_scatter"
             and len(node.args) >= 2
+        ):
+            continue
+        if not any(
+            isinstance(inner, ast.Name) and inner.id == "inputs_embeds"
+            for inner in ast.walk(node.func.value)
         ):
             continue
         source = node.args[1]
