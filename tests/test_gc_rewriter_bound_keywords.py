@@ -320,6 +320,40 @@ def test_bind_checkpoint_kwargs_is_identity_without_kwargs():
     assert _bind_checkpoint_kwargs(fn, only_torch) is fn
 
 
+def test_torch_checkpoint_keywords_covers_every_keyword_only_parameter():
+    """Whatever torch's own ``checkpoint`` declares keyword-only is the
+    checkpoint machinery's, never the block's.
+
+    ``early_stop`` is the concrete miss this pins: torch added it as a per-call
+    keyword and documents it as ignored under ``use_reentrant = True``, which is
+    what the Unsloth shims force. It used to be bound onto the wrapped function,
+    so an ordinary block raised ``TypeError: forward() got an unexpected keyword
+    argument 'early_stop'`` as soon as Unsloth replaced the global symbol."""
+    signature = inspect.signature(torch.utils.checkpoint.checkpoint)
+    keyword_only = {
+        name for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    } - {"use_reentrant"}
+    missing = keyword_only - _TORCH_CHECKPOINT_KEYWORDS
+    assert not missing, f"checkpoint keywords that would be bound to the block: {missing}"
+
+
+def test_bind_checkpoint_kwargs_drops_early_stop(monkeypatch):
+    """End of the same story, executed: a block with no ``early_stop``
+    parameter must survive a caller using torch's documented keyword."""
+    if "early_stop" not in inspect.signature(torch.utils.checkpoint.checkpoint).parameters:
+        pytest.skip("this torch has no per-call early_stop")
+
+    def block(x):
+        return x * 2
+
+    assert _bind_checkpoint_kwargs(block, {"early_stop": False}) is block
+    x = torch.randn(4, requires_grad = True)
+    out = unsloth_gradient_checkpoint(block, x, early_stop = False)
+    out.sum().backward()
+    assert x.grad is not None
+
+
 def test_bind_checkpoint_kwargs_binds_the_rest():
     def fn(x, flag = None):
         return (x, flag)

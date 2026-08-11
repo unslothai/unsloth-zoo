@@ -20,6 +20,7 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 from contextlib import contextmanager, nullcontext
 import os
 import functools
+import inspect
 import warnings
 import gc
 import threading
@@ -303,15 +304,52 @@ pass
 
 
 # Keywords that belong to the checkpoint machinery itself rather than to the
-# wrapped function. torch.utils.checkpoint.checkpoint names all four; the Unsloth
-# reentrant checkpointers below never honoured them, and that is deliberately
-# left as-is so callers passing only these see exactly today's behaviour.
-_TORCH_CHECKPOINT_KEYWORDS = frozenset({
+# wrapped function. The Unsloth reentrant checkpointers below never honoured
+# them, and that is deliberately left as-is so callers passing only these see
+# exactly today's behaviour. What must NOT happen is binding one of them onto
+# the wrapped block: the block has no such parameter and raises TypeError, so a
+# call that works against unpatched torch would start failing the moment Unsloth
+# swaps torch.utils.checkpoint.checkpoint out from under it.
+#
+# `early_stop` is the one that was missing: torch grew it as a per-call keyword
+# (present on 2.10 and 2.13 here) and documents it as ignored when
+# use_reentrant = True - which is exactly what these shims force - so dropping
+# it is the faithful behaviour.
+_TORCH_CHECKPOINT_KEYWORDS_LITERAL = frozenset({
     "preserve_rng_state",
     "context_fn",
     "determinism_check",
     "debug",
+    "early_stop",
 })
+
+
+def _torch_checkpoint_keywords():
+    """The literal set above, widened by whatever torch's own ``checkpoint``
+    actually declares.
+
+    Read off the live signature so a keyword a later torch adds (the same way it
+    added ``early_stop``) is dropped rather than bound onto the block. Falls back
+    to the literal set if the signature cannot be read, and unions rather than
+    replaces so a signature already replaced by one of the shims below can only
+    ever widen the set. ``use_reentrant`` is excluded because every shim names it
+    explicitly, so it never reaches ``**kwargs``."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    names = set(_TORCH_CHECKPOINT_KEYWORDS_LITERAL)
+    try:
+        checkpoint = getattr(
+            torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None,
+        ) or torch.utils.checkpoint.checkpoint
+        for name, parameter in inspect.signature(checkpoint).parameters.items():
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                names.add(name)
+    except Exception:
+        pass
+    names.discard("use_reentrant")
+    return frozenset(names)
+
+
+_TORCH_CHECKPOINT_KEYWORDS = _torch_checkpoint_keywords()
 
 
 def _bind_checkpoint_kwargs(function, kwargs):
