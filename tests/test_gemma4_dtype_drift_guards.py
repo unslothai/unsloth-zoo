@@ -212,7 +212,9 @@ def _gemma4_modeling_source():
 # `inputs_embeds.masked_scatter` that consumes the features, and require of each an
 # `inputs_embeds.dtype` cast either inside the merge argument or on the last
 # assignment to that name that DOMINATES the merge (same block or an enclosing one,
-# so a cast stranded in a branch the merge does not run under does not count).
+# so a cast stranded in a branch the merge does not run under does not count), plus
+# a receiver that is still AT `inputs_embeds.dtype` and a result that is actually
+# used (masked_scatter is out-of-place).
 def _is_attr(node, owner, attr):
     """`<owner>.<attr>` as an AST node, e.g. `inputs_embeds.dtype`."""
     return (
@@ -236,6 +238,97 @@ def _casts_to_inputs_embeds_dtype(node):
         if any(_is_attr(v, "inputs_embeds", "dtype") for v in values):
             return True
     return False
+
+
+# Methods that may sit between `inputs_embeds` and `.masked_scatter(...)` without
+# changing the destination dtype. Anything outside this set (`.float()`, `.half()`,
+# `.type(...)`, an unknown helper) can retype the destination, which makes an
+# `inputs_embeds.dtype` source cast prove nothing: the merge then has an fp32
+# destination and a low-precision source and raises.
+_DTYPE_PRESERVING_METHODS = frozenset({
+    "clone", "contiguous", "detach", "cpu", "cuda",
+    "view", "reshape", "flatten", "squeeze", "unsqueeze",
+    "expand", "expand_as", "transpose", "permute", "narrow",
+})
+
+
+def _is_dtype_bearing(node):
+    """Can `node` retype a tensor? (`torch.float32`, `other.dtype`, ...)"""
+    if isinstance(node, ast.Attribute) and node.attr == "dtype":
+        return not _is_attr(node, "inputs_embeds", "dtype")
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "torch"
+    ):
+        # `torch.float32` / `torch.bfloat16` / `torch.long` ...
+        return True
+    return False
+
+
+def _is_device_expr(node):
+    """`x.device`, `"cuda"`, `torch.device(...)` - device without a dtype."""
+    if isinstance(node, ast.Attribute) and node.attr == "device":
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "device"
+    ):
+        return True
+    return False
+
+
+def _to_call_preserves_dtype(call):
+    """Is this `.to(...)` device-only (or a no-op `inputs_embeds.dtype` cast)?
+
+    `inputs_embeds.to(language_model_inputs.device)` is blip_2's real spelling and
+    keeps the dtype; `.to(torch.float32)`, `.to(other.dtype)` and the tensor
+    overload `.to(other_tensor)` do not.
+    """
+    for arg in call.args:
+        if not (_is_device_expr(arg) or _is_attr(arg, "inputs_embeds", "dtype")):
+            return False
+    for kw in call.keywords:
+        if kw.arg in ("non_blocking", "copy", "memory_format"):
+            continue
+        if kw.arg == "device" and _is_device_expr(kw.value):
+            continue
+        if kw.arg == "dtype" and _is_attr(kw.value, "inputs_embeds", "dtype"):
+            continue
+        return False
+    return True
+
+
+def _receiver_preserves_embeds_dtype(node):
+    """Is the merge destination `inputs_embeds` still at `inputs_embeds.dtype`?
+
+    The whole trace is "the source is cast to `inputs_embeds.dtype`, so the merge
+    is safe", which only holds while the DESTINATION is at that dtype too. The
+    receiver may be `inputs_embeds` itself or a chain of dtype-preserving
+    transformations of it (upstream blip_2 really does write
+    `inputs_embeds.to(language_model_inputs.device).masked_scatter(...)`), but
+    `inputs_embeds.float().masked_scatter(mask, feat.to(inputs_embeds.dtype))`
+    merges a low-precision source into an fp32 destination and raises.
+    """
+    while True:
+        if isinstance(node, ast.Name):
+            return node.id == "inputs_embeds"
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return False
+        method = node.func.attr
+        if method == "to":
+            if not _to_call_preserves_dtype(node):
+                return False
+        elif method in _DTYPE_PRESERVING_METHODS:
+            values = list(node.args) + [kw.value for kw in node.keywords]
+            if any(_is_dtype_bearing(v) for v in values):
+                return False
+        else:
+            return False
+        node = node.func.value
 
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
@@ -457,21 +550,36 @@ def _dominating_alignment(forward, feature, merge_arg):
     return best_aligned
 
 
-def _feature_merge_args(forward, feature):
-    """Source args of every `inputs_embeds.masked_scatter(mask, ...)` using `<feature>`.
+_MERGE_METHODS = ("masked_scatter", "masked_scatter_")
 
-    The receiver has to be `inputs_embeds` (or something derived from it): a
+
+def _feature_merges(forward, feature):
+    """Every `inputs_embeds.masked_scatter[_](mask, ...)` call using `<feature>`.
+
+    The receiver has to REFERENCE `inputs_embeds`: a
     `scratch.masked_scatter(mask, feature)` elsewhere in `forward` is a different
-    tensor and says nothing about the dtype of the embedding merge. Nested `def`
-    / `class` / `lambda` bodies are skipped for the same reason: a merge in a
-    helper `forward` never invokes is not `forward`'s merge.
+    tensor and says nothing about the dtype of the embedding merge. Discovery
+    stays deliberately loose here (any receiver mentioning the name) so that a
+    transformed receiver such as blip_2's
+    `inputs_embeds.to(language_model_inputs.device).masked_scatter(...)` is still
+    recognised AS the embedding merge; whether that transformation is dtype-safe
+    is then decided by `_receiver_preserves_embeds_dtype`. Dropping unrecognised
+    receivers here instead would let a second, safe merge hide a dtype-changing
+    one.
+
+    The in-place spelling is accepted too (transformers writes
+    `masked_scatter_` in qwen2_5_omni and blt): it merges into the same storage
+    and needs the same dtype agreement.
+
+    Nested `def` / `class` / `lambda` bodies are skipped: a merge in a helper
+    `forward` never invokes is not `forward`'s merge.
     """
-    args = []
+    calls = []
     for node in _walk_own_scope(forward):
         if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "masked_scatter"
+            and node.func.attr in _MERGE_METHODS
             and len(node.args) >= 2
         ):
             continue
@@ -480,12 +588,33 @@ def _feature_merge_args(forward, feature):
             for n in ast.walk(node.func.value)
         ):
             continue
-        source_arg = node.args[1]
         if any(
-            isinstance(n, ast.Name) and n.id == feature for n in ast.walk(source_arg)
+            isinstance(n, ast.Name) and n.id == feature for n in ast.walk(node.args[1])
         ):
-            args.append(source_arg)
-    return sorted(args, key=lambda n: (n.lineno, n.col_offset))
+            calls.append(node)
+    return sorted(calls, key=lambda n: (n.lineno, n.col_offset))
+
+
+def _merge_result_is_used(forward, call):
+    """Does the merge's result survive?
+
+    `masked_scatter` is OUT-OF-PLACE, so a bare
+    `inputs_embeds.masked_scatter(mask, features.to(inputs_embeds.dtype))`
+    statement computes the merged embedding and throws it away: the features
+    never reach the model, silently, with every dtype canary green. Upstream has
+    always spelled it `inputs_embeds = inputs_embeds.masked_scatter(...)` on
+    5.5.0-5.15.0, so requiring the result to be consumed costs nothing. The
+    in-place `masked_scatter_` writes through the receiver and needs no
+    assignment.
+    """
+    if call.func.attr.endswith("_"):
+        return True
+    chain = _enclosing_blocks(forward, call)
+    if not chain:
+        return True
+    block, index = chain[-1]
+    statement = block[index]
+    return not (isinstance(statement, ast.Expr) and statement.value is call)
 
 
 def _merge_dtype_alignment(src, feature):
@@ -494,16 +623,25 @@ def _merge_dtype_alignment(src, feature):
     Returns (merge_found, every_merge_aligned). EVERY merge consuming the feature
     has to be aligned: one unaligned branch is one reachable dtype crash, so an
     aligned first merge must not excuse an unaligned second one.
+
+    A merge counts as aligned when all three hold: the destination is still at
+    `inputs_embeds.dtype`, the merged result is actually used, and the source
+    carries an `inputs_embeds.dtype` cast at the call or on its last dominating
+    assignment.
     """
     forward = _gemma4_model_forward_node(src)
     if forward is None:
         return (False, False)
-    merges = _feature_merge_args(forward, feature)
+    merges = _feature_merges(forward, feature)
     if not merges:
         return (False, False)
     aligned = all(
-        _casts_to_inputs_embeds_dtype(merge)
-        or _dominating_alignment(forward, feature, merge)
+        _receiver_preserves_embeds_dtype(merge.func.value)
+        and _merge_result_is_used(forward, merge)
+        and (
+            _casts_to_inputs_embeds_dtype(merge.args[1])
+            or _dominating_alignment(forward, feature, merge)
+        )
         for merge in merges
     )
     return (True, aligned)
@@ -636,18 +774,28 @@ def test_audio_compiler_transform_still_fixes_the_device_only_spelling():
 # needed, so they run on every supported version) and pin the verdict on the
 # spellings that used to slip through.
 # ---------------------------------------------------------------------------
-def _synthetic_forward(body):
-    """Minimal `Gemma4Model.forward` with `body` between the features and the merge."""
-    indented = "\n".join("            " + line if line else "" for line in body.strip("\n").split("\n"))
+_DEFAULT_MERGE = (
+    "inputs_embeds = inputs_embeds.masked_scatter(\n"
+    "    image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)\n"
+    ")"
+)
+
+
+def _indented(block):
+    return "\n".join(
+        "            " + line if line else "" for line in block.strip("\n").split("\n")
+    )
+
+
+def _synthetic_forward(body, merge = _DEFAULT_MERGE):
+    """Minimal `Gemma4Model.forward` with `body` between the features and `merge`."""
     return (
         "class Gemma4Model:\n"
         "    def forward(self, inputs_embeds, pixel_values, image_mask):\n"
         "        if pixel_values is not None:\n"
         "            image_features = self.get_image_features(pixel_values)\n"
-        f"{indented}\n"
-        "            inputs_embeds = inputs_embeds.masked_scatter(\n"
-        "                image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)\n"
-        "            )\n"
+        f"{_indented(body)}\n"
+        f"{_indented(merge)}\n"
         "        return inputs_embeds\n"
     )
 
@@ -788,3 +936,163 @@ def test_non_rebinding_targets_do_not_break_alignment(label, body):
     # Controls for the test above.
     found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
     assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
+
+
+# The whole trace is "the source is cast to `inputs_embeds.dtype`, so the merge is
+# safe". That only holds while the DESTINATION is still at `inputs_embeds.dtype`.
+# A receiver transformation that retypes it turns the source cast into the wrong
+# cast: `inputs_embeds.float().masked_scatter(mask, image_features.to(
+# inputs_embeds.dtype))` has an fp32 destination and an fp16/bf16 source and
+# raises the exact error this whole file exists to prevent.
+_RECEIVER_HOLES = [
+    ("receiver upcast with .float()",
+     "inputs_embeds = inputs_embeds.float().masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .to(torch.float32)",
+     "inputs_embeds = inputs_embeds.to(torch.float32).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver cast to a third tensor's dtype",
+     "inputs_embeds = inputs_embeds.to(image_features.dtype).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .to(dtype = torch.float32) by keyword",
+     "inputs_embeds = inputs_embeds.to(dtype = torch.float32).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver retyped by an unknown helper",
+     "inputs_embeds = self.upcast(inputs_embeds).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,merge", _RECEIVER_HOLES, ids = [case[0] for case in _RECEIVER_HOLES],
+)
+def test_receiver_that_changes_dtype_is_not_alignment(label, merge):
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found, f"{label}: the synthetic merge site itself was not found"
+    assert not aligned, (
+        f"{label}: the tracer reports the merge dtype-aligned, but the merge "
+        f"DESTINATION is no longer at `inputs_embeds.dtype`, so the "
+        f"`inputs_embeds.dtype` source cast produces a mismatched pair. With "
+        f"fp16/bf16 embeddings this is one reachable `masked_scatter_: expected "
+        f"self and source to have same dtypes` with every canary green."
+    )
+
+
+_RECEIVER_CONTROLS = [
+    # blip_2 really ships this spelling; the receiver predicate is deliberately
+    # loose enough to still recognise it, and `.to(<device>)` keeps the dtype.
+    ("blip_2 receiver .to(other.device)",
+     "inputs_embeds = inputs_embeds.to(image_features.device).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .to(device = ..., non_blocking = True)",
+     "inputs_embeds = inputs_embeds.to(device = image_features.device, non_blocking = True).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .to('cuda')",
+     "inputs_embeds = inputs_embeds.to('cuda').masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .clone().contiguous()",
+     "inputs_embeds = inputs_embeds.clone().contiguous().masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .to(inputs_embeds.dtype) is a no-op",
+     "inputs_embeds = inputs_embeds.to(inputs_embeds.dtype).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("plain receiver",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,merge", _RECEIVER_CONTROLS, ids = [case[0] for case in _RECEIVER_CONTROLS],
+)
+def test_dtype_preserving_receivers_still_count_as_alignment(label, merge):
+    # Controls for the test above: every one of these merges into a destination
+    # that is still at `inputs_embeds.dtype`, so they must NOT turn red.
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
+
+
+# `masked_scatter` is out-of-place. Losing the surrounding `inputs_embeds =`
+# leaves every dtype cast in place - and silently drops the features, because the
+# merged tensor is discarded. Upstream assigns the result on 5.5.0-5.15.0, so
+# requiring it costs nothing; the in-place `masked_scatter_` spelling
+# (transformers writes it in qwen2_5_omni / blt) needs no assignment and must
+# still be accepted.
+def test_discarded_out_of_place_merge_is_not_alignment():
+    merge = (
+        "inputs_embeds.masked_scatter(\n"
+        "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+        ")"
+    )
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found, "the synthetic merge site itself was not found"
+    assert not aligned, (
+        "the tracer reports the merge aligned, but `masked_scatter` is "
+        "out-of-place and its result is thrown away: the image features never "
+        "reach the model. Every dtype canary here would stay green while the "
+        "merge silently did nothing."
+    )
+
+
+_RESULT_USE_CONTROLS = [
+    ("in-place masked_scatter_ needs no assignment",
+     "inputs_embeds.masked_scatter_(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("result bound to a temp name, then rebound",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds = merged"),
+    ("result flows into a call argument",
+     "inputs_embeds = self.norm(inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     "))"),
+    ("result returned directly",
+     "return inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,merge", _RESULT_USE_CONTROLS, ids = [case[0] for case in _RESULT_USE_CONTROLS],
+)
+def test_used_merge_results_still_count_as_alignment(label, merge):
+    # Controls for the test above.
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
+
+
+def test_in_place_merge_with_an_unaligned_source_is_still_traced():
+    # Accepting `masked_scatter_` must not become a way to skip the dtype trace:
+    # the in-place op has exactly the same dtype requirement.
+    merge = (
+        "image_features = image_features.float()\n"
+        "inputs_embeds.masked_scatter_(image_mask, image_features)"
+    )
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found and not aligned, (
+        "an in-place merge fed by a feature rebound to fp32 must report unaligned"
+    )
