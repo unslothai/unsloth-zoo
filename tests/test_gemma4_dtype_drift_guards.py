@@ -1491,6 +1491,14 @@ _ALIGNED_SCRATCH_MERGE = (
     "    audio_mask, audio_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
     ")"
 )
+# The same decoy, written so the receiver MENTIONS `inputs_embeds` without being
+# it. Matching the name anywhere in the receiver expression accepted this as the
+# embedding merge; the receiver has to be anchored at its base instead.
+_ALIGNED_SCRATCH_MERGE_ON_EMBEDS_DEVICE = (
+    "scratch = scratch.to(inputs_embeds.device).masked_scatter(\n"
+    "    audio_mask, audio_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+    ")"
+)
 
 
 def _audio_merge_casts(body):
@@ -1518,6 +1526,24 @@ def test_eager_matcher_still_finds_the_real_merge_next_to_a_decoy():
     assert len(buggy) == 1 and not fixed, (
         f"expected the one real device-only `inputs_embeds` merge to be patchable "
         f"next to an aligned scratch decoy, got {len(buggy)} buggy / {len(fixed)} fixed"
+    )
+
+
+@pytest.mark.parametrize(
+    "decoy",
+    [_ALIGNED_SCRATCH_MERGE, _ALIGNED_SCRATCH_MERGE_ON_EMBEDS_DEVICE],
+    ids = ["bare scratch receiver", "scratch receiver naming inputs_embeds"],
+)
+def test_a_decoy_merge_never_hides_the_real_one(decoy):
+    # `scratch.to(inputs_embeds.device)` is a different tensor, however many
+    # times it names `inputs_embeds`. Counting it as the embedding merge puts an
+    # aligned cast in `fixed_casts`, and `len(buggy) == 1 and fixed_casts` is
+    # exactly the branch on which the eager patch returns without patching and
+    # without warning - the real device-only merge stays broken.
+    buggy, fixed = _audio_merge_casts(decoy + "\n" + _REAL_AUDIO_MERGE)
+    assert len(buggy) == 1 and not fixed, (
+        f"expected the one real device-only `inputs_embeds` merge to be patchable "
+        f"next to an aligned decoy, got {len(buggy)} buggy / {len(fixed)} fixed"
     )
 
 

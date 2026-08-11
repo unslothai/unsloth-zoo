@@ -671,6 +671,27 @@ def _is_gemma4_attr(node, owner, attr):
     )
 
 
+def _gemma4_receiver_is_inputs_embeds(node):
+    """Does this `masked_scatter` receiver expression START from `inputs_embeds`?
+
+    Discovery has to stay loose about HOW the receiver transforms the name
+    (`inputs_embeds.to(...).masked_scatter(...)` is still the embedding merge),
+    but the transformation has to be OF `inputs_embeds`. Merely mentioning the
+    name is not enough: `scratch.to(inputs_embeds.device)` names it and is a
+    different tensor, so an aligned merge onto that scratch buffer would land in
+    `fixed_casts` and read to the caller as "upstream fixed it".
+    """
+    while True:
+        if isinstance(node, ast.Name):
+            return node.id == "inputs_embeds"
+        if isinstance(node, ast.Call):
+            node = node.func
+        elif isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        else:
+            return False
+
+
 def _gemma4_audio_merge_casts(forward_node):
     """Split the audio `masked_scatter` source casts this patch can act on.
 
@@ -688,9 +709,10 @@ def _gemma4_audio_merge_casts(forward_node):
     receiver let an already-aligned merge on some scratch tensor land in
     `fixed_casts`, which reads to the caller as "upstream fixed it" - it sets the
     patched marker and returns without touching a real, still-device-only
-    `inputs_embeds` merge. Discovery stays loose about HOW the receiver mentions
-    the name (`inputs_embeds.to(...).masked_scatter(...)` is still the embedding
-    merge), so a transformed receiver is not silently dropped.
+    `inputs_embeds` merge. The receiver is matched at its BASE, so a transformed
+    receiver (`inputs_embeds.to(...).masked_scatter(...)`) is still recognised
+    while a different tensor that merely mentions the name
+    (`scratch.to(inputs_embeds.device)`) is not.
     """
     buggy_casts = []
     fixed_casts = []
@@ -702,10 +724,7 @@ def _gemma4_audio_merge_casts(forward_node):
             and len(node.args) >= 2
         ):
             continue
-        if not any(
-            isinstance(inner, ast.Name) and inner.id == "inputs_embeds"
-            for inner in ast.walk(node.func.value)
-        ):
+        if not _gemma4_receiver_is_inputs_embeds(node.func.value):
             continue
         source = node.args[1]
         if not (
