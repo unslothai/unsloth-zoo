@@ -571,15 +571,18 @@ def _element_value(target, value, feature):
     return value
 
 
+# Only a real destructuring assignment pairs targets with RHS elements. A
+# `for` / `with` target takes its value from the iterable / context manager, not
+# positionally from the expression's own elements.
+_ELEMENTWISE_NODES = (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+
+
 def _binding_value(node, feature):
     """The expression `<feature>` takes its dtype from in this binding node."""
     for target, value in _binding_pairs(node):
         if target is None or feature not in _bound_names(target):
             continue
-        # Only a real destructuring assignment pairs targets with RHS elements.
-        # A `for`/`with` target takes its value from the iterable / context
-        # manager, not positionally from the expression's own elements.
-        if value is not None and isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+        if value is not None and isinstance(node, _ELEMENTWISE_NODES):
             return _element_value(target, value, feature)
         return value
     return None
@@ -828,22 +831,29 @@ def _merge_result_is_used(forward, call):
             for target, value in _binding_pairs(node):
                 if target is None or value is None:
                     continue
-                bound = _bound_names(target)
-                if not bound:
-                    continue
-                carries = (
-                    (position == 0 and _contains(value, call))
-                    or _references(value, tainted)
-                )
-                if carries:
-                    tainted.update(bound)
-                elif node is statement and not isinstance(node, ast.AugAssign):
-                    # A direct, unconditional rebinding to something the merge
-                    # did NOT flow into overwrites the name: the merged value is
-                    # gone. A rebinding nested inside a conditional may not run,
-                    # so it must not clear the taint - and an augmented
-                    # assignment adds to the value rather than replacing it.
-                    tainted.difference_update(bound)
+                # A destructuring target consumes the RHS element by element, so
+                # each name is judged on the part it actually receives. Reading
+                # the whole RHS made `inputs_embeds, aux = original, merged` taint
+                # `inputs_embeds` - reporting the merge used while the embeddings
+                # were handed the ORIGINAL, unmerged tensor. A non-literal RHS
+                # (a call, a starred or mismatched target) keeps the whole value,
+                # so `inputs_embeds, aux = self.pack(merged)` still counts.
+                element = value if isinstance(node, _ELEMENTWISE_NODES) else None
+                for name in _bound_names(target):
+                    part = _element_value(target, element, name) if element is not None else value
+                    carries = (
+                        (position == 0 and part is not None and _contains(part, call))
+                        or (part is not None and _references(part, tainted))
+                    )
+                    if carries:
+                        tainted.add(name)
+                    elif node is statement and not isinstance(node, ast.AugAssign):
+                        # A direct, unconditional rebinding to something the merge
+                        # did NOT flow into overwrites the name: the merged value
+                        # is gone. A rebinding nested inside a conditional may not
+                        # run, so it must not clear the taint - and an augmented
+                        # assignment adds to the value rather than replacing it.
+                        tainted.discard(name)
         if "inputs_embeds" in tainted:
             return True
     return False
@@ -1539,6 +1549,24 @@ _DISCARDED_RESULT_HOLES = [
      "inputs_embeds.to('cuda').masked_scatter_(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
+    # A destructuring target takes its own RHS element. Crediting the whole RHS
+    # let a tuple hand `inputs_embeds` the ORIGINAL while the merge went to a
+    # name nothing reads - the modality silently dropped, every canary green.
+    ("destructuring hands the embeddings the original, not the merge",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds, aux = original, merged"),
+    ("list destructuring hands the embeddings the original",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "[inputs_embeds, aux] = [original, merged]"),
+    ("nested destructuring hands the embeddings the original",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "(inputs_embeds, aux), sizes = (original, merged), image_sizes"),
 ]
 
 
@@ -1570,6 +1598,29 @@ _RESULT_REACHES_CONTROLS = [
      "    inputs_embeds = inputs_embeds.masked_scatter(\n"
      "        image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      "    )"),
+    # The mirror image: pairing element by element must still see the merge when
+    # it IS the element the embeddings receive, and a non-literal RHS keeps the
+    # whole value, so an unpacking call still propagates it.
+    ("destructuring hands the embeddings the merge",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds, aux = merged, original"),
+    ("nested destructuring hands the embeddings the merge",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "(inputs_embeds, aux), sizes = (merged, original), image_sizes"),
+    ("unpacking call keeps the whole right-hand side",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds, aux = self.pack_image_features(merged)"),
+    ("starred destructuring keeps the whole right-hand side",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds, *aux = merged, original"),
 ]
 
 
