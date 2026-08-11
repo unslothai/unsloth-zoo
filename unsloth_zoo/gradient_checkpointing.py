@@ -220,6 +220,42 @@ def _gradient_checkpoint_recompute_marker():
         _GC_RECOMPUTE_TLS.active = previous
 
 
+def _detach_checkpoint_args(args):
+    """Detach the differentiable tensors in ``args`` for a reentrant recompute.
+
+    ``ctx.args`` are the tensors as they were handed to ``Function.apply``; a
+    Python ``autograd.Function`` does not strip their ``grad_fn``. Re-running the
+    block on them under ``torch.enable_grad()`` and calling
+    ``torch.autograd.backward`` on the result therefore walks straight into the
+    history *behind* those tensors from inside this backward - a nested backward
+    over a graph the outer engine still intends to visit, which frees it early
+    ("Trying to backward through the graph a second time") and delivers the
+    gradient as a side effect rather than as this Function's output.
+
+    Detaching stops the traversal at the recompute boundary, exactly as
+    ``UnslothCheckpointFunction`` and torch's own reentrant checkpoint do, and
+    the caller returns the collected ``.grad`` so the engine keeps propagating.
+
+    Returns ``(recompute_args, grad_holders)`` where ``grad_holders[i]`` is the
+    detached tensor to read a gradient off, or ``None`` for inputs that take no
+    gradient.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    recompute_args = []
+    grad_holders   = []
+    for arg in args:
+        if torch.is_tensor(arg) and arg.requires_grad:
+            detached = arg.detach()
+            detached.requires_grad_(True)
+            recompute_args.append(detached)
+            grad_holders  .append(detached)
+        else:
+            recompute_args.append(arg)
+            grad_holders  .append(None)
+    return recompute_args, grad_holders
+pass
+
+
 class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     """
     All Unsloth Zoo code licensed under LGPLv3
@@ -245,8 +281,9 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
+        recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            output = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
         # that return the tensor itself (Qwen2-VL's vision block, and every
         # transformers block since the tuple returns were retired) used to raise
@@ -255,7 +292,11 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         if isinstance(output, tuple):
             (output,) = output
         torch.autograd.backward(output, dY)
-        return (None, hidden_states.grad,) + (None,)*len(ctx.args)
+        # Gradients for the extra inputs are returned to the engine instead of
+        # being left to accumulate as a side effect of the nested backward.
+        return (None, hidden_states.grad,) + tuple(
+            None if holder is None else holder.grad for holder in grad_holders
+        )
     pass
 pass
 
@@ -282,8 +323,9 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
+        recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            output = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
         # that return the tensor itself (Qwen2-VL's vision block, and every
         # transformers block since the tuple returns were retired) used to raise
@@ -292,7 +334,11 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         if isinstance(output, tuple):
             (output,) = output
         torch.autograd.backward(output, dY)
-        return (None, hidden_states.grad,) + (None,)*len(ctx.args)
+        # Gradients for the extra inputs are returned to the engine instead of
+        # being left to accumulate as a side effect of the nested backward.
+        return (None, hidden_states.grad,) + tuple(
+            None if holder is None else holder.grad for holder in grad_holders
+        )
     pass
 pass
 
@@ -352,6 +398,46 @@ def _torch_checkpoint_keywords():
 _TORCH_CHECKPOINT_KEYWORDS = _torch_checkpoint_keywords()
 
 
+class _KeywordArgumentCall:
+    """Re-form keyword arguments from trailing positional arguments.
+
+    ``functools.partial(function, **extra)`` is the obvious way to turn a
+    keyword call into the positional-only call an ``autograd.Function`` can
+    make, but a tensor closed over that way is invisible to autograd: it never
+    appears in the Function's input list, so the Function cannot return a
+    gradient for it. The reentrant checkpointers re-run the wrapped block under
+    ``torch.enable_grad()`` and then call ``torch.autograd.backward`` on the
+    recomputed output, so a captured non-leaf tensor is walked *through* - its
+    own history is traversed inside the nested backward. When that history is
+    shared (the same tensor handed to several checkpointed layers, or also
+    feeding the loss) the first nested backward frees it and the next traversal
+    raises ``Trying to backward through the graph a second time``; when it does
+    not raise, the gradient arrives as a side effect of the nested call instead
+    of as a Function output.
+
+    So tensors are passed as ordinary positional inputs to the Function - which
+    is what makes them visible to autograd - and this callable puts them back
+    into keyword position, taking them off the tail of the positional list.
+    Non-tensor keywords have no gradient and stay bound directly.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    __slots__ = ("function", "keys", "constants",)
+
+    def __init__(self, function, keys, constants):
+        self.function  = function
+        self.keys      = keys
+        self.constants = constants
+    pass
+
+    def __call__(self, *args):
+        split = len(args) - len(self.keys)
+        kwargs = dict(self.constants)
+        kwargs.update(zip(self.keys, args[split:]))
+        return self.function(*args[:split], **kwargs)
+    pass
+pass
+
+
 def _bind_checkpoint_kwargs(function, kwargs):
     """Bind leftover keyword arguments into ``function``.
 
@@ -367,23 +453,35 @@ def _bind_checkpoint_kwargs(function, kwargs):
     ``unsloth_checkpoint`` raised ``Unexpected keyword arguments``. Binding makes
     all three agree and never turns a working call into an error.
 
-    Returns ``function`` unchanged when there is nothing to bind, so the ordinary
-    empty-kwargs path allocates nothing.
+    Returns ``(callable, extra_positional_args)``. The extra arguments are the
+    keyword values that require grad; the caller must append them to the
+    Function's positional inputs so autograd can see them, and
+    ``_KeywordArgumentCall`` moves them back into keyword position before the
+    block is called. Returns ``function`` unchanged with an empty tuple when
+    there is nothing to bind, so the ordinary empty-kwargs path allocates
+    nothing and the no-tensor path keeps the cheap ``functools.partial``.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if not kwargs:
-        return function
+        return function, ()
     extra = {k : v for k, v in kwargs.items() if k not in _TORCH_CHECKPOINT_KEYWORDS}
     if not extra:
-        return function
-    return functools.partial(function, **extra)
+        return function, ()
+    keys = tuple(
+        k for k, v in extra.items() if torch.is_tensor(v) and v.requires_grad
+    )
+    if not keys:
+        return functools.partial(function, **extra), ()
+    constants = {k : v for k, v in extra.items() if k not in keys}
+    return _KeywordArgumentCall(function, keys, constants), \
+        tuple(extra[k] for k in keys)
 pass
 
 
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-    function = _bind_checkpoint_kwargs(function, kwargs)
-    return Unsloth_Gradient_Checkpointer.apply(function, *args)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
 
 
@@ -975,7 +1073,8 @@ def unsloth_checkpoint(
         # Unsloth's smart gradient checkpointing is installed. Bind them into
         # the callable instead - same observable behaviour, no keyword reaches
         # UnslothCheckpointFunction. See _bind_checkpoint_kwargs.
-        function = _bind_checkpoint_kwargs(function, kwargs)
+        function, extra_args = _bind_checkpoint_kwargs(function, kwargs)
+        args = args + extra_args
         kwargs = {}
 
     if use_reentrant:
@@ -1176,8 +1275,8 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     global CPU_BUFFERS
     if len(CPU_BUFFERS) == 0:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    function = _bind_checkpoint_kwargs(function, kwargs)
-    return UnslothCheckpointFunction.apply(function, *args)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    return UnslothCheckpointFunction.apply(function, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

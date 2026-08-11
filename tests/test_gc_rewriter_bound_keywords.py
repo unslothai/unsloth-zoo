@@ -439,11 +439,11 @@ def test_generated_module_imports_functools():
 def test_bind_checkpoint_kwargs_is_identity_without_kwargs():
     def fn(x):
         return x
-    assert _bind_checkpoint_kwargs(fn, {}) is fn
+    assert _bind_checkpoint_kwargs(fn, {}) == (fn, ())
     # torch's own checkpoint keywords are consumed by the checkpoint machinery
     # and must never be bound into the wrapped function.
     only_torch = {k: object() for k in _TORCH_CHECKPOINT_KEYWORDS}
-    assert _bind_checkpoint_kwargs(fn, only_torch) is fn
+    assert _bind_checkpoint_kwargs(fn, only_torch) == (fn, ())
 
 
 def test_torch_checkpoint_keywords_covers_every_keyword_only_parameter():
@@ -473,7 +473,7 @@ def test_bind_checkpoint_kwargs_drops_early_stop(monkeypatch):
     def block(x):
         return x * 2
 
-    assert _bind_checkpoint_kwargs(block, {"early_stop": False}) is block
+    assert _bind_checkpoint_kwargs(block, {"early_stop": False}) == (block, ())
     x = torch.randn(4, requires_grad = True)
     out = unsloth_gradient_checkpoint(block, x, early_stop = False)
     out.sum().backward()
@@ -483,8 +483,11 @@ def test_bind_checkpoint_kwargs_drops_early_stop(monkeypatch):
 def test_bind_checkpoint_kwargs_binds_the_rest():
     def fn(x, flag = None):
         return (x, flag)
-    bound = _bind_checkpoint_kwargs(fn, {"flag": 7, "preserve_rng_state": False})
+    bound, extra = _bind_checkpoint_kwargs(fn, {"flag": 7, "preserve_rng_state": False})
+    # Nothing differentiable here, so the cheap partial is kept and no extra
+    # positional input is handed to the checkpoint Function.
     assert isinstance(bound, functools.partial)
+    assert extra == ()
     assert bound(1) == (1, 7)
 
 
@@ -546,3 +549,128 @@ def test_unsloth_gradient_checkpointer_still_accepts_a_one_tuple_return():
         (out,) = out
     out.sum().backward()
     assert torch.allclose(x.grad, torch.full_like(x, 3.0))
+
+
+# ---------------------------------------------------------------------------
+# Tensor keywords stay visible to autograd
+# ---------------------------------------------------------------------------
+# A keyword whose value is a non-leaf tensor that requires grad cannot be closed
+# over by functools.partial: the checkpoint autograd.Function would never see it
+# as an input, so its gradient could only arrive as a side effect of the nested
+# torch.autograd.backward() the reentrant recompute performs. When that tensor is
+# shared - handed to more than one checkpointed layer, or also feeding the loss -
+# the first nested backward frees the shared history and the next traversal dies
+# with "Trying to backward through the graph a second time".
+
+
+@pytest.fixture
+def cpu_offload_globals(monkeypatch):
+    """Let UnslothCheckpointFunction run on CPU.
+
+    Its module globals are normally seeded by
+    ``initialize_unsloth_gradient_checkpointing()``, which needs pinned memory,
+    streams and a device count. MINIMUM_SIZE above any tensor in these tests
+    keeps the offload branch off, so the plain recompute path runs."""
+    from unsloth_zoo import gradient_checkpointing as gc_module
+    for name, value in (
+        ("FIRST_PASS", False), ("LAST_GC_INDEX", 0), ("CURRENT_GC_INDEX", 0),
+        ("MINIMUM_SIZE", 1 << 40), ("CPU_INDEX", 0),
+        ("CPU_BUFFERS", [torch.empty(0)]), ("BACKWARD_PASS", False),
+        ("USE_DOUBLE_BUFFER", False), ("GPU_BUFFERS", []), ("GPU_BUFFERS_B", None),
+    ):
+        monkeypatch.setattr(gc_module, name, value, raising = False)
+    return gc_module
+
+
+class _SideLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(4) * 0.5)
+
+    def forward(self, hidden_states, side = None, flag = False):
+        out = hidden_states @ self.weight
+        if side is not None:
+            out = out + side
+        if flag:
+            out = out * 1.0
+        return out
+
+
+def _run_shared_keyword(checkpoint_fn):
+    """Two checkpointed layers fed the same non-leaf tensor keyword, which also
+    contributes to the loss. Returns the gradients."""
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_SideLayer(), _SideLayer()])
+    torch.manual_seed(1)
+    x    = torch.randn(2, 4, requires_grad = True)
+    leaf = torch.randn(2, 4, requires_grad = True)
+    side = leaf * 2.0                     # non-leaf, requires grad, shared
+
+    hidden_states = x
+    for layer in layers:
+        if checkpoint_fn is None:
+            hidden_states = layer(hidden_states, side = side, flag = True)
+        else:
+            hidden_states = checkpoint_fn(layer, hidden_states, side = side, flag = True)
+    (hidden_states.sum() + side.sum()).backward()
+    return {
+        "x": x.grad, "leaf": leaf.grad,
+        "w0": layers[0].weight.grad, "w1": layers[1].weight.grad,
+    }
+
+
+@pytest.mark.parametrize(
+    "checkpoint_fn", [unsloth_gradient_checkpoint, unsloth_checkpoint],
+)
+def test_shared_tensor_keyword_matches_the_uncheckpointed_reference(
+    checkpoint_fn, cpu_offload_globals,
+):
+    reference = _run_shared_keyword(None)
+    got = _run_shared_keyword(checkpoint_fn)
+    for name, expected in reference.items():
+        assert got[name] is not None, f"{name} received no gradient"
+        assert torch.equal(got[name], expected), (
+            f"{name}: {(got[name] - expected).abs().max().item()}"
+        )
+
+
+def test_bind_checkpoint_kwargs_routes_differentiable_tensors_positionally():
+    """The tensor keyword becomes a positional input of the checkpoint Function
+    and is put back into keyword position before the block is called."""
+    def block(x, side = None, flag = None):
+        return (x, side, flag)
+
+    side = (torch.randn(3, requires_grad = True) * 2.0)
+    bound, extra = _bind_checkpoint_kwargs(block, {"side": side, "flag": 7})
+    assert not isinstance(bound, functools.partial)
+    assert extra == (side,)
+    x = torch.zeros(3)
+    seen_x, seen_side, seen_flag = bound(x, *extra)
+    assert seen_x is x and seen_side is side and seen_flag == 7
+
+
+def test_non_differentiable_tensor_keyword_keeps_the_cheap_partial():
+    """Only tensors that require grad need to be visible to autograd."""
+    def block(x, mask = None):
+        return x
+
+    mask = torch.ones(3)
+    bound, extra = _bind_checkpoint_kwargs(block, {"mask": mask})
+    assert isinstance(bound, functools.partial)
+    assert extra == ()
+
+
+def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
+    """Positional tensor args got the same treatment: the recompute ran on the
+    still-attached tensor and the Function returned None for it."""
+    def block(hidden_states, side):
+        return hidden_states * 2.0 + side
+
+    leaf = torch.randn(4, requires_grad = True)
+    side = leaf * 3.0
+    x = torch.randn(4, requires_grad = True)
+    out = Unsloth_Gradient_Checkpointer.apply(block, x, side)
+    (out.sum() + side.sum()).backward()
+    assert torch.allclose(x.grad, torch.full_like(x, 2.0))
+    # d(loss)/d(leaf) = 3 * (1 from the block + 1 from side.sum())
+    assert torch.allclose(leaf.grad, torch.full_like(leaf, 6.0))
