@@ -513,11 +513,44 @@ def _assigns_feature(stmt, feature):
     )
 
 
+def _element_value(target, value, feature):
+    """The part of `value` that `<feature>` actually receives from `target`.
+
+    A destructuring target consumes the RHS element by element, so when the RHS
+    is written out as a literal tuple/list the name takes ITS element and nothing
+    else: in `image_features, lens = (image_features.float(), lens.to(
+    inputs_embeds.dtype))` the only cast belongs to `lens`, and crediting it to
+    `image_features` reports an fp32 tensor aligned. Anything else (a call, a
+    starred target, a length mismatch) keeps the whole RHS, which is how
+    `image_features, feature_lens = self.pack_image_features(image_features.to(
+    inputs_embeds.dtype))` - upstream's llava_next spelling - stays aligned.
+    """
+    if isinstance(target, ast.Name):
+        return value if target.id == feature else None
+    if (
+        isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(elt, ast.Starred) for elt in target.elts)
+        and not any(isinstance(elt, ast.Starred) for elt in value.elts)
+    ):
+        for element, element_value in zip(target.elts, value.elts):
+            if feature in _bound_names(element):
+                return _element_value(element, element_value, feature)
+    return value
+
+
 def _binding_value(node, feature):
     """The expression `<feature>` takes its dtype from in this binding node."""
     for target, value in _binding_pairs(node):
-        if target is not None and feature in _bound_names(target):
-            return value
+        if target is None or feature not in _bound_names(target):
+            continue
+        # Only a real destructuring assignment pairs targets with RHS elements.
+        # A `for`/`with` target takes its value from the iterable / context
+        # manager, not positionally from the expression's own elements.
+        if value is not None and isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            return _element_value(target, value, feature)
+        return value
     return None
 
 
@@ -527,11 +560,22 @@ def _binding_is_aligned(node, feature):
 
 
 def _feature_rebindings(stmt, feature):
-    """Every rebinding of `<feature>` anywhere inside `stmt`'s own scope."""
+    """Every rebinding of `<feature>` anywhere inside `stmt`'s own scope.
+
+    An augmented assignment is NOT one of them: `image_features += delta` is
+    `Tensor.add_`, which writes through the existing storage and keeps the
+    existing dtype. It neither creates the alignment its RHS carries
+    (`image_features += delta.to(inputs_embeds.dtype)` leaves an fp32
+    `image_features` fp32) nor destroys one an earlier cast established
+    (`image_features += bias` on an aligned tensor is still aligned), so it says
+    nothing and the running verdict stands.
+    """
     return [
         node
         for node in _walk_own_scope(stmt, descend = False)
-        if isinstance(node, _BINDING_NODES) and _assigns_feature(node, feature)
+        if isinstance(node, _BINDING_NODES)
+        and not isinstance(node, ast.AugAssign)
+        and _assigns_feature(node, feature)
     ]
 
 
@@ -540,7 +584,11 @@ def _rebinding_alignment(stmt, feature):
 
     `None` when `stmt` does not rebind the name (so it says nothing either way).
     """
-    if isinstance(stmt, _ASSIGN_NODES) and _assigns_feature(stmt, feature):
+    if (
+        isinstance(stmt, _ASSIGN_NODES)
+        and not isinstance(stmt, ast.AugAssign)
+        and _assigns_feature(stmt, feature)
+    ):
         return _binding_is_aligned(stmt, feature)
     # A bare named expression statement, `(image_features := ...)`, rebinds
     # unconditionally exactly like an assignment does.
@@ -748,11 +796,12 @@ def _merge_result_is_used(forward, call):
                 )
                 if carries:
                     tainted.update(bound)
-                elif node is statement:
+                elif node is statement and not isinstance(node, ast.AugAssign):
                     # A direct, unconditional rebinding to something the merge
                     # did NOT flow into overwrites the name: the merged value is
                     # gone. A rebinding nested inside a conditional may not run,
-                    # so it must not clear the taint.
+                    # so it must not clear the taint - and an augmented
+                    # assignment adds to the value rather than replacing it.
                     tainted.difference_update(bound)
         if "inputs_embeds" in tainted:
             return True
@@ -1053,6 +1102,81 @@ def test_destructuring_rebindings_of_the_feature_are_not_skipped(label, body):
         f"{label}: the tracer still credits the earlier aligned assignment even "
         f"though `image_features` was rebound by an unpack whose value carries no "
         f"`inputs_embeds.dtype` cast. The unpacked tensor reaches masked_scatter."
+    )
+
+
+# A destructuring target takes its RHS ELEMENT, not the whole RHS. Reading the
+# whole tuple lets a cast that belongs to some other name keep the feature green
+# (transformers writes literal-tuple destructuring: vilt's
+# `text_features, _ = (sequence_output[:, :n], sequence_output[:, n:])`).
+_UNPACK_PAIRING_HOLES = [
+    ("tuple RHS whose cast belongs to the other name",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features, feature_lens = (\n"
+     "    image_features.float(), feature_lens.to(inputs_embeds.dtype))"),
+    ("list RHS whose cast belongs to the other name",
+     f"{_ALIGNED_ASSIGN}\n"
+     "[image_features, feature_lens] = [\n"
+     "    image_features.float(), feature_lens.to(inputs_embeds.dtype)]"),
+    ("nested tuple RHS whose cast belongs to the other name",
+     f"{_ALIGNED_ASSIGN}\n"
+     "(image_features, feature_lens), image_sizes = (\n"
+     "    (image_features.float(), feature_lens.to(inputs_embeds.dtype)), sizes)"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body", _UNPACK_PAIRING_HOLES, ids = [case[0] for case in _UNPACK_PAIRING_HOLES],
+)
+def test_a_cast_belonging_to_another_target_is_not_alignment(label, body):
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found, f"{label}: the synthetic merge site itself was not found"
+    assert not aligned, (
+        f"{label}: the tracer credits `image_features` with an "
+        f"`inputs_embeds.dtype` cast that the unpack hands to a DIFFERENT name. "
+        f"`image_features` is fp32 when it reaches masked_scatter."
+    )
+
+
+def test_the_matching_element_of_a_tuple_rhs_still_counts():
+    body = (
+        "image_features, feature_lens = (\n"
+        "    image_features.to(inputs_embeds.device, inputs_embeds.dtype), feature_lens)"
+    )
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found and aligned, "the element the feature actually receives carries the cast"
+
+
+# `image_features += delta` is `Tensor.add_`: in place, so the name keeps the
+# dtype it already had. It can neither inherit the RHS's cast nor lose an
+# earlier one.
+_AUG_ASSIGN_CASES = [
+    ("augmented assignment does not inherit the RHS cast",
+     "image_features = image_features.float()\n"
+     "image_features += delta.to(inputs_embeds.dtype)", False),
+    ("augmented assignment with no earlier cast at all",
+     "image_features += delta.to(inputs_embeds.dtype)", False),
+    ("augmented assignment does not undo an earlier cast",
+     f"{_ALIGNED_ASSIGN}\n"
+     "image_features += self.position_embedding", True),
+    ("augmented assignment inside a branch keeps the earlier cast",
+     f"{_ALIGNED_ASSIGN}\n"
+     "if self.config.add_position_embedding:\n"
+     "    image_features += self.position_embedding", True),
+]
+
+
+@pytest.mark.parametrize(
+    "label,body,expected", _AUG_ASSIGN_CASES, ids = [case[0] for case in _AUG_ASSIGN_CASES],
+)
+def test_augmented_assignment_preserves_the_left_hand_dtype(label, body, expected):
+    found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
+    assert found, f"{label}: the synthetic merge site itself was not found"
+    assert aligned is expected, (
+        f"{label}: expected aligned={expected}, got {aligned}. An in-place "
+        f"`+=` keeps `image_features`' existing dtype, so it neither creates "
+        f"alignment from its right-hand side nor destroys alignment established "
+        f"before it."
     )
 
 
