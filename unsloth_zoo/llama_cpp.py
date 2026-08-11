@@ -128,7 +128,6 @@ try:
     from .disk_utils import (
         is_colab_environment as _is_colab_environment,
         is_kaggle_environment as _is_kaggle_environment,
-        KAGGLE_TMP,
     )
 except ImportError:
     # Loaded as a standalone file with no package context, which is how the
@@ -143,7 +142,6 @@ except ImportError:
     _disk_utils_spec.loader.exec_module(_disk_utils)
     _is_colab_environment = _disk_utils.is_colab_environment
     _is_kaggle_environment = _disk_utils.is_kaggle_environment
-    KAGGLE_TMP = _disk_utils.KAGGLE_TMP
 
 IS_COLAB_ENVIRONMENT  = _is_colab_environment()
 IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
@@ -152,15 +150,11 @@ IS_WINDOWS = sys.platform == "win32"
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
 #
-# On Kaggle the home directory sits on the same small overlay as the working
-# directory, and a llama.cpp source checkout plus its build tree is several GB
-# of it - spent before the export has written anything. The large /tmp overlay
-# is no more ephemeral than a Kaggle home directory is, so default there. Only
-# the default moves; UNSLOTH_LLAMA_CPP_PATH still wins.
-if IS_KAGGLE_ENVIRONMENT:
-    UNSLOTH_HOME = os.path.join(KAGGLE_TMP, ".unsloth")
-else:
-    UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
+# This deliberately does NOT move on Kaggle. Only /kaggle/working is small
+# there; a probe kernel measured the home directory on the same large overlay
+# as /tmp (1026.8GB free of 8062.4GB on both), so a llama.cpp checkout and its
+# build tree already have room where they land.
+UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
