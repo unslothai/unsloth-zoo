@@ -5214,9 +5214,8 @@ def _qwen3_omni_media_counts(content):
             index = 0
         elif kind == "audio" or "audio" in item or "audio_url" in item:
             index = 1
-        # `video_url` carries no "video" key. Grouped with video so this agrees
-        # with `_structured_multimodal_counts`; the native template renders no
-        # placeholder for that shape either way, so ordering is unaffected.
+        # `video_url` has no "video" key. Grouped here to agree with
+        # `_structured_multimodal_counts`; the template renders it either way.
         elif kind in ("video", "video_url") or "video" in item or "video_url" in item:
             index = 2
         else:
@@ -5448,9 +5447,8 @@ def _prepare_vlm_template_messages(
     )
 
     template_messages = normalized_messages
-    # Not gated on the scalar counts: ordering is wrong on its own merits, and a
-    # caller whose media is embedded in the messages leaves them at zero. The
-    # counts only decide how many extra placeholders the anchor needs.
+    # Not gated on the counts: embedded media leaves them at zero, and ordering
+    # is wrong on its own merits. Counts only size the anchor's deficit.
     if (
         model_type == "qwen3_omni_moe"
         and has_structured_multimodal
@@ -5470,10 +5468,9 @@ def _prepare_vlm_template_messages(
             if kwargs.get("skip_audio_token")
             else max(0, num_audios - sum(item[1] for item in counts)),
         )
-        # Every user-like turn the renderer sees, not just the anchor: a later
-        # turn ordered `text, audio` keeps that order otherwise, and audio
-        # rendered last loses Thinker conditioning. Only the anchor takes the
-        # conversation-wide deficit.
+        # Every user-like turn, not just the anchor: a later `text, audio` turn
+        # keeps that order otherwise and audio rendered last loses Thinker
+        # conditioning. Only the anchor takes the deficit.
         rebuilt = list(normalized_messages)
         changed = False
         for index, message in enumerate(normalized_messages):

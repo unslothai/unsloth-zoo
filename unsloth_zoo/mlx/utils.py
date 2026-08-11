@@ -6313,9 +6313,8 @@ def _vlm_audio_part_state(messages):
         for part in content:
             if not isinstance(part, dict):
                 continue
-            # Key-only `{"audio": clip}` too, not just a typed part: Qwen's own
-            # template renders a placeholder for it, so extracting nothing here
-            # left the row a placeholder short of a waveform.
+            # Key-only `{"audio": clip}` too: the template renders a
+            # placeholder for it, so skipping it left the row a waveform short.
             if part.get("type") not in _AUDIO_PART_TYPES and not any(
                 key in part for key in _AUDIO_PART_TYPES
             ):
