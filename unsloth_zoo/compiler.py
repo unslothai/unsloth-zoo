@@ -2787,7 +2787,13 @@ pass
 #   self._gradient_checkpointing_func(
 #       functools.partial(blk.__call__, max_seqlen = max_seqlen), ...)
 # in the checkpointed branch and `blk(..., max_seqlen = max_seqlen)` in the else
-# branch. Binding into the callable is exactly what transformers itself does in
+# branch. The same reasoning applies to the `**kwargs` expansion the call site
+# already had on EVERY version, 4.x included: it is a keyword expansion, so it
+# is moved out of the argument list and into the same partial. It looks harmless
+# only because it is usually empty; `output_hidden_states = True` reaches the
+# vision tower's **kwargs on transformers 5.x and is enough to trip the same
+# `Unexpected keyword arguments` error.
+# Binding into the callable is exactly what transformers itself does in
 # `GradientCheckpointingLayer.__call__`, so it works with every checkpoint
 # implementation - reentrant or not, Unsloth's or torch's - and the value still
 # reaches the block on both branches.
@@ -2952,15 +2958,47 @@ def patch_gradient_checkpointing(module, source):
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
 
+    # Everything left in `ARGS` is forwarded verbatim to
+    # `self._gradient_checkpointing_func`, which is frequently plain
+    # `torch.utils.checkpoint.checkpoint`. Positionals are fine there - that is
+    # exactly what checkpointing is for - but KEYWORDS are not: reentrant
+    # `torch.utils.checkpoint.checkpoint` raises `Unexpected keyword arguments`
+    # on anything it does not recognise, and Unsloth's own reentrant shims can
+    # only forward positionals. So every keyword has to be bound into the
+    # checkpointed callable instead, the way
+    # `transformers.modeling_layers.GradientCheckpointingLayer.__call__` does
+    # it upstream.
+    #
+    # Two sources of keywords:
+    #   1. `bound_keywords` - declared by a replacement entry (Qwen2-VL's
+    #      `max_seqlen`, which the 5.x block only accepts through **kwargs).
+    #   2. A `**kwargs` expansion the upstream call site already had. This one
+    #      is the layer's own runtime keywords; leaving it in `ARGS` hands them
+    #      to the checkpoint function. Empty at runtime it looks harmless, which
+    #      is why it survived - `output_hidden_states = True` on transformers
+    #      5.x is enough to make it non-empty and blow up.
+    # The `else` branch calls the layer directly, so there they all stay
+    # ordinary keywords and `ARGS` is used unchanged.
+    star_kwargs = re.findall(r"\*\*[\s]*([A-Za-z_][A-Za-z_0-9]*)", args)
+    checkpoint_args = args
+    if star_kwargs:
+        checkpoint_args = re.sub(
+            r"\*\*[\s]*[A-Za-z_][A-Za-z_0-9]*[\s]*\,?", "", args
+        )
+    partial_keywords = [
+        f"{name} = {value}" for name, value in bound_keywords.items()
+    ] + [f"**{name}" for name in star_kwargs]
+
+    if partial_keywords:
+        replacer = replacer.replace(
+            "LAYER.__call__, ARGS",
+            "functools.partial(LAYER.__call__, "
+            + ", ".join(partial_keywords)
+            + "), " + checkpoint_args,
+        )
+    pass
+
     if bound_keywords:
-        # Keywords the block only takes through **kwargs. `ARGS` is forwarded
-        # verbatim to `self._gradient_checkpointing_func`, so putting them there
-        # would bind them to the checkpoint function instead of to the layer -
-        # and `torch.utils.checkpoint.checkpoint` raises on unknown keywords
-        # under `use_reentrant = True`, as does Unsloth's `unsloth_checkpoint`.
-        # Bind them into the callable instead, like
-        # `GradientCheckpointingLayer.__call__` does upstream. The `else` branch
-        # calls the layer directly, so there they stay ordinary keywords.
         keywords = ", ".join(
             f"{name} = {value}" for name, value in bound_keywords.items()
         )
@@ -2971,10 +3009,6 @@ def patch_gradient_checkpointing(module, source):
             if not args_with_keywords.endswith(","):
                 args_with_keywords += ","
             args_with_keywords += " " + keywords
-        replacer = replacer.replace(
-            "LAYER.__call__, ARGS",
-            "functools.partial(LAYER.__call__, " + keywords + "), ARGS",
-        )
         replacer = replacer.replace(
             "hidden_states = LAYER(ARGS)",
             "hidden_states = LAYER(" + args_with_keywords + ")",
