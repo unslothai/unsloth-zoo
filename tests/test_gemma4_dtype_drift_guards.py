@@ -195,6 +195,15 @@ def _gemma4_modeling_source():
     return pathlib.Path(inspect.getsourcefile(real_gemma4)).read_text()
 
 
+def _feature_assignments(src, modality):
+    """Every line in ``src`` that BINDS ``<modality>_features``, stripped."""
+    return [
+        line.strip()
+        for line in src.splitlines()
+        if re.match(rf"\s*{modality}_features\s*=", line)
+    ]
+
+
 @requires_gemma4
 def test_real_gemma4_audio_merge_site_is_recognized():
     src = _gemma4_modeling_source()
@@ -210,12 +219,50 @@ def test_real_gemma4_audio_merge_site_is_recognized():
 
 
 @requires_gemma4
-def test_real_gemma4_image_and_video_merges_still_cast_dtype():
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_real_gemma4_image_and_video_merges_still_cast_dtype(modality):
     # Regression anchor: image/video have always cast dtype; if upstream ever
     # drops it there too, that is a new modality that also needs patching.
-    src = _gemma4_modeling_source()
-    assert "image_features.to(inputs_embeds.device, inputs_embeds.dtype)" in src
-    assert "video_features.to(inputs_embeds.device, inputs_embeds.dtype)" in src
+    #
+    # Asked of the ASSIGNMENTS rather than of one exact call spelling. Upstream
+    # reshaped the image branch to
+    #
+    #   image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+    #
+    # which still casts, but no longer contains the literal
+    # "image_features.to(inputs_embeds.device, inputs_embeds.dtype)". Only the
+    # spelling moved, so a substring match failed on a file that is still
+    # correct -- the guard fired at the wrong thing. What actually matters is
+    # that SOMETHING binds <modality>_features to a value carrying
+    # inputs_embeds.dtype before the masked_scatter, and that survives a
+    # rename of whatever produced the tensor.
+    assignments = _feature_assignments(_gemma4_modeling_source(), modality)
+    assert assignments, f"no {modality}_features assignment found at all"
+    assert any("inputs_embeds.dtype" in line for line in assignments), (
+        f"Gemma4 {modality} merge no longer casts to inputs_embeds.dtype: "
+        f"{assignments}. That is a modality the unsloth dtype patches do not "
+        f"cover, and masked_scatter will raise on a dtype mismatch."
+    )
+
+
+def test_the_dtype_cast_guard_can_actually_fail():
+    """The guard above is a search, so it is worth proving it does not always find.
+
+    Runs without gemma4 installed, unlike the guard itself, which is the point: a
+    guard that only ever runs on hosts with the newest transformers is one nobody
+    notices going vacuous."""
+    casts = "    image_features = torch.cat(x, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)\n"
+    older = "    image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+    device_only = "    image_features = image_features.to(inputs_embeds.device)\n"
+
+    def _ok(src):
+        found = _feature_assignments(src, "image")
+        return bool(found) and any("inputs_embeds.dtype" in line for line in found)
+
+    assert _ok(casts), "the current upstream spelling must pass"
+    assert _ok(older), "the spelling this guard used to match must still pass"
+    assert not _ok(device_only), "a device-only merge must fail"
+    assert not _feature_assignments(device_only, "video"), "and it must not match another modality"
 
 
 @requires_gemma4
