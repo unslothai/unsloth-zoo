@@ -5011,3 +5011,44 @@ def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
     # One audio is missing conversation-wide; it goes to the anchor only.
     assert [part.get("type") for part in template[0]["content"]] == ["image", "audio", "text"]
     assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
+
+
+def test_key_only_audio_parts_are_extracted_like_the_template_renders_them():
+    """Qwen's template emits a placeholder for a key-only `{"audio": clip}`
+    (`content.type == 'audio' or 'audio' in content or 'audio_url' in content`),
+    but the extractor keyed on `part["type"]` alone and supplied no waveform,
+    leaving the row one placeholder short of a tensor."""
+    import numpy as np
+    from unsloth_zoo.mlx.loader import _qwen3_omni_media_counts
+    from unsloth_zoo.mlx.utils import _vlm_audio_part_state
+
+    clip = np.zeros(16000, dtype = np.float32)
+    for part in (
+        {"type": "audio", "audio": clip},
+        {"type": "input_audio", "audio": clip},
+        {"audio": clip},                          # key-only, the regression
+    ):
+        messages = [{"role": "user", "content": [part, {"type": "text", "text": "t"}]}]
+        bare, payloads = _vlm_audio_part_state(messages)
+        # Whatever the counter counts, the extractor must supply.
+        assert _qwen3_omni_media_counts([part])[1] == len(payloads) == 1
+        assert bare is False
+
+
+def test_a_bare_audio_placeholder_still_reports_itself_as_bare():
+    """A typed part with no payload keeps signalling a bare placeholder, and
+    non-audio parts are still ignored."""
+    from unsloth_zoo.mlx.utils import _vlm_audio_part_state
+
+    bare, payloads = _vlm_audio_part_state(
+        [{"role": "user", "content": [{"type": "audio"}]}]
+    )
+    assert bare is True and payloads == []
+
+    bare, payloads = _vlm_audio_part_state(
+        [{"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "image": "i.png"},
+        ]}]
+    )
+    assert bare is False and payloads == []
