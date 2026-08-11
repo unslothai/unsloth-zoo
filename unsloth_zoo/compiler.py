@@ -2809,6 +2809,16 @@ pass
 # single pass, so entry 0 (which would inject `rotary_pos_emb` that 5.x blocks no
 # longer accept) has already run by the time this fires.
 #
+# Ordering alone is not enough, though, and that is what the optional FOURTH
+# element is for. transformers 5.10 - 5.14 spell the call site exactly like
+# 4.53.0 - 5.9 while the block has already lost `rotary_pos_emb`, so entry 0
+# matched on its own and produced
+#   TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4 positional
+#   arguments but 5 were given
+# Entries that inject a parameter therefore declare it, and
+# _replacement_fits_the_layer() checks it against the real block signature
+# before the entry is allowed to fire.
+#
 # There is deliberately no 5.x + `attention_mask` entry. The `attention_mask=`
 # spelling only ever existed in transformers 4.53.x (where the block named it as
 # its fifth positional parameter, which is why the 4.x entry below demotes it);
