@@ -20,12 +20,14 @@ cleanly when it is absent; when present (transformers >= 5.5.0, as on CI) they
 catch upstream source drift that would silently disable the patch.
 """
 import ast
+import collections
 import inspect
 import re
 
 import pytest
 import torch
 
+from unsloth_zoo.temporary_patches import gemma4 as g4p
 from unsloth_zoo.temporary_patches import gemma4_float32 as g4f
 from unsloth_zoo.temporary_patches.gemma4_float32 import _unsloth_gemma4_ple_cast_input
 from unsloth_zoo import compiler as C
@@ -236,6 +238,32 @@ def _casts_to_inputs_embeds_dtype(node):
     return False
 
 
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _walk_own_scope(root, descend = True):
+    """`ast.walk` restricted to the code `root`'s own scope executes.
+
+    A nested `def` / `class` / `lambda` is a separate scope with its own local
+    names, so a merge written inside a helper defined in `forward` is not
+    `forward`'s merge (the helper may never be invoked), and a cast in `forward`
+    says nothing about a same-named parameter of that helper. The nested
+    statement itself is still yielded - only its body is skipped.
+    """
+    if isinstance(root, _SCOPE_NODES) and not descend:
+        yield root
+        return
+    todo = collections.deque([root])
+    while todo:
+        node = todo.popleft()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _SCOPE_NODES):
+                yield child
+            else:
+                todo.append(child)
+
+
 def _gemma4_model_forward_node(src):
     tree = ast.parse(src)
     for node in tree.body:
@@ -268,7 +296,7 @@ def _enclosing_blocks(forward, target):
     chain = []
 
     def holds(node):
-        return any(n is target for n in ast.walk(node))
+        return any(n is target for n in _walk_own_scope(node, descend = False))
 
     def descend(block):
         for index, stmt in enumerate(block):
@@ -286,14 +314,24 @@ def _enclosing_blocks(forward, target):
 
 
 def _is_dtype_guard(test, feature):
-    """`if <feature>.dtype != ...:` - a cast under such a guard aligns both paths."""
-    for node in ast.walk(test):
-        if isinstance(node, ast.Compare) and any(
-            _is_attr(operand, feature, "dtype")
-            for operand in [node.left] + list(node.comparators)
-        ):
-            return True
-    return False
+    """Exactly `<feature>.dtype != inputs_embeds.dtype` (either operand order).
+
+    Only that comparison makes the untaken branch aligned BY DEFINITION. Any
+    other test mentioning the feature dtype (`... == inputs_embeds.dtype`,
+    `... != torch.bfloat16`, or the mismatch test `and`-ed with something else)
+    leaves a reachable path on which the feature stays un-cast, so a cast under
+    it proves nothing and must not count as unconditional alignment.
+    """
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
+        return False
+    if not isinstance(test.ops[0], ast.NotEq):
+        return False
+    operands = [test.left, test.comparators[0]]
+    return any(
+        _is_attr(operands[i], feature, "dtype")
+        and _is_attr(operands[1 - i], "inputs_embeds", "dtype")
+        for i in (0, 1)
+    )
 
 
 def _assigns_feature(stmt, feature):
@@ -301,25 +339,61 @@ def _assigns_feature(stmt, feature):
     return any(isinstance(t, ast.Name) and t.id == feature for t in targets)
 
 
+_ASSIGN_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+
+
+def _feature_rebindings(stmt, feature):
+    """Every assignment to `<feature>` anywhere inside `stmt`'s own scope."""
+    return [
+        node
+        for node in _walk_own_scope(stmt, descend = False)
+        if isinstance(node, _ASSIGN_NODES) and _assigns_feature(node, feature)
+    ]
+
+
 def _rebinding_alignment(stmt, feature):
     """Does `stmt` rebind `<feature>` on the path to the merge, and is it aligned?
 
     `None` when `stmt` does not rebind the name (so it says nothing either way).
     """
-    if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and _assigns_feature(stmt, feature):
-        return stmt.value is not None and _casts_to_inputs_embeds_dtype(stmt.value)
+    if isinstance(stmt, _ASSIGN_NODES) and _assigns_feature(stmt, feature):
+        value = getattr(stmt, "value", None)
+        return value is not None and _casts_to_inputs_embeds_dtype(value)
     # `if <feature>.dtype != inputs_embeds.dtype: <feature> = <feature>.to(...)`
     # is a cast-if-needed idiom (transformers spells it in blip_2 / granite_speech):
     # the untaken branch is aligned by definition, so it counts as unconditional.
     if isinstance(stmt, ast.If) and _is_dtype_guard(stmt.test, feature):
-        inner = [
-            s
-            for s in ast.walk(stmt)
-            if isinstance(s, (ast.Assign, ast.AnnAssign)) and _assigns_feature(s, feature)
-        ]
+        inner = _feature_rebindings(stmt, feature)
         if inner:
-            last = max(inner, key=lambda s: s.lineno)
-            return last.value is not None and _casts_to_inputs_embeds_dtype(last.value)
+            last = max(inner, key = lambda s: s.lineno)
+            value = getattr(last, "value", None)
+            return value is not None and _casts_to_inputs_embeds_dtype(value)
+    # Any OTHER compound statement that rebinds the feature is still a rebinding
+    # on the path to the merge and must not be skipped, or an earlier aligned
+    # assignment would keep proving alignment for a value that has since been
+    # rewritten (`if enabled: image_features = image_features.float()`).
+    rebindings = _feature_rebindings(stmt, feature)
+    if not rebindings:
+        return None
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        # A `with` body runs unconditionally, so its rebindings dominate the
+        # merge exactly like top-level ones: take the last one that says
+        # anything.
+        alignment = None
+        for inner in stmt.body:
+            inner_alignment = _rebinding_alignment(inner, feature)
+            if inner_alignment is not None:
+                alignment = inner_alignment
+        return alignment
+    # Conditionally executed (`if` / `for` / `while` / `try`): the rebinding may
+    # or may not run, so the state after it is "aligned before AND aligned in
+    # every branch". An unaligned branch therefore reports unaligned; a branch
+    # that only ever casts to `inputs_embeds.dtype` leaves the earlier verdict
+    # standing (`None`) instead of overriding it.
+    for rebinding in rebindings:
+        value = getattr(rebinding, "value", None)
+        if value is None or not _casts_to_inputs_embeds_dtype(value):
+            return False
     return None
 
 
@@ -341,10 +415,12 @@ def _feature_merge_args(forward, feature):
 
     The receiver has to be `inputs_embeds` (or something derived from it): a
     `scratch.masked_scatter(mask, feature)` elsewhere in `forward` is a different
-    tensor and says nothing about the dtype of the embedding merge.
+    tensor and says nothing about the dtype of the embedding merge. Nested `def`
+    / `class` / `lambda` bodies are skipped for the same reason: a merge in a
+    helper `forward` never invokes is not `forward`'s merge.
     """
     args = []
-    for node in ast.walk(forward):
+    for node in _walk_own_scope(forward):
         if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -428,6 +504,33 @@ def test_real_gemma4_image_and_video_merges_still_cast_dtype(feature):
         f"the audio bug (transformers #45192) in a new modality and needs the same "
         f"treatment as _patch_gemma4_audio_feature_dtype_on_class / "
         f"fix_gemma4_audio_feature_dtype."
+    )
+
+
+@requires_gemma4
+def test_real_gemma4_audio_eager_patch_matches_real_merge_site():
+    # The canary above only proves the COMPILER rewriter (a regex over the source)
+    # still fires. The eager patch is stricter: it requires the merge's source
+    # argument to BE the `audio_features.to(inputs_embeds.device, ...)` call, so a
+    # wrapped spelling such as
+    # `audio_features.to(inputs_embeds.device).reshape(-1, inputs_embeds.shape[-1])`
+    # matches the regex but not the AST matcher - the eager patch would log a drift
+    # warning, no-op, and the dtype crash would come back on the non-compiled path
+    # while every other guard here stayed green. Run the patch's OWN matcher over
+    # the real source so that spelling fails loudly here instead.
+    src = _gemma4_modeling_source()
+    forward = _gemma4_model_forward_node(src)
+    assert forward is not None, "Gemma4Model.forward not found in the real source"
+    buggy, fixed = g4p._gemma4_audio_merge_casts(forward)
+    already_aligned = not buggy and len(fixed) == 1
+    patchable = len(buggy) == 1 and not fixed
+    assert already_aligned or patchable, (
+        f"_patch_gemma4_audio_feature_dtype_on_class no longer recognizes the real "
+        f"Gemma4 audio merge site: it found {len(buggy)} device-only and {len(fixed)} "
+        f"device+dtype `audio_features.to(inputs_embeds.device, ...)` merge arguments, "
+        f"and it only acts on exactly one of either. The eager patch would silently "
+        f"no-op (the compiler regex may still fire, which is why the other audio "
+        f"canaries stay green). Update _patch_gemma4_audio_feature_dtype_on_class."
     )
 
 

@@ -671,33 +671,17 @@ def _is_gemma4_attr(node, owner, attr):
     )
 
 
-def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
-    """Align audio features to the actual text-embedding dtype at the merge site."""
-    marker = "_unsloth_audio_feature_dtype_patched"
-    if getattr(model_cls, marker, False):
-        return False
+def _gemma4_audio_merge_casts(forward_node):
+    """Split the audio `masked_scatter` source casts this patch can act on.
 
-    module = sys.modules.get(model_cls.__module__)
-    source_file = inspect.getsourcefile(model_cls)
-    if module is None or source_file is None:
-        return False
-
-    module_source = inspect.getsource(module)
-    tree = ast.parse(module_source, filename=source_file)
-    class_nodes = [
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == model_cls.__name__
-    ]
-    if len(class_nodes) != 1:
-        return False
-    forward_nodes = [
-        node for node in class_nodes[0].body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
-    ]
-    if len(forward_nodes) != 1:
-        return False
-    forward_node = forward_nodes[0]
-
+    Returns `(buggy_casts, fixed_casts)`: `masked_scatter(mask, audio_features.to(
+    inputs_embeds.device[, inputs_embeds.dtype]))` argument nodes, split by whether
+    the dtype is already carried. Anything else (a wrapped or reshaped source
+    argument, a different call shape) matches NEITHER list, which is exactly when
+    this patch silently no-ops - so the drift canary in
+    tests/test_gemma4_dtype_drift_guards.py calls this same matcher on the real
+    transformers source rather than re-deriving it.
+    """
     buggy_casts = []
     fixed_casts = []
     for node in ast.walk(forward_node):
@@ -725,6 +709,38 @@ def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
             for keyword in source.keywords
         )
         (fixed_casts if has_dtype else buggy_casts).append(source)
+    return buggy_casts, fixed_casts
+pass
+
+
+def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
+    """Align audio features to the actual text-embedding dtype at the merge site."""
+    marker = "_unsloth_audio_feature_dtype_patched"
+    if getattr(model_cls, marker, False):
+        return False
+
+    module = sys.modules.get(model_cls.__module__)
+    source_file = inspect.getsourcefile(model_cls)
+    if module is None or source_file is None:
+        return False
+
+    module_source = inspect.getsource(module)
+    tree = ast.parse(module_source, filename=source_file)
+    class_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == model_cls.__name__
+    ]
+    if len(class_nodes) != 1:
+        return False
+    forward_nodes = [
+        node for node in class_nodes[0].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
+    ]
+    if len(forward_nodes) != 1:
+        return False
+    forward_node = forward_nodes[0]
+
+    buggy_casts, fixed_casts = _gemma4_audio_merge_casts(forward_node)
 
     if not buggy_casts and len(fixed_casts) == 1:
         setattr(model_cls, marker, True)
