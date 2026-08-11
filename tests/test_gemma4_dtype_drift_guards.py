@@ -713,6 +713,35 @@ def _dominating_alignment(forward, feature, merge_arg):
 
 _MERGE_METHODS = ("masked_scatter", "masked_scatter_")
 
+# Attributes / methods that read a tensor's METADATA rather than its values.
+# `fallback.to(image_features.device, inputs_embeds.dtype)` mentions
+# `image_features` but scatters none of it.
+_METADATA_ATTRS = frozenset({
+    "device", "dtype", "shape", "ndim", "size", "numel", "layout",
+    "requires_grad", "is_cuda", "element_size", "itemsize", "stride",
+})
+
+
+def _carries_feature_value(node, feature):
+    """Do `<feature>`'s VALUES flow into `node`?
+
+    A merge is discovered by "the source argument uses the feature", and a bare
+    name-occurrence check answers that with `image_features.device` too. That
+    reads the feature's metadata and scatters something else entirely, so a
+    source spelled `fallback.to(image_features.device, inputs_embeds.dtype)`
+    would be reported as the image merge - and if the real merge were ever
+    dropped, `_merge_dtype_alignment` would return `(True, True)` on a source in
+    which no image value reaches the model at all. A metadata expression
+    contributes no values, so the whole subtree under it is skipped; everything
+    else still counts, which keeps
+    `image_features.to(...).reshape(-1, image_features.shape[-1])` a merge.
+    """
+    if isinstance(node, ast.Attribute) and node.attr in _METADATA_ATTRS:
+        return False
+    if isinstance(node, ast.Name):
+        return node.id == feature
+    return any(_carries_feature_value(child, feature) for child in ast.iter_child_nodes(node))
+
 
 def _feature_merges(forward, feature):
     """Every `inputs_embeds.masked_scatter[_](mask, ...)` call using `<feature>`.
@@ -727,6 +756,11 @@ def _feature_merges(forward, feature):
     is then decided by `_receiver_preserves_embeds_dtype`. Dropping unrecognised
     receivers here instead would let a second, safe merge hide a dtype-changing
     one.
+
+    The SOURCE, by contrast, has to carry the feature's values: a merge that only
+    reads `<feature>.device` or `<feature>.dtype` scatters something else, and
+    counting it would let a metadata mention stand in for a merge that upstream
+    has removed.
 
     The in-place spelling is accepted too (transformers writes
     `masked_scatter_` in qwen2_5_omni and blt): it merges into the same storage
@@ -749,9 +783,7 @@ def _feature_merges(forward, feature):
             for n in ast.walk(node.func.value)
         ):
             continue
-        if any(
-            isinstance(n, ast.Name) and n.id == feature for n in ast.walk(node.args[1])
-        ):
+        if _carries_feature_value(node.args[1], feature):
             calls.append(node)
     return sorted(calls, key=lambda n: (n.lineno, n.col_offset))
 
@@ -1425,6 +1457,73 @@ def test_used_merge_results_still_count_as_alignment(label, merge):
         _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
     )
     assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
+
+
+# ---------------------------------------------------------------------------
+# Merge DISCOVERY keys on the feature's values reaching the scatter source. A
+# source that only reads `<feature>.device` / `.dtype` / `.shape` merges some
+# other tensor, so accepting it would let a metadata mention impersonate a merge
+# upstream had deleted: `_merge_dtype_alignment` would report (True, True) on a
+# source in which no image value reaches the model.
+# ---------------------------------------------------------------------------
+_METADATA_ONLY_MERGES = [
+    ("source reads the feature device only",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, fallback.to(image_features.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("source reads the feature dtype only",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, fallback.to(inputs_embeds.device, image_features.dtype)\n"
+     ")"),
+    ("source reads the feature shape only",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, fallback.reshape(-1, image_features.shape[-1])\n"
+     ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,merge", _METADATA_ONLY_MERGES, ids = [c[0] for c in _METADATA_ONLY_MERGES],
+)
+def test_a_metadata_only_reference_is_not_a_feature_merge(label, merge):
+    found, _ = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert not found, (
+        f"{label}: the tracer counted a scatter that merely READS "
+        f"`image_features` metadata as the image merge. With the real merge gone "
+        f"this reports the modality present and aligned while no image value "
+        f"reaches the model."
+    )
+
+
+_VALUE_FLOW_CONTROLS = [
+    ("value and metadata in the same source",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype).reshape(\n"
+     "        -1, image_features.shape[-1])\n"
+     ")"),
+    ("value inside a concatenation",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, torch.cat([image_features, extra]).to(\n"
+     "        inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("value through a subscript",
+     "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features[0].to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,merge", _VALUE_FLOW_CONTROLS, ids = [c[0] for c in _VALUE_FLOW_CONTROLS],
+)
+def test_feature_values_reaching_the_source_are_still_a_merge(label, merge):
+    # Controls: dropping any of these would blind the canaries to a real merge.
+    found, aligned = _merge_dtype_alignment(
+        _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
+    )
+    assert found and aligned, f"{label}: a real feature merge was not discovered"
 
 
 def test_in_place_merge_with_an_unaligned_source_is_still_traced():
