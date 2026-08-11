@@ -436,7 +436,10 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
     ``max_seqlen=max_seqlen`` (cu_seqlens/max_seqlen moved into
     ``get_vision_attention_seqlens``) and dropped ``rotary_pos_emb`` from
     ``Qwen2VLVisionBlock.forward``. The rewriter carries one entry per
-    spelling; pass if either is still present, fail if neither is."""
+    spelling; pass if either is still present, fail if neither is.
+
+    The 5.x replacement drops ``max_seqlen`` (see
+    ``test_..._max_seqlen_is_recomputed`` below for why that is lossless)."""
     pytest.importorskip("transformers")
     try:
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
@@ -503,6 +506,53 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
             " OR ".join(str(a) for a in accepted),
             "transformers.models.qwen2_vl.modeling_qwen2_vl."
             f"Qwen2VLVisionBlock.forward signature (got {params})",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
+    """The transformers 5.x entry in
+    ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``
+    drops ``max_seqlen=max_seqlen`` from the rewritten ``blk(...)`` call: the
+    block's three positional slots are already taken and anything left as a
+    keyword binds to ``self._gradient_checkpointing_func`` instead of to the
+    block (``unsloth_checkpoint`` then raises ``Unexpected keyword
+    arguments``).
+
+    That is only lossless while ``VisionAttention.forward`` recomputes the
+    value through ``get_max_seqlen(cu_seqlens, config, kwargs=...)``, which
+    returns ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()`` when no precomputed
+    value is supplied. If upstream stops recomputing it, dropping it becomes a
+    silent numerical change, so guard it here."""
+    pytest.importorskip("transformers")
+    torch = pytest.importorskip("torch")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            get_max_seqlen, VisionAttention,
+        )
+    except ImportError:
+        pytest.skip("get_max_seqlen / VisionAttention not in this build (4.x)")
+
+    attn_src = inspect.getsource(VisionAttention.forward)
+    if "get_max_seqlen(" not in attn_src:
+        _drift(
+            "unsloth_zoo/compiler.py (custom_gradient_checkpointing_replacements, 5.x entry)",
+            "get_max_seqlen(",
+            "transformers.models.qwen2_vl.modeling_qwen2_vl.VisionAttention.forward",
+        )
+
+    class _FlashCfg:
+        _attn_implementation = "flash_attention_2"
+
+    cu_seqlens = torch.tensor([0, 4, 9], dtype = torch.int32)
+    expected = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+    # no precomputed value -> must recompute the same number the caller had
+    got = get_max_seqlen(cu_seqlens, _FlashCfg(), kwargs = {"max_seqlen": None})
+    if got != expected:
+        _drift(
+            "unsloth_zoo/compiler.py (custom_gradient_checkpointing_replacements, 5.x entry)",
+            f"get_max_seqlen(...) == {expected} when max_seqlen is absent",
+            "transformers.models.qwen2_vl.modeling_qwen2_vl.get_max_seqlen "
+            f"(got {got})",
         )
 
 

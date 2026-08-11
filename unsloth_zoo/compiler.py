@@ -2766,16 +2766,33 @@ pass
 #                              position_embeddings=None, **kwargs)
 # and added `max_seqlen=max_seqlen` to the call site (transformers 5.x moved the
 # cu_seqlens/max_seqlen computation into get_vision_attention_seqlens()).
-# `max_seqlen` is NOT a named parameter of the block - it rides along in
-# **kwargs down to the attention. Left alone the `arg=arg` demotion would turn
-# it into the third positional and it would silently be bound to
-# `position_embeddings`, so it is rewritten into an explicit
-# `**{"max_seqlen": max_seqlen}` mapping, which has no `arg=arg` spelling for
-# the demotion regex to match and therefore stays a keyword. The mapping is kept
-# inside the call (rather than hoisted into `kwargs` before the loop) so the
-# `for ... in ...:\n<spaces>hidden_states = <layer>(...)` finder regex below,
-# which requires the call to be the first statement of the loop body, still
-# matches.
+# `max_seqlen` is NOT a named parameter of the block, and there is nowhere for it
+# to go in the rewritten call: the three positional slots are already taken, and
+# anything left as a keyword is bound to `self._gradient_checkpointing_func`
+# rather than to the block - Unsloth's smart `unsloth_checkpoint` rejects leftover
+# keywords outright ("Unexpected keyword arguments: max_seqlen") and
+# `unsloth_gradient_checkpoint` silently drops them.
+#
+# So the 5.x entry simply drops `max_seqlen` from the call. This is lossless:
+# `VisionAttention.forward` recomputes it via
+#   get_max_seqlen(cu_seqlens, self.config, kwargs = {"max_seqlen": max_seqlen})
+# which, when the caller-supplied value is None, returns
+# `(cu_seqlens[1:] - cu_seqlens[:-1]).max().item()` under flash-attention and
+# None otherwise - exactly what `get_vision_attention_seqlens` computed from the
+# same `cu_seqlens`. The only cost is recomputing that max per layer.
+#
+# Order matters: the 5.x entries must stay AFTER the 4.x ones. The 5.x
+# replacement is textually the 4.x call, and the replacement list is applied in a
+# single pass, so entry 0 (which would inject `rotary_pos_emb` that 5.x blocks no
+# longer accept) has already run by the time this fires.
+#
+# There is deliberately no 5.x + `attention_mask` entry. The `attention_mask=`
+# spelling only ever existed in transformers 4.53.x (where the block named it as
+# its fifth positional parameter, which is why the 4.x entry below demotes it);
+# it was gone by 4.54 and no 5.x release pairs it with `max_seqlen`. In 5.x the
+# vision attention has no `attention_mask` parameter at all and passes
+# `attention_mask = None` to the attention interface itself, so any guessed
+# rewrite would be untestable and wrong either way.
 custom_gradient_checkpointing_replacements = [
     (
         """hidden_states = blk(
@@ -2809,8 +2826,8 @@ custom_gradient_checkpointing_replacements = [
                 **kwargs,
             )""",
     ),
-    # transformers >= 5.0 spellings. `max_seqlen` is a **kwargs-only argument of
-    # the vision block, so it must survive as a keyword.
+    # transformers >= 5.0 spelling. `max_seqlen` is dropped - the vision
+    # attention recomputes it from `cu_seqlens`. Must stay after the 4.x entries.
     (
         """hidden_states = blk(
                 hidden_states,
@@ -2823,25 +2840,6 @@ custom_gradient_checkpointing_replacements = [
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
-                **{"max_seqlen": max_seqlen},
-                **kwargs,
-            )""",
-    ),
-    (
-        """hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                **kwargs,
-            )""",
-        """hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                **{"max_seqlen": max_seqlen},
                 **kwargs,
             )""",
     ),
