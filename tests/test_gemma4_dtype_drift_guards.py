@@ -206,9 +206,11 @@ def _gemma4_modeling_source():
 # tf 5.5-5.14, or `... = torch.cat(image_features, dim=0).to(..., inputs_embeds.dtype)`,
 # tf 5.15). A substring anchor on one spelling breaks on cosmetic refactors while
 # staying blind to a real regression written in another spelling, so the canaries
-# below trace dtype ALIGNMENT structurally instead: find the masked_scatter that
-# consumes the features, then require an `inputs_embeds.dtype` cast either inside
-# the merge argument or on the last assignment to that name before the merge.
+# below trace dtype ALIGNMENT structurally instead: find every
+# `inputs_embeds.masked_scatter` that consumes the features, and require of each an
+# `inputs_embeds.dtype` cast either inside the merge argument or on the last
+# assignment to that name that DOMINATES the merge (same block or an enclosing one,
+# so a cast stranded in a branch the merge does not run under does not count).
 def _is_attr(node, owner, attr):
     """`<owner>.<attr>` as an AST node, e.g. `inputs_embeds.dtype`."""
     return (
@@ -244,16 +246,104 @@ def _gemma4_model_forward_node(src):
     return None
 
 
-def _merge_dtype_alignment(src, feature):
-    """Trace `<feature>` into `inputs_embeds.masked_scatter(...)`.
+def _child_blocks(stmt):
+    """Every nested statement list of `stmt` (`if`/`else`, loop bodies, `try`)."""
+    blocks = []
+    for field in ("body", "orelse", "finalbody"):
+        value = getattr(stmt, field, None)
+        if isinstance(value, list) and value and all(isinstance(s, ast.stmt) for s in value):
+            blocks.append(value)
+    for handler in getattr(stmt, "handlers", None) or []:
+        blocks.append(handler.body)
+    return blocks
 
-    Returns (merge_found, aligned_at_merge_call, aligned_on_last_assignment).
+
+def _enclosing_blocks(forward, target):
+    """`[(block, index)]` from the function body inwards to the stmt holding `target`.
+
+    Only these statement lists run unconditionally *relative to the merge*. A cast
+    nested in some other branch may never execute on the path that reaches the
+    merge, so it cannot prove alignment.
     """
-    forward = _gemma4_model_forward_node(src)
-    if forward is None:
-        return (False, False, False)
+    chain = []
 
-    merge_arg = None
+    def holds(node):
+        return any(n is target for n in ast.walk(node))
+
+    def descend(block):
+        for index, stmt in enumerate(block):
+            if not holds(stmt):
+                continue
+            chain.append((block, index))
+            for inner in _child_blocks(stmt):
+                if any(holds(s) for s in inner):
+                    descend(inner)
+                    break
+            return
+
+    descend(forward.body)
+    return chain
+
+
+def _is_dtype_guard(test, feature):
+    """`if <feature>.dtype != ...:` - a cast under such a guard aligns both paths."""
+    for node in ast.walk(test):
+        if isinstance(node, ast.Compare) and any(
+            _is_attr(operand, feature, "dtype")
+            for operand in [node.left] + list(node.comparators)
+        ):
+            return True
+    return False
+
+
+def _assigns_feature(stmt, feature):
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    return any(isinstance(t, ast.Name) and t.id == feature for t in targets)
+
+
+def _rebinding_alignment(stmt, feature):
+    """Does `stmt` rebind `<feature>` on the path to the merge, and is it aligned?
+
+    `None` when `stmt` does not rebind the name (so it says nothing either way).
+    """
+    if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and _assigns_feature(stmt, feature):
+        return stmt.value is not None and _casts_to_inputs_embeds_dtype(stmt.value)
+    # `if <feature>.dtype != inputs_embeds.dtype: <feature> = <feature>.to(...)`
+    # is a cast-if-needed idiom (transformers spells it in blip_2 / granite_speech):
+    # the untaken branch is aligned by definition, so it counts as unconditional.
+    if isinstance(stmt, ast.If) and _is_dtype_guard(stmt.test, feature):
+        inner = [
+            s
+            for s in ast.walk(stmt)
+            if isinstance(s, (ast.Assign, ast.AnnAssign)) and _assigns_feature(s, feature)
+        ]
+        if inner:
+            last = max(inner, key=lambda s: s.lineno)
+            return last.value is not None and _casts_to_inputs_embeds_dtype(last.value)
+    return None
+
+
+def _dominating_alignment(forward, feature, merge_arg):
+    """Is the last rebinding of `<feature>` that dominates `merge_arg` dtype-aligned?"""
+    best_line, best_aligned = None, False
+    for block, index in _enclosing_blocks(forward, merge_arg):
+        for stmt in block[:index]:
+            aligned = _rebinding_alignment(stmt, feature)
+            if aligned is None:
+                continue
+            if best_line is None or stmt.lineno > best_line:
+                best_line, best_aligned = stmt.lineno, aligned
+    return best_aligned
+
+
+def _feature_merge_args(forward, feature):
+    """Source args of every `inputs_embeds.masked_scatter(mask, ...)` using `<feature>`.
+
+    The receiver has to be `inputs_embeds` (or something derived from it): a
+    `scratch.masked_scatter(mask, feature)` elsewhere in `forward` is a different
+    tensor and says nothing about the dtype of the embedding merge.
+    """
+    args = []
     for node in ast.walk(forward):
         if not (
             isinstance(node, ast.Call)
@@ -262,42 +352,44 @@ def _merge_dtype_alignment(src, feature):
             and len(node.args) >= 2
         ):
             continue
+        if not any(
+            isinstance(n, ast.Name) and n.id == "inputs_embeds"
+            for n in ast.walk(node.func.value)
+        ):
+            continue
         source_arg = node.args[1]
         if any(
             isinstance(n, ast.Name) and n.id == feature for n in ast.walk(source_arg)
         ):
-            merge_arg = source_arg
-            break
-    if merge_arg is None:
-        return (False, False, False)
+            args.append(source_arg)
+    return sorted(args, key=lambda n: (n.lineno, n.col_offset))
 
-    aligned_at_call = _casts_to_inputs_embeds_dtype(merge_arg)
 
-    # Last `<feature> = ...` before the merge. Only the last one counts: an
-    # earlier cast says nothing if a later statement rebinds the name.
-    last_assign = None
-    for node in ast.walk(forward):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(t, ast.Name) and t.id == feature for t in targets):
-            continue
-        if node.lineno >= merge_arg.lineno:
-            continue
-        if last_assign is None or node.lineno > last_assign.lineno:
-            last_assign = node
-    aligned_on_assignment = (
-        last_assign is not None
-        and last_assign.value is not None
-        and _casts_to_inputs_embeds_dtype(last_assign.value)
+def _merge_dtype_alignment(src, feature):
+    """Trace `<feature>` into `inputs_embeds.masked_scatter(...)`.
+
+    Returns (merge_found, every_merge_aligned). EVERY merge consuming the feature
+    has to be aligned: one unaligned branch is one reachable dtype crash, so an
+    aligned first merge must not excuse an unaligned second one.
+    """
+    forward = _gemma4_model_forward_node(src)
+    if forward is None:
+        return (False, False)
+    merges = _feature_merge_args(forward, feature)
+    if not merges:
+        return (False, False)
+    aligned = all(
+        _casts_to_inputs_embeds_dtype(merge)
+        or _dominating_alignment(forward, feature, merge)
+        for merge in merges
     )
-    return (True, aligned_at_call, aligned_on_assignment)
+    return (True, aligned)
 
 
 @requires_gemma4
 def test_real_gemma4_audio_merge_site_is_recognized():
     src = _gemma4_modeling_source()
-    found, at_call, at_assign = _merge_dtype_alignment(src, "audio_features")
+    found, aligned = _merge_dtype_alignment(src, "audio_features")
     assert found, (
         "Gemma4 audio merge site drifted: no `inputs_embeds.masked_scatter(...)` "
         "consuming `audio_features` in Gemma4Model.forward. The unsloth audio patch "
@@ -305,7 +397,7 @@ def test_real_gemma4_audio_merge_site_is_recognized():
         "_patch_gemma4_audio_feature_dtype_on_class (eager) and "
         "fix_gemma4_audio_feature_dtype (compiler)."
     )
-    upstream_aligned = at_call or at_assign
+    upstream_aligned = aligned
     unsloth_can_patch = C.fix_gemma4_audio_feature_dtype(src) != src
     assert upstream_aligned or unsloth_can_patch, (
         "Gemma4 audio features reach masked_scatter with no `inputs_embeds.dtype` "
@@ -323,15 +415,16 @@ def test_real_gemma4_image_and_video_merges_still_cast_dtype(feature):
     # so unsloth patches only audio. If upstream ever drops the alignment here
     # too, that is a new modality that also needs patching.
     src = _gemma4_modeling_source()
-    found, at_call, at_assign = _merge_dtype_alignment(src, feature)
+    found, aligned = _merge_dtype_alignment(src, feature)
     assert found, (
         f"No `inputs_embeds.masked_scatter(...)` consuming `{feature}` in "
         f"Gemma4Model.forward - the merge site moved and this canary is blind."
     )
-    assert at_call or at_assign, (
+    assert aligned, (
         f"Gemma4 {feature.split('_')[0]} merge lost its `inputs_embeds.dtype` "
         f"alignment: `{feature}` reaches masked_scatter without an "
-        f"`inputs_embeds.dtype` cast at the call or on its last assignment. That is "
+        f"`inputs_embeds.dtype` cast at the call or on its last dominating "
+        f"assignment. That is "
         f"the audio bug (transformers #45192) in a new modality and needs the same "
         f"treatment as _patch_gemma4_audio_feature_dtype_on_class / "
         f"fix_gemma4_audio_feature_dtype."
@@ -361,8 +454,8 @@ def test_real_gemma4_audio_compiler_transform_emits_dtype_cast():
     # upstream already casts dtype, or our regex still matches and inserts it.
     src = _gemma4_modeling_source()
     out = C.fix_gemma4_audio_feature_dtype(src)
-    found, at_call, at_assign = _merge_dtype_alignment(out, "audio_features")
-    assert found and (at_call or at_assign), (
+    found, aligned = _merge_dtype_alignment(out, "audio_features")
+    assert found and aligned, (
         "After fix_gemma4_audio_feature_dtype, `audio_features` still reaches "
         "masked_scatter with no `inputs_embeds.dtype` alignment on upstream source "
         "(regex drift or multiple matches)."
