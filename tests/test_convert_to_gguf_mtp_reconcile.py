@@ -166,8 +166,10 @@ def test_convert_to_gguf_reconciles_mtp_config_to_index(llama_cpp, tmp_path, has
     updated = json.loads(config_path.read_text(encoding = "utf-8"))
     assert "unsloth_fixed_mtp" not in updated
     assert "unsloth_fixed_mtp" not in updated["text_config"]
-    assert ("mtp_num_hidden_layers" in updated) is has_mtp
-    assert ("mtp_num_hidden_layers" in updated["text_config"]) is has_mtp
+    # The declaration survives either way: kept as-is with MTP tensors, and kept
+    # because `--no-mtp` carries the intent without them.
+    assert "mtp_num_hidden_layers" in updated
+    assert "mtp_num_hidden_layers" in updated["text_config"]
     command, = _read_converter_commands(tmp_path)
     assert ("--no-mtp" in command) is not has_mtp
 
@@ -396,3 +398,74 @@ def test_convert_to_gguf_does_not_retry_an_unrelated_converter_failure(llama_cpp
     assert llama_cpp._converter_rejected_no_mtp("") is False
     assert llama_cpp._drop_no_mtp(["x", "--no-mtp", "y"]) == ["x", "y"]
     assert llama_cpp._drop_no_mtp(["x", "y"]) is None
+
+
+def test_convert_to_gguf_stays_idempotent_across_repeated_exports(llama_cpp, tmp_path):
+    """A retry, or a second export from the same folder, must behave like the first.
+
+    Deleting `mtp_num_hidden_layers` made the next run read no declaration, omit
+    `--no-mtp`, and hit the converter assertion the flag exists to avoid.
+    """
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "mtp_num_hidden_layers": 1,
+                "unsloth_fixed_mtp": True,
+                "text_config": {"num_hidden_layers": 24, "mtp_num_hidden_layers": 1},
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.language_model.layers.23.self_attn.q_proj.weight")
+    converter = str(_write_converter(tmp_path))
+
+    for run in range(3):
+        llama_cpp.convert_to_gguf(
+            model_name = str(tmp_path / f"output{run}.gguf"),
+            input_folder = str(model_dir),
+            converter_location = converter,
+            quantization_type = "bf16",
+        )
+
+    # Every run saw the declaration and sent the flag; the internal marker still goes.
+    updated = json.loads(config_path.read_text(encoding = "utf-8"))
+    assert "unsloth_fixed_mtp" not in updated
+    assert updated["mtp_num_hidden_layers"] == 1
+    commands = _read_converter_commands(tmp_path)
+    assert len(commands) == 3
+    assert all("--no-mtp" in command for command in commands)
+
+
+def test_convert_to_gguf_still_strips_the_declaration_for_legacy_converters(llama_cpp, tmp_path):
+    """Without the flag there is nothing to carry the intent, so the key must go."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "mtp_num_hidden_layers": 1,
+                "text_config": {"num_hidden_layers": 24, "mtp_num_hidden_layers": 1},
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.language_model.layers.23.self_attn.q_proj.weight")
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(tmp_path / "output.gguf"),
+        input_folder = str(model_dir),
+        converter_location = str(_write_converter(tmp_path, supports_no_mtp = False)),
+        quantization_type = "bf16",
+    )
+
+    updated = json.loads(config_path.read_text(encoding = "utf-8"))
+    assert "mtp_num_hidden_layers" not in updated
+    assert "mtp_num_hidden_layers" not in updated["text_config"]
+    command, = _read_converter_commands(tmp_path)
+    assert "--no-mtp" not in command
