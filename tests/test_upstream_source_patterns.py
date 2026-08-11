@@ -492,9 +492,18 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
         pytest.skip("Qwen2VLVisionBlock not in this build")
     params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
     accepted = (
-        # transformers 4.x
+        # transformers 4.51.3 - 4.52.x -- no **kwargs on the block yet
+        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+         "position_embeddings"],
+        # transformers 4.53.0 / 4.54 - 4.57
         ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
          "position_embeddings", "kwargs"],
+        # transformers 4.53.1 - 4.53.3 -- attention_mask added as the fifth
+        # positional parameter (and passed by the call site); this is the
+        # variant the 4.x + attention_mask replacement entry in compiler.py
+        # targets. Gone again by 4.54.
+        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+         "position_embeddings", "attention_mask", "kwargs"],
         # transformers 5.x -- rotary_pos_emb dropped, max_seqlen rides in kwargs
         ["self", "hidden_states", "cu_seqlens", "position_embeddings",
          "kwargs"],
