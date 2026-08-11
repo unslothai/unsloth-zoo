@@ -22,8 +22,10 @@ its pinned pattern is gone.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
+import textwrap
 
 import pytest
 
@@ -538,6 +540,177 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
         )
 
 
+_UNSET = object()
+
+_QWEN2_VL_MAX_SEQLEN_ZOO_SITE = (
+    "unsloth_zoo/compiler.py "
+    "(custom_gradient_checkpointing_replacements, 5.x entry)"
+)
+_QWEN2_VL_ATTN_PATH = (
+    "transformers.models.qwen2_vl.modeling_qwen2_vl.VisionAttention.forward"
+)
+
+
+def _qwen2_vl_max_seqlen_recompute_call(forward_src: str):
+    """Return the ``ast.Call`` for the ``max_seqlen = get_max_seqlen(...)``
+    recompute inside ``VisionAttention.forward``, or ``None``."""
+    tree = ast.parse(textwrap.dedent(forward_src))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and
+                node.targets[0].id == "max_seqlen"):
+            continue
+        call = node.value
+        if (isinstance(call, ast.Call) and
+                isinstance(call.func, ast.Name) and
+                call.func.id == "get_max_seqlen"):
+            return call
+    return None
+
+
+def _qwen2_vl_run_vision_attention(attn, hidden_states, cu_seqlens,
+                                   position_embeddings,
+                                   max_seqlen = _UNSET):
+    """Execute the real ``VisionAttention.forward`` on CPU and report the
+    packed-sequence lengths it handed to the attention backend.
+
+    The backend is swapped for a recorder by rebinding
+    ``ALL_ATTENTION_FUNCTIONS`` in the globals of the forward under test, so
+    this needs no flash-attn build and no GPU, and leaves the global attention
+    registry untouched. Passing ``max_seqlen`` reproduces the upstream call
+    site; omitting it reproduces the call the zoo rewriter emits.
+
+    Returns ``(max_length_q, max_length_k, attn_output)``."""
+    seen = {}
+
+    class _Recorder:
+        def get_interface(self, attn_implementation, default):
+            def _record(module, query, key, value, attention_mask = None,
+                        **kwargs):
+                seen.update(kwargs)
+                seq_length = query.shape[2]
+                return query.transpose(1, 2).reshape(1, seq_length, -1), None
+            return _record
+
+    forward_globals = type(attn).forward.__globals__
+    old = forward_globals["ALL_ATTENTION_FUNCTIONS"]
+    forward_globals["ALL_ATTENTION_FUNCTIONS"] = _Recorder()
+    try:
+        if max_seqlen is _UNSET:
+            out = attn(hidden_states, cu_seqlens, position_embeddings)
+        else:
+            out = attn(hidden_states, cu_seqlens, position_embeddings,
+                       max_seqlen = max_seqlen)
+    finally:
+        forward_globals["ALL_ATTENTION_FUNCTIONS"] = old
+    return seen.get("max_length_q"), seen.get("max_length_k"), out
+
+
+def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
+    """The guard body, factored out so a mutated ``VisionAttention`` can be
+    pushed through exactly the checks that ship (see
+    ``tests/mutants/qwen2_vl_max_seqlen_mutants.py``)."""
+    import torch
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+        get_vision_attention_seqlens,
+    )
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import (
+        Qwen2VLVisionConfig,
+    )
+    if forward_src is None:
+        forward_src = inspect.getsource(attn_cls.forward)
+
+    # (1) Pin the call expression itself, not just the presence of the name.
+    call = _qwen2_vl_max_seqlen_recompute_call(forward_src)
+    if call is None:
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "max_seqlen = get_max_seqlen(...)",
+            _QWEN2_VL_ATTN_PATH,
+        )
+    receiver = ast.unparse(call.args[0]) if call.args else "<no arguments>"
+    if receiver != "cu_seqlens":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(cu_seqlens, ...) -- recomputed from the very "
+            "cu_seqlens the rewritten blk(...) call still passes positionally",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got get_max_seqlen({receiver}, ...))",
+        )
+    keywords = {kw.arg: kw.value for kw in call.keywords}
+    precomputed = (
+        ast.unparse(keywords["kwargs"]) if "kwargs" in keywords
+        else "<no kwargs= argument>"
+    )
+    if precomputed != "{'max_seqlen': max_seqlen}":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(..., kwargs = {'max_seqlen': max_seqlen}) -- the "
+            "precomputed slot must be the block's own parameter, which is None "
+            "exactly because the rewriter dropped the keyword",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got kwargs = {precomputed})",
+        )
+
+    # (2) Execute the path. Flash attention is the only branch that consumes
+    # max_seqlen, so request it; the backend itself is stubbed out.
+    config = Qwen2VLVisionConfig(embed_dim = 8, num_heads = 2, hidden_size = 8)
+    config._attn_implementation = "flash_attention_2"
+    torch.manual_seed(0)
+    attn = attn_cls(config)
+
+    # Two ragged images -> 4 and 5 tokens, so max_seqlen (5) differs from both
+    # the token count (9) and the first segment (4): a recompute off the wrong
+    # tensor cannot coincidentally match.
+    grid_thw = torch.tensor([[1, 2, 2], [1, 1, 5]], dtype = torch.long)
+    cu_seqlens, caller_max_seqlen = get_vision_attention_seqlens(
+        grid_thw, config, kwargs = {},
+    )
+    assert caller_max_seqlen == 5, (
+        "test fixture is stale: get_vision_attention_seqlens returned "
+        f"{caller_max_seqlen} for grid {grid_thw.tolist()}, expected 5"
+    )
+    seq_length = int(cu_seqlens[-1])
+    head_dim = config.embed_dim // config.num_heads
+    hidden_states = torch.randn(seq_length, config.embed_dim)
+    angles = torch.arange(seq_length, dtype = torch.float32).unsqueeze(1) * 0.1
+    position_embeddings = (
+        torch.cos(angles).expand(seq_length, head_dim).contiguous(),
+        torch.sin(angles).expand(seq_length, head_dim).contiguous(),
+    )
+
+    # Upstream's own call site: max_seqlen precomputed and forwarded.
+    kept = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+        max_seqlen = caller_max_seqlen,
+    )
+    # What patch_gradient_checkpointing actually runs: keyword dropped.
+    dropped = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+    )
+    for label, (got_q, got_k, _) in (("with max_seqlen", kept),
+                                     ("with max_seqlen dropped", dropped)):
+        if (got_q, got_k) != (caller_max_seqlen, caller_max_seqlen):
+            _drift(
+                _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+                f"max_length_q/max_length_k == {caller_max_seqlen} "
+                f"({label})",
+                _QWEN2_VL_ATTN_PATH,
+                f"(got max_length_q={got_q}, max_length_k={got_k}; dropping "
+                "max_seqlen from the rewritten blk(...) call would silently "
+                "change vision attention)",
+            )
+    if not torch.equal(kept[2], dropped[2]):
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "identical VisionAttention output with and without max_seqlen",
+            _QWEN2_VL_ATTN_PATH,
+            "(outputs diverge -- dropping the keyword is no longer lossless)",
+        )
+
+
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
     """The transformers 5.x entry in
     ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``
@@ -547,42 +720,27 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recompute
     block (``unsloth_checkpoint`` then raises ``Unexpected keyword
     arguments``).
 
-    That is only lossless while ``VisionAttention.forward`` recomputes the
-    value through ``get_max_seqlen(cu_seqlens, config, kwargs=...)``, which
-    returns ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()`` when no precomputed
-    value is supplied. If upstream stops recomputing it, dropping it becomes a
-    silent numerical change, so guard it here."""
+    That is only lossless while ``VisionAttention.forward`` itself recomputes
+    the value off the same ``cu_seqlens`` the rewritten call still passes, with
+    the precomputed slot left empty. Merely finding a ``get_max_seqlen(`` call
+    somewhere in the forward proves nothing: upstream could keep the call and
+    feed it a different tensor, a config-derived cap, or a non-``None``
+    precomputed value, and dropping the keyword would then silently change
+    attention. So pin the call expression AND execute the forward twice on CPU
+    -- once as upstream calls it, once as the rewriter calls it -- and require
+    the packed-sequence lengths and the attention output to be identical."""
     pytest.importorskip("transformers")
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     try:
-        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-            get_max_seqlen, VisionAttention,
+        # Imported for existence only -- 4.x has neither helper, and the
+        # rewriter entry these guard is 5.x-only.
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (  # noqa: F401
+            get_max_seqlen, get_vision_attention_seqlens, VisionAttention,
         )
     except ImportError:
         pytest.skip("get_max_seqlen / VisionAttention not in this build (4.x)")
 
-    attn_src = inspect.getsource(VisionAttention.forward)
-    if "get_max_seqlen(" not in attn_src:
-        _drift(
-            "unsloth_zoo/compiler.py (custom_gradient_checkpointing_replacements, 5.x entry)",
-            "get_max_seqlen(",
-            "transformers.models.qwen2_vl.modeling_qwen2_vl.VisionAttention.forward",
-        )
-
-    class _FlashCfg:
-        _attn_implementation = "flash_attention_2"
-
-    cu_seqlens = torch.tensor([0, 4, 9], dtype = torch.int32)
-    expected = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-    # no precomputed value -> must recompute the same number the caller had
-    got = get_max_seqlen(cu_seqlens, _FlashCfg(), kwargs = {"max_seqlen": None})
-    if got != expected:
-        _drift(
-            "unsloth_zoo/compiler.py (custom_gradient_checkpointing_replacements, 5.x entry)",
-            f"get_max_seqlen(...) == {expected} when max_seqlen is absent",
-            "transformers.models.qwen2_vl.modeling_qwen2_vl.get_max_seqlen "
-            f"(got {got})",
-        )
+    _assert_qwen2_vl_max_seqlen_recomputed(VisionAttention)
 
 
 def test_compiler_moe_routing_weights_cast_pattern():
