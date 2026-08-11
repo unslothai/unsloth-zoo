@@ -14,11 +14,13 @@
 """Mutation harness for
 ``test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed``.
 
-That guard is what licenses the transformers 5.x entry in
-``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements`` to drop
-``max_seqlen=max_seqlen`` from the rewritten ``blk(...)`` call. A guard that
-only greps for ``get_max_seqlen(`` stays green on upstreams where dropping the
-keyword is no longer lossless, so this harness rebuilds
+That guard pins the recompute fallback behind the transformers 5.x entry in
+``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``. The
+entry keeps ``max_seqlen`` (bound into the checkpointed callable), and the
+recompute is what makes a lost or mis-bound keyword degrade into an extra
+``.max()`` instead of into wrong attention. A guard that only greps for
+``get_max_seqlen(`` stays green on upstreams where omitting the keyword is no
+longer lossless, so this harness rebuilds
 ``VisionAttention.forward`` from its own source with one line mutated and
 requires the shipped guard to fail on each mutant.
 

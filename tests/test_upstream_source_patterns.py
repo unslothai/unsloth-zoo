@@ -688,7 +688,9 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
             _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
             "get_max_seqlen(..., kwargs = {'max_seqlen': max_seqlen}) -- the "
             "precomputed slot must be the block's own parameter, which is None "
-            "exactly because the rewriter dropped the keyword",
+            "is the block's own parameter, which the rewriter now binds "
+                "into the checkpointed callable (and which is None whenever a "
+                "caller omits it)",
             _QWEN2_VL_ATTN_PATH,
             f"(got kwargs = {precomputed})",
         )
@@ -725,7 +727,7 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
         attn, hidden_states, cu_seqlens, position_embeddings,
         max_seqlen = caller_max_seqlen,
     )
-    # What patch_gradient_checkpointing actually runs: keyword dropped.
+    # The fallback: keyword absent, value recomputed from cu_seqlens.
     dropped = _qwen2_vl_run_vision_attention(
         attn, hidden_states, cu_seqlens, position_embeddings,
     )
@@ -751,23 +753,29 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
 
 
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
-    """The transformers 5.x entry in
-    ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``
-    drops ``max_seqlen=max_seqlen`` from the rewritten ``blk(...)`` call: the
-    block's three positional slots are already taken and anything left as a
-    keyword binds to ``self._gradient_checkpointing_func`` instead of to the
-    block (``unsloth_checkpoint`` then raises ``Unexpected keyword
-    arguments``).
+    """Safety net behind the transformers 5.x entry in
+    ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``.
 
-    That is only lossless while ``VisionAttention.forward`` itself recomputes
-    the value off the same ``cu_seqlens`` the rewritten call still passes, with
-    the precomputed slot left empty. Merely finding a ``get_max_seqlen(`` call
-    somewhere in the forward proves nothing: upstream could keep the call and
-    feed it a different tensor, a config-derived cap, or a non-``None``
-    precomputed value, and dropping the keyword would then silently change
-    attention. So pin the call expression AND execute the forward twice on CPU
-    -- once as upstream calls it, once as the rewriter calls it -- and require
-    the packed-sequence lengths and the attention output to be identical."""
+    The entry no longer drops ``max_seqlen=max_seqlen``: it removes it from the
+    positional argument list (where the ``arg=arg`` demotion would push it into
+    a slot the block does not have, and where it would bind to
+    ``self._gradient_checkpointing_func`` - which is often plain
+    ``torch.utils.checkpoint.checkpoint`` and raises ``Unexpected keyword
+    arguments``) and re-adds it bound into the callable with
+    ``functools.partial``. That the value now ARRIVES at the block is pinned by
+    ``tests/test_gc_rewriter_bound_keywords.py``.
+
+    This guard pins the fallback that made dropping it survivable in the first
+    place, and it is still load-bearing: it is what makes a mis-bound or lost
+    ``max_seqlen`` degrade into a recompute rather than into wrong attention.
+    ``VisionAttention.forward`` must keep recomputing the value off the same
+    ``cu_seqlens`` the rewritten call passes, with the precomputed slot honoured.
+    Merely finding a ``get_max_seqlen(`` call somewhere in the forward proves
+    nothing: upstream could keep the call and feed it a different tensor, a
+    config-derived cap, or ignore the precomputed value. So pin the call
+    expression AND execute the forward twice on CPU -- once with the keyword,
+    once without -- and require the packed-sequence lengths and the attention
+    output to be identical."""
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
     try:

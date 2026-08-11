@@ -1181,6 +1181,12 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import _maybe_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if "functools." in new_source:
+        # patch_gradient_checkpointing() emits `functools.partial(layer.__call__,
+        # ...)` for keywords the layer only accepts through **kwargs, and copied
+        # upstream source can reference functools too. Neither the license header
+        # nor the model module's own imports are guaranteed to provide it.
+        imports += "import functools\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -2766,20 +2772,31 @@ pass
 #                              position_embeddings=None, **kwargs)
 # and added `max_seqlen=max_seqlen` to the call site (transformers 5.x moved the
 # cu_seqlens/max_seqlen computation into get_vision_attention_seqlens()).
-# `max_seqlen` is NOT a named parameter of the block, and there is nowhere for it
-# to go in the rewritten call: the three positional slots are already taken, and
-# anything left as a keyword is bound to `self._gradient_checkpointing_func`
-# rather than to the block - Unsloth's smart `unsloth_checkpoint` rejects leftover
-# keywords outright ("Unexpected keyword arguments: max_seqlen") and
-# `unsloth_gradient_checkpoint` silently drops them.
+# `max_seqlen` is NOT a named parameter of the block - it only rides in through
+# **kwargs - so it cannot be demoted to a positional, and it must not be left as
+# a bare keyword either: in the rewritten call everything after the callable is
+# handed to `self._gradient_checkpointing_func`, not to the block. That function
+# is not necessarily Unsloth's. It is whatever transformers installed, i.e. very
+# often plain `torch.utils.checkpoint.checkpoint` (or a `functools.partial` of
+# it), which raises `ValueError: Unexpected keyword arguments: max_seqlen` under
+# `use_reentrant = True`. Unsloth's own `unsloth_checkpoint` raises the same way.
 #
-# So the 5.x entry simply drops `max_seqlen` from the call. This is lossless:
-# `VisionAttention.forward` recomputes it via
-#   get_max_seqlen(cu_seqlens, self.config, kwargs = {"max_seqlen": max_seqlen})
-# which, when the caller-supplied value is None, returns
-# `(cu_seqlens[1:] - cu_seqlens[:-1]).max().item()` under flash-attention and
-# None otherwise - exactly what `get_vision_attention_seqlens` computed from the
-# same `cu_seqlens`. The only cost is recomputing that max per layer.
+# So the 5.x entry drops `max_seqlen` from the positional argument list and asks
+# for it back as a *bound* keyword via the optional third element of the entry.
+# `patch_gradient_checkpointing()` then emits
+#   self._gradient_checkpointing_func(
+#       functools.partial(blk.__call__, max_seqlen = max_seqlen), ...)
+# in the checkpointed branch and `blk(..., max_seqlen = max_seqlen)` in the else
+# branch. Binding into the callable is exactly what transformers itself does in
+# `GradientCheckpointingLayer.__call__`, so it works with every checkpoint
+# implementation - reentrant or not, Unsloth's or torch's - and the value still
+# reaches the block on both branches.
+#
+# (Were the keyword dropped instead, `VisionAttention.forward` would recompute it
+# via get_max_seqlen(cu_seqlens, self.config, kwargs = {"max_seqlen": max_seqlen})
+# and return the same number, so nothing breaks - but that costs a
+# `.max().item()` device sync per vision layer under flash attention, which is
+# why the keyword is preserved instead.)
 #
 # Order matters: the 5.x entries must stay AFTER the 4.x ones. The 5.x
 # replacement is textually the 4.x call, and the replacement list is applied in a
@@ -2826,8 +2843,9 @@ custom_gradient_checkpointing_replacements = [
                 **kwargs,
             )""",
     ),
-    # transformers >= 5.0 spelling. `max_seqlen` is dropped - the vision
-    # attention recomputes it from `cu_seqlens`. Must stay after the 4.x entries.
+    # transformers >= 5.0 spelling. `max_seqlen` leaves the positional argument
+    # list and comes back as a keyword bound into the checkpointed callable (the
+    # third element below). Must stay after the 4.x entries.
     (
         """hidden_states = blk(
                 hidden_states,
@@ -2842,6 +2860,7 @@ custom_gradient_checkpointing_replacements = [
                 position_embeddings=position_embeddings,
                 **kwargs,
             )""",
+        ("max_seqlen",),
     ),
 ]
 replace_gradient_checkpointing = """
@@ -2853,6 +2872,31 @@ $    )
 $else:
 $    hidden_states = LAYER(ARGS)
 """
+
+
+def _bound_keywords_of_replacement(replacement):
+    """Optional third element of a ``custom_gradient_checkpointing_replacements``
+    entry: keyword arguments the rewritten call must keep as keywords.
+
+    They cannot travel in ``ARGS`` - everything there is forwarded to
+    ``self._gradient_checkpointing_func``, which is frequently plain
+    ``torch.utils.checkpoint.checkpoint`` and rejects unknown keywords. They are
+    bound into the checkpointed callable instead, the way
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__`` does it.
+
+    Accepts a mapping ``{keyword: expression}`` or a plain sequence of names
+    (shorthand for ``{name: name}``). A 2-tuple entry declares none, so every
+    pre-existing entry keeps behaving exactly as before.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if len(replacement) <= 2:
+        return {}
+    extra = replacement[2]
+    if extra is None:
+        return {}
+    if isinstance(extra, dict):
+        return dict(extra)
+    return {name: name for name in extra}
 
 
 def patch_gradient_checkpointing(module, source):
@@ -2871,8 +2915,13 @@ def patch_gradient_checkpointing(module, source):
         return None
 
     # Fix Qwen2 missing None for gradient checkpointing
-    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
+    bound_keywords = {}
+    for replacement in custom_gradient_checkpointing_replacements:
+        custom_find, custom_replace = replacement[0], replacement[1]
+        if custom_find not in forward:
+            continue
         forward = forward.replace(custom_find, custom_replace)
+        bound_keywords.update(_bound_keywords_of_replacement(replacement))
     pass
 
     # No gradient checkpointing?
@@ -2902,6 +2951,35 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+
+    if bound_keywords:
+        # Keywords the block only takes through **kwargs. `ARGS` is forwarded
+        # verbatim to `self._gradient_checkpointing_func`, so putting them there
+        # would bind them to the checkpoint function instead of to the layer -
+        # and `torch.utils.checkpoint.checkpoint` raises on unknown keywords
+        # under `use_reentrant = True`, as does Unsloth's `unsloth_checkpoint`.
+        # Bind them into the callable instead, like
+        # `GradientCheckpointingLayer.__call__` does upstream. The `else` branch
+        # calls the layer directly, so there they stay ordinary keywords.
+        keywords = ", ".join(
+            f"{name} = {value}" for name, value in bound_keywords.items()
+        )
+        args_with_keywords = args.rstrip()
+        if args_with_keywords.strip() == "":
+            args_with_keywords = keywords
+        else:
+            if not args_with_keywords.endswith(","):
+                args_with_keywords += ","
+            args_with_keywords += " " + keywords
+        replacer = replacer.replace(
+            "LAYER.__call__, ARGS",
+            "functools.partial(LAYER.__call__, " + keywords + "), ARGS",
+        )
+        replacer = replacer.replace(
+            "hidden_states = LAYER(ARGS)",
+            "hidden_states = LAYER(" + args_with_keywords + ")",
+        )
+    pass
 
     replacer = (
         replacer.replace("LAYER", layer)
