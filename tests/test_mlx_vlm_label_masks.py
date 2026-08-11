@@ -3598,6 +3598,34 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
         [7, image_id, 8, audio_id, 9]
     ]
 
+def _prepared_grid(model_type):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    # "content" is the phase that fixes the grid form; "positions" needs the
+    # per-family token ids a bare model_type config does not carry.
+    return _prepare_vlm_batch_for_compile({
+        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
+        "image_grid_thw": mx.array([[1, 16, 16]], dtype=mx.int32),
+    }, {"model_type": model_type, "vision_config": {"hidden_size": 8}},
+        phase="content")
+
+
+def test_array_grid_families_keep_an_indexable_grid():
+    """These vision towers open with `grid_thw.tolist()`; tuples raise there."""
+    for model_type in ("glm4v", "glm_ocr", "muse_glimmer"):
+        grid = _prepared_grid(model_type)["image_grid_thw"]
+        assert isinstance(grid, mx.array), model_type
+        assert grid.tolist() == [[1, 16, 16]], model_type
+
+
+def test_compile_patched_families_keep_the_traceable_tuple_grid():
+    """Qwen/Paddle patches trace the grid as static metadata, not an array."""
+    for model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "paddleocr_vl"):
+        grid = _prepared_grid(model_type)["image_grid_thw"]
+        assert grid == ((1, 16, 16),), model_type
+
+
 # --- audio alignment from stated spans, for families whose run carries no id ---
 
 

@@ -2452,6 +2452,19 @@ def _normalize_grid_thw(grid_thw):
     return tuple(normalized)
 
 
+# Families reaching mlx-vlm code that indexes the vision grid as an array
+# (`.tolist()`, `.prod()`, `[:, 1:]`). Everything else keeps the Python tuple
+# form, which is what the Qwen/Paddle compile patches trace: an array turns
+# into a tracer under mx.compile and its `.tolist()` raises.
+_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
+    "glm4v",
+    "glm_ocr",
+    # Muse Glimmer's vision tower is not compile-patched and opens with
+    # `grid_thw.tolist()`.
+    "muse_glimmer",
+})
+
+
 def _grid_thw_to_mx_array(grid_thw):
     if grid_thw is None:
         return None
@@ -3135,10 +3148,8 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    grid_as_array = model_type in {"glm4v", "glm_ocr"}
+    grid_as_array = model_type in _VLM_ARRAY_GRID_MODEL_TYPES
     if image_grid_thw is not None:
-        # GLM native mlx-vlm paths call .tolist(), .prod(), and slicing on
-        # grids; Qwen/Paddle compile patches expect Python tuples.
         batch_dict["image_grid_thw"] = (
             _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
         )
