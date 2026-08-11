@@ -2514,9 +2514,8 @@ def convert_to_gguf(
         and not _keep_mtp
         and _converter_supports_no_mtp(converter_location)
     )
-    # Keep the declaration when `--no-mtp` carries the intent instead. Deleting it
-    # made the export non-idempotent: a retry or a second export from the same
-    # folder read no declaration, omitted the flag, and hit the assertion again.
+    # Keep the declaration when `--no-mtp` carries the intent: deleting it made
+    # a retry or second export read none, omit the flag, and hit the assertion.
     _strip_keys = (
         ("unsloth_fixed_mtp",)
         if _keep_mtp or _no_mtp
