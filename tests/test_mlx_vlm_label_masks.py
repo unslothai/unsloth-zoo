@@ -5052,3 +5052,47 @@ def test_a_bare_audio_placeholder_still_reports_itself_as_bare():
         ]}]
     )
     assert bare is False and payloads == []
+
+
+def test_qwen3_omni_normalizes_embedded_media_without_scalar_counts():
+    """Media embedded in the messages leaves `num_images`/`num_audios` at zero,
+    and the ordering is wrong on its own merits, so gating normalization on the
+    counts let `text, audio` reach the template unchanged."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "transcribe"},
+        {"type": "audio", "audio": "a.wav"},
+    ]}]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 0, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[0]["content"]] == ["audio", "text"]
+    # Counts still drive the deficit, they just no longer gate the reordering.
+    assert [part.get("type") for part in messages[0]["content"]] == ["text", "audio"]
+
+
+def test_qwen3_omni_leaves_assistant_turns_alone_without_counts():
+    """Reordering every turn must still skip the roles the renderer treats as
+    non-user, otherwise assistant history gets rewritten."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "prior"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "audio", "audio": "b.wav"},
+            {"type": "text", "text": "next"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 0, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[0]["content"]] == ["text", "audio"]
+    assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]

@@ -5448,10 +5448,12 @@ def _prepare_vlm_template_messages(
     )
 
     template_messages = normalized_messages
+    # Not gated on the scalar counts: ordering is wrong on its own merits, and a
+    # caller whose media is embedded in the messages leaves them at zero. The
+    # counts only decide how many extra placeholders the anchor needs.
     if (
         model_type == "qwen3_omni_moe"
         and has_structured_multimodal
-        and (num_images > 0 or num_audios > 0)
         and (
             target_idx := _first_media_user_message_index(normalized_messages)
         ) >= 0
