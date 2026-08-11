@@ -1103,6 +1103,11 @@ def _get_logit_scale(model):
         scale = getattr(tm.args, "logit_scale", None)
     if scale is None and hasattr(tm, "config"):
         scale = getattr(tm.config, "logit_scale", None)
+    return _validated_head_multiplier(scale)
+
+
+def _validated_head_multiplier(scale):
+    """Returns ``(scale, invalid)``, scale None when absent or a no-op 1.0."""
     if scale is None:
         return None, False
     if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
@@ -1130,6 +1135,7 @@ _KNOB_MISSING = object()
 # config drift must fail closed); others read args (config for VLM wrappers).
 _HEAD_TRANSFORM_KNOBS = {
     "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "output_multiplier": ("attr", "args", "config"),  # Muse Glimmer: pre-softcap multiply
     "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
     "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
@@ -1247,14 +1253,20 @@ def _detect_head_transform(model, head_status):
         # value-guarded divide: presence alone makes the tail non-scalar.
         return None, ("mup_width_multiplier models mask logits after the "
                       "output head, which fused CCE cannot reproduce")
-    if knob == "logit_scale":
+    if knob in ("logit_scale", "output_multiplier"):
         # A present-None value is malformed live state (the forward would
         # multiply logits by None); fail closed rather than run unscaled.
         if raw is None:
-            return None, "logit_scale is present but None"
-        scale, invalid = _get_logit_scale(model)
+            return None, f"{knob} is present but None"
+        # logit_scale re-reads its own consumer sites; output_multiplier is
+        # read straight off the resolved knob, whose sites already agreed.
+        scale, invalid = (
+            _get_logit_scale(model)
+            if knob == "logit_scale"
+            else _validated_head_multiplier(raw)
+        )
         if invalid:
-            return None, ("logit_scale cannot be applied by fused CCE "
+            return None, (f"{knob} cannot be applied by fused CCE "
                           "(non-finite, non-scalar, or outside the "
                           "supported range)")
         return scale, None

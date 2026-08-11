@@ -1137,7 +1137,54 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
         from_wrapped = call(models[1])[0]
         assert mx.allclose(from_bare, from_wrapped), name
 
-    # Against an independent value, so the pair above cannot agree on a
-    # transformed one: unwrapping has to hand the loss these exact logits.
+    # The comparisons above only pin the two forms to each other. This pins the
+    # supervised one to a value computed outside the loss.
     expected = nn.losses.cross_entropy(logits, ids[:, 1:]).mean()
     assert mx.allclose(baseline(wrapped, ids, lengths)[0], expected)
+
+
+@metal_only
+@pytest.mark.parametrize("softcap", (0.0, 20.0), ids=("no-softcap", "softcap"))
+def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
+    """A model whose forward scales logits after the head must have that scale
+    reproduced by fused CCE, which rebuilds the logits itself.
+
+    Guards the silent failure mode: without the multiply, CCE softcaps logits
+    that are far too large, so the loss stays plausible while the gradients it
+    produces come from a saturated tanh. The softcap case is the composition
+    that failure needs, so it is exercised too.
+    """
+    from unsloth_zoo.mlx.utils import _get_text_model, make_cce_loss_fn
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    ids = mx.array([tokenizer.encode("the capital of France is Paris")])
+    # (start, end) per row: covers every shifted target position.
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+
+    # The knob is read off the resolved text model, which is not `model.model`.
+    text_model = _get_text_model(model)
+    multiplier = 0.5
+    if softcap:
+        text_model.final_logit_softcapping = softcap
+
+    try:
+        unscaled, _ = make_cce_loss_fn(model)(model, ids, lengths)
+        text_model.output_multiplier = multiplier
+        try:
+            scaled, _ = make_cce_loss_fn(model)(model, ids, lengths)
+        finally:
+            del text_model.output_multiplier
+    finally:
+        if softcap:
+            del text_model.final_logit_softcapping
+
+    # Reference: cross-entropy over the logits the model's own tail would emit.
+    logits = model(ids[:, :-1]).astype(mx.float32) * multiplier
+    if softcap:
+        logits = mx.tanh(logits / softcap) * softcap
+    reference = float(
+        nn.losses.cross_entropy(logits, ids[:, 1:], reduction="mean")
+    )
+
+    assert float(scaled) == pytest.approx(reference, rel=2e-2)
+    assert abs(float(scaled) - float(unscaled)) > 1e-3
