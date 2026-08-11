@@ -2826,8 +2826,6 @@ def test_new_audio_families_start_at_their_complete_audio_implementation(monkeyp
     assert mlx_utils._audio_family_from_processor(unified) == "gemma4_unified"
     for processor, family, floor, below in (
         (unified, "gemma4_unified", "0.6.5", "0.6.4"),
-        # 0.6.10, not the 0.5.0 that first carried the family: below it
-        # `sanitize_audio_weights` double-transposes pre-converted sound convs.
         (make_processor("nemotron_h_nano_omni"), "nemotron_h_nano_omni", "0.6.10", "0.6.7"),
         (make_processor("qwen3_omni_moe"), "qwen3_omni_moe", "0.6.7", "0.6.6"),
     ):
@@ -3802,11 +3800,7 @@ def test_qwen3_omni_audio_output_modules_are_frozen():
 
 
 def test_every_owner_of_an_audio_name_is_frozen_not_just_the_first():
-    """A model can carry the same attribute name at two levels.
-
-    Stopping at the first owner left a distinct nested tower trainable, which is
-    exactly the parameter set this call exists to keep out of the optimizer.
-    """
+    """Stopping at the first owner left a distinct nested tower trainable."""
     from unsloth_zoo.mlx.utils import freeze_audio_modules
 
     outer, nested = _FrozenAudioModule(), _FrozenAudioModule()
@@ -3834,19 +3828,8 @@ def test_a_module_shared_by_two_owners_is_frozen_once():
 
 
 def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
-    """Why Nemotron starts at 0.6.10 rather than the 0.5.0 that first shipped it.
-
-    Below 0.6.10 mlx-vlm transposes `sound_encoder.encoder.*` convs
-    unconditionally, so an already-MLX-major weight double-transposes and the
-    checkpoint cannot load. Measured on the real function:
-
-        0.5.0 / 0.6.4 / 0.6.7   (128, 3, 3, 1) -> (128, 3, 1, 3)   corrupted
-        0.6.10 / 0.6.12         (128, 3, 3, 1) -> (128, 3, 3, 1)   left alone
-
-    gemma4's `_ensure_audio_conv_sanitize` repair does not reach this family:
-    it keys on markers in the sanitize source, and Nemotron's `Model.sanitize`
-    delegates to a module-level function carrying neither.
-    """
+    """Below 0.6.10, `sanitize_audio_weights` double-transposes a pre-converted
+    sound conv ((128,3,3,1) -> (128,3,1,3)) and the checkpoint cannot load."""
     from unsloth_zoo.mlx import utils as mlx_utils
 
     floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["nemotron_h_nano_omni"]
@@ -3856,9 +3839,8 @@ def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
 
 
 def test_a_turn_without_content_is_returned_untouched():
-    """Every other shape check in this helper returns the message unchanged; a
-    dict with no "content" key (a tool call, an empty assistant stub) raised
-    KeyError instead."""
+    """A dict with no "content" key raised KeyError where every other shape
+    check in this helper returns the message unchanged."""
     from unsloth_zoo.mlx.loader import _normalize_qwen3_omni_counted_message
 
     for message in ({"role": "user"}, {"role": "assistant", "content": None}):

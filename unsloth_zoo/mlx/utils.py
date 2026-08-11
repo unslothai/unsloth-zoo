@@ -5675,21 +5675,13 @@ class _AudioVersions(NamedTuple):
 # Unified needs 0.6.5's processor/audio-layout fix; Qwen needs 0.6.7's batched
 # mel input and sample-domain length fixes. 0.6.10 is the latest real-model gate.
 #
-# Nemotron is 0.6.10, not the 0.5.0 that first carried the family. Below it,
+# Nemotron is 0.6.10, not the 0.5.0 that first carried it: below that,
 # `sanitize_audio_weights` transposes `sound_encoder.encoder.*` convs
-# unconditionally, so a pre-converted MLX checkpoint double-transposes and the
-# load fails. Measured on the real function, feeding an already-MLX-major
-# depthwise weight through each release:
-#
-#   0.5.0 / 0.6.4 / 0.6.7   (128, 3, 3, 1) -> (128, 3, 1, 3)   corrupted
-#   0.6.10 / 0.6.12         (128, 3, 3, 1) -> (128, 3, 3, 1)   left alone
-#
-# This is gemma4's #1498/#1523 bug in a second family, and the `gemma4` repair
-# above does not cover it: `_ensure_audio_conv_sanitize` keys on the
-# `subsample_conv_projection` / `depthwise_conv1d.weight` markers in the
+# unconditionally, so a pre-converted weight double-transposes and the load
+# fails ((128,3,3,1) -> (128,3,1,3) on 0.5.0/0.6.4/0.6.7, untouched on 0.6.10+).
+# `_ensure_audio_conv_sanitize` cannot repair it: it keys on markers in the
 # sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
-# function where `_safe_getsource` sees neither marker. 0.6.10 is also the
-# release this family's real-model matrix was measured on.
+# function carrying neither.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
@@ -8753,10 +8745,9 @@ def freeze_audio_modules(model):
             module = getattr(owner, attr, None) if owner is not None else None
             if module is None or not hasattr(module, "freeze"):
                 continue
-            # Every owner, not just the first: a model carrying both its own
-            # `audio_tower` and a distinct `thinker.audio_tower` would otherwise
-            # leave the nested one trainable, which is what this call prevents.
-            # Identity-deduped so a shared module is not frozen (or reported) twice.
+            # Every owner, not just the first: a distinct `thinker.audio_tower`
+            # beside a top-level one would otherwise stay trainable. Deduped by
+            # identity so an alias is not reported twice.
             if id(module) in seen:
                 continue
             seen.add(id(module))
