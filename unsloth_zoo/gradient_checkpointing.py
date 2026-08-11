@@ -245,7 +245,14 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            (output,) = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *ctx.args)
+        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
+        # that return the tensor itself (Qwen2-VL's vision block, and every
+        # transformers block since the tuple returns were retired) used to raise
+        # `ValueError: too many values to unpack` here, because forward() stored
+        # whatever the layer returned while backward() insisted on a 1-tuple.
+        if isinstance(output, tuple):
+            (output,) = output
         torch.autograd.backward(output, dY)
         return (None, hidden_states.grad,) + (None,)*len(ctx.args)
     pass
@@ -275,7 +282,14 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            (output,) = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *ctx.args)
+        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
+        # that return the tensor itself (Qwen2-VL's vision block, and every
+        # transformers block since the tuple returns were retired) used to raise
+        # `ValueError: too many values to unpack` here, because forward() stored
+        # whatever the layer returned while backward() insisted on a 1-tuple.
+        if isinstance(output, tuple):
+            (output,) = output
         torch.autograd.backward(output, dY)
         return (None, hidden_states.grad,) + (None,)*len(ctx.args)
     pass
@@ -288,8 +302,49 @@ pass
 # pass
 
 
+# Keywords that belong to the checkpoint machinery itself rather than to the
+# wrapped function. torch.utils.checkpoint.checkpoint names all four; the Unsloth
+# reentrant checkpointers below never honoured them, and that is deliberately
+# left as-is so callers passing only these see exactly today's behaviour.
+_TORCH_CHECKPOINT_KEYWORDS = frozenset({
+    "preserve_rng_state",
+    "context_fn",
+    "determinism_check",
+    "debug",
+})
+
+
+def _bind_checkpoint_kwargs(function, kwargs):
+    """Bind leftover keyword arguments into ``function``.
+
+    ``checkpoint(fn, *args, **kwargs)`` means "call ``fn(*args, **kwargs)``";
+    that is what torch's non-reentrant path does. The Unsloth checkpointers are
+    ``torch.autograd.Function`` subclasses and can only forward positionals, so
+    the keywords are bound into the callable instead - the same trick
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__`` uses.
+
+    Before this, ``unsloth_gradient_checkpoint`` /
+    ``unsloth_offloaded_gradient_checkpoint`` dropped them silently (the wrapped
+    block then ran with different arguments and no diagnostic) while
+    ``unsloth_checkpoint`` raised ``Unexpected keyword arguments``. Binding makes
+    all three agree and never turns a working call into an error.
+
+    Returns ``function`` unchanged when there is nothing to bind, so the ordinary
+    empty-kwargs path allocates nothing.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not kwargs:
+        return function
+    extra = {k : v for k, v in kwargs.items() if k not in _TORCH_CHECKPOINT_KEYWORDS}
+    if not extra:
+        return function
+    return functools.partial(function, **extra)
+pass
+
+
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
+    function = _bind_checkpoint_kwargs(function, kwargs)
     return Unsloth_Gradient_Checkpointer.apply(function, *args)
 pass
 
@@ -875,9 +930,15 @@ def unsloth_checkpoint(
     # Hack to mix *args with **kwargs in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
-        raise ValueError(
-            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
-        )
+        # torch raises here, but only because *the caller* asked for the
+        # reentrant path. We force use_reentrant = True above, so raising would
+        # turn a call that works on unpatched torch (non-reentrant checkpoint
+        # forwards **kwargs straight to `function`) into a crash the moment
+        # Unsloth's smart gradient checkpointing is installed. Bind them into
+        # the callable instead - same observable behaviour, no keyword reaches
+        # UnslothCheckpointFunction. See _bind_checkpoint_kwargs.
+        function = _bind_checkpoint_kwargs(function, kwargs)
+        kwargs = {}
 
     if use_reentrant:
         if context_fn is not noop_context_fn or debug is not False:
@@ -1077,6 +1138,7 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     global CPU_BUFFERS
     if len(CPU_BUFFERS) == 0:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
+    function = _bind_checkpoint_kwargs(function, kwargs)
     return UnslothCheckpointFunction.apply(function, *args)
 pass
 
