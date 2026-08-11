@@ -2318,6 +2318,30 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     return False
 
 
+_GGUF_CONVERTER_TEXT_CONFIG_KEYS = (
+    "num_hidden_layers",
+    "mtp_num_hidden_layers",
+)
+
+
+def _hoist_text_config_keys_for_gguf_converter(config_file):
+    """Copy nested text_config keys the llama.cpp Qwen MTP converter reads only at top level.
+
+    ``convert_hf_to_gguf``'s Qwen MTP mixin merges ``text_config`` in ``index_tensors`` but
+    not in ``__init__``, so checkpoints that only nest MTP hyperparameters under
+    ``text_config`` fail GGUF export with ``assert self.opt_num_mtp_layers != 0``.
+    """
+    text_config = config_file.get("text_config")
+    if not isinstance(text_config, dict):
+        return False
+    changed = False
+    for key in _GGUF_CONVERTER_TEXT_CONFIG_KEYS:
+        if key in text_config and key not in config_file:
+            config_file[key] = text_config[key]
+            changed = True
+    return changed
+
+
 def _find_bitsandbytes_quantization(config, _path = "config.json"):
     """Where a bitsandbytes `quantization_config` sits, or None.
 
@@ -2489,6 +2513,8 @@ def convert_to_gguf(
             if _key in _cfg:
                 _cfg.pop(_key)
                 _changed = True
+    if _hoist_text_config_keys_for_gguf_converter(config_file):
+        _changed = True
     if _changed:
         with open(config_path, "w", encoding = "utf-8") as f:
             json.dump(config_file, f, indent = 2)

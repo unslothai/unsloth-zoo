@@ -223,3 +223,61 @@ def test_convert_to_gguf_rejects_malformed_layer_count_before_rewrite(llama_cpp,
         )
 
     assert json.loads(config_path.read_text(encoding = "utf-8")) == config
+
+
+@pytest.mark.parametrize("has_mtp", (False, True))
+def test_convert_to_gguf_hoists_nested_text_config_keys_for_converter(llama_cpp, tmp_path, has_mtp):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForCausalLM"],
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "num_hidden_layers": 24,
+                    "mtp_num_hidden_layers": 1,
+                    "unsloth_fixed_mtp": True,
+                },
+            }
+        ),
+        encoding = "utf-8",
+    )
+    tensor_name = (
+        "model.layers.24.eh_proj.weight"
+        if has_mtp
+        else "model.layers.23.self_attn.q_proj.weight"
+    )
+    _write_index(model_dir, tensor_name)
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(tmp_path / "output.gguf"),
+        input_folder = str(model_dir),
+        converter_location = str(_write_converter(tmp_path)),
+        quantization_type = "bf16",
+    )
+
+    updated = json.loads(config_path.read_text(encoding = "utf-8"))
+    assert updated["num_hidden_layers"] == 24
+    assert ("mtp_num_hidden_layers" in updated) is has_mtp
+    if has_mtp:
+        assert updated["mtp_num_hidden_layers"] == 1
+    assert "unsloth_fixed_mtp" not in updated
+    assert "unsloth_fixed_mtp" not in updated["text_config"]
+
+
+def test_hoist_text_config_keys_for_gguf_converter_is_noop_without_text_config(llama_cpp):
+    config = {"num_hidden_layers": 24}
+    assert llama_cpp._hoist_text_config_keys_for_gguf_converter(config) is False
+    assert config == {"num_hidden_layers": 24}
+
+
+def test_hoist_text_config_keys_for_gguf_converter_does_not_override_top_level(llama_cpp):
+    config = {
+        "num_hidden_layers": 32,
+        "text_config": {"num_hidden_layers": 24, "mtp_num_hidden_layers": 1},
+    }
+    assert llama_cpp._hoist_text_config_keys_for_gguf_converter(config) is True
+    assert config["num_hidden_layers"] == 32
+    assert config["mtp_num_hidden_layers"] == 1
