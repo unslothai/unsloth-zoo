@@ -5674,11 +5674,27 @@ class _AudioVersions(NamedTuple):
 # fixed it in 0.6.5 (#1523).
 # Unified needs 0.6.5's processor/audio-layout fix; Qwen needs 0.6.7's batched
 # mel input and sample-domain length fixes. 0.6.10 is the latest real-model gate.
+#
+# Nemotron is 0.6.10, not the 0.5.0 that first carried the family. Below it,
+# `sanitize_audio_weights` transposes `sound_encoder.encoder.*` convs
+# unconditionally, so a pre-converted MLX checkpoint double-transposes and the
+# load fails. Measured on the real function, feeding an already-MLX-major
+# depthwise weight through each release:
+#
+#   0.5.0 / 0.6.4 / 0.6.7   (128, 3, 3, 1) -> (128, 3, 1, 3)   corrupted
+#   0.6.10 / 0.6.12         (128, 3, 3, 1) -> (128, 3, 3, 1)   left alone
+#
+# This is gemma4's #1498/#1523 bug in a second family, and the `gemma4` repair
+# above does not cover it: `_ensure_audio_conv_sanitize` keys on the
+# `subsample_conv_projection` / `depthwise_conv1d.weight` markers in the
+# sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
+# function where `_safe_getsource` sees neither marker. 0.6.10 is also the
+# release this family's real-model matrix was measured on.
 _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
     "gemma3n": _AudioVersions("0.4.4"),
     "gemma4": _AudioVersions("0.6.2"),
     "gemma4_unified": _AudioVersions("0.6.5"),
-    "nemotron_h_nano_omni": _AudioVersions("0.5.0"),
+    "nemotron_h_nano_omni": _AudioVersions("0.6.10"),
     "qwen3_omni_moe": _AudioVersions("0.6.7"),
     "phi4mm": _AudioVersions("0.4.4"),
     "minicpmo": _AudioVersions("0.4.4"),
@@ -5689,7 +5705,7 @@ _AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
 # differently, so they are refused rather than assumed compatible.
 # Redundant now gemma4's floor is 0.6.2 (every mlx-vlm there needs
 # transformers>=5.5.0), but kept for hand-assembled environments.
-_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
+_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5), "gemma4_unified": (5, 5)}
 
 _AUDIO_CAST_HINT = (
     "Cast the dataset column with "
@@ -8727,6 +8743,7 @@ def freeze_audio_modules(model):
     Returns the names of the modules that were frozen.
     """
     frozen = []
+    seen = set()
     for attr in _AUDIO_TOWER_ATTRS + _AUDIO_OUTPUT_ATTRS:
         for owner in (
             model,
@@ -8736,9 +8753,15 @@ def freeze_audio_modules(model):
             module = getattr(owner, attr, None) if owner is not None else None
             if module is None or not hasattr(module, "freeze"):
                 continue
+            # Every owner, not just the first: a model carrying both its own
+            # `audio_tower` and a distinct `thinker.audio_tower` would otherwise
+            # leave the nested one trainable, which is what this call prevents.
+            # Identity-deduped so a shared module is not frozen (or reported) twice.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
             module.freeze(recurse=True)
             frozen.append(attr)
-            break
     return frozen
 
 

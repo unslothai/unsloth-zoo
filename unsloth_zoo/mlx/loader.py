@@ -5227,7 +5227,12 @@ def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwarg
     """Put Qwen's counted media before text without losing formatter metadata."""
     if not isinstance(message, dict):
         return message
-    content = message["content"]
+    # A turn may legitimately carry no content (a tool call, an empty assistant
+    # stub). Subscripting raised KeyError where every neighbouring guard returns
+    # the message untouched.
+    content = message.get("content")
+    if content is None:
+        return message
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
     elif not isinstance(content, list):
