@@ -285,6 +285,19 @@ _DTYPE_PRESERVING_METHODS = frozenset({
 })
 
 
+# `torch.<name>` constants that are provably NOT dtypes, so they cannot retype the
+# receiver: `inputs_embeds.clone(memory_format = torch.preserve_format)` and
+# `inputs_embeds.contiguous(memory_format = torch.contiguous_format)` keep the
+# embedding dtype exactly. Reading every `torch.<attr>` as a dtype rejected those
+# receivers, so a purely cosmetic upstream addition of an explicit memory format
+# would fail the real-source canaries with "the destination was retyped" - the
+# false red this structural trace exists to remove. (`_to_call_preserves_dtype`
+# already whitelists the `memory_format` keyword of `.to(...)` for the same
+# reason.) Resolved against the live torch so the set cannot drift from reality;
+# an attribute torch does not have stays dtype-bearing, which is the safe default.
+_NON_DTYPE_TORCH_CONSTANTS = (torch.memory_format, torch.layout)
+
+
 def _is_dtype_bearing(node):
     """Can `node` retype a tensor? (`torch.float32`, `other.dtype`, ...)"""
     if isinstance(node, ast.Attribute) and node.attr == "dtype":
@@ -294,8 +307,12 @@ def _is_dtype_bearing(node):
         and isinstance(node.value, ast.Name)
         and node.value.id == "torch"
     ):
-        # `torch.float32` / `torch.bfloat16` / `torch.long` ...
-        return True
+        # `torch.float32` / `torch.bfloat16` / `torch.long` retype; a memory
+        # format or a layout does not. `Tensor.view(torch.int32)` really does
+        # reinterpret the dtype, so the check is on the constant, not the method.
+        return not isinstance(
+            getattr(torch, node.attr, None), _NON_DTYPE_TORCH_CONSTANTS
+        )
     return False
 
 
@@ -1245,6 +1262,12 @@ _RECEIVER_HOLES = [
      "inputs_embeds = self.upcast(inputs_embeds).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.dtype)\n"
      ")"),
+    # `Tensor.view(dtype)` reinterprets the storage as another dtype, so a real
+    # dtype constant must still be caught after memory formats stop counting.
+    ("receiver .view(torch.int32) reinterprets the dtype",
+     "inputs_embeds = inputs_embeds.view(torch.int32).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
 ]
 
 
@@ -1290,6 +1313,21 @@ _RECEIVER_CONTROLS = [
      ")"),
     ("plain receiver",
      "inputs_embeds = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    # A memory format is not a dtype: these keep the destination at
+    # `inputs_embeds.dtype`, and transformers already ships
+    # `.clone(memory_format = torch.contiguous_format)` (higgs_audio_v2).
+    ("receiver .clone(memory_format = torch.preserve_format)",
+     "inputs_embeds = inputs_embeds.clone(memory_format = torch.preserve_format).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .contiguous(memory_format = torch.contiguous_format)",
+     "inputs_embeds = inputs_embeds.contiguous(memory_format = torch.contiguous_format).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .contiguous(torch.channels_last) positionally",
+     "inputs_embeds = inputs_embeds.contiguous(torch.channels_last).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
 ]
