@@ -80,6 +80,42 @@ class _ToyBlocks(torch.nn.Module):
 '''
 
 
+# Same shape, but with a named layer class so the rewriter can resolve the
+# ModuleList's element type and check a replacement against its signature.
+_TOY_NAMED_SOURCE = '''
+class _ToyLayer(torch.nn.Module):
+    def forward(self, hidden_states, extra, **kwargs):
+        return hidden_states
+
+
+class _ToyNamedBlocks(torch.nn.Module):
+    def __init__(self, depth):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_ToyLayer() for _ in range(depth)])
+
+    def forward(self, hidden_states, extra, **kwargs):
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                extra=extra,
+                **kwargs,
+            )
+        return hidden_states
+'''
+
+_TOY_NAMED_FIND = """hidden_states = layer(
+                hidden_states,
+                extra=extra,
+                **kwargs,
+            )"""
+_TOY_NAMED_REPLACE = """hidden_states = layer(
+                hidden_states,
+                extra=extra,
+                injected=injected,
+                **kwargs,
+            )"""
+
+
 @functools.lru_cache(maxsize = None)
 def _build_toy():
     # patch_gradient_checkpointing() reads the class through inspect.getsource(),
@@ -96,6 +132,22 @@ def _build_toy():
     sys.modules["unsloth_gc_toy"] = module
     spec.loader.exec_module(module)
     return module._ToyBlocks
+
+
+@functools.lru_cache(maxsize = None)
+def _build_named_toy():
+    import importlib.util
+    import tempfile
+
+    directory = tempfile.mkdtemp(prefix = "unsloth_gc_named_toy_")
+    path = os.path.join(directory, "unsloth_gc_named_toy.py")
+    with open(path, "w", encoding = "utf-8") as handle:
+        handle.write("import torch\n" + _TOY_NAMED_SOURCE)
+    spec = importlib.util.spec_from_file_location("unsloth_gc_named_toy", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["unsloth_gc_named_toy"] = module
+    spec.loader.exec_module(module)
+    return module._ToyNamedBlocks
 
 
 _TOY_FIND = """hidden_states = layer(
@@ -275,6 +327,80 @@ def test_rewritten_forward_survives_non_empty_runtime_kwargs(monkeypatch):
         assert kwargs["sentinel"] == 7, "declared keyword lost"
         assert kwargs["probe"] == "delivered", "runtime keyword never reached the layer"
     assert hidden_states.grad is not None
+
+
+def _rewrite_named_toy(monkeypatch, entry):
+    monkeypatch.setattr(
+        compiler, "custom_gradient_checkpointing_replacements", [entry],
+    )
+    output = compiler.patch_gradient_checkpointing(
+        "_ToyNamedBlocks", _build_named_toy(),
+    )
+    assert output is not None, "rewriter bailed on the named toy class"
+    return output[1]
+
+
+def test_rewriter_resolves_the_modulelist_layer_class():
+    cls = _build_named_toy()
+    init = inspect.getsource(cls.__init__)
+    layer_class = compiler._modulelist_layer_class(cls, init, "self.layers")
+    assert layer_class is not None and layer_class.__name__ == "_ToyLayer"
+
+
+def test_rewriter_skips_a_replacement_the_layer_cannot_take(monkeypatch):
+    """A replacement entry may declare the parameters the layer must have.
+
+    Two transformers generations spell the Qwen2-VL vision call site
+    identically (4.53.0 - 5.9 and 5.10 - 5.14) but only the first still takes
+    ``rotary_pos_emb``. Injecting it on 5.10 - 5.14 handed the block one
+    positional too many. The text alone cannot tell them apart, so the entry
+    declares the parameter it depends on and is skipped when it is gone."""
+    forward = _rewrite_named_toy(
+        monkeypatch,
+        (_TOY_NAMED_FIND, _TOY_NAMED_REPLACE, None, ("injected",)),
+    )
+    assert "injected" not in forward, \
+        "injected a keyword the layer's forward does not declare"
+    ast.parse(textwrap.dedent(forward))
+
+
+def test_rewriter_applies_a_replacement_the_layer_can_take(monkeypatch):
+    """Control for the test above: the same entry fires when the declared
+    parameter is present, so the guard cannot pass by never applying."""
+    forward = _rewrite_named_toy(
+        monkeypatch,
+        (_TOY_NAMED_FIND, _TOY_NAMED_REPLACE, None, ("extra",)),
+    )
+    assert "injected" in forward
+    ast.parse(textwrap.dedent(forward))
+
+
+def test_rewriter_applies_a_guarded_replacement_when_the_layer_is_unresolvable(
+        monkeypatch):
+    """The plain toy fills its ModuleList with ``torch.nn.Identity``, which is
+    not a name in the toy's own module. Unresolvable means "behave exactly as
+    before", never "silently stop rewriting"."""
+    forward = _rewrite_toy(
+        monkeypatch, (_TOY_FIND, _TOY_REPLACE, None, ("nothing_has_this",)),
+    )
+    assert "sentinel" not in forward, "the replacement did not fire"
+    ast.parse(textwrap.dedent(forward))
+
+
+def test_qwen2_vl_rotary_entries_declare_the_parameter_they_depend_on():
+    """The shipped entries that re-inject ``rotary_pos_emb`` must be guarded on
+    it; transformers 5.10 - 5.14 spell the call site the same way and dropped
+    the parameter."""
+    guarded = [
+        entry for entry in compiler.custom_gradient_checkpointing_replacements
+        if "rotary_pos_emb=rotary_pos_emb" in entry[1]
+    ]
+    assert guarded, "no rotary_pos_emb re-injecting entry left"
+    for entry in guarded:
+        assert len(entry) == 4 and "rotary_pos_emb" in entry[3], (
+            "an entry that injects rotary_pos_emb must declare it as required; "
+            f"got {entry[2:]}"
+        )
 
 
 def test_qwen2_vl_5x_entry_declares_max_seqlen():

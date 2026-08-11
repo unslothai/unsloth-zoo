@@ -427,6 +427,64 @@ def test_compiler_cross_entropy_find_3_shift_logits_pattern():
             )
 
 
+_QWEN2_VL_NEEDLE_4X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+# 4.53.1 - 4.53.3 pass attention_mask at the call site. compiler.py carries
+# its own entry for that spelling; leaving it out here failed the guard on a
+# supported version while the rewriter was working fine.
+_QWEN2_VL_NEEDLE_4X_ATTENTION_MASK = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                attention_mask=attention_mask,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+_QWEN2_VL_NEEDLE_5X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                max_seqlen=max_seqlen,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+
+_QWEN2_VL_SIG_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "kwargs",
+]
+_QWEN2_VL_SIG_ROTARY_ATTENTION_MASK = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "attention_mask", "kwargs",
+]
+_QWEN2_VL_SIG_NO_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "position_embeddings", "kwargs",
+]
+
+# (label, call-site spelling, block signature) triples the rewriter handles.
+# The call spelling ALONE does not determine the rewrite: transformers
+# 4.53.0 / 4.54 - 5.9 and 5.10 - 5.14 write the call identically and need
+# different treatment, because 5.10 dropped rotary_pos_emb from the block.
+_QWEN2_VL_VARIANTS = (
+    ("4.53.0 / 4.54 - 5.9  (rotary re-injected)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_ROTARY),
+    ("4.53.1 - 4.53.3  (rotary re-injected, attention_mask at the call site)",
+     _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK, _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK),
+    ("5.10 - 5.14  (no entry fires; the arg=arg demotion already fits)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_NO_ROTARY),
+    ("5.15+  (max_seqlen bound into the checkpointed callable)",
+     _QWEN2_VL_NEEDLE_5X, _QWEN2_VL_SIG_NO_ROTARY),
+)
+
+
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
     """``unsloth_zoo/compiler.py:2779-2848`` pins the Qwen2-VL multiline
     raw strings ``hidden_states = blk(\\n hidden_states,\\n
@@ -450,35 +508,9 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
     except ImportError:
         pytest.skip("Qwen2VisionTransformerPretrainedModel not in this build")
     src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
-    needle_4x = (
-        "hidden_states = blk(\n"
-        "                hidden_states,\n"
-        "                cu_seqlens=cu_seqlens,\n"
-        "                position_embeddings=position_embeddings,\n"
-        "                **kwargs,\n"
-        "            )"
-    )
-    # 4.53.1 - 4.53.3 pass attention_mask at the call site. compiler.py carries
-    # its own entry for that spelling; leaving it out here failed the guard on a
-    # supported version while the rewriter was working fine.
-    needle_4x_attention_mask = (
-        "hidden_states = blk(\n"
-        "                hidden_states,\n"
-        "                cu_seqlens=cu_seqlens,\n"
-        "                position_embeddings=position_embeddings,\n"
-        "                attention_mask=attention_mask,\n"
-        "                **kwargs,\n"
-        "            )"
-    )
-    needle_5x = (
-        "hidden_states = blk(\n"
-        "                hidden_states,\n"
-        "                cu_seqlens=cu_seqlens,\n"
-        "                max_seqlen=max_seqlen,\n"
-        "                position_embeddings=position_embeddings,\n"
-        "                **kwargs,\n"
-        "            )"
-    )
+    needle_4x = _QWEN2_VL_NEEDLE_4X
+    needle_4x_attention_mask = _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK
+    needle_5x = _QWEN2_VL_NEEDLE_5X
     # 4.51.3 - 4.52.x spell the whole call on one line, and the same forward
     # already calls ``self._gradient_checkpointing_func`` itself. That is the
     # first thing patch_gradient_checkpointing() tests
@@ -537,19 +569,16 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
         # transformers 4.51.3 - 4.52.x -- no **kwargs on the block yet
         ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
          "position_embeddings"],
-        # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.5
-        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
-         "position_embeddings", "kwargs"],
+        # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.9
+        _QWEN2_VL_SIG_ROTARY,
         # transformers 4.53.1 - 4.53.3 -- attention_mask added as the fifth
         # positional parameter (and passed by the call site); this is the
         # variant the 4.x + attention_mask replacement entry in compiler.py
         # targets. Gone again by 4.54.
-        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
-         "position_embeddings", "attention_mask", "kwargs"],
-        # transformers 5.15 -- rotary_pos_emb dropped, max_seqlen rides in
-        # kwargs
-        ["self", "hidden_states", "cu_seqlens", "position_embeddings",
-         "kwargs"],
+        _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK,
+        # transformers 5.10+ -- rotary_pos_emb dropped; from 5.15 max_seqlen
+        # rides in kwargs
+        _QWEN2_VL_SIG_NO_ROTARY,
     )
     if params not in accepted:
         _drift(
@@ -577,6 +606,63 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
                 f"Qwen2VLVisionBlock.forward signature (got {name} as "
                 f"{parameter.kind})",
             )
+
+
+def test_compiler_qwen2_vl_call_site_and_block_signature_are_a_known_pair():
+    """The two guards above accept any known call spelling and any known block
+    signature INDEPENDENTLY, and that is not enough.
+
+    transformers 5.10.0 - 5.14.1 shipped the 4.x call spelling together with the
+    5.x no-rotary block signature. Both guards above pass on those releases,
+    while the rewriter re-injected ``rotary_pos_emb`` and the rewritten forward
+    died with ``TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4
+    positional arguments but 5 were given``. Only the PAIR is diagnostic, so
+    pin the pair."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VisionTransformerPretrainedModel,
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2-VL vision classes not in this build")
+    src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
+    if "_gradient_checkpointing_func" in src:
+        pytest.skip(
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
+        )
+    params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
+    matched = [
+        label for label, needle, signature in _QWEN2_VL_VARIANTS
+        if needle in src and params == signature
+    ]
+    if not matched:
+        present = [
+            label for label, needle, _sig in _QWEN2_VL_VARIANTS if needle in src
+        ] or ["<no known call spelling>"]
+        _drift(
+            "unsloth_zoo/compiler.py "
+            "(custom_gradient_checkpointing_replacements, call site paired "
+            "with Qwen2VLVisionBlock.forward)",
+            " OR ".join(label for label, _n, _s in _QWEN2_VL_VARIANTS),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl: call site matches "
+            f"{present} but the block signature is {params}",
+        )
+
+
+def test_qwen2_vl_variant_table_is_the_pairing_the_rewriter_implements():
+    """Documents which pairs are supported, so the table above cannot silently
+    grow back into an "any call spelling with any signature" allowlist."""
+    pairs = {(needle, tuple(sig)) for _label, needle, sig in _QWEN2_VL_VARIANTS}
+    # 5.10 - 5.14: 4.x spelling, no rotary in the block. Supported because
+    # compiler.py now skips the rotary re-injection when the block dropped it.
+    assert (_QWEN2_VL_NEEDLE_4X, tuple(_QWEN2_VL_SIG_NO_ROTARY)) in pairs
+    # Never shipped and never handled: max_seqlen at the call site while the
+    # block still takes rotary_pos_emb. The 5.x entry removes max_seqlen and
+    # nothing re-adds rotary_pos_emb, so the block would lose a positional.
+    assert (_QWEN2_VL_NEEDLE_5X, tuple(_QWEN2_VL_SIG_ROTARY)) not in pairs
 
 
 _UNSET = object()
