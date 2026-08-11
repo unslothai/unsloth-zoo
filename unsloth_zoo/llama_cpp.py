@@ -121,17 +121,46 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Check environments. Detection lives in disk_utils so unsloth and unsloth_zoo
+# cannot drift apart on the question, and so a KAGGLE_USERNAME exported for the
+# Kaggle CLI on a laptop no longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+        KAGGLE_TMP,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests import this module to skip unsloth_zoo's import-time device
+    # detection. Load the sibling by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+    KAGGLE_TMP = _disk_utils.KAGGLE_TMP
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
-UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
+#
+# On Kaggle the home directory sits on the same small overlay as the working
+# directory, and a llama.cpp source checkout plus its build tree is several GB
+# of it - spent before the export has written anything. The large /tmp overlay
+# is no more ephemeral than a Kaggle home directory is, so default there. Only
+# the default moves; UNSLOTH_LLAMA_CPP_PATH still wins.
+if IS_KAGGLE_ENVIRONMENT:
+    UNSLOTH_HOME = os.path.join(KAGGLE_TMP, ".unsloth")
+else:
+    UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
