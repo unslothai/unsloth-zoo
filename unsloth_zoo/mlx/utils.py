@@ -1504,6 +1504,11 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     return loss_fn
 
 
+def _model_logits(output):
+    """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
+    return output.logits if hasattr(output, "logits") else output
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -1533,7 +1538,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
-            logits = model(inputs)
+            logits = _model_logits(model(inputs))
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = _token_ce(logits, targets) * mask
@@ -1547,7 +1552,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         # Widen unsigned dtypes so mx.where(..., -100, ...) and the
         # `targets != -100` compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
-        logits = model(inputs)
+        logits = _model_logits(model(inputs))
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
@@ -2124,7 +2129,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = output.logits if hasattr(output, "logits") else output
+        logits = _model_logits(output)
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]

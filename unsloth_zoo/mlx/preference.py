@@ -15,6 +15,7 @@ from .utils import (
     _finite_row_schedule,
     _finite_text_pad_width,
     _get_mlx_dropout_probability,
+    _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
     _torch_randperm_order,
@@ -421,7 +422,7 @@ def make_orpo_loss_fn(beta=0.1):
     def loss_fn(model, batch, lengths, normalizers):
         targets = batch[:, 1:]
         ce = nn.losses.cross_entropy(
-            model(batch[:, :-1]), targets, reduction="none",
+            _model_logits(model(batch[:, :-1])), targets, reduction="none",
         ).reshape(targets.shape)
         mask = _response_mask(targets, lengths)
         response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
@@ -536,7 +537,7 @@ class LoRAReferencePolicy:
 def _response_logps(model, batch, lengths):
     targets = batch[:, 1:]
     ce = nn.losses.cross_entropy(
-        model(batch[:, :-1]), targets, reduction="none",
+        _model_logits(model(batch[:, :-1])), targets, reduction="none",
     ).reshape(targets.shape)
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
