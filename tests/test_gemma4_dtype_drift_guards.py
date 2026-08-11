@@ -3,8 +3,11 @@
 These lock in the three failures we traced:
 
   1. Audio merge: upstream `Gemma4Model.forward` cast `audio_features.to(device)`
-     without dtype (transformers #45192), while image/video cast dtype too ->
+     without dtype (transformers #45192), while image/video aligned dtype on the
+     statement that produced the features ->
      `masked_scatter_: expected self and source to have same dtypes`.
+     Fixed upstream in transformers 5.15.0; the guards below still cover the
+     5.5.0-5.14.1 window, which unsloth continues to support.
   2. Forced-float32 PLE: fp32 residual into the fp16 PLE Linears (unsloth-zoo #866
      forced fp32 but left PLE inputs uncast) -> `mat1 and mat2 ... float != Half`.
   3. Cross-path NameError: the eager patch rewrote calls to one helper name while
@@ -16,6 +19,7 @@ The real-source canaries import the real transformers gemma4 module and skip
 cleanly when it is absent; when present (transformers >= 5.5.0, as on CI) they
 catch upstream source drift that would silently disable the patch.
 """
+import ast
 import inspect
 import re
 
@@ -195,27 +199,143 @@ def _gemma4_modeling_source():
     return pathlib.Path(inspect.getsourcefile(real_gemma4)).read_text()
 
 
+# Upstream is free to spell the dtype alignment wherever it likes: at the merge
+# call (`audio_features.to(inputs_embeds.device, inputs_embeds.dtype)`, tf 5.15+)
+# or on the statement that produced the features
+# (`image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)`,
+# tf 5.5-5.14, or `... = torch.cat(image_features, dim=0).to(..., inputs_embeds.dtype)`,
+# tf 5.15). A substring anchor on one spelling breaks on cosmetic refactors while
+# staying blind to a real regression written in another spelling, so the canaries
+# below trace dtype ALIGNMENT structurally instead: find the masked_scatter that
+# consumes the features, then require an `inputs_embeds.dtype` cast either inside
+# the merge argument or on the last assignment to that name before the merge.
+def _is_attr(node, owner, attr):
+    """`<owner>.<attr>` as an AST node, e.g. `inputs_embeds.dtype`."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == owner
+    )
+
+
+def _casts_to_inputs_embeds_dtype(node):
+    """True if `node` contains a `.to(...)` carrying `inputs_embeds.dtype`."""
+    for sub in ast.walk(node):
+        if not (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "to"
+        ):
+            continue
+        values = list(sub.args) + [kw.value for kw in sub.keywords]
+        if any(_is_attr(v, "inputs_embeds", "dtype") for v in values):
+            return True
+    return False
+
+
+def _gemma4_model_forward_node(src):
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "Gemma4Model":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "forward":
+                    return item
+    return None
+
+
+def _merge_dtype_alignment(src, feature):
+    """Trace `<feature>` into `inputs_embeds.masked_scatter(...)`.
+
+    Returns (merge_found, aligned_at_merge_call, aligned_on_last_assignment).
+    """
+    forward = _gemma4_model_forward_node(src)
+    if forward is None:
+        return (False, False, False)
+
+    merge_arg = None
+    for node in ast.walk(forward):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "masked_scatter"
+            and len(node.args) >= 2
+        ):
+            continue
+        source_arg = node.args[1]
+        if any(
+            isinstance(n, ast.Name) and n.id == feature for n in ast.walk(source_arg)
+        ):
+            merge_arg = source_arg
+            break
+    if merge_arg is None:
+        return (False, False, False)
+
+    aligned_at_call = _casts_to_inputs_embeds_dtype(merge_arg)
+
+    # Last `<feature> = ...` before the merge. Only the last one counts: an
+    # earlier cast says nothing if a later statement rebinds the name.
+    last_assign = None
+    for node in ast.walk(forward):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == feature for t in targets):
+            continue
+        if node.lineno >= merge_arg.lineno:
+            continue
+        if last_assign is None or node.lineno > last_assign.lineno:
+            last_assign = node
+    aligned_on_assignment = (
+        last_assign is not None
+        and last_assign.value is not None
+        and _casts_to_inputs_embeds_dtype(last_assign.value)
+    )
+    return (True, aligned_at_call, aligned_on_assignment)
+
+
 @requires_gemma4
 def test_real_gemma4_audio_merge_site_is_recognized():
     src = _gemma4_modeling_source()
-    buggy = "audio_features.to(inputs_embeds.device)"
-    fixed = "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)"
-    assert (buggy in src) or (fixed in src), (
-        "Gemma4 audio merge site drifted: neither the known device-only pattern "
-        "nor the fixed device+dtype pattern is present in modeling_gemma4.py. The "
-        "unsloth audio patch would silently no-op and the masked_scatter dtype crash "
-        "would return. Update _patch_gemma4_audio_feature_dtype_on_class (eager) and "
+    found, at_call, at_assign = _merge_dtype_alignment(src, "audio_features")
+    assert found, (
+        "Gemma4 audio merge site drifted: no `inputs_embeds.masked_scatter(...)` "
+        "consuming `audio_features` in Gemma4Model.forward. The unsloth audio patch "
+        "would silently no-op and the masked_scatter dtype crash would return. Update "
+        "_patch_gemma4_audio_feature_dtype_on_class (eager) and "
+        "fix_gemma4_audio_feature_dtype (compiler)."
+    )
+    upstream_aligned = at_call or at_assign
+    unsloth_can_patch = C.fix_gemma4_audio_feature_dtype(src) != src
+    assert upstream_aligned or unsloth_can_patch, (
+        "Gemma4 audio features reach masked_scatter with no `inputs_embeds.dtype` "
+        "alignment anywhere, and the unsloth rewriter no longer matches the merge "
+        "site either. `masked_scatter_: expected self and source to have same dtypes` "
+        "is back. Update _patch_gemma4_audio_feature_dtype_on_class (eager) and "
         "fix_gemma4_audio_feature_dtype (compiler)."
     )
 
 
 @requires_gemma4
-def test_real_gemma4_image_and_video_merges_still_cast_dtype():
-    # Regression anchor: image/video have always cast dtype; if upstream ever
-    # drops it there too, that is a new modality that also needs patching.
+@pytest.mark.parametrize("feature", ["image_features", "video_features"])
+def test_real_gemma4_image_and_video_merges_still_cast_dtype(feature):
+    # Regression anchor: image/video have always aligned dtype before the merge,
+    # so unsloth patches only audio. If upstream ever drops the alignment here
+    # too, that is a new modality that also needs patching.
     src = _gemma4_modeling_source()
-    assert "image_features.to(inputs_embeds.device, inputs_embeds.dtype)" in src
-    assert "video_features.to(inputs_embeds.device, inputs_embeds.dtype)" in src
+    found, at_call, at_assign = _merge_dtype_alignment(src, feature)
+    assert found, (
+        f"No `inputs_embeds.masked_scatter(...)` consuming `{feature}` in "
+        f"Gemma4Model.forward - the merge site moved and this canary is blind."
+    )
+    assert at_call or at_assign, (
+        f"Gemma4 {feature.split('_')[0]} merge lost its `inputs_embeds.dtype` "
+        f"alignment: `{feature}` reaches masked_scatter without an "
+        f"`inputs_embeds.dtype` cast at the call or on its last assignment. That is "
+        f"the audio bug (transformers #45192) in a new modality and needs the same "
+        f"treatment as _patch_gemma4_audio_feature_dtype_on_class / "
+        f"fix_gemma4_audio_feature_dtype."
+    )
 
 
 @requires_gemma4
@@ -241,7 +361,26 @@ def test_real_gemma4_audio_compiler_transform_emits_dtype_cast():
     # upstream already casts dtype, or our regex still matches and inserts it.
     src = _gemma4_modeling_source()
     out = C.fix_gemma4_audio_feature_dtype(src)
+    found, at_call, at_assign = _merge_dtype_alignment(out, "audio_features")
+    assert found and (at_call or at_assign), (
+        "After fix_gemma4_audio_feature_dtype, `audio_features` still reaches "
+        "masked_scatter with no `inputs_embeds.dtype` alignment on upstream source "
+        "(regex drift or multiple matches)."
+    )
+
+
+def test_audio_compiler_transform_still_fixes_the_device_only_spelling():
+    # transformers 5.15.0 fixed the audio merge upstream, which makes the
+    # real-source test above pass without the rewriter doing anything. Keep the
+    # rewriter itself under test against the historical buggy spelling so it
+    # cannot silently rot while older transformers are still supported.
+    buggy = (
+        "        inputs_embeds = inputs_embeds.masked_scatter(\n"
+        "            audio_mask.to(inputs_embeds.device), audio_features.to(inputs_embeds.device)\n"
+        "        )\n"
+    )
+    out = C.fix_gemma4_audio_feature_dtype(buggy)
     assert "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)" in out, (
-        "fix_gemma4_audio_feature_dtype no longer produces the dtype-aligned cast on "
-        "upstream source (regex drift or multiple matches)."
+        "fix_gemma4_audio_feature_dtype no longer rewrites the device-only audio "
+        "cast shipped by transformers 5.5.0-5.14.1."
     )
