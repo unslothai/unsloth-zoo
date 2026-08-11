@@ -456,6 +456,18 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
         "                **kwargs,\n"
         "            )"
     )
+    # 4.53.1 - 4.53.3 pass attention_mask at the call site. compiler.py carries
+    # its own entry for that spelling; leaving it out here failed the guard on a
+    # supported version while the rewriter was working fine.
+    needle_4x_attention_mask = (
+        "hidden_states = blk(\n"
+        "                hidden_states,\n"
+        "                cu_seqlens=cu_seqlens,\n"
+        "                position_embeddings=position_embeddings,\n"
+        "                attention_mask=attention_mask,\n"
+        "                **kwargs,\n"
+        "            )"
+    )
     needle_5x = (
         "hidden_states = blk(\n"
         "                hidden_states,\n"
@@ -465,11 +477,19 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
         "                **kwargs,\n"
         "            )"
     )
-    if not any(n in src for n in (needle_4x, needle_5x)):
+    # 4.51.3 - 4.52.x spell the whole call on one line. The rewriter has no entry
+    # for that form at all, so there is no pinned string to have drifted; failing
+    # here would report drift where the truth is "never covered".
+    if "hidden_states = blk(hidden_states," in src:
+        pytest.skip(
+            "transformers <= 4.52 spells the call on one line; "
+            "custom_gradient_checkpointing_replacements has no entry for it"
+        )
+    if not any(n in src for n in (needle_4x, needle_4x_attention_mask, needle_5x)):
         _drift(
             "unsloth_zoo/compiler.py:2779-2848 "
             "(custom_gradient_checkpointing_replacements)",
-            " OR ".join((needle_4x, needle_5x)),
+            " OR ".join((needle_4x, needle_4x_attention_mask, needle_5x)),
             "transformers.models.qwen2_vl.modeling_qwen2_vl."
             "Qwen2VisionTransformerPretrainedModel.forward",
         )
