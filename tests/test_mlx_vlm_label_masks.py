@@ -4004,6 +4004,41 @@ def test_clips_of_unequal_duration_all_reach_the_model():
     assert tuple(stacked.shape) == (2, 80, 300)
 
 
+def test_mixed_aspect_ratio_images_all_reach_the_model():
+    """Gemma 4 keeps differently shaped processed images as a ragged list.
+
+    The generic conversion used to catch the failed stack and retain only the
+    first tensor, so a batch of two OCR examples reached the vision tower as one
+    unbatched 3-D image. Preserve every image and its row order instead.
+    """
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    source = (
+        np.full((3, 4, 7), 11, dtype=np.float32),
+        np.full((3, 6, 5), 29, dtype=np.float32),
+    )
+    for images in (source, source[::-1]):
+        pixels = _to_mx_vlm_batch({"pixel_values": list(images)})["pixel_values"]
+
+        assert isinstance(pixels, list)
+        assert [tuple(image.shape) for image in pixels] == [tuple(image.shape) for image in images]
+        assert [float(np.asarray(image)[1, -1, -1]) for image in pixels] == [
+            float(image[1, -1, -1]) for image in images
+        ]
+
+
+def test_equal_shape_images_stack_without_data_loss():
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    dense_source = [
+        np.full((3, 4, 7), 41, dtype=np.float32),
+        np.full((3, 4, 7), 73, dtype=np.float32),
+    ]
+    dense = _to_mx_vlm_batch({"pixel_values": dense_source})["pixel_values"]
+    assert tuple(dense.shape) == (2, *dense_source[0].shape)
+    assert [float(np.asarray(dense)[row, 1, -1, -1]) for row in (0, 1)] == [41.0, 73.0]
+
+
 def test_nested_audio_rows_are_paired_clip_by_clip():
     """A processor that wants ``(samples, rate)`` pairs may also want its audio
     nested per row (MiniCPM-o). Pairing the payload as though its entries were
