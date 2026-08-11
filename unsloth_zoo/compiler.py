@@ -1274,16 +1274,55 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        # Even with OVERWRITE disabled, force recompile on a library version
+        # mismatch. TRL counts as much as transformers here: the generated RL
+        # trainers mirror the installed TRL config signature and import symbols
+        # straight out of trl.trainer.<x>_trainer, so a cache built against a
+        # different TRL either fails to import (and Unsloth silently falls back
+        # to TRL's own untouched trainer) or forwards arguments that TRL has
+        # since retired. Checking transformers alone let a TRL 0.25 cache be
+        # reused on TRL 1.9 and reinstated the very TypeError it was fixed for.
+        if file_source is None and os.path.isfile(function_location):
+            # Callers that leave overwrite at its default never took the read
+            # above, so without this the comparison below is dead code for them
+            # and the hatch pins whatever is on disk no matter which library
+            # moved. On a read failure we fall back to None, which lands on the
+            # same "leave it alone" branch as before.
+            try:
+                with open(function_location, "r", encoding="utf-8") as f:
+                    file_source = f.read()
+            except Exception:
+                file_source = None
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            cached_trl_version = cached_lines[3] if len(cached_lines) > 3 else "0"
+            # Only a cache generated from TRL can go stale when TRL moves. The
+            # combined model modules and the peft/torch forward patches come
+            # from transformers, peft and torch source and never import trl, so
+            # regenerating them on a TRL bump would only destroy the hand edit
+            # this escape hatch exists to protect. Deliberately over-inclusive,
+            # because a false positive costs one extra rewrite while a false
+            # negative silently keeps a broken trainer: model_location covers
+            # the normal path, including trl.experimental once TRL relocates a
+            # trainer, and the cached body is the backstop for a model_location
+            # that ever resolves outside trl, since every generated trainer
+            # carries both a `from trl` import and `_tag_names = ["trl", ...]`.
+            trl_dependent = (
+                str(model_location).split(".", 1)[0] == "trl"
+                or re.search(r"\btrl\b", file_source) is not None
+            )
+            changed = []
             if cached_tf_version != transformers_version:
+                changed.append(f"transformers {cached_tf_version} -> {transformers_version}")
+            if trl_dependent and cached_trl_version != trl_version:
+                changed.append(f"trl {cached_trl_version} -> {trl_version}")
+            if changed:
                 logger.warning_once(
-                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
-                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but "
+                    f"{' and '.join(changed)}. Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
             else:
@@ -2021,6 +2060,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -2100,6 +2152,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -2210,6 +2275,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 else:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)

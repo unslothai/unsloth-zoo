@@ -645,7 +645,19 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
 def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
     """UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 must make transformers take its pure-torch
     gated-delta path, which needs both a False availability probe and the module
-    global unbound (the layer reads ``chunk_gated_delta_rule or torch_...``)."""
+    global unbound (the layer reads ``chunk_gated_delta_rule or torch_...``).
+
+    Pinned to the pre-#47630 layout, because that "or torch_..." read is what the
+    pure-torch outcome is made of: after #47630 the modeling files resolve the
+    kernel through ``use_kernel_func_from_hub_with_fallback``, which freezes the
+    implementation into a closure at import time, so there is no probe to answer
+    False and no global to unbind and pure torch is simply not reachable from
+    here. Without the pin this test silently swaps which branch of
+    ``patch_vendor_fla`` it covers as soon as the installed Transformers crosses
+    that release, and fails. The post-#47630 contract -- fall through to the
+    protection path instead of returning -- is
+    ``test_optout_falls_through_to_protection_on_the_new_layout``.
+    """
     import transformers.utils.import_utils as iu
 
     from unsloth_zoo.temporary_patches import fla_vendor as fv
@@ -653,6 +665,7 @@ def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
     monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
     monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
     monkeypatch.setattr(fv, "_FLA_DISABLED_REASON", None)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: True)
     monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda: True, raising=False)
 
     def fail_inject():
@@ -691,26 +704,66 @@ def test_opt_out_covers_models_the_vendored_tree_does_not(monkeypatch):
     assert "kimi_linear" not in _GATED_DELTA_MODELING
 
 
-def test_opt_out_outranks_the_source_preference_flags(monkeypatch, fake_gated_delta_modeling):
+@pytest.mark.parametrize("old_layout", [True, False], ids=["probe", "kernel-hub"])
+def test_opt_out_outranks_the_source_preference_flags(
+    old_layout, monkeypatch, fake_gated_delta_modeling,
+):
     """The other two flags choose *which* fla to use; this one is a correctness
-    switch, so it has to win over both."""
+    switch, so it has to win over both.
+
+    What "winning" looks like depends on the Transformers layout, so both are
+    driven explicitly rather than left to whichever version happens to be
+    installed:
+
+      * pre-#47630, the opt-out reaches pure torch, so neither flag may leave a
+        gated-delta module global bound to an fla kernel;
+      * post-#47630 it cannot (the kernel-hub decorator froze its implementation
+        at import time), so it degrades to making the fla that decorator resolves
+        a fixed one -- and neither flag may short-circuit that protection, since
+        returning early would leave an unpatched BK=64 install serving the
+        backward, i.e. setting a safety switch would make the host less safe.
+    """
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
     monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: old_layout)
 
-    def fail_inject():
-        raise AssertionError("the opt-out must not inject the vendored tree")
+    reached = []
+    if old_layout:
+        def fail_inject():
+            raise AssertionError("the opt-out must not inject the vendored tree")
 
-    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+        monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+    else:
+        monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda: None)
+        monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+        monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+        monkeypatch.setattr(fv, "_should_defer_to_installed_fla", lambda: False)
+        monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+        # An earlier test in this process may already have injected the vendored
+        # tree, which legitimately short-circuits the injection decision. Force the
+        # not-yet-injected state so the fall-through is what is under test.
+        monkeypatch.setattr(fv, "_vendored_already_injected", lambda: False)
+        monkeypatch.setattr(
+            fv, "_inject_vendored_fla", lambda: (reached.append(True), (True, False))[1],
+        )
 
     for other in ("UNSLOTH_DISABLE_VENDORED_FLA", "UNSLOTH_FORCE_VENDORED_FLA"):
         monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
         monkeypatch.setenv(other, "1")
         for mod in fake_gated_delta_modeling.values():
             mod.chunk_gated_delta_rule = lambda *a, **k: None
+        reached.clear()
         fv.patch_vendor_fla()
-        for pkg, mod in fake_gated_delta_modeling.items():
-            assert mod.chunk_gated_delta_rule is None, f"{other} defeated the opt-out for {pkg}"
+        if old_layout:
+            for pkg, mod in fake_gated_delta_modeling.items():
+                assert mod.chunk_gated_delta_rule is None, f"{other} defeated the opt-out for {pkg}"
+        else:
+            assert reached, (
+                f"{other} defeated the opt-out: the degraded opt-out must still "
+                "reach the protection path, not return and leave the kernel-hub "
+                "decorator resolving an unpatched fla"
+            )
         monkeypatch.delenv(other)
 
 

@@ -55,7 +55,7 @@ except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
 from ..utils import Version
-from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
+from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger, unwrap_already_compiled
 
 EMPTY = inspect._empty
 
@@ -272,6 +272,49 @@ _TORCHVISION_BROKE = (
     "`pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
 )
 
+# A torchao built for a newer torch imports symbols straight out of torch (e.g.
+# `from torch.nn.functional import ScalingType`). On an older pinned torch the
+# symbol is absent, and the ImportError arrives here naming neither package.
+_TORCHAO_TORCH_SYMBOLS = ("ScalingType", "ScalingGranularity", "Float8Tensor")
+
+
+def _torchao_is_newer_than_torch(message):
+    """Is this ImportError torchao reaching into a torch that lacks the symbol?
+
+    Narrow on purpose: both the symbol and the failing module must be torch's,
+    so unrelated errors keep their own text.
+    """
+    try:
+        message = str(message)
+    except Exception:                                    # noqa: BLE001
+        return False
+    if "cannot import name" not in message:
+        return False
+    if "torch" not in message:
+        return False
+    return any(sym in message for sym in _TORCHAO_TORCH_SYMBOLS)
+
+
+def _torchao_torch_mismatch_message(message):
+    """Name both versions, because the raw error names neither."""
+    def _ver(mod):
+        try:
+            import importlib.metadata as _md
+            return _md.version(mod)
+        except Exception:                                # noqa: BLE001
+            return "unknown"
+    torch_v, ao_v = _ver("torch"), _ver("torchao")
+    return (
+        f"***** Unsloth: torchao {ao_v} was built for a newer torch than the "
+        f"torch {torch_v} you have installed, so importing it fails with:\n"
+        f"    {message}\n"
+        f"Install a torchao that matches your torch, e.g.\n"
+        f"    pip install --upgrade --force-reinstall --no-cache-dir "
+        f"\"torchao<0.18\"\n"
+        f"or upgrade torch instead. Then restart your runtime/kernel. *****"
+    )
+
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -304,6 +347,8 @@ except ImportError as e:
             f"***** Your Pillow (PIL) version is incompatible with torchvision. "
             f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
         )
+    elif _torchao_is_newer_than_torch(e):
+        raise RuntimeError(_torchao_torch_mismatch_message(e)) from None
     elif "Unpack" not in e:
         raise Exception(e)
     raise RuntimeError(
@@ -1206,7 +1251,12 @@ def compile_with_eager_fallback(func, label, fullgraph = True, dynamic = True):
     # fallback itself, so wrapping its result again would leave the inner
     # wrapper swallowing the exhaustion under a label nobody looks up, and the
     # outer one returned here never latching.
-    from .common import _raw_torch_compile
+    from .common import _raw_torch_compile, unwrap_already_compiled
+    # No-op for the plain module-level functions every caller passes today, and
+    # the thing that keeps torch 2.11's bare
+    # `assert not hasattr(compile_wrapper, "get_compiler_config")` out of reach
+    # if one ever passes a callable that has already been through here.
+    func = unwrap_already_compiled(func)
     compiled = _raw_torch_compile(fullgraph = fullgraph, dynamic = dynamic)(func)
     # Without fullgraph Dynamo already falls back by itself.
     if not fullgraph:
@@ -1590,8 +1640,16 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
 
     `fullgraph = False` is returned untouched: Dynamo already falls back by
     itself there, so wrapping would add a layer that can never fire.
+
+    This is a BARE decorator: `compiler.py` writes it into every generated
+    `unsloth_compiled_cache` module and `rl_replacements.py` applies it directly,
+    so it reaches `torch.compile` without passing through `_compile_or_fall_back`
+    and needs its own `unwrap_already_compiled`. What it returns is a
+    `functools.wraps` copy of a compiled function, which is precisely the shape
+    torch 2.11+ refuses to compile again.
     """
     def _decorate(func):
+        func = unwrap_already_compiled(func)
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if not fullgraph:
             return compiled
@@ -1740,25 +1798,42 @@ def patch_function(
 
     # torch.compile if requested.
     if fullgraph is not None and type(fullgraph) is bool and not UNSLOTH_COMPILE_DISABLE:
-        # Unwrap already-compiled functions.
-        if hasattr(new_func, "get_compiler_config"):
-            new_func = new_func.__wrapped__
-        if hasattr(original_func, "get_compiler_config"):
-            original_func = original_func.__wrapped__
+        # Unwrap already-compiled functions. The shared helper rather than a
+        # bare `.__wrapped__`: a carrier without one (an `OptimizedModule`, say)
+        # raised `AttributeError` here, a bound method's `__wrapped__` is the
+        # UNBOUND original and silently dropped the receiver, and one hop is not
+        # always enough to reach the eager function.
+        new_func = unwrap_already_compiled(new_func)
+        original_func = unwrap_already_compiled(original_func)
         _eager_func = new_func
-        new_func = torch.compile(
-            new_func,
-            fullgraph = fullgraph,
-            dynamic = dynamic,
-            options = torch_compile_options,
-        )
-        if fullgraph:
-            # Only fullgraph turns cache exhaustion into a raise; without it
-            # Dynamo already falls back on its own.
-            new_func = _fall_back_to_eager_on_recompile_limit(
-                new_func, _eager_func,
-                f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+        # The compile is guarded the way `_compile_or_fall_back` guards its own,
+        # and for the same reason: a patch that cannot be compiled is a
+        # performance problem, and the eager function is still correct, so it
+        # must not end the model load. Reachable on torch 2.11+ for whatever
+        # `unwrap_already_compiled` deliberately leaves alone -- a compiled BOUND
+        # method keeps its receiver, and torch refuses to compile it again.
+        try:
+            new_func = torch.compile(
+                new_func,
+                fullgraph = fullgraph,
+                dynamic = dynamic,
+                options = torch_compile_options,
             )
+        except Exception as exception:
+            _label = f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}"
+            logger.warning(
+                f"Unsloth: torch.compile refused to wrap {_label}; running it "
+                f"eagerly. ({type(exception).__name__}: {exception})"
+            )
+            new_func = _eager_func
+        else:
+            if fullgraph:
+                # Only fullgraph turns cache exhaustion into a raise; without it
+                # Dynamo already falls back on its own.
+                new_func = _fall_back_to_eager_on_recompile_limit(
+                    new_func, _eager_func,
+                    f"{getattr(target_obj, '__name__', target_obj)}.{attr_name}",
+                )
     pass
 
     # Stash original under a unique name for later restoration.
