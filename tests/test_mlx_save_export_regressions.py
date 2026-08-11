@@ -1030,6 +1030,12 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
         ("vision_tower.weight", "model.vision_tower.weight"),
         ("embed_audio.weight", "model.embed_audio.weight"),
         ("embed_vision.weight", "model.embed_vision.weight"),
+        # The projector shares the encoder's namespace; a converter that takes only the
+        # canonical name drops it, and the mmproj it writes then holds the encoder alone
+        # and is refused at load for the missing projector tensor.
+        ("vision_adapter.fc1.weight", "model.vision_adapter.fc1.weight"),
+        ("vision_adapter.fc2.weight", "model.vision_adapter.fc2.weight"),
+        ("vision_projection.weight", "model.vision_projection.weight"),
     ],
 )
 def test_vlm_gguf_candidates_prefer_canonical_model_namespace(mlx_name, hf_name):

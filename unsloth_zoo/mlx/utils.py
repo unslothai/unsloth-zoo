@@ -13831,8 +13831,19 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
+    # A multimodal encoder MLX keeps at the top level sits under "model." in the HF
+    # layout these converters read. The projector counts: llama.cpp drops a tensor whose
+    # name it does not recognize, so a missed prefix here costs the mmproj its projector
+    # and the file only fails later, when something tries to load it.
     if name.startswith(
-        ("audio_tower.", "vision_tower.", "embed_audio.", "embed_vision.")
+        (
+            "audio_tower.",
+            "vision_tower.",
+            "vision_adapter.",
+            "vision_projection.",
+            "embed_audio.",
+            "embed_vision.",
+        )
     ):
         add(f"model.{name}")
 
