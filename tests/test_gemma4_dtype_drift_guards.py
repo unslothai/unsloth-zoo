@@ -298,8 +298,15 @@ _DTYPE_PRESERVING_METHODS = frozenset({
 _NON_DTYPE_TORCH_CONSTANTS = (torch.memory_format, torch.layout)
 
 
-def _is_dtype_bearing(node):
-    """Can `node` retype a tensor? (`torch.float32`, `other.dtype`, ...)"""
+def _is_dtype_bearing(node, aliases = frozenset()):
+    """Can `node` retype a tensor? (`torch.float32`, `other.dtype`, ...)
+
+    `aliases` are local names already known to hold a dtype, because
+    `Tensor.view(dtype)` reinterprets its receiver just as thoroughly whether the
+    dtype is written out or held in a variable.
+    """
+    if isinstance(node, ast.Name):
+        return node.id in aliases
     if isinstance(node, ast.Attribute) and node.attr == "dtype":
         return not _is_attr(node, "inputs_embeds", "dtype")
     if (
@@ -352,7 +359,7 @@ def _to_call_preserves_dtype(call):
     return True
 
 
-def _receiver_preserves_embeds_dtype(node):
+def _receiver_preserves_embeds_dtype(node, aliases = frozenset()):
     """Is the merge destination `inputs_embeds` still at `inputs_embeds.dtype`?
 
     The whole trace is "the source is cast to `inputs_embeds.dtype`, so the merge
@@ -374,7 +381,7 @@ def _receiver_preserves_embeds_dtype(node):
                 return False
         elif method in _DTYPE_PRESERVING_METHODS:
             values = list(node.args) + [kw.value for kw in node.keywords]
-            if any(_is_dtype_bearing(v) for v in values):
+            if any(_is_dtype_bearing(v, aliases) for v in values):
                 return False
         else:
             return False
@@ -722,25 +729,33 @@ _METADATA_ATTRS = frozenset({
 })
 
 
-def _carries_feature_value(node, feature):
-    """Do `<feature>`'s VALUES flow into `node`?
+def _carries_value(node, matches):
+    """Do the VALUES of a `matches` expression flow into `node`?
 
-    A merge is discovered by "the source argument uses the feature", and a bare
-    name-occurrence check answers that with `image_features.device` too. That
-    reads the feature's metadata and scatters something else entirely, so a
-    source spelled `fallback.to(image_features.device, inputs_embeds.dtype)`
-    would be reported as the image merge - and if the real merge were ever
-    dropped, `_merge_dtype_alignment` would return `(True, True)` on a source in
-    which no image value reaches the model at all. A metadata expression
-    contributes no values, so the whole subtree under it is skipped; everything
+    Both the merge SOURCE and the merge RESULT are traced by "does this
+    expression use that tensor", and a bare occurrence check answers that with
+    `image_features.device` or `merged.dtype` too. A metadata read carries none
+    of the tensor's values, so the whole subtree under it is skipped; everything
     else still counts, which keeps
-    `image_features.to(...).reshape(-1, image_features.shape[-1])` a merge.
+    `image_features.to(...).reshape(-1, image_features.shape[-1])` a use.
     """
     if isinstance(node, ast.Attribute) and node.attr in _METADATA_ATTRS:
         return False
-    if isinstance(node, ast.Name):
-        return node.id == feature
-    return any(_carries_feature_value(child, feature) for child in ast.iter_child_nodes(node))
+    if matches(node):
+        return True
+    return any(_carries_value(child, matches) for child in ast.iter_child_nodes(node))
+
+
+def _carries_feature_value(node, feature):
+    """Do `<feature>`'s VALUES flow into `node`?
+
+    A merge is discovered by "the source argument uses the feature". Counting a
+    metadata read would report a source spelled
+    `fallback.to(image_features.device, inputs_embeds.dtype)` as the image merge -
+    and if the real merge were ever dropped, `_merge_dtype_alignment` would return
+    `(True, True)` on a source in which no image value reaches the model at all.
+    """
+    return _carries_value(node, lambda n: isinstance(n, ast.Name) and n.id == feature)
 
 
 def _feature_merges(forward, feature):
@@ -788,12 +803,20 @@ def _feature_merges(forward, feature):
     return sorted(calls, key=lambda n: (n.lineno, n.col_offset))
 
 
+# The merge RESULT is followed by the same rule that discovers the merge source:
+# only an expression carrying the tensor's VALUES passes it on. A metadata read of
+# the merge (`merged.device`, `merged.dtype`, `merged.shape`) discards every
+# scattered value, so `merged = inputs_embeds.masked_scatter(...)` followed by
+# `inputs_embeds = original.to(merged.device)` hands the embeddings the ORIGINAL
+# tensor. Treating that mention as value flow reported the merge used, so an
+# upstream refactor that removed the effective merge would leave every canary
+# here green while no feature reached the model.
 def _contains(node, target):
-    return any(n is target for n in ast.walk(node))
+    return _carries_value(node, lambda n: n is target)
 
 
 def _references(node, names):
-    return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
+    return _carries_value(node, lambda n: isinstance(n, ast.Name) and n.id in names)
 
 
 def _statements_after(forward, call):
@@ -891,6 +914,36 @@ def _merge_result_is_used(forward, call):
     return False
 
 
+def _dtype_alias_names(forward):
+    """Local names bound to a dtype, e.g. `target_dtype = torch.float32`.
+
+    `inputs_embeds.view(target_dtype)` reinterprets the merge destination exactly
+    like `inputs_embeds.view(torch.float32)` does, so a receiver holding its dtype
+    in a variable must not read as dtype-preserving: the merge would then take an
+    `inputs_embeds.dtype` source into a retyped destination and raise.
+
+    Only a binding whose VALUE is itself dtype-bearing counts, which is what keeps
+    the legitimate shape overload out: `Tensor.view` accepts a single shape
+    sequence, so `target_shape = image_features.shape` / `view(target_shape)` is
+    real upstream spelling and preserves the dtype. Repeated to a fixpoint so an
+    alias of an alias resolves too.
+    """
+    names = set()
+    while True:
+        found = set()
+        for node in _walk_own_scope(forward):
+            if not isinstance(node, _ELEMENTWISE_NODES):
+                continue
+            for target, value in _binding_pairs(node):
+                if target is None or value is None:
+                    continue
+                if _is_dtype_bearing(value, names):
+                    found.update(_bound_names(target))
+        if found <= names:
+            return names
+        names |= found
+
+
 def _merge_dtype_alignment(src, feature):
     """Trace `<feature>` into `inputs_embeds.masked_scatter(...)`.
 
@@ -909,8 +962,9 @@ def _merge_dtype_alignment(src, feature):
     merges = _feature_merges(forward, feature)
     if not merges:
         return (False, False)
+    aliases = _dtype_alias_names(forward)
     aligned = all(
-        _receiver_preserves_embeds_dtype(merge.func.value)
+        _receiver_preserves_embeds_dtype(merge.func.value, aliases)
         and _merge_result_is_used(forward, merge)
         and (
             _casts_to_inputs_embeds_dtype(merge.args[1])
@@ -1320,6 +1374,24 @@ _RECEIVER_HOLES = [
      "inputs_embeds = inputs_embeds.view(torch.int32).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.dtype)\n"
      ")"),
+    # ... and it reinterprets it just as thoroughly when the dtype arrives in a
+    # variable, which reads as a plain name at the call site.
+    ("receiver .view(alias of torch.float32)",
+     "target_dtype = torch.float32\n"
+     "inputs_embeds = inputs_embeds.view(target_dtype).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .view(alias of another tensor's dtype)",
+     "target_dtype = image_mask.dtype\n"
+     "inputs_embeds = inputs_embeds.view(target_dtype).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .view(alias of an alias)",
+     "base_dtype = torch.float32\n"
+     "target_dtype = base_dtype\n"
+     "inputs_embeds = inputs_embeds.view(target_dtype).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.dtype)\n"
+     ")"),
 ]
 
 
@@ -1380,6 +1452,19 @@ _RECEIVER_CONTROLS = [
      ")"),
     ("receiver .contiguous(torch.channels_last) positionally",
      "inputs_embeds = inputs_embeds.contiguous(torch.channels_last).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    # `Tensor.view` also takes a single shape sequence, so a plain name argument
+    # is far more often a shape than a dtype. Only a name actually BOUND to a
+    # dtype may retype the destination; these two keep it.
+    ("receiver .view(shape variable)",
+     "target_shape = image_features.shape\n"
+     "inputs_embeds = inputs_embeds.view(target_shape).masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")"),
+    ("receiver .view(alias of inputs_embeds.dtype) is a no-op",
+     "target_dtype = inputs_embeds.dtype\n"
+     "inputs_embeds = inputs_embeds.view(target_dtype).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
 ]
@@ -1666,6 +1751,29 @@ _DISCARDED_RESULT_HOLES = [
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")\n"
      "(inputs_embeds, aux), sizes = (original, merged), image_sizes"),
+    # A metadata read of the merge scatters nothing: the embeddings are handed the
+    # ORIGINAL tensor and only the merge's device / dtype / shape is consulted.
+    # Propagating taint through it reported the merge used, so a refactor that
+    # dropped the effective merge would keep every canary here green.
+    ("embeddings take the original, reading only the merge device",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds = original.to(merged.device)"),
+    ("embeddings take the original, reading only the merge dtype",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds = original.to(inputs_embeds.device, merged.dtype)"),
+    ("return reads only the merge shape",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "return original.reshape(-1, merged.shape[-1])"),
+    ("the merge expression itself is consumed as metadata",
+     "inputs_embeds = original.to(inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ").device)"),
 ]
 
 
@@ -1720,6 +1828,18 @@ _RESULT_REACHES_CONTROLS = [
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")\n"
      "inputs_embeds, *aux = merged, original"),
+    # Skipping metadata must not skip a real use that merely mentions metadata
+    # alongside it: the merged VALUES still reach the embeddings here.
+    ("result reshaped by its own shape",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "inputs_embeds = merged.reshape(-1, merged.shape[-1])"),
+    ("result returned alongside a metadata read of itself",
+     "merged = inputs_embeds.masked_scatter(\n"
+     "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
+     ")\n"
+     "return merged.to(merged.device)"),
 ]
 
 
