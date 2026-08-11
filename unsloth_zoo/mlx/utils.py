@@ -39,6 +39,7 @@ import textwrap
 import numpy as np
 import os
 import random
+import re
 import sys
 import shutil
 import struct
@@ -14640,6 +14641,29 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+_GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+
+def _gguf_shard_family(first_file, produced_files):
+    """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
+
+    A conversion can also emit a vision projector, which is a separate `--outfile`
+    and so carries a different stem. Grouping by stem keeps it out without asking
+    what any filename looks like: a model may legitimately be named
+    `example-mmproj-model`, or `example-mmproj.gguf`, which the converter uses
+    verbatim.
+    """
+    def shard_stem(path):
+        name = os.path.basename(path)
+        match = _GGUF_SHARD_SUFFIX.search(name)
+        return name[: match.start()] if match else None
+
+    stem = shard_stem(first_file)
+    if stem is None:
+        return [first_file]
+    return [f for f in produced_files if shard_stem(f) == stem]
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -14841,7 +14865,7 @@ def save_pretrained_gguf(
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
         try:
-            convert_to_gguf(**kwargs)
+            produced_files, _ = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
@@ -14852,7 +14876,16 @@ def save_pretrained_gguf(
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
             quantizer = quantizer_location
-            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+            if not produced_files:
+                raise RuntimeError(
+                    "Unsloth: the GGUF converter reported no output file to quantize."
+                )
+            # Take what the converter reported first, never the requested --outfile
+            # name: past --split-max-size it writes shards under that name instead,
+            # and llama.cpp finds the rest from shard 1's split.count. The model is
+            # always converted before any vision projector, so it comes first.
+            base_gguf = produced_files[0]
+            base_files = _gguf_shard_family(base_gguf, produced_files)
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
             print(f"Unsloth: Quantizing to {quant_type}...")
@@ -14863,10 +14896,12 @@ def save_pretrained_gguf(
                 quantizer_location=quantizer,
                 print_output=True,
             )
-            # Remove intermediate bf16 gguf to save space
-            if os.path.exists(base_gguf) and base_gguf != final_gguf:
-                os.remove(base_gguf)
-                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
+            # Remove the intermediate, every shard of it, to save space
+            for stale in base_files:
+                if stale == final_gguf or not os.path.exists(stale):
+                    continue
+                os.remove(stale)
+                print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
     # List produced files
     gguf_files = sorted(save_directory.glob("*.gguf"))
