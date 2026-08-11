@@ -479,13 +479,21 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
         "                **kwargs,\n"
         "            )"
     )
-    # 4.51.3 - 4.52.x spell the whole call on one line. The rewriter has no entry
-    # for that form at all, so there is no pinned string to have drifted; failing
-    # here would report drift where the truth is "never covered".
-    if "hidden_states = blk(hidden_states," in src:
+    # 4.51.3 - 4.52.x spell the whole call on one line, and the same forward
+    # already calls ``self._gradient_checkpointing_func`` itself. That is the
+    # first thing patch_gradient_checkpointing() tests
+    # (``if "_gradient_checkpointing_func" in forward: return None``), so on
+    # those versions it returns None before the replacement list, before the
+    # ``for blk in ...`` regex and before the generic ``arg=arg`` demotion -
+    # nothing is rewritten and there is no pinned string that could have
+    # drifted. Skip on the early-return condition itself rather than on the
+    # one-line spelling, so this stays tied to the code path and not to a
+    # guess about how upstream formats the call.
+    if "_gradient_checkpointing_func" in src:
         pytest.skip(
-            "transformers <= 4.52 spells the call on one line; "
-            "custom_gradient_checkpointing_replacements has no entry for it"
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
         )
     if not any(n in src for n in (needle_4x, needle_4x_attention_mask, needle_5x)):
         _drift(
@@ -504,7 +512,18 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
     ``(hidden_states, cu_seqlens, [rotary_pos_emb,] position_embeddings)``
     in that order. A reorder / rename binds arguments to the wrong
     parameters instead of no-op'ing, so guard it separately from the
-    call-site string."""
+    call-site string.
+
+    Names and order alone are not enough. Upstream can make
+    ``position_embeddings`` keyword-only without touching either: the name
+    list and its order are unchanged, so a name-only allowlist still passes
+    while the rewritten call keeps passing the tensor positionally and the
+    block raises ``TypeError``. So check ``Parameter.kind`` too - every named
+    parameter has to stay bindable positionally and ``kwargs`` has to stay a
+    real ``**kwargs``. Positional-only is accepted alongside
+    positional-or-keyword because the rewritten call site passes everything
+    positionally; only kinds that cannot take a positional argument
+    (keyword-only, ``*args``) break it."""
     pytest.importorskip("transformers")
     try:
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
@@ -512,12 +531,13 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
         )
     except ImportError:
         pytest.skip("Qwen2VLVisionBlock not in this build")
-    params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
+    parameters = inspect.signature(Qwen2VLVisionBlock.forward).parameters
+    params = list(parameters)
     accepted = (
         # transformers 4.51.3 - 4.52.x -- no **kwargs on the block yet
         ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
          "position_embeddings"],
-        # transformers 4.53.0 / 4.54 - 4.57
+        # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.5
         ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
          "position_embeddings", "kwargs"],
         # transformers 4.53.1 - 4.53.3 -- attention_mask added as the fifth
@@ -526,7 +546,8 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
         # targets. Gone again by 4.54.
         ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
          "position_embeddings", "attention_mask", "kwargs"],
-        # transformers 5.x -- rotary_pos_emb dropped, max_seqlen rides in kwargs
+        # transformers 5.15 -- rotary_pos_emb dropped, max_seqlen rides in
+        # kwargs
         ["self", "hidden_states", "cu_seqlens", "position_embeddings",
          "kwargs"],
     )
@@ -538,6 +559,24 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
             "transformers.models.qwen2_vl.modeling_qwen2_vl."
             f"Qwen2VLVisionBlock.forward signature (got {params})",
         )
+    positional_kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+    for name, parameter in parameters.items():
+        expected = (
+            (inspect.Parameter.VAR_KEYWORD,) if name == "kwargs"
+            else positional_kinds
+        )
+        if parameter.kind not in expected:
+            _drift(
+                "unsloth_zoo/compiler.py:2779-2848 "
+                "(custom_gradient_checkpointing_replacements)",
+                f"{name} as " + " OR ".join(str(k) for k in expected),
+                "transformers.models.qwen2_vl.modeling_qwen2_vl."
+                f"Qwen2VLVisionBlock.forward signature (got {name} as "
+                f"{parameter.kind})",
+            )
 
 
 _UNSET = object()
