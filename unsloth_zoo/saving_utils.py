@@ -5069,22 +5069,31 @@ def _sibling_content_reads_anonymously(model_name):
 
     Listing is not the test. A gated repo lists publicly and still refuses its content
     anonymously: measured on `meta-llama/Llama-3.2-1B`, an anonymous `ls` returns the
-    file list while the anonymous `config.json` fetch answers 401 GatedRepoError. So ask
-    for a file. Access is repo wide rather than per file, so one readable file stands for
-    the weights. A private repo is reported as absent to an anonymous reader and lands in
-    `restricted` with the gated ones, which is the same verdict either way.
+    file list while an anonymous read of `config.json` answers 401 GatedRepoError. So ask
+    about a file. Access is repo wide rather than per file, so one anonymously readable
+    file stands for the weights.
+
+    It has to be a HEAD rather than a download. `hf_hub_download` falls back to the cache
+    whenever the HEAD fails (`if head_call_error is not None: ... return pointer_path`),
+    so on a warm cache it hands back a copy an earlier CREDENTIALED download left behind
+    and the gated repo reads as public. Measured: warm the cache for
+    `meta-llama/Llama-3.2-1B` with a token, and `token = False` then returns the cached
+    path instead of raising. `get_hf_file_metadata` has no cache path at all.
     """
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
     repo_id, revision = _hub_repo_and_revision(model_name)
     try:
-        hf_hub_download(
-            repo_id = repo_id, filename = "config.json",
-            token = False, revision = revision,
+        get_hf_file_metadata(
+            hf_hub_url(repo_id, "config.json", revision = revision), token = False,
         )
         return "public"
-    except _HUB_DOWNLOAD_UNREACHABLE_ERRORS:
-        return "unreachable"
-    except _HUB_ABSENT_ERRORS:
+    except EntryNotFoundError:
+        # The repo discussed a missing file with an anonymous reader instead of refusing
+        # it, which is itself proof of anonymous read access. A sibling that shipped
+        # safetensors without a config.json resolved before this gate existed and still
+        # must: `check_model_quantization_status` reads an absent config as unquantized.
+        return "public"
+    except (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError):
         return "restricted"
     except Exception:
         return "unreachable"
