@@ -1011,6 +1011,68 @@ def _disabled_hook_graph_break_error():
     return ()
 
 
+def _wants_hard_backend_failure():
+    """Did the caller ask for a backend codegen failure to be fatal?
+
+    Its own switch rather than a reuse of `_wants_hard_recompile_failure`:
+    that one reads a Dynamo config flag about the recompile budget, which says
+    nothing about codegen. Off by default, so the shipped behaviour is the
+    fallback; on, so this repo's tests can assert the exception still escapes
+    and a user chasing a backend bug can see it.
+
+    `os` is imported inside the function: this module has no module-level
+    `import os`, and the read has to be live anyway, since a test that sets the
+    variable after import must still be seen.
+    """
+    import os
+    return os.environ.get("UNSLOTH_HARD_BACKEND_FAILURE", "0") == "1"
+
+
+def _backend_compile_errors():
+    """Inductor's own codegen failures, if this torch exposes them.
+
+    Categorically different from a graph break. The frame traced fine and the
+    backend then refused to generate code for the graph it was handed, so the
+    eager result is the same result and only speed is lost. A graph break means
+    Dynamo could not represent the code at all, which is a bug worth raising.
+
+    The live example is torch 2.12 refusing the ragged tail of
+    `torch.chunk(x, chunks = N)` under dynamic shapes:
+
+        InductorError: CantSplit: 202048*s47*s87 - 3434816*(((s47*s87 + 17)//18))
+        not divisible by s47*s87 - 17*(((s47*s87 + 17)//18))
+
+    which is arithmetic that is true by inspection -- `202048*tail` over `tail`
+    is `202048` -- and which `statically_known_multiple_of` answers correctly on
+    2.9, 2.10 and 2.11. A version-specific simplifier gap in the backend should
+    cost speed, not end the run.
+
+    Looked up by name, like the recompile-limit and graph-break tuples above:
+    `InductorError` does not exist before 2.6 and the import must not be able to
+    stop the tuple from being built.
+    """
+    found = []
+    try:
+        from torch._inductor.exc import InductorError as _inductor_error
+    except Exception:
+        pass
+    else:
+        if isinstance(_inductor_error, type) and issubclass(_inductor_error, BaseException):
+            found.append(_inductor_error)
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        pass
+    else:
+        # What Dynamo wraps a backend failure in when it does not surface the
+        # Inductor class directly. Not a superset: on some versions only one of
+        # the two ever reaches the caller, so both are needed.
+        _e = getattr(_exc, "BackendCompilerFailed", None)
+        if isinstance(_e, type) and issubclass(_e, BaseException):
+            found.append(_e)
+    return tuple(found)
+
+
 def _is_recompile_limit_unsupported(exc):
     """Cache exhaustion reported as a plain graph break.
 
@@ -1307,7 +1369,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
-    if not errors and not graph_break_errors:
+    backend_errors = _backend_compile_errors()
+    if not errors and not graph_break_errors and not backend_errors:
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
@@ -1489,6 +1552,39 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             raise e
         return eager_func(*args, **kwargs)
 
+    def _give_up_on_backend(e, args, kwargs):
+        """Inductor refused to generate code. Run eager, and stay there.
+
+        No budget retry: cache exhaustion is a resource problem that more
+        budget can genuinely fix, but a codegen refusal is deterministic. The
+        same graph regenerates the same failure, so retrying only pays the
+        compile twice before landing here anyway.
+
+        Only THIS label latches, unlike `_give_up`. Exhaustion is process-wide
+        and takes the other borrowers with it; a codegen refusal is a property
+        of one region's graph, so knocking unrelated regions eager would cost
+        their compilation for nothing.
+
+        The checkpoint rule from `_give_up` still applies unchanged: inside a
+        non-reentrant region, anything already packed compiled this step owes a
+        backward that would now recompute eagerly, which either aborts or hands
+        back wrong gradients. End the step instead and let the caller retry.
+        """
+        packed = _in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT
+        state["eager"] = True
+        _LATCHED_EAGER_LABELS.add(label)
+        _warn(
+            f"Unsloth: torch.compile could not generate code for {label}; "
+            f"running it eagerly from here. Training is unaffected apart from "
+            f"speed. ({type(e).__name__})"
+        )
+        if packed:
+            global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise e
+        return eager_func(*args, **kwargs)
+
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
         if state["eager"]:
@@ -1496,6 +1592,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         try:
             _note_packed_under_checkpoint()
             return compiled_func(*args, **kwargs)
+        except backend_errors as e:
+            # Before the recompile-limit clause: these are disjoint classes, but
+            # the ordering states the intent, which is that a backend refusal is
+            # never a budget problem and must not consume budget.
+            if _wants_hard_backend_failure():
+                raise
+            return _give_up_on_backend(e, args, kwargs)
         except errors as e:
             if _wants_hard_recompile_failure():
                 raise
