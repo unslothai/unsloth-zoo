@@ -5062,6 +5062,36 @@ def _strip_fp8_suffix(model_name):
     return model_name[:idx] or None
 pass
 
+def _hub_repo_reads_without_a_token(model_name):
+    """True when reading `model_name` does not depend on the caller's credentials.
+
+    The sibling lookup rewrites the requested repo id (`org/model-FP8` -> `org/model`),
+    so the repo it lands on was never the one the caller asked for. A caller that runs
+    with a token broader than the request, a hosted service merging on behalf of a user,
+    would otherwise spend that token on the rewritten name and fold weights the requester
+    could not have fetched themselves into the output. Deciding that anonymously keeps
+    the rewrite from being able to widen access.
+
+    Public repos answer True. Gated ones do too: their contents are listed publicly and
+    only the download is licence gated, so a gated sibling discloses nothing private and
+    the (common) gated FP8 -> gated 16bit merge keeps working. Private repos, and
+    anything unreadable for a reason that cannot be identified, answer False.
+    """
+    if not _is_hub_repo_id(model_name): return False
+    try:
+        HfFileSystem(token = False).ls(model_name, detail = False)
+        return True
+    except Exception as e:
+        return _gated_repo_cause(e) is not None
+pass
+
+def _allow_private_fp8_sibling():
+    """Opt in to resolving an FP8 base onto a *private* 16bit sibling with the caller's
+    token. Off by default so a broad token cannot be aimed at an unrequested private
+    repo; single tenant callers who own both repos can set it to `1`."""
+    return os.environ.get("UNSLOTH_ALLOW_PRIVATE_FP8_SIBLING") == "1"
+pass
+
 def _resolve_fp8_16bit_sibling(model_name, token=None):
     """If model_name is an FP8 variant with an existing, non-quantized 16bit sibling
     (e.g. unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2), return the sibling so a 16bit merge
@@ -5088,6 +5118,19 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         if check_hf_model_exists(base, token) and not check_model_quantization_status(
             base, token, **_ask_the_hub,
         )[0]:
+            # The rewrite may not widen what the token reaches: a private sibling is only
+            # visible because of the caller's credentials, and the caller asked for the
+            # FP8 repo, not this one. Merging onto the FP8 weights stays correct, so drop
+            # the sibling rather than fold an unrequested private repo into the output.
+            if not _hub_repo_reads_without_a_token(base) and not _allow_private_fp8_sibling():
+                warnings.warn(
+                    f"Unsloth: `{base}` is a private 16bit sibling of `{model_name}` and "
+                    f"is only readable with the current token, so it is not used as the "
+                    f"merge base. Merging onto the FP8 weights instead. Set "
+                    f"`UNSLOTH_ALLOW_PRIVATE_FP8_SIBLING=1` if you own both repos and "
+                    f"want the 16bit sibling."
+                )
+                return None
             return base
     except RuntimeError as e:
         # An unreachable Hub is not "there is no 16bit sibling". None is still right,
