@@ -5062,34 +5062,39 @@ def _strip_fp8_suffix(model_name):
     return model_name[:idx] or None
 pass
 
-def _hub_repo_reads_without_a_token(model_name):
-    """True when reading `model_name` does not depend on the caller's credentials.
+def _sibling_content_reads_anonymously(model_name):
+    """How a reader carrying no credentials at all fares on `model_name`'s content:
+    `"public"` (a file came back), `"restricted"` (the repo refused it) or
+    `"unreachable"` (the Hub could not be asked, which is no answer about the repo).
 
-    The sibling lookup rewrites the requested repo id (`org/model-FP8` -> `org/model`),
-    so the repo it lands on was never the one the caller asked for. A caller that runs
-    with a token broader than the request, a hosted service merging on behalf of a user,
-    would otherwise spend that token on the rewritten name and fold weights the requester
-    could not have fetched themselves into the output. Deciding that anonymously keeps
-    the rewrite from being able to widen access.
-
-    Public repos answer True. Gated ones do too: their contents are listed publicly and
-    only the download is licence gated, so a gated sibling discloses nothing private and
-    the (common) gated FP8 -> gated 16bit merge keeps working. Private repos, and
-    anything unreadable for a reason that cannot be identified, answer False.
+    Listing is not the test. A gated repo lists publicly and still refuses its content
+    anonymously: measured on `meta-llama/Llama-3.2-1B`, an anonymous `ls` returns the
+    file list while the anonymous `config.json` fetch answers 401 GatedRepoError. So ask
+    for a file. Access is repo wide rather than per file, so one readable file stands for
+    the weights. A private repo is reported as absent to an anonymous reader and lands in
+    `restricted` with the gated ones, which is the same verdict either way.
     """
-    if not _is_hub_repo_id(model_name): return False
+    from huggingface_hub import hf_hub_download
+    repo_id, revision = _hub_repo_and_revision(model_name)
     try:
-        HfFileSystem(token = False).ls(model_name, detail = False)
-        return True
-    except Exception as e:
-        return _gated_repo_cause(e) is not None
+        hf_hub_download(
+            repo_id = repo_id, filename = "config.json",
+            token = False, revision = revision,
+        )
+        return "public"
+    except _HUB_DOWNLOAD_UNREACHABLE_ERRORS:
+        return "unreachable"
+    except _HUB_ABSENT_ERRORS:
+        return "restricted"
+    except Exception:
+        return "unreachable"
 pass
 
-def _allow_private_fp8_sibling():
-    """Opt in to resolving an FP8 base onto a *private* 16bit sibling with the caller's
-    token. Off by default so a broad token cannot be aimed at an unrequested private
+def _allow_restricted_fp8_sibling():
+    """Opt in to resolving an FP8 base onto a gated or private 16bit sibling using the
+    caller's token. Off by default so a broad token cannot be aimed at an unrequested
     repo; single tenant callers who own both repos can set it to `1`."""
-    return os.environ.get("UNSLOTH_ALLOW_PRIVATE_FP8_SIBLING") == "1"
+    return os.environ.get("UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING") == "1"
 pass
 
 def _resolve_fp8_16bit_sibling(model_name, token=None):
@@ -5111,27 +5116,41 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         local_rejected = True
     except Exception:
         return None
+    # `org/model-FP8` -> `org/model` is a guess, and the caller asked for the FP8 repo, so
+    # the sibling is resolved with NO credentials: whatever that finds, the requester could
+    # have fetched themselves. Handing the token to the rewritten name instead would let a
+    # caller running with one broader than the request, a service merging on someone's
+    # behalf, fold weights that requester cannot reach into the output. Opting in swaps the
+    # token back in for callers who own both repos.
+    opted_in = _allow_restricted_fp8_sibling()
+    sibling_token = token if opted_in else False
     try:
         # `local_ok` only when it has to be: passing it always would break any caller that
         # replaced this function with a two argument stand-in.
         _ask_the_hub = {"local_ok": False} if local_rejected else {}
-        if check_hf_model_exists(base, token) and not check_model_quantization_status(
-            base, token, **_ask_the_hub,
-        )[0]:
-            # The rewrite may not widen what the token reaches: a private sibling is only
-            # visible because of the caller's credentials, and the caller asked for the
-            # FP8 repo, not this one. Merging onto the FP8 weights stays correct, so drop
-            # the sibling rather than fold an unrequested private repo into the output.
-            if not _hub_repo_reads_without_a_token(base) and not _allow_private_fp8_sibling():
+        if check_hf_model_exists(base, sibling_token):
+            # Existence came from a listing, which a gated repo also answers. Ask for
+            # content before trusting it.
+            anonymous = "public" if opted_in else _sibling_content_reads_anonymously(base)
+            if anonymous == "unreachable":
+                raise _hub_unreachable_error(
+                    base, RuntimeError("anonymous read failed"),
+                    action = f"checking whether `{base}` is readable without a token",
+                    mistaken_for = "a missing model",
+                )
+            if anonymous != "public":
                 warnings.warn(
-                    f"Unsloth: `{base}` is a private 16bit sibling of `{model_name}` and "
-                    f"is only readable with the current token, so it is not used as the "
-                    f"merge base. Merging onto the FP8 weights instead. Set "
-                    f"`UNSLOTH_ALLOW_PRIVATE_FP8_SIBLING=1` if you own both repos and "
-                    f"want the 16bit sibling."
+                    f"Unsloth: the 16bit sibling `{base}` of `{model_name}` is gated or "
+                    f"private, so reaching it would depend on the current token rather "
+                    f"than on what was asked for. Merging onto the FP8 weights instead. "
+                    f"Set `UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING=1` if you have access to "
+                    f"both repos and want the 16bit sibling."
                 )
                 return None
-            return base
+            if not check_model_quantization_status(
+                base, sibling_token, **_ask_the_hub,
+            )[0]:
+                return base
     except RuntimeError as e:
         # An unreachable Hub is not "there is no 16bit sibling". None is still right,
         # since the merge can dequantize the FP8 weights, but say so: the base used is
