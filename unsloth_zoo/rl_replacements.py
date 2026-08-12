@@ -123,6 +123,36 @@ def chunked_hidden_states_selective_log_softmax(
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
+    # Pad the row count up to a whole multiple of `chunks` so every chunk is
+    # the same size. `torch.chunk(x, chunks = N)` otherwise gives N - 1 chunks
+    # of ceil(n/N) and a ragged last one of n - (N - 1)*ceil(n/N). Under
+    # dynamic shapes that tail is a symbolic expression in n, and Inductor has
+    # to prove a vocab-wide node over it splits evenly. torch 2.12 cannot:
+    # `SizeVarAllocator.statically_known_multiple_of` returns False there for
+    # 202048*tail over tail -- measured on a Tesla T4 with 2.12.1, and True on
+    # 2.9.1, 2.10.0 and 2.11.0 -- so the compile dies with
+    #   InductorError: CantSplit: 202048*s47*s87 - 3434816*(((s47*s87 + 17)//18))
+    #   not divisible by s47*s87 - 17*(((s47*s87 + 17)//18))
+    # which is the whole GRPO step, not a slow path. The same predicate answers
+    # True for a full chunk, ceil(n/18), on every version including 2.12.1,
+    # so equal chunks sidestep it rather than working around it.
+    #
+    # The padding repeats the last row, costs at most `chunks - 1` extra rows
+    # of a matmul that already runs over thousands, and is sliced back off
+    # below, so every returned value is unchanged. It is written without a
+    # Python `if`: `pad` is a SymInt under dynamic shapes and branching on it
+    # would either specialise the graph on n % chunks or graph-break under
+    # fullgraph. A zero-length cat is a no-op, which is the padless case.
+    n_rows = flat_hidden_states.shape[0]
+    rows_per_chunk = (n_rows + chunks - 1) // chunks
+    pad_rows = rows_per_chunk * chunks - n_rows
+    flat_hidden_states = torch.cat(
+        (flat_hidden_states, flat_hidden_states[-1:].expand(pad_rows, -1)), dim = 0,
+    )
+    flat_index = torch.cat(
+        (flat_index, flat_index[-1:].expand(pad_rows)), dim = 0,
+    )
+
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
 
@@ -161,6 +191,9 @@ def chunked_hidden_states_selective_log_softmax(
         all_per_token_logps.append(per_token_logps.to(hidden_states.device))
 
     all_per_token_logps = torch.concat(all_per_token_logps)
+    # Drop the repeated rows the equal-chunk padding added. A padless call
+    # slices [:n_rows] on exactly n_rows and is a no-op.
+    all_per_token_logps = all_per_token_logps[:n_rows]
 
     all_per_token_logps = all_per_token_logps.reshape((hidden_states.shape[0], hidden_states.shape[1]))
     return all_per_token_logps
