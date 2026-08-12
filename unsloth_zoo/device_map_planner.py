@@ -1050,9 +1050,26 @@ def plan_device_map(
         constraint, so an explicit reserve either fits or the plan is refused.
         """
         reserve = reserve_for(head_device)
-        steps = 1 if reserve_is_explicit else 21
-        for step in range(steps):
-            r = _fill(head_device, reserve, max(reserve.values()) * (20 - step) // 20)
+        # Rungs for the non-head cards, from two ladders merged. The reserve is
+        # per device now, so it is a range, not one number: the top is what we
+        # would like every card to keep, the bottom is exactly what the old
+        # shared `min` cap handed all of them. Stepping only from the top can
+        # land BELOW that bottom -- a request one percent larger overshoots by a
+        # whole 5% rung -- so 4 x 80 GiB holding a 144 GiB model kept 41.72 GiB
+        # per card where the shared cap kept 43.68 GiB. Merging both ladders
+        # keeps every rung the shared cap used to try, in the same order, so the
+        # relaxed result can only be larger.
+        top, floor = max(reserve.values()), min(reserve.values())
+        if reserve_is_explicit:
+            rungs = [top]
+        else:
+            rungs = sorted(
+                {top * (20 - step) // 20 for step in range(21)} |
+                {floor * (20 - step) // 20 for step in range(21)},
+                reverse = True,
+            )
+        for other in rungs:
+            r = _fill(head_device, reserve, other)
             if r is not None:
                 return r
         if reserve_is_explicit:

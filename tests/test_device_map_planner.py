@@ -1206,3 +1206,72 @@ def test_the_head_card_reserve_still_cannot_go_negative():
     )
     assert plan is not None
     assert all(v >= 0 for v in plan.activation_reserve_by_device.values())
+
+
+class _WideBlock(nn.Module):
+    """A decoder block chunky enough that the packing has real granularity.
+
+    `_Block` is a single square Linear, so on any budget the greedy walk fits at
+    the first try and the relaxation ladder below is never exercised.
+    """
+    def __init__(self, hidden, ffn, dtype):
+        super().__init__()
+        self.attn = nn.Linear(hidden, hidden, bias = False, dtype = dtype)
+        self.mlp = nn.Linear(hidden, ffn, bias = False, dtype = dtype)
+        self.down = nn.Linear(ffn, hidden, bias = False, dtype = dtype)
+
+
+class _Wide(nn.Module):
+    _no_split_modules = ["_WideBlock"]
+
+    def __init__(self, hidden, ffn, vocab, layers, dtype = torch.bfloat16):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden, dtype = dtype)
+        self.layers = nn.ModuleList(
+            [_WideBlock(hidden, ffn, dtype) for _ in range(layers)]
+        )
+        self.norm = nn.LayerNorm(hidden, dtype = dtype)
+        self.lm_head = nn.Linear(hidden, vocab, bias = False, dtype = dtype)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+def test_the_relaxed_reserve_is_never_below_the_old_shared_cap():
+    """Per-device reserves must not lose ground on identical cards.
+
+    The reserve is a range now, not one number, and `attempt` relaxes the
+    non-head cards from the TOP of it in 5% steps. On identical cards the top
+    sits one headroom-share above the bottom -- a fraction of a percent -- so a
+    request that misses by that fraction is answered by a whole 5% step, and the
+    cards end up keeping LESS than the single shared cap used to give them.
+
+    Measured here: 4 identical cards, a 24-layer model at ~65% of their total,
+    shared cap 3.043 GiB per card, stepping from the top alone 2.981 GiB. The
+    same shape at 4 x 80 GiB lost 1.97 GiB per card.
+    """
+    kw = dict(hidden = 4096, ffn = 16384, vocab = 152064, layers = 24)
+    with torch.device("meta"):
+        model = _Wide(**kw)
+    n, budget = 4, 6086993920
+
+    plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
+    assert plan is not None
+
+    # What a single shared `min` cap across the devices would have produced.
+    total = plan.total_weight_bytes
+    headroom = plan.headroom_bytes
+    head_bytes = model.lm_head.weight.numel() * model.lm_head.weight.element_size()
+    value = max(0, (n * budget - total - headroom) // n)
+    share = max(-(-total // n), head_bytes)
+    shared_cap = max(0, min(value, budget - share - headroom))
+    assert shared_cap > 0, "fixture no longer exercises the cap"
+
+    kept = plan.activation_reserve_by_device
+    assert min(kept.values()) >= shared_cap, (
+        f"the relaxation ladder landed below the old shared cap: kept {kept}, "
+        f"shared cap {shared_cap}"
+    )
