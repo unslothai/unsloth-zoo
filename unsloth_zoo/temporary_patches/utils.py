@@ -1379,8 +1379,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # it cannot be hoisted) dies with that forward and the registry holds it
     # weakly, so latching it bought nothing -- the next step compiled a fresh
     # one, borrowed again, and the bounded transition to eager never happened.
+    # `compiled_ok` records whether the compiled callable has ever returned for
+    # this wrapper. Only the backend-codegen path reads it, to tell a first
+    # compile that never packed anything from a later one that did. See
+    # `_give_up_on_backend`.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
+             "compiled_ok": False}
 
     def _warn(message):
         if not state["warned"]:
@@ -1565,12 +1570,26 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         of one region's graph, so knocking unrelated regions eager would cost
         their compilation for nothing.
 
-        The checkpoint rule from `_give_up` still applies unchanged: inside a
-        non-reentrant region, anything already packed compiled this step owes a
-        backward that would now recompute eagerly, which either aborts or hands
-        back wrong gradients. End the step instead and let the caller retry.
+        The checkpoint rule from `_give_up` applies, but only when THIS wrapper
+        has actually run compiled at some point in this step. That extra
+        condition is the difference between recovering and not.
+
+        `_give_up` has to assume the worst because it latches every borrower,
+        including regions that did pack activations compiled. This path latches
+        one label, so the only pack/recompute pair that can desynchronise is
+        this function's own. Inductor refuses at compile time, so a first-call
+        refusal means this region has packed nothing compiled: the eager call
+        below packs eagerly and the backward recomputes eagerly, which agree.
+
+        The case that does need the raise is a later compile for a new dynamic
+        shape, after an earlier shape already compiled and packed. Then the pack
+        was compiled and the recompute would be eager, which either aborts or
+        returns wrong gradients, so end the step instead.
         """
-        packed = _in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT
+        packed = (
+            (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
+            and state["compiled_ok"]
+        )
         state["eager"] = True
         _LATCHED_EAGER_LABELS.add(label)
         _warn(
@@ -1591,7 +1610,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             return eager_func(*args, **kwargs)
         try:
             _note_packed_under_checkpoint()
-            return compiled_func(*args, **kwargs)
+            result = compiled_func(*args, **kwargs)
         except backend_errors as e:
             # Before the recompile-limit clause: these are disjoint classes, but
             # the ordering states the intent, which is that a backend refusal is
@@ -1625,6 +1644,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 f"unaffected apart from speed."
             )
             return eager_func(*args, **kwargs)
+        else:
+            # The compiled callable returned, so anything it packs from here is
+            # packed compiled. Only `_give_up_on_backend` reads this, to decide
+            # whether switching to eager could desynchronise a pack from its
+            # recompute.
+            state["compiled_ok"] = True
+            return result
 
     # Keep the compiled callable reachable for anything that unwraps it, and
     # keep `get_compiler_config` present so the unwrap check below still sees
