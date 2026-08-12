@@ -5063,22 +5063,18 @@ def _strip_fp8_suffix(model_name):
 pass
 
 def _sibling_content_reads_anonymously(model_name):
-    """How a reader carrying no credentials at all fares on `model_name`'s content:
-    `"public"` (a file came back), `"restricted"` (the repo refused it) or
-    `"unreachable"` (the Hub could not be asked, which is no answer about the repo).
+    """How a reader with no credentials fares on `model_name`'s content: `"public"`,
+    `"restricted"` (refused) or `"unreachable"` (the Hub could not be asked, which is no
+    answer about the repo).
 
-    Listing is not the test. A gated repo lists publicly and still refuses its content
-    anonymously: measured on `meta-llama/Llama-3.2-1B`, an anonymous `ls` returns the
-    file list while an anonymous read of `config.json` answers 401 GatedRepoError. So ask
-    about a file. Access is repo wide rather than per file, so one anonymously readable
-    file stands for the weights.
-
-    It has to be a HEAD rather than a download. `hf_hub_download` falls back to the cache
-    whenever the HEAD fails (`if head_call_error is not None: ... return pointer_path`),
-    so on a warm cache it hands back a copy an earlier CREDENTIALED download left behind
-    and the gated repo reads as public. Measured: warm the cache for
-    `meta-llama/Llama-3.2-1B` with a token, and `token = False` then returns the cached
-    path instead of raising. `get_hf_file_metadata` has no cache path at all.
+    Listing is not the test, since a gated repo lists publicly and still refuses its
+    content. Nor is a download: `hf_hub_download` answers from the cache whenever its HEAD
+    fails (`if head_call_error is not None: ... return pointer_path`), handing back a copy
+    an earlier CREDENTIALED download left behind, so a warm cache makes a gated repo read
+    as public. Measured on `meta-llama/Llama-3.2-1B`: anonymous `ls` succeeds, and after a
+    credentialed fetch `token = False` returns the cached path rather than raising.
+    `get_hf_file_metadata` has no cache path, and access is repo wide, so one anonymously
+    HEADable file stands for the weights.
     """
     from huggingface_hub import get_hf_file_metadata, hf_hub_url
     repo_id, revision = _hub_repo_and_revision(model_name)
@@ -5088,10 +5084,10 @@ def _sibling_content_reads_anonymously(model_name):
         )
         return "public"
     except EntryNotFoundError:
-        # The repo discussed a missing file with an anonymous reader instead of refusing
-        # it, which is itself proof of anonymous read access. A sibling that shipped
-        # safetensors without a config.json resolved before this gate existed and still
-        # must: `check_model_quantization_status` reads an absent config as unquantized.
+        # Discussing a missing file with an anonymous reader is itself proof of anonymous
+        # access, and a sibling with safetensors but no config.json resolved before this
+        # gate existed: `check_model_quantization_status` reads an absent config as
+        # unquantized.
         return "public"
     except (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError):
         return "restricted"
@@ -5100,9 +5096,9 @@ def _sibling_content_reads_anonymously(model_name):
 pass
 
 def _allow_restricted_fp8_sibling():
-    """Opt in to resolving an FP8 base onto a gated or private 16bit sibling using the
+    """Opt in to resolving an FP8 base onto a gated or private 16bit sibling with the
     caller's token. Off by default so a broad token cannot be aimed at an unrequested
-    repo; single tenant callers who own both repos can set it to `1`."""
+    repo; callers holding access to both repos set it to `1`."""
     return os.environ.get("UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING") == "1"
 pass
 
@@ -5127,10 +5123,8 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         return None
     # `org/model-FP8` -> `org/model` is a guess, and the caller asked for the FP8 repo, so
     # the sibling is resolved with NO credentials: whatever that finds, the requester could
-    # have fetched themselves. Handing the token to the rewritten name instead would let a
-    # caller running with one broader than the request, a service merging on someone's
-    # behalf, fold weights that requester cannot reach into the output. Opting in swaps the
-    # token back in for callers who own both repos.
+    # have fetched themselves. Spending a token broader than the request on the rewritten
+    # name is what would fold unreachable weights into the output.
     opted_in = _allow_restricted_fp8_sibling()
     sibling_token = token if opted_in else False
     try:
@@ -5138,8 +5132,7 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         # replaced this function with a two argument stand-in.
         _ask_the_hub = {"local_ok": False} if local_rejected else {}
         if check_hf_model_exists(base, sibling_token):
-            # Existence came from a listing, which a gated repo also answers. Ask for
-            # content before trusting it.
+            # Existence came from a listing, which a gated repo also answers.
             anonymous = "public" if opted_in else _sibling_content_reads_anonymously(base)
             if anonymous == "unreachable":
                 raise _hub_unreachable_error(
