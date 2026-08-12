@@ -162,3 +162,73 @@ def test_the_switch_is_read_live_not_at_import(monkeypatch):
     assert patch_utils._wants_hard_backend_failure() is False
     monkeypatch.setenv("UNSLOTH_HARD_BACKEND_FAILURE", "1")
     assert patch_utils._wants_hard_backend_failure() is True
+
+
+# ---- the checkpoint distinction -------------------------------------------
+#
+# `_give_up` must re-raise inside a non-reentrant checkpoint, because it latches
+# every borrower and some of them packed activations compiled. The backend path
+# latches one label, so the only pack that can desynchronise is this function's
+# own -- and a first-call codegen refusal means it packed nothing compiled.
+
+
+def test_a_first_compile_refusal_falls_back_even_under_a_checkpoint(monkeypatch):
+    """The Muse Glimmer case: Inductor refuses before anything was ever packed."""
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+
+    def compiled(x):
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-first-compile",
+    )
+
+    assert wrapped(1) == "eager", "a first-call refusal should not end the step"
+
+
+def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
+    """A new dynamic shape refusing after an earlier one packed compiled.
+
+    Here the pack was compiled and the recompute would be eager, which either
+    aborts the backward or returns wrong gradients, so the step must end.
+    """
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-later-refusal",
+    )
+
+    assert wrapped(1) == "compiled"
+
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    errors = patch_utils._backend_compile_errors()
+    with pytest.raises(errors):
+        wrapped(2)
+
+
+def test_outside_a_checkpoint_a_later_refusal_still_falls_back(monkeypatch):
+    """Nothing is packed, so there is no pack/recompute pair to protect."""
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-no-checkpoint",
+    )
+
+    assert wrapped(1) == "compiled"
+    assert wrapped(2) == "eager"
