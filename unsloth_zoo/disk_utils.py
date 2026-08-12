@@ -264,9 +264,18 @@ def estimate_gguf_export_bytes(
     a 62GB merge, leaves 50GB - and it died at 48GB of a 65GB GGUF shard.
     Three copies would have called that export safe.
 
-    Pass `needs_merge = False` for a model already on disk in HF format, and
-    `keep_intermediate_gguf = False` only if the caller really does delete
-    the intermediate before quantizing.
+    Pass `needs_merge = False` for a model already on disk in HF format.
+
+    `keep_intermediate_gguf` only reaches the arithmetic when
+    `quantization_methods` is empty. That is not an oversight: `llama-quantize`
+    is file to file, so the first-conversion GGUF has to stay readable for
+    every quant in the loop, and `unsloth/save.py` deletes it only once the
+    whole loop has finished. Sizing a quantized export as though the
+    intermediate were gone before the quants run would under-count the real
+    high-water mark by the size of that file, which on Gemma4 (31B) Vision is
+    17.7GB, and would hand back exactly the mid-write failure this function
+    exists to prevent. The flag therefore only says whether a convert-only
+    export keeps its output.
     """
     if n_parameters is None:
         n_parameters = model_logical_numel(model) if model is not None else 0
