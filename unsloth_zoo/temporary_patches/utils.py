@@ -1028,6 +1028,43 @@ def _wants_hard_backend_failure():
     return os.environ.get("UNSLOTH_HARD_BACKEND_FAILURE", "0") == "1"
 
 
+def _is_inductor_codegen_failure(e):
+    """True only when Inductor itself refused to generate code.
+
+    `_backend_compile_errors` has to include `BackendCompilerFailed` to catch
+    the refusal on torch versions that wrap it, but that class wraps ANY
+    backend. `torch_compile_with_fallback(..., backend = custom)` is supported,
+    and swallowing a custom backend's exception would turn a configuration or
+    programming error into a silent permanent switch to eager -- the user would
+    lose both the speed and the diagnosis.
+
+    So a wrapper is only accepted when what it wraps is an Inductor error.
+    `InductorError` raised directly is accepted as itself.
+    """
+    try:
+        from torch._inductor.exc import InductorError as _inductor_error
+    except Exception:
+        _inductor_error = None
+    if _inductor_error is not None and isinstance(e, _inductor_error):
+        return True
+    # `BackendCompilerFailed` keeps the original under one of these, depending on
+    # the version; `__cause__` is the one that survives `raise ... from`.
+    for attribute in ("inner_exception", "__cause__", "__context__"):
+        inner = getattr(e, attribute, None)
+        if inner is None: continue
+        if _inductor_error is not None and isinstance(inner, _inductor_error):
+            return True
+        # 2.6-era builds raise a bare RuntimeError out of the scheduler rather
+        # than an `InductorError`, so fall back to where it was raised from.
+        module = type(inner).__module__ or ""
+        if module.startswith("torch._inductor"):
+            return True
+    # Last resort, the backend name the wrapper records.
+    backend = getattr(e, "backend", None)
+    name = getattr(backend, "__name__", None) or (backend if isinstance(backend, str) else "")
+    return name == "inductor"
+
+
 def _backend_compile_errors():
     """Inductor's own codegen failures, if this torch exposes them.
 
@@ -1232,6 +1269,7 @@ def _restore_recompile_limits():
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0
+    _COMPILED_OK_LABELS.clear()
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1342,6 +1380,15 @@ _PENDING_EAGER_LABELS: set = set()
 # one says "in this step", which is the question being asked.
 _RECENT_EAGER_LABELS: set = set()
 
+# Labels whose compiled callable returned at least once SINCE THE LAST SETTLE.
+# `_give_up_on_backend` reads this to decide whether going eager could
+# desynchronise a pack from its recompute, and that question is only ever about
+# the step being executed: last step's activations are long since freed. Holding
+# it per wrapper instead would answer for a step that is over, which is exactly
+# backwards -- it would re-raise on a first refusal in a later step, where
+# nothing compiled has been packed and the fallback is safe.
+_COMPILED_OK_LABELS: set = set()
+
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
@@ -1379,13 +1426,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # it cannot be hoisted) dies with that forward and the registry holds it
     # weakly, so latching it bought nothing -- the next step compiled a fresh
     # one, borrowed again, and the bounded transition to eager never happened.
-    # `compiled_ok` records whether the compiled callable has ever returned for
-    # this wrapper. Only the backend-codegen path reads it, to tell a first
-    # compile that never packed anything from a later one that did. See
-    # `_give_up_on_backend`.
+    # Whether the compiled callable has returned is deliberately NOT held here:
+    # it lives in the module-level `_COMPILED_OK_LABELS`, which is cleared at
+    # every step boundary. See that set for why the answer has to be per step
+    # rather than per wrapper.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
-             "compiled_ok": False}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
 
     def _warn(message):
         if not state["warned"]:
@@ -1557,7 +1603,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             raise e
         return eager_func(*args, **kwargs)
 
-    def _give_up_on_backend(e, args, kwargs):
+    def _give_up_on_backend(e, args, kwargs, marker_before):
         """Inductor refused to generate code. Run eager, and stay there.
 
         No budget retry: cache exhaustion is a resource problem that more
@@ -1586,10 +1632,17 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         was compiled and the recompute would be eager, which either aborts or
         returns wrong gradients, so end the step instead.
         """
+        global _PACKED_COMPILED_IN_CHECKPOINT
         packed = (
             (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
-            and state["compiled_ok"]
+            and label in _COMPILED_OK_LABELS
         )
+        # `_note_packed_under_checkpoint` ran before the compiled call and set
+        # the process-wide marker, but the call refused at compile time so no
+        # compiled code ran and nothing compiled was packed. Leaving the marker
+        # set would make an unrelated wrapper's `_give_up` believe this
+        # checkpoint holds a compiled pack and end the step for no reason.
+        _PACKED_COMPILED_IN_CHECKPOINT = marker_before
         state["eager"] = True
         _LATCHED_EAGER_LABELS.add(label)
         _warn(
@@ -1608,6 +1661,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
             result = compiled_func(*args, **kwargs)
@@ -1617,12 +1671,23 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # never a budget problem and must not consume budget.
             if _wants_hard_backend_failure():
                 raise
-            return _give_up_on_backend(e, args, kwargs)
+            if not _is_inductor_codegen_failure(e):
+                # Some other backend refused. Only Inductor's simplifier gaps
+                # are known-benign enough to run through eagerly; a custom
+                # backend raising is a configuration or programming error and
+                # hiding it would cost the user their diagnosis.
+                raise
+            return _give_up_on_backend(e, args, kwargs, marker_before)
         except errors as e:
             if _wants_hard_recompile_failure():
                 raise
             result = _retry_with_more_budget(args, kwargs)
             if result is not _NO_RESULT:
+                # The retry COMPILED and returned, so this region has now packed
+                # compiled activations. Without this the `else:` below is never
+                # reached on the retry path and a later backend refusal in the
+                # same step would fall back to eager against a compiled pack.
+                _COMPILED_OK_LABELS.add(label)
                 return result
             return _give_up(e, args, kwargs)
         except graph_break_errors as e:
@@ -1649,7 +1714,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # packed compiled. Only `_give_up_on_backend` reads this, to decide
             # whether switching to eager could desynchronise a pack from its
             # recompute.
-            state["compiled_ok"] = True
+            _COMPILED_OK_LABELS.add(label)
             return result
 
     # Keep the compiled callable reachable for anything that unwraps it, and
@@ -1811,6 +1876,7 @@ def apply_pending_eager_fallbacks() -> int:
     global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
+    _COMPILED_OK_LABELS.clear()              # and a new compiled-pack history
     _settled = _settle_abandoned_checkpoint_generator()
     if _RAISED_INSIDE_CHECKPOINT and not _settled:
         # Still rooted, so its saved-tensor hooks are still on the stack and the
