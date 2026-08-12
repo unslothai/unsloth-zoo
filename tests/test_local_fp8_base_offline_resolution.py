@@ -645,6 +645,12 @@ def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_confi
         huggingface_hub, "hf_hub_download",
         lambda *args, **kwargs: str(good_config), raising = True,
     )
+    # The sibling is also HEADed anonymously to prove it is readable without a token;
+    # stub that too, or the lookup leaves the fixture and asks the real Hub.
+    monkeypatch.setattr(
+        huggingface_hub, "get_hf_file_metadata",
+        lambda *args, **kwargs: None, raising = True,
+    )
 
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")
