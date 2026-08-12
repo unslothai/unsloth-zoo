@@ -1126,3 +1126,83 @@ def test_the_auto_reserve_relaxes_on_the_head_as_a_last_resort():
     assert plan.device_map["layers.0"] == 1
     # The headroom survives in full; only the activation reserve gave way.
     assert plan.raw_budgets[1] - plan.weight_bytes[1] >= headroom
+
+
+def _muse_shaped_budgets(model):
+    """Budgets that reproduce the Muse Glimmer arithmetic on a toy model.
+
+    The bug needs three things at once, and a model whose weights are
+    negligible against the budgets satisfies none of them:
+
+        headroom > B - W/2      the head's cap goes negative
+        headroom < 2B - W       the balanced reserve is still positive
+        B >= head + headroom    the head's card can actually hold its own
+
+    Solve for B and headroom from the model's real sizes rather than picking
+    round numbers, so the test states the condition instead of hoping for it.
+    """
+    sizes = {n: p.numel() * p.element_size()
+             for n, p in model.named_parameters()}
+    total = sum(sizes.values())
+    head = sizes["lm_head.weight"]
+    budget = 3 * total // 2
+    # Inside (budget - total/2, budget - head], which is non-empty exactly
+    # when head < total/2.
+    assert head < total // 2, "fixture no longer has a head under half the weights"
+    headroom = (budget - total // 2 + budget - head) // 2
+    assert budget - total // 2 < headroom <= budget - head
+    assert headroom < 2 * budget - total
+    return budget, headroom
+
+
+def test_a_negative_cap_on_the_head_does_not_zero_the_other_cards():
+    """The Muse Glimmer shape, in miniature.
+
+    Measured on Kaggle-Muse_Glimmer_(30B)-GRPO across 2 x 14.56 GiB: budgets
+    13.104 GiB each after the quantiser's haircut, 20.310 GiB of weights and
+    4.104 GiB of logit headroom. The balanced reserve worked out at 0.897 GiB
+    and the per-device caps at +2.949 (cuda:0) and -1.155 (cuda:1, the head).
+    Capping by the MINIMUM across devices took the head's negative cap and
+    applied it everywhere, so both cards got a 0.000 GiB reserve, cuda:0 was
+    packed to within 0.161 GiB, and training OOMed on its first 254 MiB
+    allocation while cuda:1 sat on 5.737 GiB of unused memory.
+
+    A card that does not pay the headroom must keep its own reserve.
+    """
+    model = _meta(hidden = 256, vocab = 8192, layers = 16)
+    budget, headroom = _muse_shaped_budgets(model)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: budget, 1: budget},
+        headroom_bytes = headroom,
+    )
+    assert plan is not None
+    reserves = plan.activation_reserve_by_device
+    head_device = plan.device_map[
+        next(n for n in plan.device_map if n.endswith("lm_head"))
+    ]
+    others = [d for d in reserves if d != head_device]
+    assert others, "expected a non-head device to exist"
+    assert any(reserves[d] > 0 for d in others), (
+        f"every non-head card was given a zero activation reserve "
+        f"({reserves}); the head's negative cap has leaked onto them again"
+    )
+
+
+def test_the_head_card_reserve_still_cannot_go_negative():
+    """The property the shared cap was originally added for.
+
+    `attempt` only ever relaxes the reserve on the OTHER cards, so a negative
+    reserve on the head's own card makes every step infeasible and the plan is
+    refused outright. Clamping each device at zero individually has to keep
+    that from happening.
+    """
+    model = _meta(hidden = 256, vocab = 8192, layers = 16)
+    budget, headroom = _muse_shaped_budgets(model)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: budget, 1: budget},
+        headroom_bytes = headroom,
+    )
+    assert plan is not None
+    assert all(v >= 0 for v in plan.activation_reserve_by_device.values())

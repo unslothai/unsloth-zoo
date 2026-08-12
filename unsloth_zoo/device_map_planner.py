@@ -1006,10 +1006,32 @@ def plan_device_map(
                 # is refused. A four-layer model whose head is larger than half
                 # the weights (share 24 KiB, head 32 KiB) was rejected on
                 # 2 x 8 GiB for exactly that reason.
+                # Capped PER DEVICE, not by the smallest cap across all of
+                # them. A single `min` lets the head's card -- the only one
+                # that pays the headroom, and so the only one whose cap can go
+                # negative -- drive the reserve to zero on cards that had room
+                # for one. Measured on Kaggle-Muse_Glimmer_(30B)-GRPO, 2 x
+                # 14.56 GiB: budgets 13.104 each, weights 20.310, headroom
+                # 4.104, so value 0.897 GiB and caps 2.949 (cuda:0) and -1.155
+                # (cuda:1, the head). The min was -1.155, both cards got a
+                # 0.000 GiB reserve, cuda:0 was packed to within 0.161 GiB and
+                # the run OOMed at the first training step asking for 254 MiB.
+                # cuda:1 finished with 5.737 GiB unused.
+                #
+                # Clamping each device at 0 individually keeps the property
+                # the shared cap was added for: the head's own reserve still
+                # cannot go negative, so `attempt` -- which only relaxes the
+                # OTHER cards -- is never handed an infeasible head budget.
                 share = max(-(-total // len(devices)), pinned_bytes)
-                cap = min(raw_budgets[d] - share - (headroom if d == head_device else 0)
-                          for d in devices)
-                value = int(max(0, min(value, cap)))
+                per_device = {
+                    d: int(max(0, min(
+                        value,
+                        raw_budgets[d] - share
+                        - (headroom if d == head_device else 0),
+                    )))
+                    for d in devices
+                }
+                return per_device
             else:
                 # Mirror accelerate: reserve the largest single placement unit.
                 value = max((s for _, s in units), default=0)
