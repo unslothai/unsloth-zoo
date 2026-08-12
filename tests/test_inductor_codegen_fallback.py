@@ -31,9 +31,11 @@ def _clear_latches():
     """The latch is process-global and keyed by label, so tests must not leak."""
     patch_utils._LATCHED_EAGER_LABELS.clear()
     patch_utils._PENDING_EAGER_LABELS.clear()
+    patch_utils._COMPILED_OK_LABELS.clear()
     yield
     patch_utils._LATCHED_EAGER_LABELS.clear()
     patch_utils._PENDING_EAGER_LABELS.clear()
+    patch_utils._COMPILED_OK_LABELS.clear()
 
 
 def _inductor_error(message = "CantSplit: 202048*s47*s87 not divisible by s47*s87"):
@@ -232,3 +234,151 @@ def test_outside_a_checkpoint_a_later_refusal_still_falls_back(monkeypatch):
 
     assert wrapped(1) == "compiled"
     assert wrapped(2) == "eager"
+
+
+# ---- what the review round found ------------------------------------------
+#
+# Four holes in the checkpoint gate above, all of them cases where the wrapper
+# either re-raises when the fallback was safe, or falls back when it was not.
+
+
+def test_a_refusal_in_a_later_step_falls_back(monkeypatch):
+    """`compiled_ok` must not answer for a step that is already over.
+
+    Held per wrapper it stays true forever, so the first refusal in ANY later
+    step re-raises even though nothing compiled has been packed in that step.
+    That defeats the fallback for exactly the long-running GRPO case it exists
+    for.
+    """
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-later-step",
+    )
+    assert wrapped(1) == "compiled"
+
+    # The step boundary. This is what `apply_pending_eager_fallbacks` does.
+    patch_utils._COMPILED_OK_LABELS.clear()
+
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    assert wrapped(2) == "eager", "a new step re-raised on its first refusal"
+
+
+def test_a_successful_budget_retry_is_recorded_as_compiled():
+    """A retry that compiles has packed compiled activations, so record it.
+
+    The retry returns from the exception branch and never reaches the `else:`
+    clause that normally does the recording, which left the wrapper believing
+    nothing compiled had run.
+
+    Worth being precise about the consequence, because it is narrower than it
+    looks: the retry also latches this label eager, so the SAME wrapper never
+    makes another compiled call and cannot itself hit a later backend refusal.
+    The record still has to be right -- it is the process-wide answer to "did
+    this label pack something compiled in this step" -- but the pack/recompute
+    divergence this guards against is not reachable through this path today.
+    """
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _recompile_limit_error()
+        return "retried"
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-retry-counts",
+    )
+    if wrapped(1) != "retried":
+        pytest.skip("this torch does not take the budget-retry path")
+    assert "test-retry-counts" in patch_utils._COMPILED_OK_LABELS, (
+        "a retry that compiled and returned was not recorded as compiled"
+    )
+
+
+def test_the_compiled_pack_marker_is_restored_after_a_refusal(monkeypatch):
+    """Nothing compiled ran, so the process-wide marker must not stay set.
+
+    Left set, an unrelated wrapper exhausting its budget in the same checkpoint
+    reads it as evidence of a compiled pack and ends the step for no reason.
+    """
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    # The real one sets the marker, which is precisely what has to be undone.
+    monkeypatch.setattr(
+        patch_utils, "_note_packed_under_checkpoint",
+        lambda: setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True),
+    )
+
+    def compiled(x):
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-marker-restored",
+    )
+    assert wrapped(1) == "eager"
+    assert patch_utils._PACKED_COMPILED_IN_CHECKPOINT is False, (
+        "a refusal that ran no compiled code left the compiled-pack marker set"
+    )
+
+
+def test_a_non_inductor_backend_failure_still_raises():
+    """`BackendCompilerFailed` wraps any backend, not only Inductor.
+
+    `torch_compile_with_fallback(..., backend = custom)` is supported, and
+    swallowing a custom backend's exception would hide a configuration or
+    programming error behind a permanent silent switch to eager.
+    """
+    try:
+        from torch._dynamo.exc import BackendCompilerFailed
+    except Exception:
+        pytest.skip("this torch has no BackendCompilerFailed")
+
+    inner = ValueError("my custom backend is misconfigured")
+    built = None
+    def _backend_fn(gm, example_inputs): return gm
+    for args in (
+        (_backend_fn, inner, None),   # 2.9+: (backend_fn, inner, first_useful_frame)
+        (_backend_fn, inner),
+        (inner, None),
+        (inner,),
+    ):
+        try:
+            built = BackendCompilerFailed(*args)
+        except TypeError:
+            continue
+        break
+    if built is None:
+        pytest.skip("cannot construct BackendCompilerFailed on this torch")
+    if patch_utils._is_inductor_codegen_failure(built):
+        pytest.skip("this torch gives the wrapper no usable backend identity")
+
+    def compiled(x):
+        raise built
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-custom-backend",
+    )
+    with pytest.raises(BackendCompilerFailed):
+        wrapped(1)
+    assert "test-custom-backend" not in patch_utils._LATCHED_EAGER_LABELS
+
+
+def _recompile_limit_error():
+    errors = patch_utils._recompile_limit_errors()
+    if not errors:
+        pytest.skip("this torch exposes no recompile-limit exception")
+    cls = errors[0]
+    for args in (("recompile limit reached",), ()):
+        try:
+            return cls(*args)
+        except TypeError:
+            continue
+    pytest.skip(f"cannot construct {cls.__name__}")
