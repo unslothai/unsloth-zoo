@@ -674,12 +674,11 @@ def _is_gemma4_attr(node, owner, attr):
 def _gemma4_receiver_is_inputs_embeds(node):
     """Does this `masked_scatter` receiver expression START from `inputs_embeds`?
 
-    Discovery has to stay loose about HOW the receiver transforms the name
-    (`inputs_embeds.to(...).masked_scatter(...)` is still the embedding merge),
-    but the transformation has to be OF `inputs_embeds`. Merely mentioning the
-    name is not enough: `scratch.to(inputs_embeds.device)` names it and is a
-    different tensor, so an aligned merge onto that scratch buffer would land in
-    `fixed_casts` and read to the caller as "upstream fixed it".
+    Matched at the BASE, so a transformed receiver
+    (`inputs_embeds.to(...).masked_scatter(...)`) still counts while a different
+    tensor that merely names it (`scratch.to(inputs_embeds.device)`) does not: an
+    aligned merge onto that scratch buffer would land in `fixed_casts` and read to
+    the caller as "upstream fixed it".
     """
     while True:
         if isinstance(node, ast.Name):
@@ -703,16 +702,9 @@ def _gemma4_audio_merge_casts(forward_node):
     tests/test_gemma4_dtype_drift_guards.py calls this same matcher on the real
     transformers source rather than re-deriving it.
 
-    The receiver has to reference `inputs_embeds`: only the embedding merge can
-    make audio features reach the model, so a `masked_scatter` onto any other
-    tensor is a different op whose dtype says nothing about ours. Accepting any
-    receiver let an already-aligned merge on some scratch tensor land in
-    `fixed_casts`, which reads to the caller as "upstream fixed it" - it sets the
-    patched marker and returns without touching a real, still-device-only
-    `inputs_embeds` merge. The receiver is matched at its BASE, so a transformed
-    receiver (`inputs_embeds.to(...).masked_scatter(...)`) is still recognised
-    while a different tensor that merely mentions the name
-    (`scratch.to(inputs_embeds.device)`) is not.
+    The receiver must be `inputs_embeds` (`_gemma4_receiver_is_inputs_embeds`):
+    only the embedding merge makes audio features reach the model, so a
+    `masked_scatter` onto any other tensor says nothing about our dtype.
     """
     buggy_casts = []
     fixed_casts = []

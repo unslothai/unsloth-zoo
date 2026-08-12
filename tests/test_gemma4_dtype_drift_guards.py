@@ -201,34 +201,29 @@ def _gemma4_modeling_source():
     return pathlib.Path(inspect.getsourcefile(real_gemma4)).read_text()
 
 
-# Upstream is free to spell the dtype alignment wherever it likes: at the merge
-# call (`audio_features.to(inputs_embeds.device, inputs_embeds.dtype)`, tf 5.15+)
-# or on the statement that produced the features
-# (`image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)`,
-# tf 5.5-5.14, or `... = torch.cat(image_features, dim=0).to(..., inputs_embeds.dtype)`,
-# tf 5.15). A substring anchor on one spelling breaks on cosmetic refactors while
-# staying blind to a real regression written in another spelling, so the canaries
-# below trace dtype ALIGNMENT structurally instead: find every
-# `inputs_embeds.masked_scatter` that consumes the features, and require of each an
-# `inputs_embeds.dtype` cast either inside the merge argument or on the last
-# assignment to that name that DOMINATES the merge (same block or an enclosing one,
-# so a cast stranded in a branch the merge does not run under does not count), plus
-# a receiver that is still AT `inputs_embeds.dtype` and a result that is actually
-# used (masked_scatter is out-of-place).
-# Known, deliberate limits of the trace, none of which any transformers 5.5.0
-# to 5.15.0 source hits (checked against every gemma4-bearing release, and the
-# spellings themselves against all 503 model families of 5.15.0):
-#   * names bound by `match`/`case` patterns are not tracked - no transformers
-#     modeling file contains a `match` statement;
-#   * the merged result only has to REACH `inputs_embeds`; a later statement
-#     overwriting it again is not modelled. Requiring survival to the end
-#     instead trades this for a false red on "merge, use, then release the
-#     name", which needs a use-before-overwrite analysis to tell apart;
-#   * `.to(other_tensor)` counts as alignment here but not in the eager patch's
-#     own matcher (unsloth_zoo/temporary_patches/gemma4.py), which reads only
-#     the `.to(inputs_embeds.device[, inputs_embeds.dtype])` spelling upstream
-#     actually ships. Upstream adopting the overload would surface as a drift
-#     warning telling us to update the patch, which is the intended signal.
+# Upstream may spell the dtype alignment at the merge call
+# (`audio_features.to(inputs_embeds.device, inputs_embeds.dtype)`, tf 5.15+) or on
+# the statement that produced the features (tf 5.5-5.14). A substring anchor on one
+# spelling breaks on cosmetic refactors while staying blind to a real regression
+# written in another, so the canaries trace dtype ALIGNMENT structurally: every
+# `inputs_embeds.masked_scatter` consuming the features needs an
+# `inputs_embeds.dtype` cast at the call or on the last assignment that DOMINATES
+# the merge (same block or an enclosing one, so a cast stranded in a branch the
+# merge does not run under does not count), a receiver still AT
+# `inputs_embeds.dtype`, and a result that is actually used (masked_scatter is
+# out-of-place).
+# Deliberate limits, none hit by any transformers 5.5.0-5.15.0 source (checked
+# against every gemma4-bearing release, and the spellings against all 503 model
+# families of 5.15.0):
+#   * `match`/`case` bindings are not tracked - no transformers modeling file has
+#     a `match` statement;
+#   * the merged result only has to REACH `inputs_embeds`; a later overwrite is not
+#     modelled, since requiring survival to the end would red-flag "merge, use,
+#     then release the name" without a use-before-overwrite analysis;
+#   * `.to(other_tensor)` counts as alignment here but not in the eager patch's own
+#     matcher (unsloth_zoo/temporary_patches/gemma4.py), which reads only the
+#     spelling upstream actually ships. Upstream adopting the overload would
+#     surface as a drift warning telling us to update the patch, as intended.
 def _is_attr(node, owner, attr):
     """`<owner>.<attr>` as an AST node, e.g. `inputs_embeds.dtype`."""
     return (
@@ -247,16 +242,12 @@ def _is_embeds_tensor(node):
 def _casts_to_inputs_embeds_dtype(node):
     """True if `node` contains a `.to(...)` that lands on `inputs_embeds`' dtype.
 
-    Two spellings count. The explicit one names the dtype
-    (`features.to(inputs_embeds.device, inputs_embeds.dtype)`), and the tensor
-    overload names the tensor: `Tensor.to(other)` is documented as "returns a
-    Tensor with same torch.dtype and torch.device as the Tensor other", so
-    `features.to(inputs_embeds)` aligns dtype AND device in one call and is just
-    as safe a merge source. Rejecting it would make these canaries fail on a
-    healthy upstream that happened to prefer that spelling, and the failure would
-    claim nobody aligns the dtype at all. Only the FIRST positional argument can
-    be the tensor overload (`to(other, non_blocking=..., copy=...)`); torch has
-    no `other=` keyword, so keywords are not considered for it.
+    Two spellings count: the explicit `features.to(inputs_embeds.device,
+    inputs_embeds.dtype)`, and the tensor overload `features.to(inputs_embeds)`,
+    documented as returning a tensor with the same dtype AND device as `other`.
+    Rejecting the overload would fail these canaries on a healthy upstream that
+    preferred it, claiming nobody aligns the dtype at all. Only the FIRST
+    positional argument can be that overload; torch has no `other=` keyword.
     """
     for sub in ast.walk(node):
         if not (
@@ -274,10 +265,9 @@ def _casts_to_inputs_embeds_dtype(node):
 
 
 # Methods that may sit between `inputs_embeds` and `.masked_scatter(...)` without
-# changing the destination dtype. Anything outside this set (`.float()`, `.half()`,
-# `.type(...)`, an unknown helper) can retype the destination, which makes an
-# `inputs_embeds.dtype` source cast prove nothing: the merge then has an fp32
-# destination and a low-precision source and raises.
+# changing the destination dtype. Anything else (`.float()`, `.type(...)`, an
+# unknown helper) can retype it, leaving an fp32 destination and a low-precision
+# source, so an `inputs_embeds.dtype` source cast would prove nothing.
 _DTYPE_PRESERVING_METHODS = frozenset({
     "clone", "contiguous", "detach", "cpu", "cuda",
     "view", "reshape", "flatten", "squeeze", "unsqueeze",
@@ -285,25 +275,20 @@ _DTYPE_PRESERVING_METHODS = frozenset({
 })
 
 
-# `torch.<name>` constants that are provably NOT dtypes, so they cannot retype the
-# receiver: `inputs_embeds.clone(memory_format = torch.preserve_format)` and
-# `inputs_embeds.contiguous(memory_format = torch.contiguous_format)` keep the
-# embedding dtype exactly. Reading every `torch.<attr>` as a dtype rejected those
-# receivers, so a purely cosmetic upstream addition of an explicit memory format
-# would fail the real-source canaries with "the destination was retyped" - the
-# false red this structural trace exists to remove. (`_to_call_preserves_dtype`
-# already whitelists the `memory_format` keyword of `.to(...)` for the same
-# reason.) Resolved against the live torch so the set cannot drift from reality;
-# an attribute torch does not have stays dtype-bearing, which is the safe default.
+# `torch.<name>` constants that provably are NOT dtypes, so they cannot retype the
+# receiver: `clone(memory_format = torch.preserve_format)` keeps the embedding dtype
+# exactly. Reading every `torch.<attr>` as a dtype turned that cosmetic upstream
+# addition into a "destination was retyped" false red - the very failure this
+# structural trace exists to remove. Resolved against the live torch, so an
+# attribute torch does not have stays dtype-bearing: the safe default.
 _NON_DTYPE_TORCH_CONSTANTS = (torch.memory_format, torch.layout)
 
 
 def _is_dtype_bearing(node, aliases = frozenset()):
     """Can `node` retype a tensor? (`torch.float32`, `other.dtype`, ...)
 
-    `aliases` are local names already known to hold a dtype, because
-    `Tensor.view(dtype)` reinterprets its receiver just as thoroughly whether the
-    dtype is written out or held in a variable.
+    `aliases` are local names known to hold a dtype: `Tensor.view(dtype)`
+    reinterprets its receiver whether the dtype is written out or held in a name.
     """
     if isinstance(node, ast.Name):
         return node.id in aliases
@@ -314,9 +299,8 @@ def _is_dtype_bearing(node, aliases = frozenset()):
         and isinstance(node.value, ast.Name)
         and node.value.id == "torch"
     ):
-        # `torch.float32` / `torch.bfloat16` / `torch.long` retype; a memory
-        # format or a layout does not. `Tensor.view(torch.int32)` really does
-        # reinterpret the dtype, so the check is on the constant, not the method.
+        # A memory format or layout does not retype; `Tensor.view(torch.int32)`
+        # does, so the check is on the constant, not the method.
         return not isinstance(
             getattr(torch, node.attr, None), _NON_DTYPE_TORCH_CONSTANTS
         )
@@ -341,9 +325,8 @@ def _is_device_expr(node):
 def _to_call_preserves_dtype(call):
     """Is this `.to(...)` device-only (or a no-op `inputs_embeds.dtype` cast)?
 
-    `inputs_embeds.to(language_model_inputs.device)` is blip_2's real spelling and
-    keeps the dtype; `.to(torch.float32)`, `.to(other.dtype)` and the tensor
-    overload `.to(other_tensor)` do not.
+    `inputs_embeds.to(other.device)` is blip_2's real spelling and keeps the dtype;
+    `.to(torch.float32)`, `.to(other.dtype)` and `.to(other_tensor)` do not.
     """
     for arg in call.args:
         if not (_is_device_expr(arg) or _is_attr(arg, "inputs_embeds", "dtype")):
@@ -362,11 +345,10 @@ def _to_call_preserves_dtype(call):
 def _receiver_preserves_embeds_dtype(node, aliases = frozenset()):
     """Is the merge destination `inputs_embeds` still at `inputs_embeds.dtype`?
 
-    The whole trace is "the source is cast to `inputs_embeds.dtype`, so the merge
-    is safe", which only holds while the DESTINATION is at that dtype too. The
-    receiver may be `inputs_embeds` itself or a chain of dtype-preserving
-    transformations of it (upstream blip_2 really does write
-    `inputs_embeds.to(language_model_inputs.device).masked_scatter(...)`), but
+    The trace is "the source is cast to `inputs_embeds.dtype`, so the merge is
+    safe", which only holds while the DESTINATION is at that dtype too. A chain of
+    dtype-preserving transformations is fine (blip_2 really writes
+    `inputs_embeds.to(other.device).masked_scatter(...)`), but
     `inputs_embeds.float().masked_scatter(mask, feat.to(inputs_embeds.dtype))`
     merges a low-precision source into an fp32 destination and raises.
     """
@@ -394,11 +376,10 @@ _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 def _walk_own_scope(root, descend = True):
     """`ast.walk` restricted to the code `root`'s own scope executes.
 
-    A nested `def` / `class` / `lambda` is a separate scope with its own local
-    names, so a merge written inside a helper defined in `forward` is not
-    `forward`'s merge (the helper may never be invoked), and a cast in `forward`
-    says nothing about a same-named parameter of that helper. The nested
-    statement itself is still yielded - only its body is skipped.
+    A nested `def` / `class` / `lambda` has its own locals, so a merge inside a
+    helper defined in `forward` is not `forward`'s merge (it may never be invoked),
+    and a cast in `forward` says nothing about a same-named parameter of that
+    helper. The nested statement itself is still yielded - only its body is skipped.
     """
     if isinstance(root, _SCOPE_NODES) and not descend:
         yield root
@@ -439,9 +420,8 @@ def _child_blocks(stmt):
 def _enclosing_blocks(forward, target):
     """`[(block, index)]` from the function body inwards to the stmt holding `target`.
 
-    Only these statement lists run unconditionally *relative to the merge*. A cast
-    nested in some other branch may never execute on the path that reaches the
-    merge, so it cannot prove alignment.
+    Only these lists run unconditionally *relative to the merge*: a cast nested in
+    another branch may never execute on the path that reaches it.
     """
     chain = []
 
@@ -466,11 +446,10 @@ def _enclosing_blocks(forward, target):
 def _is_dtype_guard(test, feature):
     """Exactly `<feature>.dtype != inputs_embeds.dtype` (either operand order).
 
-    Only that comparison makes the untaken branch aligned BY DEFINITION. Any
-    other test mentioning the feature dtype (`... == inputs_embeds.dtype`,
-    `... != torch.bfloat16`, or the mismatch test `and`-ed with something else)
-    leaves a reachable path on which the feature stays un-cast, so a cast under
-    it proves nothing and must not count as unconditional alignment.
+    Only that comparison makes the untaken branch aligned BY DEFINITION. Any other
+    test (`== inputs_embeds.dtype`, `!= torch.bfloat16`, or the mismatch test
+    `and`-ed with something else) leaves a reachable path on which the feature
+    stays un-cast, so a cast under it is not unconditional alignment.
     """
     if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
         return False
@@ -487,16 +466,14 @@ def _is_dtype_guard(test, feature):
 def _bound_names(target):
     """Every plain name an assignment target binds.
 
-    Recurses through destructuring targets, because
-    `image_features, feature_lens = self.pack_image_features(...)` (the
-    llava_next / llava_onevision / llava_next_video spelling) rebinds
-    `image_features` just as much as a bare `image_features = ...` does. Missing
-    it lets an earlier aligned assignment keep proving alignment for a tensor
-    that has since been replaced by an unpacked, possibly mismatched one.
+    Recurses through destructuring targets, because `image_features, feature_lens =
+    self.pack_image_features(...)` (llava_next / llava_onevision) rebinds
+    `image_features` just as much as a bare assignment does; missing it lets an
+    earlier aligned assignment keep proving alignment for a tensor since replaced.
 
     `image_features[0] = ...` (Subscript) and `self.image_features = ...`
-    (Attribute) are deliberately NOT name rebindings: the name still refers to
-    the same object afterwards.
+    (Attribute) are deliberately NOT rebindings: the name still refers to the same
+    object afterwards.
     """
     if isinstance(target, ast.Name):
         return [target.id]
@@ -510,24 +487,21 @@ def _bound_names(target):
 _ASSIGN_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
 _LOOP_NODES = (ast.For, ast.AsyncFor)
 _WITH_NODES = (ast.With, ast.AsyncWith)
-# Every construct that can rebind a plain name in the code's OWN scope. An
-# assignment statement is only the most common one: `for image_features in
-# image_batches:`, `with self.autocast() as image_features:` and
-# `if (image_features := self.pack(image_features)) is None:` all replace the
-# tensor the name refers to just as completely. Counting only assignments lets an
-# earlier aligned assignment keep proving alignment for a value that one of these
-# has since overwritten, and the replacement reaches masked_scatter un-cast.
-# (Comprehensions bind in their own scope and so cannot affect `forward`'s name.)
+# Every construct that can rebind a plain name in the code's OWN scope: `for
+# image_features in ...`, `with self.autocast() as image_features:` and
+# `(image_features := ...)` replace the tensor as completely as an assignment does.
+# Counting only assignments lets an earlier aligned cast keep proving alignment for
+# a value one of these has overwritten, and the replacement reaches masked_scatter
+# un-cast. (Comprehensions bind in their own scope.)
 _BINDING_NODES = _ASSIGN_NODES + _LOOP_NODES + _WITH_NODES + (ast.NamedExpr,)
 
 
 def _binding_pairs(node):
     """`[(target, value)]` this binding node establishes.
 
-    The `value` is the expression whose dtype the bound name ends up carrying, so
-    the same `_casts_to_inputs_embeds_dtype` question can be asked of every
-    binding form: an assignment's RHS, a loop's iterable (the target takes its
-    elements), and a `with` item's context expression.
+    `value` is the expression whose dtype the bound name carries, so the same
+    alignment question fits every form: an assignment's RHS, a loop's iterable, a
+    `with` item's context expression.
     """
     if isinstance(node, ast.Assign):
         return [(target, node.value) for target in node.targets]
@@ -554,14 +528,13 @@ def _assigns_feature(stmt, feature):
 def _element_value(target, value, feature):
     """The part of `value` that `<feature>` actually receives from `target`.
 
-    A destructuring target consumes the RHS element by element, so when the RHS
-    is written out as a literal tuple/list the name takes ITS element and nothing
-    else: in `image_features, lens = (image_features.float(), lens.to(
-    inputs_embeds.dtype))` the only cast belongs to `lens`, and crediting it to
+    A destructuring target consumes a literal tuple/list RHS element by element, so
+    in `image_features, lens = (image_features.float(), lens.to(
+    inputs_embeds.dtype))` the cast belongs to `lens` alone, and crediting it to
     `image_features` reports an fp32 tensor aligned. Anything else (a call, a
-    starred target, a length mismatch) keeps the whole RHS, which is how
-    `image_features, feature_lens = self.pack_image_features(image_features.to(
-    inputs_embeds.dtype))` - upstream's llava_next spelling - stays aligned.
+    starred target, a length mismatch) keeps the whole RHS, which is how upstream's
+    llava_next `image_features, lens = self.pack_image_features(image_features.to(
+    inputs_embeds.dtype))` stays aligned.
     """
     if isinstance(target, ast.Name):
         return value if target.id == feature else None
@@ -578,9 +551,8 @@ def _element_value(target, value, feature):
     return value
 
 
-# Only a real destructuring assignment pairs targets with RHS elements. A
-# `for` / `with` target takes its value from the iterable / context manager, not
-# positionally from the expression's own elements.
+# Only a real destructuring assignment pairs targets with RHS elements; a `for` /
+# `with` target takes its value from the iterable / context manager instead.
 _ELEMENTWISE_NODES = (ast.Assign, ast.AnnAssign, ast.NamedExpr)
 
 
@@ -603,13 +575,10 @@ def _binding_is_aligned(node, feature):
 def _feature_rebindings(stmt, feature):
     """Every rebinding of `<feature>` anywhere inside `stmt`'s own scope.
 
-    An augmented assignment is NOT one of them: `image_features += delta` is
-    `Tensor.add_`, which writes through the existing storage and keeps the
-    existing dtype. It neither creates the alignment its RHS carries
-    (`image_features += delta.to(inputs_embeds.dtype)` leaves an fp32
-    `image_features` fp32) nor destroys one an earlier cast established
-    (`image_features += bias` on an aligned tensor is still aligned), so it says
-    nothing and the running verdict stands.
+    An augmented assignment is NOT one: `image_features += delta` is `Tensor.add_`,
+    which writes through the existing storage and keeps its dtype. It neither
+    creates the alignment its RHS carries nor destroys one an earlier cast
+    established, so the running verdict stands.
     """
     return [
         node
@@ -623,7 +592,7 @@ def _feature_rebindings(stmt, feature):
 def _rebinding_alignment(stmt, feature):
     """Does `stmt` rebind `<feature>` on the path to the merge, and is it aligned?
 
-    `None` when `stmt` does not rebind the name (so it says nothing either way).
+    `None` when `stmt` does not rebind the name, so it says nothing either way.
     """
     if (
         isinstance(stmt, _ASSIGN_NODES)
@@ -631,23 +600,19 @@ def _rebinding_alignment(stmt, feature):
         and _assigns_feature(stmt, feature)
     ):
         return _binding_is_aligned(stmt, feature)
-    # A bare named expression statement, `(image_features := ...)`, rebinds
-    # unconditionally exactly like an assignment does.
+    # A bare `(image_features := ...)` statement rebinds like an assignment.
     if (
         isinstance(stmt, ast.Expr)
         and isinstance(stmt.value, ast.NamedExpr)
         and _assigns_feature(stmt.value, feature)
     ):
         return _binding_is_aligned(stmt.value, feature)
-    # `if <feature>.dtype != inputs_embeds.dtype: <feature> = <feature>.to(...)`
-    # is a cast-if-needed idiom (transformers spells it in blip_2 / granite_speech):
-    # the untaken branch is aligned by definition, so it counts as unconditional.
-    #
-    # Both branches still have to be analysed as PATHS, not as a bag of
-    # rebindings whose textually last one wins. `if enabled: <feature> =
-    # <feature>.to(inputs_embeds.dtype)` nested inside the guard, or an aligned
-    # `else` after an unaligned body, would otherwise report the whole guard
-    # aligned while the mismatch path leaves the feature un-cast.
+    # `if <feature>.dtype != inputs_embeds.dtype: <feature> = <feature>.to(...)` is
+    # the cast-if-needed idiom (blip_2 / granite_speech): the untaken branch is
+    # aligned by definition, so it counts as unconditional. Both branches are still
+    # analysed as PATHS, not as a bag of rebindings whose textually last one wins,
+    # or an aligned `else` after an unaligned body would report the guard aligned
+    # while the mismatch path leaves the feature un-cast.
     if isinstance(stmt, ast.If) and _is_dtype_guard(stmt.test, feature):
         if _feature_rebindings(stmt, feature):
             # Body runs only on a mismatch (starts unaligned); `orelse` only when
@@ -656,18 +621,14 @@ def _rebinding_alignment(stmt, feature):
                 _sequence_alignment(stmt.body, feature, False)
                 and _sequence_alignment(stmt.orelse, feature, True)
             )
-    # Any OTHER compound statement that rebinds the feature is still a rebinding
-    # on the path to the merge and must not be skipped, or an earlier aligned
-    # assignment would keep proving alignment for a value that has since been
-    # rewritten (`if enabled: image_features = image_features.float()`).
+    # Any OTHER compound statement that rebinds the feature is still a rebinding on
+    # the path to the merge (`if enabled: image_features = image_features.float()`).
     rebindings = _feature_rebindings(stmt, feature)
     if not rebindings:
         return None
     if isinstance(stmt, _WITH_NODES):
-        # A `with` body runs unconditionally, so its rebindings dominate the
-        # merge exactly like top-level ones: take the last one that says
-        # anything. The `as` target binds first, before the body runs, so it
-        # seeds the state.
+        # A `with` body runs unconditionally, so its rebindings dominate the merge
+        # like top-level ones. The `as` target binds first and seeds the state.
         alignment = (
             _binding_is_aligned(stmt, feature)
             if _assigns_feature(stmt, feature) else None
@@ -677,12 +638,10 @@ def _rebinding_alignment(stmt, feature):
             if inner_alignment is not None:
                 alignment = inner_alignment
         return alignment
-    # Conditionally executed (`if` / `for` / `while` / `try`): the rebinding may
-    # or may not run, so the state after it is "aligned before AND aligned in
-    # every branch". An unaligned branch therefore reports unaligned; a branch
-    # that only ever casts to `inputs_embeds.dtype` leaves the earlier verdict
-    # standing (`None`) instead of overriding it. A loop's own target counts as
-    # one of those rebindings, taking its dtype from the iterable.
+    # Conditionally executed (`if` / `for` / `while` / `try`): the rebinding may not
+    # run, so an unaligned branch reports unaligned while a branch that only ever
+    # casts to `inputs_embeds.dtype` leaves the earlier verdict standing (`None`).
+    # A loop's own target is one of those rebindings, typed by the iterable.
     for rebinding in rebindings:
         if not _binding_is_aligned(rebinding, feature):
             return False
@@ -692,10 +651,8 @@ def _rebinding_alignment(stmt, feature):
 def _sequence_alignment(block, feature, initial):
     """Alignment of `<feature>` after running `block` top to bottom.
 
-    `initial` is the state on entry to the block. Statements that say nothing
-    about the feature (`_rebinding_alignment` -> `None`, which includes a
-    conditional rebinding that only ever casts to `inputs_embeds.dtype`, since
-    it may not run) leave the running state alone.
+    `initial` is the state on entry. Statements that say nothing about the feature
+    (`None`, which includes a conditional cast that may not run) leave it alone.
     """
     state = initial
     for stmt in block:
@@ -732,11 +689,9 @@ _METADATA_ATTRS = frozenset({
 def _carries_value(node, matches):
     """Do the VALUES of a `matches` expression flow into `node`?
 
-    Both the merge SOURCE and the merge RESULT are traced by "does this
-    expression use that tensor", and a bare occurrence check answers that with
-    `image_features.device` or `merged.dtype` too. A metadata read carries none
-    of the tensor's values, so the whole subtree under it is skipped; everything
-    else still counts, which keeps
+    A bare occurrence check would answer yes to `image_features.device` or
+    `merged.dtype` too. A metadata read carries no values, so its whole subtree is
+    skipped; everything else still counts, keeping
     `image_features.to(...).reshape(-1, image_features.shape[-1])` a use.
     """
     if isinstance(node, ast.Attribute) and node.attr in _METADATA_ATTRS:
@@ -749,11 +704,10 @@ def _carries_value(node, matches):
 def _carries_feature_value(node, feature):
     """Do `<feature>`'s VALUES flow into `node`?
 
-    A merge is discovered by "the source argument uses the feature". Counting a
-    metadata read would report a source spelled
-    `fallback.to(image_features.device, inputs_embeds.dtype)` as the image merge -
-    and if the real merge were ever dropped, `_merge_dtype_alignment` would return
-    `(True, True)` on a source in which no image value reaches the model at all.
+    Counting a metadata read would report `fallback.to(image_features.device,
+    inputs_embeds.dtype)` as the image merge, so if the real merge were ever
+    dropped `_merge_dtype_alignment` would still return `(True, True)` on a source
+    in which no image value reaches the model.
     """
     return _carries_value(node, lambda n: isinstance(n, ast.Name) and n.id == feature)
 
@@ -761,28 +715,20 @@ def _carries_feature_value(node, feature):
 def _feature_merges(forward, feature):
     """Every `inputs_embeds.masked_scatter[_](mask, ...)` call using `<feature>`.
 
-    The receiver has to REFERENCE `inputs_embeds`: a
-    `scratch.masked_scatter(mask, feature)` elsewhere in `forward` is a different
-    tensor and says nothing about the dtype of the embedding merge. Discovery
-    stays deliberately loose here (any receiver mentioning the name) so that a
-    transformed receiver such as blip_2's
-    `inputs_embeds.to(language_model_inputs.device).masked_scatter(...)` is still
-    recognised AS the embedding merge; whether that transformation is dtype-safe
-    is then decided by `_receiver_preserves_embeds_dtype`. Dropping unrecognised
-    receivers here instead would let a second, safe merge hide a dtype-changing
-    one.
+    The receiver has to REFERENCE `inputs_embeds` (a `scratch.masked_scatter(...)`
+    is a different tensor), but discovery stays loose - any receiver mentioning the
+    name - so a transformed one such as blip_2's
+    `inputs_embeds.to(other.device).masked_scatter(...)` is still recognised AS the
+    embedding merge; whether it is dtype-safe is then
+    `_receiver_preserves_embeds_dtype`'s call. Dropping unrecognised receivers here
+    instead would let a second, safe merge hide a dtype-changing one.
 
-    The SOURCE, by contrast, has to carry the feature's values: a merge that only
-    reads `<feature>.device` or `<feature>.dtype` scatters something else, and
-    counting it would let a metadata mention stand in for a merge that upstream
-    has removed.
+    The SOURCE, by contrast, has to carry the feature's VALUES, or a metadata
+    mention could stand in for a merge upstream has removed.
 
-    The in-place spelling is accepted too (transformers writes
-    `masked_scatter_` in qwen2_5_omni and blt): it merges into the same storage
-    and needs the same dtype agreement.
-
-    Nested `def` / `class` / `lambda` bodies are skipped: a merge in a helper
-    `forward` never invokes is not `forward`'s merge.
+    `masked_scatter_` is accepted too (qwen2_5_omni, blt): same storage, same dtype
+    agreement. Nested `def` / `class` / `lambda` bodies are skipped - a merge in a
+    helper `forward` never invokes is not `forward`'s merge.
     """
     calls = []
     for node in _walk_own_scope(forward):
@@ -803,14 +749,11 @@ def _feature_merges(forward, feature):
     return sorted(calls, key=lambda n: (n.lineno, n.col_offset))
 
 
-# The merge RESULT is followed by the same rule that discovers the merge source:
-# only an expression carrying the tensor's VALUES passes it on. A metadata read of
-# the merge (`merged.device`, `merged.dtype`, `merged.shape`) discards every
-# scattered value, so `merged = inputs_embeds.masked_scatter(...)` followed by
-# `inputs_embeds = original.to(merged.device)` hands the embeddings the ORIGINAL
-# tensor. Treating that mention as value flow reported the merge used, so an
-# upstream refactor that removed the effective merge would leave every canary
-# here green while no feature reached the model.
+# The merge RESULT is followed by the same value-flow rule as the source. A
+# metadata read (`merged.device`, `merged.dtype`, `merged.shape`) discards every
+# scattered value, so `inputs_embeds = original.to(merged.device)` hands the
+# embeddings the ORIGINAL tensor. Treating that mention as value flow reported the
+# merge used, so a refactor dropping the effective merge stayed green.
 def _contains(node, target):
     return _carries_value(node, lambda n: n is target)
 
@@ -822,9 +765,8 @@ def _references(node, names):
 def _statements_after(forward, call):
     """The statements that execute after `call`, innermost block outwards.
 
-    The first one yielded is the merge's OWN statement; then the rest of the
-    block holding it, then the remainder of each enclosing block. That is the
-    straight-line path the merged tensor has to survive to reach the return.
+    The merge's OWN statement first, then the rest of its block, then the remainder
+    of each enclosing one: the path the merged tensor must survive to the return.
     """
     chain = _enclosing_blocks(forward, call)
     if not chain:
@@ -832,8 +774,7 @@ def _statements_after(forward, call):
     ordered = []
     for depth, (block, index) in enumerate(reversed(chain)):
         # The innermost entry points AT the merge's statement; every outer entry
-        # points at the compound statement wrapping it, which we have already
-        # accounted for.
+        # points at the compound statement wrapping it, already accounted for.
         ordered.extend(block[index if depth == 0 else index + 1:])
     return ordered
 
@@ -841,31 +782,21 @@ def _statements_after(forward, call):
 def _merge_result_is_used(forward, call):
     """Does the merge's result reach the embeddings `forward` goes on to use?
 
-    `masked_scatter` is OUT-OF-PLACE, so the merged embedding only exists in its
-    return value. Upstream has always spelled it
-    `inputs_embeds = inputs_embeds.masked_scatter(...)` on 5.5.0-5.15.0, and the
-    features reach the model precisely because that result lands back on
-    `inputs_embeds`.
-
-    Asking only whether the merge is a bare expression statement is too weak: it
+    `masked_scatter` is OUT-OF-PLACE, so the merged embedding exists only in its
+    return value; upstream lands it back on `inputs_embeds` on 5.5.0-5.15.0.
+    Asking only whether the merge is a bare expression statement is too weak - it
     passes `dead = inputs_embeds.masked_scatter(...)` and
-    `self.log(inputs_embeds.masked_scatter(...))`, both of which compute the
-    merged embedding, drop it on the floor and leave `forward` returning the
-    UNCHANGED `inputs_embeds` - the features silently never reach the model, with
-    every dtype canary in this file green. So follow the result forward instead:
-    it must flow, directly or through temporaries, into `inputs_embeds` or into a
-    `return`.
+    `self.log(inputs_embeds.masked_scatter(...))`, which drop the merged embedding
+    on the floor and leave `forward` returning the UNCHANGED `inputs_embeds` with
+    every dtype canary green. So follow the result forward: it must flow, directly
+    or through temporaries, into `inputs_embeds` or into a `return`.
 
-    The in-place `masked_scatter_` needs no result ONLY when its receiver is
-    `inputs_embeds` itself, because that is the one spelling whose write lands in
-    the embeddings `forward` goes on to use. On a transformed receiver -
-    `inputs_embeds.clone().masked_scatter_(...)`, or the device-changing
-    `inputs_embeds.to(...).masked_scatter_(...)`, both of which
-    `_receiver_preserves_embeds_dtype` accepts as dtype-safe - the mutation lands
-    in a temporary and `forward` still returns the unchanged `inputs_embeds`. So
-    only skip the result-flow analysis for a receiver that is guaranteed to alias
-    the original embeddings; anything else has to hand its result back like the
-    out-of-place spelling does (`masked_scatter_` returns the receiver, so it can).
+    `masked_scatter_` needs no result ONLY when its receiver is `inputs_embeds`
+    itself. On a transformed receiver (`inputs_embeds.clone()`, or the
+    device-changing `.to(...)`, both of which `_receiver_preserves_embeds_dtype`
+    accepts as dtype-safe) the mutation lands in a temporary, so it has to hand its
+    result back like the out-of-place spelling does - and it can, since
+    `masked_scatter_` returns its receiver.
     """
     if call.func.attr.endswith("_") and _is_embeds_tensor(call.func.value):
         return True
@@ -876,8 +807,8 @@ def _merge_result_is_used(forward, call):
     tainted = set()
     for position, statement in enumerate(statements):
         for node in _walk_own_scope(statement, descend = False):
-            # A `return` carrying the merge (or anything it flowed into) is the
-            # merged embedding leaving `forward`.
+            # A `return` carrying the merge, or its taint, is the merged embedding
+            # leaving `forward`.
             if isinstance(node, ast.Return) and node.value is not None:
                 if (position == 0 and _contains(node.value, call)) or _references(node.value, tainted):
                     return True
@@ -886,13 +817,11 @@ def _merge_result_is_used(forward, call):
             for target, value in _binding_pairs(node):
                 if target is None or value is None:
                     continue
-                # A destructuring target consumes the RHS element by element, so
-                # each name is judged on the part it actually receives. Reading
-                # the whole RHS made `inputs_embeds, aux = original, merged` taint
-                # `inputs_embeds` - reporting the merge used while the embeddings
-                # were handed the ORIGINAL, unmerged tensor. A non-literal RHS
-                # (a call, a starred or mismatched target) keeps the whole value,
-                # so `inputs_embeds, aux = self.pack(merged)` still counts.
+                # Each name is judged on the RHS element it actually receives.
+                # Reading the whole RHS made `inputs_embeds, aux = original, merged`
+                # taint `inputs_embeds` while the embeddings were handed the
+                # ORIGINAL. A non-literal RHS keeps the whole value, so
+                # `inputs_embeds, aux = self.pack(merged)` still counts.
                 element = value if isinstance(node, _ELEMENTWISE_NODES) else None
                 for name in _bound_names(target):
                     part = _element_value(target, element, name) if element is not None else value
@@ -904,10 +833,9 @@ def _merge_result_is_used(forward, call):
                         tainted.add(name)
                     elif node is statement and not isinstance(node, ast.AugAssign):
                         # A direct, unconditional rebinding to something the merge
-                        # did NOT flow into overwrites the name: the merged value
-                        # is gone. A rebinding nested inside a conditional may not
-                        # run, so it must not clear the taint - and an augmented
-                        # assignment adds to the value rather than replacing it.
+                        # did NOT flow into overwrites the name. One nested in a
+                        # conditional may not run, and `+=` adds rather than
+                        # replaces, so neither clears the taint.
                         tainted.discard(name)
         if "inputs_embeds" in tainted:
             return True
@@ -917,16 +845,12 @@ def _merge_result_is_used(forward, call):
 def _dtype_alias_names(forward):
     """Local names bound to a dtype, e.g. `target_dtype = torch.float32`.
 
-    `inputs_embeds.view(target_dtype)` reinterprets the merge destination exactly
-    like `inputs_embeds.view(torch.float32)` does, so a receiver holding its dtype
-    in a variable must not read as dtype-preserving: the merge would then take an
-    `inputs_embeds.dtype` source into a retyped destination and raise.
-
-    Only a binding whose VALUE is itself dtype-bearing counts, which is what keeps
-    the legitimate shape overload out: `Tensor.view` accepts a single shape
-    sequence, so `target_shape = image_features.shape` / `view(target_shape)` is
-    real upstream spelling and preserves the dtype. Repeated to a fixpoint so an
-    alias of an alias resolves too.
+    `inputs_embeds.view(target_dtype)` retypes the merge destination exactly like
+    `view(torch.float32)` does, so a receiver holding its dtype in a variable must
+    not read as dtype-preserving. Only a binding whose VALUE is dtype-bearing
+    counts, which keeps the legitimate shape overload (`target_shape =
+    image_features.shape` / `view(target_shape)`, real upstream spelling) out.
+    Repeated to a fixpoint so an alias of an alias resolves.
     """
     names = set()
     while True:
@@ -948,13 +872,10 @@ def _merge_dtype_alignment(src, feature):
     """Trace `<feature>` into `inputs_embeds.masked_scatter(...)`.
 
     Returns (merge_found, every_merge_aligned). EVERY merge consuming the feature
-    has to be aligned: one unaligned branch is one reachable dtype crash, so an
-    aligned first merge must not excuse an unaligned second one.
-
-    A merge counts as aligned when all three hold: the destination is still at
-    `inputs_embeds.dtype`, the merged result is actually used, and the source
-    carries an `inputs_embeds.dtype` cast at the call or on its last dominating
-    assignment.
+    has to be aligned: one unaligned branch is one reachable dtype crash. A merge
+    is aligned when the destination is still at `inputs_embeds.dtype`, the result
+    is actually used, and the source carries an `inputs_embeds.dtype` cast at the
+    call or on its last dominating assignment.
     """
     forward = _gemma4_model_forward_node(src)
     if forward is None:
@@ -1022,15 +943,12 @@ def test_real_gemma4_image_and_video_merges_still_cast_dtype(feature):
 
 @requires_gemma4
 def test_real_gemma4_audio_eager_patch_matches_real_merge_site():
-    # The canary above only proves the COMPILER rewriter (a regex over the source)
-    # still fires. The eager patch is stricter: it requires the merge's source
-    # argument to BE the `audio_features.to(inputs_embeds.device, ...)` call, so a
-    # wrapped spelling such as
-    # `audio_features.to(inputs_embeds.device).reshape(-1, inputs_embeds.shape[-1])`
-    # matches the regex but not the AST matcher - the eager patch would log a drift
-    # warning, no-op, and the dtype crash would come back on the non-compiled path
-    # while every other guard here stayed green. Run the patch's OWN matcher over
-    # the real source so that spelling fails loudly here instead.
+    # The canary above only proves the COMPILER rewriter (a regex) still fires. The
+    # eager patch is stricter - the merge source argument must BE the
+    # `audio_features.to(inputs_embeds.device, ...)` call - so a wrapped spelling
+    # matches the regex but not the AST matcher, and the eager path would no-op
+    # with the dtype crash back and every other guard green. Run the patch's OWN
+    # matcher over the real source so that spelling fails loudly here instead.
     src = _gemma4_modeling_source()
     forward = _gemma4_model_forward_node(src)
     assert forward is not None, "Gemma4Model.forward not found in the real source"
@@ -1079,10 +997,9 @@ def test_real_gemma4_audio_compiler_transform_emits_dtype_cast():
 
 
 def test_audio_compiler_transform_still_fixes_the_device_only_spelling():
-    # transformers 5.15.0 fixed the audio merge upstream, which makes the
-    # real-source test above pass without the rewriter doing anything. Keep the
-    # rewriter itself under test against the historical buggy spelling so it
-    # cannot silently rot while older transformers are still supported.
+    # transformers 5.15.0 fixed the audio merge upstream, so the real-source test
+    # above passes without the rewriter doing anything. Keep it under test against
+    # the historical buggy spelling while older transformers are still supported.
     buggy = (
         "        inputs_embeds = inputs_embeds.masked_scatter(\n"
         "            audio_mask.to(inputs_embeds.device), audio_features.to(inputs_embeds.device)\n"
@@ -1096,11 +1013,10 @@ def test_audio_compiler_transform_still_fixes_the_device_only_spelling():
 
 
 # ---------------------------------------------------------------------------
-# Tracer unit tests. The canaries above are only as good as `_merge_dtype_alignment`,
-# and a hole in it is invisible: it reports GREEN on a source that crashes. These
-# feed the tracer a minimal synthetic `Gemma4Model.forward` (no transformers
-# needed, so they run on every supported version) and pin the verdict on the
-# spellings that used to slip through.
+# Tracer unit tests. A hole in `_merge_dtype_alignment` is invisible: it reports
+# GREEN on a source that crashes. These feed it a minimal synthetic
+# `Gemma4Model.forward` (no transformers needed, so they run on every supported
+# version) and pin the verdict on the spellings that used to slip through.
 # ---------------------------------------------------------------------------
 _DEFAULT_MERGE = (
     "inputs_embeds = inputs_embeds.masked_scatter(\n"
@@ -1132,10 +1048,9 @@ _ALIGNED_ASSIGN = "image_features = image_features.to(inputs_embeds.device, inpu
 
 
 # Every path inside a `<feature>.dtype != inputs_embeds.dtype` guard has to end
-# aligned. Taking the textually last rebinding inside the guard instead reports
-# aligned for a guard whose MISMATCH path leaves the feature un-cast, which is
-# exactly one reachable `masked_scatter_: expected self and source to have same
-# dtypes`.
+# aligned. Taking the textually last rebinding instead reports aligned for a guard
+# whose MISMATCH path leaves the feature un-cast - one reachable
+# `masked_scatter_: expected self and source to have same dtypes`.
 _GUARD_HOLES = [
     ("cast nested under a second condition",
      "if image_features.dtype != inputs_embeds.dtype:\n"
@@ -1198,17 +1113,16 @@ _GUARD_CONTROLS = [
     "label,body", _GUARD_CONTROLS, ids = [case[0] for case in _GUARD_CONTROLS],
 )
 def test_cast_if_needed_guards_still_count_as_alignment(label, body):
-    # Controls for the test above: these are dtype-safe on every path and must
-    # NOT turn red, or the canaries start failing on a healthy upstream.
+    # Controls: dtype-safe on every path, so they must not turn red or the canaries
+    # start failing on a healthy upstream.
     found, aligned = _merge_dtype_alignment(_synthetic_forward(body), "image_features")
     assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
 
 
-# A destructuring assignment rebinds the feature name just like a plain one.
-# `image_features, feature_lens = self.pack_image_features(...)` is upstream's
-# own spelling in llava_next / llava_next_video / llava_onevision; skipping it
-# lets an earlier aligned assignment keep proving alignment for a tensor that
-# has since been replaced.
+# A destructuring assignment rebinds the feature name just like a plain one, and
+# `image_features, feature_lens = self.pack_image_features(...)` is upstream's own
+# llava_next spelling. Skipping it lets an earlier aligned assignment keep proving
+# alignment for a tensor that has since been replaced.
 _UNPACK_HOLES = [
     ("tuple unpack",
      f"{_ALIGNED_ASSIGN}\n"
@@ -1242,10 +1156,9 @@ def test_destructuring_rebindings_of_the_feature_are_not_skipped(label, body):
     )
 
 
-# A destructuring target takes its RHS ELEMENT, not the whole RHS. Reading the
-# whole tuple lets a cast that belongs to some other name keep the feature green
-# (transformers writes literal-tuple destructuring: vilt's
-# `text_features, _ = (sequence_output[:, :n], sequence_output[:, n:])`).
+# A destructuring target takes its RHS ELEMENT, not the whole RHS: reading the
+# whole tuple lets a cast belonging to another name keep the feature green
+# (transformers writes literal-tuple destructuring in vilt).
 _UNPACK_PAIRING_HOLES = [
     ("tuple RHS whose cast belongs to the other name",
      f"{_ALIGNED_ASSIGN}\n"
@@ -1284,9 +1197,8 @@ def test_the_matching_element_of_a_tuple_rhs_still_counts():
     assert found and aligned, "the element the feature actually receives carries the cast"
 
 
-# `image_features += delta` is `Tensor.add_`: in place, so the name keeps the
-# dtype it already had. It can neither inherit the RHS's cast nor lose an
-# earlier one.
+# `image_features += delta` is `Tensor.add_`: in place, so the name keeps the dtype
+# it already had. It can neither inherit the RHS's cast nor lose an earlier one.
 _AUG_ASSIGN_CASES = [
     ("augmented assignment does not inherit the RHS cast",
      "image_features = image_features.float()\n"
@@ -1341,12 +1253,11 @@ def test_non_rebinding_targets_do_not_break_alignment(label, body):
     assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
 
 
-# The whole trace is "the source is cast to `inputs_embeds.dtype`, so the merge is
-# safe". That only holds while the DESTINATION is still at `inputs_embeds.dtype`.
-# A receiver transformation that retypes it turns the source cast into the wrong
-# cast: `inputs_embeds.float().masked_scatter(mask, image_features.to(
-# inputs_embeds.dtype))` has an fp32 destination and an fp16/bf16 source and
-# raises the exact error this whole file exists to prevent.
+# The trace is "the source is cast to `inputs_embeds.dtype`, so the merge is safe",
+# which only holds while the DESTINATION is still at that dtype: a receiver
+# transformation that retypes it leaves `inputs_embeds.float().masked_scatter(mask,
+# image_features.to(inputs_embeds.dtype))` with an fp32 destination and an fp16/bf16
+# source, raising the exact error this file exists to prevent.
 _RECEIVER_HOLES = [
     ("receiver upcast with .float()",
      "inputs_embeds = inputs_embeds.float().masked_scatter(\n"
@@ -1368,14 +1279,14 @@ _RECEIVER_HOLES = [
      "inputs_embeds = self.upcast(inputs_embeds).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.dtype)\n"
      ")"),
-    # `Tensor.view(dtype)` reinterprets the storage as another dtype, so a real
-    # dtype constant must still be caught after memory formats stop counting.
+    # `Tensor.view(dtype)` reinterprets the storage, so a real dtype constant must
+    # still be caught now that memory formats do not count.
     ("receiver .view(torch.int32) reinterprets the dtype",
      "inputs_embeds = inputs_embeds.view(torch.int32).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.dtype)\n"
      ")"),
-    # ... and it reinterprets it just as thoroughly when the dtype arrives in a
-    # variable, which reads as a plain name at the call site.
+    # ... just as thoroughly when the dtype arrives in a variable, which reads as a
+    # plain name at the call site.
     ("receiver .view(alias of torch.float32)",
      "target_dtype = torch.float32\n"
      "inputs_embeds = inputs_embeds.view(target_dtype).masked_scatter(\n"
@@ -1413,8 +1324,8 @@ def test_receiver_that_changes_dtype_is_not_alignment(label, merge):
 
 
 _RECEIVER_CONTROLS = [
-    # blip_2 really ships this spelling; the receiver predicate is deliberately
-    # loose enough to still recognise it, and `.to(<device>)` keeps the dtype.
+    # blip_2 really ships this spelling; the receiver predicate stays loose enough
+    # to recognise it, and `.to(<device>)` keeps the dtype.
     ("blip_2 receiver .to(other.device)",
      "inputs_embeds = inputs_embeds.to(image_features.device).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1439,8 +1350,7 @@ _RECEIVER_CONTROLS = [
      "inputs_embeds = inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
-    # A memory format is not a dtype: these keep the destination at
-    # `inputs_embeds.dtype`, and transformers already ships
+    # A memory format is not a dtype, and transformers already ships
     # `.clone(memory_format = torch.contiguous_format)` (higgs_audio_v2).
     ("receiver .clone(memory_format = torch.preserve_format)",
      "inputs_embeds = inputs_embeds.clone(memory_format = torch.preserve_format).masked_scatter(\n"
@@ -1454,9 +1364,8 @@ _RECEIVER_CONTROLS = [
      "inputs_embeds = inputs_embeds.contiguous(torch.channels_last).masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
-    # `Tensor.view` also takes a single shape sequence, so a plain name argument
-    # is far more often a shape than a dtype. Only a name actually BOUND to a
-    # dtype may retype the destination; these two keep it.
+    # `Tensor.view` also takes a shape sequence, so a plain name is more often a
+    # shape than a dtype. Only a name actually BOUND to a dtype may retype.
     ("receiver .view(shape variable)",
      "target_shape = image_features.shape\n"
      "inputs_embeds = inputs_embeds.view(target_shape).masked_scatter(\n"
@@ -1474,20 +1383,17 @@ _RECEIVER_CONTROLS = [
     "label,merge", _RECEIVER_CONTROLS, ids = [case[0] for case in _RECEIVER_CONTROLS],
 )
 def test_dtype_preserving_receivers_still_count_as_alignment(label, merge):
-    # Controls for the test above: every one of these merges into a destination
-    # that is still at `inputs_embeds.dtype`, so they must NOT turn red.
+    # Controls: every destination here is still at `inputs_embeds.dtype`.
     found, aligned = _merge_dtype_alignment(
         _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
     )
     assert found and aligned, f"{label}: dtype-safe spelling reported unaligned"
 
 
-# `masked_scatter` is out-of-place. Losing the surrounding `inputs_embeds =`
-# leaves every dtype cast in place - and silently drops the features, because the
-# merged tensor is discarded. Upstream assigns the result on 5.5.0-5.15.0, so
-# requiring it costs nothing; the in-place `masked_scatter_` spelling
-# (transformers writes it in qwen2_5_omni / blt) needs no assignment and must
-# still be accepted.
+# `masked_scatter` is out-of-place: losing the surrounding `inputs_embeds =` leaves
+# every dtype cast in place and silently drops the features. Upstream assigns the
+# result on 5.5.0-5.15.0, so requiring it costs nothing; in-place `masked_scatter_`
+# (qwen2_5_omni / blt) needs no assignment and must still be accepted.
 def test_discarded_out_of_place_merge_is_not_alignment():
     merge = (
         "inputs_embeds.masked_scatter(\n"
@@ -1525,7 +1431,7 @@ _RESULT_USE_CONTROLS = [
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
     # `masked_scatter_` returns its receiver, so a transformed in-place receiver
-    # that hands the result back is exactly as safe as the out-of-place spelling.
+    # that hands the result back is as safe as the out-of-place spelling.
     ("in-place merge into a clone whose result is assigned back",
      "inputs_embeds = inputs_embeds.clone().masked_scatter_(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1545,11 +1451,10 @@ def test_used_merge_results_still_count_as_alignment(label, merge):
 
 
 # ---------------------------------------------------------------------------
-# Merge DISCOVERY keys on the feature's values reaching the scatter source. A
-# source that only reads `<feature>.device` / `.dtype` / `.shape` merges some
-# other tensor, so accepting it would let a metadata mention impersonate a merge
-# upstream had deleted: `_merge_dtype_alignment` would report (True, True) on a
-# source in which no image value reaches the model.
+# Merge DISCOVERY keys on the feature's VALUES reaching the scatter source. A source
+# that only reads `<feature>.device` / `.dtype` / `.shape` merges some other tensor,
+# so accepting it would let a metadata mention impersonate a merge upstream had
+# deleted, reporting (True, True) while no image value reaches the model.
 # ---------------------------------------------------------------------------
 _METADATA_ONLY_MERGES = [
     ("source reads the feature device only",
@@ -1612,8 +1517,7 @@ def test_feature_values_reaching_the_source_are_still_a_merge(label, merge):
 
 
 def test_in_place_merge_with_an_unaligned_source_is_still_traced():
-    # Accepting `masked_scatter_` must not become a way to skip the dtype trace:
-    # the in-place op has exactly the same dtype requirement.
+    # Accepting `masked_scatter_` must not skip the dtype trace: same requirement.
     merge = (
         "image_features = image_features.float()\n"
         "inputs_embeds.masked_scatter_(image_mask, image_features)"
@@ -1627,13 +1531,11 @@ def test_in_place_merge_with_an_unaligned_source_is_still_traced():
 
 
 # ---------------------------------------------------------------------------
-# `Tensor.to(other)` is documented as "returns a Tensor with same torch.dtype and
-# torch.device as the Tensor other", so `image_features.to(inputs_embeds)` aligns
-# BOTH in one call and is a perfectly safe merge source. Reading only the
-# explicit `inputs_embeds.dtype` spelling would fail these canaries on a healthy
-# upstream that happened to prefer the overload, and the failure message would
-# claim the dtype is never aligned - a false red that hides nothing and costs a
-# release.
+# `Tensor.to(other)` is documented as returning a tensor with the same dtype AND
+# device as `other`, so `image_features.to(inputs_embeds)` aligns both in one call.
+# Reading only the explicit `inputs_embeds.dtype` spelling would fail these canaries
+# on a healthy upstream that preferred the overload, claiming the dtype is never
+# aligned - a false red that hides nothing and costs a release.
 # ---------------------------------------------------------------------------
 _TENSOR_OVERLOAD_CONTROLS = [
     ("tensor overload at the merge argument",
@@ -1677,8 +1579,7 @@ _TENSOR_OVERLOAD_HOLES = [
     ("overload naming a module attribute",
      "image_features = image_features.to(self.dummy)"),
     # `inputs_embeds` only carries the dtype as the FIRST positional argument;
-    # torch has no `other=` keyword, and `.to(device, inputs_embeds)` is not a
-    # signature that exists.
+    # torch has no `other=` keyword.
     ("embeds passed as a keyword, which torch rejects",
      "image_features = image_features.to(device = inputs_embeds)"),
 ]
@@ -1699,10 +1600,9 @@ def test_tensor_overload_to_another_tensor_is_not_alignment(label, body):
 
 # ---------------------------------------------------------------------------
 # `masked_scatter` is out-of-place, so the merged embedding exists ONLY in the
-# return value. Rejecting just the bare-expression spelling is not enough: a
-# result bound to a name nothing reads, or passed to a logger, is discarded just
-# as completely, and `forward` then returns the UNCHANGED `inputs_embeds` with
-# every dtype canary green. The result has to reach the embeddings that survive.
+# return value. Rejecting just the bare-expression spelling is not enough: a result
+# bound to a name nothing reads, or passed to a logger, is discarded as completely
+# and `forward` returns the UNCHANGED `inputs_embeds` with every canary green.
 # ---------------------------------------------------------------------------
 _DISCARDED_RESULT_HOLES = [
     ("result bound to a name nothing reads",
@@ -1722,9 +1622,8 @@ _DISCARDED_RESULT_HOLES = [
      "collected = [inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")]"),
-    # `masked_scatter_` is in place in the RECEIVER's storage. On a clone or a
-    # device-changed copy that storage is a temporary, so the discarded result is
-    # the whole merge: `forward` returns the unchanged `inputs_embeds`.
+    # `masked_scatter_` writes into the RECEIVER's storage; on a clone or a
+    # device-changed copy that storage is a temporary, so the merge is lost.
     ("in-place merge into a clone of the embeddings",
      "inputs_embeds.clone().masked_scatter_(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1733,9 +1632,9 @@ _DISCARDED_RESULT_HOLES = [
      "inputs_embeds.to('cuda').masked_scatter_(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")"),
-    # A destructuring target takes its own RHS element. Crediting the whole RHS
-    # let a tuple hand `inputs_embeds` the ORIGINAL while the merge went to a
-    # name nothing reads - the modality silently dropped, every canary green.
+    # A destructuring target takes its own RHS element; crediting the whole RHS let
+    # a tuple hand `inputs_embeds` the ORIGINAL while the merge went to a name
+    # nothing reads - the modality silently dropped, every canary green.
     ("destructuring hands the embeddings the original, not the merge",
      "merged = inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1752,9 +1651,8 @@ _DISCARDED_RESULT_HOLES = [
      ")\n"
      "(inputs_embeds, aux), sizes = (original, merged), image_sizes"),
     # A metadata read of the merge scatters nothing: the embeddings are handed the
-    # ORIGINAL tensor and only the merge's device / dtype / shape is consulted.
-    # Propagating taint through it reported the merge used, so a refactor that
-    # dropped the effective merge would keep every canary here green.
+    # ORIGINAL tensor. Propagating taint through it reported the merge used, so a
+    # refactor dropping the effective merge kept every canary here green.
     ("embeddings take the original, reading only the merge device",
      "merged = inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1805,9 +1703,9 @@ _RESULT_REACHES_CONTROLS = [
      "    inputs_embeds = inputs_embeds.masked_scatter(\n"
      "        image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      "    )"),
-    # The mirror image: pairing element by element must still see the merge when
-    # it IS the element the embeddings receive, and a non-literal RHS keeps the
-    # whole value, so an unpacking call still propagates it.
+    # The mirror image: element-by-element pairing must still see the merge when it
+    # IS the element the embeddings receive, and a non-literal RHS keeps the whole
+    # value, so an unpacking call still propagates it.
     ("destructuring hands the embeddings the merge",
      "merged = inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1828,8 +1726,8 @@ _RESULT_REACHES_CONTROLS = [
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
      ")\n"
      "inputs_embeds, *aux = merged, original"),
-    # Skipping metadata must not skip a real use that merely mentions metadata
-    # alongside it: the merged VALUES still reach the embeddings here.
+    # Skipping metadata must not skip a real use that merely mentions it alongside:
+    # the merged VALUES still reach the embeddings here.
     ("result reshaped by its own shape",
      "merged = inputs_embeds.masked_scatter(\n"
      "    image_mask, image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1847,8 +1745,7 @@ _RESULT_REACHES_CONTROLS = [
     "label,merge", _RESULT_REACHES_CONTROLS, ids = [c[0] for c in _RESULT_REACHES_CONTROLS],
 )
 def test_results_that_do_reach_the_embeddings_still_count(label, merge):
-    # Controls: the merged tensor really does land back on `inputs_embeds`, so
-    # these must NOT turn red.
+    # Controls: the merged tensor really does land back on `inputs_embeds`.
     found, aligned = _merge_dtype_alignment(
         _synthetic_forward(_ALIGNED_ASSIGN, merge = merge), "image_features",
     )
@@ -1856,10 +1753,10 @@ def test_results_that_do_reach_the_embeddings_still_count(label, merge):
 
 
 # ---------------------------------------------------------------------------
-# A name is not only rebound by an assignment statement. A `for` target, a `with
-# ... as` target and a named expression all replace the tensor the name refers
-# to, so an earlier aligned assignment stops describing it. Skipping them lets
-# the replacement - which nothing cast - reach masked_scatter.
+# A name is not only rebound by an assignment: a `for` target, a `with ... as`
+# target and a named expression all replace the tensor the name refers to, so an
+# earlier aligned assignment stops describing it. Skipping them lets the
+# replacement, which nothing cast, reach masked_scatter.
 # ---------------------------------------------------------------------------
 _NON_ASSIGN_BINDING_HOLES = [
     ("for target",
@@ -1938,11 +1835,10 @@ def test_aligned_or_unrelated_bindings_do_not_break_alignment(label, body):
 
 # ---------------------------------------------------------------------------
 # The eager patch's own matcher must be tied to the EMBEDDING merge. Accepting
-# `masked_scatter` on any receiver let an already-aligned merge on some scratch
-# tensor land in `fixed_casts`, which reads to
-# `_patch_gemma4_audio_feature_dtype_on_class` as "upstream fixed it": it sets
-# the patched marker and returns, leaving a real, still-device-only
-# `inputs_embeds` merge unpatched and crashing.
+# `masked_scatter` on any receiver let an aligned merge on a scratch tensor land in
+# `fixed_casts`, which reads to `_patch_gemma4_audio_feature_dtype_on_class` as
+# "upstream fixed it": it sets the marker and returns, leaving a real,
+# still-device-only `inputs_embeds` merge unpatched and crashing.
 # ---------------------------------------------------------------------------
 def _audio_forward(body):
     return (
@@ -1964,9 +1860,9 @@ _ALIGNED_SCRATCH_MERGE = (
     "    audio_mask, audio_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
     ")"
 )
-# The same decoy, written so the receiver MENTIONS `inputs_embeds` without being
-# it. Matching the name anywhere in the receiver expression accepted this as the
-# embedding merge; the receiver has to be anchored at its base instead.
+# The same decoy with a receiver that MENTIONS `inputs_embeds` without being it.
+# Matching the name anywhere in the receiver accepted this as the embedding merge;
+# the receiver has to be anchored at its base instead.
 _ALIGNED_SCRATCH_MERGE_ON_EMBEDS_DEVICE = (
     "scratch = scratch.to(inputs_embeds.device).masked_scatter(\n"
     "    audio_mask, audio_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
@@ -1981,8 +1877,7 @@ def _audio_merge_casts(body):
 
 
 def test_eager_matcher_ignores_merges_onto_other_tensors():
-    # An aligned decoy on a scratch tensor must not be reported as the audio
-    # merge being already fixed.
+    # An aligned decoy on a scratch tensor is not the audio merge already fixed.
     buggy, fixed = _audio_merge_casts(_ALIGNED_SCRATCH_MERGE)
     assert not buggy and not fixed, (
         f"_gemma4_audio_merge_casts counted a `scratch.masked_scatter(...)` as the "
@@ -1993,8 +1888,8 @@ def test_eager_matcher_ignores_merges_onto_other_tensors():
 
 
 def test_eager_matcher_still_finds_the_real_merge_next_to_a_decoy():
-    # The decoy must be ignored AND the real device-only merge still picked up,
-    # so the patch fires exactly once.
+    # The decoy is ignored AND the real device-only merge still picked up, so the
+    # patch fires exactly once.
     buggy, fixed = _audio_merge_casts(_ALIGNED_SCRATCH_MERGE + "\n" + _REAL_AUDIO_MERGE)
     assert len(buggy) == 1 and not fixed, (
         f"expected the one real device-only `inputs_embeds` merge to be patchable "
@@ -2008,11 +1903,10 @@ def test_eager_matcher_still_finds_the_real_merge_next_to_a_decoy():
     ids = ["bare scratch receiver", "scratch receiver naming inputs_embeds"],
 )
 def test_a_decoy_merge_never_hides_the_real_one(decoy):
-    # `scratch.to(inputs_embeds.device)` is a different tensor, however many
-    # times it names `inputs_embeds`. Counting it as the embedding merge puts an
-    # aligned cast in `fixed_casts`, and `len(buggy) == 1 and fixed_casts` is
-    # exactly the branch on which the eager patch returns without patching and
-    # without warning - the real device-only merge stays broken.
+    # `scratch.to(inputs_embeds.device)` is a different tensor however often it
+    # names `inputs_embeds`. Counting it puts an aligned cast in `fixed_casts`, and
+    # `len(buggy) == 1 and fixed_casts` is exactly the branch on which the eager
+    # patch returns without patching and without warning.
     buggy, fixed = _audio_merge_casts(decoy + "\n" + _REAL_AUDIO_MERGE)
     assert len(buggy) == 1 and not fixed, (
         f"expected the one real device-only `inputs_embeds` merge to be patchable "
@@ -2023,7 +1917,7 @@ def test_a_decoy_merge_never_hides_the_real_one(decoy):
 def test_eager_matcher_still_accepts_a_transformed_inputs_embeds_receiver():
     # Discovery must stay loose about HOW the receiver mentions `inputs_embeds`
     # (blip_2 ships `inputs_embeds.to(...).masked_scatter(...)`), or a real merge
-    # would be dropped instead of patched.
+    # is dropped instead of patched.
     buggy, fixed = _audio_merge_casts(
         "inputs_embeds = inputs_embeds.to(audio_features.device).masked_scatter(\n"
         "    audio_mask.to(inputs_embeds.device), audio_features.to(inputs_embeds.device)\n"
