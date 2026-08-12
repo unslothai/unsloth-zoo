@@ -1006,22 +1006,19 @@ def plan_device_map(
                 # is refused. A four-layer model whose head is larger than half
                 # the weights (share 24 KiB, head 32 KiB) was rejected on
                 # 2 x 8 GiB for exactly that reason.
-                # Capped PER DEVICE, not by the smallest cap across all of
-                # them. A single `min` lets the head's card -- the only one
-                # that pays the headroom, and so the only one whose cap can go
-                # negative -- drive the reserve to zero on cards that had room
-                # for one. Measured on Kaggle-Muse_Glimmer_(30B)-GRPO, 2 x
-                # 14.56 GiB: budgets 13.104 each, weights 20.310, headroom
-                # 4.104, so value 0.897 GiB and caps 2.949 (cuda:0) and -1.155
-                # (cuda:1, the head). The min was -1.155, both cards got a
-                # 0.000 GiB reserve, cuda:0 was packed to within 0.161 GiB and
-                # the run OOMed at the first training step asking for 254 MiB.
-                # cuda:1 finished with 5.737 GiB unused.
-                #
-                # Clamping each device at 0 individually keeps the property
-                # the shared cap was added for: the head's own reserve still
-                # cannot go negative, so `attempt` -- which only relaxes the
-                # OTHER cards -- is never handed an infeasible head budget.
+                # Cap PER DEVICE, not by the smallest cap across all of them:
+                # a single `min` lets the head's card -- the only one paying
+                # the headroom, so the only one whose cap can go negative --
+                # zero the reserve on cards that had room for one. Measured on
+                # Kaggle-Muse_Glimmer_(30B)-GRPO, 2 x 14.56 GiB: budgets 13.104
+                # each, weights 20.310, headroom 4.104, so value 0.897 GiB and
+                # caps 2.949 (cuda:0) and -1.155 (cuda:1, the head). That min
+                # gave both cards a 0.000 GiB reserve, cuda:0 was packed to
+                # within 0.161 GiB and the run OOMed on the first training
+                # step's 254 MiB while cuda:1 left 5.737 GiB unused. Clamping
+                # each device at 0 still keeps the head's own reserve
+                # non-negative, so `attempt` -- which only relaxes the OTHER
+                # cards -- is never handed an infeasible head budget.
                 share = max(-(-total // len(devices)), pinned_bytes)
                 per_device = {
                     d: int(max(0, min(
@@ -1053,29 +1050,23 @@ def plan_device_map(
         if reserve_is_explicit:
             return _fill(head_device, reserve, max(reserve.values()))
 
-        # The reserve is per device now, so it is a range, not one number: the
-        # top is what we would like every card to keep, the floor is exactly
-        # what the old shared `min` cap handed all of them (`min` of a clamp is
-        # the clamp of the `min`). Relaxing from the top alone can therefore
-        # land BELOW what the old planner kept -- a request that misses by one
-        # percent is answered by a whole 5% rung -- so 4 x 80 GiB holding a
-        # 144 GiB model kept 41.72 GiB per card where the shared cap kept 43.68.
+        # The reserve is per device now, so it is a range: the top is what we
+        # would like every card to keep, the floor is exactly what the old
+        # shared `min` cap handed all of them (`min` of a clamp is the clamp of
+        # the `min`). Relaxing from the top alone can land BELOW that floor --
+        # a request missing by one percent is answered by a whole 5% rung -- so
+        # 4 x 80 GiB holding a 144 GiB model kept 41.72 GiB per card where the
+        # shared cap kept 43.68.
         #
-        # So try every rung EITHER planner would have tried, best first. The
-        # candidates are the reserves actually kept per device:
-        #
-        #   A  relax only the non-head cards, from the per-device range
-        #   B  the old shared ladder: every card on the floor, non-head cards
-        #      stepped down from it
-        #   C  last resort, relax the head's own reserve too, per device
-        #   D  last resort on the old shared ladder
-        #
-        # B and D are the old planner's two ladders, rung for rung, so its
-        # result is always in this set; ordering by the smallest reserve any
-        # card keeps means the accepted plan can never keep less than it did.
-        # C exists because the loop that only relaxes the OTHER cards can miss
-        # the head's card by less than its reserve and refuse a model that fits.
-        # The logit headroom is never touched by any of them.
+        # So try every rung EITHER planner would have tried, best first: the
+        # non-head cards stepped down from the per-device range and from the
+        # old shared floor, then both ladders again with the head's own reserve
+        # relaxed too. The old planner's ladders are in that set rung for rung,
+        # and ordering by the smallest reserve any card keeps means the
+        # accepted plan can never keep less than it did. The head-relaxing
+        # rungs exist because relaxing only the OTHER cards can miss the head's
+        # card by less than its reserve and refuse a model that fits. The logit
+        # headroom is never touched by any of them.
         top, floor = max(reserve.values()), min(reserve.values())
         rungs = sorted(
             {top * (20 - step) // 20 for step in range(21)} |
@@ -1100,9 +1091,8 @@ def plan_device_map(
                 continue
             seen.add(key)
             ordered.append(kept)
-        # Most-kept first: the smallest reserve on any card, then the head's own,
-        # then the total. Passing `max(kept.values())` as the non-head cap makes
-        # `_fill` keep exactly this mapping.
+        # Most-kept first. Passing `max(kept.values())` as the non-head cap
+        # makes `_fill` keep exactly this mapping.
         ordered.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
                      reverse = True)
         for kept in ordered:

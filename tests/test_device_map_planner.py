@@ -1138,8 +1138,8 @@ def _muse_shaped_budgets(model):
         headroom < 2B - W       the balanced reserve is still positive
         B >= head + headroom    the head's card can actually hold its own
 
-    Solve for B and headroom from the model's real sizes rather than picking
-    round numbers, so the test states the condition instead of hoping for it.
+    So solve for B and headroom from the model's real sizes rather than
+    picking round numbers and hoping.
     """
     sizes = {n: p.numel() * p.element_size()
              for n, p in model.named_parameters()}
@@ -1159,15 +1159,13 @@ def test_a_negative_cap_on_the_head_does_not_zero_the_other_cards():
     """The Muse Glimmer shape, in miniature.
 
     Measured on Kaggle-Muse_Glimmer_(30B)-GRPO across 2 x 14.56 GiB: budgets
-    13.104 GiB each after the quantiser's haircut, 20.310 GiB of weights and
-    4.104 GiB of logit headroom. The balanced reserve worked out at 0.897 GiB
-    and the per-device caps at +2.949 (cuda:0) and -1.155 (cuda:1, the head).
-    Capping by the MINIMUM across devices took the head's negative cap and
-    applied it everywhere, so both cards got a 0.000 GiB reserve, cuda:0 was
-    packed to within 0.161 GiB, and training OOMed on its first 254 MiB
-    allocation while cuda:1 sat on 5.737 GiB of unused memory.
-
-    A card that does not pay the headroom must keep its own reserve.
+    13.104 GiB each after the quantiser's haircut, 20.310 GiB of weights,
+    4.104 GiB of logit headroom, so a balanced reserve of 0.897 GiB and
+    per-device caps of +2.949 (cuda:0) and -1.155 (cuda:1, the head). Capping
+    by the MINIMUM applied the head's negative cap everywhere: both cards got
+    0.000 GiB, cuda:0 was packed to within 0.161 GiB and training OOMed on its
+    first 254 MiB allocation while cuda:1 sat on 5.737 GiB unused. A card that
+    does not pay the headroom must keep its own reserve.
     """
     model = _meta(hidden = 256, vocab = 8192, layers = 16)
     budget, headroom = _muse_shaped_budgets(model)
@@ -1193,9 +1191,8 @@ def test_the_head_card_reserve_still_cannot_go_negative():
     """The property the shared cap was originally added for.
 
     `attempt` only ever relaxes the reserve on the OTHER cards, so a negative
-    reserve on the head's own card makes every step infeasible and the plan is
-    refused outright. Clamping each device at zero individually has to keep
-    that from happening.
+    reserve on the head's own card makes every step infeasible and refuses the
+    plan outright. Clamping each device at zero has to keep that from happening.
     """
     model = _meta(hidden = 256, vocab = 8192, layers = 16)
     budget, headroom = _muse_shaped_budgets(model)
@@ -1211,8 +1208,8 @@ def test_the_head_card_reserve_still_cannot_go_negative():
 class _WideBlock(nn.Module):
     """A decoder block chunky enough that the packing has real granularity.
 
-    `_Block` is a single square Linear, so on any budget the greedy walk fits at
-    the first try and the relaxation ladder below is never exercised.
+    `_Block` is a single square Linear, so the greedy walk fits at the first
+    try and the relaxation ladder below is never exercised.
     """
     def __init__(self, hidden, ffn, dtype):
         super().__init__()
@@ -1243,15 +1240,14 @@ class _Wide(nn.Module):
 def test_the_relaxed_reserve_is_never_below_the_old_shared_cap():
     """Per-device reserves must not lose ground on identical cards.
 
-    The reserve is a range now, not one number, and `attempt` relaxes the
-    non-head cards from the TOP of it in 5% steps. On identical cards the top
-    sits one headroom-share above the bottom -- a fraction of a percent -- so a
-    request that misses by that fraction is answered by a whole 5% step, and the
-    cards end up keeping LESS than the single shared cap used to give them.
-
-    Measured here: 4 identical cards, a 24-layer model at ~65% of their total,
-    shared cap 3.043 GiB per card, stepping from the top alone 2.981 GiB. The
-    same shape at 4 x 80 GiB lost 1.97 GiB per card.
+    The reserve is a range now, and `attempt` relaxes the non-head cards from
+    the TOP of it in 5% steps. On identical cards the top sits one
+    headroom-share above the bottom -- a fraction of a percent -- so a request
+    missing by that fraction is answered by a whole 5% step and the cards keep
+    LESS than the single shared cap used to give them. Measured here: 4
+    identical cards, a 24-layer model at ~65% of their total, shared cap 3.043
+    GiB per card against 2.981 GiB stepping from the top alone. The same shape
+    at 4 x 80 GiB lost 1.97 GiB per card.
     """
     kw = dict(hidden = 4096, ffn = 16384, vocab = 152064, layers = 24)
     with torch.device("meta"):
@@ -1282,18 +1278,18 @@ def test_the_head_relaxation_ladder_also_keeps_the_old_shared_floor():
 
     Merging the floor into the rungs fixed the loop that relaxes only the
     NON-head cards. The last-resort loop below it, which relaxes the head's own
-    reserve too, kept scaling the per-device reserve from the top alone, so it
-    could still land under what a single shared cap would have kept.
+    reserve too, kept scaling from the top alone, so it could still land under
+    what a single shared cap would have kept.
 
-    Byte-exact here rather than approximated. Two units of 20 and 400 bytes and
-    an 80-byte head on budgets 300 and 590 with 22 bytes of headroom: weights
-    500, so the equal share is 250, the caps are 50 (cuda:0) and 318 (cuda:1,
-    the head) and the balanced value is 184. cuda:1 must hold the 400-byte unit,
-    which needs its reserve down to 88, so every rung of the first loop -- all of
-    which keep cuda:1 on its full 184 -- fails, and the last resort scales BOTH
-    cards down in 5% steps until cuda:1 fits. It lands at 82/22, and cuda:0 is
-    left with 22 bytes where the old shared cap of 50 fit perfectly well: the
-    placement is identical either way, so the 28 bytes bought nothing.
+    Byte-exact here. Two units of 20 and 400 bytes and an 80-byte head on
+    budgets 300 and 590 with 22 bytes of headroom: weights 500, so the equal
+    share is 250, the caps are 50 (cuda:0) and 318 (cuda:1, the head) and the
+    balanced value is 184. cuda:1 must hold the 400-byte unit, which needs its
+    reserve down to 88, so every rung of the first loop -- all keeping cuda:1
+    on its full 184 -- fails and the last resort scales BOTH cards down in 5%
+    steps until cuda:1 fits. It lands at 82/22, leaving cuda:0 with 22 bytes
+    where the old shared cap of 50 fit perfectly well: the placement is
+    identical either way, so the 28 bytes bought nothing.
     """
     with torch.device("meta"):
         model = _Bins([5, 100], head = 20)
