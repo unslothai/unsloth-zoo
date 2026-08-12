@@ -267,10 +267,10 @@ class _Sized(nn.Module):
 class _Bins(nn.Module):
     _no_split_modules = ["_Sized"]
 
-    def __init__(self, sizes):
+    def __init__(self, sizes, head = 1):
         super().__init__()
         self.parts = nn.ModuleList([_Sized(n) for n in sizes])
-        self.lm_head = nn.Linear(1, 1, bias = False)
+        self.lm_head = nn.Linear(head, 1, bias = False)
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -1274,4 +1274,37 @@ def test_the_relaxed_reserve_is_never_below_the_old_shared_cap():
     assert min(kept.values()) >= shared_cap, (
         f"the relaxation ladder landed below the old shared cap: kept {kept}, "
         f"shared cap {shared_cap}"
+    )
+
+
+def test_the_head_relaxation_ladder_also_keeps_the_old_shared_floor():
+    """The same loss, one ladder further down.
+
+    Merging the floor into the rungs fixed the loop that relaxes only the
+    NON-head cards. The last-resort loop below it, which relaxes the head's own
+    reserve too, kept scaling the per-device reserve from the top alone, so it
+    could still land under what a single shared cap would have kept.
+
+    Byte-exact here rather than approximated. Two units of 20 and 400 bytes and
+    an 80-byte head on budgets 300 and 590 with 22 bytes of headroom: weights
+    500, so the equal share is 250, the caps are 50 (cuda:0) and 318 (cuda:1,
+    the head) and the balanced value is 184. cuda:1 must hold the 400-byte unit,
+    which needs its reserve down to 88, so every rung of the first loop -- all of
+    which keep cuda:1 on its full 184 -- fails, and the last resort scales BOTH
+    cards down in 5% steps until cuda:1 fits. It lands at 82/22, and cuda:0 is
+    left with 22 bytes where the old shared cap of 50 fit perfectly well: the
+    placement is identical either way, so the 28 bytes bought nothing.
+    """
+    with torch.device("meta"):
+        model = _Bins([5, 100], head = 20)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 300, 1: 590},
+        headroom_bytes = 22,
+    )
+    assert plan is not None
+    assert plan.weight_bytes == {0: 20, 1: 480}
+    kept = plan.activation_reserve_by_device
+    assert min(kept.values()) >= 50, (
+        f"the last-resort ladder landed below the old shared cap of 50: {kept}"
     )
