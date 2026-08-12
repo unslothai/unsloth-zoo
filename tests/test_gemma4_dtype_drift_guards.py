@@ -203,106 +203,326 @@ def _mentions(node, name):
     )
 
 
-def _carries_inputs_embeds_dtype(node):
-    """Does ``node`` carry ``inputs_embeds.dtype``?
+def _is_attr(node, owner, attr):
+    """``<owner>.<attr>`` as an AST node, e.g. ``inputs_embeds.dtype``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == owner
+    )
 
-    Covers both spellings upstream uses: the positional `.to(device, dtype)`
-    overload and the keyword `dtype=inputs_embeds.dtype` one.
+
+def _is_embeds_dtype(node):
+    return _is_attr(node, "inputs_embeds", "dtype")
+
+
+def _is_device_expr(node):
+    """``x.device``, ``"cuda"`` or ``torch.device(...)``: a device, not a dtype."""
+    if isinstance(node, ast.Attribute) and node.attr == "device":
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "device"
+    )
+
+
+def _is_dtype_bearing(node):
+    """Can ``node`` be a dtype argument (``torch.float32``, ``other.dtype``)?"""
+    if isinstance(node, ast.Attribute) and node.attr == "dtype":
+        return True
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "torch"
+    )
+
+
+def _is_embeds_tensor(node):
+    return isinstance(node, ast.Name) and node.id == "inputs_embeds"
+
+
+def _call_aligns_dtype(call):
+    """Does this call land the tensor ON ``inputs_embeds``' dtype?
+
+    Three spellings count. `.to(inputs_embeds.device, inputs_embeds.dtype)` and
+    `.to(dtype = inputs_embeds.dtype)` name the dtype; `.to(inputs_embeds)` and
+    `.type_as(inputs_embeds)` take it from the tensor itself, which torch
+    documents as returning a tensor with the same dtype (and, for `.to`, device)
+    as the argument. Only a dtype ARGUMENT counts, so a bare mention of
+    `inputs_embeds.dtype` somewhere else in the expression proves nothing.
     """
-    for n in ast.walk(node):
-        if (
-            isinstance(n, ast.Attribute)
-            and n.attr == "dtype"
-            and isinstance(n.value, ast.Name)
-            and n.value.id == "inputs_embeds"
-        ):
-            return True
-    return False
+    method = call.func.attr
+    if method == "type_as":
+        return bool(call.args) and _is_embeds_tensor(call.args[0])
+    if method != "to":
+        return False
+    if any(_is_embeds_dtype(a) for a in call.args):
+        return True
+    if any(kw.arg == "dtype" and _is_embeds_dtype(kw.value) for kw in call.keywords):
+        return True
+    # torch spells the tensor overload positionally only; there is no `other=`.
+    return bool(call.args) and _is_embeds_tensor(call.args[0])
 
 
-def _merge_calls(tree, modality):
-    """Every ``masked_scatter`` call that scatters ``<modality>_features``.
+def _to_call_is_device_only(call):
+    """Is this ``.to(...)`` a pure device move, which keeps the dtype?
 
-    Returns (call_node, source_argument) pairs. The source argument is the
-    scattered VALUE (the second positional arg, or `source=`), which is the
-    tensor whose dtype has to line up with the destination.
+    `to(device = None, dtype = None, ...)` infers `dtype` from `self` when it is
+    not given, so `features.to(inputs_embeds.device)` cannot retype anything.
     """
-    name = f"{modality}_features"
+    for arg in call.args:
+        if not _is_device_expr(arg):
+            return False
+    for kw in call.keywords:
+        if kw.arg in ("non_blocking", "copy", "memory_format"):
+            continue
+        if kw.arg == "device" and _is_device_expr(kw.value):
+            continue
+        return False
+    return True
+
+
+# Methods that reshape or relocate a tensor without retyping it, so the dtype the
+# merge sees is still the one its reaching definition established.
+_DTYPE_PRESERVING_METHODS = frozenset({
+    "clone", "contiguous", "detach", "cpu", "cuda",
+    "view", "reshape", "flatten", "squeeze", "unsqueeze",
+    "expand", "expand_as", "transpose", "permute", "narrow",
+})
+
+
+def _expr_alignment(node, name):
+    """Alignment of the value ``node`` produces, for the tensor called ``name``.
+
+    True  -> the expression itself casts to inputs_embeds' dtype.
+    None  -> it only moves/reshapes ``name``, so its dtype is whatever reached it.
+    False -> anything else, including an expression that retypes (`.float()`) or
+             one built from some other tensor entirely.
+    """
+    while True:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            method = node.func.attr
+            if _call_aligns_dtype(node):
+                return True
+            if method == "to":
+                if not _to_call_is_device_only(node):
+                    return False
+            elif method in _DTYPE_PRESERVING_METHODS:
+                values = list(node.args) + [kw.value for kw in node.keywords]
+                if any(_is_dtype_bearing(v) for v in values):
+                    return False
+            else:
+                return False
+            node = node.func.value
+            continue
+        if isinstance(node, ast.Subscript):
+            node = node.value
+            continue
+        if isinstance(node, ast.Name):
+            return None if node.id == name else False
+        return False
+
+
+def _bound_names(target):
+    """Every plain local name an assignment target binds.
+
+    `image_features[0] = ...` and `self.image_features = ...` are NOT bindings:
+    the name keeps referring to the same object, so the RHS of a slice write is
+    not the definition that reaches the merge.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [n for elt in target.elts for n in _bound_names(elt)]
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    return []
+
+
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _walk_own_scope(root, descend = True):
+    """``ast.walk`` restricted to the code ``root``'s own scope executes.
+
+    A nested `def` / `class` / `lambda` has its own locals, so a cast written in
+    another method says nothing about the tensor this one scatters. The nested
+    node itself is still yielded, only its body is skipped.
+    """
+    if isinstance(root, _SCOPE_NODES) and not descend:
+        yield root
+        return
+    todo = [root]
+    while todo:
+        node = todo.pop(0)
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _SCOPE_NODES):
+                yield child
+            else:
+                todo.append(child)
+
+
+def _child_blocks(stmt):
+    """Every nested statement list of ``stmt`` (if/else, loop bodies, try)."""
+    blocks = []
+    for field in ("body", "orelse", "finalbody"):
+        value = getattr(stmt, field, None)
+        if isinstance(value, list) and value and all(isinstance(s, ast.stmt) for s in value):
+            blocks.append(value)
+    for handler in getattr(stmt, "handlers", None) or []:
+        blocks.append(handler.body)
+    return blocks
+
+
+def _enclosing_blocks(scope, target):
+    """``[(block, index)]`` from the scope body inwards to the stmt holding ``target``.
+
+    Only these statement lists run on the path to ``target``. A cast stranded in
+    a branch the merge does not run under is not a reaching definition, however
+    late in the file it is written.
+    """
+    chain = []
+
+    def holds(node):
+        return any(n is target for n in _walk_own_scope(node, descend = False))
+
+    def descend(block):
+        for index, stmt in enumerate(block):
+            if not holds(stmt):
+                continue
+            chain.append((block, index))
+            for inner in _child_blocks(stmt):
+                if any(holds(s) for s in inner):
+                    descend(inner)
+                    break
+            return
+
+    descend(scope.body)
+    return chain
+
+
+def _rebinding_values(stmt, name):
+    """The value expressions every rebinding of ``name`` inside ``stmt`` gives it."""
+    values = []
+    for node in _walk_own_scope(stmt, descend = False):
+        if isinstance(node, ast.Assign):
+            pairs = [(t, node.value) for t in node.targets]
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            pairs = [(node.target, node.value)]
+        else:
+            continue
+        for target, value in pairs:
+            if name in _bound_names(target):
+                values.append(value)
+    return values
+
+
+def _reaching_alignment(scope, name, target):
+    """Fold the statements that reach ``target`` into "is ``name`` dtype-aligned?".
+
+    Every rebinding on the way has to leave the tensor aligned. A rebinding that
+    only moves or reshapes it inherits the running verdict, so a device move
+    hoisted out of the merge call does not read as a regression; one that can
+    retype it, or that is stranded in a branch alongside an unaligned sibling,
+    makes the whole thing unaligned.
+    """
+    state, seen = False, False
+    for block, index in _enclosing_blocks(scope, target):
+        for stmt in block[:index]:
+            values = _rebinding_values(stmt, name)
+            if not values:
+                continue
+            seen = True
+            resolved = [_expr_alignment(v, name) for v in values]
+            state = all(state if r is None else r for r in resolved)
+    return state, seen
+
+
+def _feature_merges(scope, name):
+    """Every ``inputs_embeds.masked_scatter[_](mask, <name> ...)`` in ``scope``.
+
+    The receiver has to reference `inputs_embeds`: an auxiliary scatter into some
+    other tensor is not the merge these guards protect, and letting one in makes
+    the canary answer for the wrong call in both directions. Only the SOURCE
+    operand is inspected, since that is the tensor whose dtype `masked_scatter`
+    requires to match; the mask is a bool tensor and its dtype is irrelevant.
+    """
     found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    for node in _walk_own_scope(scope):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("masked_scatter", "masked_scatter_")
+        ):
             continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr in ("masked_scatter", "masked_scatter_")):
+        if not _mentions(node.func.value, "inputs_embeds"):
             continue
-        args = list(node.args) + [kw.value for kw in node.keywords if kw.arg in (None, "source")]
-        for arg in args:
-            if _mentions(arg, name):
-                found.append((node, arg))
-                break
+        source = node.args[1] if len(node.args) >= 2 else None
+        if source is None:
+            source = next((kw.value for kw in node.keywords if kw.arg == "source"), None)
+        if source is not None and _mentions(source, name):
+            found.append((node, source))
     return found
 
 
-def _last_binding_before(tree, name, lineno):
-    """The last assignment to ``name`` that can reach line ``lineno``.
-
-    Textually last wins, which is what a straight-line merge block gives us.
-    Both `x = ...` and `x: T = ...` count, as does a tuple/starred target that
-    includes ``name``.
-    """
-    best = None
+def _scopes(tree):
+    """The module plus every function body, each as its own name scope."""
+    yield tree
     for node in ast.walk(tree):
-        targets = []
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            targets = [node.target]
-        else:
-            continue
-        binds = any(
-            isinstance(t, ast.Name) and t.id == name
-            for target in targets
-            for t in ast.walk(target)
-        )
-        if not binds or node.lineno >= lineno:
-            continue
-        if best is None or node.lineno > best.lineno:
-            best = node
-    return best
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
 
 
 def _merge_is_dtype_aligned(src, modality):
     """Is the ``<modality>_features`` tensor that reaches the merge dtype-aligned?
 
-    Structural, not textual: find the masked_scatter that consumes the tensor,
-    then ask whether ``inputs_embeds.dtype`` is applied EITHER in the scattered
-    expression itself OR in the last assignment that reaches it. Answering from
-    the reaching definition (rather than from any mention of the name anywhere
-    in the file) is what stops a later device-only rebinding, or a cast in some
-    unrelated method, from standing in for the cast that actually runs.
+    Structural, not textual: find the `inputs_embeds.masked_scatter` that
+    consumes the tensor, then ask whether it lands on ``inputs_embeds.dtype``
+    either in the scattered expression itself or in the definitions that reach
+    it along the merge's own control-flow path, inside the merge's own scope.
+    Answering from the reaching definition (rather than from any mention of the
+    name anywhere in the file) is what stops a later retyping rebinding, or a
+    cast in some unrelated method or untaken branch, from standing in for the
+    cast that actually runs.
 
     Returns (ok, detail) so a failure can say what it saw.
     """
     tree = ast.parse(src)
-    merges = _merge_calls(tree, modality)
-    if not merges:
-        return False, f"no masked_scatter consuming {modality}_features"
-    for call, arg in merges:
-        if _carries_inputs_embeds_dtype(arg):
-            continue
-        binding = _last_binding_before(tree, f"{modality}_features", call.lineno)
-        if binding is None:
-            return False, (
-                f"{modality}_features is scattered at line {call.lineno} with no "
-                f"assignment reaching it"
-            )
-        if not _carries_inputs_embeds_dtype(binding.value):
-            return False, (
-                f"the {modality}_features binding reaching the merge at line "
-                f"{call.lineno} does not cast to inputs_embeds.dtype: "
-                f"{ast.unparse(binding).strip()!r}"
-            )
-    return True, f"{len(merges)} merge(s) dtype-aligned"
+    name = f"{modality}_features"
+    total = 0
+    for scope in _scopes(tree):
+        for call, source in _feature_merges(scope, name):
+            total += 1
+            at_call = _expr_alignment(source, name)
+            if at_call is True:
+                continue
+            if at_call is False:
+                # The scattered expression rebuilds or retypes the tensor, so
+                # whatever the reaching definition established no longer holds.
+                return False, (
+                    f"the expression scattered at line {call.lineno} does not "
+                    f"reach inputs_embeds.dtype: {ast.unparse(source).strip()!r}"
+                )
+            aligned, seen = _reaching_alignment(scope, name, call)
+            if not seen:
+                return False, (
+                    f"{name} is scattered at line {call.lineno} with no "
+                    f"assignment reaching it"
+                )
+            if not aligned:
+                return False, (
+                    f"the {name} binding reaching the merge at line "
+                    f"{call.lineno} does not cast to inputs_embeds.dtype: "
+                    f"{ast.unparse(source).strip()!r}"
+                )
+    if not total:
+        return False, f"no masked_scatter consuming {name}"
+    return True, f"{total} merge(s) dtype-aligned"
 
 
 @requires_gemma4
@@ -408,6 +628,78 @@ def forward(self, inputs_embeds):
     image_features = self.get_image_features(pixel_values, inputs_embeds)
     image_features = image_features.to(inputs_embeds.device)
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # torch's tensor overload: `.to(other)` takes other's dtype AND device, so
+    # this is aligned even though it never spells `inputs_embeds.dtype`.
+    "tensor_overload": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", True),
+    # `.type_as` is the dtype-only spelling of the same thing.
+    "type_as": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).type_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", True),
+    # A device move hoisted OUT of the merge call keeps the earlier cast: `.to()`
+    # infers dtype from self when none is given, so this cannot retype anything.
+    "device_move_after_cast": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+    image_features = image_features.to(inputs_embeds.device)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", True),
+    # An auxiliary scatter into some OTHER tensor is not the merge we protect,
+    # and must not be able to fail the guard on a correct inputs_embeds merge.
+    "auxiliary_scatter_elsewhere": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+    scratch = torch.zeros_like(inputs_embeds)
+    image_features = image_features.float()
+    scratch = scratch.masked_scatter(image_mask, image_features)
+""", True),
+    # A mention of inputs_embeds.dtype that is not a cast argument proves nothing.
+    "dtype_mentioned_but_not_applied": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device) if inputs_embeds.dtype is not None else image_features
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # A cast in the branch the merge does NOT come through is not a definition
+    # that reaches it.
+    "cast_in_untaken_branch": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    if fast_path:
+        image_features = image_features.to(inputs_embeds.device)
+    else:
+        image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # The mask operand's dtype is irrelevant; only the source has to line up.
+    "cast_on_the_mask_only": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device)
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_features.to(inputs_embeds.dtype).bool(), image_features
+    )
+""", False),
+    # A slice write does not rebind the name, so its RHS is not the definition
+    # that reaches the merge.
+    "subscript_write_is_not_a_binding": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device)
+    image_features[0] = replacement.to(inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # The scattered expression retypes the tensor, so an earlier good cast is
+    # already spent by the time masked_scatter sees it.
+    "source_overrides_the_dtype": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features.float())
 """, False),
     # No merge at all is a drift we want to hear about, not a silent pass.
     "no_merge": ("""
