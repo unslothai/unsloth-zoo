@@ -267,10 +267,10 @@ class _Sized(nn.Module):
 class _Bins(nn.Module):
     _no_split_modules = ["_Sized"]
 
-    def __init__(self, sizes):
+    def __init__(self, sizes, head = 1):
         super().__init__()
         self.parts = nn.ModuleList([_Sized(n) for n in sizes])
-        self.lm_head = nn.Linear(1, 1, bias = False)
+        self.lm_head = nn.Linear(head, 1, bias = False)
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -1126,3 +1126,185 @@ def test_the_auto_reserve_relaxes_on_the_head_as_a_last_resort():
     assert plan.device_map["layers.0"] == 1
     # The headroom survives in full; only the activation reserve gave way.
     assert plan.raw_budgets[1] - plan.weight_bytes[1] >= headroom
+
+
+def _muse_shaped_budgets(model):
+    """Budgets that reproduce the Muse Glimmer arithmetic on a toy model.
+
+    The bug needs three things at once, and a model whose weights are
+    negligible against the budgets satisfies none of them:
+
+        headroom > B - W/2      the head's cap goes negative
+        headroom < 2B - W       the balanced reserve is still positive
+        B >= head + headroom    the head's card can actually hold its own
+
+    Solve for B and headroom from the model's real sizes rather than picking
+    round numbers, so the test states the condition instead of hoping for it.
+    """
+    sizes = {n: p.numel() * p.element_size()
+             for n, p in model.named_parameters()}
+    total = sum(sizes.values())
+    head = sizes["lm_head.weight"]
+    budget = 3 * total // 2
+    # Inside (budget - total/2, budget - head], which is non-empty exactly
+    # when head < total/2.
+    assert head < total // 2, "fixture no longer has a head under half the weights"
+    headroom = (budget - total // 2 + budget - head) // 2
+    assert budget - total // 2 < headroom <= budget - head
+    assert headroom < 2 * budget - total
+    return budget, headroom
+
+
+def test_a_negative_cap_on_the_head_does_not_zero_the_other_cards():
+    """The Muse Glimmer shape, in miniature.
+
+    Measured on Kaggle-Muse_Glimmer_(30B)-GRPO across 2 x 14.56 GiB: budgets
+    13.104 GiB each after the quantiser's haircut, 20.310 GiB of weights and
+    4.104 GiB of logit headroom. The balanced reserve worked out at 0.897 GiB
+    and the per-device caps at +2.949 (cuda:0) and -1.155 (cuda:1, the head).
+    Capping by the MINIMUM across devices took the head's negative cap and
+    applied it everywhere, so both cards got a 0.000 GiB reserve, cuda:0 was
+    packed to within 0.161 GiB, and training OOMed on its first 254 MiB
+    allocation while cuda:1 sat on 5.737 GiB of unused memory.
+
+    A card that does not pay the headroom must keep its own reserve.
+    """
+    model = _meta(hidden = 256, vocab = 8192, layers = 16)
+    budget, headroom = _muse_shaped_budgets(model)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: budget, 1: budget},
+        headroom_bytes = headroom,
+    )
+    assert plan is not None
+    reserves = plan.activation_reserve_by_device
+    head_device = plan.device_map[
+        next(n for n in plan.device_map if n.endswith("lm_head"))
+    ]
+    others = [d for d in reserves if d != head_device]
+    assert others, "expected a non-head device to exist"
+    assert any(reserves[d] > 0 for d in others), (
+        f"every non-head card was given a zero activation reserve "
+        f"({reserves}); the head's negative cap has leaked onto them again"
+    )
+
+
+def test_the_head_card_reserve_still_cannot_go_negative():
+    """The property the shared cap was originally added for.
+
+    `attempt` only ever relaxes the reserve on the OTHER cards, so a negative
+    reserve on the head's own card makes every step infeasible and the plan is
+    refused outright. Clamping each device at zero individually has to keep
+    that from happening.
+    """
+    model = _meta(hidden = 256, vocab = 8192, layers = 16)
+    budget, headroom = _muse_shaped_budgets(model)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: budget, 1: budget},
+        headroom_bytes = headroom,
+    )
+    assert plan is not None
+    assert all(v >= 0 for v in plan.activation_reserve_by_device.values())
+
+
+class _WideBlock(nn.Module):
+    """A decoder block chunky enough that the packing has real granularity.
+
+    `_Block` is a single square Linear, so on any budget the greedy walk fits at
+    the first try and the relaxation ladder below is never exercised.
+    """
+    def __init__(self, hidden, ffn, dtype):
+        super().__init__()
+        self.attn = nn.Linear(hidden, hidden, bias = False, dtype = dtype)
+        self.mlp = nn.Linear(hidden, ffn, bias = False, dtype = dtype)
+        self.down = nn.Linear(ffn, hidden, bias = False, dtype = dtype)
+
+
+class _Wide(nn.Module):
+    _no_split_modules = ["_WideBlock"]
+
+    def __init__(self, hidden, ffn, vocab, layers, dtype = torch.bfloat16):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden, dtype = dtype)
+        self.layers = nn.ModuleList(
+            [_WideBlock(hidden, ffn, dtype) for _ in range(layers)]
+        )
+        self.norm = nn.LayerNorm(hidden, dtype = dtype)
+        self.lm_head = nn.Linear(hidden, vocab, bias = False, dtype = dtype)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+def test_the_relaxed_reserve_is_never_below_the_old_shared_cap():
+    """Per-device reserves must not lose ground on identical cards.
+
+    The reserve is a range now, not one number, and `attempt` relaxes the
+    non-head cards from the TOP of it in 5% steps. On identical cards the top
+    sits one headroom-share above the bottom -- a fraction of a percent -- so a
+    request that misses by that fraction is answered by a whole 5% step, and the
+    cards end up keeping LESS than the single shared cap used to give them.
+
+    Measured here: 4 identical cards, a 24-layer model at ~65% of their total,
+    shared cap 3.043 GiB per card, stepping from the top alone 2.981 GiB. The
+    same shape at 4 x 80 GiB lost 1.97 GiB per card.
+    """
+    kw = dict(hidden = 4096, ffn = 16384, vocab = 152064, layers = 24)
+    with torch.device("meta"):
+        model = _Wide(**kw)
+    n, budget = 4, 6086993920
+
+    plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
+    assert plan is not None
+
+    # What a single shared `min` cap across the devices would have produced.
+    total = plan.total_weight_bytes
+    headroom = plan.headroom_bytes
+    head_bytes = model.lm_head.weight.numel() * model.lm_head.weight.element_size()
+    value = max(0, (n * budget - total - headroom) // n)
+    share = max(-(-total // n), head_bytes)
+    shared_cap = max(0, min(value, budget - share - headroom))
+    assert shared_cap > 0, "fixture no longer exercises the cap"
+
+    kept = plan.activation_reserve_by_device
+    assert min(kept.values()) >= shared_cap, (
+        f"the relaxation ladder landed below the old shared cap: kept {kept}, "
+        f"shared cap {shared_cap}"
+    )
+
+
+def test_the_head_relaxation_ladder_also_keeps_the_old_shared_floor():
+    """The same loss, one ladder further down.
+
+    Merging the floor into the rungs fixed the loop that relaxes only the
+    NON-head cards. The last-resort loop below it, which relaxes the head's own
+    reserve too, kept scaling the per-device reserve from the top alone, so it
+    could still land under what a single shared cap would have kept.
+
+    Byte-exact here rather than approximated. Two units of 20 and 400 bytes and
+    an 80-byte head on budgets 300 and 590 with 22 bytes of headroom: weights
+    500, so the equal share is 250, the caps are 50 (cuda:0) and 318 (cuda:1,
+    the head) and the balanced value is 184. cuda:1 must hold the 400-byte unit,
+    which needs its reserve down to 88, so every rung of the first loop -- all of
+    which keep cuda:1 on its full 184 -- fails, and the last resort scales BOTH
+    cards down in 5% steps until cuda:1 fits. It lands at 82/22, and cuda:0 is
+    left with 22 bytes where the old shared cap of 50 fit perfectly well: the
+    placement is identical either way, so the 28 bytes bought nothing.
+    """
+    with torch.device("meta"):
+        model = _Bins([5, 100], head = 20)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 300, 1: 590},
+        headroom_bytes = 22,
+    )
+    assert plan is not None
+    assert plan.weight_bytes == {0: 20, 1: 480}
+    kept = plan.activation_reserve_by_device
+    assert min(kept.values()) >= 50, (
+        f"the last-resort ladder landed below the old shared cap of 50: {kept}"
+    )

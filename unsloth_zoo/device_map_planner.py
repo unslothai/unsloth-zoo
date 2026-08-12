@@ -1006,10 +1006,32 @@ def plan_device_map(
                 # is refused. A four-layer model whose head is larger than half
                 # the weights (share 24 KiB, head 32 KiB) was rejected on
                 # 2 x 8 GiB for exactly that reason.
+                # Capped PER DEVICE, not by the smallest cap across all of
+                # them. A single `min` lets the head's card -- the only one
+                # that pays the headroom, and so the only one whose cap can go
+                # negative -- drive the reserve to zero on cards that had room
+                # for one. Measured on Kaggle-Muse_Glimmer_(30B)-GRPO, 2 x
+                # 14.56 GiB: budgets 13.104 each, weights 20.310, headroom
+                # 4.104, so value 0.897 GiB and caps 2.949 (cuda:0) and -1.155
+                # (cuda:1, the head). The min was -1.155, both cards got a
+                # 0.000 GiB reserve, cuda:0 was packed to within 0.161 GiB and
+                # the run OOMed at the first training step asking for 254 MiB.
+                # cuda:1 finished with 5.737 GiB unused.
+                #
+                # Clamping each device at 0 individually keeps the property
+                # the shared cap was added for: the head's own reserve still
+                # cannot go negative, so `attempt` -- which only relaxes the
+                # OTHER cards -- is never handed an infeasible head budget.
                 share = max(-(-total // len(devices)), pinned_bytes)
-                cap = min(raw_budgets[d] - share - (headroom if d == head_device else 0)
-                          for d in devices)
-                value = int(max(0, min(value, cap)))
+                per_device = {
+                    d: int(max(0, min(
+                        value,
+                        raw_budgets[d] - share
+                        - (headroom if d == head_device else 0),
+                    )))
+                    for d in devices
+                }
+                return per_device
             else:
                 # Mirror accelerate: reserve the largest single placement unit.
                 value = max((s for _, s in units), default=0)
@@ -1028,21 +1050,63 @@ def plan_device_map(
         constraint, so an explicit reserve either fits or the plan is refused.
         """
         reserve = reserve_for(head_device)
-        steps = 1 if reserve_is_explicit else 21
-        for step in range(steps):
-            r = _fill(head_device, reserve, max(reserve.values()) * (20 - step) // 20)
-            if r is not None:
-                return r
         if reserve_is_explicit:
-            return None
-        # Last resort: relax the head's own activation reserve too. An
-        # auto-derived reserve is documented as relaxable and the loop above only
-        # ever took it off the OTHER cards, so a single atomic unit that fits
-        # nowhere else could miss the head's card by less than the reserve and
-        # the plan was refused. The logit headroom is never touched.
+            return _fill(head_device, reserve, max(reserve.values()))
+
+        # The reserve is per device now, so it is a range, not one number: the
+        # top is what we would like every card to keep, the floor is exactly
+        # what the old shared `min` cap handed all of them (`min` of a clamp is
+        # the clamp of the `min`). Relaxing from the top alone can therefore
+        # land BELOW what the old planner kept -- a request that misses by one
+        # percent is answered by a whole 5% rung -- so 4 x 80 GiB holding a
+        # 144 GiB model kept 41.72 GiB per card where the shared cap kept 43.68.
+        #
+        # So try every rung EITHER planner would have tried, best first. The
+        # candidates are the reserves actually kept per device:
+        #
+        #   A  relax only the non-head cards, from the per-device range
+        #   B  the old shared ladder: every card on the floor, non-head cards
+        #      stepped down from it
+        #   C  last resort, relax the head's own reserve too, per device
+        #   D  last resort on the old shared ladder
+        #
+        # B and D are the old planner's two ladders, rung for rung, so its
+        # result is always in this set; ordering by the smallest reserve any
+        # card keeps means the accepted plan can never keep less than it did.
+        # C exists because the loop that only relaxes the OTHER cards can miss
+        # the head's card by less than its reserve and refuse a model that fits.
+        # The logit headroom is never touched by any of them.
+        top, floor = max(reserve.values()), min(reserve.values())
+        rungs = sorted(
+            {top * (20 - step) // 20 for step in range(21)} |
+            {floor * (20 - step) // 20 for step in range(21)},
+            reverse = True,
+        )
+        candidates = []
+        for other in rungs:
+            candidates.append({d: reserve[d] if d == head_device else min(reserve[d], other)
+                               for d in devices})
+            candidates.append({d: floor if d == head_device else min(floor, other)
+                               for d in devices})
         for step in range(1, 21):
-            scaled = {d: v * (20 - step) // 20 for d, v in reserve.items()}
-            r = _fill(head_device, scaled, max(scaled.values()))
+            candidates.append({d: v * (20 - step) // 20 for d, v in reserve.items()})
+            candidates.append(dict.fromkeys(devices, floor * (20 - step) // 20))
+
+        seen = set()
+        ordered = []
+        for kept in candidates:
+            key = tuple(kept[d] for d in devices)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(kept)
+        # Most-kept first: the smallest reserve on any card, then the head's own,
+        # then the total. Passing `max(kept.values())` as the non-head cap makes
+        # `_fill` keep exactly this mapping.
+        ordered.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
+                     reverse = True)
+        for kept in ordered:
+            r = _fill(head_device, kept, max(kept.values()))
             if r is not None:
                 return r
         return None
