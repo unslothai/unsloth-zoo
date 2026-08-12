@@ -121,9 +121,9 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments. Detection lives in disk_utils so unsloth and unsloth_zoo
-# cannot drift apart on the question, and so a KAGGLE_USERNAME exported for the
-# Kaggle CLI on a laptop no longer looks like a Kaggle kernel.
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
 try:
     from .disk_utils import (
         is_colab_environment as _is_colab_environment,
@@ -131,8 +131,8 @@ try:
     )
 except ImportError:
     # Loaded as a standalone file with no package context, which is how the
-    # tests import this module to skip unsloth_zoo's import-time device
-    # detection. Load the sibling by path rather than duplicating it.
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
     import importlib.util as _importlib_util
     _disk_utils_spec = _importlib_util.spec_from_file_location(
         "_unsloth_zoo_disk_utils",
@@ -150,10 +150,9 @@ IS_WINDOWS = sys.platform == "win32"
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
 #
-# This deliberately does NOT move on Kaggle. Only /kaggle/working is small
-# there; a probe kernel measured the home directory on the same large overlay
-# as /tmp (1026.8GB free of 8062.4GB on both), so a llama.cpp checkout and its
-# build tree already have room where they land.
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
