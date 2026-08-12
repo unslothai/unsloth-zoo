@@ -16,6 +16,7 @@ The real-source canaries import the real transformers gemma4 module and skip
 cleanly when it is absent; when present (transformers >= 5.5.0, as on CI) they
 catch upstream source drift that would silently disable the patch.
 """
+import ast
 import inspect
 import re
 
@@ -195,13 +196,113 @@ def _gemma4_modeling_source():
     return pathlib.Path(inspect.getsourcefile(real_gemma4)).read_text()
 
 
-def _feature_assignments(src, modality):
-    """Every line in ``src`` that BINDS ``<modality>_features``, stripped."""
-    return [
-        line.strip()
-        for line in src.splitlines()
-        if re.match(rf"\s*{modality}_features\s*=", line)
-    ]
+def _mentions(node, name):
+    """Does the expression ``node`` read the local ``name`` anywhere inside it?"""
+    return any(
+        isinstance(n, ast.Name) and n.id == name for n in ast.walk(node)
+    )
+
+
+def _carries_inputs_embeds_dtype(node):
+    """Does ``node`` carry ``inputs_embeds.dtype``?
+
+    Covers both spellings upstream uses: the positional `.to(device, dtype)`
+    overload and the keyword `dtype=inputs_embeds.dtype` one.
+    """
+    for n in ast.walk(node):
+        if (
+            isinstance(n, ast.Attribute)
+            and n.attr == "dtype"
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "inputs_embeds"
+        ):
+            return True
+    return False
+
+
+def _merge_calls(tree, modality):
+    """Every ``masked_scatter`` call that scatters ``<modality>_features``.
+
+    Returns (call_node, source_argument) pairs. The source argument is the
+    scattered VALUE (the second positional arg, or `source=`), which is the
+    tensor whose dtype has to line up with the destination.
+    """
+    name = f"{modality}_features"
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in ("masked_scatter", "masked_scatter_")):
+            continue
+        args = list(node.args) + [kw.value for kw in node.keywords if kw.arg in (None, "source")]
+        for arg in args:
+            if _mentions(arg, name):
+                found.append((node, arg))
+                break
+    return found
+
+
+def _last_binding_before(tree, name, lineno):
+    """The last assignment to ``name`` that can reach line ``lineno``.
+
+    Textually last wins, which is what a straight-line merge block gives us.
+    Both `x = ...` and `x: T = ...` count, as does a tuple/starred target that
+    includes ``name``.
+    """
+    best = None
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        binds = any(
+            isinstance(t, ast.Name) and t.id == name
+            for target in targets
+            for t in ast.walk(target)
+        )
+        if not binds or node.lineno >= lineno:
+            continue
+        if best is None or node.lineno > best.lineno:
+            best = node
+    return best
+
+
+def _merge_is_dtype_aligned(src, modality):
+    """Is the ``<modality>_features`` tensor that reaches the merge dtype-aligned?
+
+    Structural, not textual: find the masked_scatter that consumes the tensor,
+    then ask whether ``inputs_embeds.dtype`` is applied EITHER in the scattered
+    expression itself OR in the last assignment that reaches it. Answering from
+    the reaching definition (rather than from any mention of the name anywhere
+    in the file) is what stops a later device-only rebinding, or a cast in some
+    unrelated method, from standing in for the cast that actually runs.
+
+    Returns (ok, detail) so a failure can say what it saw.
+    """
+    tree = ast.parse(src)
+    merges = _merge_calls(tree, modality)
+    if not merges:
+        return False, f"no masked_scatter consuming {modality}_features"
+    for call, arg in merges:
+        if _carries_inputs_embeds_dtype(arg):
+            continue
+        binding = _last_binding_before(tree, f"{modality}_features", call.lineno)
+        if binding is None:
+            return False, (
+                f"{modality}_features is scattered at line {call.lineno} with no "
+                f"assignment reaching it"
+            )
+        if not _carries_inputs_embeds_dtype(binding.value):
+            return False, (
+                f"the {modality}_features binding reaching the merge at line "
+                f"{call.lineno} does not cast to inputs_embeds.dtype: "
+                f"{ast.unparse(binding).strip()!r}"
+            )
+    return True, f"{len(merges)} merge(s) dtype-aligned"
 
 
 @requires_gemma4
@@ -224,45 +325,115 @@ def test_real_gemma4_image_and_video_merges_still_cast_dtype(modality):
     # Regression anchor: image/video have always cast dtype; if upstream ever
     # drops it there too, that is a new modality that also needs patching.
     #
-    # Asked of the ASSIGNMENTS rather than of one exact call spelling. Upstream
-    # reshaped the image branch to
+    # Asked of the tensor that REACHES the merge rather than of one exact call
+    # spelling. transformers 5.15.0 reshaped the image branch to
     #
     #   image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+    #   ...
+    #   inputs_embeds = inputs_embeds.masked_scatter(image_mask.to(...), image_features.to(inputs_embeds.device))
     #
     # which still casts, but no longer contains the literal
-    # "image_features.to(inputs_embeds.device, inputs_embeds.dtype)". Only the
-    # spelling moved, so a substring match failed on a file that is still
-    # correct -- the guard fired at the wrong thing. What actually matters is
-    # that SOMETHING binds <modality>_features to a value carrying
-    # inputs_embeds.dtype before the masked_scatter, and that survives a
+    # "image_features.to(inputs_embeds.device, inputs_embeds.dtype)" the guard
+    # used to grep for. Only the spelling moved, so the substring match went red
+    # on a file that is still correct. What matters is that the value the
+    # masked_scatter consumes carries inputs_embeds.dtype, and that survives a
     # rename of whatever produced the tensor.
-    assignments = _feature_assignments(_gemma4_modeling_source(), modality)
-    assert assignments, f"no {modality}_features assignment found at all"
-    assert any("inputs_embeds.dtype" in line for line in assignments), (
-        f"Gemma4 {modality} merge no longer casts to inputs_embeds.dtype: "
-        f"{assignments}. That is a modality the unsloth dtype patches do not "
-        f"cover, and masked_scatter will raise on a dtype mismatch."
+    ok, detail = _merge_is_dtype_aligned(_gemma4_modeling_source(), modality)
+    assert ok, (
+        f"Gemma4 {modality} merge no longer casts to inputs_embeds.dtype: {detail}. "
+        f"That is a modality the unsloth dtype patches do not cover, and "
+        f"masked_scatter will raise on a dtype mismatch."
     )
 
 
-def test_the_dtype_cast_guard_can_actually_fail():
-    """The guard above is a search, so it is worth proving it does not always find.
+# Spellings the guard above has to keep straight. Kept out of the gemma4-only
+# section on purpose: these run everywhere, so the guard cannot quietly go
+# vacuous on the hosts that do not have a gemma4 to read.
+_MERGE_SHAPES = {
+    # transformers 5.15.0: the cast moved into the torch.cat that builds the tensor.
+    "cat_then_merge": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
+    )
+""", True),
+    # transformers 5.5.0: cast on a plain rebinding of the same name.
+    "rebind_then_merge": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
+    )
+""", True),
+    # Cast written at the merge itself (what the audio branch does since 5.15.0).
+    "cast_at_merge": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+    )
+""", True),
+    # Keyword dtype= instead of the positional overload.
+    "keyword_dtype": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(dtype=inputs_embeds.dtype)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", True),
+    # The regression itself: device only, dtype dropped.
+    "device_only": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).pooler_output
+    image_features = image_features.to(inputs_embeds.device)
+    inputs_embeds = inputs_embeds.masked_scatter(
+        image_mask.to(inputs_embeds.device), image_features.to(inputs_embeds.device)
+    )
+""", False),
+    # A good cast that a later device-only rebinding undoes before the merge.
+    # This is the case a "does the cast appear anywhere" search gets wrong.
+    "cast_then_undone": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_features = postprocess(image_features).to(inputs_embeds.device)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # A cast that lives in a different method entirely must not count either.
+    "cast_in_another_method": ("""
+def get_image_features(self, pixel_values, inputs_embeds):
+    return self.vision_tower(pixel_values).to(inputs_embeds.device, inputs_embeds.dtype)
+
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values, inputs_embeds)
+    image_features = image_features.to(inputs_embeds.device)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+""", False),
+    # No merge at all is a drift we want to hear about, not a silent pass.
+    "no_merge": ("""
+def forward(self, inputs_embeds):
+    image_features = self.get_image_features(pixel_values).to(inputs_embeds.device, inputs_embeds.dtype)
+    return image_features
+""", False),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_MERGE_SHAPES))
+def test_the_dtype_cast_guard_reads_the_reaching_definition(shape):
+    """Prove the guard accepts every spelling upstream has shipped, and still fails.
 
     Runs without gemma4 installed, unlike the guard itself, which is the point: a
     guard that only ever runs on hosts with the newest transformers is one nobody
     notices going vacuous."""
-    casts = "    image_features = torch.cat(x, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)\n"
-    older = "    image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)\n"
-    device_only = "    image_features = image_features.to(inputs_embeds.device)\n"
+    src, expected = _MERGE_SHAPES[shape]
+    ok, detail = _merge_is_dtype_aligned(src, "image")
+    assert ok is expected, f"{shape}: expected ok={expected}, got {ok} ({detail})"
 
-    def _ok(src):
-        found = _feature_assignments(src, "image")
-        return bool(found) and any("inputs_embeds.dtype" in line for line in found)
 
-    assert _ok(casts), "the current upstream spelling must pass"
-    assert _ok(older), "the spelling this guard used to match must still pass"
-    assert not _ok(device_only), "a device-only merge must fail"
-    assert not _feature_assignments(device_only, "video"), "and it must not match another modality"
+def test_the_dtype_cast_guard_does_not_confuse_modalities():
+    src, _ = _MERGE_SHAPES["cat_then_merge"]
+    ok, detail = _merge_is_dtype_aligned(src, "video")
+    assert not ok and "no masked_scatter" in detail, detail
 
 
 @requires_gemma4
