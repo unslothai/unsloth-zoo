@@ -382,3 +382,34 @@ def _recompile_limit_error():
         except TypeError:
             continue
     pytest.skip(f"cannot construct {cls.__name__}")
+
+
+def test_restoring_the_marker_cannot_erase_an_earlier_compiled_pack(monkeypatch):
+    """The restore writes a process-wide global, so it must not clear too much.
+
+    If another region already packed something compiled inside this checkpoint,
+    the marker was true BEFORE this call and has to stay true: clearing it would
+    tell a later `_give_up` the checkpoint is clean when it is not, and that is
+    the direction that returns wrong gradients rather than merely ending a step.
+    Restoring the prior value rather than assigning False is what makes this
+    safe, and this test is the difference between the two.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    # An earlier region in this same checkpoint already packed compiled.
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    monkeypatch.setattr(
+        patch_utils, "_note_packed_under_checkpoint",
+        lambda: setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True),
+    )
+
+    def compiled(x):
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-marker-not-erased",
+    )
+    # This label itself never compiled, so it falls back rather than raising.
+    assert wrapped(1) == "eager"
+    assert patch_utils._PACKED_COMPILED_IN_CHECKPOINT is True, (
+        "the restore erased an earlier region's compiled pack"
+    )
