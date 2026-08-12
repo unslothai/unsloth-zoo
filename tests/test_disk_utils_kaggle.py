@@ -40,7 +40,6 @@ a scratch tree.
 
 import importlib.util
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -209,12 +208,35 @@ class _FakeParam:
         return self._logical // 2 if self.quant_state is not None else self._logical
 
 
+class _MXFP4Param:
+    """A packed MXFP4 block or scale tensor: uint8, and no quant_state at all."""
+
+    dtype = "torch.uint8"
+
+    def __init__(self, packed):
+        self._packed = packed
+
+    def numel(self):
+        return self._packed
+
+
 class _FakeModel:
     def __init__(self, params):
         self._params = params
 
     def parameters(self):
         return iter(self._params)
+
+
+class _NamedModel:
+    def __init__(self, named):
+        self._named = named
+
+    def named_parameters(self):
+        return iter(self._named.items())
+
+    def parameters(self):
+        return iter(self._named.values())
 
 
 class TestLogicalSize:
@@ -232,6 +254,36 @@ class TestLogicalSize:
         )
         # The bug: sum(p.numel()) would be 600_000, giving 1.2MB not 2.2MB.
         assert disk_utils.model_16bit_bytes(model) == 2 * 1_100_000
+
+    def test_mxfp4_blocks_are_worth_twice_their_bytes(self, disk_utils):
+        """gpt-oss kept packed has no quant_state, so numel() is the only
+        signal and it is half the truth. `convert_moe_packed_tensors` turns
+        (..., G, B) into (..., G, B * 2); the scales are consumed, not kept."""
+        blocks = _MXFP4Param(90_000_000)
+        assert (
+            disk_utils.logical_numel(blocks, "model.layers.0.mlp.experts.gate_up_proj_blocks")
+            == 180_000_000
+        )
+        assert (
+            disk_utils.logical_numel(_MXFP4Param(5_625_000), "…experts.gate_up_proj_scales") == 0
+        )
+        # Nameless (the plain `parameters()` fallback) must not double anything.
+        assert disk_utils.logical_numel(blocks) == 90_000_000
+
+    def test_a_packed_mxfp4_model_is_not_under_counted_by_half(self, disk_utils):
+        model = _NamedModel(
+            {
+                "model.layers.0.mlp.experts.gate_up_proj_blocks": _MXFP4Param(90_000_000),
+                "model.layers.0.mlp.experts.gate_up_proj_scales": _MXFP4Param(5_625_000),
+                "model.layers.0.self_attn.q_proj.weight": _FakeParam(4_000_000, quantized = False),
+            }
+        )
+        # Believing numel() gives 99.6M and sizes the merge at half the disk.
+        assert disk_utils.model_logical_numel(model) == 184_000_000
+
+    def test_a_model_without_named_parameters_still_measures(self, disk_utils):
+        model = _FakeModel([_FakeParam(1000, quantized = False)])
+        assert disk_utils.model_logical_numel(model) == 1000
 
     def test_unmeasurable_model_is_zero_not_a_guess(self, disk_utils):
         class Broken:
@@ -276,6 +328,15 @@ class TestGGUFEstimate:
             n_parameters = n, quantization_methods = ["q4_k_m", "q5_k_m"], first_conversion = "f16"
         )
         assert two - one == int(n * 5.7 / 8)
+
+    def test_a_convert_only_export_still_counts_the_file_it_writes(self, disk_utils):
+        """This is a high-water mark. A GGUF has to be written before it can be
+        deleted, so no export ever peaks below merge + first conversion."""
+        n = 1_000_000_000
+        need = disk_utils.estimate_gguf_export_bytes(
+            n_parameters = n, quantization_methods = [], first_conversion = "f16"
+        )
+        assert need == n * 2 + n * 2 + disk_utils.DISK_SLACK_BYTES
 
     def test_needs_merge_false_drops_the_merge(self, disk_utils):
         n = 1_000_000_000

@@ -128,15 +128,39 @@ def free_bytes(path):
         return None
 
 
-def logical_numel(param):
+def _is_uint8(param):
+    # str() rather than a torch import: this module stays importable without it.
+    return str(getattr(param, "dtype", "")) == "torch.uint8"
+
+
+def logical_numel(param, name = ""):
     """Logical parameter count, which is NOT `numel()` on a quantized weight.
+
+    Two packing schemes hide the real count, and both halve the estimate of a
+    16-bit merge if you believe `numel()`.
 
     bitsandbytes stores a 4-bit weight as packed uint8, two parameters per
     byte, and hangs the real shape off `quant_state`. So `numel()` reports
     exactly half the logical count per quantized tensor, and a model-wide sum
-    of `numel()` under-counts a 4-bit load by nearly 2x once most of the
-    model is quantized. Sizing a 16-bit merge from that halves the estimate.
+    of `numel()` under-counts a 4-bit load by nearly 2x once most of the model
+    is quantized.
+
+    MXFP4 (gpt-oss, kept packed by `UNSLOTH_MXFP4_NO_DEQUANTIZE=1`) has no
+    `quant_state` at all. It keeps `..._blocks` as packed uint8 beside a
+    `..._scales` exponent tensor, and `convert_moe_packed_tensors` expands a
+    `(..., G, B)` block tensor to `(..., G, B * 2)` while consuming the scales.
+    So the blocks are worth twice their `numel()`, the scales are worth
+    nothing, and the parameters this affects are the MoE experts, which are
+    most of the model.
     """
+    if name and _is_uint8(param):
+        if name.endswith("_scales"):
+            return 0
+        if name.endswith("_blocks"):
+            try:
+                return int(param.numel()) * 2
+            except Exception:
+                return 0
     try:
         shape = getattr(getattr(param, "quant_state", None), "shape", None)
         if shape is not None:
@@ -153,7 +177,14 @@ def logical_numel(param):
 
 
 def model_logical_numel(model):
-    """Total logical parameter count, or 0 if it cannot be measured."""
+    """Total logical parameter count, or 0 if it cannot be measured.
+
+    `named_parameters()`, because MXFP4 packing is only identifiable by name.
+    """
+    try:
+        return sum(logical_numel(p, n) for n, p in model.named_parameters())
+    except Exception:
+        pass
     try:
         return sum(logical_numel(p) for p in model.parameters())
     except Exception:
@@ -233,7 +264,6 @@ def estimate_gguf_export_bytes(
     first_conversion = "f16",
     needs_merge = True,
     n_parameters = None,
-    keep_intermediate_gguf = True,
     base_cache_copy = False,
 ):
     """Peak bytes a `save_pretrained_gguf` needs on one filesystem.
@@ -266,16 +296,13 @@ def estimate_gguf_export_bytes(
 
     Pass `needs_merge = False` for a model already on disk in HF format.
 
-    `keep_intermediate_gguf` only reaches the arithmetic when
-    `quantization_methods` is empty. That is not an oversight: `llama-quantize`
-    is file to file, so the first-conversion GGUF has to stay readable for
-    every quant in the loop, and `unsloth/save.py` deletes it only once the
-    whole loop has finished. Sizing a quantized export as though the
-    intermediate were gone before the quants run would under-count the real
-    high-water mark by the size of that file, which on Gemma4 (31B) Vision is
-    17.7GB, and would hand back exactly the mid-write failure this function
-    exists to prevent. The flag therefore only says whether a convert-only
-    export keeps its output.
+    The first-conversion GGUF is always counted, whether or not the export
+    keeps it. This is a high-water mark, and a file has to be written before
+    it can be deleted. `llama-quantize` is file to file besides, so that GGUF
+    has to stay readable for every quant in the loop, and `unsloth/save.py`
+    unlinks it only once the whole loop has finished - on Gemma4 (31B) Vision
+    that file is 17.7GB, and pretending it were gone hands back exactly the
+    mid-write failure this function exists to prevent.
     """
     if n_parameters is None:
         n_parameters = model_logical_numel(model) if model is not None else 0
@@ -304,8 +331,7 @@ def estimate_gguf_export_bytes(
         resolved.append(GGUF_QUANT_ALIASES.get(name, name))
     quant_only = [m for m in dict.fromkeys(resolved) if m != first]
 
-    if methods or keep_intermediate_gguf:
-        total += int(n_parameters * gguf_bits_per_weight(first) / 8)
+    total += int(n_parameters * gguf_bits_per_weight(first) / 8)
     for method in quant_only:
         total += int(n_parameters * gguf_bits_per_weight(method) / 8)
 
