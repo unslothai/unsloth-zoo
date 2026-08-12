@@ -52,8 +52,23 @@ def chunked_selective_log_softmax(
     temperature: float = 1.0,
     chunks: int = 4,
 ):
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_index  = index.reshape(-1)
+    # Equal chunks, for the reason spelled out in
+    # `chunked_hidden_states_selective_log_softmax`: the ragged last chunk of
+    # `torch.chunk(x, chunks = N)` is a symbolic expression in the row count,
+    # and torch 2.12's Inductor will not split a vocab-wide node over it,
+    # failing the whole region with `InductorError: CantSplit`. This function
+    # is the raw-logits sibling of that one and chunks the same way over the
+    # same vocab width, so it carries the same exposure. The padding repeats
+    # the last row and is sliced back off, leaving results unchanged.
+    n_rows = flat_logits.shape[0]
+    pad_rows = ((n_rows + chunks - 1) // chunks) * chunks - n_rows
+    flat_logits = torch.cat((flat_logits, flat_logits[-1:].expand(pad_rows, -1)), dim = 0)
+    flat_index  = torch.cat((flat_index,  flat_index[-1:].expand(pad_rows)),      dim = 0)
+
+    chunked_logits = torch.chunk(flat_logits, chunks = chunks, dim = 0)
+    chunked_index  = torch.chunk(flat_index,  chunks = chunks, dim = 0)
     all_per_token_logps = []
     # Per-chunk selective_log_softmax.
     for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
@@ -66,6 +81,7 @@ def chunked_selective_log_softmax(
         all_per_token_logps.append(per_token_logps)
     pass
     all_per_token_logps = torch.concat(all_per_token_logps)
+    all_per_token_logps = all_per_token_logps[:n_rows]
     all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
     return all_per_token_logps
 pass
