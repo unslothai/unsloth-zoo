@@ -271,8 +271,12 @@ def patch_bnb4bit_quantize_convert():
     def patched_convert(
         self,
         input_dict: dict[str, Union[list[torch.Tensor], torch.Tensor]],
-        full_layer_name: str | None = None,
-        model: torch.nn.Module | None = None,
+        # typing.Optional, not `str | None`: PEP 604 evaluates at def time and raises
+        # on the 3.9 floor, and deferring it with `from __future__ import annotations`
+        # would stringify every annotation in this module, which patch_function's
+        # default strict signature match compares against the live upstream ones.
+        full_layer_name: Optional[str] = None,
+        model: Optional[torch.nn.Module] = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         value = list(input_dict.values())[0]

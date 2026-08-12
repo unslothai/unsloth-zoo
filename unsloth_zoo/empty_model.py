@@ -311,6 +311,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
+    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
+    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",

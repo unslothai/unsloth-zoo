@@ -22,9 +22,17 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 bnb = pytest.importorskip("bitsandbytes")
 from bitsandbytes.nn import Params4bit
 
-if not torch.cuda.is_available():
-    pytest.skip("bnb 4-bit dequant needs CUDA", allow_module_level=True)
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
+# Skip before importing unsloth_zoo so a CPU-only host stays a clean module skip.
+if not gpu_available:
+    pytest.skip("bnb 4-bit dequant needs CUDA or XPU", allow_module_level=True)
+
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 import unsloth_zoo.temporary_patches.moe_utils as mu
 from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import forward_moe_backend_bnb4bit
 from unsloth_zoo.gradient_checkpointing import _gradient_checkpoint_recompute_marker
@@ -32,7 +40,7 @@ from unsloth_zoo.gradient_checkpointing import _gradient_checkpoint_recompute_ma
 
 def _quantized_expert_param(shape=(4, 32, 64)):
     w = torch.randn(*shape, dtype=torch.bfloat16)
-    p = Params4bit(w, requires_grad=False, quant_type="nf4", compress_statistics=True).to("cuda")
+    p = Params4bit(w, requires_grad=False, quant_type="nf4", compress_statistics=True).to(DEVICE_TYPE_TORCH)
     p._original_shape = torch.Size(shape)
     return p
 
@@ -49,15 +57,15 @@ def _run_and_record(monkeypatch):
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
     monkeypatch.setattr(
         mu, "forward_native_grouped_mm",
-        lambda self, hs, ti, tw: (calls.append("provider"), torch.zeros(1, device="cuda"))[1],
+        lambda self, hs, ti, tw: (calls.append("provider"), torch.zeros(1, device=DEVICE_TYPE_TORCH))[1],
     )
     monkeypatch.setattr(
         mu, "swap_moe_weights_for_call",
-        lambda self, gu, dn, fn, *a: (calls.append("swap"), torch.zeros(1, device="cuda"))[1],
+        lambda self, gu, dn, fn, *a: (calls.append("swap"), torch.zeros(1, device=DEVICE_TYPE_TORCH))[1],
     )
     self = _FakeExperts()
-    hs = torch.randn(3, 32, dtype=torch.bfloat16, device="cuda")
-    forward_moe_backend_bnb4bit(self, hs, torch.zeros(3, 1, dtype=torch.long, device="cuda"), None)
+    hs = torch.randn(3, 32, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)
+    forward_moe_backend_bnb4bit(self, hs, torch.zeros(3, 1, dtype=torch.long, device=DEVICE_TYPE_TORCH), None)
     return calls
 
 
@@ -90,7 +98,7 @@ def test_pre_dequantized_dense_is_never_recomputed(monkeypatch):
     # dense stack must not be scheduled for a backward recompute (which would re-hold it
     # for no memory benefit).
     monkeypatch.setattr(mu, "_base_is_recomputable", lambda src: True)
-    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device="cuda")  # requires_grad False
+    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # requires_grad False
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
     assert mu._moe_recompute_enabled(dense) is False
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
@@ -102,7 +110,7 @@ def test_source_pins_large_dequant_classifies_4bit_only(monkeypatch):
     # Only a frozen bnb 4-bit expert reports a "large dequant" pinned form; a plain
     # dense base pins its own storage, so it is not flagged.
     q = _quantized_expert_param()
-    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device="cuda")
+    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)
     assert mu._source_pins_large_dequant(q) is True
     assert mu._source_pins_large_dequant(dense) is False
 
@@ -113,7 +121,7 @@ def test_4bit_prefers_recompute_but_dense_still_pins_under_gc(monkeypatch):
     # GC recompute pass; the 4-bit base recomputes to avoid the bf16 dequant pin.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     q = _quantized_expert_param()
-    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device="cuda")  # frozen
+    dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # frozen
     with _gradient_checkpoint_recompute_marker():
         assert mu._moe_recompute_enabled(q) is True       # 4-bit -> recompute
         assert mu._moe_recompute_enabled(dense) is False  # dense -> pin (unchanged)

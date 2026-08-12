@@ -913,38 +913,153 @@ def test_immediate_success_uses_xet_only(monkeypatch):
     assert prepared == [], "no cache prep should run when Xet succeeds first try"
 
 
-def test_stall_then_http_fallback_succeeds(monkeypatch):
+def test_stall_then_xet_retry_then_http_fallback_succeeds(monkeypatch):
+    """The full ladder: a data-phase stall buys one more Xet child, then HTTP."""
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id, cache_dir = None, **k: prepared.append((repo_type, repo_id)))
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/model.gguf")])
 
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert out == "/cache/model.gguf"
-    assert len(fake.calls) == 2
-    assert fake.calls[0].disable_xet is False  # Xet first
-    assert fake.calls[1].disable_xet is True   # HTTP fallback
-    assert prepared == [("model", DL_REPO)], "must prep cache for HTTP before the retry"
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
+    assert prepared == [("model", DL_REPO)], "HTTP prep runs once, on the transport change only"
 
 
-def test_injected_prepare_for_http_used(monkeypatch):
-    """An injected prepare_for_http_fn is used; the generic default must not run."""
+def test_recovered_xet_retry_never_reaches_http(monkeypatch):
+    """A retry that succeeds ends the ladder: no HTTP attempt, no HTTP cache prep."""
+    monkeypatch.setattr(
+        xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("HTTP prep ran")
+    )
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, False]
+
+
+def test_xet_retry_purges_the_dead_child_partial(monkeypatch):
+    """hf_xet rebuilds from offset zero, so the killed child's partial must go or the watchdog
+    would read a frozen byte count on the retry and trip a false stall."""
+    purged = []
+    monkeypatch.setattr(
+        xf, "_purge_owned_partials_for_xet_retry",
+        lambda rt, rid, cache_dir = None, owned_incomplete_blobs = None: purged.append(rt),
+    )
+    monkeypatch.setattr(
+        xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("HTTP prep ran on a Xet retry")
+    )
+    _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert purged == ["model"]
+
+
+def test_injected_prepare_for_http_not_used_between_xet_attempts(monkeypatch):
+    """The injected (marker-aware) hook belongs to the transport CHANGE only: running it between two
+    Xet attempts would stamp an "http" marker over a partial Xet still owns."""
     monkeypatch.setattr(
         xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("generic prepare ran")
     )
     injected = []
-    _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/model.gguf")])
     out = xf.hf_hub_download_with_xet_fallback(
         DL_REPO, FILE, None, prepare_for_http_fn = lambda rt, rid: injected.append((rt, rid))
     )
     assert out == "/cache/model.gguf"
-    assert injected == [("model", DL_REPO)]
+    assert injected == [("model", DL_REPO)], "exactly once, on the HTTP rung"
 
 
-def test_second_stall_raises_download_stall_error(monkeypatch):
-    fake = _install(monkeypatch, [("stall", None), ("stall", None)])
+def test_pre_byte_stall_skips_the_xet_retry(monkeypatch):
+    """"did not start" is as likely slow metadata as a broken Xet, and retrying it would buy a
+    second full connect window before HTTP: straight to HTTP instead."""
+    verdict = "Download did not start (xet transport) -- no data after 90s"
+    fake = _install(monkeypatch, [("stall", verdict), ("ok", "/cache/model.gguf")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_attempts_knob_of_one_restores_the_old_ladder(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_attempts_knob_extends_the_xet_budget(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "3")
+    fake = _install(
+        monkeypatch, [("stall", None), ("stall", None), ("stall", None), ("ok", "/cache/x")]
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.disable_xet for c in fake.calls] == [False, False, False, True]
+
+
+def test_attempts_knob_rejects_junk_and_clamps(monkeypatch):
+    for bad in ("", "abc", "0", "-3", "  "):
+        monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", bad)
+        assert xf.xet_attempts() == xf.DEFAULT_XET_ATTEMPTS, bad
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "999")
+    assert xf.xet_attempts() == xf._MAX_XET_ATTEMPTS
+    monkeypatch.delenv("UNSLOTH_XET_ATTEMPTS")
+    assert xf.xet_attempts() == xf.DEFAULT_XET_ATTEMPTS
+
+
+def test_recovered_stall_is_not_charged_to_the_machine(monkeypatch):
+    """Health takes ONE outcome per download: two stalls recorded separately would let a single
+    download hit the two-consecutive-failure demotion threshold on its own."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [True], "a stall the retry recovered from is noise, not evidence"
+
+
+def test_exhausted_xet_records_exactly_one_failure(monkeypatch):
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [False]
+
+
+def test_deferred_stall_is_reported_when_a_later_attempt_errors(monkeypatch):
+    """A deterministic error on the retry ends the ladder without an HTTP rung, but the earlier
+    stall was still real evidence and must not be silently forgiven."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(
+        monkeypatch,
+        [("stall", None), ("error", "RepositoryNotFoundError: gone")],
+    )
+    with pytest.raises(Exception):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [False]
+
+
+def test_cancel_between_xet_attempts_spawns_nothing(monkeypatch):
+    """A cancel landing in the stall window must not buy one more child, nor charge the machine."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    cancel = threading.Event()
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+
+    original = fake.__call__
+
+    def _cancel_after_first(*args, **kwargs):
+        result = original(*args, **kwargs)
+        cancel.set()
+        return result
+
+    monkeypatch.setattr(xf, "_run_download_attempt", _cancel_after_first)
+    # The stall is real, so the ladder still leaves Xet -- but over HTTP, not another Xet child.
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, cancel_event = cancel)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_stall_on_every_rung_raises_download_stall_error(monkeypatch):
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("stall", None)])
     with pytest.raises(xf.DownloadStallError):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
-    assert len(fake.calls) == 2
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
 
 
 def test_cancelled_midattempt_raises_no_fallback(monkeypatch):
@@ -955,11 +1070,13 @@ def test_cancelled_midattempt_raises_no_fallback(monkeypatch):
 
 
 def test_per_file_independent_fallback(monkeypatch):
-    """A stalled shard falls back; a sibling shard that succeeds does not."""
-    fake = _install(monkeypatch, [("ok", "/a"), ("stall", None), ("ok", "/b")])
+    """A stalled shard runs its own ladder; a sibling shard that succeeds starts fresh on Xet."""
+    fake = _install(
+        monkeypatch, [("ok", "/a"), ("stall", None), ("stall", None), ("ok", "/b")]
+    )
     assert xf.hf_hub_download_with_xet_fallback(DL_REPO, "shardA.gguf", None) == "/a"
     assert xf.hf_hub_download_with_xet_fallback(DL_REPO, "shardB.gguf", None) == "/b"
-    assert [c.disable_xet for c in fake.calls] == [False, False, True]
+    assert [c.disable_xet for c in fake.calls] == [False, False, False, True]
 
 
 def test_unsloth_disable_xet_forces_http_first(monkeypatch):
@@ -1002,6 +1119,9 @@ class _FakeProc:
         self._rec["hf_transfer"] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
         self._rec["skip_gpu_init"] = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT")
         self._rec["main_file"] = getattr(sys.modules.get("__main__"), "__file__", None)
+        # What the child would actually inherit: hf_xet reads these natively at import, so the
+        # spawn window is the only moment they can be set.
+        self._rec["xet"] = {k: v for k, v in os.environ.items() if k.startswith("HF_XET_")}
 
     def is_alive(self):
         return False
@@ -1066,6 +1186,115 @@ def test_xet_attempt_does_not_force_disable_before_spawn(monkeypatch):
     )
     # On the Xet-first attempt, do not force-disable Xet for the child.
     assert rec["disable_xet"] is None
+
+
+def _spawn_xet_env(monkeypatch) -> dict:
+    """Run one Xet-first attempt against a fake spawn and return the child's HF_XET_* env."""
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    return rec["xet"]
+
+
+def test_child_keeps_a_user_set_high_performance_flag(monkeypatch):
+    """The download child is the only process that matters here, so standing our sizing down for a
+    user who asked for high-performance mode has to hold on this path too. Forcing the flag back to
+    0 and re-adding the caps is the behaviour that cost a 192-core host 2.55x."""
+    from unsloth_zoo.hf_xet_tuning import _CAPS_VOIDED_BY_HIGH_PERFORMANCE
+
+    for var in ("HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS", "UNSLOTH_XET_ALLOW_HIGH_PERFORMANCE"):
+        monkeypatch.delenv(var, raising = False)
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "1"
+    for key in _CAPS_VOIDED_BY_HIGH_PERFORMANCE:
+        assert key not in child, key
+    # The settings the preset does not touch are still tuned for the child.
+    assert child["HF_XET_CLIENT_RETRY_MAX_ATTEMPTS"] == "2"
+
+
+def test_child_is_capped_when_nothing_asked_otherwise(monkeypatch):
+    """The default path is unchanged: no flag means the caps go to the child and the preset that
+    would void them is turned off."""
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert child["HF_XET_HP"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
+
+
+def test_force_caps_still_beats_the_flag_for_the_child(monkeypatch):
+    """The escape hatch survives: someone who wants a machine bounded regardless still gets the
+    caps, which only mean anything once the preset is off."""
+    monkeypatch.delenv("HF_XET_HP", raising = False)
+    monkeypatch.setenv("HF_XET_HIGH_PERFORMANCE", "1")
+    monkeypatch.setenv("UNSLOTH_XET_FORCE_CAPS", "1")
+
+    child = _spawn_xet_env(monkeypatch)
+    assert child["HF_XET_HIGH_PERFORMANCE"] == "0"
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) > 0
+
+
+def test_the_child_is_sized_for_the_cache_dir_it_was_given(monkeypatch, tmp_path):
+    """``cache_dir`` is what huggingface_hub uses (``file_download.py``: ``if cache_dir is None:
+    cache_dir = constants.HF_HUB_CACHE``), so it, not the process's HF_HUB_CACHE, is the volume the
+    child writes to. Sizing from the global cache hands a nearly full target disk the whole budget,
+    and clamps a roomy target to the floor whenever an unrelated default cache is full."""
+    import collections
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.delenv("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", raising = False)
+
+    def _child(cache_dir, hub_cache) -> dict:
+        monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+        rec: dict = {}
+        monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(cache_dir)}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+        return rec["xet"]
+
+    # Full target volume, roomy default cache: the clamp still bites.
+    child = _child(tight / "hub", roomy / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB
+    # Roomy target volume, full default cache: the download is not throttled for it.
+    child = _child(roomy / "hub", tight / "hub")
+    assert int(child["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
 
 
 class _EmptyQueue:
@@ -1271,26 +1500,27 @@ def test_unrelated_partial_does_not_block_clean_cached_snapshot(hf_cache, monkey
 
 
 def test_retry_status_failure_does_not_abort_fallback(monkeypatch):
-    """A raising on_status during the Xet->HTTP retry must not abort the fallback."""
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    """A raising on_status during either retry must not abort the ladder."""
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
 
     def boom(_message):
         raise RuntimeError("client gone")
 
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, on_status = boom)
     assert out == "/cache/x"
-    assert [c.disable_xet for c in fake.calls] == [False, True]
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
 
 
 def test_unclearable_partial_forces_clean_redownload(hf_cache, monkeypatch):
     """When prep cannot clear an unsafe partial, the HTTP attempt forces a clean re-download rather than resume over it."""
     # The autouse fixture makes _default_prepare_for_http a no-op (partial left in place).
     (_blobs_dir(hf_cache, DL_REPO) / "x.incomplete").write_bytes(b"abc")
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/x"
-    assert fake.calls[0].force_download is False   # Xet attempt: not forced
-    assert fake.calls[1].force_download is True    # HTTP attempt: forced clean
+    # Neither Xet attempt is forced: Xet rewrites from zero anyway, and forcing would discard the
+    # finalized blobs the retry is meant to keep.
+    assert [c.force_download for c in fake.calls] == [False, False, True]
 
 
 # Snapshot variant: in-process fast path on a warm cache, else watched download.
@@ -1631,11 +1861,13 @@ def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
 def test_snapshot_stall_then_http(monkeypatch):
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid, cache_dir = None, **k: prepared.append((rt, rid)))
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/snap-dir")])
+    fake = _install(
+        monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/snap-dir")]
+    )
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/snap-dir"
-    assert [c.kind for c in fake.calls] == ["snapshot", "snapshot"]
-    assert [c.disable_xet for c in fake.calls] == [False, True]
+    assert [c.kind for c in fake.calls] == ["snapshot"] * 3
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
     assert prepared == [("model", DL_REPO)]
 
 
@@ -4842,3 +5074,120 @@ def test_peer_liveness_cannot_suppress_the_clock_forever(hf_cache, monkeypatch):
         assert "did not start" in calls[0]
     finally:
         stop.set()
+
+
+def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch, tmp_path):
+    """The real parent has already sized itself at import, so its environment carries a buffer limit
+    computed for the global cache. Because the pre-spawn call is setdefault, that stale number would
+    survive into the child unless our own seeded values are dropped first."""
+    import collections
+    import os
+    import shutil
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        if text.startswith(str(roomy)):
+            return usage(9000 * GB, 1000 * GB, 8000 * GB)
+        raise OSError(f"unexpected filesystem: {text}")
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+
+    # Exactly what import leaves behind: the roomy default cache's numbers, in the environment and
+    # recorded as ours.
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot",
+        params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert int(rec["xet"][key]) == 1 * GB
+    assert os.environ[key] == str(64 * GB)  # the parent's own environment is untouched
+
+
+def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monkeypatch, tmp_path):
+    """The spawn window puts the child's ``HF_XET_*`` into the parent environment for the duration of
+    ``proc.start()``. Sizing from a copy taken outside the lock can catch that overlay, and since
+    those values are not the ones we seeded they read as explicit user settings, so setdefault keeps
+    them and this child is left with the import-time sizing instead of its own destination's."""
+    import collections
+    import shutil
+    import threading
+
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    GB = 1_000_000_000
+    key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
+    roomy = tmp_path / "roomy"
+    tight = tmp_path / "tight"
+    for directory in (roomy, tight):
+        directory.mkdir()
+    usage = collections.namedtuple("usage", "total used free")
+
+    def _disk_usage(path):
+        text = str(path)
+        if text.startswith(str(tight)):
+            return usage(1 * GB, 1 * GB, 0)
+        return usage(9000 * GB, 1000 * GB, 8000 * GB)
+
+    monkeypatch.setattr(shutil, "disk_usage", _disk_usage)
+    monkeypatch.setattr(tuning, "_psutil_memory", lambda: (2048 * GB, 2048 * GB))
+    monkeypatch.setattr(tuning, "cgroup_memory_limit", lambda: None)
+    for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
+        monkeypatch.delenv(var, raising = False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
+    monkeypatch.setenv(key, str(64 * GB))
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {key: str(64 * GB)}, raising = False)
+
+    holding = threading.Event()
+    done = threading.Event()
+
+    def _other_spawn():
+        # Exactly what the spawn window does: another child's numbers, briefly, in our environment.
+        with xf._SPAWN_ENV_LOCK:
+            os.environ[key] = str(7 * GB)
+            holding.set()
+            done.wait(5.0)
+            os.environ[key] = str(64 * GB)
+
+    peer = threading.Thread(target = _other_spawn, daemon = True)
+    peer.start()
+    assert holding.wait(5.0), "the peer never took the spawn lock"
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    waiter = threading.Timer(0.4, done.set)
+    waiter.start()
+    try:
+        xf._run_download_attempt(
+            DL_REPO, kind = "snapshot",
+            params = {"repo_id": DL_REPO, "cache_dir": str(tight / "hub")}, token = None,
+            repo_type = "model", disable_xet = False, cancel_event = None,
+            stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+        )
+    finally:
+        waiter.cancel()
+        done.set()
+        peer.join(5.0)
+    assert int(rec["xet"][key]) == 1 * GB, "the child was sized from the peer's overlay"
