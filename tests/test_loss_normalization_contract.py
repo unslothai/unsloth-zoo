@@ -1,5 +1,19 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """The grad-accumulation loss-normalisation contract in _unsloth_get_batch_samples.
 
 We decide num_items_in_batch from the forward signature, but training_step divides
@@ -45,19 +59,24 @@ def test_guard_is_present_and_mirrors_the_stock_predicate():
 
 
 def test_guard_only_suppresses_never_flips_the_flag():
-    """Flipping the flag True would break the trainers that disable it on purpose.
+    """Flipping the flag True would break the callers that disable it on purpose.
 
-    Thirteen TRL trainers set model_accepts_loss_kwargs = False in __init__ to
-    enable the grad-accum scaling (DPO, KTO, GRPO, RLOO, Reward, CPO, ORPO, BCO,
-    Distillation, SDPO, SSD, SDFT, AsyncGRPO). Suppressing the count is safe for
-    all of them; assigning the flag is not.
+    TRL trainers set model_accepts_loss_kwargs = False in __init__ to enable the
+    grad-accum scaling, and the membership is version dependent: DPO, KTO, GRPO,
+    RLOO, CPO, ORPO and BCO on 0.22.2 and 0.24.0, and thirteen on 1.9.2 once the
+    experimental trainers and RewardTrainer are counted. RewardTrainer in
+    particular does NOT assign it before 1.x, so no fixed trainer list is safe.
+    transformers 5.5.0 adds another: Trainer.__init__ itself sets the flag False
+    for the DeepSpeed sequence-parallel backend. Suppressing the count is right
+    for all of them; assigning the flag is not, and the check is module wide so a
+    helper cannot smuggle the assignment back in.
     """
-    src = _source()
-    assert not re.search(r"\.model_accepts_loss_kwargs\s*=", src), (
-        "the guard must not assign model_accepts_loss_kwargs. Suppressing the "
+    src = inspect.getsource(_loss_utils())
+    assert not re.search(r"\.model_accepts_loss_kwargs\s*=[^=]", src), (
+        "loss_utils must not assign model_accepts_loss_kwargs. Suppressing the "
         "count is enough, and assigning it would override trainers that set it "
         "False deliberately, plus the DeepSpeed sequence-parallel opt-out that "
-        "transformers sets in Trainer.__init__"
+        "transformers 5.5.0 sets in Trainer.__init__"
     )
 
 
@@ -109,3 +128,161 @@ def test_get_batch_samples_still_returns_the_documented_pair():
     assert src.endswith("return batch_samples, num_items_in_batch"), (
         "unsloth/models/_utils.py asserts on this exact shape at patch time"
     )
+
+
+# ---------------------------------------------------------------------------
+# Numerical: the guard is what makes accumulated gradients match a single batch.
+# ---------------------------------------------------------------------------
+
+def _tiny_model():
+    """A token normalising loss: sum / count when a count is given, mean otherwise.
+
+    That is exactly what unsloth_fused_ce_loss and TRL's _chunked_cross_entropy_loss
+    do, and the class name carries "CausalLM" with a **kwargs forward so
+    _unsloth_get_batch_samples takes its counting branch.
+    """
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class TinyForCausalLM(nn.Module):
+        accepts_loss_kwargs = False
+
+        def __init__(self, vocab = 11, hidden = 6):
+            super().__init__()
+            torch.manual_seed(0)
+            self.embed = nn.Embedding(vocab, hidden)
+            self.lm_head = nn.Linear(hidden, vocab, bias = False)
+
+        def forward(self, input_ids, labels = None, num_items_in_batch = None, **kwargs):
+            logits = self.lm_head(self.embed(input_ids))
+            flat_logits = logits[..., :-1, :].reshape(-1, logits.size(-1))
+            flat_labels = labels[..., 1:].reshape(-1)
+            total = F.cross_entropy(flat_logits, flat_labels, ignore_index = -100, reduction = "sum")
+            n = (flat_labels != -100).sum() if num_items_in_batch is None else num_items_in_batch
+            return total / n
+
+    return TinyForCausalLM()
+
+
+def _fake_trainer(model, accepts, compute_loss_func = None):
+    from transformers.training_args import ParallelMode
+
+    class Args:
+        average_tokens_across_devices = False
+        n_gpu = 1
+        world_size = 1
+        parallel_mode = ParallelMode.NOT_DISTRIBUTED
+
+    class Accelerator:
+        parallelism_config = None
+
+    class Trainer:
+        pass
+
+    t = Trainer()
+    t.model = model
+    t.args = Args()
+    t.accelerator = Accelerator()
+    t.model_accepts_loss_kwargs = accepts
+    t.compute_loss_func = compute_loss_func
+    return t
+
+
+def _microbatches(n, tokens_per_row):
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(7)
+    out = []
+    for _ in range(n):
+        ids = torch.randint(0, 11, (2, tokens_per_row + 1), generator = g)
+        out.append({"input_ids": ids, "labels": ids.clone()})
+    return out
+
+
+def _accumulate(model, microbatches, count, grad_accum, accepts_loss_kwargs):
+    """Sum gradients the way Trainer.training_step does.
+
+    Upstream (4.57.6 and 5.5.0 are byte identical here):
+        if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) \
+                and self.compute_loss_func is None:
+            loss = loss / self.current_gradient_accumulation_steps
+    test_training_step_still_divides_on_the_same_flag guards that drift.
+    """
+    model.zero_grad(set_to_none = True)
+    for batch in microbatches:
+        loss = model(**batch, num_items_in_batch = count)
+        if not accepts_loss_kwargs or count is None:
+            loss = loss / grad_accum
+        loss.backward()
+    return model.lm_head.weight.grad.clone()
+
+
+def test_accumulated_gradient_matches_the_single_batch_gradient():
+    """GA invariance, the property the whole guard exists to restore.
+
+    Four microbatches of equal token count, versus one batch holding all of them.
+    Returning the count while the flag is False divides once in the loss and again
+    in training_step, so the gradient comes out at exactly 1/GA. CPU only.
+    """
+    mod = _loss_utils()
+    fn = getattr(mod, "_unsloth_get_batch_samples", None)
+    if fn is None: pytest.skip("_unsloth_get_batch_samples not present")
+    torch = pytest.importorskip("torch")
+
+    grad_accum = 4
+    model = _tiny_model()
+    microbatches = _microbatches(grad_accum, 5)
+    single = {
+        "input_ids": torch.cat([b["input_ids"] for b in microbatches]),
+        "labels":    torch.cat([b["labels"]    for b in microbatches]),
+    }
+    reference = _accumulate(model, [single], None, 1, False)
+
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, guarded = fn(_fake_trainer(model, False), iter(microbatches), grad_accum)
+    assert guarded is None, "the guard must suppress the count when the flag is False"
+    after = _accumulate(model, microbatches, guarded, grad_accum, False)
+    assert torch.allclose(after, reference, atol = 1e-6), (
+        "accumulated gradients no longer match the single batch gradient"
+    )
+
+    # What the unguarded code returned, run through the same training_step rule.
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, unguarded = fn(_fake_trainer(model, True), iter(microbatches), grad_accum)
+    assert unguarded is not None
+    before = _accumulate(model, microbatches, unguarded, grad_accum, False)
+    ratio = (before.norm() / reference.norm()).item()
+    assert abs(ratio - 1.0 / grad_accum) < 1e-4, (
+        f"expected the double normalised gradient at 1/GA, measured x{ratio}"
+    )
+
+
+def test_guard_returns_a_count_exactly_when_stock_transformers_would():
+    """Same decision as Trainer._get_num_items_in_batch, for every flag pairing.
+
+    This is the answer to "why not keep the count and normalise per token across
+    microbatches": stock never emits a count while the flag is False, because
+    training_step would then divide by GA on top of it.
+    """
+    from transformers import Trainer
+
+    mod = _loss_utils()
+    fn = getattr(mod, "_unsloth_get_batch_samples", None)
+    if fn is None: pytest.skip("_unsloth_get_batch_samples not present")
+    stock = getattr(Trainer, "_get_num_items_in_batch", None)
+    if stock is None: pytest.skip("no _get_num_items_in_batch on this transformers")
+    torch = pytest.importorskip("torch")
+
+    model = _tiny_model()
+    microbatches = _microbatches(2, 5)
+    device = torch.device("cpu")
+    for accepts in (True, False):
+        for loss_func in (None, lambda *a, **k: None):
+            trainer = _fake_trainer(model, accepts, loss_func)
+            mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+            _, ours = fn(trainer, iter(microbatches), 2, device)
+            theirs = stock(trainer, microbatches, device)
+            assert (ours is None) == (theirs is None), (
+                f"accepts={accepts} compute_loss_func={loss_func is not None}: "
+                f"we returned {ours!r} where stock returned {theirs!r}"
+            )
