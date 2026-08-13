@@ -858,7 +858,7 @@ def _is_checkpoint_pack_hook(pack):
                 ("_checkpoint_hook", "_recomputation_hook")))
 
 
-def _in_non_reentrant_checkpoint(budgeted = False):
+def _in_non_reentrant_checkpoint():
     """Are we inside a `use_reentrant = False` region? None when torch cannot say.
 
     The only saved-tensor hooks `torch.utils.checkpoint` installs are the
@@ -873,15 +873,15 @@ def _in_non_reentrant_checkpoint(budgeted = False):
     ours, so an unrecognised hook is "cannot tell from here", not "no region":
     ask the frames instead.
 
-    `budgeted` puts that frame walk on the step's `_probe_walk` budget, for the
-    one caller that runs on EVERY successful compiled call rather than once per
-    failure. The give-up paths must keep the default uncapped walk: they are
-    reached once, and their answer decides whether a compiled pack would be
-    recomputed eagerly, so ~15us there buys correctness outright. Paying it per
-    call instead defeats the very budget `_note_packed_under_checkpoint` pays
-    into and adds the walk to every compiled kernel invocation for the life of a
-    run on a torch with no accessor. A spent budget answers None, not False:
-    "stopped asking" is not "no region", and an unknown still counts as packed.
+    The walk is deliberately NOT put on `_probe_walk`'s miss budget, even though
+    `_note_compiled_ok` calls this on every successful compiled call. Budgeting
+    it means a spent budget has to answer something, and both answers are wrong
+    somewhere: False loses a compiled pack that really was under a checkpoint,
+    and None gets recorded as a possible pack, which on a generation-heavy GRPO
+    step marks uncheckpointed inference calls as packed and re-raises on the
+    first codegen refusal -- the exact failure this module exists to prevent.
+    A definite answer per call is worth the walk; the cost is instead removed by
+    not asking, see `_note_compiled_ok`.
     """
     top = _saved_tensor_hook_accessor()
     if top is not None:
@@ -892,12 +892,7 @@ def _in_non_reentrant_checkpoint(budgeted = False):
         if hooks is not _UNKNOWN:
             if not hooks: return False
             if _is_checkpoint_pack_hook(hooks[0]): return True
-    if not budgeted: return _walk_for_checkpoint_frame()
-    # Asked before walking, not after: `_probe_walk` increments the miss count
-    # itself, so reading it afterwards would report the walk it just did as a
-    # walk that was skipped.
-    if _CHECKPOINT_PROBE_MISSES >= _CHECKPOINT_PROBE_MISS_BUDGET: return None
-    return True if _probe_walk() else False
+    return _walk_for_checkpoint_frame()
 
 
 # Set when a compiled call ran with a non-reentrant checkpoint's pack hook on
@@ -1310,7 +1305,13 @@ def _restore_recompile_limits():
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0
-    _COMPILED_OK_LABELS.clear()
+    # `_COMPILED_OK_LABELS` is deliberately NOT cleared here. This runs whenever
+    # the last borrowed bump is handed back, which `_release_borrowed_budget`
+    # does mid-step after a caught exception, not only at a step boundary. One
+    # wrapper releasing budget would then erase another wrapper's record of
+    # having packed compiled under a still-open checkpoint, and that wrapper's
+    # next refusal would latch eager and let its pack be recomputed eagerly.
+    # The genuine step boundary, `apply_pending_eager_fallbacks`, clears it.
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1799,7 +1800,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # on the call that actually packs. The marker was the only thing
             # worth reading here and it is already known False above.
             return
-        answer = _in_non_reentrant_checkpoint(budgeted = True)
+        if label in _COMPILED_OK_LABELS:
+            # Already recorded this step, so the probe cannot change anything.
+            # Together with the marker branch above this is what bounds the
+            # cost: a label is probed until its answer is known, not forever.
+            return
+        answer = _in_non_reentrant_checkpoint()
         if answer is False:
             return
         if answer:

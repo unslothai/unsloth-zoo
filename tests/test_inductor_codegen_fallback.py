@@ -877,36 +877,59 @@ def test_an_unknown_answer_does_not_latch_the_process_wide_marker(monkeypatch):
         "an unknown must not latch the process-wide marker"
 
 
-def test_the_budgeted_probe_stops_walking_and_answers_unknown(monkeypatch):
-    """`budgeted = True` puts the frame walk on the step's miss budget.
+def test_a_spent_walk_budget_does_not_invent_checkpoint_history(monkeypatch):
+    """An exhausted probe budget must not mark uncheckpointed calls as packed.
 
-    Without it a torch with no accessor pays an unbounded stack walk on every
-    successful compiled call for the whole run, which is exactly the cost
-    `_probe_walk`'s budget exists to cap for the pre-call probe. A spent budget
-    has to answer None rather than False: "stopped asking" is not "no region".
+    A budgeted post-call probe has to answer something once the budget is gone,
+    and both answers are wrong somewhere. Answering None and recording it is the
+    dangerous one: on a torch with no hook accessor, a generation-heavy GRPO
+    step spends the budget on uncheckpointed inference calls, every later
+    success gets recorded as a possible compiled pack, and the first codegen
+    refusal inside the training checkpoint is then re-raised as though an
+    earlier compiled pack existed -- which ends the run this module exists to
+    keep alive. So the probe stays unbudgeted and answers definitely.
     """
     monkeypatch.setattr(patch_utils, "_saved_tensor_hook_accessor",
                         lambda: None)
-    walks = {"n": 0}
-
-    def _counting_walk():
-        walks["n"] += 1
-        return False
-
+    # No checkpoint anywhere: the walk always answers a definite False.
     monkeypatch.setattr(patch_utils, "_walk_for_checkpoint_frame",
-                        _counting_walk)
-    monkeypatch.setattr(patch_utils, "_CHECKPOINT_PROBE_MISSES", 0)
+                        lambda: False)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    # The budget is already spent, as it would be after a long generation pass.
+    monkeypatch.setattr(patch_utils, "_CHECKPOINT_PROBE_MISSES",
+                        patch_utils._CHECKPOINT_PROBE_MISS_BUDGET)
 
-    budget = patch_utils._CHECKPOINT_PROBE_MISS_BUDGET
-    for _ in range(budget + 25):
-        patch_utils._in_non_reentrant_checkpoint(budgeted = True)
-
-    assert walks["n"] == budget, (
-        f"the walk should stop at the {budget}-miss budget; it ran "
-        f"{walks['n']} times"
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        lambda x: "compiled", lambda x: "eager", "test-spent-budget",
     )
-    assert patch_utils._in_non_reentrant_checkpoint(budgeted = True) is None, \
-        "a spent budget means 'stopped asking', not 'no region'"
-    # The uncapped form is unchanged: the give-up paths still get a real answer.
-    assert patch_utils._in_non_reentrant_checkpoint() is False
-    assert walks["n"] == budget + 1
+    for _ in range(5):
+        assert wrapped(1) == "compiled"
+
+    assert "test-spent-budget" not in patch_utils._COMPILED_OK_LABELS, (
+        "an exhausted budget must not turn definitely-uncheckpointed calls "
+        "into checkpoint history"
+    )
+    assert patch_utils._in_non_reentrant_checkpoint() is False, \
+        "the probe must keep giving a definite answer, not None"
+
+
+def test_releasing_borrowed_budget_keeps_compiled_pack_history(monkeypatch):
+    """`_restore_recompile_limits` is not a step boundary, so it must not clear.
+
+    `_release_borrowed_budget` calls it mid-step, after a caught exception, as
+    soon as no live wrapper still needs its bump. Clearing the history there
+    erases another wrapper's record of having packed compiled under a still-open
+    checkpoint, and that wrapper's next refusal then latches eager and lets the
+    pack be recomputed eagerly. Only `apply_pending_eager_fallbacks`, the real
+    step boundary, may clear it.
+    """
+    patch_utils._COMPILED_OK_LABELS.add("test-packed-earlier")
+    patch_utils._restore_recompile_limits()
+    assert "test-packed-earlier" in patch_utils._COMPILED_OK_LABELS, (
+        "handing back the recompile budget mid-step erased a wrapper's record "
+        "of having packed compiled activations"
+    )
+    # The genuine step boundary still clears it.
+    patch_utils.apply_pending_eager_fallbacks()
+    assert "test-packed-earlier" not in patch_utils._COMPILED_OK_LABELS, \
+        "the step boundary must still reset the history"
