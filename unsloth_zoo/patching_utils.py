@@ -24,6 +24,7 @@ __all__ = [
     "patch_compiling_bitsandbytes",
     "patch_layernorm",
     "patch_torch_compile",
+    "stop_compiling_weak_dictionary_writes",
     "patch_model_and_tokenizer",
     "patch_compiled_autograd",
 ]
@@ -101,6 +102,73 @@ def patch_layernorm(fast_layernorm):
         torch.nn.LayerNorm = Unsloth_LayerNorm
     return
 pass
+
+
+# The stdlib weak-dictionary mutators. Dynamo inlines the standard library by
+# default and will happily compile these, and the saved-tensor bookkeeping of
+# activation checkpointing reaches them from inside a compiled region.
+_WEAK_DICTIONARY_WRITERS = (
+    ("WeakKeyDictionary",   "__setitem__"),
+    ("WeakKeyDictionary",   "__delitem__"),
+    ("WeakValueDictionary", "__setitem__"),
+    ("WeakValueDictionary", "__delitem__"),
+)
+
+
+def stop_compiling_weak_dictionary_writes():
+    """Ask Dynamo to leave `weakref`'s dictionary writes alone. Returns how many.
+
+    Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with
+
+        AssertionError: Something went unexpectedly wrong in activation
+        checkpoint
+
+    and the recompile budget is why, but not the way it looks. The budget that
+    runs out does not belong to any kernel Unsloth compiles: measured on the
+    kernel that fails, `weakref.__setitem__` was compiled 1030 times in that one
+    step against a `recompile_limit` of 1024, while the gemma4 RMSNorm kernel
+    Unsloth does compile was compiled six times in the whole run.
+
+    Non-reentrant activation checkpointing recomputes each packed forward during
+    backward and saves the intermediates through weakly-keyed bookkeeping. That
+    bookkeeping runs on the autograd thread with a compiled region on the stack,
+    so Dynamo intercepts it, and it sees a fresh key object per checkpointed
+    region -- one compilation each, thousands of them, none of which can ever be
+    reused. When the budget finally runs out, the failure surfaces inside
+    whichever compiled kernel was running, AFTER that kernel has already run and
+    its activations have been packed. The eager fallback then retries the call
+    with a little more budget, the retry packs the same activations a second
+    time, and torch's recomputation hook asserts on the duplicate.
+
+    Compiling a weak-dictionary insert buys nothing whatsoever, so the fix is to
+    stop doing it. The budget is then never touched, no retry happens, nothing is
+    packed twice, and the model stays compiled -- unlike every workaround that
+    turns compilation off to get the run to finish.
+
+    A one-time mark on four code objects. It changes no behaviour of its own:
+    a skipped frame runs in the interpreter, which is what it did before anyone
+    thought to compile it.
+    """
+    try:
+        import weakref
+        from torch._dynamo.eval_frame import skip_code
+    except Exception:
+        # Older torch without the accessor, or no Dynamo at all. Nothing to do,
+        # and nothing here is worth failing an import over.
+        return 0
+    marked = 0
+    for owner_name, method_name in _WEAK_DICTIONARY_WRITERS:
+        owner = getattr(weakref, owner_name, None)
+        method = getattr(owner, method_name, None)
+        code = getattr(method, "__code__", None)
+        if code is None:
+            continue
+        try:
+            skip_code(code)
+        except Exception:
+            continue
+        marked += 1
+    return marked
 
 
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
@@ -230,6 +298,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
+    # Here because this is where Dynamo is configured, and because it has to
+    # happen before anything compiles. See the function for what it is for.
+    stop_compiling_weak_dictionary_writes()
 pass
 
 def get_model(model):
