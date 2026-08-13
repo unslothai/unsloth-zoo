@@ -196,3 +196,53 @@ print("IMPORT_OK")
     )
     assert result.returncode == 0, result.stderr[-2000:]
     assert "IMPORT_OK" in result.stdout
+
+
+def test_flex_attention_import_does_not_query_free_device_memory():
+    """The same probe pattern in flex_attention/utils.py.
+
+    It only needs total capacity, like gpt_oss, and gpt_oss imports it, so leaving
+    mem_get_info() here would put back the context the gpt_oss fix removes for anyone
+    who reaches the flex-attention path.
+    """
+    import os
+    import subprocess
+    import sys
+
+    script = r'''
+import torch
+
+class Props:
+    major = 8
+    minor = 9
+    total_memory = 48 * 1024**3
+    multi_processor_count = 108
+    name = "stub"
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("mem_get_info was called during import")
+
+torch.cuda.is_available = lambda: True
+torch.cuda.device_count = lambda: 1
+torch.cuda.current_device = lambda: 0
+torch.cuda.get_device_capability = lambda *args, **kwargs: (8, 9)
+torch.cuda.get_device_properties = lambda *args, **kwargs: Props()
+torch.cuda.mem_get_info = forbidden
+torch.cuda.memory.mem_get_info = forbidden
+
+from unsloth_zoo.flex_attention import utils
+# 48 GB is above the 16 GB threshold, so the low-memory kernel options stay off.
+assert utils.kernel_options is None, utils.kernel_options
+print("IMPORT_OK")
+'''
+    env = {
+        **os.environ,
+        "UNSLOTH_IS_PRESENT": "1",
+        "UNSLOTH_ALLOW_CPU": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "IMPORT_OK" in result.stdout
