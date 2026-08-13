@@ -23,7 +23,7 @@ from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -35,7 +35,13 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
-if DEVICE_TYPE == "cuda":
+if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
+    # whether a device is present before asking what it can do. Cut cross
+    # entropy is a Triton GPU kernel and cannot run here regardless, so False is
+    # both the conservative answer and the only correct one.
+    HAS_CUT_CROSS_ENTROPY = False
+elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
@@ -74,7 +80,7 @@ __all__ = [
     "unsloth_fused_ce_loss",
 ]
 
-from .fused_losses import unsloth_fused_ce_loss
+from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3

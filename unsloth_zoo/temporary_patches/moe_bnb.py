@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 import os
 import warnings
-from ..log import logger
+from unsloth_zoo.log import logger
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 

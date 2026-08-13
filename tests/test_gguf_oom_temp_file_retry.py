@@ -214,8 +214,16 @@ def test_the_paths_include_the_file_and_its_shards(tmp_path):
 
 
 def test_the_retry_clears_the_old_output_first():
+    # Anchored on the OOM branch. The loop grew a second `command = retry`, for
+    # a converter that rejects --no-mtp, and a bare index() finds that one
+    # first. That retry re-runs the same command minus one flag, keeps
+    # --split-max-size and so overwrites the same paths, which is why it has no
+    # cleanup; only the OOM retry drops --split-max-size and can leave the
+    # killed run's shards behind. Searching from the kill check keeps the
+    # assertion on the branch that actually needs it.
     body = _loop_src()
-    assert body.index("_remove_gguf_outputs(output_file)") < body.index("command = retry")
+    oom = body.index("_converter_was_oom_killed(e)")
+    assert body.index("_remove_gguf_outputs(output_file)", oom) < body.index("command = retry", oom)
 
 
 def test_a_failed_projector_is_removed_and_stops_claiming_vlm():

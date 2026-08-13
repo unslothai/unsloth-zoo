@@ -55,7 +55,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from unsloth_zoo.temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -85,8 +85,15 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 major = None
 minor = None
 if DEVICE_TYPE == "cuda":
-    major, minor = torch.cuda.get_device_capability()
-    OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+    else:
+        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
+        # ask whether a device is present before asking what it can do. There is
+        # no arch to read, and the old-arch compile workarounds only ever run on
+        # a real GPU, so False is the answer that changes nothing.
+        OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "hip":
     OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "xpu":
@@ -1181,6 +1188,12 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import _maybe_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if "functools." in new_source:
+        # patch_gradient_checkpointing() emits `functools.partial(layer.__call__,
+        # ...)` for keywords the layer only accepts through **kwargs, and copied
+        # upstream source can reference functools too. Neither the license header
+        # nor the model module's own imports are guaranteed to provide it.
+        imports += "import functools\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -2744,6 +2757,82 @@ pass
 
 # We need to manually replace some items
 # For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+#
+# patch_gradient_checkpointing() below rewrites `hidden_states = blk(...)` into
+# a `self._gradient_checkpointing_func(blk.__call__, ...)` call, and on the way
+# it demotes every `arg=arg` keyword to a positional (the
+# `re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", ...)` a few lines further down). So the
+# rewritten argument list has to line up positionally with the vision block's
+# own signature, and anything the block only accepts through **kwargs has to
+# stay a keyword.
+#
+# transformers <= 4.57 spells the block as
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              rotary_pos_emb=None, position_embeddings=None,
+#                              **kwargs)
+# while the caller passes only cu_seqlens + position_embeddings, so
+# `rotary_pos_emb=rotary_pos_emb` is injected to fill the third positional slot
+# (that is the "missing None" HF 4.53.1 broke).
+#
+# transformers >= 5.0 dropped `rotary_pos_emb` from the block signature
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              position_embeddings=None, **kwargs)
+# and added `max_seqlen=max_seqlen` to the call site (transformers 5.x moved the
+# cu_seqlens/max_seqlen computation into get_vision_attention_seqlens()).
+# `max_seqlen` is NOT a named parameter of the block - it only rides in through
+# **kwargs - so it cannot be demoted to a positional, and it must not be left as
+# a bare keyword either: in the rewritten call everything after the callable is
+# handed to `self._gradient_checkpointing_func`, not to the block. That function
+# is not necessarily Unsloth's. It is whatever transformers installed, i.e. very
+# often plain `torch.utils.checkpoint.checkpoint` (or a `functools.partial` of
+# it), which raises `ValueError: Unexpected keyword arguments: max_seqlen` under
+# `use_reentrant = True`. Unsloth's own `unsloth_checkpoint` raises the same way.
+#
+# So the 5.x entry drops `max_seqlen` from the positional argument list and asks
+# for it back as a *bound* keyword via the optional third element of the entry.
+# `patch_gradient_checkpointing()` then emits
+#   self._gradient_checkpointing_func(
+#       functools.partial(blk.__call__, max_seqlen = max_seqlen), ...)
+# in the checkpointed branch and `blk(..., max_seqlen = max_seqlen)` in the else
+# branch. The same reasoning applies to the `**kwargs` expansion the call site
+# already had on EVERY version, 4.x included: it is a keyword expansion, so it
+# is moved out of the argument list and into the same partial. It looks harmless
+# only because it is usually empty; `output_hidden_states = True` reaches the
+# vision tower's **kwargs on transformers 5.x and is enough to trip the same
+# `Unexpected keyword arguments` error.
+# Binding into the callable is exactly what transformers itself does in
+# `GradientCheckpointingLayer.__call__`, so it works with every checkpoint
+# implementation - reentrant or not, Unsloth's or torch's - and the value still
+# reaches the block on both branches.
+#
+# (Were the keyword dropped instead, `VisionAttention.forward` would recompute it
+# via get_max_seqlen(cu_seqlens, self.config, kwargs = {"max_seqlen": max_seqlen})
+# and return the same number, so nothing breaks - but that costs a
+# `.max().item()` device sync per vision layer under flash attention, which is
+# why the keyword is preserved instead.)
+#
+# Order matters: the 5.x entries must stay AFTER the 4.x ones. The 5.x
+# replacement is textually the 4.x call, and the replacement list is applied in a
+# single pass, so entry 0 (which would inject `rotary_pos_emb` that 5.x blocks no
+# longer accept) has already run by the time this fires.
+#
+# Ordering alone is not enough, though, and that is what the optional FOURTH
+# element is for. transformers 5.10 - 5.14 spell the call site exactly like
+# 4.53.0 - 5.9 while the block has already lost `rotary_pos_emb`, so entry 0
+# matched on its own and produced
+#   TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4 positional
+#   arguments but 5 were given
+# Entries that inject a parameter therefore declare it, and
+# _replacement_fits_the_layer() checks it against the real block signature
+# before the entry is allowed to fire.
+#
+# There is deliberately no 5.x + `attention_mask` entry. The `attention_mask=`
+# spelling only ever existed in transformers 4.53.x (where the block named it as
+# its fifth positional parameter, which is why the 4.x entry below demotes it);
+# it was gone by 4.54 and no 5.x release pairs it with `max_seqlen`. In 5.x the
+# vision attention has no `attention_mask` parameter at all and passes
+# `attention_mask = None` to the attention interface itself, so any guessed
+# rewrite would be untestable and wrong either way.
 custom_gradient_checkpointing_replacements = [
     (
         """hidden_states = blk(
@@ -2759,6 +2848,11 @@ custom_gradient_checkpointing_replacements = [
                 position_embeddings=position_embeddings,
                 **kwargs,
             )""",
+        None,
+        # transformers 5.10 - 5.14 spell the call site exactly like 4.53.0 - 5.9
+        # but dropped rotary_pos_emb from the block, so this entry must only
+        # fire while the block still takes it. See _replacement_fits_the_layer.
+        ("rotary_pos_emb",),
     ),
     (
         """hidden_states = blk(
@@ -2776,6 +2870,27 @@ custom_gradient_checkpointing_replacements = [
                 attention_mask=attention_mask,
                 **kwargs,
             )""",
+        None,
+        ("rotary_pos_emb",),
+    ),
+    # transformers >= 5.0 spelling. `max_seqlen` leaves the positional argument
+    # list and comes back as a keyword bound into the checkpointed callable (the
+    # third element below). Must stay after the 4.x entries.
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        ("max_seqlen",),
     ),
 ]
 replace_gradient_checkpointing = """
@@ -2787,6 +2902,90 @@ $    )
 $else:
 $    hidden_states = LAYER(ARGS)
 """
+
+
+def _bound_keywords_of_replacement(replacement):
+    """Optional third element of a ``custom_gradient_checkpointing_replacements``
+    entry: keyword arguments the rewritten call must keep as keywords.
+
+    They cannot travel in ``ARGS`` - everything there is forwarded to
+    ``self._gradient_checkpointing_func``, which is frequently plain
+    ``torch.utils.checkpoint.checkpoint`` and rejects unknown keywords. They are
+    bound into the checkpointed callable instead, the way
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__`` does it.
+
+    Accepts a mapping ``{keyword: expression}`` or a plain sequence of names
+    (shorthand for ``{name: name}``). A 2-tuple entry declares none, so every
+    pre-existing entry keeps behaving exactly as before.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if len(replacement) <= 2:
+        return {}
+    extra = replacement[2]
+    if extra is None:
+        return {}
+    if isinstance(extra, dict):
+        return dict(extra)
+    return {name: name for name in extra}
+
+
+def _modulelist_layer_class(source, init, modulelist_item):
+    """The class the ``nn.ModuleList`` is filled with, or ``None``.
+
+    ``self.blocks = nn.ModuleList([Qwen2VLVisionBlock(config) for _ in ...])``
+    names it, and it is defined in the same module as ``source``. Returned so a
+    replacement entry can be checked against the signature it is rewriting the
+    call for, instead of trusting the call site's spelling alone.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    match = re.search(
+        re.escape(modulelist_item)
+        + r"[\s]*\=[\s]*.*?nn\.ModuleList\([\s]*\[?[\s]*([A-Za-z_][A-Za-z_0-9]*)[\s]*\(",
+        init, flags = re.DOTALL,
+    )
+    if match is None:
+        return None
+    return getattr(
+        sys.modules.get(getattr(source, "__module__", None), None),
+        match.group(1), None,
+    )
+
+
+def _replacement_fits_the_layer(replacement, layer_class):
+    """Optional 4th element: parameter names the layer's ``forward`` must have
+    for the replacement to be correct.
+
+    Two different transformers generations can spell the call site IDENTICALLY
+    and still need different rewrites. transformers 4.53.0 - 5.9 and 5.10 - 5.14
+    both write
+
+        hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens,
+                            position_embeddings=position_embeddings, **kwargs)
+
+    but 5.10 dropped ``rotary_pos_emb`` from ``Qwen2VLVisionBlock.forward``. The
+    entry that re-injects ``rotary_pos_emb`` (needed on <= 5.9, where the block
+    still takes it as its third positional and the un-rewritten call relies on
+    keyword binding) therefore has to be skipped on >= 5.10, where injecting it
+    hands the block one positional too many:
+    ``TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4 positional
+    arguments but 5 were given``. On >= 5.10 no entry is needed at all - the
+    generic ``arg=arg`` demotion already produces a call the block accepts.
+
+    Unresolvable layer / signature means "behave exactly as before".
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if len(replacement) <= 3:
+        return True
+    required = replacement[3]
+    if not required:
+        return True
+    if layer_class is None:
+        return True
+    try:
+        parameters = inspect.signature(layer_class.forward).parameters
+    except (TypeError, ValueError):
+        return True
+    return all(name in parameters for name in required)
 
 
 def patch_gradient_checkpointing(module, source):
@@ -2804,16 +3003,24 @@ def patch_gradient_checkpointing(module, source):
     if "_gradient_checkpointing_func" in forward:
         return None
 
-    # Fix Qwen2 missing None for gradient checkpointing
-    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
-        forward = forward.replace(custom_find, custom_replace)
-    pass
-
     # No gradient checkpointing?
     modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
     if len(modulelist_items) != 1:
         return None
     modulelist_item = modulelist_items[0]
+
+    # Fix Qwen2 missing None for gradient checkpointing
+    layer_class = _modulelist_layer_class(source, init, modulelist_item)
+    bound_keywords = {}
+    for replacement in custom_gradient_checkpointing_replacements:
+        custom_find, custom_replace = replacement[0], replacement[1]
+        if custom_find not in forward:
+            continue
+        if not _replacement_fits_the_layer(replacement, layer_class):
+            continue
+        forward = forward.replace(custom_find, custom_replace)
+        bound_keywords.update(_bound_keywords_of_replacement(replacement))
+    pass
 
     # Check in forward source
     finder = (
@@ -2836,6 +3043,63 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+
+    # Everything left in `ARGS` is forwarded verbatim to
+    # `self._gradient_checkpointing_func`, which is frequently plain
+    # `torch.utils.checkpoint.checkpoint`. Positionals are fine there - that is
+    # exactly what checkpointing is for - but KEYWORDS are not: reentrant
+    # `torch.utils.checkpoint.checkpoint` raises `Unexpected keyword arguments`
+    # on anything it does not recognise, and Unsloth's own reentrant shims can
+    # only forward positionals. So every keyword has to be bound into the
+    # checkpointed callable instead, the way
+    # `transformers.modeling_layers.GradientCheckpointingLayer.__call__` does
+    # it upstream.
+    #
+    # Two sources of keywords:
+    #   1. `bound_keywords` - declared by a replacement entry (Qwen2-VL's
+    #      `max_seqlen`, which the 5.x block only accepts through **kwargs).
+    #   2. A `**kwargs` expansion the upstream call site already had. This one
+    #      is the layer's own runtime keywords; leaving it in `ARGS` hands them
+    #      to the checkpoint function. Empty at runtime it looks harmless, which
+    #      is why it survived - `output_hidden_states = True` on transformers
+    #      5.x is enough to make it non-empty and blow up.
+    # The `else` branch calls the layer directly, so there they all stay
+    # ordinary keywords and `ARGS` is used unchanged.
+    star_kwargs = re.findall(r"\*\*[\s]*([A-Za-z_][A-Za-z_0-9]*)", args)
+    checkpoint_args = args
+    if star_kwargs:
+        checkpoint_args = re.sub(
+            r"\*\*[\s]*[A-Za-z_][A-Za-z_0-9]*[\s]*\,?", "", args
+        )
+    partial_keywords = [
+        f"{name} = {value}" for name, value in bound_keywords.items()
+    ] + [f"**{name}" for name in star_kwargs]
+
+    if partial_keywords:
+        replacer = replacer.replace(
+            "LAYER.__call__, ARGS",
+            "functools.partial(LAYER.__call__, "
+            + ", ".join(partial_keywords)
+            + "), " + checkpoint_args,
+        )
+    pass
+
+    if bound_keywords:
+        keywords = ", ".join(
+            f"{name} = {value}" for name, value in bound_keywords.items()
+        )
+        args_with_keywords = args.rstrip()
+        if args_with_keywords.strip() == "":
+            args_with_keywords = keywords
+        else:
+            if not args_with_keywords.endswith(","):
+                args_with_keywords += ","
+            args_with_keywords += " " + keywords
+        replacer = replacer.replace(
+            "hidden_states = LAYER(ARGS)",
+            "hidden_states = LAYER(" + args_with_keywords + ")",
+        )
+    pass
 
     replacer = (
         replacer.replace("LAYER", layer)

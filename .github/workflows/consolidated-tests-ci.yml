@@ -157,6 +157,11 @@ jobs:
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_inductor_codegen_fallback.py \
+            tests/test_eager_fallback_latch.py \
+            tests/test_recompile_limit_fallback.py \
+            tests/test_checkpoint_compile_mix.py \
+            tests/test_disabled_hook_graph_break.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -350,6 +355,13 @@ jobs:
         # 626 drift-detector tests / cell across 12 files. HARD GATE: a red cell
         # means real upstream drift (transformers/trl/peft/vllm/datasets renamed
         # or removed a symbol zoo references). Zoo PRs #4 through #635 mined.
+        #
+        # test_gemma4_dtype_drift_guards belongs here, not to the CPU job: its
+        # real-source canaries read the INSTALLED transformers gemma4 module and
+        # only mean something against a moving pin, which this matrix alone
+        # supplies. They skip on the HF=4.57.6 cell (no gemma4 before transformers
+        # 5.5.0). Until now no job executed the file at all -- `--collect-only`
+        # proves only that it imports, and is continue-on-error besides.
         run: |
           python -m pytest -v --tb=short -rs \
             tests/test_upstream_pinned_symbols_transformers.py \
@@ -365,11 +377,13 @@ jobs:
             tests/test_compiler_rewriter_exhaustive.py \
             tests/test_compiler_dynamic_exec.py \
             tests/test_temporary_patches_exhaustive.py \
+            tests/test_missing_parent_package_is_drift.py \
             tests/test_unsloth_zoo_lora_merge.py \
             tests/test_peft_paramwrapper_layout_drift.py \
             tests/test_transformers_moe_structure_drift.py \
             tests/test_moe_merge_e2e_cpu.py \
-            tests/test_merge_e2e_hub_unreachable.py
+            tests/test_merge_e2e_hub_unreachable.py \
+            tests/test_gemma4_dtype_drift_guards.py
 
   # The MLX VLM/shape/batching suites on Linux CPU MLX: mlx ships manylinux CPU
   # wheels and mlx-lm/mlx-vlm are py3-none-any, so these cost no macOS minutes.

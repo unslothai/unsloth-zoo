@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.8.10"
+__version__ = "2026.8.11"
 
 import os
 import platform
@@ -150,7 +150,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 
 from importlib.util import find_spec
-from .mlx.runtime import is_mlx_available
+from unsloth_zoo.mlx.runtime import is_mlx_available
 from .model_lists import FORCE_FLOAT32
 
 # Import-time fixes live in ``unsloth/import_fixes.py`` and run at ``import
@@ -184,9 +184,9 @@ else:
 # instead of a hard ImportError. Inert in the download child, which never touches them.
 # On a normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
 if _SKIP_GPU_INIT:
-    from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
+    from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
-    from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
+    from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
     _inject_bnb()
     del _inject_triton, _inject_bnb
 
@@ -503,14 +503,14 @@ if not _SKIP_GPU_INIT:
     # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
-    from .temporary_patches import (
+    from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )
 
     # Fused lm_head + cross_entropy auto-installer. On by default; set
     # UNSLOTH_FUSED_FORWARD=0 to disable.
     try:
-        from .fused_losses.forward_install import install_modeling_import_hook as _install_fused_forward
+        from unsloth_zoo.fused_losses.forward_install import install_modeling_import_hook as _install_fused_forward
         _install_fused_forward()
         del _install_fused_forward
     except Exception:

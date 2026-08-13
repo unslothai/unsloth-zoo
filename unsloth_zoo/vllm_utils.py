@@ -60,7 +60,7 @@ from .hf_utils import (
     set_dtype_in_config,
 )
 from .patching_utils import patch_model_and_tokenizer
-from .temporary_patches.common import (
+from unsloth_zoo.temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )

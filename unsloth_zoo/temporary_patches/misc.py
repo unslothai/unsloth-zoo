@@ -26,7 +26,7 @@ import functools
 # `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
 # raises "attempted relative import beyond top-level package".
 try:
-    from ..log import logger
+    from unsloth_zoo.log import logger
 except (ImportError, ValueError):
     import logging
     logger = logging.getLogger("unsloth_zoo.log")

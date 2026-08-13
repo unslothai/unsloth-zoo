@@ -35,7 +35,7 @@ __all__ = [
 import os
 import sys
 import logging
-from ..log import logger
+from unsloth_zoo.log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
