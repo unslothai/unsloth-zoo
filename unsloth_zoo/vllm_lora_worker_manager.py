@@ -150,12 +150,18 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 peft_helper = PEFTHelper.from_dict(lora_request.config)
             peft_helper.validate_legal(self.lora_config)
 
-            # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
-            # to ensure correct loading of lora weights.
+            # For some models like Qwen2VL, we need hf_to_vllm_mapper for correct
+            # lora loading. On vLLM >= 0.25.0 it also folds q/k/v (and gate/up)
+            # into orig_to_new_stacked; _map_name drops the shard id so they
+            # collide onto one key -> IndexError. Drop the stacked maps (keeping
+            # genuine renames) like vLLM's own worker_manager; absent on <0.25.0.
             hf_to_vllm_mapper = None
             if (hasattr(model, "hf_to_vllm_mapper")
                     and model.hf_to_vllm_mapper is not None):
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
+                unstack = getattr(hf_to_vllm_mapper, "get_unstacked_mapper", None)
+                if callable(unstack):
+                    hf_to_vllm_mapper = unstack()
 
             lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
             kwargs = {
@@ -231,6 +237,13 @@ class WorkerLoRAManager(AbstractWorkerManager):
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
         return self._adapter_manager.add_adapter(dummy_lora)
+
+    def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
+        # vLLM >= 0.23 queries this before LoRA warmup profiling; older vLLM has
+        # no such method on the model manager, so fall back to the given rank.
+        manager = getattr(self, "_adapter_manager", None)
+        inner = getattr(manager, "get_dummy_lora_warmup_rank", None)
+        return inner(default_rank) if inner is not None else default_rank
 
     def pin_adapter(self, adapter_id: int) -> bool:
         return self._adapter_manager.pin_adapter(adapter_id)

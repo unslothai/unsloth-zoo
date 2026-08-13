@@ -120,35 +120,384 @@ def get_forward_moe_backend():
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
-    """Grouped matmul via torch._grouped_mm with contiguous inputs.
+    """Grouped matmul; passes the weight as a transposed view (no copy) when safe.
 
-    Some low-rank LoRA weights are contiguous but still have row strides below
-    the kernel alignment requirement, so keep a narrow fallback for those cases.
+    Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
+    ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
+    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
+    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
+    always-correct copy. Falls back to a per-group matmul when the device has no
+    torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
+    path in forward and backward.
     """
     inputs = inputs.contiguous()
+    # The Triton backend is picked precisely when the probe says no, yet its separated
+    # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
+    # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
+    # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
+    if not _check_torch_grouped_mm_supported():
+        return _manual_grouped_mm(inputs, weight, offsets)
+    if not _transposed_view_grouped_mm_is_safe():
+        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
+    try:
+        return torch._grouped_mm(inputs, weight, offs=offsets)
+    except RuntimeError as exc:
+        if "strides should be multiple of 16 bytes" not in str(exc):
+            raise
     weight = weight.contiguous()
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
-        message = str(exc)
-        if "strides should be multiple of 16 bytes" not in message:
+        if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd.
+
+    `bounds` is the already-decoded group ends: the signature packs the offsets into
+    its own transfer, so re-reading them here was a second stream synchronization per
+    grouped matmul, over every layer's base and LoRA projections.
+    """
     outputs = []
     start = 0
-    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+    if bounds is None: bounds = offsets.detach().cpu().tolist()
+    for expert_idx, end in enumerate(bounds):
         if start < end:
             outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
         start = end
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+# Projection strides for the routing signature. A CHECKSUM, not an identity: four
+# projections leave a `hidden - 4` null space, so rows differing within it project
+# alike; an exact identity means copying the whole `[T, hidden]` input, the 512MB
+# transient this file avoids. A swap escapes only by matching ALL of these AND the
+# norm below, each term weighted by the row index.
+_SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
+
+# Row 2-norm, carried beside the projections. Not linear in the row, so that null
+# space does not reach it: rows differing within it must also match norms to swap unseen.
+_SIGNATURE_EXTRA = 1
+
+# Trailing checksum entries of a packed signature, not group boundaries. Named because
+# offsets are read back by slicing it off, and a bare `[:-1]` read checksums as experts.
+_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
+
+
+def _routing_signature(inputs, offsets):
+    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
+
+    Offsets are only the routing histogram, so a replay swapping two tokens between
+    equal-sized experts leaves them identical while `inputs` holds a different
+    sequence; the checksum moves with the rows, so the swap is visible. Bit-cast into
+    the offsets vector so the whole thing is one device sync, the one the group loop
+    already pays.
+
+    Rows reduce through a fixed pseudo-random projection, not a sum: a sum ignores
+    WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike and a swap across
+    an expert boundary went unseen, letting the guard accept gradients from a different
+    routing. The projection derives from the hidden size alone, so forward and
+    recompute build the same one without carrying state.
+
+    The matvec runs in the input's own dtype, not an FP32 copy: upcasting on the way in
+    materialised a whole `[routed_tokens, hidden]` transient, 512MB at 32K by 4096, to
+    produce one number per row -- an OOM risk on exactly the memory-constrained runs
+    this fallback exists for. cuBLAS accumulates a half-precision gemv in FP32 anyway.
+    """
+    inputs = inputs.detach()
+    hidden = inputs.shape[-1]
+    # Autocast off, explicitly: `mv`/`mm` are on the autocast lower-precision list and
+    # only ONE of the two calls sees it (forward with the caller's autocast live,
+    # backward with it disabled), so FP32 inputs hashed bf16 one side and fp32 the
+    # other and every backward raised the routing error below on unchanged routing.
+    with torch.autocast(device_type = inputs.device.type, enabled = False):
+        weights = torch.linspace(
+            1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
+        # Irrational stride: a linear ramp alone sums the same under a reversal.
+        strides = torch.tensor(
+            _SIGNATURE_STRIDES, device = inputs.device, dtype = torch.float32)
+        weights = torch.sin(
+            weights.unsqueeze(1) * strides).to(inputs.dtype)
+        # Several projections, not one: a single dot maps each row to one scalar, so
+        # rows orthogonal to it hash like the zero row (`[p[1], -p[0], 0, ...]` and
+        # zeros both give exactly 0) and swapping that pair across an expert boundary
+        # survived the check.
+        rows = (inputs @ weights).float()
+        # Plus the norm, not linear in the row, so the projections' shared null space
+        # does not reach it. `vector_norm` accumulates in fp32 from the input's own
+        # dtype; `(x.float() * x.float()).sum(...)` held three concurrent 512MB
+        # temporaries at the 32K-by-4096 shape this fallback targets. Promoted, not
+        # pinned to fp32: `vector_norm` refuses a dtype that narrows its input.
+        norm = torch.linalg.vector_norm(
+            inputs, dim = -1, keepdim = True,
+            dtype = torch.promote_types(inputs.dtype, torch.float32))
+        rows = torch.cat((rows, norm.to(rows.dtype)), -1)
+        ramp = torch.arange(
+            1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
+        checksum = (rows * ramp.unsqueeze(1)).sum(0)
+    packed = torch.cat((
+        offsets.detach().reshape(-1).to(torch.int64),
+        checksum.view(torch.int32).to(torch.int64),
+    ))
+    return packed.cpu().tolist()
+
+
+class _ManualGroupedMM(torch.autograd.Function):
+    """The loop above, saving what torch._grouped_mm saves and nothing else.
+
+    A Function rather than plain autograd because the naive loop tapes every per-group
+    SLICE, whose shape is the group size the router decides. Non-reentrant checkpointing
+    replays the forward and compares saved metadata, so any routing difference between
+    the two passes surfaces as
+
+        CheckpointError: Recomputed values ... have different metadata
+        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
+
+    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows that:
+    it is one op saving the whole `[T, K]` input, so a drop-in has to save the same
+    shape-stable set (inputs, weight, offsets) and rebuild the slices in backward.
+
+    This does not make routing deterministic, and does not pretend to: it restores the
+    numerics the fused path already has on an H100.
+    """
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        # A plain list, NOT a tensor: non-reentrant checkpointing swaps the saved
+        # TENSORS for the replay's, so a saved `offsets` reports the replay's routing,
+        # never the forward's. This copy survives, and backward compares the two.
+        ctx.forward_routing = routing = _routing_signature(inputs, offsets)
+        ctx.save_for_backward(inputs, weight, offsets)
+        with torch.no_grad():
+            return _grouped_matmul_loop(
+                inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weight, offsets = ctx.saved_tensors
+        routing = _routing_signature(inputs, offsets)
+        if routing != ctx.forward_routing:
+            # Shape-stable saves would let this through silently, and pairing the
+            # original `grad_output` with the replay's partition is a gradient for a
+            # routing that never produced the loss. Louder than CheckpointError.
+            were = ctx.forward_routing[:-_SIGNATURE_WIDTH]
+            now = routing[:-_SIGNATURE_WIDTH]
+            how = ("the same experts in a different order"
+                   if were == now else f"expert ends {were} then {now}")
+            raise RuntimeError(
+                "Unsloth: the MoE router assigned tokens differently in the "
+                f"activation-checkpoint replay than in the forward ({how}), so "
+                "the gradients would belong to a routing that never produced "
+                "the loss. Turn gradient checkpointing off for this run, or "
+                "make the router deterministic."
+            )
+        bounds = routing[:-_SIGNATURE_WIDTH]
+        need_x, need_w, _ = ctx.needs_input_grad
+        grad_output = grad_output.contiguous()
+        # `backward` runs OUTSIDE the forward's autocast, so `grad_output` can be bf16
+        # while the saved tensors are still fp32 and the first matmul raises. Aligned
+        # by hand, not with `torch.amp.custom_fwd/custom_bwd`, whose `device_type` is
+        # fixed at class definition: this fallback also runs on CPU and XPU.
+        compute_dtype = grad_output.dtype
+        grad_inputs = torch.zeros_like(inputs) if need_x else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
+        # Write each group straight into its slice when no cast is due. The assignment
+        # below allocates a temporary and copies it in; `out=` does neither, and there
+        # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
+        # A cast needs the temporary anyway, and a non-contiguous destination would put
+        # the copy back, so both keep the plain path.
+        # Grad mode first: it is off for an ordinary backward and ON only under
+        # `create_graph = True`, where `out=` raises "functions with out=... arguments
+        # don't support automatic differentiation". The fused path double-backwards
+        # fine, so the fallback has to as well; the plain branch is differentiable.
+        direct = (
+            not torch.is_grad_enabled()
+            and inputs.dtype == weight.dtype == compute_dtype
+            and (grad_inputs is None or grad_inputs.is_contiguous())
+            and (grad_weight is None or grad_weight.is_contiguous())
+        )
+        start = 0
+        for expert_idx, end in enumerate(bounds):
+            if start < end:
+                g = grad_output[start:end]
+                if need_x:
+                    w = weight[expert_idx]
+                    if direct:
+                        torch.matmul(g, w.transpose(-2, -1),
+                                     out = grad_inputs[start:end])
+                    else:
+                        grad_inputs[start:end] = (
+                            g @ w.to(compute_dtype).transpose(-2, -1)
+                        ).to(inputs.dtype)
+                if need_w:
+                    if direct:
+                        torch.matmul(inputs[start:end].transpose(-2, -1), g,
+                                     out = grad_weight[expert_idx])
+                    else:
+                        x = inputs[start:end].to(compute_dtype)
+                        grad_weight[expert_idx] = (
+                            x.transpose(-2, -1) @ g).to(weight.dtype)
+            start = end
+        return grad_inputs, grad_weight, None
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+
+    Not compilable, and marked so: group boundaries come off a tensor, so `start < end`
+    is a data-dependent branch Dynamo cannot guard, and a tensorized rewrite is worse
+    (gathering `weight[expert_id]` per row materializes `[T, K, N]`; masking runs every
+    expert over every row). `torch.compiler.disable` makes a compiled caller break
+    cleanly here rather than abort mid-trace; under `fullgraph = True` a break is still
+    fatal, which is what the eager fallback in `temporary_patches/utils.py` is for.
+    """
+    # Grad off means `apply` builds no autograd node, so nothing will ever read the
+    # signature: skip the Function rather than pay a `[T, hidden]` projection per call.
+    # Covers `inference_mode` and `no_grad` alike.
+    #
+    # KNOWN GAP, deliberately not closed here. A REENTRANT checkpoint also runs its
+    # loss-producing forward with grad off and its replay with grad ON, so the replay
+    # compares its own routing against itself and a reroute passes silently. Not
+    # fixable from inside this function: `ctx` cannot cross a reentrant boundary, and a
+    # side channel keyed on the weight fails too because
+    # `_canonical_lora_weights_for_grouped_mm` rebuilds a contiguous tensor per call.
+    # It needs `unsloth_checkpoint` to announce its region and call order. The
+    # non-reentrant path is unaffected: its forward runs with grad on, so the forward
+    # ctx survives and only its SAVED TENSORS are swapped.
+    if not torch.is_grad_enabled():
+        return _grouped_matmul_loop(inputs, weight, offsets)
+    return _ManualGroupedMM.apply(inputs, weight, offsets)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
+
+
+# Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
+# is rebuilt from the 4-bit Params4bit in backward (dX only; the base is frozen and
+# LoRA is a separate additive grouped_mm) instead of being pinned on the tape. Output
+# is unchanged. See _moe_recompute_enabled for the pin-vs-recompute policy.
+
+
+def _base_is_recomputable(source) -> bool:
+    """True iff the base expert weight can be rebuilt in backward (frozen and
+    grouped-mm capable). A trainable or unsupported base must use the pinned path."""
+    try:
+        if not _should_use_separated_lora():          # merged LoRA folds the delta into base
+            return False
+        if not _check_torch_grouped_mm_supported():
+            return False
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
+            if getattr(param, "quant_state", None) is None:
+                return False
+            return not param.requires_grad
+        if isinstance(param, torch.Tensor):
+            return (not param.requires_grad) and param.dtype in (
+                torch.bfloat16, torch.float16, torch.float32,
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _moe_recompute_default(prefer_memory: bool = False) -> bool:
+    """Pin-vs-recompute decision independent of the source weight.
+
+    Adaptive by default: pin (return False) inside a gradient-checkpoint recompute
+    pass, where the stack is rebuilt immediately before the layer's own backward so
+    the pin is momentary and cheap; otherwise recompute (return True), so a
+    non-checkpointed forward does not hold every layer's dense stack across the whole
+    backward. UNSLOTH_MOE_RECOMPUTE overrides it: "1" forces recompute (max memory
+    saving), "0" forces pinning (max speed for memory-rich runs).
+
+    ``prefer_memory`` biases the no-override case toward recompute even inside a GC
+    recompute pass. It is set for bases whose pinned form is a large dense dequant of
+    a compressed weight (bnb 4-bit MoE experts): there the "momentary" pin still
+    materializes the full bf16 expert stack the 4-bit storage exists to avoid, which
+    can be several GiB per layer on large MoEs, so recompute is the better default
+    when the model is already memory-constrained (4-bit + gradient checkpointing).
+
+    The GC branch reads a thread-local; under torch.compile of the MoE forward that
+    read can be traced away and frozen at the first trace, so the adaptive choice may
+    not re-evaluate per GC pass. That only trades memory for speed (pin and recompute
+    are dX-identical), never correctness, and the grouped GEMM path generally runs
+    eager anyway; set UNSLOTH_MOE_RECOMPUTE explicitly to pin the choice if needed."""
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if prefer_memory:
+        return True
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return not in_gradient_checkpoint_recompute()
+    except Exception:
+        return True  # safe default: recompute rather than pin across a full backward
+
+
+def _source_pins_large_dequant(source) -> bool:
+    """True iff pinning this base means holding a large dense dequant of a compressed
+    weight (a frozen bnb 4-bit MoE expert). For these the pinned path materializes the
+    full bf16 expert stack, so recompute is the memory-preserving default under
+    gradient checkpointing; a plain bf16/fp16/fp32 base pins its own storage (no
+    extra dequant) and keeps the speed-oriented adaptive policy."""
+    if not (HAS_BNB and Params4bit is not None):
+        return False
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        return isinstance(param, Params4bit) and getattr(param, "quant_state", None) is not None
+    except Exception:
+        return False
+
+
+def _moe_recompute_enabled(source) -> bool:
+    """Whether to recompute the dequantized base stack in backward (True) or pin it
+    for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
+    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
+    even under gradient checkpointing so the momentary pin never holds the full bf16
+    expert dequant (see _source_pins_large_dequant)."""
+    return _base_is_recomputable(source) and _moe_recompute_default(
+        prefer_memory = _source_pins_large_dequant(source)
+    )
+
+
+class _GroupedMMRecompute(torch.autograd.Function):
+    """grouped_mm(inputs, W) for a frozen W from weight_provider(): saves only offsets and rebuilds
+    W in backward (dX only) instead of pinning the dense stack."""
+
+    @staticmethod
+    def forward(ctx, inputs, offsets, weight_provider):
+        ctx.weight_provider = weight_provider
+        ctx.save_for_backward(offsets)   # inputs is unused in backward (frozen base -> dX only)
+        with torch.no_grad():
+            out = _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (offsets,) = ctx.saved_tensors
+        with torch.no_grad():
+            weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
+            grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
+        return grad_input, None, None
+
+
+def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
+    """recompute -> rebuild W in backward; else the prior eager grouped_mm."""
+    if recompute:
+        return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
+    return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
 _GROUPED_GEMM_AVAILABLE = None
@@ -167,13 +516,17 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    if not torch.cuda.is_available():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu", torch.xpu.current_device())
+    else:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        device = torch.cuda.current_device()
         dtype = torch.float16
 
         # 1 expert, 1 token, dim 8 (safe alignment).
@@ -188,6 +541,56 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
 
     return _TORCH_GROUPED_MM_SUPPORTED
+
+
+# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
+# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
+# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
+_TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
+
+
+def _transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+
+    safe = False
+    try:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = torch.device("xpu", torch.xpu.current_device())
+        else:
+            device = None
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
+            E, N, K, M = 4, 64, 32, 32
+            # local generator: never touch the process-wide RNG (manual_seed would shift training)
+            gen = torch.Generator(device=device).manual_seed(0)
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w = torch.randn(E, N, K, dtype=torch.bfloat16, device=device, generator=gen)
+            w_t = w.transpose(-2, -1)
+            w_tc = w_t.contiguous()
+            per = M // E
+            offs = torch.arange(per, M + 1, per, dtype=torch.int32, device=device)[:E]
+            offs[-1] = M
+            ok, ref = True, None
+            for _ in range(6):
+                row_wise_max = A.abs().amax(dim=-1, keepdim=True)
+                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                r_view = torch._grouped_mm(A, w_t, offs=offs)
+                r_contig = torch._grouped_mm(A, w_tc, offs=offs)
+                if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
+                    ok = False; break
+                if ref is None:
+                    ref = r_view
+                elif (r_view - ref).abs().max().item() > 1e-2:      # view not stable across calls
+                    ok = False; break
+            safe = ok
+    except Exception:
+        safe = False   # anything unexpected -> keep the safe contiguous copy
+
+    _TRANSPOSED_VIEW_GROUPED_MM_SAFE = safe
+    return safe
 
 
 _TRITON_ALLOCATOR_INITIALIZED = False
@@ -611,8 +1014,9 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
-def _get_base_weight(param):
-    """Get base weight from a potentially wrapped parameter or module."""
+def _get_base_weight(param, target_dtype=None):
+    """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
+    providers) restores the packed Params4bit to its logical shape and casts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
@@ -627,7 +1031,13 @@ def _get_base_weight(param):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        return bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        original_shape = getattr(param, "_original_shape", None)
+        if original_shape is not None and weight.shape != original_shape:
+            weight = weight.reshape(original_shape)
+        if target_dtype is not None:
+            weight = weight.to(target_dtype)
+        return weight
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -702,31 +1112,130 @@ def get_weight_preprocessor(model_type: str):
     return _WEIGHT_PREPROCESSORS.get(model_type)
 
 
-def preprocess_weight(
-    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None
-):
-    """Preprocess a weight into (E, in_dim, out_dim) for grouped_mm.
+def _logical_expert_shape(param):
+    """Return the logical expert shape without dequantizing or materializing.
 
-    Uses a registered model-specific preprocessor if present, else transposes
-    by shape. proj_type is "gate_up" or "down".
+    Resolve PEFT parameters before module wrappers. A recorded logical shape (bnb
+    Params4bit _original_shape, ParameterModule shape_3d) is read directly so a
+    get_param provider is never materialized just to read its shape.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    seen = set()
+    while param is not None and id(param) not in seen:
+        seen.add(id(param))
+
+        # Recorded logical shape avoids materializing a get_param provider.
+        recorded = getattr(param, "_original_shape", None)
+        if recorded is None:
+            recorded = getattr(param, "shape_3d", None)
+        if recorded is not None:
+            return tuple(int(x) for x in recorded)
+
+        get_param = getattr(param, "get_param", None)
+        if callable(get_param):
+            try:
+                inner = get_param()
+            except Exception:
+                inner = None
+            if inner is not None and inner is not param:
+                param = inner
+                continue
+
+        base_layer = getattr(param, "base_layer", None)
+        if base_layer is not None and base_layer is not param:
+            param = base_layer
+            continue
+
+        # Linear modules store parameters on .weight.
+        weight = getattr(param, "weight", None)
+        if weight is not None and weight is not param:
+            param = weight
+            continue
+
+        break
+
+    shape = getattr(param, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(x) for x in shape)
+    except TypeError:
+        return None
+
+
+def _orientation_needs_transpose(shape, proj_type, hidden_dim):
+    """Return whether a weight needs transposition, or None when ambiguous."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if shape is None or len(shape) < 3:
+        return None
+    d1, d2 = int(shape[1]), int(shape[2])
+    if d1 == d2:
+        return None
+    if proj_type == "gate_up":
+        # grouped_mm uses (E, hidden, 2I).
+        return d1 != hidden_dim
+    # grouped_mm down uses (E, I, hidden).
+    return d2 != hidden_dim
+
+
+_WARNED_AMBIGUOUS_LAYOUTS = set()
+
+
+def _warn_ambiguous_layout_once(proj_type, shape, hidden_dim):
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    key = (proj_type, tuple(shape), hidden_dim)
+    if key in _WARNED_AMBIGUOUS_LAYOUTS:
+        return
+    _WARNED_AMBIGUOUS_LAYOUTS.add(key)
+    # Always warn because a wrong guess corrupts training (#849).
+    print(
+        f"Unsloth: MoE '{proj_type}' expert weight of shape {tuple(shape)} has equal matmul "
+        f"dims (hidden_dim={hidden_dim}), so its layout is ambiguous, and no unambiguous "
+        f"sibling projection was reachable to disambiguate it. Assuming the transformers "
+        f"F.linear layout and transposing to grouped_mm layout. If these experts were "
+        f"already in grouped_mm layout this transpose is WRONG and trains on transposed "
+        f"weights (see unslothai/unsloth-zoo#849). Register an explicit preprocessor via "
+        f"register_weight_preprocessor('<model_type>', ...) to remove the guess.",
+        file=sys.stderr,
+    )
+
+
+def preprocess_weight(
+    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None,
+    experts_module=None,
+):
+    """Convert an expert weight to grouped_mm layout.
+
+    Registered preprocessors take precedence. Square weights use the non-square sibling.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if model_type and model_type in _WEIGHT_PREPROCESSORS:
         return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
 
-    if proj_type == "gate_up":
-        # Want (E, hidden_dim, 2*intermediate).
-        if weight.shape[1] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
-    else:  # down
-        # Want (E, intermediate, hidden_dim).
-        if weight.shape[2] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
+    # Non-square shapes reveal layout directly.
+    needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)
+    if needs_transpose is not None:
+        return weight.transpose(-2, -1) if needs_transpose else weight
+
+    # One sibling is always non-square and reveals the shared layout.
+    if experts_module is not None:
+        sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
+        sibling_type = "down" if proj_type == "gate_up" else "gate_up"
+        sibling = getattr(experts_module, sibling_name, None)
+        if sibling is not None:
+            sibling_transpose = _orientation_needs_transpose(
+                _logical_expert_shape(sibling), sibling_type, hidden_dim,
+            )
+            if sibling_transpose is not None:
+                return weight.transpose(-2, -1) if sibling_transpose else weight
+
+    # Default to F.linear when no sibling is readable.
+    _warn_ambiguous_layout_once(proj_type, weight.shape, hidden_dim)
+    return weight.transpose(-2, -1)
 
 
 # Generic MoE detection and ParamWrapper patching.
@@ -1001,6 +1510,72 @@ def patch_param_wrapper_for_moe():
         return False
 
 
+# Gate gradient via the inner-product identity dGate = <A, dA> / gate, instead of
+# <dOut, Y> which pins the down-projection output Y on the tape solely for that
+# gradient. Output unchanged; on by default to save memory. The runtime gate below
+# still auto-disables it for fp16, down-bias models and frozen routers. Set
+# UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
+
+
+@lru_cache(maxsize=1)
+def _moe_gategrad_enabled() -> bool:
+    """Whether the MoE gate-gradient identity path is active (on by default).
+
+    Cached with maxsize=1 since UNSLOTH_MOE_GATEGRAD is read once per process. Any
+    code or test that toggles the env var at runtime must call
+    _moe_gategrad_enabled.cache_clear() afterwards for the change to take effect.
+    """
+    return os.environ.get("UNSLOTH_MOE_GATEGRAD", "1") != "0"
+
+
+class _MoEGateGradIdentity(torch.autograd.Function):
+    """Identity over the pre-down activation ``inter``; backward derives the gate
+    gradient as ``dGate = <inter, dA> / gate`` instead of ``<dOut, Y>``.
+
+    The incoming dA equals ``gate * (dOut @ W2_eff.T)`` for the effective down
+    weight (base + LoRA), so ``<inter, dA> / gate`` is exactly ``<Y, dOut>``
+    without ever materialising Y for the gradient. The caller passes a
+    sign-floored gate and multiplies Y by that same value, so the identity holds
+    for any routing weight, including exact zeros. Exact for any linear down
+    projection; NOT valid with a post-matmul down bias, so callers must
+    disable it when one is present.
+    """
+
+    @staticmethod
+    def forward(ctx, inter, permuted_weights):
+        ctx.save_for_backward(inter, permuted_weights)
+        return inter
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_inter):
+        # once_differentiable: the reconstruction is first-order exact but its
+        # graph is not the original one, so create_graph must raise, not
+        # silently return wrong second derivatives.
+        # grad_inter is None when nothing downstream needs inter's gradient
+        # (e.g. a frozen down projection); there is nothing to propagate then.
+        if grad_inter is None:
+            return None, None
+        inter, gate = ctx.saved_tensors
+        grad_gate = None
+        # Skip the gate gradient when the routing weight is frozen (e.g. a frozen
+        # router under LoRA), where its gradient is never consumed.
+        if ctx.needs_input_grad[1]:
+            dgate = (inter.to(torch.float32) * grad_inter.to(torch.float32)).sum(dim=-1)
+            # The call site multiplies Y by this same sign-floored gate, so the
+            # floor cancels exactly and the quotient equals <Y, dOut> for any
+            # gate, including exact zeros. The re-clamp is a no-op for the safe
+            # gate passed by forward_native_grouped_mm; it only protects direct
+            # callers from dividing by a raw zero.
+            gate_f = gate.to(torch.float32)
+            safe_gate = torch.where(
+                gate_f >= 0, gate_f.clamp_min(1e-12), gate_f.clamp_max(-1e-12)
+            )
+            grad_gate = (dgate / safe_gate).to(gate.dtype)
+        # inter passes through unchanged, so its gradient is grad_inter.
+        return grad_inter, grad_gate
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -1012,9 +1587,14 @@ def forward_native_grouped_mm(
 
     # Runtime safety check (defense in depth).
     if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        # Compute Capability is CUDA-only; on XPU it would mask this message.
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            where = f"this device (Compute Capability {major}.{minor})"
+        else:
+            where = "this device"
         raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
+            f"torch._grouped_mm is not supported on {where}. "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
@@ -1052,12 +1632,16 @@ def forward_native_grouped_mm(
         )
 
     if hasattr(self, "gate_up_proj"):
-        gate_up_base = _get_base_weight(self.gate_up_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
+        _gate_up_src = self.gate_up_proj
 
-        # grouped_mm backward needs contiguous weights; preprocess may return a transposed view.
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
-        mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
+        # Provider re-derives the base weight on demand so Fix 3 can recompute it in
+        # backward instead of pinning it (grouped_mm needs contiguous weights).
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
+        mm1_out = _base_grouped_mm(
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+        )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -1171,6 +1755,42 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
+    # Env-gated gate-grad identity; disabled when a down bias exists (identity
+    # assumes a linear down), the router is frozen (nothing to synthesize, and
+    # the Function would needlessly keep inter saved), or inter is float16. For
+    # fp16, the gradient into the identity carries the tiny floored gate as a
+    # factor (grad_inter = gate * (W2 @ dOut)); with a near-zero gate that product
+    # underflows fp16 to 0 before backward runs, dropping the router gradient for
+    # near-zero routes. fp16 therefore keeps the standard multiply (correct
+    # gradient, saves Y); bf16/fp32 hold the tiny value and are unaffected.
+    _gategrad = (
+        _moe_gategrad_enabled()
+        and getattr(self, "down_proj_bias", None) is None
+        and top_k_weights.requires_grad
+        and inter.dtype != torch.float16
+    )
+    permuted_weights = None
+    if _gategrad:
+        raw_weights = top_k_weights.reshape(-1)[sorted_indices]
+        # Sign-floor the gate away from zero (straight-through, so the synthesized
+        # gradient still reaches top_k_weights). The multiply below and the
+        # identity's divide use the SAME floored value, so they cancel exactly and
+        # the gate gradient <Y, dOut> survives even a routing weight of exactly
+        # zero. An fp16 gate cannot represent eps=1e-12 (its smallest normal is
+        # ~6e-5), so upcast it to float32; inter is non-fp16 here, so the floored
+        # value survives in grad_inter. The forward then changes by at most
+        # 1e-12 * |Y| for |gate| < 1e-12.
+        if raw_weights.dtype == torch.float16:
+            raw_weights = raw_weights.to(torch.float32)
+        eps = 1e-12
+        floored = torch.where(
+            raw_weights >= 0,
+            raw_weights.clamp(min=eps),
+            raw_weights.clamp(max=-eps),
+        )
+        permuted_weights = raw_weights + (floored - raw_weights).detach()
+        inter = _MoEGateGradIdentity.apply(inter, permuted_weights)
+
     # Down projection with optional separated LoRA (default).
     down_lora = None
 
@@ -1185,10 +1805,13 @@ def forward_native_grouped_mm(
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
 
     if hasattr(self, "down_proj"):
-        down_base = _get_base_weight(self.down_proj)
         model_type = getattr(self, "_unsloth_model_type", None)
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
-        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
+        _down_src = self.down_proj
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
+        mm2_out = _base_grouped_mm(
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+        )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora
@@ -1244,9 +1867,13 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
     # Apply routing weights and scatter-add (reduce).
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+    if _gategrad:
+        # Gate grad comes from the identity; detach so the multiply does not pin Y.
+        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+    else:
+        flat_weights = top_k_weights.reshape(-1)
+        permuted_weights = flat_weights[sorted_indices]
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
     final_hidden_states = torch.zeros(
         (batch_size * sequence_length, hidden_dim),

@@ -55,7 +55,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from unsloth_zoo.temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -375,6 +375,196 @@ def replace_with_grouped_query_attention(module, source):
 
 
 pass
+
+
+
+
+_AITER_SDPA_NAMES = frozenset((
+    "scaled_dot_product_attention",
+    "F.scaled_dot_product_attention",
+    "nn.functional.scaled_dot_product_attention",
+    "torch.nn.functional.scaled_dot_product_attention",
+))
+
+
+def _dotted_name(node):
+    """Render an ast expression as a dotted name, or None if it is not one."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _is_plain_causal_sdpa(node):
+    """Match exactly `out = <prefix.>scaled_dot_product_attention(q, k, v, is_causal=True)`.
+
+    Rejects attn_mask/dropout_p/scale/enable_gqa, positional extras,
+    is_causal=False or a variable, non-Name q/k/v, and attribute/tuple targets.
+    """
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        return None
+    target = node.targets[0]
+    if not isinstance(target, ast.Name):
+        return None
+    call = node.value
+    if not isinstance(call, ast.Call):
+        return None
+    if _dotted_name(call.func) not in _AITER_SDPA_NAMES:
+        return None
+    if len(call.args) != 3 or not all(isinstance(a, ast.Name) for a in call.args):
+        return None
+    if len(call.keywords) != 1:
+        return None
+    keyword = call.keywords[0]
+    if keyword.arg != "is_causal":
+        return None
+    if not (isinstance(keyword.value, ast.Constant) and keyword.value.value is True):
+        return None
+    return target.id, [a.id for a in call.args]
+
+
+def _owns_its_lines(node, lines):
+    """True when the statement is alone on its line(s).
+
+    Rejects `a = 1; out = sdpa(...)` and `if c: out = sdpa(...)`, where replacing
+    the line range would delete the neighbour or the `if` header.
+    """
+    if lines[node.lineno - 1][:node.col_offset].strip():
+        return False
+    after = lines[node.end_lineno - 1][node.end_col_offset:].strip()
+    return not after or after.startswith("#")
+
+
+# Emitted into every rewritten block and checked before rewriting, so a second
+# pass is a no-op. Without it the two SDPA fallbacks this emits are themselves
+# valid matches, and re-running triples the block.
+_AITER_MARKER = "# AMD aiter Flash Attention"
+
+
+def _unique_suffix(source):
+    """Pick a name suffix that collides with nothing already in the source."""
+    suffix, counter = "", 0
+    while any(f"{n}{suffix}" in source for n in (
+        "_aiter_fn", "_aiter_ok", "_aiter_q", "_aiter_k", "_aiter_v",
+        "_aiter_out", "_call_aiter_safe", "_get_aiter_fn",
+    )):
+        counter += 1
+        suffix = f"_{counter}"
+    return suffix
+
+
+def replace_sdpa_with_amd_aiter(source):
+    """
+    For AMD ROCm with amd-aiter installed: replace scaled_dot_product_attention
+    calls with amd-aiter Flash Attention in the compiled source.
+
+    Activation requires ALL of:
+      1. get_amd_attention_implementation() == "amd_aiter" (ROCm >= 7.0, aiter
+         installed, gfx942 or gfx950)
+      2. the statement is exactly
+         `<name> = <prefix.>scaled_dot_product_attention(q, k, v, is_causal=True)`
+         with q/k/v plain names, matched on the parsed AST rather than on text
+      3. the statement occupies its own line(s)
+      4. at runtime: q/k seq lengths equal (SDPA aligns causal masks top-left,
+         aiter bottom-right), fp16/bf16, and no input requires grad (aiter
+         asserts return_lse for backward, which we omit, so this is inference
+         only)
+      5. failures return None from a helper and fall back to SDPA
+
+    Selecting on the AST means comments and string literals can never be
+    rewritten, and unparseable source is returned untouched. Idempotent: already
+    rewritten source carries a marker and is returned unchanged.
+
+    Known limitation: Unsloth's own compiled SDPA paths emit attn_mask= or
+    is_causal=<variable>, which guard 2 correctly rejects, so this only matches
+    user-code calls. Wiring it to Unsloth's shim is a separate follow-up.
+
+    No-op on NVIDIA, and on ROCm without amd-aiter, ROCm < 7.0 or another arch.
+    """
+    from unsloth_zoo.device_type import get_amd_attention_implementation
+    if get_amd_attention_implementation() != "amd_aiter":
+        return source
+
+    # Already rewritten, so leave it alone. Compiled sources can be handed back
+    # here (cached modules, repeated compile passes) and this must be a fixed
+    # point, not a second wrap.
+    if _AITER_MARKER in source:
+        return source
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Rewriting source we cannot parse would turn a parse error into
+        # corrupted code.
+        return source
+
+    lines = source.splitlines(keepends = True)
+    matches = [
+        (node, parsed[0], tuple(parsed[1]))
+        for node in ast.walk(tree)
+        for parsed in [_is_plain_causal_sdpa(node)]
+        if parsed is not None and _owns_its_lines(node, lines)
+    ]
+    if not matches:
+        return source
+
+    suffix = _unique_suffix(source)
+    fn_var  = f"_aiter_fn{suffix}"
+    ok_var  = f"_aiter_ok{suffix}"
+    out_tmp = f"_aiter_out{suffix}"
+    safe_fn = f"_call_aiter_safe{suffix}"
+    get_fn  = f"_get_aiter_fn{suffix}"
+    qt, kt, vt = f"_aiter_q{suffix}", f"_aiter_k{suffix}", f"_aiter_v{suffix}"
+
+    # Bottom up so earlier line numbers stay valid.
+    for node, out_var, (q_var, k_var, v_var) in sorted(
+        matches, key = lambda item: item[0].lineno, reverse = True,
+    ):
+        indent = " " * node.col_offset
+
+        def sdpa_fallback(pad):
+            return [
+                f"{pad}{out_var} = torch.nn.functional.scaled_dot_product_attention(",
+                f"{pad}    {q_var}, {k_var}, {v_var}, is_causal=True)",
+            ]
+
+        block = [
+            f"{indent}{_AITER_MARKER}, requires: pip install amd-aiter (ROCm >= 7.0)",
+            f"{indent}from unsloth_zoo.device_type import get_amd_flash_attn_func as {get_fn}",
+            f"{indent}{fn_var} = {get_fn}()",
+            f"{indent}{ok_var} = (",
+            f"{indent}    {fn_var} is not None",
+            # SDPA aligns causal masks top-left, aiter bottom-right; they agree
+            # only at equal q/k lengths.
+            f"{indent}    and {q_var}.shape[-2] == {k_var}.shape[-2]",
+            f"{indent}    and {q_var}.dtype in (torch.float16, torch.bfloat16)",
+            # aiter asserts return_lse when any input requires grad
+            # (aiter/ops/mha.py) and we omit it, so this is inference only.
+            f"{indent}    and not ({q_var}.requires_grad or {k_var}.requires_grad or {v_var}.requires_grad)",
+            f"{indent})",
+            f"{indent}if {ok_var}:",
+            f"{indent}    {qt} = {q_var}.transpose(1, 2)",
+            f"{indent}    {kt} = {k_var}.transpose(1, 2)",
+            f"{indent}    {vt} = {v_var}.transpose(1, 2)",
+            # A helper returning None keeps try/except out of the compiled
+            # region, which torch.compile(fullgraph=True) would reject.
+            f"{indent}    def {safe_fn}(_fn, _q, _k, _v):",
+            f"{indent}        try: return _fn(_q, _k, _v, causal=True)",
+            f"{indent}        except Exception: return None",
+            f"{indent}    {out_tmp} = {safe_fn}({fn_var}, {qt}, {kt}, {vt})",
+            f"{indent}    if {out_tmp} is not None:",
+            f"{indent}        {out_var} = {out_tmp}.transpose(1, 2)",
+            f"{indent}    else:",
+        ] + sdpa_fallback(indent + " " * 8) + [
+            f"{indent}else:",
+        ] + sdpa_fallback(indent + " " * 4)
+        lines[node.lineno - 1 : node.end_lineno] = [("\n".join(block)) + "\n"]
+
+    return "".join(lines)
 
 
 def _get_compile_folder(use_tempfile=False):
@@ -931,7 +1121,7 @@ def create_new_function(
 
     if add_torch_compile:
         new_source = (
-            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
+            "@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
             f"{new_source}"
         )
     pass
@@ -984,10 +1174,23 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    if "torch_compile_with_fallback" in new_source:
+        # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
+        # name must resolve in the generated module.
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
+    if "_maybe_compile" in new_source:
+        # Decorators travel with the copied source, so the name must resolve here.
+        imports += "from unsloth_zoo.temporary_patches.common import _maybe_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if "functools." in new_source:
+        # patch_gradient_checkpointing() emits `functools.partial(layer.__call__,
+        # ...)` for keywords the layer only accepts through **kwargs, and copied
+        # upstream source can reference functools too. Neither the license header
+        # nor the model module's own imports are guaranteed to provide it.
+        imports += "import functools\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -1081,16 +1284,55 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        # Even with OVERWRITE disabled, force recompile on a library version
+        # mismatch. TRL counts as much as transformers here: the generated RL
+        # trainers mirror the installed TRL config signature and import symbols
+        # straight out of trl.trainer.<x>_trainer, so a cache built against a
+        # different TRL either fails to import (and Unsloth silently falls back
+        # to TRL's own untouched trainer) or forwards arguments that TRL has
+        # since retired. Checking transformers alone let a TRL 0.25 cache be
+        # reused on TRL 1.9 and reinstated the very TypeError it was fixed for.
+        if file_source is None and os.path.isfile(function_location):
+            # Callers that leave overwrite at its default never took the read
+            # above, so without this the comparison below is dead code for them
+            # and the hatch pins whatever is on disk no matter which library
+            # moved. On a read failure we fall back to None, which lands on the
+            # same "leave it alone" branch as before.
+            try:
+                with open(function_location, "r", encoding="utf-8") as f:
+                    file_source = f.read()
+            except Exception:
+                file_source = None
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            cached_trl_version = cached_lines[3] if len(cached_lines) > 3 else "0"
+            # Only a cache generated from TRL can go stale when TRL moves. The
+            # combined model modules and the peft/torch forward patches come
+            # from transformers, peft and torch source and never import trl, so
+            # regenerating them on a TRL bump would only destroy the hand edit
+            # this escape hatch exists to protect. Deliberately over-inclusive,
+            # because a false positive costs one extra rewrite while a false
+            # negative silently keeps a broken trainer: model_location covers
+            # the normal path, including trl.experimental once TRL relocates a
+            # trainer, and the cached body is the backstop for a model_location
+            # that ever resolves outside trl, since every generated trainer
+            # carries both a `from trl` import and `_tag_names = ["trl", ...]`.
+            trl_dependent = (
+                str(model_location).split(".", 1)[0] == "trl"
+                or re.search(r"\btrl\b", file_source) is not None
+            )
+            changed = []
             if cached_tf_version != transformers_version:
+                changed.append(f"transformers {cached_tf_version} -> {transformers_version}")
+            if trl_dependent and cached_trl_version != trl_version:
+                changed.append(f"trl {cached_trl_version} -> {trl_version}")
+            if changed:
                 logger.warning_once(
-                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
-                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but "
+                    f"{' and '.join(changed)}. Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
             else:
@@ -1235,6 +1477,143 @@ def create_new_function(
 pass
 
 
+def fix_gemma4_audio_feature_dtype(source):
+    """Align Gemma 4 audio features with the destination embedding dtype."""
+    rewritten, count = re.subn(
+        r"audio_features\.to\(\s*inputs_embeds\.device\s*\)",
+        "audio_features.to(inputs_embeds.device, inputs_embeds.dtype)",
+        source,
+    )
+    if count != 1:
+        return source
+    return rewritten
+pass
+
+
+_GEMMA4_PLE_CAST_HELPER = """
+def _unsloth_gemma4_ple_cast_input(module, x):
+    get_base_layer = getattr(module, "get_base_layer", None)
+    base_layer = get_base_layer() if callable(get_base_layer) else getattr(module, "base_layer", module)
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(base_layer, "weight", None)
+    if weight is None:
+        return x
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is not None:
+        return x
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not getattr(dtype, "is_floating_point", False):
+        return x
+    if getattr(dtype, "itemsize", 2) < 2:
+        return x
+    return x if x.dtype == dtype else x.to(dtype)
+pass
+"""
+
+
+def fix_gemma4_forced_float32_ple_dtype(source, module = None):
+    """Align only Gemma 4 PLE Linear inputs for forced-float32 residuals."""
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1":
+        return source
+
+    replacements_by_module = {
+        "Gemma4TextModel": (
+            (
+            "self.per_layer_model_projection(inputs_embeds)",
+            "self.per_layer_model_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_model_projection, inputs_embeds))",
+            ),
+        ),
+        "Gemma4TextDecoderLayer": (
+            (
+            "self.per_layer_input_gate(hidden_states)",
+            "self.per_layer_input_gate(_unsloth_gemma4_ple_cast_input(self.per_layer_input_gate, hidden_states))",
+            ),
+            (
+            "self.per_layer_projection(hidden_states)",
+            "self.per_layer_projection(_unsloth_gemma4_ple_cast_input(self.per_layer_projection, hidden_states))",
+            ),
+        ),
+    }
+    replacements = (
+        tuple(item for group in replacements_by_module.values() for item in group)
+        if module is None else replacements_by_module.get(module, ())
+    )
+    if not replacements:
+        return source
+    rewritten = source
+    counts = [rewritten.count(old) for old, _ in replacements]
+    if not any(counts):
+        return source
+    if (module is None and any(count > 1 for count in counts)) or \
+        (module is not None and any(count != 1 for count in counts)):
+        return source
+    for old, new in replacements:
+        if old in rewritten:
+            rewritten = rewritten.replace(old, new, 1)
+    return rewritten
+pass
+
+
+def _unwrap_undecorated_method(func, owner_qualname):
+    """
+    Recover the real, undecorated method hidden behind a decorator that returns
+    a bare closure without `functools.wraps`.
+
+    `functools.wraps` copies `__qualname__` and sets `__wrapped__`, and both
+    `inspect.getsource` and `inspect.signature` already follow `__wrapped__`, so
+    well behaved decorators need no help here and are returned unchanged by the
+    `__qualname__` fast path below.
+
+    A decorator that does NOT use `functools.wraps` leaves a class attribute
+    whose source and signature belong to the wrapper, not to the method. One
+    such decorator is transformers' `@force_accelerate_hooks(...)` in
+    `transformers/integrations/accelerate.py`, applied to
+    `Qwen3_5GatedDeltaNet.forward`: it leaves behind
+    `force_accelerate_hooks.<locals>.decorator.<locals>.wrapped`, so
+    `inspect.getsource` returns the wrapper (which lives in another file and
+    closes over free variables that do not exist at module scope) and
+    `inspect.signature` returns `(self, *args, **kwargs)`. Generating a
+    standalone function from that emits `return wrapped(self, *args, **kwargs)`
+    under the real named signature, which is a `NameError` at the first forward.
+
+    Walk `__wrapped__` and then single function closure cells until we land on a
+    function that really belongs to `owner_qualname`. If no such function is
+    found, return `func` unchanged so nothing else changes behaviour.
+    """
+    prefix = owner_qualname + "."
+    if getattr(func, "__qualname__", "").startswith(prefix):
+        return func
+    seen = set()
+    current = func
+    for _ in range(10):
+        candidate = getattr(current, "__wrapped__", None)
+        if candidate is None:
+            cells = getattr(current, "__closure__", None)
+            if getattr(current, "__code__", None) is None or not cells:
+                break
+            inner = []
+            for cell in cells:
+                try:
+                    value = cell.cell_contents
+                except ValueError:
+                    continue
+                if inspect.isfunction(value):
+                    inner.append(value)
+            # More than one candidate is ambiguous, so leave `func` alone.
+            if len(inner) != 1:
+                break
+            candidate = inner[0]
+        if not inspect.isfunction(candidate) or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        current = candidate
+        if getattr(current, "__qualname__", "").startswith(prefix):
+            return current
+    return func
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -1258,10 +1637,18 @@ def create_standalone_class(
     # All Unsloth Zoo code licensed under LGPLv3
     f = eval(f"{model_location}.{module}")
     full_class = inspect.getsource(f)
-    old_source = inspect.getsource(f.forward)
+    # A decorator that returns a bare closure (no `functools.wraps`) hides the
+    # real method behind the wrapper, so read the source and the signature off
+    # the undecorated function instead of off the class attribute.
+    real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
+    old_source = inspect.getsource(real_forward)
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+    if module == "Gemma4Model":
+        forward_source = fix_gemma4_audio_feature_dtype(forward_source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        forward_source = fix_gemma4_forced_float32_ple_dtype(forward_source, module)
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:
@@ -1379,7 +1766,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1387,7 +1774,7 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(f.forward).parameters
+    parameters = inspect.signature(real_forward).parameters
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
@@ -1509,6 +1896,19 @@ def create_standalone_class(
         source,
     )
 
+    if module == "Gemma4Model":
+        source = fix_gemma4_audio_feature_dtype(source)
+    elif module in ("Gemma4TextModel", "Gemma4TextDecoderLayer"):
+        source = fix_gemma4_forced_float32_ple_dtype(source, module)
+
+    # Append the PLE cast helper only once a call to it actually exists in the
+    # generated source (from the rewrite above, or from already-cast eager source
+    # read back through inspect.getsource). This keeps the emitted helper name in
+    # sync with the eager patch and avoids appending dead code when nothing was
+    # rewritten (drift / already-fixed upstream / flag off).
+    if "_unsloth_gemma4_ple_cast_input(" in source and \
+        "def _unsloth_gemma4_ple_cast_input" not in source:
+        source += _GEMMA4_PLE_CAST_HELPER
     return source
 
 
@@ -1517,8 +1917,9 @@ pass
 
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
+from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+@torch_compile_with_fallback(fullgraph = True, dynamic = True, options = torch_compile_options)
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -1669,6 +2070,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -1748,6 +2162,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
@@ -1858,6 +2285,19 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
+    # Inference returns these logits to the caller, so they must carry the same
+    # scale and softcap transforms the training branches below apply. Leaving
+    # them off does not change greedy decoding, since tanh is monotonic, but it
+    # does change the distribution: sampling, returned logprobs and any scoring
+    # that reads the logits all see uncapped values.
+    if (\\2) != ():
+        logits = logits * (\\2)
+    if (\\3) != ():
+        logits = logits / (\\3)
+    if (\\4) not in (None, (),):
+        logits = logits / (\\4)
+        logits = torch.tanh(logits)
+        logits = logits * (\\4)
 else:
     lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
@@ -2314,6 +2754,82 @@ pass
 
 # We need to manually replace some items
 # For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+#
+# patch_gradient_checkpointing() below rewrites `hidden_states = blk(...)` into
+# a `self._gradient_checkpointing_func(blk.__call__, ...)` call, and on the way
+# it demotes every `arg=arg` keyword to a positional (the
+# `re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", ...)` a few lines further down). So the
+# rewritten argument list has to line up positionally with the vision block's
+# own signature, and anything the block only accepts through **kwargs has to
+# stay a keyword.
+#
+# transformers <= 4.57 spells the block as
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              rotary_pos_emb=None, position_embeddings=None,
+#                              **kwargs)
+# while the caller passes only cu_seqlens + position_embeddings, so
+# `rotary_pos_emb=rotary_pos_emb` is injected to fill the third positional slot
+# (that is the "missing None" HF 4.53.1 broke).
+#
+# transformers >= 5.0 dropped `rotary_pos_emb` from the block signature
+#   Qwen2VLVisionBlock.forward(self, hidden_states, cu_seqlens,
+#                              position_embeddings=None, **kwargs)
+# and added `max_seqlen=max_seqlen` to the call site (transformers 5.x moved the
+# cu_seqlens/max_seqlen computation into get_vision_attention_seqlens()).
+# `max_seqlen` is NOT a named parameter of the block - it only rides in through
+# **kwargs - so it cannot be demoted to a positional, and it must not be left as
+# a bare keyword either: in the rewritten call everything after the callable is
+# handed to `self._gradient_checkpointing_func`, not to the block. That function
+# is not necessarily Unsloth's. It is whatever transformers installed, i.e. very
+# often plain `torch.utils.checkpoint.checkpoint` (or a `functools.partial` of
+# it), which raises `ValueError: Unexpected keyword arguments: max_seqlen` under
+# `use_reentrant = True`. Unsloth's own `unsloth_checkpoint` raises the same way.
+#
+# So the 5.x entry drops `max_seqlen` from the positional argument list and asks
+# for it back as a *bound* keyword via the optional third element of the entry.
+# `patch_gradient_checkpointing()` then emits
+#   self._gradient_checkpointing_func(
+#       functools.partial(blk.__call__, max_seqlen = max_seqlen), ...)
+# in the checkpointed branch and `blk(..., max_seqlen = max_seqlen)` in the else
+# branch. The same reasoning applies to the `**kwargs` expansion the call site
+# already had on EVERY version, 4.x included: it is a keyword expansion, so it
+# is moved out of the argument list and into the same partial. It looks harmless
+# only because it is usually empty; `output_hidden_states = True` reaches the
+# vision tower's **kwargs on transformers 5.x and is enough to trip the same
+# `Unexpected keyword arguments` error.
+# Binding into the callable is exactly what transformers itself does in
+# `GradientCheckpointingLayer.__call__`, so it works with every checkpoint
+# implementation - reentrant or not, Unsloth's or torch's - and the value still
+# reaches the block on both branches.
+#
+# (Were the keyword dropped instead, `VisionAttention.forward` would recompute it
+# via get_max_seqlen(cu_seqlens, self.config, kwargs = {"max_seqlen": max_seqlen})
+# and return the same number, so nothing breaks - but that costs a
+# `.max().item()` device sync per vision layer under flash attention, which is
+# why the keyword is preserved instead.)
+#
+# Order matters: the 5.x entries must stay AFTER the 4.x ones. The 5.x
+# replacement is textually the 4.x call, and the replacement list is applied in a
+# single pass, so entry 0 (which would inject `rotary_pos_emb` that 5.x blocks no
+# longer accept) has already run by the time this fires.
+#
+# Ordering alone is not enough, though, and that is what the optional FOURTH
+# element is for. transformers 5.10 - 5.14 spell the call site exactly like
+# 4.53.0 - 5.9 while the block has already lost `rotary_pos_emb`, so entry 0
+# matched on its own and produced
+#   TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4 positional
+#   arguments but 5 were given
+# Entries that inject a parameter therefore declare it, and
+# _replacement_fits_the_layer() checks it against the real block signature
+# before the entry is allowed to fire.
+#
+# There is deliberately no 5.x + `attention_mask` entry. The `attention_mask=`
+# spelling only ever existed in transformers 4.53.x (where the block named it as
+# its fifth positional parameter, which is why the 4.x entry below demotes it);
+# it was gone by 4.54 and no 5.x release pairs it with `max_seqlen`. In 5.x the
+# vision attention has no `attention_mask` parameter at all and passes
+# `attention_mask = None` to the attention interface itself, so any guessed
+# rewrite would be untestable and wrong either way.
 custom_gradient_checkpointing_replacements = [
     (
         """hidden_states = blk(
@@ -2329,6 +2845,11 @@ custom_gradient_checkpointing_replacements = [
                 position_embeddings=position_embeddings,
                 **kwargs,
             )""",
+        None,
+        # transformers 5.10 - 5.14 spell the call site exactly like 4.53.0 - 5.9
+        # but dropped rotary_pos_emb from the block, so this entry must only
+        # fire while the block still takes it. See _replacement_fits_the_layer.
+        ("rotary_pos_emb",),
     ),
     (
         """hidden_states = blk(
@@ -2346,6 +2867,27 @@ custom_gradient_checkpointing_replacements = [
                 attention_mask=attention_mask,
                 **kwargs,
             )""",
+        None,
+        ("rotary_pos_emb",),
+    ),
+    # transformers >= 5.0 spelling. `max_seqlen` leaves the positional argument
+    # list and comes back as a keyword bound into the checkpointed callable (the
+    # third element below). Must stay after the 4.x entries.
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        ("max_seqlen",),
     ),
 ]
 replace_gradient_checkpointing = """
@@ -2357,6 +2899,90 @@ $    )
 $else:
 $    hidden_states = LAYER(ARGS)
 """
+
+
+def _bound_keywords_of_replacement(replacement):
+    """Optional third element of a ``custom_gradient_checkpointing_replacements``
+    entry: keyword arguments the rewritten call must keep as keywords.
+
+    They cannot travel in ``ARGS`` - everything there is forwarded to
+    ``self._gradient_checkpointing_func``, which is frequently plain
+    ``torch.utils.checkpoint.checkpoint`` and rejects unknown keywords. They are
+    bound into the checkpointed callable instead, the way
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__`` does it.
+
+    Accepts a mapping ``{keyword: expression}`` or a plain sequence of names
+    (shorthand for ``{name: name}``). A 2-tuple entry declares none, so every
+    pre-existing entry keeps behaving exactly as before.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if len(replacement) <= 2:
+        return {}
+    extra = replacement[2]
+    if extra is None:
+        return {}
+    if isinstance(extra, dict):
+        return dict(extra)
+    return {name: name for name in extra}
+
+
+def _modulelist_layer_class(source, init, modulelist_item):
+    """The class the ``nn.ModuleList`` is filled with, or ``None``.
+
+    ``self.blocks = nn.ModuleList([Qwen2VLVisionBlock(config) for _ in ...])``
+    names it, and it is defined in the same module as ``source``. Returned so a
+    replacement entry can be checked against the signature it is rewriting the
+    call for, instead of trusting the call site's spelling alone.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    match = re.search(
+        re.escape(modulelist_item)
+        + r"[\s]*\=[\s]*.*?nn\.ModuleList\([\s]*\[?[\s]*([A-Za-z_][A-Za-z_0-9]*)[\s]*\(",
+        init, flags = re.DOTALL,
+    )
+    if match is None:
+        return None
+    return getattr(
+        sys.modules.get(getattr(source, "__module__", None), None),
+        match.group(1), None,
+    )
+
+
+def _replacement_fits_the_layer(replacement, layer_class):
+    """Optional 4th element: parameter names the layer's ``forward`` must have
+    for the replacement to be correct.
+
+    Two different transformers generations can spell the call site IDENTICALLY
+    and still need different rewrites. transformers 4.53.0 - 5.9 and 5.10 - 5.14
+    both write
+
+        hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens,
+                            position_embeddings=position_embeddings, **kwargs)
+
+    but 5.10 dropped ``rotary_pos_emb`` from ``Qwen2VLVisionBlock.forward``. The
+    entry that re-injects ``rotary_pos_emb`` (needed on <= 5.9, where the block
+    still takes it as its third positional and the un-rewritten call relies on
+    keyword binding) therefore has to be skipped on >= 5.10, where injecting it
+    hands the block one positional too many:
+    ``TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4 positional
+    arguments but 5 were given``. On >= 5.10 no entry is needed at all - the
+    generic ``arg=arg`` demotion already produces a call the block accepts.
+
+    Unresolvable layer / signature means "behave exactly as before".
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if len(replacement) <= 3:
+        return True
+    required = replacement[3]
+    if not required:
+        return True
+    if layer_class is None:
+        return True
+    try:
+        parameters = inspect.signature(layer_class.forward).parameters
+    except (TypeError, ValueError):
+        return True
+    return all(name in parameters for name in required)
 
 
 def patch_gradient_checkpointing(module, source):
@@ -2374,16 +3000,24 @@ def patch_gradient_checkpointing(module, source):
     if "_gradient_checkpointing_func" in forward:
         return None
 
-    # Fix Qwen2 missing None for gradient checkpointing
-    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
-        forward = forward.replace(custom_find, custom_replace)
-    pass
-
     # No gradient checkpointing?
     modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
     if len(modulelist_items) != 1:
         return None
     modulelist_item = modulelist_items[0]
+
+    # Fix Qwen2 missing None for gradient checkpointing
+    layer_class = _modulelist_layer_class(source, init, modulelist_item)
+    bound_keywords = {}
+    for replacement in custom_gradient_checkpointing_replacements:
+        custom_find, custom_replace = replacement[0], replacement[1]
+        if custom_find not in forward:
+            continue
+        if not _replacement_fits_the_layer(replacement, layer_class):
+            continue
+        forward = forward.replace(custom_find, custom_replace)
+        bound_keywords.update(_bound_keywords_of_replacement(replacement))
+    pass
 
     # Check in forward source
     finder = (
@@ -2406,6 +3040,63 @@ def patch_gradient_checkpointing(module, source):
 
     # Gradient checkpointing calling must remove arg=arg convention
     args = re.sub(r"([^\s]{1,})[\s]?\=[\s]?\1", r"\1", args)
+
+    # Everything left in `ARGS` is forwarded verbatim to
+    # `self._gradient_checkpointing_func`, which is frequently plain
+    # `torch.utils.checkpoint.checkpoint`. Positionals are fine there - that is
+    # exactly what checkpointing is for - but KEYWORDS are not: reentrant
+    # `torch.utils.checkpoint.checkpoint` raises `Unexpected keyword arguments`
+    # on anything it does not recognise, and Unsloth's own reentrant shims can
+    # only forward positionals. So every keyword has to be bound into the
+    # checkpointed callable instead, the way
+    # `transformers.modeling_layers.GradientCheckpointingLayer.__call__` does
+    # it upstream.
+    #
+    # Two sources of keywords:
+    #   1. `bound_keywords` - declared by a replacement entry (Qwen2-VL's
+    #      `max_seqlen`, which the 5.x block only accepts through **kwargs).
+    #   2. A `**kwargs` expansion the upstream call site already had. This one
+    #      is the layer's own runtime keywords; leaving it in `ARGS` hands them
+    #      to the checkpoint function. Empty at runtime it looks harmless, which
+    #      is why it survived - `output_hidden_states = True` on transformers
+    #      5.x is enough to make it non-empty and blow up.
+    # The `else` branch calls the layer directly, so there they all stay
+    # ordinary keywords and `ARGS` is used unchanged.
+    star_kwargs = re.findall(r"\*\*[\s]*([A-Za-z_][A-Za-z_0-9]*)", args)
+    checkpoint_args = args
+    if star_kwargs:
+        checkpoint_args = re.sub(
+            r"\*\*[\s]*[A-Za-z_][A-Za-z_0-9]*[\s]*\,?", "", args
+        )
+    partial_keywords = [
+        f"{name} = {value}" for name, value in bound_keywords.items()
+    ] + [f"**{name}" for name in star_kwargs]
+
+    if partial_keywords:
+        replacer = replacer.replace(
+            "LAYER.__call__, ARGS",
+            "functools.partial(LAYER.__call__, "
+            + ", ".join(partial_keywords)
+            + "), " + checkpoint_args,
+        )
+    pass
+
+    if bound_keywords:
+        keywords = ", ".join(
+            f"{name} = {value}" for name, value in bound_keywords.items()
+        )
+        args_with_keywords = args.rstrip()
+        if args_with_keywords.strip() == "":
+            args_with_keywords = keywords
+        else:
+            if not args_with_keywords.endswith(","):
+                args_with_keywords += ","
+            args_with_keywords += " " + keywords
+        replacer = replacer.replace(
+            "hidden_states = LAYER(ARGS)",
+            "hidden_states = LAYER(" + args_with_keywords + ")",
+        )
+    pass
 
     replacer = (
         replacer.replace("LAYER", layer)
@@ -3278,6 +3969,10 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
+    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
+    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    "DeepseekV4HyperConnection",
+    "DeepseekV4HyperHead",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -3337,6 +4032,216 @@ def calls_output_capture_target(init, source, target_names):
             if f"self.{assigned_name}(" in source:
                 return True
     return False
+
+
+def _install_patched_forward(model_location, module, forward, combined_module):
+    """Bind one rewritten forward everywhere the old one is reachable."""
+    exec(
+        f"{model_location}.torch.nn.{module}.forward = forward",
+        globals(),
+        locals(),
+    )
+    try:
+        exec(f"{model_location}.nn.{module}.forward = forward", globals(), locals())
+    except:
+        pass
+    if combined_module is not None:
+        exec(
+            f"combined_module.torch.nn.{module}.forward = forward",
+            globals(),
+            locals(),
+        )
+        try:
+            exec(f"combined_module.nn.{module}.forward = forward", globals(), locals())
+        except:
+            pass
+    pass
+
+
+def _dtype_safe_forward(original_forward, is_conv, disable):
+    """The dtype casts of the source rewrite, without needing the source.
+
+    Same three shapes: a conv casts its input to the weight dtype and the
+    result back; an eager norm does the same but only when it is affine; a
+    compiled norm only casts the result, since casting in changes batched
+    numerics.
+
+    The tensor is taken by whatever name the original declares, because these
+    are public forwards: `RMSNorm.forward(self, x)` and `rms_norm(x = t)` both
+    work today and a hard-coded `input` would start raising TypeError.
+    """
+    try:
+        first = list(inspect.signature(original_forward).parameters)[1]
+    except Exception:
+        first = "input"
+
+    def forward(self, *args, **kwargs):
+        if args:
+            tensor, rest = args[0], args[1:]
+        elif first in kwargs:
+            tensor, rest = kwargs.pop(first), ()
+        else:
+            # Not a shape we know how to cast; leave it entirely alone.
+            return original_forward(self, *args, **kwargs)
+        original_dtype = tensor.dtype
+        if is_conv:
+            tensor = tensor.to(self.weight.dtype)
+        elif disable and getattr(self, "weight", None) is not None:
+            tensor = tensor.to(self.weight.dtype)
+        return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
+
+    forward.__unsloth_dtype_wrapped__ = True
+    # `disable` is baked into the closure above, so a later load in the same
+    # process with the other setting needs a new wrapper built from the same
+    # original rather than one stacked on this one.
+    forward.__unsloth_dtype_disable__ = disable
+    forward.__unsloth_dtype_original__ = original_forward
+    return forward
+
+
+def _patch_torch_dtype_modules(
+    model_location,
+    functions,
+    torch_compile_options,
+    compile_torch_modules,
+    disable,
+    combined_module,
+):
+    """Patch torch.nn conv / norm forwards for mixed-precision dtypes.
+
+    Lifted out of ``unsloth_compile_transformers`` unchanged so the
+    unreadable-source path can still run it: these rewrites read torch's
+    own source, never the model's, so they work when the model's does not.
+    """
+    # These rewrites never compile (add_torch_compile=False), so run them even
+    # when compiling is disabled: norms are fp32 upcast at load regardless, and
+    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
+    if compile_torch_modules:
+        if not disable:
+            # Compiled global F.layer_norm: only when compiling is allowed
+            from .patch_torch_functions import patch_torch_functions
+
+            patch_torch_functions()
+
+        _conv_modules = frozenset([
+            "Conv1d", "Conv2d", "Conv3d",
+            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
+        ])
+        for module in _patch_functions:
+            try:
+                source = eval(f"{model_location}.torch")
+            except:
+                continue
+            if not hasattr(source, "nn"):
+                continue
+            if not hasattr(source.nn, module):
+                continue
+            function = eval(f"source.nn.{module}")
+            if not hasattr(function, "forward"):
+                continue
+            if hasattr(function.forward, "get_compiler_config"):
+                continue
+            if getattr(function.forward, "__unsloth_dtype_wrapped__", False):
+                if getattr(function.forward, "__unsloth_dtype_disable__", None) == disable:
+                    continue
+                # Compile mode changed since the wrapper was built. Rebuild from
+                # the original so the casts match, and so wrappers never stack.
+                _install_patched_forward(
+                    model_location,
+                    module,
+                    _dtype_safe_forward(
+                        function.forward.__unsloth_dtype_original__,
+                        module in _conv_modules,
+                        disable,
+                    ),
+                    combined_module,
+                )
+                continue
+
+            try:
+                source = inspect.getsource(function.forward).rstrip()
+            except (OSError, TypeError):
+                # A forward built by exec, or one whose file has gone. Unguarded
+                # the OSError propagates out of FastModel.from_pretrained and
+                # the model does not load, over source we only wanted in order
+                # to patch a dtype cast. `get_compiler_config` above only covers
+                # torch.compile wrappers.
+                #
+                # The precondition is not fully characterised: two plain Qwen
+                # loads do not trigger it, and after such a load no torch.nn
+                # forward is unreadable (both measured). This guards a state we
+                # have seen, not a theory about how it arises.
+                #
+                # Skipping would only move the failure to the first forward, so
+                # wrap instead: the casts do not need the source, only the
+                # rewrite does.
+                _install_patched_forward(
+                    model_location,
+                    module,
+                    _dtype_safe_forward(
+                        function.forward, module in _conv_modules, disable
+                    ),
+                    combined_module,
+                )
+                continue
+
+            if module in _conv_modules:
+                # Conv modules: cast input to weight dtype before the conv op,
+                # then cast output back to original input dtype. This prevents
+                # dtype mismatches under mixed-precision autocast (eg bf16
+                # weight + fp16 input crashes F.conv1d).
+                lines = source.split("\n")
+                def_line = lines[0]
+                body_lines = lines[1:]
+                first_body = next((l for l in body_lines if l.strip()), "")
+                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                prologue = [
+                    body_indent + "original_dtype = input.dtype",
+                    body_indent + "input = input.to(self.weight.dtype)",
+                ]
+                source = "\n".join([def_line] + prologue + body_lines)
+                append_str = ".to(original_dtype)\n"
+            else:
+                # Norm modules: detect the actual parameter name (input or x)
+                import re as _re
+                m = _re.search(r"def forward\(self,\s*(\w+)", source)
+                param_name = m.group(1) if m else "input"
+                if disable:
+                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
+                    # and out. Compiled path left untouched (adding the cast there
+                    # changes batched numerics). weight is None when affine=False.
+                    lines = source.split("\n")
+                    def_line = lines[0]
+                    body_lines = lines[1:]
+                    first_body = next((l for l in body_lines if l.strip()), "")
+                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
+                    prologue = [
+                        body_indent + f"original_dtype = {param_name}.dtype",
+                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
+                    ]
+                    source = "\n".join([def_line] + prologue + body_lines)
+                    append_str = ".to(original_dtype)\n"
+                else:
+                    append_str = f".to({param_name}.dtype)\n"
+
+            forward = create_new_function(
+                module,
+                source,
+                model_location,
+                functions,
+                prepend=_license_header
+                + f"\ntorch_compile_options = {torch_compile_options}\n",
+                append=append_str,
+                overwrite=False,
+                add_torch_compile=False,
+            ).forward
+
+            _install_patched_forward(
+                model_location, module, forward, combined_module
+            )
+            pass
+        pass
+    pass
 
 
 def unsloth_compile_transformers(
@@ -3448,6 +4353,55 @@ def unsloth_compile_transformers(
         use_block_ptr=False,  # Sometimes fails
     )
 
+    # Pre-load persisted torch.compile artifacts (Mega-cache) for this exact
+    # environment + model + compile configuration. This runs during
+    # from_pretrained, strictly before any @torch.compile region executes, so
+    # a hit lets the first training step skip Inductor codegen and Triton
+    # autotuning. A miss is silent and falls back to a normal local compile;
+    # the artifacts are then saved at process exit for the next run.
+    # On by default on POSIX; opt-in (=1) on Windows; kill switch =0. See compile_cache.py.
+    try:
+        from .compile_cache import megacache_load
+        # Env vars override these arguments below (and the generated forwards
+        # branch on UNSLOTH_RETURN_HIDDEN_STATES), so key on the EFFECTIVE
+        # values or one mode's bundle would be a false hit for another.
+        _effective_fullgraph = os.environ.get(
+            "UNSLOTH_FULLGRAPH", "1" if fullgraph else "0"
+        ) == "1"
+        _effective_return_logits = os.environ.get(
+            "UNSLOTH_RETURN_LOGITS", "1" if return_logits else "0"
+        ) == "1"
+        _return_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+        megacache_load(
+            model_type,
+            compile_kwargs = {
+                "sdpa_dynamic_mask"     : sdpa_dynamic_mask,
+                "sdpa_bool_masks"       : sdpa_bool_masks,
+                "sdpa_gqa_replace"      : sdpa_gqa_replace,
+                "sdpa_dynamic_compile"  : sdpa_dynamic_compile,
+                "compile_attention"     : compile_attention,
+                "disable_causal_masks"  : disable_causal_masks,
+                "compile_torch_modules" : compile_torch_modules,
+                "compile_custom_modules": compile_custom_modules,
+                "compile_function_calls": compile_function_calls,
+                "fuse_lm_head"          : fuse_lm_head,
+                "gradient_checkpointing": gradient_checkpointing,
+                "manual_replacements"   : manual_replacements,
+                "fast_lora_forwards"    : fast_lora_forwards,
+                "fast_residual_stream"  : fast_residual_stream,
+                "accurate_accumulation" : accurate_accumulation,
+                "fullgraph"             : _effective_fullgraph,
+                "disable"               : disable,
+                "return_logits"         : _effective_return_logits,
+                "return_hidden_states"  : _return_hidden_states,
+            },
+            torch_compile_options = torch_compile_options,
+        )
+    except Exception as _megacache_error:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Mega-cache skipped ({_megacache_error})")
+    pass
+
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
@@ -3481,7 +4435,39 @@ def unsloth_compile_transformers(
 
     modeling_file.__UNSLOTH_PATCHED__ = True
     functions = dir(modeling_file)
-    full_source = inspect.getsource(modeling_file)
+    try:
+        full_source = inspect.getsource(modeling_file)
+    except (OSError, TypeError) as exception:
+        # Everything below is source-level feature detection, so with no source
+        # there is nothing to do. Unguarded the OSError propagates out of
+        # FastModel.from_pretrained and the model fails to LOAD, over a file we
+        # only wanted in order to make it faster.
+        #
+        # Return rather than continue with an empty string: checks of the form
+        # `"_supports_sdpa = False" not in full_source` are TRUE on empty and
+        # would enable a path the model never claimed to support.
+        logger.warning(
+            f"Unsloth: Could not read the source of {getattr(modeling_file, '__name__', modeling_file)} "
+            f"({type(exception).__name__}: {exception}), so source-level "
+            f"optimisations are skipped for it. The model still works."
+        )
+        # Say so explicitly: the caller seeds this True and only the normal
+        # path writes it, so returning silently leaves SDPA selected for a
+        # model that never claimed it. Eager is always available.
+        modeling_file.__UNSLOTH_SUPPORTS_SDPA__ = False
+        if supports_sdpa is not None:
+            assert type(supports_sdpa) is list and len(supports_sdpa) == 1
+            supports_sdpa[0] = False
+        # These read torch's source, not the model's, so they still work here.
+        _patch_torch_dtype_modules(
+            model_location,
+            functions,
+            torch_compile_options,
+            compile_torch_modules,
+            disable,
+            None,
+        )
+        return
 
     # Order by definition position. A bare-name find() also matches
     # forward references in annotations, docstrings and type unions,
@@ -3760,6 +4746,15 @@ def unsloth_compile_transformers(
                 disabled_scaled_dot_product_attention_modules.append(module)
             pass
         pass
+        # AMD ROCm: replace SDPA with amd-aiter Flash Attention if available.
+        # Note: this fires on the model's compiled source after Unsloth's SDPA
+        # rewriting. The Unsloth-rewritten SDPA calls carry attn_mask= or
+        # is_causal=is_causal (variable, not literal True) and will not match
+        # the aiter guards. User-added model code with bare
+        # scaled_dot_product_attention(q, k, v, is_causal=True) will match.
+        # A future PR can also rewrite the Unsloth SDPA shim to emit
+        # is_causal=True literally where provably safe.
+        new_source = replace_sdpa_with_amd_aiter(new_source)
         scaled_dot_product_attention_modules[module] = new_source
     pass
 
@@ -4421,7 +5416,7 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4485,7 +5480,7 @@ def unsloth_compile_transformers(
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
@@ -4547,118 +5542,14 @@ def unsloth_compile_transformers(
             print(str(dir(combined_module)))
         combined_module = None
 
-    # These rewrites never compile (add_torch_compile=False), so run them even
-    # when compiling is disabled: norms are fp32 upcast at load regardless, and
-    # eager F.layer_norm crashes on bf16 activations against fp32 weights.
-    if compile_torch_modules:
-        if not disable:
-            # Compiled global F.layer_norm: only when compiling is allowed
-            from .patch_torch_functions import patch_torch_functions
-
-            patch_torch_functions()
-
-        _conv_modules = frozenset([
-            "Conv1d", "Conv2d", "Conv3d",
-            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
-        ])
-        for module in _patch_functions:
-            try:
-                source = eval(f"{model_location}.torch")
-            except:
-                continue
-            if not hasattr(source, "nn"):
-                continue
-            if not hasattr(source.nn, module):
-                continue
-            function = eval(f"source.nn.{module}")
-            if not hasattr(function, "forward"):
-                continue
-            if hasattr(function.forward, "get_compiler_config"):
-                continue
-
-            source = inspect.getsource(function.forward).rstrip()
-
-            if module in _conv_modules:
-                # Conv modules: cast input to weight dtype before the conv op,
-                # then cast output back to original input dtype. This prevents
-                # dtype mismatches under mixed-precision autocast (eg bf16
-                # weight + fp16 input crashes F.conv1d).
-                lines = source.split("\n")
-                def_line = lines[0]
-                body_lines = lines[1:]
-                first_body = next((l for l in body_lines if l.strip()), "")
-                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
-                prologue = [
-                    body_indent + "original_dtype = input.dtype",
-                    body_indent + "input = input.to(self.weight.dtype)",
-                ]
-                source = "\n".join([def_line] + prologue + body_lines)
-                append_str = ".to(original_dtype)\n"
-            else:
-                # Norm modules: detect the actual parameter name (input or x)
-                import re as _re
-                m = _re.search(r"def forward\(self,\s*(\w+)", source)
-                param_name = m.group(1) if m else "input"
-                if disable:
-                    # Eager F.layer_norm needs input dtype == weight dtype: cast in
-                    # and out. Compiled path left untouched (adding the cast there
-                    # changes batched numerics). weight is None when affine=False.
-                    lines = source.split("\n")
-                    def_line = lines[0]
-                    body_lines = lines[1:]
-                    first_body = next((l for l in body_lines if l.strip()), "")
-                    body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
-                    prologue = [
-                        body_indent + f"original_dtype = {param_name}.dtype",
-                        body_indent + f"if self.weight is not None: {param_name} = {param_name}.to(self.weight.dtype)",
-                    ]
-                    source = "\n".join([def_line] + prologue + body_lines)
-                    append_str = ".to(original_dtype)\n"
-                else:
-                    append_str = f".to({param_name}.dtype)\n"
-
-            forward = create_new_function(
-                module,
-                source,
-                model_location,
-                functions,
-                prepend=_license_header
-                + f"\ntorch_compile_options = {torch_compile_options}\n",
-                append=append_str,
-                overwrite=False,
-                add_torch_compile=False,
-            ).forward
-
-            exec(
-                f"{model_location}.torch.nn.{module}.forward = forward",
-                globals(),
-                locals(),
-            )
-            try:
-                exec(
-                    f"{model_location}.nn.{module}.forward = forward",
-                    globals(),
-                    locals(),
-                )
-            except:
-                pass
-            if combined_module is not None:
-                exec(
-                    f"combined_module.torch.nn.{module}.forward = forward",
-                    globals(),
-                    locals(),
-                )
-                try:
-                    exec(
-                        f"combined_module.nn.{module}.forward = forward",
-                        globals(),
-                        locals(),
-                    )
-                except:
-                    pass
-            pass
-        pass
-    pass
+    _patch_torch_dtype_modules(
+        model_location,
+        functions,
+        torch_compile_options,
+        compile_torch_modules,
+        disable,
+        combined_module,
+    )
     # Quick exit
     if combined_module is None or full_disable:
         print(

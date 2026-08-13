@@ -28,34 +28,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 604 annotations below would evaluate at def time and raise on Python 3.9.
+from __future__ import annotations
+
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
 ]
 
-IMAGE_TOKENS = [
-    "<|image|>",          # Llama 3.2 Vision, Phi 3.5
-    "<|vision_start|>",   # Qwen
-    "<|vision_end|>",     # Qwen
-    "<|vision_pad|>",     # Qwen
-    "<|image_pad|>",      # Qwen
-    "<|video_pad|>",      # Qwen
-    "<image>",            # PaliGemma / Llava
-    "[IMG]",              # Mistral
-    "[IMG_BREAK]",        # Mistral
-    "[IMG_END]",          # Mistral
-    "<image_soft_token>", # Gemma 3
-    "<start_of_image>",   # Gemma 3
-    "<end_of_image>",     # Gemma 3
-    "<|START_OF_IMG|>",   # Cohere
-    "<|END_OF_IMG|>",     # Cohere
-    "<|IMG_LINE_BREAK|>", # Cohere
-    "<|IMG_PATCH|>",      # Cohere
-]
-
-AUDIO_TOKENS = [
-    "<|audio|>",  # Gemma 4
-]
+# Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
+# share one source of truth. Re-exported here for backwards compatibility.
+from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
@@ -67,6 +50,7 @@ import time
 import warnings
 import os
 from functools import lru_cache
+from collections.abc import Mapping
 
 
 import requests
@@ -571,13 +555,53 @@ def _fix_audio_feature_extractor_padding_side(processor):
         feature_extractor.padding_side = "right"
 
 
+@lru_cache(maxsize=1)
+def _audio_decoder_types():
+    # torchcodec AudioDecoder type (datasets >= 4 Audio() columns), matched
+    # directly so an unpatched decoder (only __getitem__) is still recognized.
+    # Returns () when datasets < 4 / the dep is unavailable. See #7226.
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+    except (ImportError, AttributeError, RuntimeError):
+        return ()
+    return (AudioDecoder,)
+
+
+def _is_audio_mapping(audio):
+    # True for anything _resolve_audio_dict can read "array"/"sampling_rate" from:
+    # a Mapping, a torchcodec AudioDecoder, or a duck-typed mapping. isinstance(dict)
+    # alone drops decoders into the raw-waveform catch-all (#7226). callable() (not
+    # hasattr) rejects objects with a non-callable get/keys.
+    if isinstance(audio, Mapping):
+        return True
+    if isinstance(audio, _audio_decoder_types()):
+        return True
+    return (
+        callable(getattr(audio, "get", None)) and
+        callable(getattr(audio, "keys", None)) and
+        callable(getattr(audio, "__contains__", None))
+    )
+
+
+def _audio_get(audio, key, default=None):
+    # Mapping-style lookup that falls back to subscripting for an unpatched
+    # AudioDecoder (only __getitem__, no .get).
+    getter = getattr(audio, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return audio[key]
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
-    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
-    value = audio.get("array")
+    _check_audio_sampling_rate(_audio_get(audio, "sampling_rate"), sampling_rate)
+    value = _audio_get(audio, "array")
     if value is None:
-        value = audio.get("path") or audio.get("url")
+        value = _audio_get(audio, "path") or _audio_get(audio, "url")
     return value
 
 
@@ -601,7 +625,7 @@ def extract_audio_info(
                     # Feature extractors also accept local paths and URLs as strings
                     if audio is None:
                         audio = ele.get("url") or ele.get("path")
-                    if isinstance(audio, dict):
+                    if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
@@ -654,6 +678,11 @@ def get_padding_tokens_ids(tokenizer):
         placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
+    # Tokens absent from this tokenizer map to the unk id; do not mask unk from loss
+    # (mirrors the MLX path in mlx/utils.py). pad_token_id is added separately below.
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None:
+        padding_token_ids = [x for x in padding_token_ids if x != unk_id]
     if hasattr(tokenizer, "pad_token_id"):
         padding_token_ids.append(tokenizer.pad_token_id)
 
@@ -681,6 +710,43 @@ def _get_dtype(dtype):
 import PIL.Image
 LANCZOS = PIL.Image.Resampling.LANCZOS
 from .dataset_utils import train_on_responses_only as _train_on_responses_only
+
+
+def _resolve_processor_model_name(processor, model = None):
+    """Best-effort human readable name for the processor / model in errors."""
+    for obj in (processor, getattr(model, "config", None), model):
+        if obj is None:
+            continue
+        for attr in ("name_or_path", "_name_or_path"):
+            name = getattr(obj, attr, None)
+            if isinstance(name, str) and len(name) > 0:
+                return name
+    if processor is not None:
+        return processor.__class__.__name__
+    return "this model"
+
+
+def _raise_chat_template_error(error, processor, model = None):
+    """Turn an apply_chat_template failure into an actionable Unsloth error (usually a base
+    checkpoint whose processor has no chat template)."""
+    name = _resolve_processor_model_name(processor, model)
+    msg = str(error)
+    lowered = msg.lower()
+    # newer Transformers says "chat template"; older says "apply_chat_template()/chat_template"
+    if "chat template" in lowered or "chat_template" in lowered:
+        raise RuntimeError(
+            f"Unsloth: The processor for `{name}` has no chat template, so vision "
+            "conversations cannot be formatted.\n"
+            "Use an instruction-tuned checkpoint (e.g. the `-Instruct` / `-it` "
+            "variant of this model), or set a chat template before training via "
+            "`processor.chat_template = ...` -- the collator calls "
+            "`processor.apply_chat_template`, so setting it on a separate tokenizer "
+            "has no effect (you may also pass `chat_template=` to "
+            "`apply_chat_template`).\n"
+            f"(original error: {msg})"
+        ) from error
+    raise RuntimeError(error) from error
+
 
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
@@ -847,9 +913,9 @@ class UnslothVisionDataCollator:
                     "We will auto fix the data collator to support it!"
                 )
             except Exception as e:
-                raise RuntimeError(e) from e
+                _raise_chat_template_error(e, processor, model)
         except Exception as e:
-            raise RuntimeError(e) from e
+            _raise_chat_template_error(e, processor, model)
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1027,7 +1093,7 @@ class UnslothVisionDataCollator:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        elif isinstance(audio_val, dict):
+        elif _is_audio_mapping(audio_val):
             clip = _resolve_audio_dict(audio_val, target_sr)
             if clip is None:
                 raise ValueError(
@@ -1040,12 +1106,16 @@ class UnslothVisionDataCollator:
                 clips = []
             # A flat list of samples is one clip, not a list of clips
             # (strings are path/url clips, so they stay in the list-of-clips branch)
-            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
+            elif (
+                not _is_audio_mapping(audio_val[0])
+                and not isinstance(audio_val[0], (list, tuple, str))
+                and getattr(audio_val[0], "ndim", 0) == 0
+            ):
                 clips = [audio_val]
             else:
                 clips = []
                 for clip in audio_val:
-                    if isinstance(clip, dict):
+                    if _is_audio_mapping(clip):
                         clip = _resolve_audio_dict(clip, target_sr)
                         if clip is None:
                             raise ValueError(
@@ -1101,8 +1171,13 @@ class UnslothVisionDataCollator:
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
             audio_tokens.append(tok.audio_token)
+        # Audio strings absent from this tokenizer map to the unk id (matching
+        # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
+        # miscounted as an audio token and tripping the alignment check below.
+        unk_id = getattr(tok, "unk_token_id", None)
         audio_ids = torch.tensor(
-            [i for i in tok.convert_tokens_to_ids(audio_tokens) if isinstance(i, int) and i >= 0],
+            [i for i in tok.convert_tokens_to_ids(audio_tokens)
+             if isinstance(i, int) and i >= 0 and i != unk_id],
             device=batch["input_ids"].device,
         )
         n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())

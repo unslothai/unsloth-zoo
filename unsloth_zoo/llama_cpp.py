@@ -121,16 +121,38 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+#
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
@@ -182,6 +204,40 @@ def _resolve_local_convert_script():
         f"convert_hf_to_gguf.py or convert-hf-to-gguf.py. Unset the env var "
         f"to use the network converter."
     )
+
+
+def _resolve_bundle_convert_script():
+    """Fallback when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is unset: a prebuilt llama.cpp
+    bundle ships convert_hf_to_gguf.py alongside its own conversion/ package, so
+    the two are co-versioned. Downloading the latest entrypoint instead runs it
+    against the bundle's older conversion/ModelBase and crashes (e.g. unexpected
+    target_model_dir kwarg). Prefer the bundle's converter when, and only when,
+    that paired conversion/ package is present. We require both __init__.py and
+    base.py, the same signal _detect_converter_layout uses, so selection and
+    layout detection never disagree. Returns (path, mtime_ns, size) or None
+    (monolith installs / trees without a paired conversion/ fall through)."""
+    bundle_dir = LLAMA_CPP_DEFAULT_DIR
+    if not bundle_dir or not os.path.isdir(bundle_dir):
+        return None
+    conversion_dir = os.path.join(bundle_dir, "conversion")
+    if not (os.path.isfile(os.path.join(conversion_dir, "__init__.py")) and
+            os.path.isfile(os.path.join(conversion_dir, "base.py"))):
+        return None
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        candidate = os.path.join(bundle_dir, name)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            stat = os.stat(candidate)
+        except OSError:
+            continue
+        logger.info(
+            f"Unsloth: Using bundle convert_hf_to_gguf.py from {candidate} "
+            f"(co-versioned with its conversion/ package)"
+        )
+        return (candidate, stat.st_mtime_ns, stat.st_size)
+    return None
+pass
 
 
 @contextlib.contextmanager
@@ -725,11 +781,13 @@ def _rocm_gfx_family(gfx):
     return None
 
 
-def _select_gpu_assets(tag, assets, manifest):
+def _select_gpu_assets(tag, assets, manifest, target = None):
     """Ordered download attempts [(asset_name, url), ...] of unslothai/llama.cpp
     GPU bundles for this host: narrowest CUDA coverage for the torch runtime
     line first, that line's portable build next, then the other line; ROCm by
-    gfx family; macOS by the fork's Metal bundles. Empty list = compile."""
+    gfx family; macOS by the fork's Metal bundles. Empty list = compile.
+    target is the _detect_gpu_target() result; pass it to reuse an already-probed
+    value (the caller's gate probes it once), else it is detected here."""
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"): arch = "x64"
     elif machine in ("aarch64", "arm64"): arch = "arm64"
@@ -740,7 +798,8 @@ def _select_gpu_assets(tag, assets, manifest):
         name = f"llama-{tag}-bin-macos-{arch}.tar.gz"
         return [(name, assets[name])] if name in assets else []
 
-    target = _detect_gpu_target()
+    if target is None:
+        target = _detect_gpu_target()
     if target is None:
         return []
     artifacts = (manifest or {}).get("artifacts", [])
@@ -824,6 +883,40 @@ def _select_prebuilt_asset(tag, assets):
     return name, assets[name]
 
 
+def _select_cpu_assets(tag, assets, manifest):
+    """Ordered download attempts [(asset_name, url), ...] of the unslothai/llama.cpp
+    fork's CPU bundle for this host -- the final prebuilt fallback before a source
+    compile (its app-*-cpu archive still ships llama-quantize, the only binary the
+    export path needs). On macOS the CPU and GPU bundle are the same Metal archive,
+    named by convention. On Linux/Windows the fork CPU asset names carry a
+    commit-hash suffix, so they are looked up by the manifest's install_kind rather
+    than constructed. Empty list = no fork CPU bundle for this host."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"): arch = "x64"
+    elif machine in ("aarch64", "arm64"): arch = "arm64"
+    else: return []
+    system = platform.system()
+
+    if system == "Darwin":
+        name = f"llama-{tag}-bin-macos-{arch}.tar.gz"
+        return [(name, assets[name])] if name in assets else []
+
+    kind = {
+        ("Linux",   "x64")   : "linux-cpu",
+        ("Linux",   "arm64") : "linux-arm64",
+        ("Windows", "x64")   : "windows-cpu",
+        ("Windows", "arm64") : "windows-arm64",
+    }.get((system, arch))
+    if kind is None:
+        return []
+    artifacts = (manifest or {}).get("artifacts", [])
+    return [
+        (a["asset_name"], assets[a["asset_name"]])
+        for a in artifacts
+        if a.get("install_kind") == kind and a.get("asset_name") in assets
+    ]
+
+
 def _download_archive(url, dest_path):
     response = _requests_get_with_retries(url, headers = _github_auth_headers(), stream = True)
     with open(dest_path, "wb") as f:
@@ -834,19 +927,44 @@ def _download_archive(url, dest_path):
 def _extract_archive(archive_path, extract_dir):
     """Extract a release .zip / .tar.gz, refusing path-escaping members."""
     real_root = os.path.realpath(extract_dir)
+    def _escapes(target):
+        try:
+            return os.path.commonpath([real_root, target]) != real_root
+        except ValueError:
+            return True
     def _check(name):
         target = os.path.realpath(os.path.join(extract_dir, name))
-        if target != real_root and not target.startswith(real_root + os.sep):
+        if _escapes(target):
             raise RuntimeError(f"Unsloth: Archive member escapes extraction dir: {name}")
+        return target
+    def _check_tar_member(member):
+        member_target = _check(member.name)
+        if member.issym() or member.islnk():
+            # Hardlink targets are archive-relative (resolve from the root);
+            # symlink targets resolve from the link's own directory.
+            link_base = real_root if member.islnk() else os.path.dirname(member_target)
+            link_target = member.linkname if os.path.isabs(member.linkname) else os.path.join(link_base, member.linkname)
+            if _escapes(os.path.realpath(link_target)):
+                raise RuntimeError(f"Unsloth: Archive link escapes extraction dir: {member.name} -> {member.linkname}")
+        elif not (member.isfile() or member.isdir()):
+            raise RuntimeError(f"Unsloth: Unsupported archive member type: {member.name}")
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.namelist(): _check(member)
+            for member in archive.infolist():
+                _check(member.filename)
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RuntimeError(f"Unsloth: Archive contains an unsupported symlink: {member.filename}")
             archive.extractall(extract_dir)
     else:
         tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
         with tarfile.open(archive_path, "r:gz") as archive:
-            for member in archive.getmembers(): _check(member.name)
-            archive.extractall(extract_dir, **tar_kwargs)
+            # Validate every member (rejecting links whose targets escape) before
+            # extracting anything, so no escaping symlink is ever written for a
+            # later member to traverse through. extractall defers directory attrs
+            # until contents are written, which per-member extract would break.
+            members = archive.getmembers()
+            for member in members: _check_tar_member(member)
+            archive.extractall(extract_dir, members = members, **tar_kwargs)
 
 
 def _single_extracted_root(extract_dir):
@@ -885,13 +1003,27 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _hydrate_converter_sources(tag, install_folder):
+def _hydrate_converter_sources(tag, install_folder, source_assets = None):
     """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
     source tarball so check_llama_cpp and the converter machinery work
-    without a git checkout, and tensor mappings match the binaries."""
+    without a git checkout, and tensor mappings match the binaries.
+
+    Fork releases use "mix" tags (e.g. b9739-mix-2d6bd50) that do NOT exist on
+    ggml-org, so a verbatim ggml-org download 404s and the whole prebuilt install
+    fails into a source compile. Prefer the fork release's own source asset
+    (llama.cpp-source-{tag}.tar.gz, passed in via source_assets) so the converter
+    exactly matches the fork build; otherwise strip the -mix-... suffix and pull
+    the matching upstream tag from ggml-org. Plain ggml-org tags carry no suffix,
+    so this is a no-op for them (upstream_tag == tag)."""
+    fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
+    if source_assets and fork_source_name in source_assets:
+        source_url = source_assets[fork_source_name]
+    else:
+        upstream_tag = tag.split("-mix-")[0]
+        source_url = LLAMA_CPP_SOURCE_TARBALL.format(tag = upstream_tag)
     with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
-        _download_archive(LLAMA_CPP_SOURCE_TARBALL.format(tag = tag), archive_path)
+        _download_archive(source_url, archive_path)
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
         _extract_archive(archive_path, extract_dir)
@@ -922,9 +1054,11 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/lla
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp"):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
-    then activate into llama_cpp_folder. Raises on any failure."""
+    then activate into llama_cpp_folder. Raises on any failure. source_assets is
+    the release's asset map, used so the converter sources hydrate from the fork's
+    own source tarball for "mix" tags (see _hydrate_converter_sources)."""
     parent_dir = os.path.dirname(llama_cpp_folder) or "."
     os.makedirs(parent_dir, exist_ok = True)
     # Stage next to the target so activation is an atomic same-fs move,
@@ -943,7 +1077,7 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
         staged_install = os.path.join(staging, "install")
         os.makedirs(staged_install)
         _place_prebuilt_binaries(_single_extracted_root(extract_dir), staged_install)
-        _hydrate_converter_sources(tag, staged_install)
+        _hydrate_converter_sources(tag, staged_install, source_assets = source_assets)
         _write_prebuilt_marker(staged_install, tag, asset_name, repo = repo)
         check_llama_cpp(llama_cpp_folder = staged_install)
 
@@ -959,50 +1093,84 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
 
 
 def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_output = False):
-    """Install prebuilt llama.cpp binaries plus same-tag converter sources
-    into llama_cpp_folder. CPU builds come from ggml-org releases; GPU builds
-    from the unslothai/llama.cpp bundles Studio publishes. Returns
-    (quantizer, converter) on success, None on any failure so the caller
-    compiles from source as before."""
+    """Install prebuilt llama.cpp binaries plus same-tag converter sources into
+    llama_cpp_folder, always preferring the unslothai/llama.cpp fork. Tries, in
+    order: the fork GPU bundle (CUDA/ROCm/Metal) when a GPU target is present, the
+    fork CPU bundle (the final prebuilt fallback -- its app-*-cpu archive also ships
+    llama-quantize), then ggml-org's upstream CPU build for extra resilience on
+    non-macOS hosts. Returns (quantizer, converter) on the first asset that installs,
+    else None so the caller compiles from source as before. ggml-org is skipped on
+    macOS: its recent CPU build targets a newer macOS and fails to load on 14/15."""
     try:
-        if gpu_support:
-            # Cheap host check before any network: no detectable GPU target
-            # (and not macOS Metal) means no bundle could match.
-            if platform.system() != "Darwin" and _detect_gpu_target() is None:
-                logger.warning("Unsloth: gpu_support requested but no GPU target detected - compiling instead.")
-                return None
-            repo = "unslothai/llama.cpp"
-            resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
-            if resolved is None:
-                return None
-            tag, assets = resolved
-            manifest = _fetch_release_json_asset(assets, LLAMA_CPP_PREBUILT_MANIFEST_ASSET)
-            checksums = _fetch_release_json_asset(assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
-            checksums = checksums.get("artifacts", {})
-            attempts = _select_gpu_assets(tag, assets, manifest)
-            if not attempts:
-                logger.warning("Unsloth: No prebuilt GPU llama.cpp bundle matches this host in release %s.", tag)
-                return None
-        else:
-            repo = "ggml-org/llama.cpp"
-            resolved = _resolve_llama_cpp_release()
-            if resolved is None:
-                return None
-            tag, assets = resolved
-            checksums = {}
-            selected = _select_prebuilt_asset(tag, assets)
-            if selected is None:
-                logger.warning("Unsloth: No prebuilt llama.cpp asset for this platform in release %s.", tag)
-                return None
-            attempts = [selected]
+        is_darwin = platform.system() == "Darwin"
+        # Each attempt carries its own (repo, tag, checksums, source_assets) so
+        # staging verifies the right sha256 and hydrates the converter from the
+        # matching source. (repo, asset_name) dedups the macOS bundle, which both
+        # fork selectors return.
+        attempts = []          # [(repo, tag, checksums, source_assets, name, url), ...]
+        seen = set()           # {(repo, asset_name)}
 
-        for asset_name, asset_url in attempts:
+        def _extend(repo, tag, checksums, source_assets, selected):
+            for asset_name, asset_url in selected:
+                key = (repo, asset_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                attempts.append((repo, tag, checksums, source_assets, asset_name, asset_url))
+
+        # 1 + 2: unslothai/llama.cpp fork bundles (GPU then CPU). Best-effort: a
+        # failed fork release resolution still lets ggml-org be tried below.
+        fork_repo = "unslothai/llama.cpp"
+        resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
+        if resolved is not None:
+            fork_tag, fork_assets = resolved
+            manifest = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_MANIFEST_ASSET)
+            fork_checksums = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
+            fork_checksums = fork_checksums.get("artifacts", {})
+            # 1: GPU bundle, only with a usable GPU target (or macOS Metal).
+            # Probe the GPU target once and reuse it inside _select_gpu_assets.
+            gpu_target = _detect_gpu_target() if (gpu_support and not is_darwin) else None
+            if gpu_support and (is_darwin or gpu_target is not None):
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target))
+            # 2: CPU bundle -- the final prebuilt fallback for CPU-oriented
+            # installs. Skipped for an explicit GPU request so a failed GPU
+            # prebuilt compiles a GPU-enabled build (the pre-prebuilt behavior)
+            # rather than silently landing on a CPU-only prebuilt. macOS export
+            # passes gpu_support=False and still gets the right archive: on Darwin
+            # the CPU selector returns the same universal macOS/Metal bundle.
+            if not gpu_support:
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_cpu_assets(fork_tag, fork_assets, manifest))
+        else:
+            logger.warning("Unsloth: Could not resolve a unslothai/llama.cpp release - "
+                           "trying upstream ggml-org instead.")
+
+        # 3: ggml-org upstream CPU, non-Darwin CPU installs only (its Darwin CPU
+        # build is unusable on macOS 14/15, and a GPU request must not be shadowed
+        # by a CPU-only prebuilt -- it falls through to a source GPU build).
+        if not is_darwin and not gpu_support:
+            ggml_repo = "ggml-org/llama.cpp"
+            resolved = _resolve_llama_cpp_release()
+            if resolved is not None:
+                ggml_tag, ggml_assets = resolved
+                selected = _select_prebuilt_asset(ggml_tag, ggml_assets)
+                if selected is not None:
+                    _extend(ggml_repo, ggml_tag, {}, None, [selected])
+
+        if not attempts:
+            logger.warning("Unsloth: No prebuilt llama.cpp bundle matches this host - "
+                           "falling back to source build.")
+            return None
+
+        for repo, tag, checksums, source_assets, asset_name, asset_url in attempts:
             print(f"Unsloth: Installing prebuilt llama.cpp {tag} ({asset_name}) - skipping compilation.")
             try:
                 result = _stage_prebuilt_install(
                     llama_cpp_folder, tag, asset_name, asset_url,
                     expected_sha256 = (checksums.get(asset_name) or {}).get("sha256"),
                     repo = repo,
+                    source_assets = source_assets,
                 )
             except Exception as e:
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)
@@ -1253,9 +1421,14 @@ def install_llama_cpp(
                 # Clean up any partial build
                 try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
 
-                # Build cmake configure command with library detection
+                # Build cmake configure command with library detection.
+                # Set CMAKE_BUILD_TYPE=Release at configure time: on single-config
+                # generators (Unix Makefiles / Ninja on Linux/macOS) the build
+                # step's `--config Release` is ignored, so without this the
+                # binaries are built unoptimized.
                 cmake_configure = (
                     f"cmake . -B build "
+                    f"-DCMAKE_BUILD_TYPE=Release "
                     f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
                 )
 
@@ -1495,6 +1668,8 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
     # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
+    if local_script_info is None:
+        local_script_info = _resolve_bundle_convert_script()
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
     _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))
@@ -2091,6 +2266,202 @@ def _reinstall_converter_deps(python_exe, print_output = False):
     return result
 
 
+def _has_mtp_weight_tensors(input_folder, num_layers):
+    """Return whether the checkpoint's tensor names include an MTP layer."""
+    input_folder = Path(input_folder)
+    _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+
+    def _is_mtp(name):
+        # Match the converter's TextModel.filter_tensors normalization.
+        name = name.replace("language_model.", "")
+        if name.startswith(("mtp.", "model.mtp.")):
+            return True
+        m = _layer_re.match(name)
+        return m is not None and int(m.group(1)) >= num_layers
+
+    def _inspection_error(path):
+        return RuntimeError(
+            f"Unsloth: Could not inspect `{path.name}` for MTP tensors; "
+            "`config.json` was not changed."
+        )
+
+    def _names_from_index(index_path):
+        try:
+            with index_path.open("r", encoding = "utf-8") as f:
+                index = json.load(f)
+        except Exception as error:
+            raise _inspection_error(index_path) from error
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise _inspection_error(index_path)
+        return weight_map.keys()
+
+    parts = sorted(input_folder.glob("model*.safetensors"))
+    if parts:
+        index_path = input_folder / "model.safetensors.index.json"
+        # llama.cpp gives the canonical index precedence whenever any
+        # safetensors part exists, including alongside model.safetensors.
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        from safetensors import safe_open
+
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    if any(_is_mtp(name) for name in f.keys()):
+                        return True
+            except Exception as error:
+                raise _inspection_error(part) from error
+        return False
+
+    parts = sorted(input_folder.glob("pytorch_model*.bin"))
+    if parts:
+        index_path = input_folder / "pytorch_model.bin.index.json"
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        if torch is None:
+            raise RuntimeError("Unsloth: PyTorch is required to inspect `.bin` model weights.")
+        for part in parts:
+            try:
+                state_dict = torch.load(
+                    part,
+                    map_location = "cpu",
+                    mmap = True,
+                    weights_only = True,
+                )
+            except Exception as error:
+                raise _inspection_error(part) from error
+            if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+                state_dict = state_dict["state_dict"]
+            if not isinstance(state_dict, dict):
+                raise _inspection_error(part)
+            if any(_is_mtp(name) for name in state_dict):
+                return True
+    return False
+
+
+def _converter_supports_no_mtp(converter_location):
+    """Return whether the selected converter declares the `--no-mtp` option."""
+    try:
+        source = Path(converter_location).read_bytes()
+    # Missing/unreadable path, or None and NUL-bearing ones: all mean "cannot
+    # prove support", and omitting --no-mtp just restores the old behaviour.
+    except (OSError, TypeError, ValueError):
+        return False
+    return re.search(
+        rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
+        source,
+        flags = re.DOTALL,
+    ) is not None
+
+
+def _find_bitsandbytes_quantization(config, _path = "config.json"):
+    """Where a bitsandbytes `quantization_config` sits, or None.
+
+    Recursive: VLMs keep theirs under a sub-config like `text_config`.
+    """
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+        # Older checkpoints omit quant_method and only carry the bnb flags.
+        if method == "bitsandbytes" or (
+            method is None
+            and ("load_in_4bit" in quant or "load_in_8bit" in quant)
+        ):
+            return _path
+    for key, value in config.items():
+        if key == "quantization_config" or not isinstance(value, dict):
+            continue
+        found = _find_bitsandbytes_quantization(value, f"{_path}[{key!r}]")
+        if found is not None:
+            return found
+    return None
+
+
+def _converter_was_oom_killed(exc):
+    """Was the converter OOM-killed (SIGKILL), rather than failing on its own?"""
+    if getattr(exc, "returncode", None) in (-9, 137):
+        return True
+    return "sigkill" in f"{exc}".lower()
+
+
+def _converter_rejected_no_mtp(text):
+    """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
+    if not text: return False
+    for line in text.splitlines():
+        low = line.lower()
+        if "--mtp" not in low and "--no-mtp" not in low and "--no-nextn" not in low:
+            continue
+        if "not supported" in low or "only supported" in low:
+            return True
+    return False
+
+
+def _drop_no_mtp(command):
+    """The same command without `--no-mtp`, or None when it has none to drop."""
+    if "--no-mtp" not in command: return None
+    return [token for token in command if token != "--no-mtp"]
+
+
+def _retry_with_temp_file(command):
+    """The same command spooling tensors to disk instead of holding them in RAM.
+
+    llama.cpp refuses `--use-temp-file` alongside splitting ("Cannot use temp
+    file when splitting"), so the split options are dropped. None when the
+    command already has the flag, so the retry cannot loop.
+    """
+    if "--use-temp-file" in command:
+        return None
+    out = []
+    drop_value = False
+    for token in command:
+        if drop_value:
+            drop_value = False
+            # Only its value: a flag here means the previous one had none.
+            if not str(token).startswith("--"):
+                continue
+        if token in ("--split-max-size", "--split-max-tensors"):
+            drop_value = True
+            continue
+        out.append(token)
+    # The trailing model path must stay last.
+    return out[:-1] + ["--use-temp-file"] + out[-1:]
+
+
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
+    basename_without_gguf = os.path.splitext(output_file)[0]
+    shard_pattern = re.compile(
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
+    )
+    parent_dir = os.path.dirname(output_file) or '.'
+    paths = [output_file]
+    try:
+        # fullmatch, not search: these get os.remove'd, and an unanchored match
+        # would take a neighbour like "old-model.BF16-00001-of-00002".
+        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                        if shard_pattern.fullmatch(f))
+    except OSError:
+        pass
+    return paths
+
+
+def _remove_gguf_outputs(output_file):
+    """Delete what a failed or abandoned conversion left at `output_file`.
+
+    The writer opens every shard with "wb" before any tensor byte and cleans up
+    nothing on failure, and callers upload every save_directory/*.gguf, so a
+    truncated leftover gets published as a valid artifact.
+    """
+    for path in _gguf_output_paths(output_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2115,19 +2486,79 @@ def convert_to_gguf(
     if not os.path.exists(input_folder):
         raise RuntimeError(f"Unsloth: `{input_folder}` does not exist?")
 
-    config_file = os.path.join(input_folder, "config.json")
-    if not os.path.exists(config_file):
+    config_path = os.path.join(input_folder, "config.json")
+    if not os.path.exists(config_path):
         raise RuntimeError(f"Unsloth: `config.json` does not exist inside `{input_folder}`.")
 
     # Load config.json
-    with open(config_file, "r", encoding = "utf-8") as config_file:
-        config_file = json.load(config_file)
+    with open(config_path, "r", encoding = "utf-8") as f:
+        config_file = json.load(f)
+
+    _bnb_where = _find_bitsandbytes_quantization(config_file)
+    if _bnb_where is not None:
+        # llama.cpp has no bitsandbytes dequantizer and only refuses after
+        # reading the whole model, so fail here instead of after a multi-GB
+        # download. Both flags are named: 8bit checkpoints hit this too.
+        raise RuntimeError(
+            f"Unsloth: `{input_folder}` still holds bitsandbytes quantized "
+            f"weights (`quantization_config` at {_bnb_where}), and llama.cpp "
+            f"cannot convert those to GGUF.\n"
+            f"GGUF export needs dequantized 16bit weights. Either load the "
+            f"model with `load_in_4bit = False` and `load_in_8bit = False` "
+            f"before saving, or merge a LoRA adapter with "
+            f"`save_method = \"merged_16bit\"`, which downloads the original "
+            f"16bit weights. Saving a quantized model that has no adapter does "
+            f"not dequantize it."
+        )
+
+    # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
+    # only when the weights still carry the MTP layer (else it crashes on the extra
+    # tensor), and strip it when they don't (else it errors on the missing one).
+    # `unsloth_fixed_mtp` is an internal marker, always dropped. Only Qwen3.5/3.6 set
+    # these keys, so other arches are untouched.
+    _tc = config_file.get("text_config")
+    if not isinstance(_tc, dict):
+        _tc = {}
+    _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
+    _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
+    if _mtp_declared and (
+        not isinstance(_num_layers, int)
+        or isinstance(_num_layers, bool)
+        or _num_layers <= 0
+    ):
+        raise ValueError(
+            "Unsloth: `num_hidden_layers` must be a positive integer to reconcile MTP tensors; "
+            "`config.json` was not changed."
+        )
+    _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _no_mtp = (
+        _mtp_declared
+        and not _keep_mtp
+        and _converter_supports_no_mtp(converter_location)
+    )
+    # Keep the declaration when `--no-mtp` carries the intent: deleting it made
+    # a retry or second export read none, omit the flag, and hit the assertion.
+    _strip_keys = (
+        ("unsloth_fixed_mtp",)
+        if _keep_mtp or _no_mtp
+        else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
+    )
+    _changed = False
+    for _cfg in (config_file, _tc):
+        if not _cfg:
+            continue
+        for _key in _strip_keys:
+            if _key in _cfg:
+                _cfg.pop(_key)
+                _changed = True
+    if _changed:
+        with open(config_path, "w", encoding = "utf-8") as f:
+            json.dump(config_file, f, indent = 2)
     pass
 
     # Check if arch is supported
     supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
-    if supported_types:
-        assert("architectures" in config_file)
+    if supported_types and "architectures" in config_file:
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
@@ -2137,8 +2568,11 @@ def convert_to_gguf(
     pass
 
     if is_vlm and supported_vision_archs is not None:
-        arch = config_file["architectures"][0]
-        if arch not in supported_vision_archs:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
                 is_vlm = False
                 print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 
@@ -2174,7 +2608,9 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((text_args, text_output, "text model"))
+        if _no_mtp:
+            text_args["--no-mtp"] = ""
+        runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
         mmproj_args = {
@@ -2183,7 +2619,8 @@ def convert_to_gguf(
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
-        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+        # Optional: a projector failure must not discard the text GGUF above.
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector", False))
 
     else:
         if is_gpt_oss:
@@ -2209,10 +2646,37 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((args, final_output, "model"))
+        if _no_mtp:
+            args["--no-mtp"] = ""
+        runs_to_do.append((args, final_output, "model", True))
+
+    # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
+    # (app launched from a protected dir), so the final write failed with PermissionError
+    # [Errno 13] even though conversion succeeded. Only then redirect the bare name into
+    # input_folder; a writable CWD (Linux/Mac/Colab) is left unchanged.
+    def _dir_is_writable(d):
+        # mkstemp is exclusive: never truncates an existing file or follows a symlink.
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
+            os.close(fd)
+            os.remove(probe)
+            return True
+        except Exception:
+            return False
+    _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
-    for args, output_file, description in runs_to_do:
+    for args, output_file, description, required in runs_to_do:
+        # Redirect only a bare filename under an unwritable CWD. Absolute paths and
+        # relative paths with a directory are the caller's choice; input_folder is probed
+        # too since it may be a read-only model source.
+        if (not _cwd_writable
+                and not os.path.isabs(output_file)
+                and os.path.dirname(output_file) == ""):
+            _dst = os.path.abspath(input_folder)
+            if _dir_is_writable(_dst):
+                output_file = os.path.join(_dst, output_file)
+                args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
@@ -2226,7 +2690,10 @@ def convert_to_gguf(
         # Run the converter; self-heal and retry once if the env (not the model)
         # is broken. No cost on the happy path.
         attempted_repair = False
+        attempted_temp_file = False
+        attempted_no_mtp_drop = False
         repair_note = ""
+        optional_failed = False
         while True:
             try:
                 # encoding/errors pinned so non-UTF8 output never crashes decoding.
@@ -2259,6 +2726,35 @@ def convert_to_gguf(
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
 
+                # `--no-mtp` is architecture-gated, so a config key alone cannot
+                # prove it is accepted. Retry once without it: the pre-existing
+                # behaviour, and correct for an arch with no MTP block to strip.
+                if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
+                    retry = _drop_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_drop = True
+                        command = retry
+                        continue
+
+                # OOM-killed: retry once spooling to disk, the one resource
+                # these machines have. Only for a kill, so a converter that
+                # failed on its own is not quietly run twice.
+                if not attempted_temp_file and _converter_was_oom_killed(e):
+                    retry = _retry_with_temp_file(command)
+                    if retry is not None:
+                        attempted_temp_file = True
+                        print(
+                            "Unsloth: The GGUF converter ran out of host RAM "
+                            "and was killed. Retrying with --use-temp-file, "
+                            "which spools tensors to disk instead."
+                        )
+                        # The retry drops --split-max-size, so the killed
+                        # run's shards would linger beside the good file and
+                        # be uploaded with it.
+                        _remove_gguf_outputs(output_file)
+                        command = retry
+                        continue
+
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
                 cmd = " ".join(str(x) for x in command)
@@ -2271,7 +2767,33 @@ def convert_to_gguf(
                     text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
                     text = text.strip()
                     if text: details += f"\n--- converter {label} ---\n{text}"
+                if not required:
+                    # Degrade like the "Converting as text-only model" path,
+                    # but for listed archs whose projector conversion fails.
+                    reason = ""
+                    for line in reversed((details or "").splitlines()):
+                        line = line.strip()
+                        if line and ("Error" in line or "Exception" in line):
+                            reason = line
+                            break
+                    # The converter truncates its --outfile at header time,
+                    # so the failed run leaves a partial projector that callers
+                    # would upload as if it were valid.
+                    _remove_gguf_outputs(output_file)
+                    is_vlm = False
+                    optional_failed = True
+                    print(
+                        f"Unsloth: Could not convert the {description} to GGUF "
+                        f"({reason or e}). The text model was converted "
+                        f"successfully and is usable; only multimodal "
+                        f"(image/audio) input is unavailable in this GGUF."
+                    )
+                    break
                 raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+
+        # Its partial output was just removed, so validation would fail for nothing.
+        if optional_failed:
+            continue
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
@@ -2340,6 +2862,7 @@ def quantize_gguf(
     quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
     n_threads = None,
     print_output = True,
+    imatrix = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
@@ -2359,11 +2882,11 @@ def quantize_gguf(
         n_threads *= 2
 
     def _quote(s):
-        """Quote a path for shell usage, handling both Windows and Unix."""
+        """Quote a path for shell usage (the command runs under shell=True)."""
         s = str(s)
         if IS_WINDOWS:
-            # On Windows cmd, wrap in double quotes if path contains spaces
-            return f'"{s}"' if ' ' in s else s
+            # cmd.exe: always wrap so spaces and metachars (& | ^) stay literal.
+            return f'"{s}"'
         import shlex
         return shlex.quote(s)
 
@@ -2375,7 +2898,8 @@ def quantize_gguf(
     # override doesn't leak into other tensors containing "ffn_down".
     _display_quant_type = quant_type
     _extra_flags = ""
-    if str(quant_type).strip().lower() == "q2_k_l":
+    _is_q2_k_l_preset = str(quant_type).strip().lower() == "q2_k_l"
+    if _is_q2_k_l_preset:
         _extra_flags = (
             '--tensor-type "\\.ffn_down_exps=Q3_K" '
             '--tensor-type "\\.ffn_down=Q3_K" '
@@ -2384,6 +2908,15 @@ def quantize_gguf(
         )
         quant_type = "q2_k"
 
+    # An imatrix unlocks the IQ low-bit quants; prepend it (before positional args) and quote.
+    if imatrix is not None and str(imatrix).strip() != "":
+        # Normalize to a clean string first: os.path.exists(True) would treat a bool as a file
+        # descriptor, and a space-padded path must be trimmed before the existence check / quoting.
+        imatrix = str(imatrix).strip()
+        if not os.path.exists(imatrix):
+            raise FileNotFoundError(f"Unsloth: imatrix file `{imatrix}` does not exist.")
+        _extra_flags = f"--imatrix {_quote(imatrix)} " + _extra_flags
+
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
         f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
@@ -2391,7 +2924,7 @@ def quantize_gguf(
 
     if print_output:
         print(f"Unsloth: Quantizing to {_display_quant_type}...")
-        if _extra_flags:
+        if _is_q2_k_l_preset:
             print(
                 "Unsloth: Expanding Q2_K_L preset "
                 "(q2_k base, .ffn_down_exps=Q3_K + .ffn_down=Q3_K, "
