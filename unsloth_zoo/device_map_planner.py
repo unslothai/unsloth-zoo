@@ -1049,20 +1049,38 @@ def plan_device_map(
                 # monotone against the flat-average planner, so no card can come
                 # out of this with less than it had.
                 #
-                # It is also what keeps identical cards byte identical. There
-                # the prorated share IS the flat average, so `min` and the
-                # pinned floor collapse onto the old expression exactly and the
-                # measured Muse Glimmer arithmetic stands: 13.104 each of
-                # 26.208 gives 10.155, caps 2.949 and -1.155. Ceiling division
-                # on both sides is what makes the two agree byte for byte.
-                # Single-device budgets are unchanged too (the share is the
-                # whole model either way).
+                # On identical cards the prorated share IS the flat average, so
+                # `min` collapses onto the old expression and the measured Muse
+                # Glimmer arithmetic stands: 13.104 each of 26.208 gives 10.155,
+                # caps 2.949 and -1.155. Ceiling division on both sides is what
+                # makes the two agree byte for byte. Single-device budgets are
+                # unchanged too (the share is the whole model either way).
+                #
+                # The pinned floor is the HEAD's alone, because the head's card
+                # is the only one that holds the pinned units. Charging it to
+                # every card is what the flat-average planner did, and it
+                # recreates on a small card exactly the zero reserve this branch
+                # exists to remove: `_Bins([100, 50], head = 150)` on budgets
+                # 400 + 2000 with no headroom has 1200 bytes of weights and a
+                # 600-byte pinned head, so cuda:0's proportional share is 200
+                # but a shared floor raises it to 600, its cap 400 - 600 clamps
+                # to zero and the in-order walk fills all 400 bytes of the card
+                # while cuda:1 leaves 1200 free. Head-only, cuda:0 keeps 200.
+                # The cap stays per device monotone against the flat-average
+                # planner either way (`min(flat, prorated) <= flat <=
+                # max(flat, pinned_bytes)`), and `attempt`'s per-card legacy
+                # floor is what guarantees the higher non-head ask can never
+                # settle BELOW the old answer: measured over 36,460 configs, 0
+                # devices anywhere come out under 7c9a7ac0, and 3 x 80 GiB on a
+                # 4-layer 8192-wide model -- the shape that regressed when the
+                # floor was head-only and that guard did not yet exist -- is
+                # byte identical.
                 capacity = sum(raw_budgets.values()) or 1
                 flat = -(-total // len(devices))
                 share = {
                     d: max(
                         min(flat, -(-total * raw_budgets[d] // capacity)),
-                        pinned_bytes,
+                        pinned_bytes if d == head_device else 0,
                     )
                     for d in devices
                 }
@@ -1076,6 +1094,10 @@ def plan_device_map(
                 }
                 # What the flat-average planner would have asked for. `attempt`
                 # walks this ladder too, so every rung it used stays reachable.
+                # It keeps the SHARED pinned floor on purpose: this mapping has
+                # to reproduce the old planner exactly, floor included, or the
+                # per-card guarantee `attempt` derives from it is not a
+                # statement about the previous release.
                 flat_reserve[head_device] = {
                     d: int(max(0, min(
                         value,

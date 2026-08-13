@@ -1539,3 +1539,34 @@ def test_a_merged_ladder_rung_never_undercuts_the_flat_average_plan():
         f"a merged rung kept less than the flat-average planner {legacy}: {kept}"
     )
     assert kept == {0: 866, 1: 963}, kept
+
+
+def test_a_small_card_is_not_charged_the_pinned_head_it_never_holds():
+    """The pinned output head is the head card's weight, nobody else's.
+
+    Byte exact: free units of 400 and 200 bytes and a 600-byte pinned head on
+    budgets 400 and 2000 with no headroom. Weights are 1200, so cuda:0's
+    capacity-proportional share is 200 bytes and cuda:1 takes the head. A
+    pinned floor charged to every card raises cuda:0's share to 600, its cap
+    400 - 600 clamps to zero, and the walk then fills all 400 bytes of that
+    card while cuda:1 leaves 1200 free -- the same zero-reserve packing the
+    proportional share exists to remove. Charged only to the head, cuda:0 keeps
+    a 200-byte reserve.
+    """
+    with torch.device("meta"):
+        model = _Bins([100, 50], head = 150)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 400, 1: 2000},
+        headroom_bytes = 0,
+    )
+    assert plan is not None
+    assert plan.head_device == 1
+    assert plan.total_weight_bytes == 1200
+    kept = plan.activation_reserve_by_device
+    assert kept[0] > 0, (
+        f"cuda:0 was charged the pinned head it does not hold: {kept}"
+    )
+    assert kept == {0: 200, 1: 600}, kept
+    free = {d: plan.raw_budgets[d] - plan.weight_bytes.get(d, 0) for d in (0, 1)}
+    assert free[0] >= kept[0], f"cuda:0 was packed below its own reserve: {free}"
