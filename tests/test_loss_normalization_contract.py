@@ -16,15 +16,14 @@
 
 """The grad-accumulation loss-normalisation contract in _unsloth_get_batch_samples.
 
-We decide num_items_in_batch from the forward signature, but training_step divides
-by grad-accum from self.model_accepts_loss_kwargs. Returning a count while that
-flag is False normalises twice, since TRL's chunked_nll and our own fused CE both
-divide by the count, so loss and gradients end up scaled by 1/GA.
-
-The guard mirrors stock Trainer._get_num_items_in_batch: only count when the flag
-is True or a compute_loss_func exists. Every loss that divides by the count falls
-back to a mean when it is None, so training_step's /GA is then the single correct
-normalisation, and no per-model or per-trainer knowledge is needed.
+num_items_in_batch is set from the forward signature, but training_step divides by
+grad-accum off self.model_accepts_loss_kwargs. A count returned while that flag is
+False normalises twice, since TRL's chunked_nll and our own fused CE each divide by
+it, so loss and gradients end up scaled by 1/GA. The guard mirrors stock
+Trainer._get_num_items_in_batch: count only when the flag is True or a
+compute_loss_func exists. Those losses fall back to a mean when it is None, leaving
+training_step's /GA as the single correct normalisation, with no per-model or
+per-trainer knowledge needed.
 
 CPU only, no model downloads.
 """
@@ -62,14 +61,12 @@ def test_guard_only_suppresses_never_flips_the_flag():
     """Flipping the flag True would break the callers that disable it on purpose.
 
     TRL trainers set model_accepts_loss_kwargs = False in __init__ to enable the
-    grad-accum scaling, and the membership is version dependent: DPO, KTO, GRPO,
-    RLOO, CPO, ORPO and BCO on 0.22.2 and 0.24.0, and thirteen on 1.9.2 once the
-    experimental trainers and RewardTrainer are counted. RewardTrainer in
-    particular does NOT assign it before 1.x, so no fixed trainer list is safe.
-    transformers 5.5.0 adds another: Trainer.__init__ itself sets the flag False
-    for the DeepSpeed sequence-parallel backend. Suppressing the count is right
-    for all of them; assigning the flag is not, and the check is module wide so a
-    helper cannot smuggle the assignment back in.
+    grad-accum scaling, and the membership is version dependent: seven on 0.22.2
+    and 0.24.0, thirteen on 1.9.2, and RewardTrainer does not assign it before 1.x,
+    so no fixed trainer list is safe. transformers 5.5.0 adds another: its own
+    Trainer.__init__ sets the flag False for the DeepSpeed sequence-parallel
+    backend. Suppressing the count is right for all of them; assigning the flag is
+    not, and the check is module wide so a helper cannot smuggle it back in.
     """
     src = inspect.getsource(_loss_utils())
     assert not re.search(r"\.model_accepts_loss_kwargs\s*=[^=]", src), (
@@ -130,16 +127,13 @@ def test_get_batch_samples_still_returns_the_documented_pair():
     )
 
 
-# ---------------------------------------------------------------------------
 # Numerical: the guard is what makes accumulated gradients match a single batch.
-# ---------------------------------------------------------------------------
 
 def _tiny_model():
     """A token normalising loss: sum / count when a count is given, mean otherwise.
 
-    That is exactly what unsloth_fused_ce_loss and TRL's _chunked_cross_entropy_loss
-    do, and the class name carries "CausalLM" with a **kwargs forward so
-    _unsloth_get_batch_samples takes its counting branch.
+    That is what unsloth_fused_ce_loss and TRL's _chunked_cross_entropy_loss do. The
+    "CausalLM" class name and **kwargs forward make _unsloth_get_batch_samples count.
     """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
@@ -200,9 +194,9 @@ def _microbatches(n, tokens_per_row):
 
 
 def _accumulate(model, microbatches, count, grad_accum, accepts_loss_kwargs):
-    """Sum gradients the way Trainer.training_step does.
+    """Sum gradients the way Trainer.training_step does (4.57.6 and 5.5.0 are byte
+    identical here):
 
-    Upstream (4.57.6 and 5.5.0 are byte identical here):
         if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) \
                 and self.compute_loss_func is None:
             loss = loss / self.current_gradient_accumulation_steps
@@ -220,9 +214,9 @@ def _accumulate(model, microbatches, count, grad_accum, accepts_loss_kwargs):
 def test_accumulated_gradient_matches_the_single_batch_gradient():
     """GA invariance, the property the whole guard exists to restore.
 
-    Four microbatches of equal token count, versus one batch holding all of them.
+    Four microbatches of equal token count versus one batch holding all of them.
     Returning the count while the flag is False divides once in the loss and again
-    in training_step, so the gradient comes out at exactly 1/GA. CPU only.
+    in training_step, so the gradient lands at exactly 1/GA. CPU only.
     """
     mod = _loss_utils()
     fn = getattr(mod, "_unsloth_get_batch_samples", None)
@@ -258,9 +252,8 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
 
 
 def test_guard_returns_a_count_exactly_when_stock_transformers_would():
-    """Same decision as Trainer._get_num_items_in_batch, for every flag pairing.
-
-    This is the answer to "why not keep the count and normalise per token across
+    """Same decision as Trainer._get_num_items_in_batch, for every flag pairing, and
+    the answer to "why not keep the count and normalise per token across
     microbatches": stock never emits a count while the flag is False, because
     training_step would then divide by GA on top of it.
     """

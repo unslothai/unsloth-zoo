@@ -337,12 +337,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             raise RuntimeError(exception)
     pass
 
-    # We decide num_items_in_batch from the forward signature, but training_step
-    # divides by grad-accum based on self.model_accepts_loss_kwargs. Returning a
-    # count while that flag is False normalises the loss twice (TRL's chunked_nll
-    # and our fused CE both divide by it), silently scaling loss and grads by 1/GA.
-    # Mirror stock Trainer._get_num_items_in_batch: only count when someone will
-    # consume it. Every such loss falls back to a mean when it is None.
+    # num_items_in_batch is set from the forward signature, but training_step
+    # divides by grad-accum off self.model_accepts_loss_kwargs. Counting while
+    # that flag is False normalises twice (TRL chunked_nll and our fused CE each
+    # divide by it), scaling loss and grads by 1/GA. Like stock
+    # Trainer._get_num_items_in_batch, only count when a consumer exists; these
+    # losses fall back to a mean when it is None.
     if (num_items_in_batch is not None
             and not getattr(self, "model_accepts_loss_kwargs", True)
             and getattr(self, "compute_loss_func", None) is None):
