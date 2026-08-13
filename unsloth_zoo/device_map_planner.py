@@ -1118,8 +1118,8 @@ def plan_device_map(
         # non-head cards stepped down from the per-device range and from the
         # old shared floor, then both ladders again with the head's own reserve
         # relaxed too. The old planner's ladders are in that set rung for rung,
-        # and ordering by the smallest reserve any card keeps means the
-        # accepted plan can never keep less than it did. The head-relaxing
+        # and the per-card floor below is what stops a rung with a larger
+        # minimum from being taken when it keeps some card less. The head-relaxing
         # rungs exist because relaxing only the OTHER cards can miss the head's
         # card by less than its reserve and refuse a model that fits. The logit
         # headroom is never touched by any of them.
@@ -1147,31 +1147,61 @@ def plan_device_map(
         # rung that fit. Budgets 1264 + 1354, 1368 of weights and 3 of headroom
         # ask 580/623 flat and 603/623 prorated; free units of 272 and 768 make
         # the flat 493 rung fit, and the prorated ladder lands on 482 instead.
-        # A 28749 config sweep of GiB-scale budgets found no shape where this
-        # changes the answer -- the cap above already keeps the two asks equal
-        # wherever the pinned floor dominates -- so this is the cheap guarantee
-        # rather than a measured fix: candidates are only ADDED and the sort is
-        # smallest-reserve-first, so keeping every rung either planner would
-        # have tried cannot cost anything and cannot land lower than it did.
         candidates = ladder(reserve)
         flat = flat_reserve.get(head_device)
-        if flat is not None and flat != reserve:
-            candidates += ladder(flat)
+        legacy = ladder(flat) if flat is not None and flat != reserve else []
+        candidates += legacy
 
-        seen = set()
-        ordered = []
-        for kept in candidates:
-            key = tuple(kept[d] for d in devices)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(kept)
-        # Most-kept first. Passing `max(kept.values())` as the non-head cap
-        # makes `_fill` keep exactly this mapping.
-        ordered.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
+        def _ordered(cands):
+            # Most-kept first. Passing `max(kept.values())` as the non-head cap
+            # makes `_fill` keep exactly this mapping.
+            seen = set()
+            out = []
+            for kept in cands:
+                key = tuple(kept[d] for d in devices)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(kept)
+            out.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
                      reverse = True)
-        for kept in ordered:
-            r = _fill(head_device, kept, max(kept.values()))
+            return out
+
+        filled = {}
+        def _try(kept):
+            key = tuple(kept[d] for d in devices)
+            if key not in filled:
+                filled[key] = _fill(head_device, kept, max(kept.values()))
+            return filled[key]
+
+        # What the flat-average planner would have kept: its own ladder, walked
+        # on its own. Ordering by the smallest reserve any card keeps is not
+        # coordinate-wise monotone, so merging the two ladders and taking the
+        # largest minimum can hand one card LESS than that planner did while
+        # another gains. `_Bins([249, 230, 144, 203, 223, 68], head = 32)` on
+        # budgets 3050 + 3977 with 504 of headroom asks 752/963 flat and
+        # 963/963 prorated; 963 does not fit, the prorated ladder's next rung
+        # 914/914 does, and its larger minimum sorts ahead of the still feasible
+        # 752/963 -- so the head, the card that also pays the logit headroom,
+        # comes out 49 short of what it used to keep. That fixture scales
+        # linearly, so on real cards it is gigabytes of activation reserve. A
+        # 1500 config fuzz at MiB scale put it at 58 shapes.
+        #
+        # So a candidate is only better if it is at least the legacy reserve on
+        # EVERY card. The legacy rung itself always passes that test, so this
+        # can never refuse a plan the old planner accepted, and the best rung
+        # above it is still taken: the fixture ends on 866/963, keeping the
+        # head whole AND lifting the small card 114 over the old answer.
+        legacy_kept = None
+        for kept in _ordered(legacy):
+            if _try(kept) is not None:
+                legacy_kept = kept
+                break
+
+        for kept in _ordered(candidates):
+            if legacy_kept is not None and any(kept[d] < legacy_kept[d] for d in devices):
+                continue
+            r = _try(kept)
             if r is not None:
                 return r
         return None

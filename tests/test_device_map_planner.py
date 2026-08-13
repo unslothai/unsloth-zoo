@@ -1506,3 +1506,36 @@ def test_the_relaxation_ladder_still_offers_the_flat_average_rungs():
         f"the prorated ladder skipped the flat-average rung: "
         f"{plan.activation_reserve_by_device}"
     )
+
+
+def test_a_merged_ladder_rung_never_undercuts_the_flat_average_plan():
+    """The largest minimum is not the best plan when another card pays for it.
+
+    Ordering candidates by the smallest reserve any card keeps is not
+    coordinate-wise monotone, so pooling the prorated and flat-average ladders
+    can hand a card LESS than the flat-average planner did. Byte exact: free
+    units of 996, 920, 576, 812, 892 and 272 bytes and a 128-byte pinned head
+    on budgets 3050 and 3977 with 504 bytes of headroom. Weights are 4596, so
+    the flat average asks 752 and 963 while proration asks 963 and 963. cuda:1
+    holds the head and pays the headroom; 963 everywhere does not fit, the
+    prorated ladder's 963 * 19 // 20 = 914 rung does, and its larger minimum
+    sorts ahead of the still feasible 752 and 963 -- which would take 49 bytes
+    off the one card that also has to hold the logits. The fixture scales
+    linearly, so on real cards that is gigabytes.
+    """
+    with torch.device("meta"):
+        model = _Bins([249, 230, 144, 203, 223, 68], head = 32)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 3050, 1: 3977},
+        headroom_bytes = 504,
+    )
+    assert plan is not None
+    assert plan.head_device == 1
+    assert plan.total_weight_bytes == 4596
+    legacy = {0: 752, 1: 963}
+    kept = plan.activation_reserve_by_device
+    assert all(kept[d] >= legacy[d] for d in legacy), (
+        f"a merged rung kept less than the flat-average planner {legacy}: {kept}"
+    )
+    assert kept == {0: 866, 1: 963}, kept
