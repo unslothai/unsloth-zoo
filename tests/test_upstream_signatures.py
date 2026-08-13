@@ -45,6 +45,25 @@ def _skip_if_transformers_5x(reason: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
+    """Did the import fail because OUR target is gone, rather than a dependency?
+
+    ``exc.name`` is the deepest package that could not be found, which for a
+    removed model package is the PARENT, not the module we asked for: dropping
+    ``transformers/models/siglip/`` makes importing
+    ``transformers.models.siglip.modeling_siglip`` raise with
+    ``name == "transformers.models.siglip"``. Comparing only against the full
+    path and the top-level package therefore read a removed target as a broken
+    dependency and skipped, hiding real drift. Any package prefix counts.
+
+    The trailing dot keeps this a PACKAGE prefix: without it
+    ``transformers.models.siglip`` would also claim
+    ``transformers.models.siglipx.modeling_x``.
+    """
+    name = exc.name or ""
+    return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
+
+
 def _import_or_skip(dotted_module: str, *names):
     """Import ``names`` from ``dotted_module``, or skip with the real reason.
 
@@ -61,7 +80,7 @@ def _import_or_skip(dotted_module: str, *names):
     try:
         mod = importlib.import_module(dotted_module)
     except ModuleNotFoundError as exc:
-        if (exc.name or "") in (dotted_module, dotted_module.split(".")[0]):
+        if _names_the_target(exc, dotted_module):
             raise
         pytest.skip(
             f"{dotted_module!r} raised on import, so nothing can be said about "

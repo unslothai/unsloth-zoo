@@ -56,6 +56,26 @@ def _unimportable(dotted_module: str, exc: BaseException) -> str:
     )
 
 
+def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
+    """Did the import fail because OUR target is gone, rather than a dependency?
+
+    ``exc.name`` is the deepest package that could not be found, which for a
+    removed model package is the PARENT, not the module we asked for: dropping
+    ``transformers/models/siglip/`` makes importing
+    ``transformers.models.siglip.modeling_siglip`` raise with
+    ``name == "transformers.models.siglip"``. Comparing only against the full
+    path and the top-level package therefore read a removed target as a broken
+    dependency and skipped, so the hard gate passed while the patch target had
+    disappeared. Any package prefix of the target counts.
+
+    The trailing dot is what keeps this a PACKAGE prefix: without it
+    ``transformers.models.siglip`` would also claim
+    ``transformers.models.siglipx.modeling_x``.
+    """
+    name = exc.name or ""
+    return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
+
+
 def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
     Used to skip 5.0+-gated tests on a 4.x install.
@@ -74,7 +94,7 @@ def _try_get_class(dotted_module: str, class_name: str):
     except ModuleNotFoundError as exc:
         # An absent target module IS drift, so callers still get None and judge.
         # One naming something else is a broken dependency: skip below.
-        if (exc.name or "") in (dotted_module, dotted_module.split(".")[0]):
+        if _names_the_target(exc, dotted_module):
             return None
         pytest.skip(_unimportable(dotted_module, exc))
     except Exception as exc:
