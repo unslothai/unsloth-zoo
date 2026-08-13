@@ -64,16 +64,34 @@ def test_the_pattern_is_recognized():
     assert _imports_through_the_tests_package("from a import tests") == []
 
 
-def test_no_test_file_imports_a_sibling_through_the_tests_package():
+def _scan_the_suite() -> dict:
+    """Every file under `tests/` that reaches a sibling through `tests.`.
+
+    This file is scanned too. Its own examples are string literals and parse to
+    no import node, so there is nothing to exempt - and exempting it would have
+    let the one module whose whole job is refusing this pattern be the one
+    module allowed to carry it.
+    """
     offenders = {}
     for path in sorted(TESTS.rglob("*.py")):
-        if path == pathlib.Path(__file__).resolve():
-            continue
         hits = _imports_through_the_tests_package(
             path.read_text(encoding = "utf-8", errors = "replace")
         )
         if hits:
             offenders[path.relative_to(TESTS).as_posix()] = hits
+    return offenders
+
+
+def test_the_guard_scans_itself():
+    """The examples above are literals, so scanning this file finds nothing."""
+    here = pathlib.Path(__file__).resolve()
+    assert _imports_through_the_tests_package(here.read_text(encoding = "utf-8")) == []
+    # And it really is in the walk, rather than passing by being skipped.
+    assert here in set(TESTS.rglob("*.py"))
+
+
+def test_no_test_file_imports_a_sibling_through_the_tests_package():
+    offenders = _scan_the_suite()
     assert not offenders, (
         "these reach a sibling through `tests.`, which binds to another "
         f"project's package under unsloth's CI: {offenders}. Import the module "
