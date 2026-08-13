@@ -1412,3 +1412,97 @@ def test_identical_cards_still_get_the_flat_average_share():
             f"{n} x 14.56 GiB moved: got {plan.activation_reserve_by_device}, "
             f"the flat-average formula gives {old}"
         )
+
+
+def _flat_average_ask(plan, pinned_bytes):
+    """What the pre-proration planner asked every device to keep."""
+    n = len(plan.raw_budgets)
+    total, headroom = plan.total_weight_bytes, plan.headroom_bytes
+    value = max(0, (sum(plan.raw_budgets.values()) - total - headroom) // n)
+    share = max(-(-total // n), pinned_bytes)
+    return {
+        d: int(max(0, min(
+            value,
+            budget - share - (headroom if d == plan.head_device else 0),
+        )))
+        for d, budget in plan.raw_budgets.items()
+    }
+
+
+def test_prorating_never_charges_the_head_card_more_than_the_flat_average():
+    """The head lands on the BIGGER card, which proration charges the most.
+
+    A symmetric proration is not a one-way improvement: it takes off the small
+    card exactly what it puts on the big one, and the big one is where the head
+    goes, so it is the only device also paying the logit headroom. Charged both,
+    its own cap goes where the small card's used to. 4 + 12 GiB carrying a
+    4-layer 8192-wide 128k-vocab model with 8 GiB of logit headroom: the flat
+    average leaves the head 1.297 GiB, the raw proportional share leaves it
+    exactly 0.000 and the first activation has nowhere to go. The 10 + 12 GiB
+    pair with 2 GiB of headroom is the same loss without the clamp, 7.297 GiB
+    down to 7.051. So the prorated share is only ever taken when it is the
+    SMALLER of the two, which makes the cap per device monotone against the old
+    planner -- no card can come out of proration with less than it had.
+    """
+    with torch.device("meta"):
+        model = _Wide(hidden = 8192, ffn = 8192, vocab = 128000, layers = 4)
+    pinned = model.lm_head.weight.numel() * model.lm_head.weight.element_size()
+
+    for small, big, hr in [(4, 12, 8), (10, 12, 2)]:
+        plan = plan_device_map(
+            model,
+            max_memory = {0: small * _GiB, 1: big * _GiB},
+            headroom_bytes = hr * _GiB,
+        )
+        assert plan is not None, f"{small} + {big} GiB was refused"
+
+        flat = _flat_average_ask(plan, pinned)
+        head = plan.head_device
+        assert plan.raw_budgets[head] > min(plan.raw_budgets.values()), (
+            f"{small} + {big} GiB: the head is not on the bigger card any more"
+        )
+        assert flat[head] > 0, "fixture no longer exercises the head's cap"
+
+        kept = plan.activation_reserve_by_device
+        assert kept[head] > 0, (
+            f"{small} + {big} GiB: the head card was given a zero activation "
+            f"reserve ({kept}); it is being charged its full proportional "
+            f"share AND the logit headroom"
+        )
+        assert kept[head] >= flat[head], (
+            f"{small} + {big} GiB: the head kept {kept[head]} where the "
+            f"flat-average planner kept {flat[head]}; proration must only "
+            f"loosen the cap, never tighten it"
+        )
+        # And the small card still gets the reserve this whole change is about.
+        assert all(v > 0 for v in kept.values()), kept
+
+
+def test_the_relaxation_ladder_still_offers_the_flat_average_rungs():
+    """A rung is 5% of the mapping it is scaled from, so the start matters.
+
+    Proration raises the non-head ask on unequal cards, and the ladder off that
+    higher start can step straight PAST a flat-average rung that fit. Byte
+    exact: units of 272 and 768 bytes and a 328-byte pinned head on budgets
+    1264 and 1354 with 3 bytes of headroom. Weights are 1368, so the flat
+    average asks 580 and 623 while proration asks 603 and 623. cuda:1 holds the
+    head and cannot also take the 768-byte unit, so cuda:0 must relax to 496 or
+    less: the flat ladder offers 580 * 17 // 20 = 493 and fits, the prorated one
+    offers 623 * 16 // 20 = 498 (too big) then 603 * 16 // 20 = 482 and gives 11
+    bytes away for nothing -- the placement is identical either way. Walking
+    both ladders keeps every rung the old planner had.
+    """
+    with torch.device("meta"):
+        model = _Bins([68, 192], head = 82)
+    plan = plan_device_map(
+        model,
+        max_memory = {0: 1264, 1: 1354},
+        headroom_bytes = 3,
+    )
+    assert plan is not None
+    assert plan.total_weight_bytes == 1368
+    assert plan.weight_bytes == {0: 768, 1: 600}
+    assert plan.activation_reserve_by_device == {0: 493, 1: 623}, (
+        f"the prorated ladder skipped the flat-average rung: "
+        f"{plan.activation_reserve_by_device}"
+    )
