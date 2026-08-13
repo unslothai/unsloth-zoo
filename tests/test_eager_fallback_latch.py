@@ -127,9 +127,14 @@ def test_an_unrelated_exception_still_propagates():
 
 
 def test_no_wrapper_at_all_when_torch_has_no_such_errors(monkeypatch):
-    """On a torch with neither exception there is nothing to catch, and the
-    compiled callable must be returned untouched rather than wrapped."""
+    """On a torch with none of these exceptions there is nothing to catch, and
+    the compiled callable must be returned untouched rather than wrapped.
+
+    `_backend_compile_errors` is stubbed too: the wrapper also catches Inductor
+    codegen failures now, so leaving that tuple populated gives it a real reason
+    to exist and the assertion below would be testing the wrong thing."""
     monkeypatch.setattr(U, "_recompile_limit_errors", lambda: ())
+    monkeypatch.setattr(U, "_backend_compile_errors", lambda: ())
     compiled, eager, _ = _pair()
     assert U._fall_back_to_eager_on_recompile_limit(
         compiled, eager, "M.f") is compiled
