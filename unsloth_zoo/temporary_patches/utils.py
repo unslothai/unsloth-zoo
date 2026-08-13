@@ -1079,14 +1079,27 @@ def _backend_compile_errors():
         InductorError: CantSplit: 202048*s47*s87 - 3434816*(((s47*s87 + 17)//18))
         not divisible by s47*s87 - 17*(((s47*s87 + 17)//18))
 
-    which is arithmetic that is true by inspection -- `202048*tail` over `tail`
-    is `202048` -- and which `statically_known_multiple_of` answers correctly on
-    2.9, 2.10 and 2.11. A version-specific simplifier gap in the backend should
-    cost speed, not end the run.
+    which is arithmetic that is true by inspection: `202048*tail` over `tail`
+    is `202048`. A backend that cannot see that should cost speed, not end the
+    run.
 
-    Looked up by name, like the recompile-limit and graph-break tuples above:
-    `InductorError` does not exist before 2.6 and the import must not be able to
-    stop the tuple from being built.
+    Deliberately NOT claiming which torch versions answer the underlying
+    divisibility question correctly. A standalone `statically_known_multiple_of`
+    probe does not reproduce the refusal: driving it with an unbacked symint
+    answers False on 2.6 through 2.10 and on 2.12, and True only on 2.11, which
+    tracks neither the versions nor the hardware where the compile actually
+    fails. What IS measured: the same expression compiles cleanly under torch
+    2.12.1 on CPU Inductor and on an sm_100 B200, and refuses on an sm_75 T4,
+    where the reduction has to be split in the first place. So the trigger is a
+    tiling decision, not a version constant, and this net is written to catch
+    the refusal wherever it appears rather than to encode a version range.
+
+    Looked up by name, like the recompile-limit and graph-break tuples above.
+    Measured across CPU builds 2.6.0, 2.7.1, 2.8.0, 2.10.0, 2.11.0, 2.12.1 and
+    2.9.1+cu128: `InductorError` is absent on 2.6 and present from 2.7, while
+    `BackendCompilerFailed` is present on all of them, so the tuple is non-empty
+    everywhere in the supported range and the import must not be able to stop it
+    from being built.
     """
     found = []
     try:
