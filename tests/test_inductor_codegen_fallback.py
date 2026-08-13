@@ -22,6 +22,7 @@ torch versions where the real expression compiles fine.
 from __future__ import annotations
 
 import pytest
+import torch
 
 from unsloth_zoo.temporary_patches import utils as patch_utils
 
@@ -933,3 +934,66 @@ def test_releasing_borrowed_budget_keeps_compiled_pack_history(monkeypatch):
     patch_utils.apply_pending_eager_fallbacks()
     assert "test-packed-earlier" not in patch_utils._COMPILED_OK_LABELS, \
         "the step boundary must still reset the history"
+
+def test_generation_does_not_pay_the_success_probe(monkeypatch):
+    """Inference mode saves nothing for backward, so there is nothing to ask.
+
+    This is the O(1) exit that keeps the frame walk off GRPO's generation pass
+    on a torch with no hook accessor, where the walk is the only signal.
+    Inference mode and NOT `is_grad_enabled()`: `autograd.Function.forward`
+    runs with grad off and Unsloth's gradient checkpointing IS one, so grad-off
+    is true in the exact place the record has to be made.
+    """
+    monkeypatch.setattr(patch_utils, "_saved_tensor_hook_accessor",
+                        lambda: None)
+    walks = {"n": 0}
+
+    def _counting_walk():
+        walks["n"] += 1
+        return False
+
+    monkeypatch.setattr(patch_utils, "_walk_for_checkpoint_frame",
+                        _counting_walk)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    monkeypatch.setattr(patch_utils, "_CHECKPOINT_PROBE_MISSES", 0)
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        lambda x: "compiled", lambda x: "eager", "test-generation-free",
+    )
+    with torch.inference_mode():
+        for _ in range(200):
+            assert wrapped(1) == "compiled"
+
+    assert walks["n"] == 0, (
+        f"generation walked the stack {walks['n']} times for an answer that "
+        f"cannot matter: inference mode packs nothing that is recomputed"
+    )
+    assert "test-generation-free" not in patch_utils._COMPILED_OK_LABELS
+
+
+def test_a_recorded_label_is_not_probed_again(monkeypatch):
+    """The record is idempotent, so the second probe cannot change anything.
+
+    With the marker branch, this is what bounds the success-path cost: a label
+    is probed until its answer is known, not once per call forever.
+    """
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    probes = {"n": 0}
+
+    def _counting_probe(*_, **__):
+        probes["n"] += 1
+        return None                      # unknown: records without latching
+
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        _counting_probe)
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        lambda x: "compiled", lambda x: "eager", "test-probe-once",
+    )
+    for _ in range(50):
+        assert wrapped(1) == "compiled"
+
+    assert "test-probe-once" in patch_utils._COMPILED_OK_LABELS
+    assert probes["n"] == 1, (
+        f"an already-recorded label was probed {probes['n']} times"
+    )

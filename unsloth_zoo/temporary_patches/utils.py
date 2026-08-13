@@ -1800,6 +1800,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # on the call that actually packs. The marker was the only thing
             # worth reading here and it is already known False above.
             return
+        if torch.is_inference_mode_enabled():
+            # Inference mode saves nothing for backward, so this call cannot
+            # have packed anything that is ever recomputed and the answer is
+            # known without asking. Inference mode, NOT `is_grad_enabled()`:
+            # `autograd.Function.forward` runs with grad off and Unsloth's
+            # gradient checkpointing IS one, so grad-off is true in the exact
+            # place the record has to be made -- the same trap
+            # `_note_packed_under_checkpoint` documents.
+            return
         if label in _COMPILED_OK_LABELS:
             # Already recorded this step, so the probe cannot change anything.
             # Together with the marker branch above this is what bounds the
@@ -2105,6 +2114,11 @@ def apply_pending_eager_fallbacks() -> int:
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
     _RECENT_EAGER_LABELS.clear()
+    # A genuine settlement: everything is eager now, so the step is being
+    # abandoned and the compiled-pack history answers for nobody.
+    # `_restore_recompile_limits` deliberately does NOT do this, because it also
+    # runs mid-step when a borrower hands its bump back.
+    _COMPILED_OK_LABELS.clear()
     # Everything that borrowed headroom is eager now, so hand the budget back
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()
