@@ -78,15 +78,32 @@ def _try_load_fetch_shim():
     """Locate ``_postmerge_audit/tests/version_compat/_fetch.py`` and
     return its (fetch_text, has_def) helpers. Returns ``None`` if the
     shim isn't present on this machine; the parametrized fetch-based
-    tests then ``pytest.skip`` instead of crashing on import."""
+    tests then ``pytest.skip`` instead of crashing on import.
+
+    Two things this has to survive, both learned by watching it not:
+
+    * The shim is optional and lives OUTSIDE the repo, so the only
+      admissible location is one derived from this file. An absolute path
+      naming a particular machine's home used to sit at the top of this
+      list; it made collection of the whole suite depend on a directory
+      that exists on exactly one box.
+    * ``is_file()`` raises rather than returning False when a parent
+      directory denies traversal. That turned "shim not available, skip"
+      into ``PermissionError`` during collection, which pytest reports as
+      an error for the entire session -- 10 skipped, 1 error, no tests run.
+      Hence ``OSError`` is swallowed per candidate.
+    """
     candidates = [
-        # Sister workspace layout the parent agent uses
-        Path("/mnt/disks/unslothai/ubuntu/workspace_6/_postmerge_audit/tests/version_compat/_fetch.py"),
-        # Generic relative layout (zoo_clone/.. sibling)
+        # zoo_clone/.. sibling. Derived from this file, so it cannot depend
+        # on where the checkout happens to live.
         Path(__file__).resolve().parents[2] / "_postmerge_audit/tests/version_compat/_fetch.py",
     ]
     for path in candidates:
-        if path.is_file():
+        try:
+            reachable = path.is_file()
+        except OSError:
+            continue
+        if reachable:
             spec_dir = str(path.parent)
             if spec_dir not in sys.path:
                 sys.path.insert(0, spec_dir)
