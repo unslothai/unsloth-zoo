@@ -48,19 +48,15 @@ def _skip_if_transformers_5x(reason: str) -> None:
 def _import_or_skip(dotted_module: str, *names):
     """Import ``names`` from ``dotted_module``, or skip with the real reason.
 
-    A bare ``from transformers.models.X.modeling_X import Y`` inside a test
-    turns any failure on the way in into a test failure, and this file's whole
-    purpose is to report UPSTREAM SIGNATURE DRIFT. Those are not the same
-    finding. gemma3n showed the difference: its config module does
-    ``from timm.data import ImageNetInfo``, a newer timm no longer exports that,
-    and four signature tests failed here for a reason that has nothing to do
-    with the signatures they check or with the transformers version installed.
+    A bare inline import turns any failure on the way in into a signature-drift
+    failure, and those are different findings. gemma3n showed it: its config
+    does ``from timm.data import ImageNetInfo``, which a newer timm dropped, and
+    four signature tests failed here for a reason unrelated to the signatures
+    they check or to the transformers version installed. A module that has
+    genuinely gone away still raises, since that IS drift; only a module that
+    exists and raises is skipped.
 
-    A module that has genuinely gone away is still allowed through as an error,
-    since that IS drift; only a module that exists and raises is skipped.
-
-    Any other direct import in this file has the same latent shape and can be
-    routed through here when it bites.
+    Other direct imports in this file have the same shape and can move here.
     """
     try:
         mod = importlib.import_module(dotted_module)
@@ -78,7 +74,6 @@ def _import_or_skip(dotted_module: str, *names):
         )
     got = tuple(getattr(mod, name) for name in names)
     return got[0] if len(got) == 1 else got
-
 
 
 def _param_names(func) -> list[str]:

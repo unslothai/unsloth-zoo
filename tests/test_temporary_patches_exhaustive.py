@@ -60,34 +60,20 @@ def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
     Used to skip 5.0+-gated tests on a 4.x install.
 
-    ``None`` now means one thing only: the module imported and the attribute is
-    not on it. That is the real drift signal, and it is the one 15 of the 23
-    callers below turn into a DRIFT failure.
-
-    A module that RAISES on import is a different question. The signal is not
-    lost: a ``ModuleNotFoundError`` naming the module we asked for still answers
-    ``None``, because an upstream module that has genuinely gone away is drift.
-    What is now separated out is a module that exists but blows up on the way
-    in, which says nothing about upstream at all. Swallowing every exception
-    made the two indistinguishable, and the resulting message
-
-        DRIFT DETECTED: gemma3n.py:53 helper expects Gemma3nRMSNorm but it is
-        missing on transformers 4.57.6
-
-    named the wrong component: transformers 4.57.6 does ship that class. What
-    actually happened was that ``configuration_gemma3n`` imports
-    ``ImageNetInfo`` from ``timm.data``, which a newer timm no longer exports,
-    so the whole module raised ImportError and every gemma3n class looked
-    deleted. Eight tests reported upstream drift for a broken sibling package.
+    ``None`` means drift, and 15 of the 23 callers below fail on it: either the
+    module imported without the attribute, or a ``ModuleNotFoundError`` named
+    the module we asked for. A module that exists but RAISES on the way in says
+    nothing about upstream, so it skips instead. Swallowing every exception
+    conflated the two and reported "Gemma3nRMSNorm missing on transformers
+    4.57.6" for a class transformers 4.57.6 ships: configuration_gemma3n imports
+    ImageNetInfo from timm.data, which a newer timm dropped, so every gemma3n
+    class looked deleted and eight tests blamed transformers.
     """
     try:
         mod = importlib.import_module(dotted_module)
     except ModuleNotFoundError as exc:
-        # The target module itself is absent. That IS drift (or a version gate),
-        # and it is what the callers were always judging, so it still answers
-        # None and they still decide. Only a miss on the module we asked for
-        # counts: a ModuleNotFoundError naming something else is a broken
-        # dependency, and falls through to the skip below.
+        # An absent target module IS drift, so callers still get None and judge.
+        # One naming something else is a broken dependency: skip below.
         if (exc.name or "") in (dotted_module, dotted_module.split(".")[0]):
             return None
         pytest.skip(_unimportable(dotted_module, exc))
@@ -2533,19 +2519,13 @@ def test_temporary_patches_directory_has_expected_files():
 
 
 def test_a_broken_dependency_is_not_reported_as_upstream_drift():
-    """The two ways an import can fail are not the same finding.
-
-    A module that has gone away upstream is drift and must still reach the
-    caller as None so it can fail. A module that exists but raises on the way
-    in says nothing about upstream: gemma3n did exactly this, where
-    configuration_gemma3n imports ImageNetInfo from timm.data and a newer timm
-    no longer exports it, so eight tests announced
-
-        DRIFT DETECTED: ... missing on transformers 4.57.6
-
-    about classes transformers 4.57.6 ships perfectly well.
+    """A module gone upstream is drift and must still reach the caller as None;
+    a module that raises on its own dependency is not. gemma3n conflated them:
+    configuration_gemma3n imports ImageNetInfo from timm.data, which a newer
+    timm dropped, so eight tests announced "missing on transformers 4.57.6"
+    about classes transformers 4.57.6 ships.
     """
-    # Genuinely absent module: still None, so the callers still judge it.
+    # Absent module: still None, so the callers still judge it.
     assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
 
     # Present but raising, on a dependency of its own: skipped, not blamed.
@@ -2565,8 +2545,8 @@ def test_a_broken_dependency_is_not_reported_as_upstream_drift():
 
     importlib.import_module = fake_import
     try:
-        # Skipped derives from BaseException, so `pytest.raises(Exception)`
-        # would let it through and silently skip THIS test instead.
+        # Skipped derives from BaseException: pytest.raises(Exception) would
+        # let it through and silently skip THIS test.
         with pytest.raises(_pytest_outcomes.Skipped) as caught:
             _try_get_class(module_name, "Anything")
         assert "nothing can be said about upstream drift" in str(caught.value)

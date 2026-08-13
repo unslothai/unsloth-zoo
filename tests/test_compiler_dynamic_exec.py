@@ -115,11 +115,9 @@ def _load_modeling(model_type: str):
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present, but raising on the way in. gemma3n's config does
-        # `from timm.data import ImageNetInfo`, which a newer timm no longer
-        # exports, so the module blows up for a reason that has nothing to do
-        # with whether the rewriter emits parseable Python. Same outcome as an
-        # absent model_type -- there is nothing to drive -- but say which.
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
@@ -558,11 +556,9 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present, but raising on the way in. gemma3n's config does
-        # `from timm.data import ImageNetInfo`, which a newer timm no longer
-        # exports, so the module blows up for a reason that has nothing to do
-        # with whether the rewriter emits parseable Python. Same outcome as an
-        # absent model_type -- there is nothing to drive -- but say which.
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
