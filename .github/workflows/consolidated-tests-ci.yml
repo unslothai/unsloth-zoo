@@ -157,6 +157,11 @@ jobs:
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_inductor_codegen_fallback.py \
+            tests/test_eager_fallback_latch.py \
+            tests/test_recompile_limit_fallback.py \
+            tests/test_checkpoint_compile_mix.py \
+            tests/test_disabled_hook_graph_break.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

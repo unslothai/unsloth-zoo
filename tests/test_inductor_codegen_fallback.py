@@ -38,26 +38,74 @@ def _clear_latches():
     patch_utils._COMPILED_OK_LABELS.clear()
 
 
+def _inductor_backend_fn(gm, example_inputs):
+    """Stands in for the backend object torch hands `BackendCompilerFailed`.
+
+    `BackendCompilerFailed.__init__` stores `getattr(backend_fn, "__name__",
+    "?")` as `backend_name`, and torch passes `OutputGraph.compiler_fn`, whose
+    `__name__` is `inductor`. Verified by execution on torch 2.9.1: making
+    `torch._inductor.compile_fx.compile_fx` raise a bare `RuntimeError` under
+    `torch.compile(backend = "inductor")` produces a `BackendCompilerFailed`
+    with `backend_name == "inductor"`.
+    """
+    return gm
+_inductor_backend_fn.__name__ = "inductor"
+
+
 def _inductor_error(message = "CantSplit: 202048*s47*s87 not divisible by s47*s87"):
-    """Build whichever backend exception this torch has.
+    """Build whichever backend exception this torch has, WITH an Inductor identity.
 
     The constructors disagree across versions: 2.12's `InductorError` takes
     `(inner_exception, first_useful_frame)`, `BackendCompilerFailed` takes
-    `(backend_fn, exc)`, and older builds accept a bare message. Try the
-    shapes rather than pinning one, so the test tracks the tuple the wrapper
-    actually catches instead of a single release's signature.
+    `(backend_fn, inner_exception)` up to 2.8 and `(backend_fn,
+    inner_exception, first_useful_frame)` from 2.9. Try the shapes rather than
+    pinning one, so the test tracks the tuple the wrapper actually catches
+    instead of a single release's signature.
+
+    Every candidate has to carry an Inductor identity, and the result is
+    checked for one. On torch 2.6 `InductorError` does not exist, so
+    `_backend_compile_errors()[0]` is `BackendCompilerFailed` and the old
+    `(inner, None)` shape fitted its two-argument signature -- producing an
+    exception whose backend was the RuntimeError (`backend_name == "?"`) and
+    whose `inner_exception` was `None`. `_is_inductor_codegen_failure` rightly
+    rejects that, so every fallback test below asserted the OPPOSITE of the
+    behaviour it was written for on exactly the version where the wrapped form
+    is the only form.
     """
     errors = patch_utils._backend_compile_errors()
     if not errors:
         pytest.skip("this torch exposes no backend compile exception")
     cls = errors[0]
     inner = RuntimeError(message)
-    for args in ((inner, None), (inner, inner), (message,), (inner,)):
+    for args in (
+        (inner, None),                              # InductorError, 2.7+
+        (_inductor_backend_fn, inner, None),        # BackendCompilerFailed, 2.9+
+        (_inductor_backend_fn, inner),              # BackendCompilerFailed, <= 2.8
+    ):
         try:
-            return cls(*args)
+            built = cls(*args)
         except TypeError:
             continue
-    pytest.skip(f"cannot construct {cls.__name__} on this torch")
+        if patch_utils._is_inductor_codegen_failure(built):
+            return built
+    pytest.skip(f"cannot construct an Inductor-identified {cls.__name__}")
+
+
+class _Torch26BackendCompilerFailed(RuntimeError):
+    """torch 2.6's `BackendCompilerFailed`, reproduced attribute for attribute.
+
+    2.6 is in the supported range and is the version with no `InductorError`,
+    so the wrapped form is the ONLY form the fallback can see there. Standing
+    it in is the only way to exercise that path from a newer torch, and it is a
+    faithful copy of the 2.6.0 source rather than an approximation.
+    """
+    def __init__(self, backend_fn, inner_exception):
+        self.backend_name = getattr(backend_fn, "__name__", "?")
+        self.inner_exception = inner_exception
+        super().__init__(
+            f"backend={self.backend_name!r} raised:\n"
+            f"{type(inner_exception).__name__}: {inner_exception}"
+        )
 
 
 def test_the_backend_error_tuple_is_not_empty_on_this_torch():
@@ -194,7 +242,14 @@ def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
 
     Here the pack was compiled and the recompute would be eager, which either
     aborts the backward or returns wrong gradients, so the step must end.
+
+    The successful call has to happen INSIDE the checkpoint, which is what
+    makes it a compiled pack. Entering the region only for the refusal, as this
+    test used to, describes a different situation entirely -- a compiled call
+    somewhere else in the step -- and that one is safe to fall back from.
     """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
     def compiled(x):
@@ -209,8 +264,6 @@ def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
 
     assert wrapped(1) == "compiled"
 
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
-    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     errors = patch_utils._backend_compile_errors()
     with pytest.raises(errors):
         wrapped(2)
@@ -271,7 +324,7 @@ def test_a_refusal_in_a_later_step_falls_back(monkeypatch):
     assert wrapped(2) == "eager", "a new step re-raised on its first refusal"
 
 
-def test_a_successful_budget_retry_is_recorded_as_compiled():
+def test_a_successful_budget_retry_is_recorded_as_compiled(monkeypatch):
     """A retry that compiles has packed compiled activations, so record it.
 
     The retry returns from the exception branch and never reaches the `else:`
@@ -284,7 +337,13 @@ def test_a_successful_budget_retry_is_recorded_as_compiled():
     The record still has to be right -- it is the process-wide answer to "did
     this label pack something compiled in this step" -- but the pack/recompute
     divergence this guards against is not reachable through this path today.
+
+    Under a checkpoint, because that is the only place a compiled return packs
+    something that will be recomputed, and therefore the only place the record
+    means anything.
     """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
     def compiled(x):
@@ -413,3 +472,286 @@ def test_restoring_the_marker_cannot_erase_an_earlier_compiled_pack(monkeypatch)
     assert patch_utils._PACKED_COMPILED_IN_CHECKPOINT is True, (
         "the restore erased an earlier region's compiled pack"
     )
+
+
+# ---- what the second review round found ------------------------------------
+#
+# Five more, all of them the same shape as the first four: a path where the
+# wrapper either re-raises where the fallback was safe, or never sees the
+# refusal at all.
+
+
+def test_the_wrapped_form_is_recognised_by_its_recorded_backend_name():
+    """`BackendCompilerFailed` records `backend_name`; nothing records `backend`.
+
+    This is the shape torch actually produces when Inductor raises something
+    that is not an `InductorError` -- confirmed on 2.9.1 by making `compile_fx`
+    raise a bare `RuntimeError`: `backend_name == "inductor"`, no `backend`
+    attribute, and `inner_exception` a `builtins.RuntimeError` whose module
+    tells the caller nothing. Reading the attribute that never exists made this
+    branch dead code, so the wrapped form `_backend_compile_errors()` goes out
+    of its way to catch was re-raised anyway.
+    """
+    built = _Torch26BackendCompilerFailed(
+        _inductor_backend_fn, RuntimeError("CantSplit: not divisible"))
+    assert built.backend_name == "inductor"
+    assert not hasattr(built, "backend"), "no torch has ever set `backend`"
+    assert patch_utils._is_inductor_codegen_failure(built), (
+        "an Inductor refusal recorded under `backend_name` was not recognised"
+    )
+
+
+def test_a_non_inductor_backend_name_is_still_rejected():
+    """The `backend_name` read must not widen the net to every backend."""
+    def my_backend(gm, example_inputs): return gm
+    built = _Torch26BackendCompilerFailed(
+        my_backend, ValueError("my custom backend is misconfigured"))
+    assert built.backend_name == "my_backend"
+    assert not patch_utils._is_inductor_codegen_failure(built)
+
+
+def test_a_torch_2_6_shaped_refusal_falls_back_to_eager(monkeypatch):
+    """2.6 has no `InductorError`, so the wrapped form is the only form.
+
+    Stand in the 2.6 exception and drive the real wrapper with it: without the
+    `backend_name` read this re-raises, which on 2.6 means the fallback does
+    not exist at all.
+    """
+    monkeypatch.setattr(
+        patch_utils, "_backend_compile_errors",
+        lambda: (_Torch26BackendCompilerFailed,),
+    )
+
+    def compiled(x):
+        raise _Torch26BackendCompilerFailed(
+            _inductor_backend_fn, RuntimeError("CantSplit: not divisible"))
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-torch26-shape",
+    )
+    assert wrapped(1) == "eager"
+
+
+def test_a_refusal_from_the_budget_retry_falls_back(monkeypatch):
+    """Cache exhaustion first, then Inductor refuses once the budget is bumped.
+
+    `_retry_with_more_budget` calls `compiled_func` inside its own `try`, and
+    its `except BaseException` re-raises. Python does not route that to the
+    wrapper's sibling `except backend_errors`, so the refusal escaped and ended
+    the run -- the exact outcome the fallback exists to prevent, reached by the
+    one path where the compiler had to be given more budget before it got as
+    far as refusing.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _recompile_limit_error()
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-retry-refusal",
+    )
+    if not patch_utils._recompile_limit_errors():
+        pytest.skip("this torch exposes no recompile-limit exception")
+    assert wrapped(1) == "eager", (
+        "a codegen refusal raised by the budget retry escaped the wrapper"
+    )
+    assert "test-retry-refusal" in patch_utils._LATCHED_EAGER_LABELS
+
+
+def test_a_refusal_from_the_budget_retry_is_not_recorded_as_compiled(monkeypatch):
+    """It ran EAGER, so it must not count as a compiled pack.
+
+    Guards the sentinel: returning the eager value down the ordinary
+    retry-succeeded path would record this label as having packed something
+    compiled, which is the lie that ends a later step for no reason -- or, in a
+    checkpoint, the one that recomputes in the wrong mode.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _recompile_limit_error()
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-retry-refusal-record",
+    )
+    if not patch_utils._recompile_limit_errors():
+        pytest.skip("this torch exposes no recompile-limit exception")
+    assert wrapped(1) == "eager"
+    assert "test-retry-refusal-record" not in patch_utils._COMPILED_OK_LABELS
+
+
+def test_a_legacy_budget_retry_is_recorded_as_compiled(monkeypatch):
+    """torch 2.4 reaches the retry through the graph-break arm, not the typed one.
+
+    Cache exhaustion has no exception class there, so it arrives as
+    `Unsupported` and is matched by message. That arm returned the retry's
+    result without recording it, so 2.4 took the opposite decision from 2.7+
+    when a backend refusal followed in the same step.
+    """
+    graph_break_errors = patch_utils._disabled_hook_graph_break_error()
+    if not graph_break_errors:
+        pytest.skip("this torch exposes no graph-break exception")
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            try:
+                raise graph_break_errors[0]("recompile_limit reached")
+            except TypeError:
+                raise graph_break_errors[0]()
+        return "retried"
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-legacy-retry",
+    )
+    if wrapped(1) != "retried":
+        pytest.skip("this torch does not take the legacy budget-retry path")
+    assert "test-legacy-retry" in patch_utils._COMPILED_OK_LABELS, (
+        "a legacy retry that compiled and returned was not recorded as compiled"
+    )
+
+
+def test_a_compiled_call_outside_a_checkpoint_is_not_a_compiled_pack(monkeypatch):
+    """GRPO generates with the same patched kernels it then trains with.
+
+    A compiled call made outside a non-reentrant checkpoint packs nothing that
+    is ever recomputed, so it cannot desynchronise a pack from a recompute and
+    must not stop the fallback. Recording every compiled return made the first
+    refusal of the training pass end the step because the generation pass had
+    succeeded earlier in the same step.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-uncheckpointed-success",
+    )
+    assert wrapped(1) == "compiled"           # generation: no region open
+    assert "test-uncheckpointed-success" not in patch_utils._COMPILED_OK_LABELS
+
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    assert wrapped(2) == "eager", (
+        "a compiled call made outside any checkpoint blocked the fallback"
+    )
+
+
+def test_an_unknown_checkpoint_answer_still_counts_as_packed(monkeypatch):
+    """`None` is "torch cannot say", and that has to count as yes.
+
+    Before 2.8 there is no hook accessor, and a user's own
+    `saved_tensors_hooks` can sit above ours on any version. Over-recording
+    ends a step that `force_eager_fallback` retries; under-recording recomputes
+    a compiled pack eagerly and hands back wrong gradients, so the unknown
+    answer must take the expensive side.
+
+    Only the RECORD is asserted here, which is what `_note_compiled_ok` owns.
+    Whether `_give_up_on_backend` then raises is a separate decision, and on an
+    unknown answer it leans on the marker -- so the marker is set for the
+    refusal, matching a step where some region is known to have packed.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: None)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-unknown-checkpoint",
+    )
+    assert wrapped(1) == "compiled"
+    assert "test-unknown-checkpoint" in patch_utils._COMPILED_OK_LABELS, (
+        "an unknown checkpoint answer was read as 'no region', which is the "
+        "direction that recomputes a compiled pack eagerly"
+    )
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    errors = patch_utils._backend_compile_errors()
+    with pytest.raises(errors):
+        wrapped(2)
+
+
+def test_a_backend_refusal_is_evidence_for_force_eager_fallback(monkeypatch):
+    """The transition has to be recorded where `force_eager_fallback` reads it.
+
+    It deliberately does not read `_LATCHED_EAGER_LABELS` -- that set is
+    permanent, so a discarded model's labels would answer for this one -- and
+    otherwise asks the LIVE wrappers. GRPO's `accumulate_chunk` is built inside
+    the forward and collected before the backward that calls this, so with only
+    the permanent latch recorded the call returns 0, the caller reads that as
+    "no compile-mode flip happened" and re-raises the failure it was asked to
+    retry past. Every other give-up path already writes `_RECENT_EAGER_LABELS`.
+    """
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+    monkeypatch.setattr(patch_utils, "_RECENT_EAGER_LABELS", set())
+    monkeypatch.setattr(patch_utils, "_EAGER_FALLBACK_WRAPPERS", [])
+
+    def _transient():
+        """Built inside the forward and dropped before backward, like GRPO's."""
+        calls = {"n": 0}
+        def compiled(x):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "compiled"
+            raise _inductor_error()
+        w = patch_utils._fall_back_to_eager_on_recompile_limit(
+            compiled, lambda x: "eager", "test-transient-evidence",
+        )
+        assert w(1) == "compiled"
+        with pytest.raises(patch_utils._backend_compile_errors()):
+            w(2)
+
+    _transient()
+    import gc; gc.collect()
+
+    assert "test-transient-evidence" in patch_utils._RECENT_EAGER_LABELS
+    assert patch_utils.force_eager_fallback() > 0, (
+        "the backend fallback left no evidence, so the caller would re-raise"
+    )
+
+
+def test_the_error_builder_produces_an_inductor_identity_on_a_2_6_shaped_torch(
+        monkeypatch):
+    """The builder must not hand the tests an unrecognisable exception.
+
+    On a torch with no `InductorError`, `_backend_compile_errors()[0]` is
+    `BackendCompilerFailed`, whose two-argument signature happily accepts
+    `(inner, None)` -- producing `backend_name == "?"` and
+    `inner_exception is None`. Every fallback test above then drove the wrapper
+    with something `_is_inductor_codegen_failure` correctly rejects, so on 2.6
+    they asserted eager fallback against an exception that re-raises by design.
+    """
+    monkeypatch.setattr(
+        patch_utils, "_backend_compile_errors",
+        lambda: (_Torch26BackendCompilerFailed,),
+    )
+    built = _inductor_error()
+    assert isinstance(built, _Torch26BackendCompilerFailed)
+    assert built.backend_name == "inductor", (
+        f"the builder produced backend_name={built.backend_name!r}"
+    )
+    assert isinstance(built.inner_exception, RuntimeError)
+    assert patch_utils._is_inductor_codegen_failure(built)
