@@ -990,8 +990,43 @@ def patch_Gemma4TextMLP():
         # Zero overflows so the residual identity path survives.
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
+        # NOT torch.compiled, deliberately: `fullgraph=None` skips the compile branch in
+        # `patch_function` (which only compiles when `fullgraph` is a bool).
+        #
+        # torch.compile and non-reentrant gradient checkpointing cannot agree on this
+        # function. Dynamo does not run inside backward, so the ORIGINAL forward executes
+        # the compiled graph -- where gate_proj / up_proj / down_proj are inlined and never
+        # enter `nn.Module.__call__` -- while the RECOMPUTE executes eager, calling those
+        # submodules normally. The two passes therefore save different tensors, and
+        # `torch.utils.checkpoint`, which matches saved tensors POSITIONALLY, raises:
+        #
+        #   CheckpointError: Recomputed values for the following tensors have different
+        #   metadata than during the forward pass
+        #
+        # Measured 2026-08-12 on google/gemma-4-E2B-it, RTX A4500 (sm_86), load_in_4bit,
+        # non-reentrant checkpointing, unsloth 2026.6.9 AND 2026.8.15:
+        #
+        #   * exactly 1 of 35 checkpointed segments diverges, and it is `layers.0.mlp`
+        #   * both passes save 76 tensors; index 50 disagrees
+        #   * instrumenting torch's saved-tensor hooks with an `nn.Module` stack shows the
+        #     forward saving with only `layers.0.mlp:Gemma4TextMLP` on the stack and the
+        #     recompute saving inside `layers.0.mlp.gate_proj` -- i.e. inlined vs eager
+        #   * forward saves ACTIVATIONS (393,6144)/(393,32); recompute saves WEIGHTS
+        #     (6144,32)/(32,1536), the signature of a different save set, not bad values
+        #   * UNSLOTH_COMPILE_DISABLE=1 fixes it, which is what identified this call site
+        #
+        # Ruled out first, so nobody re-runs them: `use_cache` (already False), toggling
+        # `use_reentrant` either way, `enable_input_require_grads()`, the `gate.dtype`
+        # branch above (all 35 MLPs agree on it across both passes), and upgrading unsloth.
+        #
+        # Scoped to this one function rather than the whole process on purpose:
+        # UNSLOTH_COMPILE_DISABLE=1 also un-compiles every other model, and Qwen 3 / 3.5
+        # check-point correctly while compiled.
+        #
+        # The fp16 overflow clamp this patch exists for is unaffected -- it is pure eager
+        # tensor work and does not need Dynamo.
         patch_function(
-            Gemma4TextMLP, "forward", forward, fullgraph=False,
+            Gemma4TextMLP, "forward", forward, fullgraph=None,
         )
     except Exception as e:
         return raise_error("Gemma4TextMLP.forward", e)
