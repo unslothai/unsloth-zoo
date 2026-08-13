@@ -4639,13 +4639,13 @@ class MLXTrainer:
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
                 _disable_fused_mrope(model)
-                from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
+                from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
                 patch_gated_delta()
                 patch_gated_delta_vlm()
                 gated_delta_patched = True
             # Structural check: qwen3_next / kimi_linear also need the VJP.
             if not gated_delta_patched and model_has_gated_delta_layers(model):
-                from ..gated_delta_vjp import patch_gated_delta
+                from unsloth_zoo.gated_delta_vjp import patch_gated_delta
                 patch_gated_delta()
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
@@ -8439,7 +8439,7 @@ def train_on_responses_only(
     Returns:
         The trainer (for chaining), or the closure if return_function=True.
     """
-    from ..dataset_utils import (
+    from unsloth_zoo.dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
 

@@ -58,8 +58,8 @@ from typing import NamedTuple
 from packaging.version import Version as _Version
 
 
-from .cce import _get_runtime_cce
-from .cce.runtime_cce import _normalize_label_smoothing
+from unsloth_zoo.mlx.cce import _get_runtime_cce
+from unsloth_zoo.mlx.cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -1574,7 +1574,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
 # so the two backends cannot drift apart.
-from ..vlm_tokens import VLM_PLACEHOLDER_TOKENS
+from unsloth_zoo.vlm_tokens import VLM_PLACEHOLDER_TOKENS
 _IMAGE_TOKEN_STRINGS = tuple(VLM_PLACEHOLDER_TOKENS)
 
 
@@ -5566,7 +5566,7 @@ def _extract_vlm_images(
 
     if not images and isinstance(messages, list):
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             extracted = process_vision_info(messages, return_video_kwargs=True)
             if isinstance(extracted, tuple) and extracted:
@@ -5596,7 +5596,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
 
     if isinstance(item, dict) and "images" in item:
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             raw_images = item["images"]
             vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
@@ -14518,7 +14518,7 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         # Reuse the same guards the generic installer uses so a user-pointed
         # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
         # never wiped out from under the caller.
-        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        from unsloth_zoo.llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
         is_prebuilt_install = os.path.isfile(
             os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
         )
@@ -14632,7 +14632,7 @@ def save_pretrained_gguf(
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
     """
-    from ..llama_cpp import (
+    from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
         check_llama_cpp,
