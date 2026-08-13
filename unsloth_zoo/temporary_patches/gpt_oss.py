@@ -1391,9 +1391,11 @@ from unsloth_zoo.device_type import DEVICE_TYPE
 # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
 # with is_available() like device_synchronize() does.
 if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+    # Only total capacity is needed. mem_get_info() can create a device context at
+    # import time, leaving otherwise idle processes with persistent device memory.
+    device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+    device_memory = torch.cuda.get_device_properties(0).total_memory
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
