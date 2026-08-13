@@ -114,6 +114,14 @@ def _load_modeling(model_type: str):
             f"model_type {model_type} not present on installed "
             f"transformers, can't drive compiler"
         )
+    except ImportError as exc:
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
+        pytest.skip(
+            f"model_type {model_type} raised on import, so the compiler cannot "
+            f"be driven for it: {type(exc).__name__}: {exc}"
+        )
 
 
 def _assert_parseable(rewritten: str, entry_point: str, *, dedent: bool = False):
@@ -546,6 +554,14 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
         pytest.skip(
             f"model_type {model_type} not present on installed "
             f"transformers, can't drive compiler"
+        )
+    except ImportError as exc:
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
+        pytest.skip(
+            f"model_type {model_type} raised on import, so the compiler cannot "
+            f"be driven for it: {type(exc).__name__}: {exc}"
         )
     if hasattr(mod, "__UNSLOTH_PATCHED__"):
         try:
