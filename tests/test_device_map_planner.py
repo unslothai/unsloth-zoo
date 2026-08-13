@@ -1304,3 +1304,111 @@ def test_the_head_relaxation_ladder_also_keeps_the_old_shared_floor():
     assert min(kept.values()) >= 50, (
         f"the last-resort ladder landed below the old shared cap of 50: {kept}"
     )
+
+
+def _held_bytes(model, plan):
+    """Weights each device really holds, walked from the map, not the plan."""
+    per = {d: 0 for d in plan.raw_budgets}
+    for name, device in plan.device_map.items():
+        module = model.get_submodule(name) if name else model
+        per[device] += sum(
+            p.numel() * p.element_size() for p in module.parameters(recurse = True)
+        )
+    return per
+
+
+def test_the_smaller_card_of_an_asymmetric_pair_is_not_packed_to_zero():
+    """Unequal cards were charged the FLAT AVERAGE weight, which no card holds.
+
+    The balanced cap read `raw_budgets[d] - share` with `share` the average
+    weight per device. The packing is capacity-proportional, so on a 16 + 80
+    GiB pair holding a 47 GiB model the average is larger than the whole 16 GiB
+    card: its cap went negative, `max(0, ...)` zeroed its reserve, and the walk
+    then filled it to 0.09 GiB free (99.4% full) while the 80 GiB card kept
+    16.41 GiB. The 24 + 48 pair did the same at 99.6% full. A card that does
+    not pay the headroom must keep a reserve sized to the weight IT holds.
+    """
+    with torch.device("meta"):
+        model = _Wide(hidden = 8192, ffn = 8192, vocab = 128000, layers = 110)
+
+    for small, big in [(16, 80), (24, 48), (40, 80)]:
+        max_memory = {0: small * _GiB, 1: big * _GiB}
+        plan = plan_device_map(model, max_memory = max_memory)
+        assert plan is not None, f"{small}+{big} GiB was refused"
+
+        kept = plan.activation_reserve_by_device
+        assert kept[0] > 0, (
+            f"{small}+{big} GiB: the smaller card was given a zero activation "
+            f"reserve ({kept}); it is being charged the flat average weight again"
+        )
+
+        # Reserving the small card's WHOLE budget would satisfy the line above
+        # by leaving it empty, which is not a two-GPU plan.
+        assert plan.weight_bytes[0] > 0, (
+            f"{small}+{big} GiB: the smaller card was left holding nothing "
+            f"({plan.weight_bytes})"
+        )
+
+        # The reported free space is the truth of the packing, not the ask.
+        held = _held_bytes(model, plan)
+        assert held == plan.weight_bytes, f"{small}+{big} GiB: {held} vs {plan.weight_bytes}"
+        free = plan.free_bytes
+        assert free[0] >= kept[0], (
+            f"{small}+{big} GiB: kept {kept[0]} but only {free[0]} is free"
+        )
+
+        # And it is not packed disproportionately tighter than the big card.
+        small_frac = free[0] / max_memory[0]
+        big_frac = free[1] / max_memory[1]
+        assert small_frac >= big_frac / 2, (
+            f"{small}+{big} GiB: the small card has {100 * small_frac:.1f}% free "
+            f"against {100 * big_frac:.1f}% on the big one; free {free}"
+        )
+
+
+def test_identical_cards_still_get_the_flat_average_share():
+    """Kaggle's 2 x T4 pair, and 3 and 4 of them, byte for byte.
+
+    Prorating the weight share by capacity has to be an exact no-op when the
+    capacities are equal, otherwise the measured Muse Glimmer arithmetic
+    (2 x 14.56 GiB, budgets 13.104 each, weights 20.310, headroom 4.104, so a
+    balanced value of 0.897 GiB against caps of +2.949 and -1.155) moves under
+    us. On equal cards only the HEAD's cap ever binds -- a non-head cap is
+    `b - total/n`, which is always above the balanced value `b - (total +
+    headroom)/n` -- so this pins the head's reserve. Ceiling division on both
+    sides is what makes the two expressions agree: `total * b // (n * b)`
+    floors, so a model whose byte count is not a multiple of the card count
+    (here 1778393088 bytes across 5 cards) drifts off the old `-(-total // n)`
+    and the head keeps a byte more than it used to.
+    """
+    with torch.device("meta"):
+        model = _Wide(hidden = 2048, ffn = 8192, vocab = 32768, layers = 20)
+    budget = int(14.56 * _GiB)
+
+    head_bytes = (
+        model.lm_head.weight.numel() * model.lm_head.weight.element_size()
+    )
+    for n in (2, 3, 4, 5):
+        plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
+        assert plan is not None, f"{n} x 14.56 GiB was refused"
+
+        # The pre-proration formula: one flat average share for every device,
+        # with the pinned head as its floor.
+        total = plan.total_weight_bytes
+        headroom = plan.headroom_bytes
+        value = max(0, (n * budget - total - headroom) // n)
+        share = max(-(-total // n), head_bytes)
+        old = {
+            d: int(max(0, min(
+                value,
+                budget - share - (headroom if d == plan.head_device else 0),
+            )))
+            for d in range(n)
+        }
+        assert value > 0 and old[plan.head_device] < value, (
+            f"{n} cards: fixture no longer exercises the head's cap"
+        )
+        assert plan.activation_reserve_by_device == old, (
+            f"{n} x 14.56 GiB moved: got {plan.activation_reserve_by_device}, "
+            f"the flat-average formula gives {old}"
+        )

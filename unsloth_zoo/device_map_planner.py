@@ -1019,11 +1019,39 @@ def plan_device_map(
                 # each device at 0 still keeps the head's own reserve
                 # non-negative, so `attempt` -- which only relaxes the OTHER
                 # cards -- is never handed an infeasible head budget.
-                share = max(-(-total // len(devices)), pinned_bytes)
+                #
+                # Charge each device the weight IT holds, not the flat average.
+                # The packing is capacity-proportional, so on unequal cards the
+                # average is the weight of no device: 16 + 80 GiB holding a
+                # 62.81 GiB model gives an average of 31.41, which is larger
+                # than the whole 16 GiB card, so its cap went to -15.41 and the
+                # clamp zeroed its reserve -- and the packing then filled it to
+                # 0.09 GiB free (99.4%) while the 80 GiB card kept 16.41. Same
+                # shape at 24 + 48. Prorating by capacity keeps the cap
+                # strictly positive for every card whenever the model fits at
+                # all (the cap is `raw * (1 - total / capacity)`), and the
+                # pinned floor stays on the head, which is the only device that
+                # takes those units whole, so the four-layer big-head case
+                # above still clears.
+                #
+                # On identical cards the prorated share IS the flat average, so
+                # the Muse Glimmer arithmetic above is unchanged: 13.104 each
+                # of 26.208 gives 10.155, caps 2.949 and -1.155 exactly as
+                # measured. Ceiling division on both sides is what makes the two
+                # agree byte for byte. Single-device budgets are unchanged too
+                # (the share is the whole model either way).
+                capacity = sum(raw_budgets.values()) or 1
+                share = {
+                    d: max(
+                        -(-total * raw_budgets[d] // capacity),
+                        pinned_bytes if d == head_device else 0,
+                    )
+                    for d in devices
+                }
                 per_device = {
                     d: int(max(0, min(
                         value,
-                        raw_budgets[d] - share
+                        raw_budgets[d] - share[d]
                         - (headroom if d == head_device else 0),
                     )))
                     for d in devices
