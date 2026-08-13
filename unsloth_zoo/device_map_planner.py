@@ -966,6 +966,10 @@ def plan_device_map(
     reserve_is_explicit = activation_reserve_bytes is not None
     requested_reserve = activation_reserve_bytes
 
+    # Per head candidate, the balanced reserve the flat-average planner asked
+    # for. `attempt` relaxes from it as well as from the prorated one.
+    flat_reserve: dict[int, dict[int, int]] = {}
+
     def reserve_for(head_device: int) -> dict[int, int]:
         """The per-device reserve to try for this head candidate.
 
@@ -1019,11 +1023,85 @@ def plan_device_map(
                 # each device at 0 still keeps the head's own reserve
                 # non-negative, so `attempt` -- which only relaxes the OTHER
                 # cards -- is never handed an infeasible head budget.
-                share = max(-(-total // len(devices)), pinned_bytes)
+                #
+                # Charge each device the weight IT holds, not the flat average.
+                # The packing is capacity-proportional, so on unequal cards the
+                # average is the weight of no device: 16 + 80 GiB holding a
+                # 62.81 GiB model gives an average of 31.41, which is larger
+                # than the whole 16 GiB card, so its cap went to -15.41 and the
+                # clamp zeroed its reserve -- and the packing then filled it to
+                # 0.09 GiB free (99.4%) while the 80 GiB card kept 16.41. Same
+                # shape at 24 + 48.
+                #
+                # Prorating only ever LOOSENS the flat-average share, never
+                # tightens it (`min` below), and that one-sidedness is load
+                # bearing twice over. The proration is symmetric, so it charges
+                # the BIGGER card more than the average -- and the bigger card
+                # is the one the head lands on, the only one that also pays the
+                # headroom. Charged both, its own cap can go where the small
+                # card's used to: budgets 852 + 1089 with 1368 of weights, 358
+                # of headroom and a 168-byte pinned head kept 107 and 47, and
+                # the raw proportional share turns that into 107 and 0. On a
+                # real pair, 10 + 18 GiB carrying a 4-layer 8192-wide model with
+                # 12 GiB of logit headroom loses the head's whole 1.094 GiB
+                # reserve. Taking the smaller of the two shares fixes the small
+                # card without ever moving the big one: the cap is per device
+                # monotone against the flat-average planner, so no card can come
+                # out of this with less than it had.
+                #
+                # On identical cards the prorated share IS the flat average, so
+                # `min` collapses onto the old expression and the measured Muse
+                # Glimmer arithmetic stands: 13.104 each of 26.208 gives 10.155,
+                # caps 2.949 and -1.155. Ceiling division on both sides is what
+                # makes the two agree byte for byte. Single-device budgets are
+                # unchanged too (the share is the whole model either way).
+                #
+                # The pinned floor is the HEAD's alone, because the head's card
+                # is the only one that holds the pinned units. Charging it to
+                # every card is what the flat-average planner did, and it
+                # recreates on a small card exactly the zero reserve this branch
+                # exists to remove: `_Bins([100, 50], head = 150)` on budgets
+                # 400 + 2000 with no headroom has 1200 bytes of weights and a
+                # 600-byte pinned head, so cuda:0's proportional share is 200
+                # but a shared floor raises it to 600, its cap 400 - 600 clamps
+                # to zero and the in-order walk fills all 400 bytes of the card
+                # while cuda:1 leaves 1200 free. Head-only, cuda:0 keeps 200.
+                # The cap stays per device monotone against the flat-average
+                # planner either way (`min(flat, prorated) <= flat <=
+                # max(flat, pinned_bytes)`), and `attempt`'s per-card legacy
+                # floor is what guarantees the higher non-head ask can never
+                # settle BELOW the old answer: measured over 36,460 configs, 0
+                # devices anywhere come out under 7c9a7ac0, and 3 x 80 GiB on a
+                # 4-layer 8192-wide model -- the shape that regressed when the
+                # floor was head-only and that guard did not yet exist -- is
+                # byte identical.
+                capacity = sum(raw_budgets.values()) or 1
+                flat = -(-total // len(devices))
+                share = {
+                    d: max(
+                        min(flat, -(-total * raw_budgets[d] // capacity)),
+                        pinned_bytes if d == head_device else 0,
+                    )
+                    for d in devices
+                }
                 per_device = {
                     d: int(max(0, min(
                         value,
-                        raw_budgets[d] - share
+                        raw_budgets[d] - share[d]
+                        - (headroom if d == head_device else 0),
+                    )))
+                    for d in devices
+                }
+                # What the flat-average planner would have asked for. `attempt`
+                # walks this ladder too, so every rung it used stays reachable.
+                # It keeps the SHARED pinned floor on purpose: this mapping has
+                # to reproduce the old planner exactly, floor included, or the
+                # per-card guarantee `attempt` derives from it is not a
+                # statement about the previous release.
+                flat_reserve[head_device] = {
+                    d: int(max(0, min(
+                        value,
+                        raw_budgets[d] - max(flat, pinned_bytes)
                         - (headroom if d == head_device else 0),
                     )))
                     for d in devices
@@ -1051,9 +1129,9 @@ def plan_device_map(
             return _fill(head_device, reserve, max(reserve.values()))
 
         # The reserve is per device now, so it is a range: the top is what we
-        # would like every card to keep, the floor is exactly what the old
-        # shared `min` cap handed all of them (`min` of a clamp is the clamp of
-        # the `min`). Relaxing from the top alone can land BELOW that floor --
+        # would like every card to keep, the floor the least of it (`min` of a
+        # clamp is the clamp of the `min`). Relaxing from the top alone can
+        # land BELOW that floor --
         # a request missing by one percent is answered by a whole 5% rung -- so
         # 4 x 80 GiB holding a 144 GiB model kept 41.72 GiB per card where the
         # shared cap kept 43.68.
@@ -1062,41 +1140,90 @@ def plan_device_map(
         # non-head cards stepped down from the per-device range and from the
         # old shared floor, then both ladders again with the head's own reserve
         # relaxed too. The old planner's ladders are in that set rung for rung,
-        # and ordering by the smallest reserve any card keeps means the
-        # accepted plan can never keep less than it did. The head-relaxing
+        # and the per-card floor below is what stops a rung with a larger
+        # minimum from being taken when it keeps some card less. The head-relaxing
         # rungs exist because relaxing only the OTHER cards can miss the head's
         # card by less than its reserve and refuse a model that fits. The logit
         # headroom is never touched by any of them.
-        top, floor = max(reserve.values()), min(reserve.values())
-        rungs = sorted(
-            {top * (20 - step) // 20 for step in range(21)} |
-            {floor * (20 - step) // 20 for step in range(21)},
-            reverse = True,
-        )
-        candidates = []
-        for other in rungs:
-            candidates.append({d: reserve[d] if d == head_device else min(reserve[d], other)
-                               for d in devices})
-            candidates.append({d: floor if d == head_device else min(floor, other)
-                               for d in devices})
-        for step in range(1, 21):
-            candidates.append({d: v * (20 - step) // 20 for d, v in reserve.items()})
-            candidates.append(dict.fromkeys(devices, floor * (20 - step) // 20))
+        def ladder(base: dict[int, int]) -> list[dict[int, int]]:
+            top, floor = max(base.values()), min(base.values())
+            rungs = sorted(
+                {top * (20 - step) // 20 for step in range(21)} |
+                {floor * (20 - step) // 20 for step in range(21)},
+                reverse = True,
+            )
+            out = []
+            for other in rungs:
+                out.append({d: base[d] if d == head_device else min(base[d], other)
+                            for d in devices})
+                out.append({d: floor if d == head_device else min(floor, other)
+                            for d in devices})
+            for step in range(1, 21):
+                out.append({d: v * (20 - step) // 20 for d, v in base.items()})
+                out.append(dict.fromkeys(devices, floor * (20 - step) // 20))
+            return out
 
-        seen = set()
-        ordered = []
-        for kept in candidates:
-            key = tuple(kept[d] for d in devices)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(kept)
-        # Most-kept first. Passing `max(kept.values())` as the non-head cap
-        # makes `_fill` keep exactly this mapping.
-        ordered.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
+        # Both ladders, because a rung is 5% of the mapping it is scaled from:
+        # prorating raises the non-head asks on unequal cards, and the coarser
+        # ladder off that higher start can step straight PAST a flat-average
+        # rung that fit. Budgets 1264 + 1354, 1368 of weights and 3 of headroom
+        # ask 580/623 flat and 603/623 prorated; free units of 272 and 768 make
+        # the flat 493 rung fit, and the prorated ladder lands on 482 instead.
+        candidates = ladder(reserve)
+        flat = flat_reserve.get(head_device)
+        legacy = ladder(flat) if flat is not None and flat != reserve else []
+        candidates += legacy
+
+        def _ordered(cands):
+            # Most-kept first. Passing `max(kept.values())` as the non-head cap
+            # makes `_fill` keep exactly this mapping.
+            seen = set()
+            out = []
+            for kept in cands:
+                key = tuple(kept[d] for d in devices)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(kept)
+            out.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
                      reverse = True)
-        for kept in ordered:
-            r = _fill(head_device, kept, max(kept.values()))
+            return out
+
+        filled = {}
+        def _try(kept):
+            key = tuple(kept[d] for d in devices)
+            if key not in filled:
+                filled[key] = _fill(head_device, kept, max(kept.values()))
+            return filled[key]
+
+        # What the flat-average planner would have kept: its own ladder, walked
+        # on its own. Ordering by the smallest reserve any card keeps is not
+        # coordinate-wise monotone, so merging the two ladders and taking the
+        # largest minimum can hand one card LESS than that planner did while
+        # another gains. `_Bins([249, 230, 144, 203, 223, 68], head = 32)` on
+        # budgets 3050 + 3977 with 504 of headroom asks 752/963 flat and
+        # 963/963 prorated; 963 does not fit, the prorated ladder's next rung
+        # 914/914 does, and its larger minimum sorts ahead of the still feasible
+        # 752/963 -- so the head, the card that also pays the logit headroom,
+        # comes out 49 short of what it used to keep. That fixture scales
+        # linearly, so on real cards it is gigabytes of activation reserve. A
+        # 1500 config fuzz at MiB scale put it at 58 shapes.
+        #
+        # So a candidate is only better if it is at least the legacy reserve on
+        # EVERY card. The legacy rung itself always passes that test, so this
+        # can never refuse a plan the old planner accepted, and the best rung
+        # above it is still taken: the fixture ends on 866/963, keeping the
+        # head whole AND lifting the small card 114 over the old answer.
+        legacy_kept = None
+        for kept in _ordered(legacy):
+            if _try(kept) is not None:
+                legacy_kept = kept
+                break
+
+        for kept in _ordered(candidates):
+            if legacy_kept is not None and any(kept[d] < legacy_kept[d] for d in devices):
+                continue
+            r = _try(kept)
             if r is not None:
                 return r
         return None
