@@ -224,7 +224,8 @@ def test_the_switch_is_read_live_not_at_import(monkeypatch):
 
 def test_a_first_compile_refusal_falls_back_even_under_a_checkpoint(monkeypatch):
     """The Muse Glimmer case: Inductor refuses before anything was ever packed."""
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
 
     def compiled(x):
@@ -248,7 +249,8 @@ def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
     test used to, describes a different situation entirely -- a compiled call
     somewhere else in the step -- and that one is safe to fall back from.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
@@ -271,7 +273,8 @@ def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
 
 def test_outside_a_checkpoint_a_later_refusal_still_falls_back(monkeypatch):
     """Nothing is packed, so there is no pack/recompute pair to protect."""
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
     calls = {"n": 0}
 
@@ -319,7 +322,8 @@ def test_a_refusal_in_a_later_step_falls_back(monkeypatch):
     # The step boundary. This is what `apply_pending_eager_fallbacks` does.
     patch_utils._COMPILED_OK_LABELS.clear()
 
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     assert wrapped(2) == "eager", "a new step re-raised on its first refusal"
 
@@ -342,7 +346,8 @@ def test_a_successful_budget_retry_is_recorded_as_compiled(monkeypatch):
     something that will be recomputed, and therefore the only place the record
     means anything.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
@@ -369,7 +374,8 @@ def test_the_compiled_pack_marker_is_restored_after_a_refusal(monkeypatch):
     reads it as evidence of a compiled pack and ends the step for no reason.
     """
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     # The real one sets the marker, which is precisely what has to be undone.
     monkeypatch.setattr(
         patch_utils, "_note_packed_under_checkpoint",
@@ -453,7 +459,8 @@ def test_restoring_the_marker_cannot_erase_an_earlier_compiled_pack(monkeypatch)
     Restoring the prior value rather than assigning False is what makes this
     safe, and this test is the difference between the two.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     # An earlier region in this same checkpoint already packed compiled.
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     monkeypatch.setattr(
@@ -542,7 +549,8 @@ def test_a_refusal_from_the_budget_retry_falls_back(monkeypatch):
     one path where the compiler had to be given more budget before it got as
     far as refusing.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
     calls = {"n": 0}
 
@@ -571,7 +579,8 @@ def test_a_refusal_from_the_budget_retry_is_not_recorded_as_compiled(monkeypatch
     compiled, which is the lie that ends a later step for no reason -- or, in a
     checkpoint, the one that recomputes in the wrong mode.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
@@ -601,7 +610,8 @@ def test_a_legacy_budget_retry_is_recorded_as_compiled(monkeypatch):
     graph_break_errors = patch_utils._disabled_hook_graph_break_error()
     if not graph_break_errors:
         pytest.skip("this torch exposes no graph-break exception")
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     calls = {"n": 0}
 
@@ -633,7 +643,8 @@ def test_a_compiled_call_outside_a_checkpoint_is_not_a_compiled_pack(monkeypatch
     refusal of the training pass end the step because the generation pass had
     succeeded earlier in the same step.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: False)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
     calls = {"n": 0}
 
@@ -649,7 +660,8 @@ def test_a_compiled_call_outside_a_checkpoint_is_not_a_compiled_pack(monkeypatch
     assert wrapped(1) == "compiled"           # generation: no region open
     assert "test-uncheckpointed-success" not in patch_utils._COMPILED_OK_LABELS
 
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     assert wrapped(2) == "eager", (
         "a compiled call made outside any checkpoint blocked the fallback"
     )
@@ -669,7 +681,8 @@ def test_an_unknown_checkpoint_answer_still_counts_as_packed(monkeypatch):
     unknown answer it leans on the marker -- so the marker is set for the
     refusal, matching a step where some region is known to have packed.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: None)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: None)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
     calls = {"n": 0}
 
@@ -704,7 +717,8 @@ def test_a_backend_refusal_is_evidence_for_force_eager_fallback(monkeypatch):
     "no compile-mode flip happened" and re-raises the failure it was asked to
     retry past. Every other give-up path already writes `_RECENT_EAGER_LABELS`.
     """
-    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint", lambda: True)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     monkeypatch.setattr(patch_utils, "_RECENT_EAGER_LABELS", set())
     monkeypatch.setattr(patch_utils, "_EAGER_FALLBACK_WRAPPERS", [])
@@ -755,3 +769,144 @@ def test_the_error_builder_produces_an_inductor_identity_on_a_2_6_shaped_torch(
     )
     assert isinstance(built.inner_exception, RuntimeError)
     assert patch_utils._is_inductor_codegen_failure(built)
+
+
+# ---- what the SECOND review round found -----------------------------------
+#
+# The post-call `_note_compiled_ok` probe runs on the SUCCESS path, so unlike
+# every probe above it is paid by runs that never fall back at all. Two
+# consequences, one a cost and one a correctness hole, and the same one-line
+# marker latch closes both.
+
+
+def test_a_successful_call_does_not_reprobe_once_the_marker_has_latched(
+        monkeypatch):
+    """The success-path probe must read the cheap global BEFORE the walk.
+
+    `_note_compiled_ok` asked `_in_non_reentrant_checkpoint() is False and not
+    _PACKED_COMPILED_IN_CHECKPOINT`, and Python evaluates the left operand of
+    `and` first, so the probe was paid on EVERY successful compiled call even
+    after the marker had latched and the answer could not change. On a torch
+    with no saved-tensor-hook accessor that probe is an uncapped walk to the
+    root of the Python stack, which the module itself prices at ~15us against
+    ~0.1us for the wrapper -- a per-call cost on runs that compile cleanly and
+    never touch the fallback at all.
+    """
+    probes = {"n": 0}
+
+    def _counting_probe(**_):
+        probes["n"] += 1
+        return True
+
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        _counting_probe)
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        lambda x: "compiled", lambda x: "eager", "test-no-reprobe",
+    )
+    for _ in range(20):
+        assert wrapped(1) == "compiled"
+
+    assert "test-no-reprobe" in patch_utils._COMPILED_OK_LABELS, \
+        "the observation itself must survive the short-circuit"
+    assert probes["n"] == 0, (
+        f"the marker was already latched, so the checkpoint probe should never "
+        f"have run; it ran {probes['n']} times"
+    )
+
+
+def test_the_success_probe_latches_the_marker_when_it_finds_a_checkpoint(
+        monkeypatch):
+    """A definite yes from the post-call probe is process-wide news, not local.
+
+    The pre-call probe can miss a region this one then finds -- on a torch with
+    no accessor its `_probe_walk` budget may already be spent by earlier
+    uncheckpointed calls. Recording only the label left
+    `_PACKED_COMPILED_IN_CHECKPOINT` false, so a later refusal by this same
+    wrapper OUTSIDE the region read `packed` as false, latched eager, and left
+    the compiled activations this call had just packed to be recomputed
+    eagerly: a checkpoint abort, or silently wrong gradients.
+    """
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    inside = {"yes": True}
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: inside["yes"])
+    calls = {"n": 0}
+
+    def compiled(x):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _inductor_error()
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda x: "eager", "test-latch-marker",
+    )
+
+    assert wrapped(1) == "compiled"
+    assert patch_utils._PACKED_COMPILED_IN_CHECKPOINT is True, (
+        "a definite yes from the post-call probe must latch the process-wide "
+        "marker, not only the per-label history"
+    )
+
+    # The layer has returned, so the region is closed -- but its compiled pack
+    # is still owed a recompute.
+    inside["yes"] = False
+    with pytest.raises(patch_utils._backend_compile_errors()):
+        wrapped(2)
+
+
+def test_an_unknown_answer_does_not_latch_the_process_wide_marker(monkeypatch):
+    """`None` counts as packed for THIS label, but must not speak for others.
+
+    The marker is read by every other wrapper's give-up path, so latching it on
+    a guess would end steps that had nothing compiled packed anywhere.
+    """
+    monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
+                        lambda **_: None)
+
+    wrapped = patch_utils._fall_back_to_eager_on_recompile_limit(
+        lambda x: "compiled", lambda x: "eager", "test-unknown-no-latch",
+    )
+    assert wrapped(1) == "compiled"
+
+    assert "test-unknown-no-latch" in patch_utils._COMPILED_OK_LABELS
+    assert patch_utils._PACKED_COMPILED_IN_CHECKPOINT is False, \
+        "an unknown must not latch the process-wide marker"
+
+
+def test_the_budgeted_probe_stops_walking_and_answers_unknown(monkeypatch):
+    """`budgeted = True` puts the frame walk on the step's miss budget.
+
+    Without it a torch with no accessor pays an unbounded stack walk on every
+    successful compiled call for the whole run, which is exactly the cost
+    `_probe_walk`'s budget exists to cap for the pre-call probe. A spent budget
+    has to answer None rather than False: "stopped asking" is not "no region".
+    """
+    monkeypatch.setattr(patch_utils, "_saved_tensor_hook_accessor",
+                        lambda: None)
+    walks = {"n": 0}
+
+    def _counting_walk():
+        walks["n"] += 1
+        return False
+
+    monkeypatch.setattr(patch_utils, "_walk_for_checkpoint_frame",
+                        _counting_walk)
+    monkeypatch.setattr(patch_utils, "_CHECKPOINT_PROBE_MISSES", 0)
+
+    budget = patch_utils._CHECKPOINT_PROBE_MISS_BUDGET
+    for _ in range(budget + 25):
+        patch_utils._in_non_reentrant_checkpoint(budgeted = True)
+
+    assert walks["n"] == budget, (
+        f"the walk should stop at the {budget}-miss budget; it ran "
+        f"{walks['n']} times"
+    )
+    assert patch_utils._in_non_reentrant_checkpoint(budgeted = True) is None, \
+        "a spent budget means 'stopped asking', not 'no region'"
+    # The uncapped form is unchanged: the give-up paths still get a real answer.
+    assert patch_utils._in_non_reentrant_checkpoint() is False
+    assert walks["n"] == budget + 1

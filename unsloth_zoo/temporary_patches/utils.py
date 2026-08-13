@@ -858,7 +858,7 @@ def _is_checkpoint_pack_hook(pack):
                 ("_checkpoint_hook", "_recomputation_hook")))
 
 
-def _in_non_reentrant_checkpoint():
+def _in_non_reentrant_checkpoint(budgeted = False):
     """Are we inside a `use_reentrant = False` region? None when torch cannot say.
 
     The only saved-tensor hooks `torch.utils.checkpoint` installs are the
@@ -872,6 +872,16 @@ def _in_non_reentrant_checkpoint():
     `saved_tensors_hooks`/`save_on_cpu` entered inside the region sits above
     ours, so an unrecognised hook is "cannot tell from here", not "no region":
     ask the frames instead.
+
+    `budgeted` puts that frame walk on the step's `_probe_walk` budget, for the
+    one caller that runs on EVERY successful compiled call rather than once per
+    failure. The give-up paths must keep the default uncapped walk: they are
+    reached once, and their answer decides whether a compiled pack would be
+    recomputed eagerly, so ~15us there buys correctness outright. Paying it per
+    call instead defeats the very budget `_note_packed_under_checkpoint` pays
+    into and adds the walk to every compiled kernel invocation for the life of a
+    run on a torch with no accessor. A spent budget answers None, not False:
+    "stopped asking" is not "no region", and an unknown still counts as packed.
     """
     top = _saved_tensor_hook_accessor()
     if top is not None:
@@ -882,7 +892,12 @@ def _in_non_reentrant_checkpoint():
         if hooks is not _UNKNOWN:
             if not hooks: return False
             if _is_checkpoint_pack_hook(hooks[0]): return True
-    return _walk_for_checkpoint_frame()
+    if not budgeted: return _walk_for_checkpoint_frame()
+    # Asked before walking, not after: `_probe_walk` increments the miss count
+    # itself, so reading it afterwards would report the walk it just did as a
+    # walk that was skipped.
+    if _CHECKPOINT_PROBE_MISSES >= _CHECKPOINT_PROBE_MISS_BUDGET: return None
+    return True if _probe_walk() else False
 
 
 # Set when a compiled call ran with a non-reentrant checkpoint's pack hook on
@@ -1761,22 +1776,48 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         conservative test `_retry_with_more_budget` uses to decide whether
         anything is half-packed, and for the same reason.
         """
+        global _PACKED_COMPILED_IN_CHECKPOINT
+        # The marker FIRST, because it is a plain global read and everything
+        # below it can cost a full stack walk. Written as one `and` it read
+        # `_in_non_reentrant_checkpoint() is False and not marker`, and Python
+        # evaluates the left operand first, so the probe was paid on every
+        # successful compiled call even once the marker had latched and the
+        # answer was a foregone conclusion -- on 2.4-2.7, where there is no hook
+        # accessor, that is an uncapped ~15us frame walk per compiled kernel
+        # invocation for the rest of the run.
+        if _PACKED_COMPILED_IN_CHECKPOINT:
+            _COMPILED_OK_LABELS.add(label)
+            return
         if _dynamo_is_tracing():
-            # The accessor `_in_non_reentrant_checkpoint` reaches for is a
-            # pybind builtin Dynamo refuses to enter, and under
-            # `fullgraph = True` that is fatal rather than a graph break -- the
-            # failure `_note_packed_under_checkpoint` documents, which killed
+            # The accessor the probe reaches for is a pybind builtin Dynamo
+            # refuses to enter, and under `fullgraph = True` that is fatal
+            # rather than a graph break -- the failure
+            # `_note_packed_under_checkpoint` documents, which killed
             # Gemma4_(E2B)-Vision at cell 15. This runs in the wrapper body, so
             # a nested compiled region traces it. Nothing is lost: the answer is
             # meaningless mid-trace, and the same wrapper is entered from eager
-            # on the call that actually packs. Fall back to the marker, which is
-            # a plain global read.
-            if _PACKED_COMPILED_IN_CHECKPOINT:
-                _COMPILED_OK_LABELS.add(label)
+            # on the call that actually packs. The marker was the only thing
+            # worth reading here and it is already known False above.
             return
-        if _in_non_reentrant_checkpoint() is False and \
-            not _PACKED_COMPILED_IN_CHECKPOINT:
+        answer = _in_non_reentrant_checkpoint(budgeted = True)
+        if answer is False:
             return
+        if answer:
+            # Latch the process-wide marker too, not just this label. The
+            # pre-call probe can miss a region the post-call one then finds --
+            # on 2.4-2.7 its budget may already be spent -- and leaving the
+            # marker False lets a later refusal by this same wrapper OUTSIDE the
+            # region read `packed` as false, latch eager, and leave the compiled
+            # activations this call just packed to be recomputed eagerly, which
+            # aborts the backward or returns wrong gradients.
+            #
+            # It also makes this probe self-limiting, which is the other half of
+            # the cost fix above: once the marker is set the branch at the top
+            # short-circuits and no further call walks anything.
+            _PACKED_COMPILED_IN_CHECKPOINT = True
+        # `answer is None` falls through to here deliberately: torch could not
+        # say, and an unknown has to count as packed (see the docstring), but it
+        # must NOT latch the process-wide marker on a guess.
         _COMPILED_OK_LABELS.add(label)
 
     @functools.wraps(eager_func)
