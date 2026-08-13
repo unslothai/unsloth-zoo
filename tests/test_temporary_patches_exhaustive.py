@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import types
+
+from _pytest import outcomes as _pytest_outcomes
 import inspect
 import os
 from typing import Iterable
@@ -46,13 +49,50 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
+def _unimportable(dotted_module: str, exc: BaseException) -> str:
+    return (
+        f"{dotted_module!r} raised on import, so nothing can be said about "
+        f"upstream drift here: {type(exc).__name__}: {exc}"
+    )
+
+
 def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
-    Used to skip 5.0+-gated tests on a 4.x install."""
+    Used to skip 5.0+-gated tests on a 4.x install.
+
+    ``None`` now means one thing only: the module imported and the attribute is
+    not on it. That is the real drift signal, and it is the one 15 of the 23
+    callers below turn into a DRIFT failure.
+
+    A module that RAISES on import is a different question. The signal is not
+    lost: a ``ModuleNotFoundError`` naming the module we asked for still answers
+    ``None``, because an upstream module that has genuinely gone away is drift.
+    What is now separated out is a module that exists but blows up on the way
+    in, which says nothing about upstream at all. Swallowing every exception
+    made the two indistinguishable, and the resulting message
+
+        DRIFT DETECTED: gemma3n.py:53 helper expects Gemma3nRMSNorm but it is
+        missing on transformers 4.57.6
+
+    named the wrong component: transformers 4.57.6 does ship that class. What
+    actually happened was that ``configuration_gemma3n`` imports
+    ``ImageNetInfo`` from ``timm.data``, which a newer timm no longer exports,
+    so the whole module raised ImportError and every gemma3n class looked
+    deleted. Eight tests reported upstream drift for a broken sibling package.
+    """
     try:
         mod = importlib.import_module(dotted_module)
-    except Exception:
-        return None
+    except ModuleNotFoundError as exc:
+        # The target module itself is absent. That IS drift (or a version gate),
+        # and it is what the callers were always judging, so it still answers
+        # None and they still decide. Only a miss on the module we asked for
+        # counts: a ModuleNotFoundError naming something else is a broken
+        # dependency, and falls through to the skip below.
+        if (exc.name or "") in (dotted_module, dotted_module.split(".")[0]):
+            return None
+        pytest.skip(_unimportable(dotted_module, exc))
+    except Exception as exc:
+        pytest.skip(_unimportable(dotted_module, exc))
     return getattr(mod, class_name, None)
 
 
@@ -2490,3 +2530,45 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
+
+
+def test_a_broken_dependency_is_not_reported_as_upstream_drift():
+    """The two ways an import can fail are not the same finding.
+
+    A module that has gone away upstream is drift and must still reach the
+    caller as None so it can fail. A module that exists but raises on the way
+    in says nothing about upstream: gemma3n did exactly this, where
+    configuration_gemma3n imports ImageNetInfo from timm.data and a newer timm
+    no longer exports it, so eight tests announced
+
+        DRIFT DETECTED: ... missing on transformers 4.57.6
+
+    about classes transformers 4.57.6 ships perfectly well.
+    """
+    # Genuinely absent module: still None, so the callers still judge it.
+    assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
+
+    # Present but raising, on a dependency of its own: skipped, not blamed.
+    module_name = "_zoo_probe_broken_import"
+    module = types.ModuleType(module_name)
+
+    def _explode():
+        raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+
+    module.__getattr__ = lambda name: _explode()
+    real_import = importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == module_name:
+            raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+        return real_import(name, *args, **kwargs)
+
+    importlib.import_module = fake_import
+    try:
+        # Skipped derives from BaseException, so `pytest.raises(Exception)`
+        # would let it through and silently skip THIS test instead.
+        with pytest.raises(_pytest_outcomes.Skipped) as caught:
+            _try_get_class(module_name, "Anything")
+        assert "nothing can be said about upstream drift" in str(caught.value)
+    finally:
+        importlib.import_module = real_import
