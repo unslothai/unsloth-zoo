@@ -36,7 +36,10 @@ else:
 pass
 
 if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
-    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
+    # whether a device is present before asking what it can do. Cut cross
+    # entropy is a Triton GPU kernel and cannot run here regardless, so False is
+    # both the conservative answer and the only correct one.
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()

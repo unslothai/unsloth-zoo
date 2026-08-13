@@ -89,7 +89,10 @@ if DEVICE_TYPE == "cuda":
         major, minor = torch.cuda.get_device_capability()
         OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
     else:
-        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts
+        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
+        # ask whether a device is present before asking what it can do. There is
+        # no arch to read, and the old-arch compile workarounds only ever run on
+        # a real GPU, so False is the answer that changes nothing.
         OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "hip":
     OLD_CUDA_ARCH_VERSION = False
