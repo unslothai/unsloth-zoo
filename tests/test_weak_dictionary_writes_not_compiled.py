@@ -16,21 +16,16 @@
 
 """Dynamo must not compile the standard library's weak-dictionary writes.
 
-Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with
-
-    AssertionError: Something went unexpectedly wrong in activation checkpoint
-
-and the recompile budget is why, but not the way it looks. The budget that runs
-out belongs to `weakref.__setitem__`, compiled 1030 times in that one step
-against a limit of 1024, while the gemma4 RMSNorm kernel Unsloth does compile
-was compiled six times in the whole run. Activation checkpointing's saved-tensor
-bookkeeping reaches those writes from inside a compiled region and hands Dynamo
-a fresh key object per checkpointed region, so every one of them is a
-compilation that can never be reused.
+Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with "AssertionError:
+Something went unexpectedly wrong in activation checkpoint". The exhausted
+recompile budget is `weakref.__setitem__`'s -- 1030 compiles against a limit of
+1024 in that step -- not the gemma4 RMSNorm kernel the warning names, which
+compiles six times in the whole run. Checkpointing's saved-tensor bookkeeping
+reaches those writes from inside a compiled region with a fresh key object per
+region, so none of those compilations can ever be reused.
 
 Kaggle T4 `danielhanchen/unsloth-t4-ci-e29ca7f0`: with these four code objects
-marked skipped and nothing else changed, the run that had been asserting
-completes, still compiled.
+skipped and nothing else changed, the asserting run completes, still compiled.
 """
 
 import sys
@@ -45,7 +40,7 @@ from unsloth_zoo import patching_utils as P  # noqa: E402
 
 
 def test_every_weak_dictionary_writer_is_marked():
-    """All four, because all four are what the T4 run was measured with."""
+    """All four, as measured on the T4 run."""
     marked = []
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("torch._dynamo.eval_frame.skip_code",
@@ -65,12 +60,10 @@ def test_every_weak_dictionary_writer_is_marked():
 def test_the_marked_frames_are_never_compiled():
     """No Dynamo cache entry for any of the four, through the real accessor.
 
-    This is a weaker statement than it looks anywhere but a T4. Whether Dynamo
-    intercepts these frames at all depends on how they are reached -- on the
-    failing kernel it is from the saved-tensor bookkeeping of a checkpoint
-    recompute, on an autograd worker thread, with a compiled region on the
-    stack, and that arrangement has not been reproduced anywhere else. What this
-    pins is the invariant either way: after the mark, nothing compiles them.
+    Weaker than it looks off a T4: whether Dynamo intercepts these frames at all
+    depends on how they are reached, and the failing arrangement (checkpoint
+    recompute on an autograd thread under a compiled region) has not been
+    reproduced elsewhere. The invariant holds either way.
     """
     import weakref
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
@@ -91,8 +84,7 @@ def test_the_marked_frames_are_never_compiled():
 
 
 def test_a_skipped_write_still_works():
-    """A skipped frame runs in the interpreter, which is what it did before
-    anyone thought to compile it. Nothing about the dictionary changes."""
+    """A skipped frame runs in the interpreter; the dictionary is unchanged."""
     import weakref
 
     class Key:
@@ -109,15 +101,14 @@ def test_a_skipped_write_still_works():
 
 
 def test_it_is_safe_to_call_twice():
-    """`patch_torch_compile` is not guaranteed to run once, and marking an
-    already-marked code object must not be an error."""
+    """`patch_torch_compile` is not guaranteed to run only once."""
     assert P.stop_compiling_weak_dictionary_writes() == 4
     assert P.stop_compiling_weak_dictionary_writes() == 4
 
 
 def test_a_torch_without_the_accessor_is_not_an_error():
-    """This runs from `patch_torch_compile`, at import. A torch that cannot be
-    asked has to mean "nothing marked", never a failed import."""
+    """This runs at import, so a torch that cannot be asked must mean
+    "nothing marked", never a failed import."""
     with pytest.MonkeyPatch.context() as patch:
         patch.delattr("torch._dynamo.eval_frame.skip_code")
         assert P.stop_compiling_weak_dictionary_writes() == 0
@@ -137,8 +128,7 @@ def test_one_refusal_does_not_stop_the_others():
 
 
 def test_a_missing_weak_dictionary_is_skipped_quietly():
-    """Named through `weakref` rather than imported, so a python that has moved
-    one of them leaves the other three marked."""
+    """Named through `weakref`, so a python missing one still marks the rest."""
     import weakref
     with pytest.MonkeyPatch.context() as patch:
         patch.delattr(weakref, "WeakValueDictionary")
@@ -146,8 +136,8 @@ def test_a_missing_weak_dictionary_is_skipped_quietly():
 
 
 def test_patching_torch_compile_marks_them():
-    """The wiring, not just the function: nothing else calls it, so a
-    `patch_torch_compile` that forgets it is the bug back again."""
+    """Nothing else calls it, so a `patch_torch_compile` that forgets it is the
+    bug back again."""
     called = []
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(P, "stop_compiling_weak_dictionary_writes",
