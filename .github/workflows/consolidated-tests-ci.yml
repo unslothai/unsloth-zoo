@@ -134,6 +134,16 @@ jobs:
         # raising requires-python relaxes it rather than making it lie.
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
+        #
+        # The last two are here because `--collect-only` is exactly what missed
+        # the bug they cover. `tests/` is not a package, so `from tests.x import
+        # y` binds to whatever `tests` package is importable; unsloth's CI runs
+        # these files with its own repo root on sys.path and it DOES ship
+        # `tests/__init__.py`, so the import resolved there and took the module
+        # out at collection, ending that job at exit 2 on every unsloth pull
+        # request. Collecting the drift file here proves it still imports under
+        # a plain root, and the sweep is a stdlib-only grep that refuses the
+        # pattern anywhere in the suite.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -162,6 +172,8 @@ jobs:
             tests/test_recompile_limit_fallback.py \
             tests/test_checkpoint_compile_mix.py \
             tests/test_disabled_hook_graph_break.py \
+            tests/test_missing_parent_package_is_drift.py \
+            tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

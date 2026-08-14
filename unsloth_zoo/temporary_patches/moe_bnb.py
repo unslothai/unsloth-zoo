@@ -37,7 +37,8 @@ try:
     from bitsandbytes.nn import Params4bit
     from bitsandbytes.functional import dequantize_4bit
     HAS_BNB = True
-except ImportError:
+except Exception:
+    # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
     Params4bit = None
 

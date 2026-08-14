@@ -25,6 +25,7 @@ from triton import __version__ as triton_version
 from . import DEVICE_TYPE
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
+import re
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -341,6 +342,18 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+
+    # num_items_in_batch is set from the forward signature, but training_step
+    # divides by grad-accum off self.model_accepts_loss_kwargs. Counting while
+    # that flag is False normalises twice (TRL chunked_nll and our fused CE each
+    # divide by it), scaling loss and grads by 1/GA. Like stock
+    # Trainer._get_num_items_in_batch, only count when a consumer exists; these
+    # losses fall back to a mean when it is None.
+    if (num_items_in_batch is not None
+            and not getattr(self, "model_accepts_loss_kwargs", True)
+            and getattr(self, "compute_loss_func", None) is None):
+        num_items_in_batch = None
+
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     
