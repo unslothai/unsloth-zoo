@@ -29,13 +29,22 @@ mutilated on disk.
 """
 
 import importlib
+import pathlib
+import sys
 
 import pytest
 
-from tests.test_temporary_patches_exhaustive import (
+# By path, not through `tests.`: this repo's `tests/` is not a package, so that
+# name binds to whatever `tests` package is importable instead. Unsloth's own
+# CI runs these files with its repo root on sys.path, and unsloth DOES ship
+# `tests/__init__.py`, so the absolute form resolved to a sibling project's
+# package and the whole module failed to collect.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from test_temporary_patches_exhaustive import (  # noqa: E402
     _names_the_target as _names_the_target_patches,
 )
-from tests.test_upstream_signatures import (
+from test_upstream_signatures import (  # noqa: E402
     _names_the_target as _names_the_target_signatures,
 )
 
