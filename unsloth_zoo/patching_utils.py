@@ -730,13 +730,19 @@ class WrapRecursiveCall(ast.NodeTransformer):
 
 # Patch for dynamic 4bit quantization
 import inspect
-import transformers.integrations.bitsandbytes
-if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
-    (transformers.integrations.bitsandbytes._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
+try:
+    import transformers.integrations.bitsandbytes as _transformers_bnb
+except Exception:
+    # Not just ImportError: this transformers module imports bitsandbytes at its own module
+    # scope, and a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    _transformers_bnb = None
+if _transformers_bnb is not None and \
+    hasattr(_transformers_bnb, "_replace_with_bnb_linear") and \
+    (_transformers_bnb._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
 
     # All Unsloth Zoo code licensed under LGPLv3
-    source = inspect.getsource(transformers.integrations.bitsandbytes._replace_with_bnb_linear)
-    functions = dir(transformers.integrations.bitsandbytes)
+    source = inspect.getsource(_transformers_bnb._replace_with_bnb_linear)
+    functions = dir(_transformers_bnb)
     functions = [x for x in functions if f" {x}" in source or f"{x}." in source or f"{x}(" in source]
     functions = [x for x in functions if x != "_replace_with_bnb_linear"]
     x = ", ".join(functions)
@@ -804,7 +810,7 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
 
 # Patch for transformers 5.x: should_convert_module uses re.match + endswith
@@ -813,7 +819,10 @@ pass
 # 4.x patches _replace_with_bnb_linear (substring matching); on 5.x that no
 # longer exists, so patch should_convert_module instead.
 import transformers.quantizers.quantizers_utils as _quantizers_utils
-if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
+# A bitsandbytes too broken to import leaves _transformers_bnb None, which rules out 4.x's
+# _replace_with_bnb_linear the same way 5.x does. should_convert_module below is the marker
+# that actually separates the two, so the 5.x patch still applies instead of being skipped.
+if (_transformers_bnb is None or not hasattr(_transformers_bnb, "_replace_with_bnb_linear")) and \
     hasattr(_quantizers_utils, "should_convert_module") and \
     getattr(_quantizers_utils.should_convert_module, "__name__", "") != "_unsloth_should_convert_module":
 
@@ -833,8 +842,8 @@ if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear
 
     _quantizers_utils.should_convert_module = _unsloth_should_convert_module
     # Also patch the imported reference in bitsandbytes module
-    if hasattr(transformers.integrations.bitsandbytes, "should_convert_module"):
-        transformers.integrations.bitsandbytes.should_convert_module = _unsloth_should_convert_module
+    if _transformers_bnb is not None and hasattr(_transformers_bnb, "should_convert_module"):
+        _transformers_bnb.should_convert_module = _unsloth_should_convert_module
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
