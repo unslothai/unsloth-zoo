@@ -1156,8 +1156,25 @@ def _remove_compiled_cache_bytecode(function_location):
     """Remove this rank's timestamp-based pyc before loading verified source."""
     try:
         os.remove(importlib.util.cache_from_source(function_location))
-    except (NotImplementedError, OSError):
+    except (FileNotFoundError, NotImplementedError):
         pass
+    except OSError as error:
+        raise RuntimeError(
+            f"Unsloth: Cannot remove stale bytecode for {function_location}: {error}"
+        ) from error
+pass
+
+def _verify_cache_digest_under_lock(function_location, expected_digest):
+    """Ensure the locked file still matches the collectively verified bytes."""
+    if expected_digest is None:
+        return
+    with open(function_location, "rb") as file:
+        actual_digest = hashlib.sha256(file.read()).hexdigest()
+    if actual_digest != expected_digest:
+        raise RuntimeError(
+            f"Unsloth: Compiled cache file {function_location} changed after "
+            f"verification ({expected_digest[:12]} -> {actual_digest[:12]})."
+        )
 pass
 
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
@@ -1173,8 +1190,8 @@ def _compiled_cache_decision(function_location, write_new_source, overwrite):
         with open(function_location, "rb") as f:
             return False, hashlib.sha256(f.read()).hexdigest()
     except Exception:
-        # Unreadable on rank 0, so the others can only check existence.
-        return False, None
+        # Unknown retained bytes cannot establish cross-rank agreement.
+        return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
 pass
 
 def _verify_compiled_cache_file(
@@ -1663,6 +1680,7 @@ def create_new_function(
                     use_tempfile=True
                 )
                 function_location = os.path.join(compile_folder, f"{name}.py")
+            cache_file_digest = retained_digest
             temp_failure = write_node_local_file(
                 function_location, cache_source,
             )
@@ -1677,7 +1695,7 @@ def create_new_function(
     old_path = None
     new_module = None
 
-    def import_module(compile_folder, name):
+    def import_module(compile_folder, name, expected_digest):
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
@@ -1689,6 +1707,7 @@ def create_new_function(
         try:
             with lock:
                 # Try standard import
+                _verify_cache_digest_under_lock(target_name, expected_digest)
                 _remove_compiled_cache_bytecode(target_name)
                 importlib.invalidate_caches()
                 new_module = importlib.import_module(name)
@@ -1704,11 +1723,12 @@ def create_new_function(
 
     pass
 
-    def load_module_directly(compile_folder, name):
+    def load_module_directly(compile_folder, name, expected_digest):
         module_name = f"unsloth_cache_{name}"
         file_location = os.path.join(compile_folder, name) + ".py"
         lock = get_lock(file_location)
         with lock:
+            _verify_cache_digest_under_lock(file_location, expected_digest)
             _remove_compiled_cache_bytecode(file_location)
             spec = importlib.util.spec_from_file_location(module_name, file_location)
             new_module = importlib.util.module_from_spec(spec)
@@ -1729,7 +1749,9 @@ def create_new_function(
         sys.modules.pop(f"unsloth_cache_{name}", None)
         import_error = None
         try:
-            new_module, old_path = import_module(compile_folder, name)
+            new_module, old_path = import_module(
+                compile_folder, name, cache_file_digest,
+            )
         except Exception as e:
             new_module = None
             import_error = e
@@ -1752,6 +1774,7 @@ def create_new_function(
                         f"Standard import failed for {name}: {reason}. Using tempfile instead!"
                     )
                 cache_source, generated_digest = rank0_generated_source()
+                cache_file_digest = generated_digest
                 temp_failure = write_node_local_file(
                     function_location, cache_source,
                 )
@@ -1765,7 +1788,9 @@ def create_new_function(
             # module they imported before another rank requested recovery.
             direct_load_error = None
             try:
-                new_module = load_module_directly(compile_folder, name)
+                new_module = load_module_directly(
+                    compile_folder, name, cache_file_digest,
+                )
             except Exception as error:
                 new_module = None
                 direct_load_error = RuntimeError(

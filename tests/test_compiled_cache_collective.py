@@ -445,6 +445,78 @@ def test_direct_recovery_invalidates_temp_folder_bytecode(
     assert getattr(updated, f"{name}_fn")(21) == 63
 
 
+def test_undeletable_persistent_bytecode_recovers_to_temp(
+    tmp_path, monkeypatch, compiler, probe,
+):
+    """Permission errors removing stale pyc must not permit a stale import."""
+    primary = tmp_path / "primary"
+    temp = tmp_path / "temp"
+    primary.mkdir()
+    temp.mkdir()
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    real_remove = compiler.os.remove
+
+    def deny_primary_pyc_removal(path):
+        if primary in pathlib.Path(path).parents:
+            raise PermissionError("simulated read-only pycache")
+        return real_remove(path)
+
+    monkeypatch.setattr(compiler.os, "remove", deny_primary_pyc_removal)
+    name = "pr967_undeletable_pyc"
+
+    module = probe(name, "return x * 2")
+
+    assert pathlib.Path(module.__file__).parent == temp
+    assert getattr(module, f"{name}_fn")(21) == 42
+
+
+def test_import_rechecks_digest_while_holding_lock(
+    tmp_path, monkeypatch, compiler, probe,
+):
+    """A concurrent rewrite after collective verification must trigger recovery."""
+    primary = tmp_path / "primary"
+    temp = tmp_path / "temp"
+    primary.mkdir()
+    temp.mkdir()
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
+    name = "pr967_locked_digest"
+    location = primary / f"{name}.py"
+    real_get_lock = compiler.get_lock
+    primary_lock_count = 0
+
+    class RewriteAfterLock:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            value = self.lock.__enter__()
+            location.write_text(
+                f"def {name}_fn(x):\n    return x * 99\n",
+                encoding="utf-8",
+            )
+            return value
+
+        def __exit__(self, *args):
+            return self.lock.__exit__(*args)
+
+    def rewrite_on_import_lock(target, *args, **kwargs):
+        nonlocal primary_lock_count
+        lock = real_get_lock(target, *args, **kwargs)
+        if pathlib.Path(target) == location:
+            primary_lock_count += 1
+            if primary_lock_count == 2:
+                return RewriteAfterLock(lock)
+        return lock
+
+    monkeypatch.setattr(compiler, "get_lock", rewrite_on_import_lock)
+
+    module = probe(name, "return x * 2")
+
+    assert pathlib.Path(module.__file__).parent == temp
+    assert getattr(module, f"{name}_fn")(21) == 42
+
+
 def test_decision_digests_disk_not_generated_source(
     tmp_path, monkeypatch, compiler,
 ):
@@ -465,6 +537,31 @@ def test_decision_digests_disk_not_generated_source(
         "the digest describes write_new_source rather than the file rank 0 will "
         "import, which breaks UNSLOTH_COMPILE_OVERWRITE=0."
     )
+
+
+def test_unknown_rank0_digest_forces_regeneration(
+    tmp_path, monkeypatch, compiler,
+):
+    """Unreadable rank-0 bytes must not degrade to existence-only agreement."""
+    location = tmp_path / "mod.py"
+    location.write_bytes(b"retained bytes")
+    source = "fresh generated source"
+    real_open = builtins.open
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
+
+    def fail_rank0_binary_read(file, mode="r", *args, **kwargs):
+        if pathlib.Path(file) == location and mode == "rb":
+            raise PermissionError("simulated rank-0 digest failure")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_rank0_binary_read)
+
+    should_write, digest = compiler._compiled_cache_decision(
+        str(location), source, False,
+    )
+
+    assert should_write is True
+    assert digest == hashlib.sha256(source.encode()).hexdigest()
 
 
 def test_decision_skips_hashing_without_process_group(
