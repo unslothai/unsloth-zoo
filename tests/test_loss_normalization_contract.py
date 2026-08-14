@@ -180,6 +180,13 @@ def _fake_trainer(model, accepts, compute_loss_func = None):
     t.accelerator = Accelerator()
     t.model_accepts_loss_kwargs = accepts
     t.compute_loss_func = compute_loss_func
+    # transformers 5.x reads this INSIDE the try that counts labels, and the except
+    # swallows AttributeError. A stand-in without it therefore does not measure stock's
+    # decision at all: stock raises on the first list comprehension, returns None, and a
+    # differential test reads that as "stock declined to count". Every real Trainer sets
+    # it in __init__. True is the value for this fixture's model, which shifts labels
+    # internally like any causal LM, which is exactly the case the flag selects.
+    t._loss_shifts_labels = True
     return t
 
 
@@ -251,6 +258,19 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
     )
 
 
+
+def _stock_counts_shifted_labels(stock):
+    """Does the installed transformers count over `labels[..., 1:]` rather than `labels`?
+
+    Read off the source rather than the version, so a backport or a fork lands on the
+    right branch and this does not need a table of version numbers.
+    """
+    import inspect
+    try:
+        return "_loss_shifts_labels" in inspect.getsource(stock)
+    except (OSError, TypeError):
+        return False
+
 def test_guard_returns_a_count_exactly_when_stock_transformers_would():
     """Same decision as Trainer._get_num_items_in_batch, for every flag pairing, and
     the answer to "why not keep the count and normalise per token across
@@ -279,3 +299,13 @@ def test_guard_returns_a_count_exactly_when_stock_transformers_would():
                 f"accepts={accepts} compute_loss_func={loss_func is not None}: "
                 f"we returned {ours!r} where stock returned {theirs!r}"
             )
+            # Where stock counts over labels[..., 1:] the COUNT has to agree too, not
+            # just whether one was produced. transformers adopted that rule in 5.x
+            # (position 0 of a row is never a prediction target for a causal LM); zoo
+            # has always counted that way, so before 5.x the two legitimately differ by
+            # one token per row and only the nullity above is a shared contract.
+            if _stock_counts_shifted_labels(stock) and ours is not None:
+                assert int(ours) == int(theirs), (
+                    f"accepts={accepts} compute_loss_func={loss_func is not None}: "
+                    f"counted {int(ours)} where stock counted {int(theirs)}"
+                )
