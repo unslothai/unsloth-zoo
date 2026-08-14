@@ -24,6 +24,7 @@ __all__ = [
     "patch_compiling_bitsandbytes",
     "patch_layernorm",
     "patch_torch_compile",
+    "stop_compiling_weak_dictionary_writes",
     "patch_model_and_tokenizer",
     "patch_compiled_autograd",
 ]
@@ -101,6 +102,56 @@ def patch_layernorm(fast_layernorm):
         torch.nn.LayerNorm = Unsloth_LayerNorm
     return
 pass
+
+
+# Dynamo inlines the stdlib, so checkpointing's bookkeeping gets these compiled.
+_WEAK_DICTIONARY_WRITERS = (
+    ("WeakKeyDictionary",   "__setitem__"),
+    ("WeakKeyDictionary",   "__delitem__"),
+    ("WeakValueDictionary", "__setitem__"),
+    ("WeakValueDictionary", "__delitem__"),
+)
+
+
+def stop_compiling_weak_dictionary_writes():
+    """Mark `weakref`'s dictionary writes never-compile. Returns how many.
+
+    Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with
+    "AssertionError: Something went unexpectedly wrong in activation
+    checkpoint". The exhausted recompile budget is `weakref.__setitem__`'s --
+    1030 compiles against a `recompile_limit` of 1024 in that step -- NOT the
+    gemma4 RMSNorm kernel the warning names, which compiles six times in the
+    whole run and is only named because the failure surfaces inside whichever
+    compiled kernel is on the stack.
+
+    Non-reentrant checkpointing saves recomputed intermediates through weakly
+    keyed bookkeeping, which runs on the autograd thread under a compiled
+    region with a fresh key object per region: one unusable compilation each.
+    The budget runs out after the kernel has packed its activations, so the
+    eager retry packs them again and torch's recomputation hook asserts.
+
+    Compiling a weak-dictionary insert buys nothing, so skipping these four
+    code objects costs nothing and keeps the model compiled.
+    """
+    try:
+        import weakref
+        from torch._dynamo.eval_frame import skip_code
+    except Exception:
+        # Older torch, or no Dynamo: not worth failing an import over.
+        return 0
+    marked = 0
+    for owner_name, method_name in _WEAK_DICTIONARY_WRITERS:
+        owner = getattr(weakref, owner_name, None)
+        method = getattr(owner, method_name, None)
+        code = getattr(method, "__code__", None)
+        if code is None:
+            continue
+        try:
+            skip_code(code)
+        except Exception:
+            continue
+        marked += 1
+    return marked
 
 
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
@@ -230,6 +281,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
+    # Must happen before anything compiles.
+    stop_compiling_weak_dictionary_writes()
 pass
 
 def get_model(model):
