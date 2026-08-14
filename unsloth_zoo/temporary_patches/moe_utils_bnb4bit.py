@@ -41,10 +41,7 @@ try:
     from bitsandbytes.nn import Params4bit
     HAS_BNB = True
 except Exception:
-    # Not just ImportError: a bitsandbytes built against a different torch
-    # raises AttributeError from its own import (for example
-    # torch._C._cuda_getCurrentRawStream missing on a CPU torch). Degrading
-    # to HAS_BNB = False beats taking the whole of unsloth_zoo down with it.
+    # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
     Params4bit = None
 
