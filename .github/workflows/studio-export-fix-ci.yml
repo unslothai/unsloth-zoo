@@ -17,7 +17,10 @@ on:
 
 concurrency:
   group: studio-export-fix-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Latest-only on branches, never on main. Pushes to main land in bursts, so
+  # cancelling superseded runs there throws away the run that would have
+  # reported a regression, and the run that writes the shared caches.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -48,9 +51,9 @@ jobs:
       UNSLOTH_COMPILE_DISABLE: '1'
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip

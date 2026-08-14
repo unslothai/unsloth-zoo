@@ -23,8 +23,9 @@ from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect
+import re
 
 global HAS_CUT_CROSS_ENTROPY
 global UNSLOTH_STUDIO_ENABLED
@@ -35,7 +36,13 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
-if DEVICE_TYPE == "cuda":
+if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
+    # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
+    # whether a device is present before asking what it can do. Cut cross
+    # entropy is a Triton GPU kernel and cannot run here regardless, so False is
+    # both the conservative answer and the only correct one.
+    HAS_CUT_CROSS_ENTROPY = False
+elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
@@ -74,7 +81,7 @@ __all__ = [
     "unsloth_fused_ce_loss",
 ]
 
-from .fused_losses import unsloth_fused_ce_loss
+from unsloth_zoo.fused_losses import unsloth_fused_ce_loss
 
 def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -335,6 +342,18 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         except Exception as exception:
             raise RuntimeError(exception)
     pass
+
+    # num_items_in_batch is set from the forward signature, but training_step
+    # divides by grad-accum off self.model_accepts_loss_kwargs. Counting while
+    # that flag is False normalises twice (TRL chunked_nll and our fused CE each
+    # divide by it), scaling loss and grads by 1/GA. Like stock
+    # Trainer._get_num_items_in_batch, only count when a consumer exists; these
+    # losses fall back to a mean when it is None.
+    if (num_items_in_batch is not None
+            and not getattr(self, "model_accepts_loss_kwargs", True)
+            and getattr(self, "compute_loss_func", None) is None):
+        num_items_in_batch = None
+
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
     

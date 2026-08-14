@@ -31,7 +31,7 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
-from ..utils import Version
+from unsloth_zoo.utils import Version
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -44,7 +44,7 @@ from .utils import (
     Cache,
     process_return,
 )
-from ..hf_utils import dtype_from_config
+from unsloth_zoo.hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
 # UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
@@ -1386,14 +1386,16 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
-from ..device_type import DEVICE_TYPE
+from unsloth_zoo.device_type import DEVICE_TYPE
 
 # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
 # with is_available() like device_synchronize() does.
 if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+    # Only total capacity is needed. mem_get_info() can create a device context at
+    # import time, leaving otherwise idle processes with persistent device memory.
+    device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+    device_memory = torch.cuda.get_device_properties(0).total_memory
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
@@ -2079,7 +2081,7 @@ def patch_GptOssAttention():
     if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
-        from ..flex_attention import (
+        from unsloth_zoo.flex_attention import (
             flex_attention_with_sink,
             is_flex_attention_decoding,
             flex_attention_with_sink_decoding,
@@ -2519,7 +2521,7 @@ def patch_GptOssModel():
             mk["cache_position"] = cache_position
         return mk
 
-    from ..flex_attention import (
+    from unsloth_zoo.flex_attention import (
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
         flex_attention_add_sinks,

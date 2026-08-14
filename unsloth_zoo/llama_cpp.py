@@ -121,16 +121,38 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+#
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
@@ -2318,6 +2340,21 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     return False
 
 
+def _converter_supports_no_mtp(converter_location):
+    """Return whether the selected converter declares the `--no-mtp` option."""
+    try:
+        source = Path(converter_location).read_bytes()
+    # Missing/unreadable path, or None and NUL-bearing ones: all mean "cannot
+    # prove support", and omitting --no-mtp just restores the old behaviour.
+    except (OSError, TypeError, ValueError):
+        return False
+    return re.search(
+        rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
+        source,
+        flags = re.DOTALL,
+    ) is not None
+
+
 def _find_bitsandbytes_quantization(config, _path = "config.json"):
     """Where a bitsandbytes `quantization_config` sits, or None.
 
@@ -2348,6 +2385,24 @@ def _converter_was_oom_killed(exc):
     if getattr(exc, "returncode", None) in (-9, 137):
         return True
     return "sigkill" in f"{exc}".lower()
+
+
+def _converter_rejected_no_mtp(text):
+    """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
+    if not text: return False
+    for line in text.splitlines():
+        low = line.lower()
+        if "--mtp" not in low and "--no-mtp" not in low and "--no-nextn" not in low:
+            continue
+        if "not supported" in low or "only supported" in low:
+            return True
+    return False
+
+
+def _drop_no_mtp(command):
+    """The same command without `--no-mtp`, or None when it has none to drop."""
+    if "--no-mtp" not in command: return None
+    return [token for token in command if token != "--no-mtp"]
 
 
 def _retry_with_temp_file(command):
@@ -2476,9 +2531,16 @@ def convert_to_gguf(
             "`config.json` was not changed."
         )
     _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _no_mtp = (
+        _mtp_declared
+        and not _keep_mtp
+        and _converter_supports_no_mtp(converter_location)
+    )
+    # Keep the declaration when `--no-mtp` carries the intent: deleting it made
+    # a retry or second export read none, omit the flag, and hit the assertion.
     _strip_keys = (
         ("unsloth_fixed_mtp",)
-        if _keep_mtp
+        if _keep_mtp or _no_mtp
         else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
     )
     _changed = False
@@ -2546,6 +2608,8 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
+        if _no_mtp:
+            text_args["--no-mtp"] = ""
         runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
@@ -2582,6 +2646,8 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
+        if _no_mtp:
+            args["--no-mtp"] = ""
         runs_to_do.append((args, final_output, "model", True))
 
     # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
@@ -2625,6 +2691,7 @@ def convert_to_gguf(
         # is broken. No cost on the happy path.
         attempted_repair = False
         attempted_temp_file = False
+        attempted_no_mtp_drop = False
         repair_note = ""
         optional_failed = False
         while True:
@@ -2658,6 +2725,16 @@ def convert_to_gguf(
                         repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                # `--no-mtp` is architecture-gated, so a config key alone cannot
+                # prove it is accepted. Retry once without it: the pre-existing
+                # behaviour, and correct for an arch with no MTP block to strip.
+                if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
+                    retry = _drop_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_drop = True
+                        command = retry
+                        continue
 
                 # OOM-killed: retry once spooling to disk, the one resource
                 # these machines have. Only for a kill, so a converter that

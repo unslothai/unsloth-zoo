@@ -66,7 +66,12 @@ include-package-data = false
 unsloth_zoo = ["diffusion_studio/*.html"]
 
 [tool.setuptools.packages.find]
-exclude = ["images*"]
+# Explicit include: auto-discovery shipped top-level tests/ and scripts/ into
+# site-packages, where they collide with every other wheel using those names.
+# Dotted rather than "unsloth_zoo*", which also matches a sibling like
+# unsloth_zoo_cache/ and would ship it as another top-level package.
+include = ["unsloth_zoo", "unsloth_zoo.*"]
+exclude = ["images*", "tests*", "scripts*"]
 
 [project.optional-dependencies]
 mlx = [

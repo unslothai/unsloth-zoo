@@ -22,8 +22,10 @@ its pinned pattern is gone.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
+import textwrap
 
 import pytest
 
@@ -425,11 +427,79 @@ def test_compiler_cross_entropy_find_3_shift_logits_pattern():
             )
 
 
+_QWEN2_VL_NEEDLE_4X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+# 4.53.1 - 4.53.3 pass attention_mask at the call site. compiler.py carries
+# its own entry for that spelling; leaving it out here failed the guard on a
+# supported version while the rewriter was working fine.
+_QWEN2_VL_NEEDLE_4X_ATTENTION_MASK = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                attention_mask=attention_mask,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+_QWEN2_VL_NEEDLE_5X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                max_seqlen=max_seqlen,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+
+_QWEN2_VL_SIG_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "kwargs",
+]
+_QWEN2_VL_SIG_ROTARY_ATTENTION_MASK = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "attention_mask", "kwargs",
+]
+_QWEN2_VL_SIG_NO_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "position_embeddings", "kwargs",
+]
+
+# (label, call-site spelling, block signature) triples the rewriter handles.
+# The call spelling ALONE does not determine the rewrite: transformers
+# 4.53.0 / 4.54 - 5.9 and 5.10 - 5.14 write the call identically and need
+# different treatment, because 5.10 dropped rotary_pos_emb from the block.
+_QWEN2_VL_VARIANTS = (
+    ("4.53.0 / 4.54 - 5.9  (rotary re-injected)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_ROTARY),
+    ("4.53.1 - 4.53.3  (rotary re-injected, attention_mask at the call site)",
+     _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK, _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK),
+    ("5.10 - 5.14  (no entry fires; the arg=arg demotion already fits)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_NO_ROTARY),
+    ("5.15+  (max_seqlen bound into the checkpointed callable)",
+     _QWEN2_VL_NEEDLE_5X, _QWEN2_VL_SIG_NO_ROTARY),
+)
+
+
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
-    """``unsloth_zoo/compiler.py:2192-2207`` pins the Qwen2-VL multiline
-    raw string ``hidden_states = blk(\\n hidden_states,\\n
-    cu_seqlens=cu_seqlens,\\n position_embeddings=position_embeddings,\\n
-    **kwargs,\\n )``. A re-indent silently no-ops."""
+    """``unsloth_zoo/compiler.py:2779-2848`` pins the Qwen2-VL multiline
+    raw strings ``hidden_states = blk(\\n hidden_states,\\n
+    cu_seqlens=cu_seqlens,\\n [max_seqlen=max_seqlen,\\n]
+    position_embeddings=position_embeddings,\\n **kwargs,\\n )``.
+    A re-indent silently no-ops.
+
+    transformers 4.x and 5.x spell the call differently: 5.x added
+    ``max_seqlen=max_seqlen`` (cu_seqlens/max_seqlen moved into
+    ``get_vision_attention_seqlens``) and dropped ``rotary_pos_emb`` from
+    ``Qwen2VLVisionBlock.forward``. The rewriter carries one entry per
+    spelling; pass if either is still present, fail if neither is.
+
+    The 5.x replacement drops ``max_seqlen`` (see
+    ``test_..._max_seqlen_is_recomputed`` below for why that is lossless)."""
     pytest.importorskip("transformers")
     try:
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
@@ -438,19 +508,372 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
     except ImportError:
         pytest.skip("Qwen2VisionTransformerPretrainedModel not in this build")
     src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
-    needle = (
-        "hidden_states = blk(\n"
-        "                hidden_states,\n"
-        "                cu_seqlens=cu_seqlens,\n"
-        "                position_embeddings=position_embeddings,\n"
-        "                **kwargs,\n"
-        "            )"
+    needle_4x = _QWEN2_VL_NEEDLE_4X
+    needle_4x_attention_mask = _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK
+    needle_5x = _QWEN2_VL_NEEDLE_5X
+    # 4.51.3 - 4.52.x spell the whole call on one line, and the same forward
+    # already calls ``self._gradient_checkpointing_func`` itself. That is the
+    # first thing patch_gradient_checkpointing() tests
+    # (``if "_gradient_checkpointing_func" in forward: return None``), so on
+    # those versions it returns None before the replacement list, before the
+    # ``for blk in ...`` regex and before the generic ``arg=arg`` demotion -
+    # nothing is rewritten and there is no pinned string that could have
+    # drifted. Skip on the early-return condition itself rather than on the
+    # one-line spelling, so this stays tied to the code path and not to a
+    # guess about how upstream formats the call.
+    if "_gradient_checkpointing_func" in src:
+        pytest.skip(
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
+        )
+    if not any(n in src for n in (needle_4x, needle_4x_attention_mask, needle_5x)):
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join((needle_4x, needle_4x_attention_mask, needle_5x)),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            "Qwen2VisionTransformerPretrainedModel.forward",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
+    """The rewriter in ``unsloth_zoo/compiler.py:2779-2848`` demotes every
+    ``arg=arg`` keyword to a positional, so the rewritten ``blk(...)`` call
+    only works if ``Qwen2VLVisionBlock.forward`` still takes
+    ``(hidden_states, cu_seqlens, [rotary_pos_emb,] position_embeddings)``
+    in that order. A reorder / rename binds arguments to the wrong
+    parameters instead of no-op'ing, so guard it separately from the
+    call-site string.
+
+    Names and order alone are not enough. Upstream can make
+    ``position_embeddings`` keyword-only without touching either: the name
+    list and its order are unchanged, so a name-only allowlist still passes
+    while the rewritten call keeps passing the tensor positionally and the
+    block raises ``TypeError``. So check ``Parameter.kind`` too - every named
+    parameter has to stay bindable positionally and ``kwargs`` has to stay a
+    real ``**kwargs``. Positional-only is accepted alongside
+    positional-or-keyword because the rewritten call site passes everything
+    positionally; only kinds that cannot take a positional argument
+    (keyword-only, ``*args``) break it."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2VLVisionBlock not in this build")
+    parameters = inspect.signature(Qwen2VLVisionBlock.forward).parameters
+    params = list(parameters)
+    accepted = (
+        # transformers 4.51.3 - 4.52.x -- no **kwargs on the block yet
+        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+         "position_embeddings"],
+        # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.9
+        _QWEN2_VL_SIG_ROTARY,
+        # transformers 4.53.1 - 4.53.3 -- attention_mask added as the fifth
+        # positional parameter (and passed by the call site); this is the
+        # variant the 4.x + attention_mask replacement entry in compiler.py
+        # targets. Gone again by 4.54.
+        _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK,
+        # transformers 5.10+ -- rotary_pos_emb dropped; from 5.15 max_seqlen
+        # rides in kwargs
+        _QWEN2_VL_SIG_NO_ROTARY,
     )
-    _assert_in_source(
-        needle, src,
-        "unsloth_zoo/compiler.py:2194-2199 (custom_gradient_checkpointing_replacements[0])",
-        "transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VisionTransformerPretrainedModel.forward",
+    if params not in accepted:
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join(str(a) for a in accepted),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            f"Qwen2VLVisionBlock.forward signature (got {params})",
+        )
+    positional_kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
     )
+    for name, parameter in parameters.items():
+        expected = (
+            (inspect.Parameter.VAR_KEYWORD,) if name == "kwargs"
+            else positional_kinds
+        )
+        if parameter.kind not in expected:
+            _drift(
+                "unsloth_zoo/compiler.py:2779-2848 "
+                "(custom_gradient_checkpointing_replacements)",
+                f"{name} as " + " OR ".join(str(k) for k in expected),
+                "transformers.models.qwen2_vl.modeling_qwen2_vl."
+                f"Qwen2VLVisionBlock.forward signature (got {name} as "
+                f"{parameter.kind})",
+            )
+
+
+def test_compiler_qwen2_vl_call_site_and_block_signature_are_a_known_pair():
+    """The two guards above accept any known call spelling and any known block
+    signature INDEPENDENTLY, and that is not enough.
+
+    transformers 5.10.0 - 5.14.1 shipped the 4.x call spelling together with the
+    5.x no-rotary block signature. Both guards above pass on those releases,
+    while the rewriter re-injected ``rotary_pos_emb`` and the rewritten forward
+    died with ``TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4
+    positional arguments but 5 were given``. Only the PAIR is diagnostic, so
+    pin the pair."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VisionTransformerPretrainedModel,
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2-VL vision classes not in this build")
+    src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
+    if "_gradient_checkpointing_func" in src:
+        pytest.skip(
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
+        )
+    params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
+    matched = [
+        label for label, needle, signature in _QWEN2_VL_VARIANTS
+        if needle in src and params == signature
+    ]
+    if not matched:
+        present = [
+            label for label, needle, _sig in _QWEN2_VL_VARIANTS if needle in src
+        ] or ["<no known call spelling>"]
+        _drift(
+            "unsloth_zoo/compiler.py "
+            "(custom_gradient_checkpointing_replacements, call site paired "
+            "with Qwen2VLVisionBlock.forward)",
+            " OR ".join(label for label, _n, _s in _QWEN2_VL_VARIANTS),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl: call site matches "
+            f"{present} but the block signature is {params}",
+        )
+
+
+def test_qwen2_vl_variant_table_is_the_pairing_the_rewriter_implements():
+    """Documents which pairs are supported, so the table above cannot silently
+    grow back into an "any call spelling with any signature" allowlist."""
+    pairs = {(needle, tuple(sig)) for _label, needle, sig in _QWEN2_VL_VARIANTS}
+    # 5.10 - 5.14: 4.x spelling, no rotary in the block. Supported because
+    # compiler.py now skips the rotary re-injection when the block dropped it.
+    assert (_QWEN2_VL_NEEDLE_4X, tuple(_QWEN2_VL_SIG_NO_ROTARY)) in pairs
+    # Never shipped and never handled: max_seqlen at the call site while the
+    # block still takes rotary_pos_emb. The 5.x entry removes max_seqlen and
+    # nothing re-adds rotary_pos_emb, so the block would lose a positional.
+    assert (_QWEN2_VL_NEEDLE_5X, tuple(_QWEN2_VL_SIG_ROTARY)) not in pairs
+
+
+_UNSET = object()
+
+_QWEN2_VL_MAX_SEQLEN_ZOO_SITE = (
+    "unsloth_zoo/compiler.py "
+    "(custom_gradient_checkpointing_replacements, 5.x entry)"
+)
+_QWEN2_VL_ATTN_PATH = (
+    "transformers.models.qwen2_vl.modeling_qwen2_vl.VisionAttention.forward"
+)
+
+
+def _qwen2_vl_max_seqlen_recompute_call(forward_src: str):
+    """Return the ``ast.Call`` for the ``max_seqlen = get_max_seqlen(...)``
+    recompute inside ``VisionAttention.forward``, or ``None``."""
+    tree = ast.parse(textwrap.dedent(forward_src))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and
+                node.targets[0].id == "max_seqlen"):
+            continue
+        call = node.value
+        if (isinstance(call, ast.Call) and
+                isinstance(call.func, ast.Name) and
+                call.func.id == "get_max_seqlen"):
+            return call
+    return None
+
+
+def _qwen2_vl_run_vision_attention(attn, hidden_states, cu_seqlens,
+                                   position_embeddings,
+                                   max_seqlen = _UNSET):
+    """Execute the real ``VisionAttention.forward`` on CPU and report the
+    packed-sequence lengths it handed to the attention backend.
+
+    The backend is swapped for a recorder by rebinding
+    ``ALL_ATTENTION_FUNCTIONS`` in the globals of the forward under test, so
+    this needs no flash-attn build and no GPU, and leaves the global attention
+    registry untouched. Passing ``max_seqlen`` reproduces the upstream call
+    site; omitting it reproduces the call the zoo rewriter emits.
+
+    Returns ``(max_length_q, max_length_k, attn_output)``."""
+    seen = {}
+
+    class _Recorder:
+        def get_interface(self, attn_implementation, default):
+            def _record(module, query, key, value, attention_mask = None,
+                        **kwargs):
+                seen.update(kwargs)
+                seq_length = query.shape[2]
+                return query.transpose(1, 2).reshape(1, seq_length, -1), None
+            return _record
+
+    forward_globals = type(attn).forward.__globals__
+    old = forward_globals["ALL_ATTENTION_FUNCTIONS"]
+    forward_globals["ALL_ATTENTION_FUNCTIONS"] = _Recorder()
+    try:
+        if max_seqlen is _UNSET:
+            out = attn(hidden_states, cu_seqlens, position_embeddings)
+        else:
+            out = attn(hidden_states, cu_seqlens, position_embeddings,
+                       max_seqlen = max_seqlen)
+    finally:
+        forward_globals["ALL_ATTENTION_FUNCTIONS"] = old
+    return seen.get("max_length_q"), seen.get("max_length_k"), out
+
+
+def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
+    """The guard body, factored out so a mutated ``VisionAttention`` can be
+    pushed through exactly the checks that ship (see
+    ``tests/mutants/qwen2_vl_max_seqlen_mutants.py``)."""
+    import torch
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+        get_vision_attention_seqlens,
+    )
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import (
+        Qwen2VLVisionConfig,
+    )
+    if forward_src is None:
+        forward_src = inspect.getsource(attn_cls.forward)
+
+    # (1) Pin the call expression itself, not just the presence of the name.
+    call = _qwen2_vl_max_seqlen_recompute_call(forward_src)
+    if call is None:
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "max_seqlen = get_max_seqlen(...)",
+            _QWEN2_VL_ATTN_PATH,
+        )
+    receiver = ast.unparse(call.args[0]) if call.args else "<no arguments>"
+    if receiver != "cu_seqlens":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(cu_seqlens, ...) -- recomputed from the very "
+            "cu_seqlens the rewritten blk(...) call still passes positionally",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got get_max_seqlen({receiver}, ...))",
+        )
+    keywords = {kw.arg: kw.value for kw in call.keywords}
+    precomputed = (
+        ast.unparse(keywords["kwargs"]) if "kwargs" in keywords
+        else "<no kwargs= argument>"
+    )
+    if precomputed != "{'max_seqlen': max_seqlen}":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(..., kwargs = {'max_seqlen': max_seqlen}) -- the "
+            "precomputed slot must be the block's own parameter, which is None "
+            "is the block's own parameter, which the rewriter now binds "
+                "into the checkpointed callable (and which is None whenever a "
+                "caller omits it)",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got kwargs = {precomputed})",
+        )
+
+    # (2) Execute the path. Flash attention is the only branch that consumes
+    # max_seqlen, so request it; the backend itself is stubbed out.
+    config = Qwen2VLVisionConfig(embed_dim = 8, num_heads = 2, hidden_size = 8)
+    config._attn_implementation = "flash_attention_2"
+    torch.manual_seed(0)
+    attn = attn_cls(config)
+
+    # Two ragged images -> 4 and 5 tokens, so max_seqlen (5) differs from both
+    # the token count (9) and the first segment (4): a recompute off the wrong
+    # tensor cannot coincidentally match.
+    grid_thw = torch.tensor([[1, 2, 2], [1, 1, 5]], dtype = torch.long)
+    cu_seqlens, caller_max_seqlen = get_vision_attention_seqlens(
+        grid_thw, config, kwargs = {},
+    )
+    assert caller_max_seqlen == 5, (
+        "test fixture is stale: get_vision_attention_seqlens returned "
+        f"{caller_max_seqlen} for grid {grid_thw.tolist()}, expected 5"
+    )
+    seq_length = int(cu_seqlens[-1])
+    head_dim = config.embed_dim // config.num_heads
+    hidden_states = torch.randn(seq_length, config.embed_dim)
+    angles = torch.arange(seq_length, dtype = torch.float32).unsqueeze(1) * 0.1
+    position_embeddings = (
+        torch.cos(angles).expand(seq_length, head_dim).contiguous(),
+        torch.sin(angles).expand(seq_length, head_dim).contiguous(),
+    )
+
+    # Upstream's own call site: max_seqlen precomputed and forwarded.
+    kept = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+        max_seqlen = caller_max_seqlen,
+    )
+    # The fallback: keyword absent, value recomputed from cu_seqlens.
+    dropped = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+    )
+    for label, (got_q, got_k, _) in (("with max_seqlen", kept),
+                                     ("with max_seqlen dropped", dropped)):
+        if (got_q, got_k) != (caller_max_seqlen, caller_max_seqlen):
+            _drift(
+                _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+                f"max_length_q/max_length_k == {caller_max_seqlen} "
+                f"({label})",
+                _QWEN2_VL_ATTN_PATH,
+                f"(got max_length_q={got_q}, max_length_k={got_k}; dropping "
+                "max_seqlen from the rewritten blk(...) call would silently "
+                "change vision attention)",
+            )
+    if not torch.equal(kept[2], dropped[2]):
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "identical VisionAttention output with and without max_seqlen",
+            _QWEN2_VL_ATTN_PATH,
+            "(outputs diverge -- dropping the keyword is no longer lossless)",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
+    """Safety net behind the transformers 5.x entry in
+    ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``.
+
+    The entry no longer drops ``max_seqlen=max_seqlen``: it removes it from the
+    positional argument list (where the ``arg=arg`` demotion would push it into
+    a slot the block does not have, and where it would bind to
+    ``self._gradient_checkpointing_func`` - which is often plain
+    ``torch.utils.checkpoint.checkpoint`` and raises ``Unexpected keyword
+    arguments``) and re-adds it bound into the callable with
+    ``functools.partial``. That the value now ARRIVES at the block is pinned by
+    ``tests/test_gc_rewriter_bound_keywords.py``.
+
+    This guard pins the fallback that made dropping it survivable in the first
+    place, and it is still load-bearing: it is what makes a mis-bound or lost
+    ``max_seqlen`` degrade into a recompute rather than into wrong attention.
+    ``VisionAttention.forward`` must keep recomputing the value off the same
+    ``cu_seqlens`` the rewritten call passes, with the precomputed slot honoured.
+    Merely finding a ``get_max_seqlen(`` call somewhere in the forward proves
+    nothing: upstream could keep the call and feed it a different tensor, a
+    config-derived cap, or ignore the precomputed value. So pin the call
+    expression AND execute the forward twice on CPU -- once with the keyword,
+    once without -- and require the packed-sequence lengths and the attention
+    output to be identical."""
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    try:
+        # Imported for existence only -- 4.x has neither helper, and the
+        # rewriter entry these guard is 5.x-only.
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (  # noqa: F401
+            get_max_seqlen, get_vision_attention_seqlens, VisionAttention,
+        )
+    except ImportError:
+        pytest.skip("get_max_seqlen / VisionAttention not in this build (4.x)")
+
+    _assert_qwen2_vl_max_seqlen_recomputed(VisionAttention)
 
 
 def test_compiler_moe_routing_weights_cast_pattern():
