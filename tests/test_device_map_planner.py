@@ -1812,6 +1812,44 @@ def test_a_sub_config_left_as_a_dict_is_still_read():
     assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
 
 
+@pytest.mark.parametrize("model_type", ["aya_vision", "cohere2_vision"])
+def test_a_wrapper_that_re_heads_its_text_tower_claims_no_transform(model_type):
+    """Aya Vision and Cohere 2 Vision build a bare `AutoModel` text tower and put
+    their own `nn.Linear` lm_head on top, so `logits = self.lm_head(...)` with no
+    scale; `logit_scale` does not appear in either modeling file. The Cohere 2
+    config they carry still declares it, and crediting it reserves a temporary
+    nobody allocates."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    config = CONFIG_MAPPING[model_type]()
+    assert getattr(config.text_config, "logit_scale", None)   # the trap is real
+    assert detect_logit_transforms(config)["logit_scale_multiply"] == 0.0
+
+
+def test_a_wrapper_that_reuses_the_causal_lm_head_keeps_its_transform():
+    """The other half of the rule. Granite Speech builds an
+    `AutoModelForCausalLM`, so the divide happens inside the text model and the
+    reserve is still owed, even though `logits_scaling` never appears in Granite
+    Speech's own file."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    config = CONFIG_MAPPING["granite_speech"]()
+    assert detect_logit_transforms(config)["logit_scale_divide"] == \
+        config.text_config.logits_scaling
+
+
+@pytest.mark.parametrize("wrapper", ["module", "_orig_mod"])
+def test_a_wrapped_model_still_reports_its_transforms(wrapper):
+    """`nn.Module.__getattr__` resolves submodules and parameters, not plain
+    attributes, so DistributedDataParallel and torch.compile wrappers have no
+    `.config` and the model inside would read as transform-free."""
+    inner = nn.Module()
+    inner.config = _Cfg(final_logit_softcapping = 30.0)
+    outer = nn.Module()
+    setattr(outer, wrapper, inner)
+    assert detect_logit_transforms(outer)["logit_softcapping"] == 30.0
+
+
 def test_a_config_that_hands_back_itself_terminates():
     class _Circular:
         final_logit_softcapping = 20.0

@@ -190,6 +190,41 @@ def _config_attr(holder, name, default = None):
 _TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
 
 
+def _model_config(model_or_config):
+    """The config, through the wrappers a training model arrives in.
+
+    ``nn.Module.__getattr__`` resolves submodules and parameters, not plain
+    attributes, so a ``DistributedDataParallel`` or a ``torch.compile`` wrapper
+    has no ``.config`` of its own and the transforms of the model inside would
+    read as none at all. PEFT already forwards ``config``, so unwrapping the two
+    that do not is enough. Anything that is already a config falls straight
+    through, since it has no ``.config`` either.
+    """
+    obj = model_or_config
+    for _ in range(4):
+        config = _config_attr(obj, "config")
+        if config is not None:
+            return config
+        inner = _config_attr(obj, "module")
+        if inner is None:
+            inner = _config_attr(obj, "_orig_mod")
+        if inner is None or inner is obj:
+            break
+        obj = inner
+    return model_or_config
+
+
+# Composite wrappers that build their own ``lm_head`` over a bare ``AutoModel``
+# text tower instead of reusing the family's ``*ForCausalLM``. The tower's config
+# still carries the family's scale, but the wrapper's ``forward`` never applies
+# it, so crediting it reserves a temporary nobody allocates. Both were confirmed
+# against ``modeling_aya_vision.py`` / ``modeling_cohere2_vision.py``, where
+# ``logit_scale`` does not appear at all. Contrast Granite Speech, which builds
+# an ``AutoModelForCausalLM`` and so does divide, and Gemma 3n, which re-applies
+# the soft cap in its own ``forward``; neither belongs here.
+_OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
+
+
 def _text_configs(config):
     """``config`` and every text sub-config it exposes, outermost first.
 
@@ -250,11 +285,16 @@ def detect_logit_transforms(model_or_config) -> dict:
         "logit_scale_divide": 0.0,
     }
     try:
-        config = _config_attr(model_or_config, "config", model_or_config)
+        config = _model_config(model_or_config)
         if config is None:
             return zero
         found = dict(zero)
+        # A wrapper that re-heads its text tower carries the tower's config, and
+        # so its transforms, without ever applying them.
+        own_head = _config_attr(config, "model_type") in _OWN_UNTRANSFORMED_HEAD
         for holder in _text_configs(config):
+            if own_head and holder is not config:
+                continue
             for key, names in (
                 ("logit_softcapping",
                  ("final_logit_softcapping", "logits_soft_cap",
