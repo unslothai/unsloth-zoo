@@ -269,15 +269,11 @@ def _normalize_packed_seq_lengths(seq_lengths):
             lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
         if lengths.ndim != 1:
             lengths = lengths.reshape(-1)
-        # Everything through the last read stays inside the try. Dropping the
-        # non-positive entries is a boolean mask, so it lowers to aten.nonzero,
-        # whose output shape is data dependent: under FakeTensorMode it raises
-        # DynamicOutputShapeException and under vmap it raises outright. Left
-        # outside, those escape into the caller's `except Exception: raise
-        # RuntimeError(...)`, which is a dead training run rather than the
-        # missing correction this helper promises. Filtering is not optional --
-        # a zero-length entry would otherwise duplicate a start, and a negative
-        # one would corrupt every later cumsum.
+        # Filtering is mandatory (a 0 length duplicates a start, a negative one
+        # corrupts every later cumsum) and must stay inside the try: the mask
+        # lowers to aten.nonzero, which raises DynamicOutputShapeException under
+        # FakeTensorMode and raises under vmap. Escaping into the caller's
+        # `except Exception: raise RuntimeError(...)` kills the run.
         lengths = lengths[lengths > 0]
         if lengths.numel() <= 1: return None
     except Exception:
@@ -365,36 +361,26 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     mark_dynamic(token_type_ids, 1)
                 seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
                 if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
-                    # Packing N documents leaves N-1 internal boundaries that are not
-                    # valid training positions. Zero those exact slots instead of
-                    # subtracting N-1 from the total: whatever already wrote -100
-                    # there would otherwise be charged for them twice, which
-                    # under-counts num_items_in_batch and inflates loss and grads.
-                    # Collators that already mask them include TRL >= 0.23.1, which
-                    # sets labels[position_ids == 0] = -100, transformers'
-                    # DataCollatorWithFlattening on every version, and
-                    # completion_only_loss / assistant_masks on every TRL version.
-                    # So the arithmetic has to be idempotent rather than version
-                    # detected.
+                    # Packing N documents leaves N-1 internal boundaries that are
+                    # not valid training positions. Zero those exact slots rather
+                    # than subtract N-1: many collators already mask them (TRL
+                    # >= 0.23.1 labels[position_ids == 0] = -100, transformers'
+                    # DataCollatorWithFlattening, completion_only_loss /
+                    # assistant_masks), so subtracting double counts them and
+                    # inflates loss and grads. Zeroing is idempotent and cannot
+                    # go below zero; subtracting had no lower bound and drove the
+                    # count to zero or negative on small batches.
                     #
-                    # Subtracting also had no lower bound: on a batch whose live
-                    # targets number fewer than N, the old count went to zero or
-                    # negative, so the loss divided by zero or changed sign. Zeroing
-                    # slots that may already be False cannot go below zero.
+                    # labels[..., 1:] already dropped column 0 of every row, so a
+                    # document starting at flat index s sits at column s - 1, and
+                    # one starting at a row boundary is already gone. cumsum[:-1]
+                    # drops the trailing boundary, making a single document a
+                    # provable no-op and keeping truncated metadata harmless.
                     #
-                    # labels[..., 1:] above already dropped the first token of every
-                    # row, so a document starting at flat index s sits at column s - 1
-                    # of its row here, and a document starting at a row boundary
-                    # (col 0) was eaten by that slice already. cumsum(...)[:-1] leaves
-                    # out the trailing boundary, which makes a single document a
-                    # provable no-op and stops truncated metadata from ever killing a
-                    # live target.
-                    #
-                    # This block has its own unprotected data-dependent reads
-                    # (rows[keep], then rows.numel()). They are safe only because
-                    # _normalize_packed_seq_lengths returns None first under any
-                    # mode that cannot evaluate them, so nothing here ever runs on
-                    # a tensor whose shape is unbacked. Keep that ordering.
+                    # The data-dependent reads below (rows[keep], rows.numel())
+                    # are unprotected, and safe only because
+                    # _normalize_packed_seq_lengths already returned None under
+                    # any mode that cannot evaluate them. Keep that ordering.
                     n_shift = token_count.shape[-1]
                     n_rows  = token_count.numel() // n_shift
                     starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]

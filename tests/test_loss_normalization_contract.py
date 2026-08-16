@@ -180,12 +180,10 @@ def _fake_trainer(model, accepts, compute_loss_func = None):
     t.accelerator = Accelerator()
     t.model_accepts_loss_kwargs = accepts
     t.compute_loss_func = compute_loss_func
-    # transformers 5.x reads this INSIDE the try that counts labels, and the except
-    # swallows AttributeError. A stand-in without it therefore does not measure stock's
-    # decision at all: stock raises on the first list comprehension, returns None, and a
-    # differential test reads that as "stock declined to count". Every real Trainer sets
-    # it in __init__. True is the value for this fixture's model, which shifts labels
-    # internally like any causal LM, which is exactly the case the flag selects.
+    # transformers 5.x reads this inside the try that counts labels, and the except
+    # swallows the AttributeError, so a stand-in without it makes stock look like it
+    # declined to count. Every real Trainer sets it; True matches this fixture's model,
+    # which shifts labels internally like any causal LM.
     t._loss_shifts_labels = True
     return t
 
@@ -261,16 +259,13 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
 
 # Packed / padding-free boundary counting.
 #
-# Packing N documents into a flat row leaves N-1 internal boundaries whose next
-# token prediction crosses a document, so the count has to exclude them. Doing
-# that by subtracting N-1 from the total double counts every boundary a collator
-# had already masked with -100, which under-counts num_items_in_batch and so
-# inflates loss and every gradient. TRL >= 0.23.1 masks them (labels[position_ids
-# == 0] = -100) and completion_only_loss / assistant_masks mask them on every TRL
-# version including 0.22.2, so the arithmetic must be idempotent, not version
-# detected. unsloth's enable_padding_free_metadata attaches packed_seq_lengths
-# even when packing is off, one entry per example, so this reaches ordinary LoRA
-# runs with per_device_train_batch_size > 1.
+# The N-1 internal boundaries of a packed row are not training positions, but
+# subtracting N-1 double counts every boundary a collator already masked with
+# -100 (TRL >= 0.23.1 labels[position_ids == 0] = -100, completion_only_loss /
+# assistant_masks on every version), under-counting num_items_in_batch and
+# inflating loss and grads. So the arithmetic must be idempotent, not version
+# detected. unsloth attaches packed_seq_lengths even when packing is off, so
+# this reaches ordinary LoRA runs with per_device_train_batch_size > 1.
 
 
 def _padding_free_batch(lengths, premask_starts = False, completion_only = 0):
@@ -424,8 +419,8 @@ def test_completion_only_masking_is_not_double_subtracted():
     batch = _padding_free_batch(lengths, completion_only = 3)
     counted = _counted(batch)
     assert counted == _true_target_count(batch["labels"], lengths)
-    # 4 documents x 5 tokens, first 3 of each masked, minus the boundary targets
-    # that are already inside the masked prefixes.
+    # 4 documents x 5 tokens, first 3 of each masked; the boundary targets are
+    # already inside those masked prefixes.
     assert counted == 8, f"counted {counted}, expected 8"
 
 
@@ -451,9 +446,9 @@ def test_lengths_overrunning_the_batch_do_not_kill_live_targets():
     not. Boundaries past the end of the batch must be dropped, not wrapped onto a
     row that is really there."""
     torch = pytest.importorskip("torch")
-    # 5 puts a boundary at flat 15, past the end of a 10 token batch and NOT on a
-    # row start, so only the rows < n_rows filter can catch it. Without it this
-    # raises IndexError inside the try that re-raises as RuntimeError.
+    # 5 puts a boundary at flat 15: past a 10 token batch and not on a row start,
+    # so only the rows < n_rows filter catches it. Without it, IndexError inside
+    # the try that re-raises as RuntimeError.
     for overrun in ([4, 3, 3, 5, 50], [4, 3, 3, 50, 50], [4, 3, 3, 1]):
         batch = _padding_free_batch([4, 3, 3])
         batch["packed_seq_lengths"] = torch.tensor(overrun, dtype = torch.int32)
@@ -504,8 +499,7 @@ def test_multi_row_boundaries_map_row_major():
     }
     counted = _counted(batch)
     # 12 tokens, 3 row starts dropped by the slice, boundaries at flat 3 and 8.
-    # Flat 8 is a row start (row 2 column 0) and is already gone, so only flat 3
-    # is a live boundary to remove.
+    # Flat 8 is a row start and already gone, so only flat 3 is live.
     assert counted == _true_target_count(batch["labels"], lengths) == 8, (
         f"counted {counted}, expected 8"
     )
@@ -599,11 +593,9 @@ def test_the_counting_path_does_not_raise_on_a_traced_tensor():
             "packed_seq_lengths": torch.tensor([4, 3, 3], dtype = torch.int32),
         }
         mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
-        # Called directly rather than through _counted, which ends in int(count):
-        # that is a .item() and raises on a fake tensor all by itself, which would
-        # make this test fail for a reason that has nothing to do with the code
-        # under test. No assertion on the number either, since under a fake tensor
-        # there is no number. The contract is only that it does not end the run.
+        # Called directly, not through _counted: its int(count) is a .item() that
+        # raises on a fake tensor by itself. No number exists under a fake tensor
+        # either, so the only contract here is that it does not end the run.
         fn(_fake_trainer(_tiny_model(), True), iter([batch]), 1)
 
 
@@ -632,10 +624,8 @@ def test_the_count_can_never_go_negative():
             lengths, premask_starts = premask, completion_only = completion_only,
         )
         counted = _counted(batch)
-        # The bound first. Asserting it after the equality below would make it dead:
-        # every expected value here is >= 1, so the equality can never leave a
-        # negative count for this to catch, and the invariant the test is named for
-        # would never actually be exercised.
+        # The bound first: after the equality below it would be dead, since every
+        # expected value here is >= 1 and no negative count could ever reach it.
         assert counted is not None and counted > 0, (
             f"lengths={lengths} completion_only={completion_only}: num_items_in_batch "
             f"came back {counted}. A non-positive count makes the loss divide by zero "
@@ -661,8 +651,7 @@ def test_the_real_installed_trl_collator_is_counted_correctly():
         cls = getattr(candidate, "DataCollatorForLanguageModeling", None)
         if cls is not None: break
     if cls is None: pytest.skip("this TRL has no DataCollatorForLanguageModeling")
-    # return_position_ids only exists on some releases; padding_free implies it on
-    # the rest.
+    # return_position_ids only exists on some releases; padding_free implies it elsewhere.
     collator = None
     for kwargs in ({"return_position_ids": True}, {}):
         try:
@@ -761,11 +750,10 @@ def test_guard_returns_a_count_exactly_when_stock_transformers_would():
                 f"accepts={accepts} compute_loss_func={loss_func is not None}: "
                 f"we returned {ours!r} where stock returned {theirs!r}"
             )
-            # Where stock counts over labels[..., 1:] the COUNT has to agree too, not
-            # just whether one was produced. transformers adopted that rule in 5.x
-            # (position 0 of a row is never a prediction target for a causal LM); zoo
-            # has always counted that way, so before 5.x the two legitimately differ by
-            # one token per row and only the nullity above is a shared contract.
+            # Where stock counts over labels[..., 1:] the count must agree too, not
+            # just whether one was produced. transformers adopted that rule in 5.x;
+            # zoo always counted that way, so before 5.x the two legitimately differ
+            # by one token per row and only the nullity above is shared.
             if _stock_counts_shifted_labels(stock) and ours is not None:
                 assert int(ours) == int(theirs), (
                     f"accepts={accepts} compute_loss_func={loss_func is not None}: "
