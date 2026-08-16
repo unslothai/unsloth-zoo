@@ -198,6 +198,8 @@ def detect_logit_transforms(model_or_config) -> dict:
     * ``final_logit_softcapping`` (Gemma 2/3/3n, T5Gemma, VaultGemma) and its
       RecurrentGemma spelling ``logits_soft_cap``.
     * ``logit_scale`` multiplies the logits (Cohere, Cohere 2).
+    * ``lm_head_multiplier`` multiplies them too (Falcon-H1, which applies it on
+      the ``lm_head`` call itself rather than on a following line).
     * ``logits_scaling`` divides them (Granite and its MoE variants).
 
     Both scale fields are applied unguarded in their ``forward``, so the buffer
@@ -221,7 +223,7 @@ def detect_logit_transforms(model_or_config) -> dict:
         for holder in _text_configs(config):
             for key, names in (
                 ("logit_softcapping", ("final_logit_softcapping", "logits_soft_cap")),
-                ("logit_scale_multiply", ("logit_scale",)),
+                ("logit_scale_multiply", ("logit_scale", "lm_head_multiplier")),
                 ("logit_scale_divide", ("logits_scaling",)),
             ):
                 if found[key]:

@@ -1608,6 +1608,8 @@ class _MethodOnlyTextConfig:
         (_Cfg(logit_scale = 0.0625), (0.0, 0.0625, 0.0)),
         # Granite and its MoE variants divide.
         (_Cfg(logits_scaling = 16.0), (0.0, 0.0, 16.0)),
+        # Falcon-H1 multiplies, on the lm_head call line rather than after it.
+        (_Cfg(lm_head_multiplier = 4.0), (0.0, 4.0, 0.0)),
         # Llama and friends transform nothing.
         (_Cfg(), (0.0, 0.0, 0.0)),
     ],
