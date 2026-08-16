@@ -310,7 +310,10 @@ def detect_logit_transforms(model_or_config) -> dict:
                         continue
                     try:
                         found[key] = float(value)
-                    except (TypeError, ValueError):
+                    except Exception:
+                        # Anything at all: a huge int raises OverflowError, not
+                        # ValueError, and falling through to the outer handler
+                        # would discard the fields already read.
                         continue
                     break
         return found

@@ -1770,6 +1770,37 @@ def test_a_non_numeric_alias_falls_through_to_the_next_one():
     assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
 
 
+@pytest.mark.parametrize(
+    "junk",
+    [
+        ["not a number"],                    # TypeError
+        "twenty",                            # ValueError
+        10 ** 400,                           # OverflowError, not a ValueError
+        torch.tensor([1.0, 2.0]),            # ValueError from torch
+    ],
+)
+def test_no_conversion_error_discards_the_fields_already_read(junk):
+    config = _Cfg(final_logit_softcapping = 30.0, logit_scale = junk)
+    found = detect_logit_transforms(config)
+    assert found["logit_softcapping"] == 30.0
+    assert found["logit_scale_multiply"] == 0.0
+
+
+@pytest.mark.parametrize("value", [0.0, 0, -0.0, False])
+def test_a_zero_scale_reserves_nothing(value):
+    """The headroom sizes the chunked loss, and that loss guards every transform
+    on `!= 0.0` (`rl_replacements.py`, `if logit_scale_multiply != 0.0`). At zero
+    it allocates no scaled copy, so reserving one would reserve for nothing. The
+    `bool` cast is what keeps the two in step."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(logit_scale = value)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    off = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = False,
+    )
+    assert auto.headroom_bytes == off.headroom_bytes
+
+
 def test_the_xlstm_spelling_of_the_soft_cap():
     """xLSTM calls it `output_logit_soft_cap`, defaults it to 30.0 and applies it
     unguarded (`modeling_xlstm.py`, `logits = soft_cap(logits, ...)`), so
