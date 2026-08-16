@@ -30,15 +30,24 @@ import pytest
 UTILS = (Path(__file__).resolve().parents[1] / "unsloth_zoo"
          / "temporary_patches" / "utils.py")
 
+_HELPER_NAMES = (
+    "torch_supports_float8_e8m0fnu",
+    "_temporary_float8_e8m0fnu_import_stub",
+    "require_native_float8_e8m0fnu",
+)
 
-def _load_helpers():
+
+def _helper_namespace(torch_mod, *, include_require_native: bool = False):
+    """Extract e8m0 helpers with the same module globals they expect at runtime."""
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
-    wanted = {
-        "_temporary_float8_e8m0fnu_import_stub",
-        "torch_supports_float8_e8m0fnu",
-        "require_native_float8_e8m0fnu",
+    wanted = set(_HELPER_NAMES)
+    if not include_require_native:
+        wanted.discard("require_native_float8_e8m0fnu")
+    ns: dict = {
+        "torch": torch_mod,
+        "contextlib": __import__("contextlib"),
+        "_E8M0_IMPORT_STUB_ACTIVE": False,
     }
-    ns: dict = {"contextlib": __import__("contextlib")}
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in wanted:
             exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
@@ -47,31 +56,9 @@ def _load_helpers():
     return ns
 
 
-HELPERS = _load_helpers()
-temporary_stub = HELPERS["_temporary_float8_e8m0fnu_import_stub"]
-supports = HELPERS["torch_supports_float8_e8m0fnu"]
-require_native = HELPERS["require_native_float8_e8m0fnu"]
-
-
-def _run_temporary_stub(torch_mod):
-    tree = ast.parse(UTILS.read_text(encoding="utf-8"))
-    ns = {
-        "torch": torch_mod,
-        "contextlib": __import__("contextlib"),
-        "_E8M0_IMPORT_STUB_ACTIVE": False,
-    }
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in (
-            "torch_supports_float8_e8m0fnu",
-            "_temporary_float8_e8m0fnu_import_stub",
-        ):
-            exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
-    return ns["_temporary_float8_e8m0fnu_import_stub"]
-
-
 def test_temporary_stub_aliases_e4m3_only_during_context():
     torch_mod = types.SimpleNamespace(float8_e4m3fn = object())
-    stub = _run_temporary_stub(torch_mod)
+    stub = _helper_namespace(torch_mod)["_temporary_float8_e8m0fnu_import_stub"]
     with stub() as used:
         assert used is True
         assert torch_mod.float8_e8m0fnu is torch_mod.float8_e4m3fn
@@ -81,7 +68,7 @@ def test_temporary_stub_aliases_e4m3_only_during_context():
 def test_temporary_stub_is_noop_when_e8m0_already_exists():
     sentinel = object()
     torch_mod = types.SimpleNamespace(float8_e8m0fnu = sentinel)
-    stub = _run_temporary_stub(torch_mod)
+    stub = _helper_namespace(torch_mod)["_temporary_float8_e8m0fnu_import_stub"]
     with stub() as used:
         assert used is False
         assert torch_mod.float8_e8m0fnu is sentinel
@@ -121,6 +108,9 @@ def test_require_native_raises_when_e8m0_missing():
     if hasattr(torch, "float8_e8m0fnu"):
         pytest.skip("need torch without native e8m0 for this check")
 
+    require_native = _helper_namespace(
+        torch, include_require_native = True,
+    )["require_native_float8_e8m0fnu"]
     with pytest.raises(RuntimeError, match="PyTorch >= 2.7"):
         require_native()
 
@@ -136,7 +126,9 @@ def test_old_transformers_bind_inside_temporary_stub():
     if hasattr(torch, "float8_e8m0fnu"):
         pytest.skip("need torch without native e8m0 for this check")
 
-    stub = _run_temporary_stub(torch)
+    helpers = _helper_namespace(torch, include_require_native = True)
+    stub = helpers["_temporary_float8_e8m0fnu_import_stub"]
+    require_native = helpers["require_native_float8_e8m0fnu"]
     with stub():
         _UE8M0_SF_DTYPE = torch.float8_e8m0fnu  # noqa: N806
         assert _UE8M0_SF_DTYPE is torch.float8_e4m3fn
