@@ -495,3 +495,130 @@ def test_a_failed_install_is_not_marked_available(monkeypatch):
     assert getattr(import_utils, f"_{_SECOND_BACKEND}_available") is False
     # The one that did install is still refreshed, or the retry buys nothing.
     assert getattr(import_utils, f"_{_BACKEND}_available") is True
+
+
+# ---------------------------------------------------------------------------
+# 4. _in_venv: the running interpreter decides, not an inherited variable.
+#
+# The mirror image of (2). `--python sys.executable` stopped uv installing into
+# whatever VIRTUAL_ENV / CONDA_PREFIX happened to name, but `_in_venv()` still
+# read those same variables, and it gates two decisions: whether `_pip_install`
+# hands the job to uv at all, and whether `_pip_command` probes for write access
+# and falls back to `--user`. Under the kernel mismatch this module exists to
+# handle (interpreter A running, variables inherited from environment B) a stale
+# variable made every one of those decisions as if A were a venv, while the
+# installers kept targeting A's site-packages.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_environments(tmp_path, monkeypatch):
+    """Interpreter A is running; B is a real, different directory it is not in."""
+    a = tmp_path / "envA"
+    b = tmp_path / "envB"
+    a.mkdir()
+    b.mkdir()
+    monkeypatch.delattr(sys, "real_prefix", raising = False)
+    monkeypatch.setattr(sys, "prefix", str(a))
+    monkeypatch.setattr(sys, "base_prefix", str(a))   # A is not itself a venv
+    monkeypatch.delenv("VIRTUAL_ENV", raising = False)
+    monkeypatch.delenv("CONDA_PREFIX", raising = False)
+    return types.SimpleNamespace(a = a, b = b)
+
+
+@pytest.fixture
+def unwritable_site(tmp_path, monkeypatch):
+    """A site-packages path the write probe cannot create, for any uid."""
+    blocker = tmp_path / "not_a_directory"
+    blocker.write_text("")
+    target = blocker / "site-packages"
+    monkeypatch.setattr(notebook_deps.site, "getsitepackages", lambda: [str(target)])
+    monkeypatch.setattr(notebook_deps.os, "geteuid", lambda: 1000, raising = False)
+    return target
+
+
+@pytest.mark.parametrize("variable", ["VIRTUAL_ENV", "CONDA_PREFIX"])
+def test_in_venv_ignores_an_activation_variable_for_another_environment(
+    two_environments, monkeypatch, variable,
+):
+    monkeypatch.setenv(variable, str(two_environments.b))
+    assert notebook_deps._in_venv() is False, (
+        f"{variable} points at an environment the running interpreter is not in, "
+        f"so it says nothing about where sys.executable installs to"
+    )
+
+
+@pytest.mark.parametrize("variable", ["VIRTUAL_ENV", "CONDA_PREFIX"])
+def test_in_venv_trusts_a_variable_naming_the_running_prefix(
+    two_environments, monkeypatch, variable,
+):
+    """conda environments have base_prefix == prefix, so the variable is all they have."""
+    monkeypatch.setenv(variable, str(two_environments.a))
+    assert notebook_deps._in_venv() is True
+
+
+def test_in_venv_reads_the_interpreter_when_no_variable_is_set(two_environments, monkeypatch):
+    assert notebook_deps._in_venv() is False
+    monkeypatch.setattr(sys, "base_prefix", str(two_environments.b))  # A is a venv now
+    assert notebook_deps._in_venv() is True
+
+
+def test_in_venv_ignores_a_variable_pointing_at_a_deleted_environment(
+    two_environments, monkeypatch,
+):
+    gone = two_environments.b / "removed"
+    monkeypatch.setenv("VIRTUAL_ENV", str(gone))
+    assert notebook_deps._in_venv() is False
+
+
+def test_pip_command_falls_back_to_user_under_a_kernel_mismatch(
+    two_environments, unwritable_site, monkeypatch,
+):
+    """The stale variable must not skip the write probe and --user."""
+    monkeypatch.setenv("VIRTUAL_ENV", str(two_environments.b))
+    cmd = notebook_deps._pip_command("timm")
+    assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
+    assert "--user" in cmd, (
+        "pip runs under sys.executable, whose site-packages is unwritable here; "
+        "an inherited VIRTUAL_ENV does not make it writable"
+    )
+
+
+def test_pip_command_keeps_user_off_a_real_venv(two_environments, unwritable_site, monkeypatch):
+    """pip refuses --user inside a virtualenv, so a genuine venv must not get it."""
+    monkeypatch.setattr(sys, "base_prefix", str(two_environments.b))
+    cmd = notebook_deps._pip_command("timm")
+    assert "--user" not in cmd
+
+
+def test_pip_install_does_not_hand_a_mismatched_kernel_to_uv(
+    two_environments, unwritable_site, monkeypatch,
+):
+    """uv has no user-site fallback, and its permission failure is not retried.
+
+    Observed for real: with VIRTUAL_ENV naming another environment, `uv pip
+    install --python /usr/bin/python3 addict` exits 2 with "Permission denied
+    (os error 13)". That text matches none of the retry triggers in
+    `_run_install`, so `_pip_install` returned False without ever reaching pip,
+    which installs the same package into the user site and exits 0.
+    """
+    commands = []
+
+    def _run(cmd, *args, **kwargs):
+        commands.append(list(cmd))
+        if cmd[0] == "uv":
+            return types.SimpleNamespace(
+                returncode = 2, stdout = "",
+                stderr = "error: Failed to install: addict-2.4.0-py3-none-any.whl\n"
+                         "  Caused by: Permission denied (os error 13)",
+            )
+        return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
+    monkeypatch.setattr(notebook_deps.shutil, "which", lambda exe: "/usr/bin/uv")
+    monkeypatch.setattr(notebook_deps, "_attempted", set())
+    monkeypatch.setenv("VIRTUAL_ENV", str(two_environments.b))
+
+    assert notebook_deps._pip_install("addict") is True
+    assert [c[0] for c in commands] == [sys.executable], commands
+    assert "--user" in commands[0]

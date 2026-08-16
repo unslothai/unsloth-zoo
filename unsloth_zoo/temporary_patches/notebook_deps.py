@@ -73,12 +73,36 @@ _NO_NETWORK = (
 _attempted: set = set()
 
 
+def _is_running_prefix(root: str) -> bool:
+    # Does `root` name the environment the running interpreter actually lives in?
+    # `samefile` resolves symlinks and differing spellings of the same directory,
+    # and raises when either side does not exist, which is the answer we want for
+    # a variable left over from an environment that has since been deleted.
+    try:
+        return os.path.samefile(root, sys.prefix)
+    except Exception:
+        return False
+
+
 def _in_venv() -> bool:
-    return (
-        hasattr(sys, "real_prefix")
-        or (getattr(sys, "base_prefix", sys.prefix) != sys.prefix)
-        or bool(os.environ.get("VIRTUAL_ENV"))
-        or bool(os.environ.get("CONDA_PREFIX"))
+    # Decided from the RUNNING interpreter, never from an inherited activation
+    # variable on its own. A notebook kernel routinely runs interpreter A while
+    # the process inherited VIRTUAL_ENV / CONDA_PREFIX from a different
+    # environment B, which is the exact mismatch `_uv_command` pins `--python`
+    # for. Counting B as "in a venv" made `_pip_install` hand the install to uv
+    # and `_pip_command` skip both the write probe and `--user`, while every
+    # installer still targeted A's site-packages: on a system A a non-root
+    # kernel then failed outright, even though plain pip would have installed
+    # into the user site.
+    if hasattr(sys, "real_prefix"):
+        return True
+    if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
+        return True
+    # conda environments report `base_prefix == prefix`, so the variable is the
+    # only marker they have. Trust it only when it names the prefix we run in.
+    return any(
+        bool(root) and _is_running_prefix(root)
+        for root in (os.environ.get("VIRTUAL_ENV"), os.environ.get("CONDA_PREFIX"))
     )
 
 
