@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from unsloth_zoo.device_map_planner import (
     DeviceMapInfeasible,
+    detect_logit_transforms,
     _auto_class_for,
     _compute_module_sizes,
     _from_config_remote_aware,
@@ -1570,3 +1571,361 @@ def test_a_small_card_is_not_charged_the_pinned_head_it_never_holds():
     assert kept == {0: 200, 1: 600}, kept
     free = {d: plan.raw_budgets[d] - plan.weight_bytes.get(d, 0) for d in (0, 1)}
     assert free[0] >= kept[0], f"cuda:0 was packed below its own reserve: {free}"
+
+
+# --------------------------------------------------------------------------- #
+# logit transform detection
+# --------------------------------------------------------------------------- #
+class _Cfg:
+    """A model config stands in as a plain attribute holder."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+class _MethodOnlyTextConfig:
+    """The T5Gemma shape: no `text_config` attribute, so a reader that only
+    checks the top level and `.text_config` sees no soft cap at all."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def get_text_config(self):
+        return self._inner
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        # Gemma 2/3/3n, T5Gemma, VaultGemma.
+        (_Cfg(final_logit_softcapping = 30.0), (30.0, 0.0, 0.0)),
+        # RecurrentGemma spells the same knob differently.
+        (_Cfg(logits_soft_cap = 30.0), (30.0, 0.0, 0.0)),
+        # Cohere and Cohere 2 multiply.
+        (_Cfg(logit_scale = 0.0625), (0.0, 0.0625, 0.0)),
+        # Granite and its MoE variants divide.
+        (_Cfg(logits_scaling = 16.0), (0.0, 0.0, 16.0)),
+        # Falcon-H1 multiplies, on the lm_head call line itself.
+        (_Cfg(lm_head_multiplier = 4.0), (0.0, 4.0, 0.0)),
+        # Llama and friends transform nothing.
+        (_Cfg(), (0.0, 0.0, 0.0)),
+    ],
+)
+def test_detects_the_transform_each_family_applies(config, expected):
+    found = detect_logit_transforms(config)
+    assert (
+        found["logit_softcapping"],
+        found["logit_scale_multiply"],
+        found["logit_scale_divide"],
+    ) == expected
+
+
+def test_reads_a_nested_text_config():
+    """Gemma 3 puts the soft cap on the text sub-config, not the top level."""
+    config = _Cfg(text_config = _Cfg(final_logit_softcapping = 20.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
+
+
+def test_reads_a_text_config_only_reachable_by_method():
+    """Reading `.text_config` alone reports no soft cap, under-reserving the
+    head's card by the tanh temporary plus the retained term."""
+    config = _MethodOnlyTextConfig(_Cfg(final_logit_softcapping = 30.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+def test_a_contrastive_logit_scale_is_not_an_output_head_transform():
+    """CLIP carries a `logit_scale` (spelled `logit_scale_init_value` in its
+    config), but it scales image-text similarity, not an output head."""
+    from transformers.models.clip import CLIPConfig
+
+    found = detect_logit_transforms(CLIPConfig())
+    assert found == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
+def test_detection_never_raises():
+    """An unreadable config reports nothing, leaving the caller on the
+    behaviour it had before detection existed."""
+    class _Hostile:
+        def __getattr__(self, name):
+            raise ValueError(name)
+
+    for config in (None, object(), _Hostile(), _MethodOnlyTextConfig(None)):
+        assert detect_logit_transforms(config) == {
+            "logit_softcapping": 0.0,
+            "logit_scale_multiply": 0.0,
+            "logit_scale_divide": 0.0,
+        }
+
+
+def test_the_planner_sizes_a_detected_soft_cap_without_being_told():
+    """The point of the detection: the same model plans the same either way."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(final_logit_softcapping = 30.0)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    told = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, softcapped = True,
+    )
+    assert auto is not None and told is not None
+    assert auto.headroom_bytes == told.headroom_bytes
+
+
+def test_the_planner_sizes_a_detected_logit_scale_without_being_told():
+    model = _meta(vocab = 512)
+    model.config = _Cfg(logits_scaling = 16.0)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    told = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = True,
+    )
+    assert auto is not None and told is not None
+    assert auto.headroom_bytes == told.headroom_bytes
+    # And bigger than the un-scaled reserve, or the flag is inert.
+    plain = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = False,
+    )
+    assert auto.headroom_bytes > plain.headroom_bytes
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_an_explicit_flag_still_wins_over_detection(flag):
+    """Backwards compatible: only `None` asks for detection."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(final_logit_softcapping = 30.0, logits_scaling = 16.0)
+    told = plan_device_map(
+        model,
+        max_memory = {0: 8 * _GiB, 1: 8 * _GiB},
+        softcapped = flag,
+        logit_scaled = flag,
+    )
+    expected = logit_headroom_bytes(
+        512, 128, logit_dtype = model.lm_head.weight.dtype,
+        softcapped = flag, logit_scaled = flag,
+    )
+    assert told.headroom_bytes == expected
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError, KeyError, OSError, ImportError, RecursionError],
+)
+def test_a_config_that_raises_anything_does_not_abort_planning(error):
+    """`getattr`'s default only swallows `AttributeError`, so a remote-code
+    config raising anything else used to take the whole plan down with it."""
+    class _Attribute:
+        def __getattr__(self, name):
+            raise error(name)
+
+    class _Property:
+        @property
+        def text_config(self):
+            raise error("text_config")
+
+    class _Method:
+        text_config = None
+        def get_text_config(self):
+            raise error("get_text_config")
+
+    for config in (_Attribute(), _Property(), _Method()):
+        assert detect_logit_transforms(config) == {
+            "logit_softcapping": 0.0,
+            "logit_scale_multiply": 0.0,
+            "logit_scale_divide": 0.0,
+        }
+
+    model = _meta(vocab = 512)
+    model.config = _Property()
+    plan = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    assert plan is not None
+
+
+def test_an_interrupt_is_not_swallowed():
+    """Detection absorbs config errors, not the user's Ctrl-C."""
+    class _Interrupting:
+        def __getattr__(self, name):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        detect_logit_transforms(_Interrupting())
+
+
+def test_one_unreadable_field_does_not_discard_the_readable_ones():
+    """A non-numeric field is skipped on its own; zeroing the whole result
+    would drop a soft cap the old flag-free path did detect."""
+    config = _Cfg(final_logit_softcapping = 30.0, logit_scale = ["not a number"])
+    found = detect_logit_transforms(config)
+    assert found["logit_softcapping"] == 30.0
+    assert found["logit_scale_multiply"] == 0.0
+
+
+def test_a_non_numeric_alias_falls_through_to_the_next_one():
+    config = _Cfg(final_logit_softcapping = object(), logits_soft_cap = 20.0)
+    assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        ["not a number"],                    # TypeError
+        "twenty",                            # ValueError
+        10 ** 400,                           # OverflowError, not a ValueError
+        torch.tensor([1.0, 2.0]),            # ValueError from torch
+    ],
+)
+def test_no_conversion_error_discards_the_fields_already_read(junk):
+    config = _Cfg(final_logit_softcapping = 30.0, logit_scale = junk)
+    found = detect_logit_transforms(config)
+    assert found["logit_softcapping"] == 30.0
+    assert found["logit_scale_multiply"] == 0.0
+
+
+@pytest.mark.parametrize("value", [0.0, 0, -0.0, False])
+def test_a_zero_scale_reserves_nothing(value):
+    """The chunked loss guards every transform on `!= 0.0`
+    (`rl_replacements.py`, `if logit_scale_multiply != 0.0`), so at zero it
+    allocates no scaled copy. The `bool` cast keeps the two in step."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(logit_scale = value)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    off = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = False,
+    )
+    assert auto.headroom_bytes == off.headroom_bytes
+
+
+def test_the_xlstm_spelling_of_the_soft_cap():
+    """xLSTM calls it `output_logit_soft_cap`, defaults it to 30.0 and applies
+    it unguarded (`modeling_xlstm.py`, `logits = soft_cap(logits, ...)`), so
+    NX-AI/xLSTM-7b was under-reserved. The name is unique to xLSTM."""
+    assert detect_logit_transforms(
+        _Cfg(output_logit_soft_cap = 30.0))["logit_softcapping"] == 30.0
+
+
+def test_reads_a_decoder_sub_config():
+    """T5Gemma keeps the cap on `config.decoder`, and on transformers 4.56.x
+    overrides `get_text_config` to return `self`, so neither `.text_config` nor
+    the method reaches it. Following `decoder` directly does."""
+    class _SelfReturning:
+        def __init__(self, decoder):
+            self.decoder = decoder
+        def get_text_config(self, *args, **kwargs):
+            return self
+
+    config = _SelfReturning(_Cfg(final_logit_softcapping = 30.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+def test_a_decoder_that_transforms_nothing_stays_inert():
+    """Following `decoder` must not invent a transform for encoder-decoder
+    models that simply have one."""
+    config = _Cfg(decoder = _Cfg(vocab_size = 32000), text_encoder = _Cfg())
+    assert detect_logit_transforms(config) == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
+def test_a_sub_config_left_as_a_dict_is_still_read():
+    """A composite declaring no sub-config type keeps the checkpoint's raw
+    JSON, and `getattr` on a dict never sees the keys."""
+    config = _Cfg(text_config = {"final_logit_softcapping": 30.0})
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+@pytest.mark.parametrize("model_type", ["aya_vision", "cohere2_vision"])
+def test_a_wrapper_that_re_heads_its_text_tower_claims_no_transform(model_type):
+    """Aya Vision and Cohere 2 Vision put their own `nn.Linear` lm_head on a
+    bare `AutoModel` tower, so `logits = self.lm_head(...)` with no scale;
+    `logit_scale` does not appear in either modeling file. The Cohere 2 config
+    they carry still declares it, so crediting it reserves nothing real."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    config = CONFIG_MAPPING[model_type]()
+    assert getattr(config.text_config, "logit_scale", None)   # the trap is real
+    assert detect_logit_transforms(config)["logit_scale_multiply"] == 0.0
+
+
+def test_a_wrapper_that_reuses_the_causal_lm_head_keeps_its_transform():
+    """The other half of the rule. Granite Speech builds an
+    `AutoModelForCausalLM`, so the divide happens inside the text model and the
+    reserve is still owed, though `logits_scaling` is absent from its own file."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    config = CONFIG_MAPPING["granite_speech"]()
+    assert detect_logit_transforms(config)["logit_scale_divide"] == \
+        config.text_config.logits_scaling
+
+
+@pytest.mark.parametrize("wrapper", ["module", "_orig_mod"])
+def test_a_wrapped_model_still_reports_its_transforms(wrapper):
+    """`nn.Module.__getattr__` resolves submodules, not plain attributes, so
+    DDP and torch.compile wrappers have no `.config` and the model inside would
+    read as transform-free."""
+    inner = nn.Module()
+    inner.config = _Cfg(final_logit_softcapping = 30.0)
+    outer = nn.Module()
+    setattr(outer, wrapper, inner)
+    assert detect_logit_transforms(outer)["logit_softcapping"] == 30.0
+
+
+def test_the_muse_glimmer_multiplier():
+    """Muse Glimmer pre-scales by `output_multiplier` and then soft caps, so it
+    owes BOTH buffers; only the cap was detected. Applied in the composite's own
+    forward (`logits = logits * self.config.text_config.output_multiplier`), and
+    the name appears in no other config."""
+    config = _Cfg(text_config = _Cfg(output_multiplier = 0.19611613513818404,
+                                     final_logit_softcapping = 20.0))
+    found = detect_logit_transforms(config)
+    assert found["logit_scale_multiply"] == 0.19611613513818404
+    assert found["logit_softcapping"] == 20.0
+
+
+def test_logits_scaling_multiplies_for_hyperclovax_and_divides_for_granite():
+    """Same spelling, opposite operations, as transformers says on the line:
+    "MuP: multiply logits by logits_scaling (cf. GraniteForCausalLM which
+    divides)". Bucketing HyperCLOVA X as a divide reports the wrong magnitude
+    to anything that applies the transform rather than just sizing it."""
+    granite = _Cfg(model_type = "granite", logits_scaling = 8.0)
+    assert detect_logit_transforms(granite)["logit_scale_divide"] == 8.0
+    assert detect_logit_transforms(granite)["logit_scale_multiply"] == 0.0
+
+    clova = _Cfg(model_type = "hyperclovax", logits_scaling = 8.0)
+    assert detect_logit_transforms(clova)["logit_scale_multiply"] == 8.0
+    assert detect_logit_transforms(clova)["logit_scale_divide"] == 0.0
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_falcon_h1_multiplies_whether_or_not_the_head_is_tied(tied):
+    """`FalconH1ForCausalLM.forward` has one head line and it is unconditional:
+    `logits = self.lm_head(...) * self.model.lm_head_multiplier`. There is no
+    `tie_word_embeddings` branch in the file and the config defaults the flag to
+    False, so gating on tied would drop the reserve for the common case. (The
+    tied gate in `mlx/utils.py` is the MLX fused-CCE path, a different
+    contract.)"""
+    config = _Cfg(model_type = "falcon_h1", lm_head_multiplier = 4.0,
+                  tie_word_embeddings = tied)
+    assert detect_logit_transforms(config)["logit_scale_multiply"] == 4.0
+
+
+def test_minicpm3_logits_scaling_is_not_a_logit_transform():
+    """MiniCPM3 exposes `logits_scaling` as a property that divides the HIDDEN
+    STATES before the head (`hidden_states = hidden_states / ...`), so no logits
+    temporary exists to reserve."""
+    config = _Cfg(model_type = "minicpm3", logits_scaling = 10.0)
+    assert detect_logit_transforms(config) == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
+def test_a_config_that_hands_back_itself_terminates():
+    class _Circular:
+        final_logit_softcapping = 20.0
+        @property
+        def text_config(self):
+            return self
+
+    assert detect_logit_transforms(_Circular())["logit_softcapping"] == 20.0

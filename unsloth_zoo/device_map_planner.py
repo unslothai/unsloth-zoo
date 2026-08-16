@@ -143,6 +143,7 @@ import torch.nn as nn
 __all__ = [
     "DeviceMapInfeasible",
     "DeviceMapPlan",
+    "detect_logit_transforms",
     "logit_headroom_bytes",
     "plan_device_map",
     "plan_device_map_for_pretrained",
@@ -158,6 +159,171 @@ class DeviceMapInfeasible(RuntimeError):
 
 class _SearchExhausted(Exception):
     """Internal: the bounded exact-packing search hit its node budget."""
+
+
+# --------------------------------------------------------------------------- #
+# logit transform detection
+# --------------------------------------------------------------------------- #
+def _config_attr(holder, name, default = None):
+    """``getattr`` that a hostile config cannot break out of.
+
+    ``getattr``'s default only swallows ``AttributeError``, but a remote-code
+    config can raise anything. Sub-configs left as plain dicts are read as dicts.
+    """
+    try:
+        if isinstance(holder, Mapping):
+            return holder.get(name, default)
+        return getattr(holder, name, default)
+    except Exception:
+        return default
+
+
+# The names ``PretrainedConfig.get_text_config`` searches, in its order. Asking
+# the method is not enough: T5Gemma overrides it to return ``self`` on
+# transformers 4.56.x, hiding the soft cap on ``config.decoder``.
+_TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
+
+
+def _model_config(model_or_config):
+    """The config, through the wrappers a training model arrives in.
+
+    ``nn.Module.__getattr__`` resolves submodules, not plain attributes, so DDP
+    and ``torch.compile`` wrappers have no ``.config``; unwrap those two. PEFT
+    already forwards ``config``, and a config itself falls straight through.
+    """
+    obj = model_or_config
+    for _ in range(4):
+        config = _config_attr(obj, "config")
+        if config is not None:
+            return config
+        inner = _config_attr(obj, "module")
+        if inner is None:
+            inner = _config_attr(obj, "_orig_mod")
+        if inner is None or inner is obj:
+            break
+        obj = inner
+    return model_or_config
+
+
+# Composites that build their own ``lm_head`` over a bare ``AutoModel`` tower
+# instead of the family's ``*ForCausalLM``. The tower's config still declares the
+# scale but the wrapper's ``forward`` never applies it (``logit_scale`` does not
+# appear in ``modeling_aya_vision.py`` / ``modeling_cohere2_vision.py``), so
+# crediting it reserves a temporary nobody allocates. Not here: Granite Speech
+# (builds an ``AutoModelForCausalLM``, so it does divide) and Gemma 3n
+# (re-applies the cap in its own ``forward``).
+_OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
+
+# Config field -> which magnitude it contributes, by default.
+_TRANSFORM_FIELDS = (
+    ("logit_softcapping",
+     ("final_logit_softcapping", "logits_soft_cap", "output_logit_soft_cap")),
+    ("logit_scale_multiply",
+     ("logit_scale", "lm_head_multiplier", "output_multiplier")),
+    ("logit_scale_divide", ("logits_scaling",)),
+)
+
+# ``logits_scaling`` is not one knob. Granite divides the logits by it;
+# HyperCLOVA X multiplies, as transformers notes on the line itself ("MuP:
+# multiply logits by logits_scaling (cf. GraniteForCausalLM which divides)");
+# MiniCPM3 scales the HIDDEN STATES before the head, so it is not a logit
+# transform at all. Keyed on the ``model_type`` of the config the field came
+# from, so a composite is judged by the tower it wraps.
+_BUCKET_OVERRIDES = {
+    ("logits_scaling", "hyperclovax"): "logit_scale_multiply",
+    ("logits_scaling", "minicpm3"): None,
+}
+
+
+def _text_configs(config):
+    """``config`` and every text sub-config it exposes, outermost first.
+
+    Composites put the head's settings on a sub-config (Gemma 3 on
+    ``text_config``, T5Gemma on ``decoder``). First holder to report a transform
+    wins, so this order is the precedence order.
+    """
+    seen = [config]
+    candidates = [_config_attr(config, name) for name in _TEXT_CONFIG_ATTRS]
+    get_text_config = _config_attr(config, "get_text_config")
+    if callable(get_text_config):
+        try:
+            candidates.append(get_text_config())
+        except Exception:
+            pass
+    for candidate in candidates:
+        # Identity, not equality: two sub-configs can compare equal.
+        if candidate is None or any(candidate is s for s in seen):
+            continue
+        seen.append(candidate)
+    return seen
+
+
+def detect_logit_transforms(model_or_config) -> dict:
+    """What the loss will do to the logits, read off the model config.
+
+    The planner sizes a temporary for each of these and the GRPO loss applies
+    them; both derive from here, or the reserve stops matching the allocation.
+
+    Returns ``logit_softcapping``, ``logit_scale_multiply`` and
+    ``logit_scale_divide``, ``0.0`` when the architecture does not use one:
+
+    * ``final_logit_softcapping`` (Gemma 2/3/3n, T5Gemma, VaultGemma), its
+      RecurrentGemma spelling ``logits_soft_cap`` and its xLSTM spelling
+      ``output_logit_soft_cap``.
+    * ``logit_scale`` multiplies (Cohere, Cohere 2), as do ``lm_head_multiplier``
+      (Falcon-H1, on the ``lm_head`` call itself) and ``output_multiplier``
+      (Muse Glimmer, which then soft caps as well).
+    * ``logits_scaling`` divides (Granite and its MoE variants), except in
+      HyperCLOVA X where it multiplies and MiniCPM3 where it scales the hidden
+      states before the head and so is not a logit transform.
+
+    Every scale field is applied unguarded in its ``forward``, so a no-op value
+    like ``1.0`` still allocates the buffer and still owes the reserve.
+
+    CLIP-style models also carry a ``logit_scale``, but it scales image-text
+    similarity, not an output head, and is never what the planner is asked about.
+
+    Never raises, short of ``KeyboardInterrupt`` and friends: an unreadable
+    config or field is skipped on its own and reported as zero, leaving the
+    caller on the behaviour it had before this existed.
+    """
+    zero = {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+    try:
+        config = _model_config(model_or_config)
+        if config is None:
+            return zero
+        found = dict(zero)
+        # A re-heading wrapper carries the tower's transforms without applying
+        # them, so only its own top-level config counts.
+        own_head = _config_attr(config, "model_type") in _OWN_UNTRANSFORMED_HEAD
+        for holder in _text_configs(config):
+            if own_head and holder is not config:
+                continue
+            model_type = _config_attr(holder, "model_type")
+            for key, names in _TRANSFORM_FIELDS:
+                for name in names:
+                    # Same spelling, different meaning in some families.
+                    bucket = _BUCKET_OVERRIDES.get((name, model_type), key)
+                    if bucket is None or found[bucket]:
+                        continue
+                    value = _config_attr(holder, name)
+                    if value is None:
+                        continue
+                    try:
+                        found[bucket] = float(value)
+                    except Exception:
+                        # Anything at all: a huge int raises OverflowError, and
+                        # the outer handler would discard the fields already
+                        # read.
+                        continue
+                    break
+        return found
+    except Exception:
+        return zero
 
 
 # --------------------------------------------------------------------------- #
@@ -369,9 +535,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
         weight = getattr(head, "weight", None)
         if weight is not None and weight.dim() >= 1:
             return int(weight.shape[0])
-    cfg = getattr(model, "config", None)
-    for holder in (getattr(cfg, "text_config", None), cfg):
-        v = getattr(holder, "vocab_size", None)
+    cfg = _config_attr(model, "config")
+    for holder in (_config_attr(cfg, "text_config"), cfg):
+        v = _config_attr(holder, "vocab_size")
         if isinstance(v, int) and v > 0:
             return v
     return 0
@@ -379,9 +545,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
 
 def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
     """True when the output head shares storage with the input embedding."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
-        flag = getattr(holder, "tie_word_embeddings", None)
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
+        flag = _config_attr(holder, "tie_word_embeddings")
         if flag is True:
             return True
     if head is None:
@@ -399,10 +565,10 @@ def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
 
 def _model_dtype(model: nn.Module) -> Any:
     """The dtype the checkpoint will be loaded in, as the config declares it."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
         for attr in ("dtype", "torch_dtype"):
-            d = getattr(holder, attr, None)
+            d = _config_attr(holder, attr)
             if isinstance(d, torch.dtype):
                 return d
     for t in model.parameters():
@@ -737,7 +903,7 @@ def plan_device_map(
     vocab_size: int | None = None,
     logit_dtype: torch.dtype | None = None,
     softcapped: bool | None = None,
-    logit_scaled: bool = False,
+    logit_scaled: bool | None = None,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,
@@ -759,10 +925,10 @@ def plan_device_map(
         vocab_size: override the detected head width.
         logit_dtype: dtype of the logits; defaults to the head's dtype.
         softcapped: whether a non-zero ``logit_softcapping`` is in play.
-            ``None`` (default) reads ``final_logit_softcapping`` (or its
-            RecurrentGemma alias ``logits_soft_cap``) off the config.
-        logit_scaled: whether the caller passes a non-zero
-            ``logit_scale_multiply`` or ``logit_scale_divide``.
+            ``None`` (default) detects it from the config, aliases and text
+            sub-configs included.
+        logit_scaled: whether the logits are multiplied or divided before the
+            loss. ``None`` (default) detects it. See ``detect_logit_transforms``.
         temperature_scaled: whether the caller divides by a temperature != 1.
         headroom_bytes: bypass the formula entirely.
         safety_bytes: slack added to the headroom.
@@ -831,17 +997,16 @@ def plan_device_map(
         w = getattr(head_mod, "weight", None)
         logit_dtype = w.dtype if w is not None and w.dtype.is_floating_point else torch.bfloat16
 
-    if softcapped is None:
-        cfg = getattr(model, "config", None)
-        # `logits_soft_cap` is the RecurrentGemma spelling of the same knob, and
-        # the repository's own `_detect_logit_softcap` already treats them as
-        # aliases. Missing it drops the tanh temporary and the retained soft-cap
-        # buffer from the headroom, so the head's card is under-reserved.
-        softcapped = any(
-            bool(getattr(h, name, None))
-            for h in (cfg, getattr(cfg, "text_config", None))
-            for name in ("final_logit_softcapping", "logits_soft_cap")
-        )
+    if softcapped is None or logit_scaled is None:
+        # Missing a transform drops its temporary from the headroom and
+        # under-reserves the head's card.
+        transforms = detect_logit_transforms(model)
+        if softcapped is None:
+            softcapped = bool(transforms["logit_softcapping"])
+        if logit_scaled is None:
+            logit_scaled = bool(
+                transforms["logit_scale_multiply"] or transforms["logit_scale_divide"]
+            )
 
     if headroom_bytes is None:
         headroom = logit_headroom_bytes(
@@ -1663,7 +1828,7 @@ def plan_device_map_for_pretrained(
     retained_rows: int = 0,
     vocab_size: int | None = None,
     softcapped: bool | None = None,
-    logit_scaled: bool = False,
+    logit_scaled: bool | None = None,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,
