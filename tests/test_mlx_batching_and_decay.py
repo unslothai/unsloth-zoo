@@ -182,6 +182,60 @@ def test_ordered_text_torch_randperm_can_materialize_multiple_epochs():
     assert first_epoch != second_epoch
 
 
+def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
+    # int(num_epochs) rounded the requested row count down: 0 < epochs < 1 built
+    # an empty plan, surfacing later as "No training batches created" and
+    # blaming the dataset, and 1.5 built a single pass. Five rows at batch 1 is
+    # 3 batches for half an epoch and 8 for one and a half.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def plan_for(num_epochs):
+        return create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(5)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=1,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+        )
+
+    assert len(plan_for(0.5)) == 3
+    assert len(plan_for(1.5)) == 8
+    # Whole counts are unchanged.
+    assert len(plan_for(2)) == 10
+
+
+def test_ordered_text_fractional_epochs_match_transformers_step_budget():
+    # Golden values measured by running a real transformers.Trainer on the same
+    # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
+    # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
+    # and accum 2 is one update over 4 rows, not a proportional 3 rows.
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import create_ordered_batches
+
+    def rows_for(n_rows, batch_size, grad_accum, num_epochs):
+        batches = create_ordered_batches(
+            dataset=[{"text": f"{i} {i + 10}"} for i in range(n_rows)],
+            tokenizer=_TinyTokenizer(),
+            batch_size=batch_size,
+            max_seq_length=4,
+            seed=None,
+            dataset_order="torch_randperm",
+            num_epochs=num_epochs,
+            grad_accum=grad_accum,
+        )
+        return sum(int(lengths.shape[0]) for _b, lengths, _l in batches)
+
+    # (rows, batch, accum, epochs): rows consumed by transformers.Trainer
+    assert rows_for(5, 2, 2, 0.5) == 4
+    assert rows_for(5, 2, 2, 1.0) == 5
+    assert rows_for(5, 2, 2, 1.5) == 9
+    assert rows_for(10, 2, 2, 0.75) == 10
+    assert rows_for(10, 2, 2, 1.5) == 18
+
+
 def test_vlm_torch_randperm_seed_none_and_multi_epoch_batches():
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_vlm_batches
@@ -521,6 +575,35 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
     assert plannable(family(edge))
     mx.compile(lambda d: mx.ones(1))(edge)
     assert family({"t": Point(1, 2)}) != family({"t": (1, 2)})
+
+
+def test_per_row_audio_spans_stay_plannable():
+    """Spans are carried one array per row, since rows hold different clip
+    counts and stacking them raises. Leaving them as host arrays would describe
+    every batch of the family as opaque, sending it to eager and making a
+    strict run raise -- text-only batches of that family included."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import (
+        _to_mx_vlm_batch,
+        _vlm_batch_family as family,
+        _vlm_family_is_plannable as plannable,
+    )
+
+    cases = [
+        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),         # a text-only batch
+        ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])],
+         [[[1, 3]], [[1, 3], [4, 7]]]),
+    ]
+    for spans, expected in cases:
+        batch = _to_mx_vlm_batch({
+            "input_ids": np.zeros((2, 8), dtype=np.int32),
+            "audio_bounds": spans,
+        })
+        # Both halves matter here: the generic conversion also yields something
+        # plannable, by stacking equal rows and keeping only the first of ragged
+        # ones, so plannability alone would not show the rows survived.
+        assert [np.asarray(row).tolist() for row in batch["audio_bounds"]] == expected
+        assert plannable(family(batch))
 
 
 class _VarWidthProcessor(_CountingProcessor):
@@ -1169,7 +1252,7 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
         def __call__(self, input_ids, **_kwargs):
             return self.embed(input_ids)
 
-        def train(self):
+        def train(self, mode=True):
             return self
 
         def load_weights(self, *_args, **_kwargs):

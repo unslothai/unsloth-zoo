@@ -35,7 +35,7 @@ __all__ = [
 
 import torch
 import functools
-from ..temporary_patches.common import torch_compile, _torch_compile
+from unsloth_zoo.temporary_patches.common import torch_compile, _torch_compile
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:
@@ -51,7 +51,9 @@ try:
     # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
     # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
     # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
-    vram_of_gpu = min(torch.cuda.memory.mem_get_info(i)[-1]/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    # Total capacity, like the gpt_oss probe: mem_get_info() would create a device
+    # context at import time and leave an otherwise idle process holding it.
+    vram_of_gpu = min(torch.cuda.get_device_properties(i).total_memory/1024/1024/1024 for i in range(torch.cuda.device_count()))
     kernel_options = None
     if vram_of_gpu <= 16:
         kernel_options = {

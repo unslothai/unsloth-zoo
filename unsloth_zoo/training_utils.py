@@ -480,6 +480,9 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
+                # Deliberately NOT guarded on is_compiling() like the peft_utils pre hook:
+                # this is the only thing making a FROZEN embedding's output require grad,
+                # so skipping it would silently starve the adapters of gradients.
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
