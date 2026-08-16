@@ -266,12 +266,21 @@ def _normalize_packed_seq_lengths(seq_lengths):
             lengths = seq_lengths.detach().to(device = "cpu", dtype = torch.long)
         else:
             lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
+        if lengths.ndim != 1:
+            lengths = lengths.reshape(-1)
+        # Everything through the last read stays inside the try. Dropping the
+        # non-positive entries is a boolean mask, so it lowers to aten.nonzero,
+        # whose output shape is data dependent: under FakeTensorMode it raises
+        # DynamicOutputShapeException and under vmap it raises outright. Left
+        # outside, those escape into the caller's `except Exception: raise
+        # RuntimeError(...)`, which is a dead training run rather than the
+        # missing correction this helper promises. Filtering is not optional --
+        # a zero-length entry would otherwise duplicate a start, and a negative
+        # one would corrupt every later cumsum.
+        lengths = lengths[lengths > 0]
+        if lengths.numel() <= 1: return None
     except Exception:
         return None
-    if lengths.ndim != 1:
-        lengths = lengths.reshape(-1)
-    lengths = lengths[lengths > 0]
-    if lengths.numel() <= 1: return None
     return lengths
 pass
 
@@ -360,10 +369,17 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # subtracting N-1 from the total: whatever already wrote -100
                     # there would otherwise be charged for them twice, which
                     # under-counts num_items_in_batch and inflates loss and grads.
-                    # Collators that already mask them include TRL >= 0.24, which
-                    # sets labels[position_ids == 0] = -100, plus completion_only_loss
-                    # and assistant_masks on every TRL version. So the arithmetic has
-                    # to be idempotent rather than version detected.
+                    # Collators that already mask them include TRL >= 0.23.1, which
+                    # sets labels[position_ids == 0] = -100, transformers'
+                    # DataCollatorWithFlattening on every version, and
+                    # completion_only_loss / assistant_masks on every TRL version.
+                    # So the arithmetic has to be idempotent rather than version
+                    # detected.
+                    #
+                    # Subtracting also had no lower bound: on a batch whose live
+                    # targets number fewer than N, the old count went to zero or
+                    # negative, so the loss divided by zero or changed sign. Zeroing
+                    # slots that may already be False cannot go below zero.
                     #
                     # labels[..., 1:] above already dropped the first token of every
                     # row, so a document starting at flat index s sits at column s - 1

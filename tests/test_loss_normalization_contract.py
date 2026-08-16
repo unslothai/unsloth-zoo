@@ -265,7 +265,7 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
 # token prediction crosses a document, so the count has to exclude them. Doing
 # that by subtracting N-1 from the total double counts every boundary a collator
 # had already masked with -100, which under-counts num_items_in_batch and so
-# inflates loss and every gradient. TRL >= 0.24 masks them (labels[position_ids
+# inflates loss and every gradient. TRL >= 0.23.1 masks them (labels[position_ids
 # == 0] = -100) and completion_only_loss / assistant_masks mask them on every TRL
 # version including 0.22.2, so the arithmetic must be idempotent, not version
 # detected. unsloth's enable_padding_free_metadata attaches packed_seq_lengths
@@ -276,7 +276,7 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
 def _padding_free_batch(lengths, premask_starts = False, completion_only = 0):
     """One flattened padding-free row holding len(lengths) documents.
 
-    premask_starts reproduces TRL >= 0.24, which writes -100 at every
+    premask_starts reproduces TRL >= 0.23.1, which writes -100 at every
     position_ids == 0 slot. completion_only masks the first N tokens of each
     document, which is what completion_only_loss and assistant_masks do on every
     TRL version, and which also lands -100 on the document starts. Synthesising
@@ -392,7 +392,7 @@ def test_normalize_drops_nonpositive_and_short_circuits_one_document():
 
 
 def test_count_is_identical_whether_or_not_the_collator_premasked():
-    """The headline property. TRL >= 0.24 masks the document starts and earlier
+    """The headline property. TRL >= 0.23.1 masks the document starts and earlier
     versions do not, and completion-only masking does it on every version. The
     count must not depend on which of those produced the batch."""
     lengths = [4, 3, 3]
@@ -564,6 +564,84 @@ def test_unusable_metadata_degrades_instead_of_raising():
     batch["packed_seq_lengths"] = "garbage"
     # Falls back to the plain shifted count rather than raising RuntimeError.
     assert _counted(batch) == 9
+
+
+def test_normalize_does_not_raise_when_the_length_filter_cannot_run():
+    """Dropping the non-positive lengths is a boolean mask, so it lowers to
+    aten.nonzero, whose output shape is data dependent. Under FakeTensorMode that
+    raises DynamicOutputShapeException. The whole body therefore has to sit inside
+    the try: the caller counts inside `except Exception: raise RuntimeError(...)`,
+    so an escape here is a dead training run, not the missing correction this
+    helper exists to degrade to."""
+    torch = pytest.importorskip("torch")
+    fake = pytest.importorskip("torch._subclasses.fake_tensor")
+    normalize = _normalizer()
+    with fake.FakeTensorMode():
+        # Positive lengths only, so this is metadata the helper would normally
+        # accept: the raise comes from the filter, not from rejecting the input.
+        assert normalize(torch.tensor([4, 3, 3])) is None
+
+
+def test_the_counting_path_does_not_raise_on_a_traced_tensor():
+    """The same escape, observed where it actually hurts: through the public
+    counting entry point, whose except clause converts anything that gets out into
+    a RuntimeError that ends the run."""
+    torch = pytest.importorskip("torch")
+    fake = pytest.importorskip("torch._subclasses.fake_tensor")
+    mod = _loss_utils()
+    fn = getattr(mod, "_unsloth_get_batch_samples", None)
+    if fn is None: pytest.skip("_unsloth_get_batch_samples not present")
+    with fake.FakeTensorMode():
+        ids = torch.randint(1, 11, (1, 10))
+        batch = {
+            "input_ids": ids,
+            "labels": ids.clone(),
+            "packed_seq_lengths": torch.tensor([4, 3, 3], dtype = torch.int32),
+        }
+        mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+        # Called directly rather than through _counted, which ends in int(count):
+        # that is a .item() and raises on a fake tensor all by itself, which would
+        # make this test fail for a reason that has nothing to do with the code
+        # under test. No assertion on the number either, since under a fake tensor
+        # there is no number. The contract is only that it does not end the run.
+        fn(_fake_trainer(_tiny_model(), True), iter([batch]), 1)
+
+
+def test_the_count_can_never_go_negative():
+    """Subtracting N-1 had no lower bound. On a batch whose live targets number
+    fewer than N, the old arithmetic returned zero or a negative num_items_in_batch,
+    so the loss divided by zero or changed sign and the gradients ascended. Zeroing
+    slots that may already be False is bounded below by construction, and this
+    pins that.
+
+    Every case here has real trainable targets, so declining to count is not an
+    acceptable answer either.
+    """
+    torch = pytest.importorskip("torch")
+    # (lengths, completion_only, premask, true target count)
+    cases = [
+        ([4, 3, 3],    3, False, 1),
+        ([1, 1, 2],    1, True,  1),
+        ([5, 3],       4, False, 1),
+        ([2, 5, 2],    4, False, 1),
+        ([1, 5, 6, 3, 3], 4, True, 3),
+        ([5, 3, 4, 2], 3, False, 3),
+    ]
+    for lengths, completion_only, premask, expected in cases:
+        batch = _padding_free_batch(
+            lengths, premask_starts = premask, completion_only = completion_only,
+        )
+        counted = _counted(batch)
+        assert counted == _true_target_count(batch["labels"], lengths)
+        assert counted == expected, (
+            f"lengths={lengths} completion_only={completion_only}: "
+            f"counted {counted}, expected {expected}"
+        )
+        assert counted >= 0, (
+            f"lengths={lengths} completion_only={completion_only}: num_items_in_batch "
+            f"came back {counted}. A non-positive count makes the loss divide by zero "
+            "or flip sign, which is what subtracting an unbounded N-1 allowed"
+        )
 
 
 def test_the_real_installed_trl_collator_is_counted_correctly():

@@ -141,8 +141,8 @@ jobs:
         # file was in NO job, so `--collect-only` proved only that it imports while
         # the count double-removed every document boundary a collator had already
         # masked, inflating loss and every gradient. `.[core]` resolves trl 0.24.0
-        # here, the first release that masks labels[position_ids == 0], so this job
-        # exercises the regressed regime on every pull request.
+        # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
+        # so this job exercises the regressed regime on every pull request.
         #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
