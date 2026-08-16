@@ -243,6 +243,39 @@ from transformers.training_args import ParallelMode
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
+
+def _normalize_packed_seq_lengths(seq_lengths):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Coerce collator supplied packed sequence lengths to a 1D int64 CPU tensor.
+
+    Returns None when the metadata is missing, unusable, or describes a single
+    document, since one document has no internal boundary to drop. Kept on CPU:
+    these are tens of elements, it avoids MPS / XPU integer op gaps, and it keeps
+    the counting path free of a device sync.
+
+    Deliberately duplicated from unsloth/utils/packing.py rather than imported.
+    The dependency arrow runs unsloth -> unsloth_zoo and must never run back.
+
+    Anything unconvertible is treated as absent rather than raised: the caller
+    counts inside a try that re-raises as RuntimeError, so a plain list of ints
+    used to end the run outright.
+    """
+    if seq_lengths is None: return None
+    try:
+        if isinstance(seq_lengths, torch.Tensor):
+            lengths = seq_lengths.detach().to(device = "cpu", dtype = torch.long)
+        else:
+            lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
+    except Exception:
+        return None
+    if lengths.ndim != 1:
+        lengths = lengths.reshape(-1)
+    lengths = lengths[lengths > 0]
+    if lengths.numel() <= 1: return None
+    return lengths
+pass
+
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -320,12 +353,42 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
+                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
+                if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
+                    # Packing N documents leaves N-1 internal boundaries that are not
+                    # valid training positions. Zero those exact slots instead of
+                    # subtracting N-1 from the total: whatever already wrote -100
+                    # there would otherwise be charged for them twice, which
+                    # under-counts num_items_in_batch and inflates loss and grads.
+                    # Collators that already mask them include TRL >= 0.24, which
+                    # sets labels[position_ids == 0] = -100, plus completion_only_loss
+                    # and assistant_masks on every TRL version. So the arithmetic has
+                    # to be idempotent rather than version detected.
+                    #
+                    # labels[..., 1:] above already dropped the first token of every
+                    # row, so a document starting at flat index s sits at column s - 1
+                    # of its row here, and a document starting at a row boundary
+                    # (col 0) was eaten by that slice already. cumsum(...)[:-1] leaves
+                    # out the trailing boundary, which makes a single document a
+                    # provable no-op and stops truncated metadata from ever killing a
+                    # live target.
+                    n_shift = token_count.shape[-1]
+                    n_rows  = token_count.numel() // n_shift
+                    starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]
+                    rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
+                    cols    = starts - rows * (n_shift + 1)
+                    keep    = (cols > 0) & (rows < n_rows)
+                    rows, cols = rows[keep], cols[keep]
+                    if rows.numel() != 0:
+                        if rows.device != token_count.device:
+                            rows = rows.to(token_count.device)
+                            cols = cols.to(token_count.device)
+                        # Reassign: reshape can copy on a non contiguous input.
+                        token_count = token_count.reshape(n_rows, n_shift)
+                        token_count[rows, cols - 1] = False
+                    pass
+                pass
                 count = token_count.sum()
-                seq_lengths = x.get("packed_seq_lengths")
-                if seq_lengths is not None:
-                    # Packing N sequences has N-1 internal boundaries that
-                    # aren't valid training positions.
-                    count -= torch.count_nonzero(seq_lengths > 0).item() - 1
                 token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)
