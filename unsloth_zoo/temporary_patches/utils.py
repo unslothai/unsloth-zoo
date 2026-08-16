@@ -315,6 +315,24 @@ def _torchao_torch_mismatch_message(message):
     )
 
 
+def _ensure_torch_float8_e8m0fnu():
+    """Let transformers import on torch builds before float8_e8m0fnu existed.
+
+    Older transformers releases bind ``torch.float8_e8m0fnu`` at import time inside
+    ``integrations.finegrained_fp8``. PyTorch added that dtype in 2.7, so a plain
+    ``import unsloth`` dies on earlier torch even when the run will never touch
+    UE8M0 FP8 checkpoints. Aliasing to ``torch.float8_e4m3fn`` is enough for the
+    import to succeed; UE8M0 models still fail later with transformers' own error.
+    """
+    if hasattr(torch, "float8_e8m0fnu"):
+        return
+    fallback = getattr(torch, "float8_e4m3fn", None)
+    if fallback is not None:
+        torch.float8_e8m0fnu = fallback  # type: ignore[attr-defined]
+
+
+_ensure_torch_float8_e8m0fnu()
+
 try:
     from transformers.processing_utils import Unpack
     assert \
@@ -360,6 +378,14 @@ except Exception as e:
     # The nms arm above, for the case that never arrives as an ImportError: a
     # torchvision whose compiled ops do not match torch fails inside
     # `_meta_registrations` at `register_fake("torchvision::nms")`, a RuntimeError.
+    if "float8_e8m0fnu" in e_str and "has no attribute" in e_str:
+        raise RuntimeError(
+            f"***** Unsloth: your transformers build needs torch.float8_e8m0fnu "
+            f"(PyTorch >= 2.7), but torch {torch.__version__} does not provide it. "
+            f"Upgrade torch to use UE8M0 FP8 checkpoints, or update unsloth_zoo if "
+            f"you are on an older torch and only training non-FP8 models. "
+            f"Original error: {e_str} *****"
+        ) from None
     if "torchvision::nms does not exist" in e_str:
         raise RuntimeError(_TORCHVISION_BROKE)
     if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
