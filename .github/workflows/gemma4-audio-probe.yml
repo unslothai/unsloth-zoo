@@ -74,7 +74,7 @@ jobs:
         # the zoo import path still wants it.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.13.0"
+          pip install "torch>=2.4.0,<2.14.0"
           pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}"
           python -c "
           import mlx_vlm, transformers
