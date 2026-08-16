@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from unsloth_zoo.device_map_planner import (
     DeviceMapInfeasible,
+    detect_logit_transforms,
     _auto_class_for,
     _compute_module_sizes,
     _from_config_remote_aware,
@@ -1570,3 +1571,140 @@ def test_a_small_card_is_not_charged_the_pinned_head_it_never_holds():
     assert kept == {0: 200, 1: 600}, kept
     free = {d: plan.raw_budgets[d] - plan.weight_bytes.get(d, 0) for d in (0, 1)}
     assert free[0] >= kept[0], f"cuda:0 was packed below its own reserve: {free}"
+
+
+# --------------------------------------------------------------------------- #
+# logit transform detection
+# --------------------------------------------------------------------------- #
+class _Cfg:
+    """A model config stands in as a plain attribute holder."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+class _MethodOnlyTextConfig:
+    """A config whose text settings are only reachable through a method.
+
+    T5Gemma is shaped like this: no `text_config` attribute, so anything that
+    only reads the top level and `.text_config` sees no soft cap at all.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def get_text_config(self):
+        return self._inner
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        # Gemma 2/3/3n, T5Gemma, VaultGemma.
+        (_Cfg(final_logit_softcapping = 30.0), (30.0, 0.0, 0.0)),
+        # RecurrentGemma spells the same knob differently.
+        (_Cfg(logits_soft_cap = 30.0), (30.0, 0.0, 0.0)),
+        # Cohere and Cohere 2 multiply; the default is not 1.
+        (_Cfg(logit_scale = 0.0625), (0.0, 0.0625, 0.0)),
+        # Granite and its MoE variants divide.
+        (_Cfg(logits_scaling = 16.0), (0.0, 0.0, 16.0)),
+        # Llama and friends transform nothing.
+        (_Cfg(), (0.0, 0.0, 0.0)),
+    ],
+)
+def test_detects_the_transform_each_family_applies(config, expected):
+    found = detect_logit_transforms(config)
+    assert (
+        found["logit_softcapping"],
+        found["logit_scale_multiply"],
+        found["logit_scale_divide"],
+    ) == expected
+
+
+def test_reads_a_nested_text_config():
+    """Gemma 3 puts the soft cap on the text sub-config, not the top level."""
+    config = _Cfg(text_config = _Cfg(final_logit_softcapping = 20.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
+
+
+def test_reads_a_text_config_only_reachable_by_method():
+    """The T5Gemma shape. Reading `.text_config` alone reports no soft cap and
+    under-reserves the head's card by the tanh temporary plus the retained
+    term, which is the larger of the two."""
+    config = _MethodOnlyTextConfig(_Cfg(final_logit_softcapping = 30.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+def test_a_contrastive_logit_scale_is_not_an_output_head_transform():
+    """CLIP-family models carry a `logit_scale`, but it scales image-text
+    similarity, not an output head. Its config spells it `logit_scale_init_value`,
+    and reserving for it would be reserving for a tensor nobody allocates."""
+    from transformers.models.clip import CLIPConfig
+
+    found = detect_logit_transforms(CLIPConfig())
+    assert found == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
+def test_detection_never_raises():
+    """An unreadable or remote-code config reports nothing, which leaves the
+    caller on the behaviour it had before detection existed."""
+    class _Hostile:
+        def __getattr__(self, name):
+            raise ValueError(name)
+
+    for config in (None, object(), _Hostile(), _MethodOnlyTextConfig(None)):
+        assert detect_logit_transforms(config) == {
+            "logit_softcapping": 0.0,
+            "logit_scale_multiply": 0.0,
+            "logit_scale_divide": 0.0,
+        }
+
+
+def test_the_planner_sizes_a_detected_soft_cap_without_being_told():
+    """The point of the detection: the same model plans the same either way."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(final_logit_softcapping = 30.0)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    told = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, softcapped = True,
+    )
+    assert auto is not None and told is not None
+    assert auto.headroom_bytes == told.headroom_bytes
+
+
+def test_the_planner_sizes_a_detected_logit_scale_without_being_told():
+    model = _meta(vocab = 512)
+    model.config = _Cfg(logits_scaling = 16.0)
+    auto = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    told = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = True,
+    )
+    assert auto is not None and told is not None
+    assert auto.headroom_bytes == told.headroom_bytes
+    # And it really is bigger than the un-scaled reserve, or the flag is inert.
+    plain = plan_device_map(
+        model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB}, logit_scaled = False,
+    )
+    assert auto.headroom_bytes > plain.headroom_bytes
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_an_explicit_flag_still_wins_over_detection(flag):
+    """Backwards compatible: only `None` asks for detection."""
+    model = _meta(vocab = 512)
+    model.config = _Cfg(final_logit_softcapping = 30.0, logits_scaling = 16.0)
+    told = plan_device_map(
+        model,
+        max_memory = {0: 8 * _GiB, 1: 8 * _GiB},
+        softcapped = flag,
+        logit_scaled = flag,
+    )
+    expected = logit_headroom_bytes(
+        512, 128, logit_dtype = model.lm_head.weight.dtype,
+        softcapped = flag, logit_scaled = flag,
+    )
+    assert told.headroom_bytes == expected
