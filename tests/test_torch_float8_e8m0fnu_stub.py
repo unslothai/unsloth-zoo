@@ -73,5 +73,22 @@ def test_attribute_error_branch_names_e8m0():
     assert '"float8_e8m0fnu" in e_str and "has no attribute" in e_str' in src
 
 
+@pytest.mark.integration
+def test_old_transformers_module_bind_succeeds_after_stub():
+    """Mimic pinned transformers that bind _UE8M0_SF_DTYPE at import time."""
+    pytest.importorskip("torch")
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch build lacks float8_e4m3fn")
+
+    if hasattr(torch, "float8_e8m0fnu"):
+        del torch.float8_e8m0fnu
+
+    _run_ensure(torch)
+    _UE8M0_SF_DTYPE = torch.float8_e8m0fnu  # noqa: N806 — mirrors transformers
+    assert _UE8M0_SF_DTYPE is torch.float8_e4m3fn
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
