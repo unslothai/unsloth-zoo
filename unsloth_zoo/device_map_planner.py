@@ -173,29 +173,45 @@ def _config_attr(holder, name, default = None):
     documents as never raising.
     """
     try:
+        # A sub-config is not always a config object. A composite whose class
+        # declares no sub-config type keeps whatever the checkpoint's JSON held,
+        # and `getattr` on a plain dict never sees the keys.
+        if isinstance(holder, Mapping):
+            return holder.get(name, default)
         return getattr(holder, name, default)
     except Exception:
         return default
 
 
-def _text_configs(config):
-    """``config`` and every text sub-config it exposes, innermost last.
+# The sub-config names ``PretrainedConfig.get_text_config`` searches, in its own
+# order. Asking the method instead is not enough on its own: T5Gemma overrides it
+# to return ``self`` on transformers 4.56.x, which hides the 30.0 soft cap that
+# lives on ``config.decoder``.
+_TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
 
-    Composite models put the head's settings on a sub-config. Gemma 3 reaches it
-    as ``config.text_config``; T5Gemma only through ``config.get_text_config()``.
-    Reading just the top level misses both.
+
+def _text_configs(config):
+    """``config`` and every text sub-config it exposes, outermost first.
+
+    Composite models put the head's settings on a sub-config: Gemma 3 on
+    ``config.text_config``, T5Gemma on ``config.decoder``. Reading only the top
+    level misses both, and the first holder to report a transform wins, so the
+    order here is the precedence order.
     """
     seen = [config]
-    text_config = _config_attr(config, "text_config")
-    if text_config is None:
-        get_text_config = _config_attr(config, "get_text_config")
-        if callable(get_text_config):
-            try:
-                text_config = get_text_config()
-            except Exception:
-                text_config = None
-    if text_config is not None and text_config is not config:
-        seen.append(text_config)
+    candidates = [_config_attr(config, name) for name in _TEXT_CONFIG_ATTRS]
+    get_text_config = _config_attr(config, "get_text_config")
+    if callable(get_text_config):
+        try:
+            candidates.append(get_text_config())
+        except Exception:
+            pass
+    for candidate in candidates:
+        # Identity, not equality: two sub-configs can compare equal, and a
+        # config that hands back itself must not be visited twice.
+        if candidate is None or any(candidate is s for s in seen):
+            continue
+        seen.append(candidate)
     return seen
 
 
@@ -209,8 +225,9 @@ def detect_logit_transforms(model_or_config) -> dict:
     Returns ``logit_softcapping``, ``logit_scale_multiply`` and
     ``logit_scale_divide``, ``0.0`` when the architecture does not use one:
 
-    * ``final_logit_softcapping`` (Gemma 2/3/3n, T5Gemma, VaultGemma) and its
-      RecurrentGemma spelling ``logits_soft_cap``.
+    * ``final_logit_softcapping`` (Gemma 2/3/3n, T5Gemma, VaultGemma), its
+      RecurrentGemma spelling ``logits_soft_cap``, and its xLSTM spelling
+      ``output_logit_soft_cap``.
     * ``logit_scale`` multiplies the logits (Cohere, Cohere 2).
     * ``lm_head_multiplier`` multiplies them too (Falcon-H1, which applies it on
       the ``lm_head`` call itself rather than on a following line).
@@ -239,7 +256,9 @@ def detect_logit_transforms(model_or_config) -> dict:
         found = dict(zero)
         for holder in _text_configs(config):
             for key, names in (
-                ("logit_softcapping", ("final_logit_softcapping", "logits_soft_cap")),
+                ("logit_softcapping",
+                 ("final_logit_softcapping", "logits_soft_cap",
+                  "output_logit_soft_cap")),
                 ("logit_scale_multiply", ("logit_scale", "lm_head_multiplier")),
                 ("logit_scale_divide", ("logits_scaling",)),
             ):

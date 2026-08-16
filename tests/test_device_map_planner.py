@@ -1768,3 +1768,55 @@ def test_one_unreadable_field_does_not_discard_the_readable_ones():
 def test_a_non_numeric_alias_falls_through_to_the_next_one():
     config = _Cfg(final_logit_softcapping = object(), logits_soft_cap = 20.0)
     assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
+
+
+def test_the_xlstm_spelling_of_the_soft_cap():
+    """xLSTM calls it `output_logit_soft_cap`, defaults it to 30.0 and applies it
+    unguarded (`modeling_xlstm.py`, `logits = soft_cap(logits, ...)`), so
+    NX-AI/xLSTM-7b was under-reserved by a whole logits temporary. The name is
+    unique to xLSTM across transformers, so matching it costs no false positive."""
+    assert detect_logit_transforms(
+        _Cfg(output_logit_soft_cap = 30.0))["logit_softcapping"] == 30.0
+
+
+def test_reads_a_decoder_sub_config():
+    """T5Gemma keeps the cap on `config.decoder`, and on transformers 4.56.x its
+    `get_text_config` is overridden to return `self`, so neither `.text_config`
+    nor the method reaches it. `decoder` is one of the names `get_text_config`
+    searches itself, so following it directly covers both spellings."""
+    class _SelfReturning:
+        def __init__(self, decoder):
+            self.decoder = decoder
+        def get_text_config(self, *args, **kwargs):
+            return self
+
+    config = _SelfReturning(_Cfg(final_logit_softcapping = 30.0))
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+def test_a_decoder_that_transforms_nothing_stays_inert():
+    """Following `decoder` must not invent a transform for the encoder-decoder
+    models that simply have one."""
+    config = _Cfg(decoder = _Cfg(vocab_size = 32000), text_encoder = _Cfg())
+    assert detect_logit_transforms(config) == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
+def test_a_sub_config_left_as_a_dict_is_still_read():
+    """A composite whose class declares no sub-config type keeps whatever the
+    checkpoint's JSON held, and `getattr` on a dict never sees the keys."""
+    config = _Cfg(text_config = {"final_logit_softcapping": 30.0})
+    assert detect_logit_transforms(config)["logit_softcapping"] == 30.0
+
+
+def test_a_config_that_hands_back_itself_terminates():
+    class _Circular:
+        final_logit_softcapping = 20.0
+        @property
+        def text_config(self):
+            return self
+
+    assert detect_logit_transforms(_Circular())["logit_softcapping"] == 20.0
