@@ -248,8 +248,9 @@ def _normalize_packed_seq_lengths(seq_lengths):
     # All Unsloth Zoo code licensed under LGPLv3
     """Coerce collator supplied packed sequence lengths to a 1D int64 CPU tensor.
 
-    Returns None when the metadata is missing, unusable, or describes a single
-    document, since one document has no internal boundary to drop. Kept on CPU:
+    Returns None when the metadata is missing, unusable, describes a single
+    document (one document has no internal boundary to drop), or when the running
+    execution mode cannot evaluate the filter below. Kept on CPU:
     these are tens of elements, it avoids MPS / XPU integer op gaps, and it keeps
     the counting path free of a device sync.
 
@@ -388,6 +389,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # out the trailing boundary, which makes a single document a
                     # provable no-op and stops truncated metadata from ever killing a
                     # live target.
+                    #
+                    # This block has its own unprotected data-dependent reads
+                    # (rows[keep], then rows.numel()). They are safe only because
+                    # _normalize_packed_seq_lengths returns None first under any
+                    # mode that cannot evaluate them, so nothing here ever runs on
+                    # a tensor whose shape is unbacked. Keep that ordering.
                     n_shift = token_count.shape[-1]
                     n_rows  = token_count.numel() // n_shift
                     starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]

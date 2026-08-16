@@ -620,27 +620,31 @@ def test_the_count_can_never_go_negative():
     torch = pytest.importorskip("torch")
     # (lengths, completion_only, premask, true target count)
     cases = [
-        ([4, 3, 3],    3, False, 1),
-        ([1, 1, 2],    1, True,  1),
-        ([5, 3],       4, False, 1),
-        ([2, 5, 2],    4, False, 1),
-        ([1, 5, 6, 3, 3], 4, True, 3),
-        ([5, 3, 4, 2], 3, False, 3),
+        ([4, 3, 3],       3, False, 1),
+        ([1, 1, 2],       1, True,  1),
+        ([5, 3],          4, False, 1),
+        ([2, 5, 2],       4, False, 1),
+        ([1, 5, 6, 3, 3], 4, True,  3),
+        ([5, 3, 4, 2],    3, False, 3),
     ]
     for lengths, completion_only, premask, expected in cases:
         batch = _padding_free_batch(
             lengths, premask_starts = premask, completion_only = completion_only,
         )
         counted = _counted(batch)
+        # The bound first. Asserting it after the equality below would make it dead:
+        # every expected value here is >= 1, so the equality can never leave a
+        # negative count for this to catch, and the invariant the test is named for
+        # would never actually be exercised.
+        assert counted is not None and counted > 0, (
+            f"lengths={lengths} completion_only={completion_only}: num_items_in_batch "
+            f"came back {counted}. A non-positive count makes the loss divide by zero "
+            "or flip sign, which is what subtracting an unbounded N-1 allowed"
+        )
         assert counted == _true_target_count(batch["labels"], lengths)
         assert counted == expected, (
             f"lengths={lengths} completion_only={completion_only}: "
             f"counted {counted}, expected {expected}"
-        )
-        assert counted >= 0, (
-            f"lengths={lengths} completion_only={completion_only}: num_items_in_batch "
-            f"came back {counted}. A non-positive count makes the loss divide by zero "
-            "or flip sign, which is what subtracting an unbounded N-1 allowed"
         )
 
 
