@@ -1907,6 +1907,19 @@ def test_logits_scaling_multiplies_for_hyperclovax_and_divides_for_granite():
     assert detect_logit_transforms(clova)["logit_scale_divide"] == 0.0
 
 
+@pytest.mark.parametrize("tied", [True, False])
+def test_falcon_h1_multiplies_whether_or_not_the_head_is_tied(tied):
+    """`FalconH1ForCausalLM.forward` has one head line and it is unconditional:
+    `logits = self.lm_head(...) * self.model.lm_head_multiplier`. No
+    `tie_word_embeddings` branch exists in the file, and the config defaults the
+    flag to False, so gating on tied would drop the reserve for the common case.
+    (The tied gate in `mlx/utils.py` is the MLX fused-CCE path, a different
+    runtime and a different contract.)"""
+    config = _Cfg(model_type = "falcon_h1", lm_head_multiplier = 4.0,
+                  tie_word_embeddings = tied)
+    assert detect_logit_transforms(config)["logit_scale_multiply"] == 4.0
+
+
 def test_minicpm3_logits_scaling_is_not_a_logit_transform():
     """MiniCPM3 exposes `logits_scaling` as a property that divides the HIDDEN
     STATES before the head (`hidden_states = hidden_states / ...`), so no logits
