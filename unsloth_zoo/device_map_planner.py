@@ -164,6 +164,20 @@ class _SearchExhausted(Exception):
 # --------------------------------------------------------------------------- #
 # logit transform detection
 # --------------------------------------------------------------------------- #
+def _config_attr(holder, name, default = None):
+    """``getattr`` that a hostile config cannot break out of.
+
+    ``getattr``'s default only swallows ``AttributeError``. A remote-code config
+    is free to raise ``KeyError``, ``OSError`` or anything else from a property
+    or from ``__getattr__``, and that would escape a detection this module
+    documents as never raising.
+    """
+    try:
+        return getattr(holder, name, default)
+    except Exception:
+        return default
+
+
 def _text_configs(config):
     """``config`` and every text sub-config it exposes, innermost last.
 
@@ -172,13 +186,13 @@ def _text_configs(config):
     Reading just the top level misses both.
     """
     seen = [config]
-    text_config = getattr(config, "text_config", None)
+    text_config = _config_attr(config, "text_config")
     if text_config is None:
-        get_text_config = getattr(config, "get_text_config", None)
+        get_text_config = _config_attr(config, "get_text_config")
         if callable(get_text_config):
             try:
                 text_config = get_text_config()
-            except (TypeError, ValueError):
+            except Exception:
                 text_config = None
     if text_config is not None and text_config is not config:
         seen.append(text_config)
@@ -207,8 +221,11 @@ def detect_logit_transforms(model_or_config) -> dict:
     but it scales image-text similarity rather than an output head, and they are
     never what the planner is asked about.
 
-    Never raises: an unreadable or remote-code config reports no transforms,
-    which leaves the caller on the behaviour it had before this existed.
+    Never raises, short of ``KeyboardInterrupt`` and friends: an unreadable or
+    remote-code config reports the transforms it could read and zero for the
+    rest, which leaves the caller on the behaviour it had before this existed.
+    A field that is present but not a number is skipped on its own, without
+    discarding the fields that did read cleanly.
     """
     zero = {
         "logit_softcapping": 0.0,
@@ -216,7 +233,7 @@ def detect_logit_transforms(model_or_config) -> dict:
         "logit_scale_divide": 0.0,
     }
     try:
-        config = getattr(model_or_config, "config", model_or_config)
+        config = _config_attr(model_or_config, "config", model_or_config)
         if config is None:
             return zero
         found = dict(zero)
@@ -229,13 +246,16 @@ def detect_logit_transforms(model_or_config) -> dict:
                 if found[key]:
                     continue
                 for name in names:
-                    value = getattr(holder, name, None)
+                    value = _config_attr(holder, name)
                     if value is None:
                         continue
-                    found[key] = float(value)
+                    try:
+                        found[key] = float(value)
+                    except (TypeError, ValueError):
+                        continue
                     break
         return found
-    except (TypeError, ValueError, AttributeError):
+    except Exception:
         return zero
 
 
@@ -448,9 +468,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
         weight = getattr(head, "weight", None)
         if weight is not None and weight.dim() >= 1:
             return int(weight.shape[0])
-    cfg = getattr(model, "config", None)
-    for holder in (getattr(cfg, "text_config", None), cfg):
-        v = getattr(holder, "vocab_size", None)
+    cfg = _config_attr(model, "config")
+    for holder in (_config_attr(cfg, "text_config"), cfg):
+        v = _config_attr(holder, "vocab_size")
         if isinstance(v, int) and v > 0:
             return v
     return 0
@@ -458,9 +478,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
 
 def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
     """True when the output head shares storage with the input embedding."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
-        flag = getattr(holder, "tie_word_embeddings", None)
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
+        flag = _config_attr(holder, "tie_word_embeddings")
         if flag is True:
             return True
     if head is None:
@@ -478,10 +498,10 @@ def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
 
 def _model_dtype(model: nn.Module) -> Any:
     """The dtype the checkpoint will be loaded in, as the config declares it."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
         for attr in ("dtype", "torch_dtype"):
-            d = getattr(holder, attr, None)
+            d = _config_attr(holder, attr)
             if isinstance(d, torch.dtype):
                 return d
     for t in model.parameters():

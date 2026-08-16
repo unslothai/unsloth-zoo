@@ -1710,3 +1710,61 @@ def test_an_explicit_flag_still_wins_over_detection(flag):
         softcapped = flag, logit_scaled = flag,
     )
     assert told.headroom_bytes == expected
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError, KeyError, OSError, ImportError, RecursionError],
+)
+def test_a_config_that_raises_anything_does_not_abort_planning(error):
+    """`getattr`'s default only swallows `AttributeError`, so a remote-code
+    config raising anything else used to escape detection and take the whole
+    plan down with it, even for a caller that asked for no detection at all."""
+    class _Attribute:
+        def __getattr__(self, name):
+            raise error(name)
+
+    class _Property:
+        @property
+        def text_config(self):
+            raise error("text_config")
+
+    class _Method:
+        text_config = None
+        def get_text_config(self):
+            raise error("get_text_config")
+
+    for config in (_Attribute(), _Property(), _Method()):
+        assert detect_logit_transforms(config) == {
+            "logit_softcapping": 0.0,
+            "logit_scale_multiply": 0.0,
+            "logit_scale_divide": 0.0,
+        }
+
+    model = _meta(vocab = 512)
+    model.config = _Property()
+    plan = plan_device_map(model, max_memory = {0: 8 * _GiB, 1: 8 * _GiB})
+    assert plan is not None
+
+
+def test_an_interrupt_is_not_swallowed():
+    """Detection absorbs config errors, not the user's Ctrl-C."""
+    class _Interrupting:
+        def __getattr__(self, name):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        detect_logit_transforms(_Interrupting())
+
+
+def test_one_unreadable_field_does_not_discard_the_readable_ones():
+    """A field that is present but not a number is skipped on its own. Zeroing
+    the whole result would drop a soft cap the old flag-free path did detect."""
+    config = _Cfg(final_logit_softcapping = 30.0, logit_scale = ["not a number"])
+    found = detect_logit_transforms(config)
+    assert found["logit_softcapping"] == 30.0
+    assert found["logit_scale_multiply"] == 0.0
+
+
+def test_a_non_numeric_alias_falls_through_to_the_next_one():
+    config = _Cfg(final_logit_softcapping = object(), logits_soft_cap = 20.0)
+    assert detect_logit_transforms(config)["logit_softcapping"] == 20.0
