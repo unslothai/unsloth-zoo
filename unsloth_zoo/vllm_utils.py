@@ -1374,6 +1374,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
                 kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
             elif quant_method == 'fp8':
+                if quantization_config.get("scale_fmt") == "ue8m0":
+                    from .temporary_patches.utils import require_native_float8_e8m0fnu
+                    require_native_float8_e8m0fnu()
                 kwargs['activation_scheme'] = quantization_config['activation_scheme']
                 kwargs['block_size'] = quantization_config['weight_block_size']
                 try:
@@ -1387,6 +1390,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 except:
                     raise ImportError("Unsloth: FP8 models need importing FbgemmFP8Linear from `transformers.integrations.fbgemm_fp8` but we don't see it.")
             elif quant_method == 'compressed-tensors':
+                if quantization_config.get("scale_fmt") == "ue8m0":
+                    from .temporary_patches.utils import require_native_float8_e8m0fnu
+                    require_native_float8_e8m0fnu()
                 kwargs['activation_scheme'] = 'dynamic' # mark it dynamic for now
                 block_size = [128, 128] # The default we override if we find in config
                 config_groups = quantization_config.get('config_groups', None)

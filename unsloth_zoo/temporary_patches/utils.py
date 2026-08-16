@@ -45,6 +45,7 @@ __all__ = [
 import functools
 import inspect
 import weakref
+import contextlib
 import typing as t
 import torch
 from textwrap import dedent
@@ -315,88 +316,142 @@ def _torchao_torch_mismatch_message(message):
     )
 
 
-def _ensure_torch_float8_e8m0fnu():
-    """Let transformers import on torch builds before float8_e8m0fnu existed.
+_E8M0_IMPORT_STUB_ACTIVE = False
 
-    Older transformers releases bind ``torch.float8_e8m0fnu`` at import time inside
-    ``integrations.finegrained_fp8``. PyTorch added that dtype in 2.7, so a plain
-    ``import unsloth`` dies on earlier torch even when the run will never touch
-    UE8M0 FP8 checkpoints. Aliasing to ``torch.float8_e4m3fn`` is enough for the
-    import to succeed; UE8M0 models still fail later with transformers' own error.
-    """
-    if hasattr(torch, "float8_e8m0fnu"):
+
+def torch_supports_float8_e8m0fnu() -> bool:
+    """True when torch natively provides ``float8_e8m0fnu`` (not our import alias)."""
+    return hasattr(torch, "float8_e8m0fnu") and not _E8M0_IMPORT_STUB_ACTIVE
+
+
+def require_native_float8_e8m0fnu(
+    feature: str = "UE8M0 FP8 checkpoints",
+) -> None:
+    """Raise when a UE8M0 FP8 path is taken on torch without the real dtype."""
+    if torch_supports_float8_e8m0fnu():
+        return
+    raise RuntimeError(
+        f"***** Unsloth: {feature} require torch.float8_e8m0fnu, which is only "
+        f"available in PyTorch >= 2.7 (found {torch.__version__}). Upgrade torch "
+        f"to use UE8M0 FP8 checkpoints. *****"
+    )
+
+
+class _UE8M0RuntimeUnavailable:
+    """Dropped into finegrained_fp8 after a stubbed import on torch < 2.7."""
+
+    def __repr__(self) -> str:
+        return "torch.float8_e8m0fnu (unavailable; upgrade PyTorch >= 2.7)"
+
+
+@contextlib.contextmanager
+def _temporary_float8_e8m0fnu_import_stub():
+    """Stub ``torch.float8_e8m0fnu`` only while transformers is importing."""
+    global _E8M0_IMPORT_STUB_ACTIVE
+    if torch_supports_float8_e8m0fnu():
+        yield False
         return
     fallback = getattr(torch, "float8_e4m3fn", None)
-    if fallback is not None:
-        torch.float8_e8m0fnu = fallback  # type: ignore[attr-defined]
+    if fallback is None:
+        yield False
+        return
+    _E8M0_IMPORT_STUB_ACTIVE = True
+    torch.float8_e8m0fnu = fallback  # type: ignore[attr-defined]
+    try:
+        yield True
+    finally:
+        _E8M0_IMPORT_STUB_ACTIVE = False
+        if hasattr(torch, "float8_e8m0fnu"):
+            del torch.float8_e8m0fnu
 
 
-_ensure_torch_float8_e8m0fnu()
+def _install_finegrained_fp8_ue8m0_guard() -> None:
+    """After a stubbed import, stop UE8M0 from using the import-time alias."""
+    if torch_supports_float8_e8m0fnu():
+        return
+    try:
+        import transformers.integrations.finegrained_fp8 as fg
+    except Exception:
+        return
 
-try:
-    from transformers.processing_utils import Unpack
-    assert \
-        type(Unpack) is type(t_Unpack), \
-        "Unsloth: Unpack type changed! Please file a bug report asap!"
-except ImportError as e:
-    e = str(e)
-    if "cannot import name '_center' from 'numpy._core.umath'" in e:
+    unavailable = _UE8M0RuntimeUnavailable()
+    if hasattr(fg, "_UE8M0_SF_DTYPE"):
+        fg._UE8M0_SF_DTYPE = unavailable  # type: ignore[attr-defined]
+
+    getter = getattr(fg, "_get_ue8m0_dtype", None)
+    if getter is None:
+        return
+
+    def _guarded_get_ue8m0_dtype():
+        require_native_float8_e8m0fnu()
+
+    try:
+        fg._get_ue8m0_dtype = functools.cache(_guarded_get_ue8m0_dtype)  # type: ignore[attr-defined]
+    except Exception:
+        fg._get_ue8m0_dtype = _guarded_get_ue8m0_dtype  # type: ignore[attr-defined]
+
+
+_STUBBED_TRANSFORMERS_IMPORT = False
+
+with _temporary_float8_e8m0fnu_import_stub() as _stubbed_transformers_import:
+    _STUBBED_TRANSFORMERS_IMPORT = _stubbed_transformers_import
+    try:
+        from transformers.processing_utils import Unpack
+        assert \
+            type(Unpack) is type(t_Unpack), \
+            "Unsloth: Unpack type changed! Please file a bug report asap!"
+    except ImportError as e:
+        e = str(e)
+        if "cannot import name '_center' from 'numpy._core.umath'" in e:
+            raise RuntimeError(
+                f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
+            )
+        elif "torchvision::nms does not exist" in e:
+            raise RuntimeError(_TORCHVISION_BROKE)
+        elif "No module named 'torchvision.io.video'" in e or \
+             "No module named 'torchvision.io._video'" in e:
+            raise RuntimeError(
+                f"***** Your torchvision install is incomplete: `torchvision.io` "
+                f"imports a `video` module that is not there. Please run "
+                f"`pip install --upgrade --force-reinstall --no-cache-dir torchvision` "
+                f"then restart your runtime/kernel. Original error = {e} *****"
+            )
+        elif "PIL" in e or "_Ink" in e or "Pillow" in e:
+            raise RuntimeError(
+                f"***** Your Pillow (PIL) version is incompatible with torchvision. "
+                f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
+            )
+        elif _torchao_is_newer_than_torch(e):
+            raise RuntimeError(_torchao_torch_mismatch_message(e)) from None
+        elif "Unpack" not in e:
+            raise Exception(e)
         raise RuntimeError(
-            f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
+            f"Unsloth: Unpack has been moved! Other error = {str(e)}.\n"\
+            "Please file a bug report asap!"
         )
-    elif "torchvision::nms does not exist" in e:
-        raise RuntimeError(_TORCHVISION_BROKE)
-    elif "No module named 'torchvision.io.video'" in e or \
-         "No module named 'torchvision.io._video'" in e:
-        # A half-installed torchvision, like the nms arm above. No release raises
-        # this alone (0.25 ships `io/video.py`, 0.26 dropped it with its importer),
-        # so only a tree partly overwritten by a venv install gets here.
-        # The MISSING-MODULE form only: `cannot import name 'read_video' from
-        # 'torchvision.io.video'` carries the same substring while the module is
-        # right there, and the message below would then be a lie.
-        raise RuntimeError(
-            f"***** Your torchvision install is incomplete: `torchvision.io` "
-            f"imports a `video` module that is not there. Please run "
-            f"`pip install --upgrade --force-reinstall --no-cache-dir torchvision` "
-            f"then restart your runtime/kernel. Original error = {e} *****"
-        )
-    elif "PIL" in e or "_Ink" in e or "Pillow" in e:
-        raise RuntimeError(
-            f"***** Your Pillow (PIL) version is incompatible with torchvision. "
-            f"Please run `pip install --upgrade --force-reinstall Pillow` then restart your runtime/kernel. *****"
-        )
-    elif _torchao_is_newer_than_torch(e):
-        raise RuntimeError(_torchao_torch_mismatch_message(e)) from None
-    elif "Unpack" not in e:
-        raise Exception(e)
-    raise RuntimeError(
-        f"Unsloth: Unpack has been moved! Other error = {str(e)}.\n"\
-        "Please file a bug report asap!"
-    )
-except Exception as e:
-    e_str = str(e)
-    # The nms arm above, for the case that never arrives as an ImportError: a
-    # torchvision whose compiled ops do not match torch fails inside
-    # `_meta_registrations` at `register_fake("torchvision::nms")`, a RuntimeError.
-    if "float8_e8m0fnu" in e_str and "has no attribute" in e_str:
-        raise RuntimeError(
-            f"***** Unsloth: your transformers build needs torch.float8_e8m0fnu "
-            f"(PyTorch >= 2.7), but torch {torch.__version__} does not provide it. "
-            f"Upgrade torch to use UE8M0 FP8 checkpoints, or update unsloth_zoo if "
-            f"you are on an older torch and only training non-FP8 models. "
-            f"Original error: {e_str} *****"
-        ) from None
-    if "torchvision::nms does not exist" in e_str:
-        raise RuntimeError(_TORCHVISION_BROKE)
-    if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
-        raise RuntimeError(
-            f"***** numpy was likely upgraded mid-session without restarting the kernel. "
-            f"numpy C extensions cannot be reloaded in-place. "
-            f"Please restart your runtime/kernel after installing packages. "
-            f"Original error: {e_str} *****"
-        )
-    raise
-pass
+    except Exception as e:
+        e_str = str(e)
+        if "float8_e8m0fnu" in e_str and "has no attribute" in e_str:
+            raise RuntimeError(
+                f"***** Unsloth: your transformers build needs torch.float8_e8m0fnu "
+                f"(PyTorch >= 2.7), but torch {torch.__version__} does not provide it. "
+                f"Upgrade torch to use UE8M0 FP8 checkpoints, or update unsloth_zoo if "
+                f"you are on an older torch and only training non-FP8 models. "
+                f"Original error: {e_str} *****"
+            ) from None
+        if "torchvision::nms does not exist" in e_str:
+            raise RuntimeError(_TORCHVISION_BROKE)
+        if "numpy" in e_str and ("_blas" in e_str or "_multiarray" in e_str):
+            raise RuntimeError(
+                f"***** numpy was likely upgraded mid-session without restarting the kernel. "
+                f"numpy C extensions cannot be reloaded in-place. "
+                f"Please restart your runtime/kernel after installing packages. "
+                f"Original error: {e_str} *****"
+            )
+        raise
+
+if _STUBBED_TRANSFORMERS_IMPORT:
+    _install_finegrained_fp8_ue8m0_guard()
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
 

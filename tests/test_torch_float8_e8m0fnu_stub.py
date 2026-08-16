@@ -31,41 +31,82 @@ UTILS = (Path(__file__).resolve().parents[1] / "unsloth_zoo"
          / "temporary_patches" / "utils.py")
 
 
-def _run_ensure(torch_mod):
+def _load_helpers():
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
+    wanted = {
+        "_temporary_float8_e8m0fnu_import_stub",
+        "torch_supports_float8_e8m0fnu",
+        "require_native_float8_e8m0fnu",
+    }
+    ns: dict = {"contextlib": __import__("contextlib")}
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_ensure_torch_float8_e8m0fnu":
-            ns = {"torch": torch_mod}
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
             exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
-            ns["_ensure_torch_float8_e8m0fnu"]()
-            return
-    raise AssertionError("_ensure_torch_float8_e8m0fnu not found in utils.py")
+    missing = wanted - set(ns)
+    assert not missing, f"helpers not found in utils.py: {missing}"
+    return ns
 
 
-def test_stub_aliases_e4m3_when_e8m0_missing():
+HELPERS = _load_helpers()
+temporary_stub = HELPERS["_temporary_float8_e8m0fnu_import_stub"]
+supports = HELPERS["torch_supports_float8_e8m0fnu"]
+require_native = HELPERS["require_native_float8_e8m0fnu"]
+
+
+def _run_temporary_stub(torch_mod):
+    tree = ast.parse(UTILS.read_text(encoding="utf-8"))
+    ns = {
+        "torch": torch_mod,
+        "contextlib": __import__("contextlib"),
+        "_E8M0_IMPORT_STUB_ACTIVE": False,
+    }
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in (
+            "torch_supports_float8_e8m0fnu",
+            "_temporary_float8_e8m0fnu_import_stub",
+        ):
+            exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
+    return ns["_temporary_float8_e8m0fnu_import_stub"]
+
+
+def test_temporary_stub_aliases_e4m3_only_during_context():
     torch_mod = types.SimpleNamespace(float8_e4m3fn = object())
-    _run_ensure(torch_mod)
-    assert torch_mod.float8_e8m0fnu is torch_mod.float8_e4m3fn
-
-
-def test_stub_is_a_noop_when_e8m0_already_exists():
-    sentinel = object()
-    torch_mod = types.SimpleNamespace(float8_e8m0fnu = sentinel, float8_e4m3fn = object())
-    _run_ensure(torch_mod)
-    assert torch_mod.float8_e8m0fnu is sentinel
-
-
-def test_stub_leaves_torch_alone_when_no_fp8_dtypes_exist():
-    torch_mod = types.SimpleNamespace()
-    _run_ensure(torch_mod)
+    stub = _run_temporary_stub(torch_mod)
+    with stub() as used:
+        assert used is True
+        assert torch_mod.float8_e8m0fnu is torch_mod.float8_e4m3fn
     assert not hasattr(torch_mod, "float8_e8m0fnu")
 
 
-def test_the_helper_runs_before_the_unpack_import():
-    src = UTILS.read_text(encoding="utf-8")
-    stub = src.index("_ensure_torch_float8_e8m0fnu()")
-    unpack = src.index("from transformers.processing_utils import Unpack")
-    assert stub < unpack, "the stub must run before transformers is imported"
+def test_temporary_stub_is_noop_when_e8m0_already_exists():
+    sentinel = object()
+    torch_mod = types.SimpleNamespace(float8_e8m0fnu = sentinel)
+    stub = _run_temporary_stub(torch_mod)
+    with stub() as used:
+        assert used is False
+        assert torch_mod.float8_e8m0fnu is sentinel
+
+
+def test_the_import_context_runs_before_unpack_import():
+    tree = ast.parse(UTILS.read_text(encoding="utf-8"))
+    with_line = None
+    unpack_line = None
+    for node in tree.body:
+        if isinstance(node, ast.With):
+            for item in node.items:
+                ctx = item.context_expr
+                if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name):
+                    if ctx.func.id == "_temporary_float8_e8m0fnu_import_stub":
+                        with_line = node.lineno
+        if isinstance(node, ast.With):
+            for child in ast.walk(node):
+                if isinstance(child, ast.ImportFrom) and child.module == "transformers.processing_utils":
+                    for alias in child.names:
+                        if alias.name == "Unpack":
+                            unpack_line = child.lineno
+    assert with_line is not None, "import context manager not found"
+    assert unpack_line is not None, "Unpack import not found"
+    assert with_line < unpack_line
 
 
 def test_attribute_error_branch_names_e8m0():
@@ -73,21 +114,35 @@ def test_attribute_error_branch_names_e8m0():
     assert '"float8_e8m0fnu" in e_str and "has no attribute" in e_str' in src
 
 
+def test_require_native_raises_when_e8m0_missing():
+    pytest.importorskip("torch")
+    import torch
+
+    if hasattr(torch, "float8_e8m0fnu"):
+        pytest.skip("need torch without native e8m0 for this check")
+
+    with pytest.raises(RuntimeError, match="PyTorch >= 2.7"):
+        require_native()
+
+
 @pytest.mark.integration
-def test_old_transformers_module_bind_succeeds_after_stub():
+def test_old_transformers_bind_inside_temporary_stub():
     """Mimic pinned transformers that bind _UE8M0_SF_DTYPE at import time."""
     pytest.importorskip("torch")
     import torch
 
     if not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("torch build lacks float8_e4m3fn")
-
     if hasattr(torch, "float8_e8m0fnu"):
-        del torch.float8_e8m0fnu
+        pytest.skip("need torch without native e8m0 for this check")
 
-    _run_ensure(torch)
-    _UE8M0_SF_DTYPE = torch.float8_e8m0fnu  # noqa: N806 — mirrors transformers
-    assert _UE8M0_SF_DTYPE is torch.float8_e4m3fn
+    stub = _run_temporary_stub(torch)
+    with stub():
+        _UE8M0_SF_DTYPE = torch.float8_e8m0fnu  # noqa: N806
+        assert _UE8M0_SF_DTYPE is torch.float8_e4m3fn
+    assert not hasattr(torch, "float8_e8m0fnu")
+    with pytest.raises(RuntimeError, match="PyTorch >= 2.7"):
+        require_native()
 
 
 if __name__ == "__main__":

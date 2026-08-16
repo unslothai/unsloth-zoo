@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import os
+
+os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
+
+import subprocess
 import sys
 import traceback
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-STUDIO_TRANSFORMERS_ROOT = os.path.expanduser(
-    "~/.unsloth/studio/.venv_t5_510"
-)
 
 
 def _banner(title: str) -> None:
@@ -21,7 +22,9 @@ def test_old_transformers_fails_without_stub() -> bool:
     _banner("1. Studio finegrained_fp8 bind WITHOUT stub (expect fail)")
     import torch
 
-    assert not hasattr(torch, "float8_e8m0fnu"), "need torch < 2.7 for this check"
+    if hasattr(torch, "float8_e8m0fnu"):
+        print("SKIP: need torch < 2.7")
+        return True
     try:
         ns = {"torch": torch}
         exec("_UE8M0_SF_DTYPE = torch.float8_e8m0fnu", ns)  # noqa: S102
@@ -35,32 +38,51 @@ def test_old_transformers_fails_without_stub() -> bool:
         return False
 
 
-def _load_ensure_helper():
-    import ast
-
-    path = os.path.join(ROOT, "unsloth_zoo", "temporary_patches", "utils.py")
-    tree = ast.parse(open(path, encoding="utf-8").read())
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_ensure_torch_float8_e8m0fnu":
-            ns = {"torch": __import__("torch")}
-            exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
-            return ns["_ensure_torch_float8_e8m0fnu"]
-    raise RuntimeError("helper not found")
-
-
 def test_old_transformers_succeeds_with_stub() -> bool:
-    _banner("2. Studio finegrained_fp8 bind WITH stub (expect pass)")
+    _banner("2. Studio finegrained_fp8 bind WITH temporary stub (expect pass)")
+    import ast
     import torch
 
-    ensure = _load_ensure_helper()
-    ensure()
-    assert torch.float8_e8m0fnu is torch.float8_e4m3fn
+    if hasattr(torch, "float8_e8m0fnu"):
+        print("SKIP: need torch < 2.7")
+        return True
+
+    utils_path = os.path.join(ROOT, "unsloth_zoo", "temporary_patches", "utils.py")
+    tree = ast.parse(open(utils_path, encoding="utf-8").read())
+    ns = {
+        "torch": torch,
+        "contextlib": __import__("contextlib"),
+        "_E8M0_IMPORT_STUB_ACTIVE": False,
+    }
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in (
+            "torch_supports_float8_e8m0fnu",
+            "require_native_float8_e8m0fnu",
+            "_temporary_float8_e8m0fnu_import_stub",
+        ):
+            exec(compile(ast.Module([node], []), "<utils>", "exec"), ns)
+    if "require_native_float8_e8m0fnu" not in ns:
+        print("FAIL: could not load require_native_float8_e8m0fnu from utils.py")
+        return False
+    temporary_stub = ns["_temporary_float8_e8m0fnu_import_stub"]
+    require_native = ns["require_native_float8_e8m0fnu"]
 
     try:
-        ns = {"torch": torch}
-        exec("_UE8M0_SF_DTYPE = torch.float8_e8m0fnu", ns)  # noqa: S102
-        assert ns["_UE8M0_SF_DTYPE"] is torch.float8_e4m3fn
-        print("OK: Studio bind line succeeds after stub")
+        with temporary_stub() as used:
+            assert used is True
+            bind_ns = {"torch": torch}
+            exec("_UE8M0_SF_DTYPE = torch.float8_e8m0fnu", bind_ns)  # noqa: S102
+            assert bind_ns["_UE8M0_SF_DTYPE"] is torch.float8_e4m3fn
+        assert not hasattr(torch, "float8_e8m0fnu")
+        try:
+            require_native()
+            print("FAIL: require_native should raise after stub exits")
+            return False
+        except RuntimeError as exc:
+            if "PyTorch >= 2.7" not in str(exc):
+                print("FAIL: unexpected error:", exc)
+                return False
+        print("OK: temporary bind works; UE8M0 rejected after import")
         return True
     except Exception as exc:
         print("FAIL:", exc)
@@ -70,21 +92,17 @@ def test_old_transformers_succeeds_with_stub() -> bool:
 
 def test_temporary_patches_utils_import() -> bool:
     _banner("3. unsloth_zoo.temporary_patches.utils import on torch 2.6")
-    import subprocess
+    venv_py = os.path.join(ROOT, ".test-e8m0-venv", "bin", "python")
+    if not os.path.isfile(venv_py):
+        print("SKIP: .test-e8m0-venv not found")
+        return True
 
     code = r'''
-import os, sys, types
+import os, sys, types, importlib.util
 os.environ["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 root = os.environ["UNSLOTH_ZOO_ROOT"]
 sys.path.insert(0, root)
-
 import torch
-assert not hasattr(torch, "float8_e8m0fnu")
-assert hasattr(torch, "float8_e4m3fn")
-
-# conftest-style device_type preload
-import importlib.util
 pkg = "unsloth_zoo"
 pkg_path = os.path.join(root, pkg)
 pkg_mod = types.ModuleType(pkg)
@@ -108,36 +126,20 @@ try:
     dt_spec.loader.exec_module(dt_mod)
 finally:
     torch.cuda.is_available = _orig
-
-from unsloth_zoo.temporary_patches.utils import Unpack
-assert torch.float8_e8m0fnu is torch.float8_e4m3fn
+utils_path = os.path.join(pkg_path, "temporary_patches", "utils.py")
+utils_spec = importlib.util.spec_from_file_location(
+    "unsloth_zoo.temporary_patches.utils", utils_path,
+    submodule_search_locations=[os.path.join(pkg_path, "temporary_patches")],
+)
+utils_mod = importlib.util.module_from_spec(utils_spec)
+sys.modules["unsloth_zoo.temporary_patches.utils"] = utils_mod
+utils_spec.loader.exec_module(utils_mod)
+assert not utils_mod.torch_supports_float8_e8m0fnu()
+assert hasattr(utils_mod, "Unpack")
 print("ok")
 '''
-    env = dict(os.environ)
-    env["UNSLOTH_ZOO_ROOT"] = ROOT
-    # Load utils.py directly (same entry point as the Studio crash) without
-    # pulling every temporary_patches submodule.
-    code = code.replace(
-        "from unsloth_zoo.temporary_patches import utils as tp_utils\n"
-        "assert torch.float8_e8m0fnu is torch.float8_e4m3fn\n"
-        "assert hasattr(tp_utils, \"Unpack\")",
-        "utils_path = os.path.join(pkg_path, \"temporary_patches\", \"utils.py\")\n"
-        "utils_spec = importlib.util.spec_from_file_location(\n"
-        "    \"unsloth_zoo.temporary_patches.utils\", utils_path,\n"
-        "    submodule_search_locations=[os.path.join(pkg_path, \"temporary_patches\")],\n"
-        ")\n"
-        "utils_mod = importlib.util.module_from_spec(utils_spec)\n"
-        "sys.modules[\"unsloth_zoo.temporary_patches.utils\"] = utils_mod\n"
-        "utils_spec.loader.exec_module(utils_mod)\n"
-        "assert torch.float8_e8m0fnu is torch.float8_e4m3fn\n"
-        "assert hasattr(utils_mod, \"Unpack\")",
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    env = {**os.environ, "UNSLOTH_ZOO_ROOT": ROOT, "UNSLOTH_ZOO_DISABLE_GPU_INIT": "1"}
+    result = subprocess.run([venv_py, "-c", code], env=env, capture_output=True, text=True)
     if result.returncode == 0 and "ok" in result.stdout:
         print("OK: temporary_patches.utils imported with Unpack")
         return True
@@ -147,60 +149,50 @@ print("ok")
 
 def test_ue8m0_on_capable_torch() -> bool:
     _banner("4. UE8M0 dtype available on torch 2.12+ (Studio FP8 path)")
-    import subprocess
-
-    code = """
-import torch
-from transformers.integrations import finegrained_fp8 as fg
-if hasattr(torch, "float8_e8m0fnu"):
-    getter = getattr(fg, "_get_ue8m0_dtype", None)
-    if getter is not None:
-        dtype = getter()
-        assert dtype is torch.float8_e8m0fnu
-        print("ok getter")
-    elif hasattr(fg, "_UE8M0_SF_DTYPE"):
-        assert fg._UE8M0_SF_DTYPE is torch.float8_e8m0fnu
-        print("ok module bind")
-    else:
-        print("skip no ue8m0 hook")
-else:
-    raise RuntimeError("torch lacks float8_e8m0fnu on a build that should have it")
-"""
     py = "/home/ubuntu/workspace/unsloth/.venv/bin/python"
     if not os.path.isfile(py):
         print("SKIP: unsloth venv not available")
         return True
-    result = subprocess.run([py, "-c", code], capture_output=True, text=True)
+    code = """
+import torch
+from transformers.integrations import finegrained_fp8 as fg
+assert hasattr(torch, "float8_e8m0fnu")
+getter = getattr(fg, "_get_ue8m0_dtype", None)
+if getter is not None:
+    assert getter() is torch.float8_e8m0fnu
+    print("ok getter")
+elif hasattr(fg, "_UE8M0_SF_DTYPE"):
+    assert fg._UE8M0_SF_DTYPE is torch.float8_e8m0fnu
+    print("ok module bind")
+else:
+    print("skip no ue8m0 hook")
+"""
+    env = {**os.environ}
+    result = subprocess.run([py, "-c", code], env=env, capture_output=True, text=True)
     if result.returncode == 0:
-        print("OK:", (result.stdout or "").strip())
+        out = (result.stdout or "").strip()
+        print("OK:", out or "passed")
         return True
     print("FAIL:", result.stderr or result.stdout)
     return False
 
 
 def main() -> int:
-    os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    sys.path.insert(0, ROOT)
     import torch
 
     print("torch", torch.__version__)
-    print("e8m0", hasattr(torch, "float8_e8m0fnu"))
-    print("e4m3", hasattr(torch, "float8_e4m3fn"))
-    print("studio transformers root:", STUDIO_TRANSFORMERS_ROOT)
+    print("e8m0 native", hasattr(torch, "float8_e8m0fnu"))
 
     results = [
         test_old_transformers_fails_without_stub(),
         test_old_transformers_succeeds_with_stub(),
         test_temporary_patches_utils_import(),
+        test_ue8m0_on_capable_torch(),
     ]
-
-    # UE8M0-capable torch check uses the workspace torch 2.12 venv.
-    results.append(test_ue8m0_on_capable_torch())
-
     passed = sum(results)
-    total = len(results)
-    print(f"\n=== SUMMARY: {passed}/{total} passed ===")
-    return 0 if passed == total else 1
+    print(f"\n=== SUMMARY: {passed}/{len(results)} passed ===")
+    return 0 if passed == len(results) else 1
 
 
 if __name__ == "__main__":
