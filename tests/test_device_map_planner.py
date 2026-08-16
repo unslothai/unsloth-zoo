@@ -1881,6 +1881,44 @@ def test_a_wrapped_model_still_reports_its_transforms(wrapper):
     assert detect_logit_transforms(outer)["logit_softcapping"] == 30.0
 
 
+def test_the_muse_glimmer_multiplier():
+    """Muse Glimmer pre-scales by `output_multiplier` and then soft caps, so it
+    owes BOTH buffers; only the cap was detected. The composite applies it in its
+    own forward (`logits = logits * self.config.text_config.output_multiplier`),
+    and the name appears in no other config, so matching it risks nothing."""
+    config = _Cfg(text_config = _Cfg(output_multiplier = 0.19611613513818404,
+                                     final_logit_softcapping = 20.0))
+    found = detect_logit_transforms(config)
+    assert found["logit_scale_multiply"] == 0.19611613513818404
+    assert found["logit_softcapping"] == 20.0
+
+
+def test_logits_scaling_multiplies_for_hyperclovax_and_divides_for_granite():
+    """The same spelling, opposite operations. transformers says so on the line:
+    "MuP: multiply logits by logits_scaling (cf. GraniteForCausalLM which
+    divides)". Bucketing HyperCLOVA X as a divide reports the wrong magnitude to
+    anything that applies the transform rather than just sizing it."""
+    granite = _Cfg(model_type = "granite", logits_scaling = 8.0)
+    assert detect_logit_transforms(granite)["logit_scale_divide"] == 8.0
+    assert detect_logit_transforms(granite)["logit_scale_multiply"] == 0.0
+
+    clova = _Cfg(model_type = "hyperclovax", logits_scaling = 8.0)
+    assert detect_logit_transforms(clova)["logit_scale_multiply"] == 8.0
+    assert detect_logit_transforms(clova)["logit_scale_divide"] == 0.0
+
+
+def test_minicpm3_logits_scaling_is_not_a_logit_transform():
+    """MiniCPM3 exposes `logits_scaling` as a property that divides the HIDDEN
+    STATES before the head (`hidden_states = hidden_states / ...`), so no logits
+    temporary exists and reserving one reserves for nothing."""
+    config = _Cfg(model_type = "minicpm3", logits_scaling = 10.0)
+    assert detect_logit_transforms(config) == {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+
+
 def test_a_config_that_hands_back_itself_terminates():
     class _Circular:
         final_logit_softcapping = 20.0

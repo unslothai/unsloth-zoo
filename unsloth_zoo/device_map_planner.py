@@ -224,6 +224,28 @@ def _model_config(model_or_config):
 # the soft cap in its own ``forward``; neither belongs here.
 _OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
 
+# Config field -> which magnitude it contributes, by default.
+_TRANSFORM_FIELDS = (
+    ("logit_softcapping",
+     ("final_logit_softcapping", "logits_soft_cap", "output_logit_soft_cap")),
+    ("logit_scale_multiply",
+     ("logit_scale", "lm_head_multiplier", "output_multiplier")),
+    ("logit_scale_divide", ("logits_scaling",)),
+)
+
+# ``logits_scaling`` is not one knob. Granite divides the logits by it, but
+# HyperCLOVA X multiplies, and transformers says so on the line itself: "MuP:
+# multiply logits by logits_scaling (cf. GraniteForCausalLM which divides)".
+# MiniCPM3 spells the same name as a property that scales the HIDDEN STATES
+# before the head (``hidden_states = hidden_states / self.config.logits_scaling``),
+# so it makes no logits temporary at all and maps to nothing. Keyed on the
+# ``model_type`` of the config the field was read from, so a composite wrapping
+# one of these towers is judged by the tower.
+_BUCKET_OVERRIDES = {
+    ("logits_scaling", "hyperclovax"): "logit_scale_multiply",
+    ("logits_scaling", "minicpm3"): None,
+}
+
 
 def _text_configs(config):
     """``config`` and every text sub-config it exposes, outermost first.
@@ -265,8 +287,11 @@ def detect_logit_transforms(model_or_config) -> dict:
       ``output_logit_soft_cap``.
     * ``logit_scale`` multiplies the logits (Cohere, Cohere 2).
     * ``lm_head_multiplier`` multiplies them too (Falcon-H1, which applies it on
-      the ``lm_head`` call itself rather than on a following line).
-    * ``logits_scaling`` divides them (Granite and its MoE variants).
+      the ``lm_head`` call itself rather than on a following line), as does
+      ``output_multiplier`` (Muse Glimmer, which then soft caps as well).
+    * ``logits_scaling`` divides them (Granite and its MoE variants), except in
+      HyperCLOVA X where it multiplies, and in MiniCPM3 where it scales the
+      hidden states before the head and so is not a logit transform at all.
 
     Both scale fields are applied unguarded in their ``forward``, so the buffer
     exists whatever the value. CLIP-style models also carry a ``logit_scale``,
@@ -295,21 +320,18 @@ def detect_logit_transforms(model_or_config) -> dict:
         for holder in _text_configs(config):
             if own_head and holder is not config:
                 continue
-            for key, names in (
-                ("logit_softcapping",
-                 ("final_logit_softcapping", "logits_soft_cap",
-                  "output_logit_soft_cap")),
-                ("logit_scale_multiply", ("logit_scale", "lm_head_multiplier")),
-                ("logit_scale_divide", ("logits_scaling",)),
-            ):
-                if found[key]:
-                    continue
+            model_type = _config_attr(holder, "model_type")
+            for key, names in _TRANSFORM_FIELDS:
                 for name in names:
+                    # Same spelling, different meaning in some families.
+                    bucket = _BUCKET_OVERRIDES.get((name, model_type), key)
+                    if bucket is None or found[bucket]:
+                        continue
                     value = _config_attr(holder, name)
                     if value is None:
                         continue
                     try:
-                        found[key] = float(value)
+                        found[bucket] = float(value)
                     except Exception:
                         # Anything at all: a huge int raises OverflowError, not
                         # ValueError, and falling through to the outer handler
