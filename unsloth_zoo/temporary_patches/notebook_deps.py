@@ -269,13 +269,17 @@ def patch_requires_backends_autoinstall():
             wanted = [b for b in wanted_iter if isinstance(b, str) and b in _ALLOW_LIST]
             if not wanted:
                 raise
-            installed_any = False
-            for b in wanted:
-                if _try_install_and_import(b):
-                    installed_any = True
-            if not installed_any:
+            # Refresh only the backends that are genuinely importable now.
+            # On transformers 4.x `_refresh_backend_availability` flips the
+            # module level `_<backend>_available` flag that
+            # `is_<backend>_available` returns, so refreshing a backend whose
+            # install failed makes the retry below report it as present. The
+            # caller then proceeds into an import of a package that is still
+            # missing and fails later with a much less actionable error.
+            installed = [b for b in wanted if _try_install_and_import(b)]
+            if not installed:
                 raise
-            for b in wanted:
+            for b in installed:
                 _refresh_backend_availability(iu, b)
             return _orig(obj, backends)
 

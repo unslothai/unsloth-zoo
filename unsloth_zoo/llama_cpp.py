@@ -327,6 +327,19 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         try:
             acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
         except EOFError:
+            # Only a stdin that is not a terminal is implicit consent. An
+            # interactive terminal also raises EOFError, on Ctrl-D, and there
+            # it means the user backed out of the prompt, so it has to keep
+            # cancelling rather than authorise a package manager command.
+            try:
+                _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
+            except Exception:
+                _stdin_is_a_tty = False
+            if _stdin_is_a_tty:
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
             if os.environ.get("UNSLOTH_AUTO_INSTALL", "1") != "1":
                 raise RuntimeError(
                     f"Unsloth: Execution of `{install_cmd}` was cancelled (no TTY and UNSLOTH_AUTO_INSTALL=0)!\n"\

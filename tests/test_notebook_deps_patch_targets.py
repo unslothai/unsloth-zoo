@@ -415,3 +415,83 @@ def test_refresh_tolerates_a_backend_with_no_cached_probe(monkeypatch):
     import_utils._timm_available = False
     notebook_deps._refresh_backend_availability(import_utils, _BACKEND)
     assert import_utils._timm_available is True
+
+
+# ---------------------------------------------------------------------------
+# 5. A backend whose install failed must not be marked available.
+# ---------------------------------------------------------------------------
+
+
+_SECOND_BACKEND = "av"
+
+
+def _fake_flag_based_transformers(monkeypatch, installed):
+    """A synthetic transformers shaped like 4.x: one module level
+    ``_<backend>_available`` flag per backend, and the ``BACKENDS_MAPPING``
+    probe reading it. Verified against the real transformers 4.57.6, where
+    ``is_av_available()`` is ``return _av_available`` and the mapping entry
+    carries no ``cache_clear``."""
+    import_utils = types.ModuleType("transformers.utils.import_utils")
+
+    def _probe(backend):
+        return lambda: getattr(import_utils, f"_{backend}_available")
+
+    for backend, available in installed.items():
+        setattr(import_utils, f"_{backend}_available", available)
+    import_utils.BACKENDS_MAPPING = {
+        backend: (_probe(backend), "{0} needs " + backend) for backend in installed
+    }
+
+    def original(obj, backends):
+        wanted = backends if isinstance(backends, (list, tuple)) else [backends]
+        failed = [b for b in wanted if not import_utils.BACKENDS_MAPPING[b][0]()]
+        if failed:
+            name = getattr(obj, "__name__", type(obj).__name__)
+            raise ImportError(f"{name} requires the {', '.join(failed)} library")
+        return None
+
+    import_utils.requires_backends = original
+
+    utils = types.ModuleType("transformers.utils")
+    utils.import_utils = import_utils
+    utils.requires_backends = original
+
+    root = types.ModuleType("transformers")
+    root.utils = utils
+
+    for name, module in (
+        ("transformers", root),
+        ("transformers.utils", utils),
+        ("transformers.utils.import_utils", import_utils),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return import_utils
+
+
+def test_a_failed_install_is_not_marked_available(monkeypatch):
+    """One backend installs, another does not: only the first may be refreshed.
+
+    Refreshing every requested backend sets `_<backend>_available = True` for
+    the one that is still missing, so the retry succeeds and the caller walks
+    into a bare ModuleNotFoundError further down instead of the actionable
+    ImportError it was about to get.
+    """
+    import_utils = _fake_flag_based_transformers(
+        monkeypatch, {_BACKEND: False, _SECOND_BACKEND: False}
+    )
+
+    def _stub(pkg):
+        return pkg == _BACKEND      # `av` cannot be installed here
+
+    monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
+    monkeypatch.setattr(notebook_deps, "_AUTO_INSTALL", True)
+    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+
+    notebook_deps.patch_requires_backends_autoinstall()
+
+    with pytest.raises(ImportError) as excinfo:
+        import_utils.requires_backends(_Consumer, [_BACKEND, _SECOND_BACKEND])
+    assert _SECOND_BACKEND in str(excinfo.value)
+    assert getattr(import_utils, f"_{_SECOND_BACKEND}_available") is False
+    # The one that did install is still refreshed, or the retry buys nothing.
+    assert getattr(import_utils, f"_{_BACKEND}_available") is True

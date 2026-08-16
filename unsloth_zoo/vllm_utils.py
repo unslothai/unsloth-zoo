@@ -2044,6 +2044,45 @@ def _clear_flashinfer_env_on_hip():
     return True
 
 
+# Modules evicted by `_block_flashinfer_import`, so the block can be lifted
+# again. A name mapped to None was absent before the block and must stay absent.
+_UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
+
+
+def _block_flashinfer_import():
+    # Make `import flashinfer` raise ImportError for the rest of the process:
+    # None in sys.modules is the documented "this module fails to import"
+    # marker, see https://docs.python.org/3/reference/import.html. Everything
+    # evicted is remembered so `_unblock_flashinfer_import` can put it back.
+    try:
+        for _name in list(sys.modules):
+            if _name == "flashinfer" or _name.startswith("flashinfer."):
+                _UNSLOTH_BLOCKED_FLASHINFER_MODULES.setdefault(_name, sys.modules[_name])
+                del sys.modules[_name]
+        _UNSLOTH_BLOCKED_FLASHINFER_MODULES.setdefault("flashinfer", None)
+        sys.modules["flashinfer"] = None
+    except Exception:
+        pass
+
+
+def _unblock_flashinfer_import():
+    # Undo `_block_flashinfer_import`, restoring sys.modules to what it held
+    # before. Without this the process-wide block outlives the load_vllm() call
+    # that installed it, so unrelated code can never `import flashinfer` again
+    # and `importlib.util.find_spec("flashinfer")` keeps reporting the package
+    # as absent even after nvcc/ninja are installed.
+    if not _UNSLOTH_BLOCKED_FLASHINFER_MODULES: return
+    try:
+        if sys.modules.get("flashinfer", False) is None:
+            del sys.modules["flashinfer"]
+        for _name, _module in _UNSLOTH_BLOCKED_FLASHINFER_MODULES.items():
+            if _module is not None and _name not in sys.modules:
+                sys.modules[_name] = _module
+        _UNSLOTH_BLOCKED_FLASHINFER_MODULES.clear()
+    except Exception:
+        pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -2275,6 +2314,13 @@ def load_vllm(
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
     # On AMD, vLLM uses its built-in paged attention instead.
+    # A previous load_vllm() in this process may have blocked `import flashinfer`
+    # below. Lift that block whenever the opt-out is clear, so a caller that has
+    # since installed nvcc/ninja and reset UNSLOTH_VLLM_NO_FLASHINFER=0 gets a
+    # fresh probe (find_spec reports the package as absent while the block is in
+    # place) instead of a process that can never reach FlashInfer again.
+    if os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+        _unblock_flashinfer_import()
     if _clear_flashinfer_env_on_hip():
         pass
     elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
@@ -2299,6 +2345,7 @@ def load_vllm(
                 f"  To enable FlashInfer, install the missing tools:\n"
                 f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
                 f"    ninja - pip install ninja\n"
+                f"  Then set UNSLOTH_VLLM_NO_FLASHINFER=0 to use FlashInfer again in this session.\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
             # Force vLLM off FlashInfer when nvcc/ninja are missing.
@@ -2320,17 +2367,7 @@ def load_vllm(
             # its own default instead of a backend it cannot JIT-compile.
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
-            try:
-                # Drop any cached flashinfer module then mark it None so
-                # `import flashinfer` raises ImportError. None-in-sys.modules
-                # is the documented Python idiom for "this module fails to
-                # import"; see https://docs.python.org/3/reference/import.html.
-                for _name in list(sys.modules):
-                    if _name == "flashinfer" or _name.startswith("flashinfer."):
-                        del sys.modules[_name]
-                sys.modules["flashinfer"] = None
-            except Exception:
-                pass
+            _block_flashinfer_import()
         else:
             # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
