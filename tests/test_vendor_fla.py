@@ -60,9 +60,8 @@ VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
 def _injection_supported() -> bool:
     # Mirror the production support gate exactly (Python>=3.10, torch/triton
-    # minimums, CUDA, and the Hopper/Triton range that needs the pruned TileLang
-    # backend). A looser check would run the subprocess tests on hosts where the
-    # patch intentionally skips injection, so they would fail instead of skip.
+    # minimums, CUDA). A looser check would run the subprocess tests on hosts where
+    # the patch intentionally skips injection, so they would fail instead of skip.
     try:
         from unsloth_zoo.temporary_patches.fla_vendor import (
             _vendored_injection_supported,
@@ -194,7 +193,29 @@ def test_backported_blackwell_hopper_fixes_present():
     assert "for num_warps in [2, 4, 8]" in wy
 
     co = (VENDORED / "ops" / "common" / "chunk_o.py").read_text()
-    assert "IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1" in co
+    # Upstream's guard window, kept intact: [3.4.0, 3.7.1) only.
+    assert "and TRITON_ABOVE_3_4_0\n        and not TRITON_ABOVE_3_7_1" in co
+    # Hopper is decided per tensor, not from the import-time global. That global is
+    # frozen from device 0 and is wrong in both directions on a mixed host: it misses
+    # a Hopper card at a nonzero index, and it marks a call on an Ada/Blackwell card
+    # as affected when device 0 is the Hopper one. It survives only as the fallback
+    # for when the probe cannot tell, so a probe failure never fails open.
+    assert "_on_hopper = _is_hopper_tensor(k)" in co
+    assert "if _on_hopper is None:\n        _on_hopper = IS_NVIDIA_HOPPER" in co
+    assert "def _device_is_nvidia_hopper(index):" in co
+    # Capability, not shared memory: check_shared_mem('hopper') is a >=232448-byte
+    # tier test that Blackwell B200 also passes, so it cannot detect Hopper.
+    assert "torch.cuda.get_device_capability(index)[0] == 9" in co
+    # fla #640's root cause is BK == 64 on Hopper, so we step the tile down instead
+    # of refusing to run. Pin both halves so a re-vendor cannot silently drop them.
+    assert "if HOPPER_DQKWG_BROKEN and BK == 64:\n        BK = 32" in co
+    assert co.index("BK = 32") < co.index("NK = triton.cdiv(K, BK)"), (
+        "the BK override must run before NK / the dg scratch / the grid are derived"
+    )
+    # The dead remediation must not come back: the TileLang kernels are pruned and
+    # _inject_vendored_fla force-sets FLA_TILELANG=0, so installing it cannot help.
+    assert "install tilelang: `pip install tilelang`" not in co
+    assert 'pip install -U "triton>=3.7.1"' in co
 
     compat = (VENDORED / "utils" / "_compat.py").read_text()
     assert "TRITON_ABOVE_3_7_1 = " in compat
@@ -384,12 +405,14 @@ def test_python_39_skips_injection(monkeypatch):
     assert fla_vendor._torch_triton_cuda_supported() is False
 
 
-def test_hopper_bad_triton_range_skips_injection():
-    # Upstream chunk_bwd_dqkwg raises on Hopper + triton [3.4.0, 3.7.1) and
-    # points at the pruned TileLang backend, so injection must bail there.
+def test_hopper_bad_triton_range_is_suspect_but_still_supported():
+    # Hopper + triton [3.4.0, 3.7.1) is the fla #640 miscompile range. It used to
+    # skip injection entirely; the vendored chunk_bwd_dqkwg now steps around the
+    # bad BK=64 tile, so such a host is flagged *suspect* (prefer our copy over an
+    # installed fla) while remaining *supported* (keep the Triton fast path).
     import types
 
-    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
 
     def fake_torch(name, major, count=1):
         cuda = types.SimpleNamespace(
@@ -410,8 +433,20 @@ def test_hopper_bad_triton_range_skips_injection():
         ("3.8.0", False),
     ):
         tri = types.SimpleNamespace(__version__=ver)
-        assert _hopper_triton_needs_tilelang(hopper, tri) is want_on_hopper, ver
-        assert _hopper_triton_needs_tilelang(blackwell, tri) is False, ver
+        assert _hopper_dqkwg_suspect(hopper, tri) is want_on_hopper, ver
+        assert _hopper_dqkwg_suspect(blackwell, tri) is False, ver
+
+    # The key inversion: being suspect no longer disables injection. The support
+    # gate must not consult the Hopper predicate at all any more.
+    import inspect
+
+    from unsloth_zoo.temporary_patches.fla_vendor import _torch_triton_cuda_supported
+
+    src = inspect.getsource(_torch_triton_cuda_supported)
+    assert "_hopper_dqkwg_suspect(" not in src, (
+        "the support gate must not disable fla on Hopper; the vendored kernel "
+        "avoids the miscompiled tile instead"
+    )
 
 
 def test_rocm_major9_device_not_treated_as_hopper():
@@ -420,7 +455,7 @@ def test_rocm_major9_device_not_treated_as_hopper():
     # Hopper guard, or AMD users lose the vendored path on triton [3.4.0, 3.7.1).
     import types
 
-    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
 
     def fake_torch(name, major, hip):
         cuda = types.SimpleNamespace(
@@ -433,12 +468,12 @@ def test_rocm_major9_device_not_treated_as_hopper():
     bad = types.SimpleNamespace(__version__="3.6.0")  # in [3.4.0, 3.7.1)
     # AMD Instinct on a ROCm build: major 9 but not Hopper -> keep the fast path.
     amd = fake_torch("AMD Instinct MI300X", 9, "6.0.32830")
-    assert _hopper_triton_needs_tilelang(amd, bad) is False
+    assert _hopper_dqkwg_suspect(amd, bad) is False
     # A real Hopper on a CUDA build (hip=None) still trips, by name and by major.
     nvidia_named = fake_torch("NVIDIA H100 80GB HBM3", 9, None)
     nvidia_unnamed = fake_torch("", 9, None)
-    assert _hopper_triton_needs_tilelang(nvidia_named, bad) is True
-    assert _hopper_triton_needs_tilelang(nvidia_unnamed, bad) is True
+    assert _hopper_dqkwg_suspect(nvidia_named, bad) is True
+    assert _hopper_dqkwg_suspect(nvidia_unnamed, bad) is True
 
 
 def test_hopper_at_nonzero_device_index_trips_guard():
@@ -446,7 +481,7 @@ def test_hopper_at_nonzero_device_index_trips_guard():
     # different architecture; the guard must scan every visible device, not just 0.
     import types
 
-    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_triton_needs_tilelang
+    from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
 
     def mixed_torch(caps, names):
         cuda = types.SimpleNamespace(
@@ -471,11 +506,11 @@ def test_hopper_at_nonzero_device_index_trips_guard():
     ok = types.SimpleNamespace(__version__="3.7.1")    # patched Triton
 
     # A Hopper card at cuda:1 must trip the guard in the bad Triton range.
-    assert _hopper_triton_needs_tilelang(ada_then_hopper, bad) is True
+    assert _hopper_dqkwg_suspect(ada_then_hopper, bad) is True
     # Same host, patched Triton: no skip.
-    assert _hopper_triton_needs_tilelang(ada_then_hopper, ok) is False
+    assert _hopper_dqkwg_suspect(ada_then_hopper, ok) is False
     # No Hopper on any index: never skip.
-    assert _hopper_triton_needs_tilelang(ada_only, bad) is False
+    assert _hopper_dqkwg_suspect(ada_only, bad) is False
 
 
 def test_blackwell_import_device_scans_visible_devices():

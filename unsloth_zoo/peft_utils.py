@@ -329,26 +329,37 @@ def requires_grad_for_gradient_checkpointing(model):
     def requires_grad_post_hook(module, input, output):
         type_output = type(output)
         if type_output is torch.Tensor:
-            output.requires_grad_(True)
+            target = output
         else:
             try: # For HF dataclass, try loss or logits
                 if hasattr(output, "loss") and output.loss is not None:
-                    output.loss.requires_grad_(True)
+                    target = output.loss
                 elif hasattr(output, "logits") and output.logits is not None: # RL like GRPO has no loss (no labels)
-                    output.logits.requires_grad_(True)
+                    target = output.logits
                 elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
                     # Encoder / decoder-style embedding backbones (e.g. Qwen3-Embedding) return a
                     # BaseModelOutputWithPast with only last_hidden_state (no loss/logits) when called
                     # for sentence embeddings. Make it require grad so gradient checkpointing works.
                     # See https://github.com/unslothai/unsloth/issues/5360
-                    output.last_hidden_state.requires_grad_(True)
+                    target = output.last_hidden_state
                 else:
+                    # Raise while tracing too: is_compiling() is constant folded, so a skip
+                    # here is permanent and the region trains with no adapter gradients.
                     raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
+        # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping the
+        # no-op keeps fullgraph = True working. Skipping a real flip would break the frozen
+        # input embedding this also lands on, losing every checkpointing gradient.
+        if torch.compiler.is_compiling() and target.requires_grad: return
+        target.requires_grad_(True)
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):
+        # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA target
+        # (embed_audio.embedding_projection) with fullgraph = True, so it is a hard error.
+        # Safe to skip: anything traced here is already downstream of trainable LoRA weights.
+        if torch.compiler.is_compiling(): return
         # Try positional args first (normal text models)
         if args:
             first = args[0]

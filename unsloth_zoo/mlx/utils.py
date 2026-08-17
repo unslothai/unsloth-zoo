@@ -55,9 +55,11 @@ from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
 
+from packaging.version import Version as _Version
 
-from .cce import _get_runtime_cce
-from .cce.runtime_cce import _normalize_label_smoothing
+
+from unsloth_zoo.mlx.cce import _get_runtime_cce
+from unsloth_zoo.mlx.cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -1572,7 +1574,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
 # so the two backends cannot drift apart.
-from ..vlm_tokens import VLM_PLACEHOLDER_TOKENS
+from unsloth_zoo.vlm_tokens import VLM_PLACEHOLDER_TOKENS
 _IMAGE_TOKEN_STRINGS = tuple(VLM_PLACEHOLDER_TOKENS)
 
 
@@ -4398,14 +4400,62 @@ def _tokenize_mlx_prompt_completion(
     state=None,
 ):
     """Tokenize a text prompt/completion pair and mask prompt labels like TRL."""
-    prompt_ids = list(encode_mlx_text(tokenizer, prompt, state=state))
-    input_ids = list(encode_mlx_text(tokenizer, prompt + completion, state=state))
+    encoded = _encode_mlx_prompt_completion(
+        tokenizer, prompt, prompt + completion, append_eos=False, state=state,
+    )
     return _mask_mlx_prompt_completion_labels(
         tokenizer,
-        prompt_ids,
-        input_ids,
+        list(encoded.input_ids[:encoded.prompt_length]),
+        list(encoded.input_ids),
         append_eos=append_eos,
         completion_only_loss=completion_only_loss,
+    )
+
+
+@dataclass(frozen=True)
+class _MLXPromptCompletionTokens:
+    """Immutable encoding shared by SFT and preference tokenization."""
+
+    prompt_ids: tuple
+    input_ids: tuple
+    prompt_length: int
+
+
+def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
+    """Locate the completion after tolerating one boundary-merged token."""
+    prompt_ids = tuple(prompt_ids)
+    input_ids = tuple(input_ids)
+    if input_ids[:len(prompt_ids)] == prompt_ids:
+        return len(prompt_ids)
+    prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
+    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+        raise ValueError(
+            "Unsloth MLX: tokenized prompt and prompt+completion differ before "
+            "the final prompt token; only a boundary merge is supported."
+        )
+    return prompt_length
+
+
+def _encode_mlx_prompt_completion(
+    tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+):
+    """Encode a prompt and its full text with one EOS policy."""
+    prompt_ids = tuple(int(x) for x in encode_mlx_text(
+        tokenizer, prompt_text, state=state,
+    ))
+    input_ids = [int(x) for x in encode_mlx_text(
+        tokenizer, full_text, state=state,
+    )]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if append_eos and eos_id is not None and (
+        not input_ids or input_ids[-1] != int(eos_id)
+    ):
+        input_ids.append(int(eos_id))
+    input_ids = tuple(input_ids)
+    return _MLXPromptCompletionTokens(
+        prompt_ids,
+        input_ids,
+        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
     )
 
 
@@ -5527,7 +5577,7 @@ def _extract_vlm_images(
 
     if not images and isinstance(messages, list):
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             extracted = process_vision_info(messages, return_video_kwargs=True)
             if isinstance(extracted, tuple) and extracted:
@@ -5557,7 +5607,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
 
     if isinstance(item, dict) and "images" in item:
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             raw_images = item["images"]
             vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
@@ -5586,20 +5636,79 @@ _AUDIO_SOFT_TOKEN_STRINGS = (
     "<|endoftext11|>",
 )
 
-# Families and the exact mlx-vlm versions their audio path was validated on.
-# Anything else is refused: merge contracts differ per family and mlx-vlm has
-# changed audio preprocessing within its supported span.
-_AUDIO_QUALIFIED_FAMILIES: "dict[str, frozenset]" = {
-    "gemma3n": frozenset({"0.4.4"}),
-    "gemma4": frozenset({"0.4.4"}),
-    "phi4mm": frozenset({"0.4.4"}),
-    "minicpmo": frozenset({"0.4.4"}),
+class _AudioVersions(NamedTuple):
+    """The first mlx-vlm release containing a family's qualified audio path."""
+
+    minimum: str
+
+    def admits(self, installed):
+        if not installed:
+            return False
+        try:
+            found = _Version(installed)
+            # Only published final releases were probed, and mlx-vlm has shipped
+            # no prerelease, post-release or local build in 73 releases.
+            if found.is_prerelease or found.is_postrelease or found.local:
+                return False
+            return _Version(self.minimum) <= found
+        except Exception:
+            # An unparseable version is not evidence; refusing beats raising.
+            return False
+
+    def __str__(self):
+        return f">={self.minimum}"
+
+
+# Families and the mlx-vlm releases their audio path is qualified for.
+#
+# Probes ran on 0.4.4. gemma3n, phi4mm and minicpmo ship a byte-identical
+# processor from 0.4.4 through 0.6.9.
+#
+# Gemma 4 starts at 0.6.2, not 0.4.4: below that mlx-vlm cannot load the
+# checkpoint at all. E2B's KV-shared layers reuse an earlier layer's K/V and
+# ship no k_proj/v_proj/k_norm, and mlx-vlm built those modules for every layer
+# until Blaizzy/mlx-vlm#1301, so loading died on 60 missing tensors.
+#
+# The 0.4.4 this replaces was correct when written -- the export before
+# 2026-07-06 shipped those projections -- and was invalidated by the checkpoint
+# being re-uploaded. A version key cannot express a fact about an artefact, so
+# re-measure with `tests/gemma4_audio_version_probe.py` rather than argue.
+#
+# Measured on macos-14 against mlx-community/gemma-4-e2b-it-4bit @ 2387675275,
+# 0.4.4 through 0.6.4: load, placeholder count vs the positions `audio_tower`
+# returns at 0.5s/1.0s/2.0s/3.7s, two clips giving two losses. 0.6.1 red,
+# 0.6.2-0.6.4 green.
+#
+# Raw mlx-vlm 0.6.4 fails on these weights -- #1498
+# made sanitize unconditional, double-transposing pre-converted convs -- but
+# loader.py's `_ensure_audio_conv_sanitize` (PR 879) undoes it, and upstream
+# fixed it in 0.6.5 (#1523).
+# Unified needs 0.6.5's processor/audio-layout fix; Qwen needs 0.6.7's batched
+# mel input and sample-domain length fixes. 0.6.10 is the latest real-model gate.
+#
+# Nemotron is 0.6.10, not the 0.5.0 that first carried it: below that,
+# `sanitize_audio_weights` transposes `sound_encoder.encoder.*` convs
+# unconditionally, so a pre-converted weight double-transposes and the load
+# fails ((128,3,3,1) -> (128,3,1,3) on 0.5.0/0.6.4/0.6.7, untouched on 0.6.10+).
+# `_ensure_audio_conv_sanitize` cannot repair it: it keys on markers in the
+# sanitize source, and Nemotron's `Model.sanitize` delegates to a module-level
+# function carrying neither.
+_AUDIO_QUALIFIED_FAMILIES: "dict[str, _AudioVersions]" = {
+    "gemma3n": _AudioVersions("0.4.4"),
+    "gemma4": _AudioVersions("0.6.2"),
+    "gemma4_unified": _AudioVersions("0.6.5"),
+    "nemotron_h_nano_omni": _AudioVersions("0.6.10"),
+    "qwen3_omni_moe": _AudioVersions("0.6.7"),
+    "phi4mm": _AudioVersions("0.4.4"),
+    "minicpmo": _AudioVersions("0.4.4"),
 }
 
 # Families probed only on a newer transformers than this package pins, at the
 # version the probes ran on. Older releases expand their audio tokens
 # differently, so they are refused rather than assumed compatible.
-_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5)}
+# Redundant now gemma4's floor is 0.6.2 (every mlx-vlm there needs
+# transformers>=5.5.0), but kept for hand-assembled environments.
+_AUDIO_MIN_TRANSFORMERS = {"gemma4": (5, 5), "gemma4_unified": (5, 5)}
 
 _AUDIO_CAST_HINT = (
     "Cast the dataset column with "
@@ -5652,14 +5761,17 @@ def _check_audio_transformers_floor(family):
         import transformers
 
         version = transformers.__version__
-        parts = tuple(int(x) for x in version.split(".")[:2])
+        # PEP 440, not int(split(".")), which raised on "5.5rc1" or a v-prefixed
+        # tag. Compared whole, not by `.release`: that reads 5.5rc1 as 5.5, and
+        # PEP 440 sorts the prerelease below 5.5.0.
+        found = _Version(version)
     except Exception:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' requires transformers "
             f"{floor[0]}.{floor[1]} or newer, and the installed version could "
             f"not be determined."
         ) from None
-    if parts < floor:
+    if found < _Version(f"{floor[0]}.{floor[1]}"):
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' was verified on "
             f"transformers {floor[0]}.{floor[1]}, but {version} is installed; "
@@ -5862,7 +5974,7 @@ def _check_audio_family_gate(processor):
     family = _audio_family_from_processor(processor)
     probed = _AUDIO_QUALIFIED_FAMILIES.get(family)
     installed = _installed_mlx_vlm_version()
-    if probed and installed in probed:
+    if probed and probed.admits(installed):
         _check_audio_transformers_floor(family)
         return family
     if not _AUDIO_QUALIFIED_FAMILIES:
@@ -5873,13 +5985,13 @@ def _check_audio_family_gate(processor):
             f"image parts of this dataset."
         )
     supported = ", ".join(
-        f"{name} (mlx-vlm {', '.join(sorted(versions))})"
+        f"{name} (mlx-vlm {versions})"
         for name, versions in sorted(_AUDIO_QUALIFIED_FAMILIES.items())
     )
     if probed:
         raise NotImplementedError(
             f"Unsloth MLX: audio training for '{family}' has only been verified "
-            f"on mlx-vlm {', '.join(sorted(probed))}, but mlx-vlm "
+            f"on mlx-vlm {probed}, but mlx-vlm "
             f"{installed or 'unknown'} is installed. Pin a verified version to "
             f"train on audio. Verified: {supported}."
         )
@@ -5898,6 +6010,8 @@ def audio_extractor_sampling_rate(processor):
         processor,
     ):
         rate = getattr(holder, "sampling_rate", None)
+        if rate is None and holder is processor:
+            rate = getattr(processor, "audio_sampling_rate", None)
         if rate:
             try:
                 return int(rate)
@@ -6044,7 +6158,12 @@ def _model_carries_audio_modules(model):
         return False
     for entry in walk():
         name = entry[0] if isinstance(entry, tuple) else entry
-        if "audio" in str(name).lower():
+        lowered = str(name).lower()
+        if (
+            "audio" in lowered
+            or lowered.startswith("sound_")
+            or ".sound_" in lowered
+        ):
             return True
     return False
 
@@ -6205,7 +6324,11 @@ def _vlm_audio_part_state(messages):
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in _AUDIO_PART_TYPES:
+            # Key-only `{"audio": clip}` too: the template renders a
+            # placeholder for it, so skipping it left the row a waveform short.
+            if part.get("type") not in _AUDIO_PART_TYPES and not any(
+                key in part for key in _AUDIO_PART_TYPES
+            ):
                 continue
             payload = None
             for key in _AUDIO_PART_TYPES:
@@ -6324,8 +6447,13 @@ def _extract_vlm_audio(item, messages, processor):
 
 # Payload keys only: masks and size vectors can survive a dropped payload.
 _AUDIO_FEATURE_PAYLOAD_KEYS = (
-    "input_features", "input_audio_embeds", "audio_features",
+    "input_features", "input_audio_embeds", "audio_features", "sound_clips",
 )
+
+# Some image processors keep one tensor per image when aspect-ratio-dependent
+# preprocessing produces different spatial shapes. Their vision tower consumes
+# that ragged list directly; collapsing to value[0] silently drops later images.
+_VLM_RAGGED_MEDIA_PAYLOAD_KEYS = (*_AUDIO_FEATURE_PAYLOAD_KEYS, "pixel_values")
 
 
 def _assert_audio_features_present(inputs, expected, processor):
@@ -6931,6 +7059,14 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 def _to_mx_vlm_batch(inputs):
     batch = {}
     for key, value in inputs.items():
+        if key == "sound_clips" and isinstance(value, (list, tuple)):
+            # Nemotron's outer list is the clip axis. Stacking equal lengths
+            # turns it into one 2-D clip, which its extractor downmixes.
+            batch[key] = [
+                x if isinstance(x, mx.array) else mx.array(np.asarray(x))
+                for x in value
+            ]
+            continue
         if key in _VLM_PER_ROW_MEDIA_KEYS and isinstance(value, (list, tuple)):
             batch[key] = [mx.array(np.asarray(row)) for row in value]
             continue
@@ -6945,13 +7081,11 @@ def _to_mx_vlm_batch(inputs):
                     for x in value
                 ])
             except Exception:
-                if key in _AUDIO_FEATURE_PAYLOAD_KEYS and len(value) > 1:
-                    # Clips of unequal duration do not stack, and dropping to
-                    # value[0] would leave one clip behind ids, placeholder runs
-                    # and labels for all of them -- the pairing
-                    # `_assert_audio_features_present` just verified. Kept entry
-                    # by entry so the count survives; ragged audio never reaches
-                    # the compiled path, so there is no signature to hold.
+                if key in _VLM_RAGGED_MEDIA_PAYLOAD_KEYS and len(value) > 1:
+                    # Unequal media shapes do not stack, and dropping to value[0]
+                    # would leave one payload behind ids, placeholder runs and
+                    # labels for all of them. Keep every entry so model-specific
+                    # eager paths can apply their own ragged handling.
                     batch[key] = [
                         x if isinstance(x, mx.array) else mx.array(np.asarray(x))
                         for x in value
@@ -7200,6 +7334,31 @@ def _processor_vlm_inputs(
         base_kwargs["truncation"] = True
         if max_seq_length is not None:
             base_kwargs["max_length"] = max_seq_length
+        if audio is not None:
+            # `max_length` is a token budget, but transformers' `_merge_kwargs`
+            # fans a flat keyword out to *every* modality that declares it, and
+            # `AudioKwargs` declares both `max_length` and `truncation`. So the
+            # token cap reaches the audio feature extractor, which reads the
+            # same number as a *sample* budget. Gemma 3n shows it plainly: a
+            # one-second 16 kHz clip under `max_length=512` comes back as
+            # `input_features` of shape (1, 0, 128) -- the waveform cut to 512
+            # samples, 0.032s, which frames to nothing -- while `input_ids` is
+            # untouched. Every clip longer than `max_seq_length` samples loses
+            # its audio that way, which at any realistic cap is every clip.
+            #
+            # An empty `audio_kwargs` shields the audio modality alone: a
+            # modality that appears in kwargs stops reading flat keywords, so
+            # the extractor no longer sees the cap while the text path keeps
+            # every flat keyword it has always had.
+            #
+            # Scoping the *text* side instead would take the same switch the
+            # other way and silently drop `padding`, `add_special_tokens` and
+            # `return_tensors` for the text modality, which returns ragged
+            # lists and a doubled BOS. The shield has to go on the side that
+            # should not be reading these keywords.
+            base_kwargs.update(_drop_unsupported_processor_kwargs(
+                processor, {"audio_kwargs": {}},
+            ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
     images = _format_vlm_images_for_processor(all_images, processor=processor)
@@ -7229,6 +7388,24 @@ def _processor_vlm_inputs(
             try:
                 return _call_vlm_processor(processor, (), proc_kwargs)
             except TypeError as exc:
+                if (
+                    "audio_kwargs" in str(exc)
+                    and "unexpected keyword argument" in str(exc)
+                    and "audio_kwargs" in proc_kwargs
+                ):
+                    # Gemma 4 handles audio itself, then forwards remaining
+                    # kwargs to its tokenizer. It therefore rejects the
+                    # modality shield used by ProcessorMixin-based families;
+                    # its feature extractor never sees the flat text cap.
+                    proc_kwargs.pop("audio_kwargs")
+                    try:
+                        return _call_vlm_processor(processor, (), proc_kwargs)
+                    except Exception as retry_exc:
+                        if first_error is None:
+                            first_error = retry_exc
+                        if len(image_layouts) == 1:
+                            raise
+                        continue
                 if (
                     "add_special_tokens" in str(exc)
                     # Bound twice, or not accepted: both mean drop and retry.
@@ -8412,8 +8589,9 @@ def _audio_fixed_budget(processor, config=None):
 
 _AUDIO_TOWER_ATTRS = (
     "audio_tower", "embed_audio", "audio_encoder", "audio_projection",
-    "audio_projection_layer",
+    "audio_projection_layer", "sound_encoder", "sound_projection",
 )
+_AUDIO_OUTPUT_ATTRS = ("talker", "code2wav")
 
 
 _AUDIO_MERGE_SENTINEL = "_unsloth_audio_merge_patched"
@@ -8582,25 +8760,36 @@ def _masked_scatter_rowwise(embeds, mask, source):
 
 
 def freeze_audio_modules(model):
-    """Freeze the audio tower and its projection.
+    """Freeze audio-input towers/projections and audio-output modules.
 
     Audio towers are inference-only here: their encoders carry fp32 promotions,
     long cumulative reductions and host-synchronizing guards that make them
     poor training subjects, and the model-side merge assumes their output is a
-    fixed function of the clip. LoRA runs freeze everything by default, but a
-    full fine-tune would otherwise pull these parameters into the optimizer.
+    fixed function of the clip. Audio-output modules are outside this input-only
+    training path. LoRA runs freeze everything by default, but a full fine-tune
+    would otherwise pull all of these parameters into the optimizer.
 
     Returns the names of the modules that were frozen.
     """
     frozen = []
-    for attr in _AUDIO_TOWER_ATTRS:
-        for owner in (model, getattr(model, "language_model", None)):
+    seen = set()
+    for attr in _AUDIO_TOWER_ATTRS + _AUDIO_OUTPUT_ATTRS:
+        for owner in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "thinker", None),
+        ):
             module = getattr(owner, attr, None) if owner is not None else None
             if module is None or not hasattr(module, "freeze"):
                 continue
+            # Every owner, not just the first: a distinct `thinker.audio_tower`
+            # beside a top-level one would otherwise stay trainable. Deduped by
+            # identity so an alias is not reported twice.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
             module.freeze(recurse=True)
             frozen.append(attr)
-            break
     return frozen
 
 
@@ -10800,6 +10989,87 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
+    """Translate fractional epochs into HF-style accumulation windows."""
+    accum = max(1, int(grad_accum or 1))
+    per_epoch = max(1, math.ceil(cycle_length / accum))
+    budget = max(1, math.ceil(float(num_epochs) * per_epoch))
+    whole, rem = divmod(budget, per_epoch)
+    return whole * cycle_length + rem * accum
+
+
+def _finite_row_schedule(
+    row_count,
+    batch_size,
+    *,
+    order_for_epoch,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    comm_group=None,
+):
+    """Build a finite, epoch-bounded microbatch schedule from row indices."""
+    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
+
+    def batches_for_epoch(epoch):
+        order = list(order_for_epoch(epoch))
+        batches = []
+        for start in range(0, row_count, global_batch_size):
+            chunk = _rank_slice_distributed_batch(
+                order[start : start + global_batch_size],
+                batch_size,
+                comm_group=comm_group,
+                pad_source=order,
+            )
+            if chunk:
+                batches.append(tuple(chunk))
+        return tuple(batches)
+
+    return _finite_batch_schedule(
+        batches_for_epoch,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+
+
+def _finite_batch_schedule(
+    batches_for_epoch,
+    *,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+):
+    """Build a finite horizon from already-bounded epoch microbatches."""
+    first_batches = tuple(tuple(batch) for batch in batches_for_epoch(0))
+    cycle_length = len(first_batches)
+    if cycle_length == 0:
+        return (), 0
+    target = num_batches
+    if target is None:
+        target = (
+            cycle_length
+            if num_epochs is None
+            else _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
+        )
+    schedule = []
+    epoch = 0
+    while len(schedule) < target:
+        batches = (
+            first_batches
+            if epoch == 0
+            else tuple(tuple(batch) for batch in batches_for_epoch(epoch))
+        )
+        if len(batches) != cycle_length:
+            raise ValueError("finite epoch schedules must have a stable batch count")
+        for batch in batches:
+            schedule.append(batch)
+            if len(schedule) >= target:
+                break
+        epoch += 1
+    return tuple(schedule), cycle_length
+
+
 def _create_ordered_text_plan(
     dataset,
     tokenizer,
@@ -10921,76 +11191,15 @@ def _create_ordered_text_plan(
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))
 
-    schedule = []
-    epoch = 0
-    order = make_order(epoch)
-    order_pos = 0
-    seen = 0
-    global_batch_size = _distributed_global_batch_size(batch_size, comm_group)
-    # Micro-batches in ONE dataset pass. Every epoch chunks an order of the
-    # same length and a chunk's local slice is non-empty whatever rows it holds,
-    # so this is constant across epochs even under num_batches truncation.
-    cycle_length = sum(
-        1 for start in range(0, len(order), global_batch_size)
-        if _rank_slice_distributed_batch(
-            order[start : start + global_batch_size],
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
+    schedule, cycle_length = _finite_row_schedule(
+        len(tokenized),
+        batch_size,
+        order_for_epoch=make_order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+        comm_group=comm_group,
     )
-    # why: HF quantizes a fractional num_train_epochs to whole accumulation
-    # windows and re-iterates the dataloader rather than taking a proportional
-    # slice of rows, so 0.5 epochs of 5 rows at batch 2 / accum 2 is one update
-    # over 4 rows, not 3 rows. Build to that step budget: whole passes plus the
-    # windows of the partial one, where a pass's last micro-batch forces its own
-    # update. int(num_epochs) instead built 0 batches for 0 < epochs < 1, which
-    # surfaced as "No training batches created", and one pass for 1.5.
-    target_batches = None
-    if num_batches is None:
-        if num_epochs is None:
-            target_batches = cycle_length
-        else:
-            accum = max(1, int(grad_accum or 1))
-            per_epoch = max(1, math.ceil(cycle_length / accum))
-            budget = max(1, math.ceil(float(num_epochs) * per_epoch))
-            whole, rem = divmod(budget, per_epoch)
-            target_batches = whole * cycle_length + rem * accum
-    while num_batches is None or len(schedule) < num_batches:
-        # Don't mix epochs in one batch; emit a partial then restart at epoch+1.
-        # Matches CUDA SequentialSampler `drop_last=False` and VLM path at :2539.
-        if order_pos >= len(order):
-            # Stop when num_batches or the epoch step budget is reached.
-            if (
-                num_batches is None
-                and (target_batches is None or len(schedule) >= target_batches)
-            ):
-                break
-            epoch += 1
-            order = make_order(epoch)
-            order_pos = 0
-
-        chunk = order[order_pos : order_pos + global_batch_size]
-        if not chunk:
-            break
-        order_pos += len(chunk)
-        seen += len(chunk)
-        chunk = _rank_slice_distributed_batch(
-            chunk,
-            batch_size,
-            comm_group=comm_group,
-            pad_source=order,
-        )
-        if not chunk:
-            break
-        schedule.append(tuple(chunk))
-
-        if (
-            num_batches is None
-            and target_batches is not None
-            and len(schedule) >= target_batches
-        ):
-            break
 
     if labeled:
         rows = _finite_text_rows(tokenized)
@@ -12698,23 +12907,7 @@ def _extract_mlx_lora_parameters(model):
             rank = int(a_shape[-1])
         scale = getattr(m, "scale", 1.0)
 
-        drop = getattr(m, "dropout", None)
-        # mlx.nn.Dropout stores keep-prob in _p_1; fall back to .p for shims
-        if drop is None:
-            dropout = 0.0
-        else:
-            keep = getattr(drop, "_p_1", None)
-            if keep is not None:
-                try:
-                    dropout = float(1.0 - float(keep))
-                except (TypeError, ValueError):
-                    dropout = 0.0
-            else:
-                p = getattr(drop, "p", None)
-                try:
-                    dropout = float(p) if p is not None else 0.0
-                except (TypeError, ValueError):
-                    dropout = 0.0
+        dropout = _read_mlx_lora_dropout(m)
         break
     return rank, scale, dropout
 
@@ -12744,6 +12937,8 @@ def collect_mlx_lora_adapter_tensors(model):
         prefix = f"{module_name}." if module_name else ""
         adapter_keys.add(f"{prefix}lora_a")
         adapter_keys.add(f"{prefix}lora_b")
+        adapter_keys.add(f"{prefix}lora_a.weight")
+        adapter_keys.add(f"{prefix}lora_b.weight")
         # Include DoRA magnitude `m`, gated on the DoRA class name so a
         # future LoRA wrapper with an unrelated `m` attribute isn't exported.
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
@@ -13098,6 +13293,17 @@ def _get_mlx_dropout_probability(drop):
     return 0.0
 
 
+def _read_mlx_lora_dropout(module):
+    """Read configured adapter dropout while a preference run has it disabled."""
+    drop = getattr(module, "dropout", None)
+    original = getattr(
+        drop, "_unsloth_preference_original_probability", None,
+    )
+    if original is not None:
+        return float(original)
+    return _get_mlx_dropout_probability(drop)
+
+
 def _coerce_mlx_lora_scale(scale, default=1.0):
     """Return a Python float from an mlx-lm LoRA wrapper's `.scale` attribute.
 
@@ -13378,9 +13584,7 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 lora_scale = _coerce_mlx_lora_scale(
                     getattr(module, "scale", 1.0),
                 )
-                lora_dropout = _get_mlx_dropout_probability(
-                    getattr(module, "dropout", None)
-                )
+                lora_dropout = _read_mlx_lora_dropout(module)
 
         # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
@@ -14442,7 +14646,7 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         # Reuse the same guards the generic installer uses so a user-pointed
         # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
         # never wiped out from under the caller.
-        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        from unsloth_zoo.llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
         is_prebuilt_install = os.path.isfile(
             os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
         )
@@ -14556,7 +14760,7 @@ def save_pretrained_gguf(
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
     """
-    from ..llama_cpp import (
+    from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
         check_llama_cpp,

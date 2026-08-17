@@ -37,6 +37,7 @@ Usage mirrors TRL notebooks:
 """
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
+import copy
 import concurrent.futures
 import hashlib
 import json
@@ -548,7 +549,6 @@ from .utils import (
     _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     _create_vlm_batch_plan,
-    _finite_text_pad_width,
     _vlm_batch_family,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
@@ -579,6 +579,14 @@ from .utils import (
     _distributed_rank_size,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
+)
+from .preference import (
+    FinitePreferenceBatchPlan,
+    PreferenceRunContext,
+    build_reference_policy,
+    create_preference_batch_plan,
+    make_dpo_loss_fn,
+    make_orpo_loss_fn,
 )
 from .compile import (
     build_compile_policy,
@@ -612,12 +620,14 @@ from .shape_guard import (
 
 # Finite CPU-backed batch plans sharing one protocol (visit mapping,
 # __getitem__/materialize, __len__).
-_FINITE_BATCH_PLAN_TYPES = (FiniteTextBatchPlan, FiniteVLMBatchPlan)
+_FINITE_BATCH_PLAN_TYPES = (
+    FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan,
+)
 # Plans a compile-failure fallback may refetch unpadded. The text plan rebuilds
 # from stored token ids and touches no RNG. The VLM plan reruns the caller's
 # processor, so a refetch would draw twice and offset every later batch; it
 # reuses the materialized batch instead, whose planned padding is masked.
-_EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan,)
+_EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan)
 
 
 def _is_hf_tokenizer(tokenizer):
@@ -1196,12 +1206,13 @@ class MLXTrainingConfig:
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
-        if len(args) > len(config_fields):
+        positional_fields = [field for field in config_fields if not field.kw_only]
+        if len(args) > len(positional_fields):
             raise TypeError(
-                f"MLXTrainingConfig expected at most {len(config_fields)} "
+                f"MLXTrainingConfig expected at most {len(positional_fields)} "
                 f"positional arguments, got {len(args)}"
             )
-        for field, value in zip(config_fields, args):
+        for field, value in zip(positional_fields, args):
             if field.name in kwargs:
                 raise TypeError(
                     f"MLXTrainingConfig got multiple values for argument "
@@ -1239,6 +1250,10 @@ class MLXTrainingConfig:
             "compile_max_variants",
             "label_smoothing_factor",
             "report_grad_norm",
+            "beta",
+            "disable_dropout",
+            "reference_free",
+            "label_smoothing",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1290,6 +1305,24 @@ class MLXTrainingConfig:
             key: value if type(value) in valid_types else str(value)
             for key, value in output.items()
         }
+
+
+@dataclass(init=False)
+class MLXORPOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXORPOTrainer."""
+
+    beta: float = field(default=0.1, kw_only=True)
+    disable_dropout: bool = field(default=True, kw_only=True)
+
+
+@dataclass(init=False)
+class MLXDPOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXDPOTrainer."""
+
+    beta: float = field(default=0.1, kw_only=True)
+    reference_free: bool = field(default=False, kw_only=True)
+    label_smoothing: float = field(default=0.0, kw_only=True)
+    disable_dropout: bool = field(default=True, kw_only=True)
 
 
 def _shape_guard_report(
@@ -1870,7 +1903,7 @@ def _plan_single_process_text_shapes(
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap,
         ), True, None
-    if not isinstance(batches, FiniteTextBatchPlan):
+    if not isinstance(batches, (FiniteTextBatchPlan, FinitePreferenceBatchPlan)):
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
@@ -1999,6 +2032,9 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
+    config_class = MLXTrainingConfig
+    preference_kind = None
+
     def __init__(
         self,
         model,
@@ -2022,7 +2058,13 @@ class MLXTrainer:
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
         # Use args or defaults
-        self.args = args or MLXTrainingConfig()
+        self.args = args or self.config_class()
+        if self.preference_kind and not isinstance(self.args, self.config_class):
+            raise TypeError(
+                f"{type(self).__name__} requires {self.config_class.__name__}."
+            )
+        if self.preference_kind and args is not None:
+            self.args = copy.copy(self.args)
 
         # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
@@ -2035,6 +2077,10 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
+        if self.preference_kind and self.args.packing:
+            raise ValueError(
+                "Unsloth MLX preference: packing is not supported."
+            )
         if self.args.packing:
             print(
                 "Unsloth: packing=True is not yet supported on MLX. "
@@ -2047,6 +2093,7 @@ class MLXTrainer:
             and self.train_dataset is not None
             and self.tokenizer is not None
             and self.args.streaming
+            and not self.preference_kind
             and _is_mlx_lazy_text_source(self.train_dataset)
         ):
             config = getattr(self.model, "_config", {})
@@ -2072,6 +2119,7 @@ class MLXTrainer:
             self._mlx_train_dataset_for_batches = self.train_dataset
         elif (
             not self._is_vlm
+            and not self.preference_kind
             and self.train_dataset is not None
             and self.tokenizer is not None
             and hasattr(self.train_dataset, "__getitem__")
@@ -2094,7 +2142,8 @@ class MLXTrainer:
         # Freeze non-LoRA params when LoRA is detected. Otherwise LayerNorm
         # weights stay trainable and adaptive optimizers NaN on step 1 (their
         # 1D second-moment init is numerically unstable).
-        self._ensure_lora_frozen(model)
+        if not self.preference_kind:
+            self._ensure_lora_frozen(model)
 
         # Training state. Per-run tracking lives in _reset_run_state (re-run at
         # each train() so a reused trainer starts clean); callbacks and
@@ -3669,13 +3718,14 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name in ("adamw_8bit", "adam_8bit"):
-            # Print rather than route silently: the old path was a quiet rewrite.
+            # One line, once per process, main process only: _build_optimizer runs
+            # per run and per rank, and this is the default optim in every example.
             from .optimizers_quantized import (
                 QuantizedMomentAdam,
                 QuantizedMomentAdamW,
-                describe_quantized_optimizer,
+                announce_quantized_optimizer,
             )
-            print(describe_quantized_optimizer(opt_name))
+            announce_quantized_optimizer(opt_name, enabled=self.is_main_process)
             if opt_name == "adamw_8bit":
                 self._manual_weight_decay = float(wd or 0.0)
                 optimizer = QuantizedMomentAdamW(
@@ -4277,9 +4327,13 @@ class MLXTrainer:
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
+            _neftune_noise_enabled = True
             def __call__(self, x):
                 out = _Base.__call__(self, x)
-                if getattr(self, "training", False):
+                if (
+                    getattr(self, "training", False)
+                    and getattr(self, "_neftune_noise_enabled", True)
+                ):
                     dim = out.shape[-1] * out.shape[-2]
                     scale = _alpha / (dim ** 0.5)
                     noise = mx.random.uniform(
@@ -4802,13 +4856,13 @@ class MLXTrainer:
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
                 _disable_fused_mrope(model)
-                from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
+                from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
                 patch_gated_delta()
                 patch_gated_delta_vlm()
                 gated_delta_patched = True
             # Structural check: qwen3_next / kimi_linear also need the VJP.
             if not gated_delta_patched and model_has_gated_delta_layers(model):
-                from ..gated_delta_vjp import patch_gated_delta
+                from unsloth_zoo.gated_delta_vjp import patch_gated_delta
                 patch_gated_delta()
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
@@ -4842,6 +4896,12 @@ class MLXTrainer:
                 if _cb in self._eval_callbacks: self._eval_callbacks.remove(_cb)
             self._report_to_handles = (None, None)
             self._report_to_callbacks = ()
+            _preference_context = getattr(self, "_preference_run_context", None)
+            if _preference_context is not None:
+                try:
+                    _preference_context.restore()
+                finally:
+                    self._preference_run_context = None
             self._remove_neftune()
             if args.gradient_checkpointing:
                 try:
@@ -4886,12 +4946,17 @@ class MLXTrainer:
         # before any model-derived loss selection (config errors raise; model
         # properties fall back).
         use_cce = args.use_cce
-        label_smoothing = _validate_label_smoothing(
+        preference_kind = self.preference_kind
+        if preference_kind:
+            use_cce = False
+        label_smoothing = 0.0 if preference_kind else _validate_label_smoothing(
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
         )
         _vlm_ignore_token_ids = None
 
-        if is_vlm:
+        if preference_kind:
+            loss_fn = None
+        elif is_vlm:
             processor = self._resolve_vlm_processor()
             # Backstop only; VLM collation already owns label masking.
             _vlm_ignore_token_ids = _get_vlm_ignore_token_ids(
@@ -5098,6 +5163,9 @@ class MLXTrainer:
         )
         self._compile_shape_guard_report = _compile_shape_guard_report
 
+        if preference_kind:
+            self._ensure_lora_frozen(model)
+
         # Whole run, not just when audio is spotted up front: audio-free
         # batches pass straight through, and audio may start in a later row.
         config = getattr(self.model, "config", None)
@@ -5132,6 +5200,7 @@ class MLXTrainer:
         self._reset_run_state()
 
         _resume_step = 0
+        ts = {}
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
         if _resume_from:
@@ -5139,6 +5208,40 @@ class MLXTrainer:
             # RuntimeError that the handler below does not catch.
             _require_complete_resume_checkpoint(_resume_from)
             try:
+                _cached = getattr(self, "_mlx_resume_state_cache", None)
+                ts = (
+                    _cached[1]
+                    if _cached is not None and _cached[0] == _resume_from
+                    else load_trainer_state(_resume_from)
+                )
+                if preference_kind:
+                    resume_provenance = ts.get("preference_reference")
+                    if not isinstance(resume_provenance, dict):
+                        raise ValueError(
+                            "Unsloth MLX preference: resume requires a checkpoint "
+                            "from the same preference objective."
+                        )
+                if preference_kind == "orpo" and resume_provenance != {
+                    "kind": "orpo_no_reference"
+                }:
+                    raise ValueError(
+                        "Unsloth MLX ORPO: checkpoint objective does not match."
+                    )
+                if (
+                    preference_kind == "dpo"
+                    and bool(args.reference_free)
+                    and resume_provenance != {"kind": "reference_free"}
+                ):
+                    raise ValueError(
+                        "Unsloth MLX DPO: checkpoint reference mode does not match."
+                    )
+                if preference_kind == "dpo" and not bool(args.reference_free):
+                    build_reference_policy(
+                        model,
+                        reference_free=False,
+                        resume_provenance=resume_provenance,
+                    )
+
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
                 #    get_peft_model before training); strict=False ensures
@@ -5150,13 +5253,7 @@ class MLXTrainer:
                 load_optimizer_state(optimizer, _resume_from)
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
-                #    pre-fix checkpoints (which lack these keys) resumable.
-                _cached = getattr(self, "_mlx_resume_state_cache", None)
-                ts = (
-                    _cached[1]
-                    if _cached is not None and _cached[0] == _resume_from
-                    else load_trainer_state(_resume_from)
-                )
+                #    pre-fix SFT checkpoints resumable.
                 _resume_step = int(ts.get("global_step", 0))
                 # Seed the live step counter from the checkpoint so a no-op
                 # resume (checkpoint already at max_steps, loop body never runs)
@@ -5245,6 +5342,35 @@ class MLXTrainer:
                     f"resume state files are missing ({e}). Refusing to "
                     f"silently restart from step 0."
                 ) from e
+
+        if preference_kind:
+            if preference_kind == "orpo":
+                loss_fn = make_orpo_loss_fn(beta=args.beta)
+                self._preference_reference_provenance = {
+                    "kind": "orpo_no_reference"
+                }
+                _main_print(f"Unsloth: Using ORPO loss (beta={args.beta}).")
+            else:
+                reference_policy, provenance = build_reference_policy(
+                    model,
+                    reference_free=bool(args.reference_free),
+                    resume_provenance=ts.get("preference_reference"),
+                    neftune=(
+                        [self._neftune_emb]
+                        if getattr(self, "_neftune_emb", None) is not None else []
+                    ),
+                )
+                self._preference_reference_provenance = provenance
+                loss_fn = make_dpo_loss_fn(
+                    beta=args.beta,
+                    label_smoothing=args.label_smoothing,
+                    reference_policy=reference_policy,
+                    reference_free=bool(args.reference_free),
+                )
+                _main_print(f"Unsloth: Using DPO loss (beta={args.beta}).")
+            self._preference_run_context = PreferenceRunContext(
+                model, enabled=bool(getattr(args, "disable_dropout", True)),
+            )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -6058,6 +6184,8 @@ class MLXTrainer:
         steps = 0
         pending_losses = 0
         pending_n_tokens = 0
+        supervised_tokens = 0
+        pending_supervised_tokens = 0
         pending_steps = 0
         trained_tokens = 0
         train_time = 0
@@ -6143,7 +6271,7 @@ class MLXTrainer:
             global figures. Printing and the native step callbacks run on rank 0;
             on_log fires on every rank and self-gates on is_world_process_zero.
             """
-            nonlocal losses, n_tokens, steps, train_time, trained_tokens
+            nonlocal losses, n_tokens, supervised_tokens, steps, train_time, trained_tokens
             # Nothing accumulated since the last log: a callback can force
             # should_log again on a step that already logged, and the accumulators
             # are plain-int 0 after a reset, so .item() below would raise and a real
@@ -6155,13 +6283,17 @@ class MLXTrainer:
                 return
             metric_losses = self._distributed_all_sum(losses, stream=mx.cpu)
             metric_tokens = self._distributed_all_sum(n_tokens, stream=mx.cpu)
-            mx.eval(metric_losses, metric_tokens)
+            metric_supervised = self._distributed_all_sum(
+                supervised_tokens, stream=mx.cpu,
+            )
+            mx.eval(metric_losses, metric_tokens, metric_supervised)
             train_loss = (
                 (metric_losses / metric_tokens).item()
                 if metric_tokens.item() > 0 else 0.0
             )
-            local_tok_count = int(n_tokens.item())
-            tok_count = int(metric_tokens.item())
+            local_tok_count = int(supervised_tokens.item())
+            tok_count = int(metric_supervised.item())
+            optimization_count = int(metric_tokens.item())
             trained_tokens += tok_count
             lr_val = optimizer.learning_rate.item()
             tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -6171,7 +6303,7 @@ class MLXTrainer:
             # metric_losses is already sum(loss * tokens) over the window, so these
             # totals give the exact global mean whatever the boundaries were.
             self._train_loss_token_sum += float(metric_losses.item())
-            self._train_loss_token_total += tok_count
+            self._train_loss_token_total += optimization_count
             grad_norm_val = (
                 float(grad_norm.item())
                 if grad_norm is not None else None
@@ -6244,6 +6376,7 @@ class MLXTrainer:
 
             losses = 0
             n_tokens = 0
+            supervised_tokens = 0
             steps = 0
             train_time = 0
 
@@ -6479,6 +6612,9 @@ class MLXTrainer:
                                     # log_history; without it a resumed run
                                     # loses every pre-resume entry.
                                     "log_history": list(self.state.log_history),
+                                    "preference_reference": getattr(
+                                        self, "_preference_reference_provenance", None,
+                                    ),
                                 },
                                 ckpt_dir,
                             )
@@ -7119,25 +7255,40 @@ class MLXTrainer:
             # forced log or the post-loop flush never reports a not-yet-applied
             # partial window, matching HF (a partial window is never logged and its
             # loss is folded into tr_loss only after the optimizer step).
+            supervised_toks = (
+                loss_fn._unsloth_supervised_tokens(batch_data)
+                if hasattr(loss_fn, "_unsloth_supervised_tokens") else toks
+            )
             pending_losses += lvalue * toks
             pending_n_tokens += toks
+            pending_supervised_tokens += supervised_toks
             pending_steps += 1
             if do_update:
                 # Window applied: fold pending into committed and reset pending.
                 # Evaluating the committed accumulators here materializes the folded
                 # pending contribution, so pending (now 0) needs no separate eval.
-                losses += pending_losses
-                n_tokens += pending_n_tokens
+                if preference_kind:
+                    losses += pending_losses / mx.maximum(
+                        pending_n_tokens, mx.array(1),
+                    )
+                    n_tokens += mx.array(1, dtype=mx.int32)
+                else:
+                    losses += pending_losses
+                    n_tokens += pending_n_tokens
+                supervised_tokens += pending_supervised_tokens
                 steps += pending_steps
                 pending_losses = 0
                 pending_n_tokens = 0
+                pending_supervised_tokens = 0
                 pending_steps = 0
-                _metric_eval = (losses, n_tokens)
+                _metric_eval = (losses, n_tokens, supervised_tokens)
             else:
                 # Substep: only the pending window changed; committed is unchanged
                 # (already materialized at its last fold). Both are always arrays at
                 # this point, so mx.eval never sees a plain-int accumulator.
-                _metric_eval = (pending_losses, pending_n_tokens)
+                _metric_eval = (
+                    pending_losses, pending_n_tokens, pending_supervised_tokens,
+                )
             # One evaluation boundary: the reported norm (when present) is
             # evaluated together with model/optimizer state and metric
             # accumulators, never as a separate earlier graph execution.
@@ -7148,7 +7299,7 @@ class MLXTrainer:
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
             mx.eval(*eval_targets)
-            global_toks = self._distributed_all_sum(toks, stream=mx.cpu)
+            global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
             if int(global_toks.item()) == 0:
                 raise ValueError(
@@ -7252,6 +7403,7 @@ class MLXTrainer:
                         # update, as HF does.
                         pending_losses = 0
                         pending_n_tokens = 0
+                        pending_supervised_tokens = 0
                         pending_steps = 0
                         # Drop the abandoned window's time with its tokens, else
                         # the next window's tokens/s is deflated by it.
@@ -7664,6 +7816,11 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
+        if self.preference_kind and is_vlm:
+            raise ValueError(
+                "Unsloth MLX preference: vision-language models are not supported."
+            )
+
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -7675,6 +7832,82 @@ class MLXTrainer:
                 is_vlm=False,
                 strict=False,
             )
+
+        if self.preference_kind:
+            if self.distributed_world_size > 1:
+                raise ValueError(
+                    "Unsloth MLX preference: distributed training is not supported."
+                )
+            if args.streaming:
+                raise ValueError(
+                    "Unsloth MLX preference: streaming datasets are not supported."
+                )
+            if (
+                self.eval_dataset is not None
+                or args.eval_steps > 0
+                or args.load_best_model_at_end
+                or args.early_stopping_patience > 0
+            ):
+                raise ValueError(
+                    "Unsloth MLX preference: evaluation, best-model loading, "
+                    "and early stopping are not supported yet."
+                )
+            if self._batches is not None:
+                raise ValueError(
+                    "Unsloth MLX preference: prebuilt SFT or response-masked "
+                    "batches are not compatible with preference objectives."
+                )
+            if args.train_on_completions or args.assistant_only_loss or (
+                args.completion_only_loss is not None
+            ):
+                raise ValueError(
+                    "Unsloth MLX preference: SFT completion masking options are "
+                    "not compatible with preference objectives."
+                )
+            if float(getattr(args, "label_smoothing_factor", 0.0) or 0.0):
+                raise ValueError(
+                    "Unsloth MLX preference: label_smoothing_factor is an SFT "
+                    "option. Use MLXDPOConfig(label_smoothing=...) for DPO."
+                )
+            if not math.isfinite(float(args.beta)) or float(args.beta) < 0:
+                raise ValueError("Unsloth MLX preference: beta must be finite and non-negative.")
+            if self.preference_kind == "dpo":
+                smoothing = float(args.label_smoothing)
+                if not math.isfinite(smoothing) or not 0 <= smoothing < 0.5:
+                    raise ValueError(
+                        "Unsloth MLX DPO: label_smoothing must be in [0, 0.5)."
+                    )
+            try:
+                len(train_dataset)
+                train_dataset[0]
+            except (TypeError, AttributeError, KeyError, IndexError) as exc:
+                raise ValueError(
+                    "Unsloth MLX preference: training requires a non-empty finite "
+                    "map-style dataset."
+                ) from exc
+            total_batches_needed = (
+                args.max_steps * args.gradient_accumulation_steps
+                if args.max_steps > 0 else None
+            )
+            preference_epochs = (
+                args.num_train_epochs
+                if args.max_steps <= 0 and args.num_train_epochs > 0 else None
+            )
+            self._prepared_batches_include_epochs = preference_epochs is not None
+            return create_preference_batch_plan(
+                train_dataset,
+                self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                num_epochs=preference_epochs,
+                grad_accum=args.gradient_accumulation_steps,
+                dataset_order=args.dataset_order,
+                preserve_dataset_order=args.preserve_dataset_order,
+                seed=args.seed,
+                append_eos=bool(args.append_eos),
+                formatting_func=self.formatting_func,
+            ), None
 
         if self._batches is not None:
             return self._batches, None
@@ -8023,7 +8256,7 @@ class MLXTrainer:
     def _save_model_impl(self, output_dir=None):
         from .utils import (
             _coerce_mlx_lora_scale,
-            _get_mlx_dropout_probability,
+            _read_mlx_lora_dropout,
             _infer_mlx_lora_rank,
             save_merged_model,
         )
@@ -8050,9 +8283,7 @@ class MLXTrainer:
                 # _coerce handles LoRASwitchLinear's per-expert mx.array where
                 # raw float()/.item() raise.
                 _lora_scale = _coerce_mlx_lora_scale(getattr(m, "scale", 1.0))
-                _lora_dropout = _get_mlx_dropout_probability(
-                    getattr(m, "dropout", None)
-                )
+                _lora_dropout = _read_mlx_lora_dropout(m)
                 break
 
             from .utils import _get_transformer_layers
@@ -8156,6 +8387,20 @@ class MLXTrainer:
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
+
+
+class MLXORPOTrainer(MLXTrainer):
+    """MLX trainer for Odds Ratio Preference Optimization."""
+
+    config_class = MLXORPOConfig
+    preference_kind = "orpo"
+
+
+class MLXDPOTrainer(MLXTrainer):
+    """MLX trainer for Direct Preference Optimization."""
+
+    config_class = MLXDPOConfig
+    preference_kind = "dpo"
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
@@ -8600,7 +8845,7 @@ def train_on_responses_only(
     Returns:
         The trainer (for chaining), or the closure if return_function=True.
     """
-    from ..dataset_utils import (
+    from unsloth_zoo.dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
 
