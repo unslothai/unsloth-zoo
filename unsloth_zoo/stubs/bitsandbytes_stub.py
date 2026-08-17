@@ -15,12 +15,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Bitsandbytes stub for Apple Silicon / MLX.
+Bitsandbytes stub for hosts that skip GPU init (gated in unsloth_zoo/__init__.py).
 
-Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module.
-Only injected on macOS ARM64 with MLX (gated in unsloth_zoo/__init__.py).
+Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module. Injected only
+when no real bitsandbytes is installed: shadowing a working one makes bnb-quantized
+checkpoints unloadable.
 """
 
+import importlib.util
 import types
 import sys
 from importlib.abc import MetaPathFinder
@@ -99,6 +101,21 @@ def __getattr__(name):
     if name.startswith("__") and name.endswith("__"):
         raise AttributeError(name)
     return _Noop(f"bitsandbytes.{name}")
+
+
+def real_bitsandbytes_available():
+    """Whether a real (non-stub) bitsandbytes is installed.
+
+    Locates the distribution rather than importing it: importing pulls in torch, which
+    costs about a second on the hosts that skip GPU init to avoid exactly that.
+    """
+    existing = sys.modules.get("bitsandbytes")
+    if existing is not None:
+        return not getattr(existing, "IS_UNSLOTH_STUB", False)
+    try:
+        return importlib.util.find_spec("bitsandbytes") is not None
+    except Exception:  # noqa: BLE001 -- an unlocatable install is not usable either
+        return False
 
 
 def inject_into_sys_modules():
