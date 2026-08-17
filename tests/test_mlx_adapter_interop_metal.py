@@ -792,6 +792,89 @@ def test_full_state_shape_mismatch_rejected(tmp_path, base_dir):
         FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
 
 
+def test_auto_saved_base_state_refused_off_embedding_and_head(tmp_path, base_dir):
+    """peft auto-saves full base state for the input embedding and the output
+    head only. Every LoRA target carries a .base_layer, so a key spelled that
+    way on any other module would bind and replace live base weights."""
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    tensors = st_load_file(wf)
+    target = "model.layers.0.self_attn.q_proj"
+    tensors[f"base_model.model.{target}.base_layer.weight"] = torch.zeros(
+        HIDDEN, HIDDEN
+    )
+    from safetensors.torch import save_file as _st_save
+    _st_save(tensors, wf)
+
+    model, _ = load_model(Path(base_dir))
+    before = np.array(dict(model.named_modules())[target].weight)
+    cfg = json.load(open(os.path.join(peft_dir, "adapter_config.json")))
+    with pytest.raises(ValueError, match="not the input embedding or output head"):
+        attach_and_bind_peft_adapter(model, peft_dir, cfg)
+    live = dict(model.named_modules())[target]
+    assert np.array_equal(np.array(getattr(live, "linear", live).weight), before)
+
+
+def test_auto_saved_base_state_refused_before_conversion(tmp_path, base_dir):
+    """The converted directory is loadable by stock mlx-lm, whose load_adapters
+    binds adapters.safetensors with load_weights(strict=False) and never reads
+    full_state_modules, so the key must be refused before anything is written."""
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    tensors = st_load_file(wf)
+    target = "model.layers.0.self_attn.q_proj"
+    tensors[f"base_model.model.{target}.base_layer.weight"] = torch.zeros(
+        HIDDEN, HIDDEN
+    )
+    from safetensors.torch import save_file as _st_save
+    _st_save(tensors, wf)
+
+    mlx_dir = tmp_path / "mlx"
+    with pytest.raises(ValueError, match="not the input embedding or output head"):
+        convert_peft_dir_to_mlx(
+            peft_dir, str(mlx_dir),
+            json.load(open(os.path.join(base_dir, "config.json"))),
+        )
+    assert not mlx_dir.exists()
+
+
+@pytest.mark.parametrize("path,accepted", [
+    ("model.embed_tokens", True),
+    ("lm_head", True),
+    ("transformer.wte", True),                 # GPT-2 / MPT
+    ("gpt_neox.embed_in", True),
+    ("backbone.embeddings", True),             # Mamba
+    ("model.transformer.ff_out", True),        # OLMo's root output head
+    ("model.tok_embeddings", True),            # InternLM2
+    ("model.layers.0.self_attn.q_proj", False),
+    ("model.ngram.embedders.0", False),
+    ("model.embed_tokens_per_layer", False),   # Gemma 4 auxiliary table
+    ("model.layers.0.mlp.gate_proj", False),
+    # Leaves the root head shares with a per-layer module: OLMo names every
+    # block's MLP output ff_out, and `output` also spells an attention
+    # projection.
+    ("model.transformer.blocks.0.ff_out", False),
+    ("model.layers.0.attention.output", False),
+])
+def test_grouping_admits_only_hugging_face_embedding_and_head_paths(path, accepted):
+    """A PEFT artifact carries Hugging Face paths, whose input-embedding and
+    output-head spellings are a small known set. Conversion has no live tree to
+    ask and the directory it writes is loadable by stock mlx-lm, so the path is
+    all this layer has; a leaf shared with a per-layer module is told apart by
+    the numbered segment such a path always carries."""
+    from unsloth_zoo.saving_utils import group_peft_lora_pairs
+    lora = "base_model.model.model.layers.0.self_attn.q_proj"
+    _, full_state, rejected = group_peft_lora_pairs({
+        f"{lora}.lora_A.weight": mx.zeros((8, HIDDEN)),
+        f"{lora}.lora_B.weight": mx.zeros((HIDDEN, 8)),
+        f"base_model.model.{path}.base_layer.weight": mx.zeros((VOCAB, HIDDEN)),
+    }, {})
+    assert (not rejected) is accepted
+    assert (path in full_state) is accepted
+
+
 def test_nested_text_tower_bridge(tmp_path, base_dir):
     """A PEFT adapter names modules one level shallower than an mlx-vlm
     tree nests them; the import resolves that nesting and the export emits

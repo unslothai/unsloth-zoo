@@ -6375,6 +6375,15 @@ def group_peft_lora_pairs(tensors, cfg=None):
                 # peft saves it under the wrapper's inner path; normalize to
                 # the module path the MLX tree uses.
                 fs_path = fs_path[: -len(".base_layer")]
+                if not _is_auto_saved_module_path(fs_path):
+                    # Every LoRA target has a .base_layer, so without this any
+                    # of them could carry full state and replace its own base
+                    # weights.
+                    rejected[key] = (
+                        "auto-saved base state on a module that is not the "
+                        "input embedding or output head"
+                    )
+                    continue
                 full_state.setdefault(fs_path, {})[tname] = tensor
                 full_state[fs_path]["__origin__"] = "embedding_auto"
                 continue
@@ -6429,10 +6438,8 @@ def group_peft_lora_pairs(tensors, cfg=None):
                 _slot[tname] = tensor
                 _slot["__origin__"] = "modules_to_save"
                 continue
-            leaf = fs_path.rsplit(".", 1)[-1]
-            if leaf in _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES:
-                # Auto-saved embedding/head state across mlx-lm spellings;
-                # biased heads (e.g. Phi) include their bias.
+            if _is_auto_saved_module_path(fs_path):
+                # Auto-saved embedding/head state; biased heads include bias.
                 full_state.setdefault(fs_path, {})[tname] = tensor
                 full_state[fs_path]["__origin__"] = "embedding_auto"
                 continue
@@ -6830,6 +6837,23 @@ _OUTPUT_HEAD_LEAF_NAMES = ("lm_head", "output", "embed_out")
 
 def _leaf_in(path, names):
     return path.rsplit(".", 1)[-1] in names
+
+
+def _is_auto_saved_module_path(path):
+    """Whether a path could name the input embedding or output head, the two
+    modules peft auto-saves full base state for. These are Hugging Face paths,
+    whose spellings for those two are a small fixed set, but some are reused
+    deeper in the tree: OLMo names both its root head and every block's MLP
+    output ff_out, and `output` also spells an attention projection. Neither
+    of those sits at the root, so a path through a numbered layer is never
+    one of them."""
+    if any(segment.isdigit() for segment in path.split(".")):
+        return False
+    # ff_out is hf_olmo's head, kept local: the tied-embedding checks read the
+    # shared tuple without the numbered-segment rule.
+    return _leaf_in(
+        path, _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES + ("ff_out",)
+    )
 
 
 def _config_ties_word_embeddings(config):
