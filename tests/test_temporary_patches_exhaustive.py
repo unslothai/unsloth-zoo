@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import types
+
+from _pytest import outcomes as _pytest_outcomes
 import inspect
 import os
 from typing import Iterable
@@ -46,13 +49,56 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
+def _unimportable(dotted_module: str, exc: BaseException) -> str:
+    return (
+        f"{dotted_module!r} raised on import, so nothing can be said about "
+        f"upstream drift here: {type(exc).__name__}: {exc}"
+    )
+
+
+def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
+    """Did the import fail because OUR target is gone, rather than a dependency?
+
+    ``exc.name`` is the deepest package that could not be found, which for a
+    removed model package is the PARENT, not the module we asked for: dropping
+    ``transformers/models/siglip/`` makes importing
+    ``transformers.models.siglip.modeling_siglip`` raise with
+    ``name == "transformers.models.siglip"``. Comparing only against the full
+    path and the top-level package therefore read a removed target as a broken
+    dependency and skipped, so the hard gate passed while the patch target had
+    disappeared. Any package prefix of the target counts.
+
+    The trailing dot is what keeps this a PACKAGE prefix: without it
+    ``transformers.models.siglip`` would also claim
+    ``transformers.models.siglipx.modeling_x``.
+    """
+    name = exc.name or ""
+    return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
+
+
 def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
-    Used to skip 5.0+-gated tests on a 4.x install."""
+    Used to skip 5.0+-gated tests on a 4.x install.
+
+    ``None`` means drift, and 15 of the 23 callers below fail on it: either the
+    module imported without the attribute, or a ``ModuleNotFoundError`` named
+    the module we asked for. A module that exists but RAISES on the way in says
+    nothing about upstream, so it skips instead. Swallowing every exception
+    conflated the two and reported "Gemma3nRMSNorm missing on transformers
+    4.57.6" for a class transformers 4.57.6 ships: configuration_gemma3n imports
+    ImageNetInfo from timm.data, which a newer timm dropped, so every gemma3n
+    class looked deleted and eight tests blamed transformers.
+    """
     try:
         mod = importlib.import_module(dotted_module)
-    except Exception:
-        return None
+    except ModuleNotFoundError as exc:
+        # An absent target module IS drift, so callers still get None and judge.
+        # One naming something else is a broken dependency: skip below.
+        if _names_the_target(exc, dotted_module):
+            return None
+        pytest.skip(_unimportable(dotted_module, exc))
+    except Exception as exc:
+        pytest.skip(_unimportable(dotted_module, exc))
     return getattr(mod, class_name, None)
 
 
@@ -2490,3 +2536,39 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
+
+
+def test_a_broken_dependency_is_not_reported_as_upstream_drift():
+    """A module gone upstream is drift and must still reach the caller as None;
+    a module that raises on its own dependency is not. gemma3n conflated them:
+    configuration_gemma3n imports ImageNetInfo from timm.data, which a newer
+    timm dropped, so eight tests announced "missing on transformers 4.57.6"
+    about classes transformers 4.57.6 ships.
+    """
+    # Absent module: still None, so the callers still judge it.
+    assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
+
+    # Present but raising, on a dependency of its own: skipped, not blamed.
+    module_name = "_zoo_probe_broken_import"
+    module = types.ModuleType(module_name)
+
+    def _explode():
+        raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+
+    module.__getattr__ = lambda name: _explode()
+    real_import = importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == module_name:
+            raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+        return real_import(name, *args, **kwargs)
+
+    importlib.import_module = fake_import
+    try:
+        # Skipped derives from BaseException: pytest.raises(Exception) would
+        # let it through and silently skip THIS test.
+        with pytest.raises(_pytest_outcomes.Skipped) as caught:
+            _try_get_class(module_name, "Anything")
+        assert "nothing can be said about upstream drift" in str(caught.value)
+    finally:
+        importlib.import_module = real_import

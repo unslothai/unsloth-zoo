@@ -105,7 +105,7 @@ def _is_force_float32_arch(model_type: str) -> bool:
     (strips ``-``/``_``; trailing comma marks an exact-match entry)."""
     if not model_type:
         return False
-    from ..model_lists import FORCE_FLOAT32
+    from unsloth_zoo.model_lists import FORCE_FLOAT32
     def _norm(s: str) -> str:
         return s.lower().replace("-", "").replace("_", "")
     norm_input = _norm(model_type)

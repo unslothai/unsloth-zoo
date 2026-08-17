@@ -24,7 +24,7 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
 # Import each independently: convert_moe_packed_tensors_cpu is injected at runtime by Unsloth's
@@ -5062,6 +5062,46 @@ def _strip_fp8_suffix(model_name):
     return model_name[:idx] or None
 pass
 
+def _sibling_content_reads_anonymously(model_name):
+    """How a reader with no credentials fares on `model_name`'s content: `"public"`,
+    `"restricted"` (refused) or `"unreachable"` (the Hub could not be asked, which is no
+    answer about the repo).
+
+    Listing is not the test, since a gated repo lists publicly and still refuses its
+    content. Nor is a download: `hf_hub_download` answers from the cache whenever its HEAD
+    fails (`if head_call_error is not None: ... return pointer_path`), handing back a copy
+    an earlier CREDENTIALED download left behind, so a warm cache makes a gated repo read
+    as public. Measured on `meta-llama/Llama-3.2-1B`: anonymous `ls` succeeds, and after a
+    credentialed fetch `token = False` returns the cached path rather than raising.
+    `get_hf_file_metadata` has no cache path, and access is repo wide, so one anonymously
+    HEADable file stands for the weights.
+    """
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
+    repo_id, revision = _hub_repo_and_revision(model_name)
+    try:
+        get_hf_file_metadata(
+            hf_hub_url(repo_id, "config.json", revision = revision), token = False,
+        )
+        return "public"
+    except EntryNotFoundError:
+        # Discussing a missing file with an anonymous reader is itself proof of anonymous
+        # access, and a sibling with safetensors but no config.json resolved before this
+        # gate existed: `check_model_quantization_status` reads an absent config as
+        # unquantized.
+        return "public"
+    except (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError):
+        return "restricted"
+    except Exception:
+        return "unreachable"
+pass
+
+def _allow_restricted_fp8_sibling():
+    """Opt in to resolving an FP8 base onto a gated or private 16bit sibling with the
+    caller's token. Off by default so a broad token cannot be aimed at an unrequested
+    repo; callers holding access to both repos set it to `1`."""
+    return os.environ.get("UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING") == "1"
+pass
+
 def _resolve_fp8_16bit_sibling(model_name, token=None):
     """If model_name is an FP8 variant with an existing, non-quantized 16bit sibling
     (e.g. unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2), return the sibling so a 16bit merge
@@ -5081,14 +5121,38 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         local_rejected = True
     except Exception:
         return None
+    # `org/model-FP8` -> `org/model` is a guess, and the caller asked for the FP8 repo, so
+    # the sibling is resolved with NO credentials: whatever that finds, the requester could
+    # have fetched themselves. Spending a token broader than the request on the rewritten
+    # name is what would fold unreachable weights into the output.
+    opted_in = _allow_restricted_fp8_sibling()
+    sibling_token = token if opted_in else False
     try:
         # `local_ok` only when it has to be: passing it always would break any caller that
         # replaced this function with a two argument stand-in.
         _ask_the_hub = {"local_ok": False} if local_rejected else {}
-        if check_hf_model_exists(base, token) and not check_model_quantization_status(
-            base, token, **_ask_the_hub,
-        )[0]:
-            return base
+        if check_hf_model_exists(base, sibling_token):
+            # Existence came from a listing, which a gated repo also answers.
+            anonymous = "public" if opted_in else _sibling_content_reads_anonymously(base)
+            if anonymous == "unreachable":
+                raise _hub_unreachable_error(
+                    base, RuntimeError("anonymous read failed"),
+                    action = f"checking whether `{base}` is readable without a token",
+                    mistaken_for = "a missing model",
+                )
+            if anonymous != "public":
+                warnings.warn(
+                    f"Unsloth: the 16bit sibling `{base}` of `{model_name}` is gated or "
+                    f"private, so reaching it would depend on the current token rather "
+                    f"than on what was asked for. Merging onto the FP8 weights instead. "
+                    f"Set `UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING=1` if you have access to "
+                    f"both repos and want the 16bit sibling."
+                )
+                return None
+            if not check_model_quantization_status(
+                base, sibling_token, **_ask_the_hub,
+            )[0]:
+                return base
     except RuntimeError as e:
         # An unreachable Hub is not "there is no 16bit sibling". None is still right,
         # since the merge can dequantize the FP8 weights, but say so: the base used is

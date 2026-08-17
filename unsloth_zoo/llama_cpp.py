@@ -121,16 +121,38 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+#
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",

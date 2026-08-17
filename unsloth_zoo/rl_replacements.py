@@ -26,7 +26,7 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import (
+from unsloth_zoo.temporary_patches.common import (
     torch_compile_options,
     _maybe_compile,
 )

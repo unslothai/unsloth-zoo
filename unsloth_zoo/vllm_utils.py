@@ -60,7 +60,7 @@ from .hf_utils import (
     set_dtype_in_config,
 )
 from .patching_utils import patch_model_and_tokenizer
-from .temporary_patches.common import (
+from unsloth_zoo.temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
@@ -417,7 +417,20 @@ else:
 pass
 
 
-if importlib.util.find_spec("bitsandbytes") is not None:
+def _bitsandbytes_is_usable():
+    # find_spec only proves the wheel is on disk. One built against a different torch is
+    # on disk and still fails its own import with AttributeError, so import it and see.
+    if importlib.util.find_spec("bitsandbytes") is None:
+        return False
+    try:
+        import bitsandbytes
+    except Exception:
+        return False
+    return True
+pass
+
+
+if _bitsandbytes_is_usable():
     import bitsandbytes.functional
     from bitsandbytes.utils import pack_dict_to_tensor, unpack_tensor_to_dict
 
