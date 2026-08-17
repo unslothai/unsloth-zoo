@@ -6,7 +6,13 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pure planning for bounded finite-text ``mx.compile`` signatures.
+"""Pure planning for bounded ``mx.compile`` signatures.
+
+Two regimes share this module. A finite dataset, text or VLM, is planned whole
+from the widths its schedule already fixes. An unsized stream has no schedule to
+plan from and is instead held to an endpoint grid — anchored to
+``max_seq_length`` for text, anchor-free for VLM, whose compile-visible width is
+only known after image-token expansion.
 
 The cap here counts application-visible callable signatures. It is not an MLX
 compiler-cache count and is not an estimate of Metal resources.
