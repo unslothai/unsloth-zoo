@@ -2574,7 +2574,7 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
 
     class _ExpandingProcessor(_ContentProcessor):
-        # A post-expansion batch: wider than max_seq_length.
+        # Post-expansion width, past max_seq_length, with a grid for its image.
         def __call__(self, text, **_kwargs):  # noqa: D401
             width = 40 + 7 * max(int(item) for item in text)
             rows = [[int(item), 200] + [2] * (width - 2) for item in text]
@@ -2583,10 +2583,13 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
                 "attention_mask": np.array(
                     [[1] * width for _ in rows], dtype=np.int32,
                 ),
+                "image_grid_thw": np.array([[1, 2, 2]] * len(text), np.int32),
             }
 
     grid = StreamShapeGrid()
-    config, items = {"image_size": 16, "image_token_id": 200}, [{"text": "5"}]
+    config = {"model_type": "qwen3_5", "image_size": 16, "image_token_id": 200,
+              "video_token_id": 201, "vision_config": {"spatial_merge_size": 2}}
+    items = [{"text": "5"}]
     plain = _build_response_masked_vlm_batch(
         items, _ExpandingProcessor(), config, 8, 16,
     )
@@ -2600,9 +2603,12 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     assert raw_width > 8
     guarded_width = int(guarded["input_ids"].shape[1])
     assert guarded_width == grid.endpoint_for(raw_width)
-    # Content preserved, pad tail masked out.
+    # Content preserved, pad tail masked, positions rebuilt at the padded width.
     assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
     assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
+    assert int(guarded["position_ids"].shape[-1]) == guarded_width
+    assert (guarded["position_ids"][..., :raw_width].tolist()
+            == plain["position_ids"].tolist())
 
     # Unmaterializable widening keeps the exact width instead of aborting.
     from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
