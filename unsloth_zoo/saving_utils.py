@@ -2879,9 +2879,12 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
 
 def _config_vocab_size(config):
     # VLM configs keep the text vocab on the nested text config, plain LM configs at the top level.
-    vocab_size = getattr(config, "vocab_size", None)
+    # Some composite configs carry both, and `resize_token_embeddings` only updates the nested one
+    # (PaliGemma leaves its top-level compatibility `vocab_size` behind), so the nested value wins:
+    # reading a stale top-level size would look like "no resize happened".
+    vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     if vocab_size is None:
-        vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
+        vocab_size = getattr(config, "vocab_size", None)
     return vocab_size
 pass
 
