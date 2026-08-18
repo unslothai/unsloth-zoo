@@ -3214,7 +3214,27 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config.save_pretrained(save_directory)
+        # `config` is `model.config`, which is already the nested text config when the model was
+        # loaded with `text_only = True`. The weights below come from `model_name` (the resolved
+        # base checkpoint) and still carry the full VLM prefixes, so saving `config` here writes a
+        # text-only config beside VLM weights and every tensor is silently re-initialized on
+        # reload. Take the config from the same checkpoint the weights come from, matching what the
+        # `mxfp4` branch below already does.
+        from transformers import AutoConfig
+        try:
+            base_config = AutoConfig.from_pretrained(
+                model_name,
+                token = token,
+                trust_remote_code = False,
+            )
+        except Exception as base_config_error:
+            warnings.warn(
+                f"Unsloth: Could not read the base config from `{model_name}` "
+                f"({base_config_error}). Falling back to the in-memory config, which might not "
+                f"describe the exported weights."
+            )
+            base_config = config
+        base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.
