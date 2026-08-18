@@ -2877,6 +2877,31 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _config_vocab_size(config):
+    # VLM configs keep the text vocab on the nested text config, plain LM configs at the top level.
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
+    return vocab_size
+pass
+
+
+def _carry_over_vocab_size(base_config, trained_config):
+    # `resize_token_embeddings`, or a `modules_to_save` embed_tokens / lm_head, grows the vocab and
+    # updates the in-memory config. The merge writes those expanded tensors, but a config read from
+    # the base checkpoint still carries the original `vocab_size`, which would rebuild smaller
+    # layers and fail the reload on a size mismatch. Carry the trained size across.
+    trained_vocab_size = _config_vocab_size(trained_config)
+    if trained_vocab_size is None: return
+    if _config_vocab_size(base_config) == trained_vocab_size: return
+    if getattr(base_config, "vocab_size", None) is not None:
+        base_config.vocab_size = trained_vocab_size
+    text_config = getattr(base_config, "text_config", None)
+    if getattr(text_config, "vocab_size", None) is not None:
+        text_config.vocab_size = trained_vocab_size
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3234,6 +3259,8 @@ def merge_and_overwrite_lora(
                 f"describe the exported weights."
             )
             base_config = config
+        else:
+            _carry_over_vocab_size(base_config, config)
         base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
