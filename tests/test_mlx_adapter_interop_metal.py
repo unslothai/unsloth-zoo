@@ -105,6 +105,122 @@ def test_format_detection_and_fresh_destination(tmp_path, base_dir):
         convert_peft_dir_to_mlx(peft_dir, str(tmp_path / "dst"), {"num_hidden_layers": LAYERS})
 
 
+def test_converter_refuses_disagreeing_factor_ranks(tmp_path, base_dir):
+    """A factor pair whose ranks disagree is refused, not silently bound."""
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    tensors = st_load_file(wf)
+    key = next(k for k in tensors if k.endswith("lora_B.weight"))
+    tensors[key] = torch.zeros(HIDDEN, 4)   # rank 4 against lora_A's 8
+    from safetensors.torch import save_file as _st_save
+    _st_save(tensors, wf)
+
+    with pytest.raises(ValueError, match="lora_A rank 8 but lora_B rank 4"):
+        convert_peft_dir_to_mlx(
+            peft_dir, str(tmp_path / "mlx"),
+            json.load(open(os.path.join(base_dir, "config.json"))),
+        )
+    # The export direction reads the other axis, in its own key spelling.
+    mlx_dir = str(tmp_path / "mlx-ok")
+    _make_peft_adapter(base_dir, str(tmp_path / "p2"))
+    convert_peft_dir_to_mlx(
+        str(tmp_path / "p2"), mlx_dir,
+        json.load(open(os.path.join(base_dir, "config.json"))),
+    )
+    mt = st_load_file(os.path.join(mlx_dir, MLX_WEIGHTS_FILE))
+    bkey = next(k for k in mt if k.endswith(".lora_b"))
+    mt[bkey] = torch.zeros(4, HIDDEN)
+    _st_save(mt, os.path.join(mlx_dir, MLX_WEIGHTS_FILE))
+    with pytest.raises(ValueError, match="lora_a rank 8 but lora_b rank 4"):
+        convert_mlx_dir_to_peft(mlx_dir, str(tmp_path / "back"))
+
+
+@pytest.fixture(scope="module")
+def tied_base_dir(tmp_path_factory):
+    """Most small on-device models tie word embeddings, and peft auto-saves
+    both the embedding and the head for them."""
+    path = tmp_path_factory.mktemp("tiny-llama-tied")
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(
+        vocab_size=VOCAB, hidden_size=HIDDEN, intermediate_size=128,
+        num_hidden_layers=LAYERS, num_attention_heads=4,
+        num_key_value_heads=2, max_position_embeddings=128,
+        tie_word_embeddings=True,
+    )).to(torch.float32).save_pretrained(path, safe_serialization=True)
+    return str(path)
+
+
+def test_tied_output_head_snapshot_folds_or_refuses(tmp_path, tied_base_dir):
+    """On a tied base the auto-saved head IS the embedding weight: it folds
+    away silently, and a head that does not duplicate the embedding is
+    refused rather than bound as independent head state."""
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(
+        tied_base_dir, peft_dir, save_embedding_layers=True,
+        mutate=lambda pm: pm.get_input_embeddings().weight.add_(0.02),
+    )
+    base_config = json.load(open(os.path.join(tied_base_dir, "config.json")))
+    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
+    head = next(k for k in st_load_file(wf) if "lm_head" in k)
+
+    convert_peft_dir_to_mlx(peft_dir, str(tmp_path / "ok"), base_config)
+    mlx_cfg = json.load(open(os.path.join(tmp_path, "ok", "adapter_config.json")))
+    assert "lm_head" not in json.dumps(mlx_cfg.get("full_state_modules") or {})
+    # Folded, not dropped: the written artifact must still carry the trained
+    # embedding, or a reload silently reverts it to the base weight.
+    assert any("embed_tokens" in p for p in mlx_cfg["full_state_modules"])
+    torch.testing.assert_close(
+        st_load_file(os.path.join(tmp_path, "ok", MLX_WEIGHTS_FILE))[
+            "model.embed_tokens.weight"
+        ],
+        st_load_file(wf)[head],
+    )
+
+    # The live attach path folds through the same helper, with an MLX
+    # equality callback that casts before comparing.
+    cfg = json.load(open(os.path.join(peft_dir, "adapter_config.json")))
+    model, _ = load_model(Path(tied_base_dir))
+    attach_and_bind_peft_adapter(model, peft_dir, cfg)
+    assert not any(
+        "lm_head" in p
+        for p in getattr(model, "_unsloth_full_state_modules", {})
+    )
+
+    # Folded, not dropped: the trained embedding must survive both paths.
+    assert any(
+        "embed_tokens" in p
+        for p in getattr(model, "_unsloth_full_state_modules", {})
+    )
+    emb = dict(model.named_modules())["model.embed_tokens"]
+    torch.testing.assert_close(
+        torch.tensor(np.array(emb.weight)),
+        st_load_file(wf)[head],
+    )
+
+    # export_peft_adapter's own refusal: a modules_to_save snapshot of a tied
+    # embedding has no untied PEFT form.
+    from unsloth_zoo.saving_utils import export_peft_adapter
+    ok_cfg = os.path.join(tmp_path, "ok", "adapter_config.json")
+    _c = json.load(open(ok_cfg))
+    _c["full_state_modules"] = {"model.embed_tokens": "modules_to_save"}
+    json.dump(_c, open(ok_cfg, "w"))
+    with pytest.raises(ValueError, match="tied embedding or output head"):
+        export_peft_adapter(
+            str(tmp_path / "ok"), str(tmp_path / "exp"), base_config=base_config,
+        )
+
+    tensors = st_load_file(wf)
+    tensors[head] = tensors[head] + 1.0
+    from safetensors.torch import save_file as _st_save
+    _st_save(tensors, wf)
+    with pytest.raises(ValueError, match="tied output-head snapshot"):
+        convert_peft_dir_to_mlx(peft_dir, str(tmp_path / "bad"), base_config)
+    model2, _ = load_model(Path(tied_base_dir))
+    with pytest.raises(ValueError, match="tied output-head snapshot"):
+        attach_and_bind_peft_adapter(model2, peft_dir, cfg)
+
+
 @pytest.mark.parametrize("field,value,match", [
     ("target_parameters", ["experts.gate_up_proj"], "expert-parameter"),
     ("alora_invocation_tokens", [1, 2], "aLoRA"),
@@ -201,8 +317,8 @@ def test_attach_matches_peft_forward_with_patterns(tmp_path, base_dir):
 
 
 @pytest.mark.parametrize("key,shape,match", [
-    ("base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight",
-     (8, HIDDEN), "language_model"),
+    ("base_model.model.decoder.blocks.0.attn.q_proj.lora_A.weight",
+     (8, HIDDEN), "decoder.blocks"),
     ("base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
      (HIDDEN + 8, 8), "out-dim"),
 ])
@@ -212,7 +328,7 @@ def test_attach_rejects_bad_tensors(tmp_path, base_dir, key, shape, match):
 
     def mutate(tensors):
         tensors[key] = torch.zeros(*shape)
-        if "language_model" in key:  # give the alien path a complete pair
+        if "decoder.blocks" in key:  # give the alien path a complete pair
             tensors[key.replace("lora_A", "lora_B")] = torch.zeros(HIDDEN, 8)
 
     from safetensors.torch import save_file
@@ -420,16 +536,6 @@ def test_save_lora_adapters_peft_format(tmp_path, base_dir):
     np.testing.assert_allclose(
         _peft_logits(reexported), _mlx_logits(model), atol=5e-3,
     )
-    # base_weights_source is inert for a linear-only adapter: no embedding
-    # targets means nothing to source.
-    from unsloth_zoo.saving_utils import export_peft_adapter
-    mlx_dir = str(tmp_path / "mlx")
-    save_lora_adapters(model, mlx_dir)
-    sourced = str(tmp_path / "sourced")
-    export_peft_adapter(mlx_dir, sourced, base_weights_source=base_dir)
-    assert set(st_load_file(os.path.join(sourced, PEFT_WEIGHTS_FILE))) == set(
-        st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE))
-    )
 
 
 def test_peft_export_includes_lm_head_on_mirrored_layout(tmp_path, base_dir):
@@ -459,7 +565,11 @@ def test_peft_export_includes_lm_head_on_mirrored_layout(tmp_path, base_dir):
     )
 
 
-def test_peft_export_rejects_unsupported_wrapper(tmp_path, base_dir):
+@pytest.mark.parametrize("wrapper", ["fused", "dora_embedding"])
+def test_peft_export_rejects_unsupported_wrapper(tmp_path, base_dir, wrapper):
+    """Only a stock LoRALinear/DoRALinear over a stock Linear is
+    representable: a foreign wrapper type and a stock wrapper over an
+    embedding are both refused by name."""
     peft_dir = str(tmp_path / "peft")
     _make_peft_adapter(base_dir, peft_dir)
     from unsloth_zoo.mlx.loader import FastMLXModel
@@ -473,13 +583,20 @@ def test_peft_export_rejects_unsupported_wrapper(tmp_path, base_dir):
         # is what makes the semantics non-plain.
         def __init__(self, inner):
             super().__init__()
-            self.lora_a = inner.lora_a
-            self.lora_b = inner.lora_b
+            self.lora_a, self.lora_b = inner.lora_a, inner.lora_b
             self.linear = inner.linear
 
-    layers = model.model.layers
-    layers[0].self_attn.q_proj = _FusedWrap(layers[0].self_attn.q_proj)
-    with pytest.raises(ValueError, match="_FusedWrap"):
+    if wrapper == "fused":
+        attn = model.model.layers[0].self_attn
+        attn.q_proj = _FusedWrap(attn.q_proj)
+        match = "_FusedWrap"
+    else:
+        from mlx_lm.tuner.dora import DoRAEmbedding
+        model.model.embed_tokens = DoRAEmbedding.from_base(
+            model.model.embed_tokens, r=4,
+        )
+        match = "DoRAEmbedding"
+    with pytest.raises(ValueError, match=match):
         save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
 
 
@@ -585,15 +702,7 @@ def test_dora_dropout_rejected():
         })
 
 
-def test_dora_rejects_embedding_and_mixed(tmp_path, base_dir):
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(
-        base_dir, peft_dir, use_dora=True,
-        target_modules=["q_proj", "embed_tokens"],
-    )
-    from unsloth_zoo.mlx.loader import FastMLXModel
-    with pytest.raises((ValueError, RuntimeError)):
-        FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+def test_dora_rejects_partial_magnitudes(tmp_path, base_dir):
     peft2 = str(tmp_path / "p2")
     _make_peft_adapter(base_dir, peft2, use_dora=True)
     from safetensors.torch import save_file
@@ -607,22 +716,6 @@ def test_dora_rejects_embedding_and_mixed(tmp_path, base_dir):
             peft2, str(tmp_path / "m"),
             json.load(open(os.path.join(base_dir, "config.json"))),
         )
-
-
-def test_dora_embedding_export_rejected(tmp_path, base_dir):
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir)
-    from unsloth_zoo.mlx.loader import FastMLXModel
-    from unsloth_zoo.mlx.utils import save_lora_adapters
-    from mlx_lm.tuner.dora import DoRAEmbedding
-    model, _ = FastMLXModel.from_pretrained(
-        peft_dir, load_in_4bit=False, max_seq_length=64,
-    )
-    model.model.embed_tokens = DoRAEmbedding.from_base(
-        model.model.embed_tokens, r=4,
-    )
-    with pytest.raises(ValueError, match="DoRAEmbedding"):
-        save_lora_adapters(model, str(tmp_path / "x"), adapter_format="peft")
 
 
 def test_mixed_lora_dora_save_refused(tmp_path, base_dir):
@@ -642,57 +735,27 @@ def test_mixed_lora_dora_save_refused(tmp_path, base_dir):
             saver(model, str(tmp_path / "x"))
 
 
-def test_embedding_lora_genuine_roundtrip(tmp_path, base_dir):
+def test_embedding_lora_is_refused(tmp_path, base_dir):
+    """Embedding LoRA is unsupported, so it is named and refused rather than
+    silently dropped from the converted adapter."""
     peft_dir = str(tmp_path / "peft")
-    wrapped, _ = _make_peft_adapter(
+    _make_peft_adapter(
         base_dir, peft_dir, target_modules=["q_proj", "embed_tokens"],
         save_embedding_layers="auto",
     )
-    assert "base_model.model.model.embed_tokens.base_layer.weight" in st_load_file(
+    assert any("lora_embedding_A" in k for k in st_load_file(
         os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
-    )
+    ))
+    with pytest.raises(ValueError, match="does not support"):
+        convert_peft_dir_to_mlx(
+            peft_dir, str(tmp_path / "mlx"),
+            json.load(open(os.path.join(base_dir, "config.json"))),
+        )
     from unsloth_zoo.mlx.loader import FastMLXModel
-    model, _ = FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
-    emb = dict(model.named_modules())["model.embed_tokens"]
-    assert hasattr(emb, "lora_a") and type(emb).__name__ == "LoRAEmbedding"
-    # The auto-saved base embedding is value-equal here: verified and skipped.
-    assert getattr(model, "_unsloth_full_state_modules", {}) == {}
-    np.testing.assert_allclose(_mlx_logits(model), _peft_logits(wrapped), atol=5e-3)
-
-    from unsloth_zoo.mlx.utils import save_lora_adapters
-    out_peft = str(tmp_path / "reexport")
-    save_lora_adapters(model, out_peft, adapter_format="peft")
-    keys = set(st_load_file(os.path.join(out_peft, PEFT_WEIGHTS_FILE)))
-    assert "base_model.model.model.embed_tokens.lora_embedding_A" in keys
-    # No base_weights_source: the auto-saved embedding weights are omitted.
-    assert not any("base_layer" in k for k in keys)
-    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
-    reloaded = peft.PeftModel.from_pretrained(base, out_peft)
-    np.testing.assert_allclose(_peft_logits(reloaded), _peft_logits(wrapped), atol=5e-3)
-
-    # The standalone-converted directory reloads and agrees (its full
-    # state binds under the reload wrappers' inner paths).
-    conv = str(tmp_path / "converted")
-    convert_peft_dir_to_mlx(
-        peft_dir, conv, json.load(open(os.path.join(base_dir, "config.json"))),
-    )
-    mconv, _ = FastMLXModel.from_pretrained(conv, load_in_4bit=False, max_seq_length=64)
-    np.testing.assert_allclose(_mlx_logits(mconv), _peft_logits(wrapped), atol=5e-3)
-
-    # Studio-style emission: source the embedding weights from the base dir.
-    from unsloth_zoo.saving_utils import export_peft_adapter
-    mlx_dir = str(tmp_path / "mlx")
-    save_lora_adapters(model, mlx_dir)
-    sourced = str(tmp_path / "sourced")
-    export_peft_adapter(
-        mlx_dir, sourced, module_types={"model.embed_tokens": "embedding"},
-        base_weights_source=base_dir,
-    )
-    st = st_load_file(os.path.join(sourced, PEFT_WEIGHTS_FILE))
-    torch.testing.assert_close(
-        st["base_model.model.model.embed_tokens.base_layer.weight"],
-        base.get_input_embeddings().weight,
-    )
+    with pytest.raises(ValueError, match="does not support"):
+        FastMLXModel.from_pretrained(
+            peft_dir, load_in_4bit=False, max_seq_length=64,
+        )
 
 
 def test_full_state_modules_lifecycle(tmp_path, base_dir):
@@ -795,7 +858,9 @@ def test_full_state_shape_mismatch_rejected(tmp_path, base_dir):
 def test_auto_saved_base_state_refused_off_embedding_and_head(tmp_path, base_dir):
     """peft auto-saves full base state for the input embedding and the output
     head only. Every LoRA target carries a .base_layer, so a key spelled that
-    way on any other module would bind and replace live base weights."""
+    way on any other module would bind and replace live base weights. Stock
+    mlx-lm binds adapters.safetensors with load_weights(strict=False) and never
+    reads full_state_modules, so conversion must refuse before it writes."""
     peft_dir = str(tmp_path / "peft")
     _make_peft_adapter(base_dir, peft_dir)
     wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
@@ -806,33 +871,20 @@ def test_auto_saved_base_state_refused_off_embedding_and_head(tmp_path, base_dir
     )
     from safetensors.torch import save_file as _st_save
     _st_save(tensors, wf)
+    refused = pytest.raises(
+        ValueError, match="not the input embedding or output head",
+    )
 
     model, _ = load_model(Path(base_dir))
     before = np.array(dict(model.named_modules())[target].weight)
     cfg = json.load(open(os.path.join(peft_dir, "adapter_config.json")))
-    with pytest.raises(ValueError, match="not the input embedding or output head"):
+    with refused:
         attach_and_bind_peft_adapter(model, peft_dir, cfg)
     live = dict(model.named_modules())[target]
     assert np.array_equal(np.array(getattr(live, "linear", live).weight), before)
 
-
-def test_auto_saved_base_state_refused_before_conversion(tmp_path, base_dir):
-    """The converted directory is loadable by stock mlx-lm, whose load_adapters
-    binds adapters.safetensors with load_weights(strict=False) and never reads
-    full_state_modules, so the key must be refused before anything is written."""
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir)
-    wf = os.path.join(peft_dir, PEFT_WEIGHTS_FILE)
-    tensors = st_load_file(wf)
-    target = "model.layers.0.self_attn.q_proj"
-    tensors[f"base_model.model.{target}.base_layer.weight"] = torch.zeros(
-        HIDDEN, HIDDEN
-    )
-    from safetensors.torch import save_file as _st_save
-    _st_save(tensors, wf)
-
     mlx_dir = tmp_path / "mlx"
-    with pytest.raises(ValueError, match="not the input embedding or output head"):
+    with refused:
         convert_peft_dir_to_mlx(
             peft_dir, str(mlx_dir),
             json.load(open(os.path.join(base_dir, "config.json"))),
@@ -873,215 +925,6 @@ def test_grouping_admits_only_hugging_face_embedding_and_head_paths(path, accept
     }, {})
     assert (not rejected) is accepted
     assert (path in full_state) is accepted
-
-
-def test_nested_text_tower_bridge(tmp_path, base_dir):
-    """A PEFT adapter names modules one level shallower than an mlx-vlm
-    tree nests them; the import resolves that nesting and the export emits
-    Hugging-Face-native paths again."""
-    peft_dir = str(tmp_path / "peft")
-    wrapped, cfg = _make_peft_adapter(base_dir, peft_dir)
-    model, _ = load_model(Path(base_dir))
-
-    class _Tower(nn.Module):
-        """Stand-in for the mlx-vlm wrapper: the text model nested one level."""
-        def __init__(self, inner):
-            super().__init__()
-            self.language_model = inner
-
-        def __call__(self, *args, **kwargs):
-            return self.language_model(*args, **kwargs)
-
-    nested = _Tower(model)
-    assert attach_and_bind_peft_adapter(
-        nested, peft_dir, normalize_peft_adapter_config(cfg),
-    ) == 2 * LAYERS
-    assert nested._unsloth_tree_prefix == "language_model."
-    np.testing.assert_allclose(
-        _mlx_logits(nested), _peft_logits(wrapped), atol=5e-3,
-    )
-    # Live state is keyed by the real (nested) module paths.
-    assert all(
-        k.startswith("language_model.")
-        for k in nested._unsloth_lora_module_scales
-    )
-
-    from unsloth_zoo.mlx.utils import save_lora_adapters
-    out = str(tmp_path / "back")
-    save_lora_adapters(nested, out, adapter_format="peft")
-    back_cfg = json.load(open(os.path.join(out, "adapter_config.json")))
-    keys = st_load_file(os.path.join(out, PEFT_WEIGHTS_FILE))
-    assert all(t.startswith("model.layers.") for t in back_cfg["target_modules"])
-    assert all("language_model" not in k for k in keys)
-    base = transformers.LlamaForCausalLM.from_pretrained(base_dir, dtype=torch.float32)
-    reloaded = peft.PeftModel.from_pretrained(base, out)
-    np.testing.assert_allclose(
-        _peft_logits(reloaded), _peft_logits(wrapped), atol=5e-3,
-    )
-
-
-def test_nested_tower_is_never_guessed(tmp_path, base_dir):
-    """A tower outside the known text-tower names is not inferred, and a
-    natively nested adapter without import provenance is not unnested: both
-    keep the named refusal rather than binding the wrong module set."""
-    from unsloth_zoo.mlx.utils import _resolve_tree_prefix, save_lora_adapters
-    from mlx_lm.tuner.lora import LoRALinear
-
-    paths = ["model.layers.0.self_attn.q_proj"]
-    assert _resolve_tree_prefix({"vision_tower." + paths[0]: 1}, paths) is None
-    assert _resolve_tree_prefix({"language_model." + paths[0]: 1}, paths) == "language_model."
-
-    class _Tower(nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.language_model = inner
-
-    inner, _ = load_model(Path(base_dir))
-    model = _Tower(inner)
-    attn = model.language_model.model.layers[0].self_attn
-    attn.q_proj = LoRALinear.from_base(attn.q_proj, r=8, dropout=0.0, scale=2.0)
-    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring|not possible"):
-        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
-
-
-def _nested(model):
-    """Wrap a text model the way mlx-vlm nests it."""
-    class _Tower(nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.language_model = inner
-        def __call__(self, *a, **kw):
-            return self.language_model(*a, **kw)
-    return _Tower(model)
-
-
-def test_tree_prefix_bridge_resolution():
-    """The nesting resolver: unique prefix wins, ambiguity and unknown
-    layouts fall through to the caller's per-path report."""
-    from unsloth_zoo.mlx.utils import _resolve_tree_prefix
-
-    flat = {"model.layers.0.self_attn.q_proj": 1, "model.layers.1.self_attn.q_proj": 1}
-    nested = {"language_model." + k: v for k, v in flat.items()}
-    paths = list(flat)
-
-    assert _resolve_tree_prefix(flat, paths) == ""
-    assert _resolve_tree_prefix(nested, paths) == "language_model."
-    # A vision tower is never a candidate, even when its shapes would fit:
-    # binding a language adapter onto it would be silently wrong.
-    vision_only = {"vision_tower." + k: v for k, v in flat.items()}
-    assert _resolve_tree_prefix(vision_only, paths) is None
-    both = dict(nested)
-    both.update(vision_only)
-    assert _resolve_tree_prefix(both, paths) == "language_model."
-    # A tail that exists nowhere resolves to nothing.
-    assert _resolve_tree_prefix(nested, ["decoder.layers.0.attn.q_proj"]) is None
-    # A prefix must map EVERY path, not just one.
-    partial = dict(nested)
-    partial.pop("language_model.model.layers.1.self_attn.q_proj")
-    assert _resolve_tree_prefix(partial, paths) is None
-
-
-def test_nested_tower_survives_mlx_reload_and_dir_conversion(tmp_path, base_dir):
-    """The nesting marker persists through MLX save -> reload -> re-save, so a
-    later directory-only conversion still emits Hugging-Face-native paths."""
-    from pathlib import Path
-    from unsloth_zoo.mlx.utils import (
-        attach_and_bind_peft_adapter, normalize_peft_adapter_config,
-        save_lora_adapters,
-    )
-    from unsloth_zoo.saving_utils import convert_mlx_dir_to_peft
-
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir)
-    cfg = normalize_peft_adapter_config(
-        json.load(open(os.path.join(peft_dir, "adapter_config.json")))
-    )
-    inner, _ = load_model(Path(base_dir))
-    model = _nested(inner)
-    attach_and_bind_peft_adapter(model, peft_dir, cfg)
-
-    first = str(tmp_path / "mlx1")
-    save_lora_adapters(model, first)
-    saved = json.load(open(os.path.join(first, "adapter_config.json")))
-    assert saved["unsloth_mlx_tree_prefix"] == "language_model."
-    assert any(k.startswith("language_model.")
-               for k in mx.load(os.path.join(first, MLX_WEIGHTS_FILE)))
-
-    # Directory-only conversion honours the recorded marker.
-    back = str(tmp_path / "back")
-    convert_mlx_dir_to_peft(first, back)
-    keys = st_load_file(os.path.join(back, PEFT_WEIGHTS_FILE))
-    assert keys and all("language_model" not in k for k in keys)
-
-    # An explicit empty prefix means "do not unnest", unlike omitting it.
-    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring"):
-        convert_mlx_dir_to_peft(first, str(tmp_path / "raw"), strip_prefix="")
-
-
-def test_nested_tower_ambiguity_and_collisions_refuse(tmp_path, base_dir):
-    """Two towers that both fit, or that collapse onto one path, refuse."""
-    from unsloth_zoo.mlx.utils import _resolve_tree_prefix
-    from unsloth_zoo.saving_utils import convert_mlx_dir_to_peft
-
-    flat = {"model.layers.0.self_attn.q_proj": 1}
-    both = dict(flat, **{"language_model.model.layers.0.self_attn.q_proj": 1})
-    with pytest.raises(ValueError, match="match both the root"):
-        _resolve_tree_prefix(both, list(flat))
-
-    # An artifact carrying the same module in two towers cannot unnest.
-    d = str(tmp_path / "mlx")
-    os.makedirs(d)
-    mx.save_safetensors(os.path.join(d, MLX_WEIGHTS_FILE), {
-        "language_model.model.layers.0.self_attn.q_proj.lora_a": mx.zeros((HIDDEN, 8)),
-        "language_model.model.layers.0.self_attn.q_proj.lora_b": mx.zeros((8, HIDDEN)),
-        "model.layers.0.self_attn.q_proj.lora_a": mx.zeros((HIDDEN, 8)),
-        "model.layers.0.self_attn.q_proj.lora_b": mx.zeros((8, HIDDEN)),
-    })
-    json.dump({"fine_tune_type": "lora", "lora_parameters": {"rank": 8, "scale": 2.0},
-               "unsloth_mlx_tree_prefix": "language_model."},
-              open(os.path.join(d, "adapter_config.json"), "w"))
-    with pytest.raises(ValueError, match="collapses"):
-        convert_mlx_dir_to_peft(d, str(tmp_path / "out"))
-
-
-def test_nested_tower_mixed_dropout_is_still_caught(tmp_path, base_dir):
-    """The dropout guard must see through the nesting, not skip it."""
-    from pathlib import Path
-    from unsloth_zoo.mlx.utils import (
-        attach_and_bind_peft_adapter, normalize_peft_adapter_config,
-        save_lora_adapters,
-    )
-    peft_dir = str(tmp_path / "peft")
-    _make_peft_adapter(base_dir, peft_dir, lora_dropout=0.1)
-    cfg = normalize_peft_adapter_config(
-        json.load(open(os.path.join(peft_dir, "adapter_config.json")))
-    )
-    inner, _ = load_model(Path(base_dir))
-    model = _nested(inner)
-    attach_and_bind_peft_adapter(model, peft_dir, cfg)
-    wrappers = [m for _n, m in model.named_modules() if hasattr(m, "lora_a")]
-    drop = getattr(wrappers[0], "dropout", None)
-    if drop is not None and hasattr(drop, "_p_1"):
-        drop._p_1 = 1.0 - 0.5   # diverge one module's dropout
-    with pytest.raises(ValueError, match="different lora_dropout"):
-        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
-
-
-def test_native_nested_adapter_is_not_guessed_on_export(tmp_path, base_dir):
-    """Without import provenance the Hugging Face counterpart of a nested
-    tower is unknowable (a VLM class nests it the other way round), so the
-    export refuses instead of emitting paths that bind the wrong modules."""
-    from pathlib import Path
-    from unsloth_zoo.mlx.utils import save_lora_adapters
-    from mlx_lm.tuner.lora import LoRALinear
-
-    inner, _ = load_model(Path(base_dir))
-    model = _nested(inner)
-    layer = model.language_model.model.layers[0].self_attn
-    layer.q_proj = LoRALinear.from_base(layer.q_proj, r=8, dropout=0.0, scale=2.0)
-    assert not getattr(model, "_unsloth_tree_prefix", "")
-    with pytest.raises(ValueError, match="outside a Hugging-Face-mirroring|not possible"):
-        save_lora_adapters(model, str(tmp_path / "out"), adapter_format="peft")
 
 
 def _peft_task_type(name):

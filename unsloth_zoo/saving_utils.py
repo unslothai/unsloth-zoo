@@ -127,12 +127,9 @@ def _inference_mode(fn):
 
 
 def _bnb_linear4bit():
-    # Empty when bitsandbytes is absent (e.g. gfx906, whose generic wheel has
-    # no kernels) or stubbed out, as it is on hosts with no CUDA build: either
-    # way there are no 4bit layers, so isinstance against an empty tuple is
-    # exactly right. Resolved lazily to keep the import off this module's
-    # import path, and filtered to real classes because the stub answers every
-    # attribute with a placeholder object that isinstance would reject.
+    # Empty when bitsandbytes is absent or stubbed: no 4bit layers exist, so
+    # isinstance against () is right. Filtered to real classes because the stub
+    # answers every attribute with a placeholder.
     try:
         candidate = bnb.nn.Linear4bit
     except Exception:
@@ -6053,25 +6050,19 @@ pass
 
 
 # ---------------------------------------------------------------------------
-# PEFT <-> MLX LoRA adapter interop. PEFT adapters
-# (adapter_model.safetensors, lora_A/lora_B keys under a base_model.model.
-# prefix) and mlx-lm adapters (adapters.safetensors, lora_a/lora_b keys)
-# encode the same math in different layouts:
+# PEFT <-> MLX LoRA adapter interop. The two formats encode the same math in
+# different layouts:
 #
 #     peft {p}.lora_A.weight [r, in]   ==  mlx {p}.lora_a [in, r], transposed
 #     peft {p}.lora_B.weight [out, r]  ==  mlx {p}.lora_b [r, out], transposed
 #     effective scale = lora_alpha / r     (rsLoRA: lora_alpha / sqrt(r))
 #
-# Conversion is rename + transpose only, so dtypes are exact and a round trip
-# is bitwise-identical for the supported subset: plain linear LoRA; linear
-# DoRA, whose magnitude maps to m with numeric verification; embedding LoRA
-# via lora_embedding_A/B; and full-module state (modules_to_save snapshots and
-# peft's auto-saved embeddings) tracked through origin-tagged
-# full_state_modules maps. Expert target_parameters factors, embedding DoRA,
-# and embedding adapters on tied-output models are refused with a named reason
-# rather than lossily converted. Tensor IO prefers mlx.core (native bfloat16),
-# falling back to safetensors.torch off Apple hardware — the numpy backend
-# cannot represent bf16.
+# Conversion is rename + transpose only, so a round trip is bitwise-identical
+# for the supported subset: linear LoRA, linear DoRA, and full-module state
+# (modules_to_save snapshots and peft's auto-saved embeddings) tracked through
+# origin-tagged full_state_modules maps. Everything else is refused by name.
+# Tensor IO prefers mlx.core for native bfloat16, falling back to
+# safetensors.torch off Apple hardware.
 # ---------------------------------------------------------------------------
 
 import math
@@ -6081,9 +6072,8 @@ PEFT_WEIGHTS_FILE = "adapter_model.safetensors"
 MLX_WEIGHTS_FILE = "adapters.safetensors"
 _PEFT_PREFIX = "base_model.model."
 
-# peft resolves rank_pattern / alpha_pattern keys by ordered first-match against
-# the module path, and a key may be a regex fragment; mirror peft's expression
-# exactly (end-anchored, optional dotted ancestry).
+# peft resolves rank_pattern / alpha_pattern by ordered first-match, and a key
+# may be a regex fragment; mirror its expression exactly.
 def _resolve_pattern(patterns, module_path):
     if not patterns:
         return None
@@ -6232,9 +6222,8 @@ def normalize_peft_adapter_config(cfg, adapter_dir=None):
             f"Unsloth MLX: only peft_type='LORA' adapters can be imported; "
             f"got {cfg.get('peft_type')!r}."
         )
-    # The MLX backend builds a causal language model, so an adapter trained
-    # for another task would attach its backbone factors and then answer with
-    # vocabulary logits instead of what it was trained to produce.
+    # The MLX backend builds a causal LM, so another task's adapter would
+    # attach its backbone factors and then answer with vocabulary logits.
     task_type = cfg.get("task_type")
     task_type = getattr(task_type, "value", task_type)
     if task_type is not None and str(task_type).upper() != "CAUSAL_LM":
@@ -6254,30 +6243,22 @@ def normalize_peft_adapter_config(cfg, adapter_dir=None):
                 f"Unsloth MLX: cannot import this PEFT adapter: {reason} "
                 f"(adapter_config.json field {key!r})."
             )
-    # PiSSA/OLoRA/CorDA subtract their decomposition from the base at init and
-    # LoftQ writes its re-quantized weight back, so their factors only reproduce
-    # the trained model on that mutated base, which this importer never applies.
-    # peft can convert them to plain LoRA at save time; require that instead of
-    # silently changing logits.
+    # PiSSA/OLoRA/CorDA/LoftQ factors only reproduce the trained model on the
+    # base they mutated at init, which this importer never applies. peft can
+    # convert them to plain LoRA at save time; require that.
     init_mode = cfg.get("init_lora_weights")
     # peft matches these case-insensitively, dispatching corda by prefix.
     init_norm = init_mode.lower() if isinstance(init_mode, str) else ""
     if not _is_empty(cfg.get("loftq_config")) or init_norm == "loftq":
+        _named = "LoftQ"
+    elif init_norm.startswith(("pissa", "corda")) or init_norm == "olora":
+        _named = f"init_lora_weights={init_mode!r}"
+    else:
+        _named = None
+    if _named:
         raise ValueError(
-            "Unsloth MLX: LoftQ-initialized adapters assume the base weight "
-            "was replaced by its re-quantized form at initialization; "
-            "re-save the adapter converted to plain LoRA before importing."
-        )
-    if (
-        init_norm.startswith("pissa")
-        or init_norm.startswith("corda")
-        or init_norm == "olora"
-    ):
-        raise ValueError(
-            f"Unsloth MLX: init_lora_weights={init_mode!r} adapters assume "
-            "a base model mutated at initialization; re-save the adapter "
-            "converted to plain LoRA (peft's "
-            "path_initial_model_for_weight_conversion) before importing."
+            f"Unsloth MLX: {_named} adapters assume a base mutated at "
+            "initialization; re-save converted to plain LoRA."
         )
     known = _PEFT_HANDLED_KEYS | _PEFT_NEUTRAL_KEYS | set(_PEFT_REJECTED_KEYS)
     known |= {"bias", "loftq_config"}
@@ -6314,8 +6295,7 @@ def _effective_scale(cfg, module_path, rank):
 def group_peft_lora_pairs(tensors, cfg=None):
     """Split raw PEFT tensors into (pairs, full_state, rejected).
 
-    ``pairs`` maps module paths to {'A','B'[,'M']} for linear LoRA/DoRA and
-    {'EA','EB'} for embedding LoRA. ``full_state`` maps module paths to
+    ``pairs`` maps module paths to {'A','B'[,'M']}. ``full_state`` maps to
     {tensor_name: tensor} for modules_to_save snapshots (peft strips the infix
     at save, so detection is config-driven) and auto-saved embedding weights.
     The wrapper prefix is stripped exactly once; keys without it are rejected.
@@ -6325,9 +6305,8 @@ def group_peft_lora_pairs(tensors, cfg=None):
 
     def _m2s_hit(cand):
         # peft selects with a RAW key.endswith(name) — no dot boundary, so
-        # ["head"] wraps lm_head. A composite module's snapshot arrives as
-        # SUBMODULE keys (classifier.0.weight), so a name may also suffix-match
-        # a dotted ancestor of the key path.
+        # ["head"] wraps lm_head — and a composite module's snapshot arrives as
+        # submodule keys, so a name may suffix-match a dotted ancestor too.
         for m2s in m2s_paths:
             if cand.endswith(m2s):
                 return m2s
@@ -6336,22 +6315,17 @@ def group_peft_lora_pairs(tensors, cfg=None):
                     return m2s
         return None
 
-    def _tensors_equal(a, b):
-        if tuple(getattr(a, "shape", ())) != tuple(getattr(b, "shape", ())):
-            return False
-        if getattr(a, "dtype", None) != getattr(b, "dtype", None):
-            return False
-        return bool((a == b).all())
-
     pairs = {}
     full_state = {}
     rejected = {}
     for key, tensor in tensors.items():
-        emb = re.match(
+        if re.match(
             rf"^{re.escape(_PEFT_PREFIX)}(.+)\.lora_embedding_(A|B)$", key
-        )
-        if emb is not None:
-            pairs.setdefault(emb.group(1), {})["E" + emb.group(2)] = tensor
+        ):
+            rejected[key] = (
+                "embedding LoRA, which this converter does not support; "
+                "retrain without the embedding in target_modules"
+            )
             continue
         mag = re.match(
             rf"^{re.escape(_PEFT_PREFIX)}(.+)\.lora_magnitude_vector(?:\.weight)?$",
@@ -6377,8 +6351,7 @@ def group_peft_lora_pairs(tensors, cfg=None):
                 fs_path = fs_path[: -len(".base_layer")]
                 if not _is_auto_saved_module_path(fs_path):
                     # Every LoRA target has a .base_layer, so without this any
-                    # of them could carry full state and replace its own base
-                    # weights.
+                    # of them could replace its own base weights.
                     rejected[key] = (
                         "auto-saved base state on a module that is not the "
                         "input embedding or output head"
@@ -6391,9 +6364,7 @@ def group_peft_lora_pairs(tensors, cfg=None):
             # `{p}.modules_to_save[.name].{t}` duplicates the snapshot and
             # `{p}.original_module[.name].{t}` is the pristine base. Fold the
             # former, drop the latter — before the general modules_to_save
-            # match, which would adopt these as real submodules. A user module
-            # genuinely named like a wrapper internal is misread; genuine
-            # wrapper keys are common and such names are not.
+            # match, which would adopt them as real submodules.
             for _marker in (".modules_to_save", ".original_module"):
                 _idx = fs_path.find(_marker)
                 if _idx > 0 and _m2s_hit(fs_path[:_idx]) is not None:
@@ -6447,31 +6418,10 @@ def group_peft_lora_pairs(tensors, cfg=None):
         continue
     has_mag = {p for p, v in pairs.items() if "M" in v}
     for path, pair in pairs.items():
-        if ("EA" in pair) != ("EB" in pair):
-            rejected[f"{_PEFT_PREFIX}{path}.lora_embedding_*"] = (
-                "incomplete lora_embedding_A/B pair"
-            )
-        if "EA" in pair and "M" in pair:
-            rejected[f"{_PEFT_PREFIX}{path}.lora_magnitude_vector"] = (
-                "embedding DoRA decompositions are incompatible between "
-                "peft and mlx-lm"
-            )
-        if "EA" in pair:
-            continue
         if "A" not in pair or "B" not in pair:
             rejected[f"{_PEFT_PREFIX}{path}.lora_*"] = (
                 "incomplete lora_A/lora_B pair"
             )
-    # use_dora is global, so an embedding target under it is embedding DoRA
-    # (incompatible decompositions) or a truncated file. Either way, refuse.
-    if cfg.get("use_dora"):
-        for _p, _v in pairs.items():
-            if "EA" in _v:
-                rejected[f"{_PEFT_PREFIX}{_p}.lora_embedding_*"] = (
-                    "embedding adapters under use_dora have no compatible "
-                    "peft/mlx-lm decomposition (or the magnitude vector "
-                    "is missing from the file)"
-                )
     # use_dora is global: a partial magnitude set means file and config
     # disagree about what the adapter is.
     _linear_pairs = {p for p, v in pairs.items() if "A" in v}
@@ -6482,14 +6432,8 @@ def group_peft_lora_pairs(tensors, cfg=None):
         )
         pairs = {}
     for _p, _v in pairs.items():
-        if ("A" in _v or "B" in _v) and ("EA" in _v or "EB" in _v):
-            rejected[f"{_PEFT_PREFIX}{_p}.lora_*"] = (
-                "carries both linear (lora_A/B) and embedding "
-                "(lora_embedding_A/B) factors for one module; the artifact "
-                "is inconsistent"
-            )
         _bad = sorted(
-            k for k in ("A", "B", "EA", "EB", "M")
+            k for k in ("A", "B", "M")
             if k in _v and not _is_float_dtype(_v[k])
         )
         if _bad:
@@ -6498,13 +6442,10 @@ def group_peft_lora_pairs(tensors, cfg=None):
                 f"({', '.join(str(_v[k].dtype) for k in _bad)}); LoRA "
                 "factors must be floating point"
             )
-    pairs = {
-        p: v for p, v in pairs.items()
-        if ("A" in v and "B" in v) or ("EA" in v and "EB" in v)
-    }
-    # An entry with no tensors would silently downgrade to plain LoRA, dropping
-    # a trained replacement. Credit every declaration a snapshot satisfies —
-    # overlapping names like ["head", "lm_head"] select the same module.
+    pairs = {p: v for p, v in pairs.items() if "A" in v and "B" in v}
+    # An entry with no tensors would silently downgrade to plain LoRA. Credit
+    # every declaration a snapshot satisfies: overlapping names like
+    # ["head", "lm_head"] select the same module.
     _m2s_snapshot_paths = [
         p for p, v in full_state.items()
         if v.get("__origin__") == "modules_to_save"
@@ -6578,58 +6519,16 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
     out = {}
     ranks, scales = {}, {}
     fs_origins = {}
-    emb_paths = {p for p, v in pairs.items() if "EA" in v}
-    if emb_paths and _config_ties_word_embeddings(base_config):
-        # Routing cannot be verified from configs alone and a wrongly-admitted
-        # adapter silently changes logits, so a true flag refuses even where the
-        # forward ignores it.
-        raise ValueError(
-            f"Unsloth MLX: {sorted(emb_paths)} carry embedding LoRA but the "
-            "base model ties word embeddings; mlx-lm applies the update to "
-            "the tied output projection while peft applies it to input "
-            "lookup only, so no faithful conversion exists."
-        )
-    if emb_paths and float(cfg.get("lora_dropout") or 0.0) > 0:
-        raise ValueError(
-            f"Unsloth MLX: {sorted(emb_paths)} carry embedding LoRA with "
-            "nonzero lora_dropout; peft applies no dropout on embedding "
-            "adapters while mlx-lm does, so training behavior cannot be "
-            "preserved. Set lora_dropout=0 to convert."
-        )
     _base_ties = _config_ties_word_embeddings(base_config)
     if _base_ties:
-        _vocab = None
-        for _scope in ((base_config or {}).get("text_config") or {},
-                       base_config or {}):
-            if isinstance(_scope, dict) and _scope.get("vocab_size"):
-                _vocab = int(_scope["vocab_size"])
-                break
-
-        def _looks_like_embedding(p, v):
-            w = v.get("weight")
-            if (
-                _vocab is not None
-                and w is not None
-                and getattr(w, "ndim", 0) == 2
-                and int(w.shape[0]) == _vocab
-            ):
-                return True
-            return p.rsplit(".", 1)[-1] in (
-                _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES
-            )
-
         _m2s_emb = sorted(
             p for p, v in full_state.items()
             if v.get("__origin__") == "modules_to_save"
-            and _looks_like_embedding(p, v)
+            and _names_embedding_or_head(p, v.get("weight"), base_config)
         )
         if _m2s_emb:
             raise ValueError(
-                f"Unsloth MLX: {_m2s_emb} are modules_to_save snapshots of "
-                "a tied embedding or output head; peft trains an untied "
-                "copy while the tied MLX embedding both looks up inputs "
-                "and projects output logits, so no faithful conversion "
-                "exists."
+                f"Unsloth MLX: {_m2s_emb} carry {_TIED_FULL_STATE_REASON}."
             )
     for path, entries in sorted(full_state.items()):
         if (
@@ -6637,9 +6536,6 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
             and entries["__origin__"] == "embedding_auto"
             and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
         ):
-            # On a tied base the auto-saved head IS the embedding weight, so
-            # verify it against the embedding snapshot and fold; emitting head
-            # state would restore a duplicate the tree may not even carry.
             _emb_matches = [
                 v for p, v in full_state.items()
                 if _leaf_in(p, _EMBEDDING_LEAF_NAMES)
@@ -6650,34 +6546,17 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
                     "but the artifact carries multiple embed_tokens "
                     "snapshots; the duplicate cannot be attributed."
                 )
-            _emb_entries = _emb_matches[0] if _emb_matches else None
-            _ew = (_emb_entries or {}).get("weight")
-            _lw = entries.get("weight")
-            _extra = sorted(set(entries) - {"__origin__", "weight"})
-            if (
-                _ew is None
-                or _lw is None
-                or _extra
-                or tuple(_ew.shape) != tuple(_lw.shape)
-                or _ew.dtype != _lw.dtype
-                or not bool((_ew == _lw).all())
-            ):
-                raise ValueError(
-                    f"Unsloth MLX: {path} is a tied model's output-head "
-                    "snapshot but does not exactly duplicate the tied "
-                    "embedding snapshot"
-                    + (f" (extra tensors {_extra})" if _extra else "")
-                    + "; a tied MLX model cannot hold an independent "
-                    "lm_head."
-                )
+            _err = _tied_head_fold_error(
+                path, entries, (_emb_matches or [{}])[0].get("weight"),
+                _tensors_equal,
+            )
+            if _err:
+                raise ValueError(f"Unsloth MLX: {_err}.")
             continue
         fs_origins[path] = entries["__origin__"]
         # A reload wraps LoRA-paired modules, so base tensors live under the
         # wrapper's inner module.
-        if path in pairs:
-            _kp = f"{path}.embedding" if "EA" in pairs[path] else f"{path}.linear"
-        else:
-            _kp = path
+        _kp = f"{path}.linear" if path in pairs else path
         for tname, tensor in entries.items():
             if tname == "__origin__":
                 continue
@@ -6688,37 +6567,9 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
                     "the artifact cannot restore as module state."
                 )
             out[f"{_kp}.{tname}"] = tensor
-    for path in sorted(emb_paths):
-        ea, eb = pairs[path]["EA"], pairs[path]["EB"]
-        if getattr(ea, "ndim", 0) != 2 or getattr(eb, "ndim", 0) != 2:
-            raise ValueError(
-                f"Unsloth MLX: {path} embedding LoRA factors are not 2-D."
-            )
-        rank = int(ea.shape[0])
-        if int(eb.shape[1]) != rank:
-            raise ValueError(
-                f"Unsloth MLX: {path} embedding LoRA ranks disagree."
-            )
-        out[f"{path}.lora_a"] = transpose(ea)
-        out[f"{path}.lora_b"] = transpose(eb)
-        ranks[path] = rank
-        scales[path] = _effective_scale(cfg, path, rank)
-    for path in sorted(set(pairs) - emb_paths):
+    for path in sorted(pairs):
         a, b = pairs[path]["A"], pairs[path]["B"]
-        # 2-D only: higher-rank factors are not linear LoRA, and the two IO
-        # backends transpose them differently.
-        if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
-            raise ValueError(
-                f"Unsloth MLX: {path} carries non-2-D LoRA factors "
-                f"(A ndim={getattr(a, 'ndim', '?')}, "
-                f"B ndim={getattr(b, 'ndim', '?')}); not plain linear LoRA."
-            )
-        rank = int(a.shape[0])
-        if int(b.shape[1]) != rank:
-            raise ValueError(
-                f"Unsloth MLX: {path} has lora_A rank {rank} but lora_B "
-                f"rank {int(b.shape[1])}; the adapter file is inconsistent."
-            )
+        rank = _lora_pair_rank(path, a, b, 0)
         out[f"{path}.lora_a"] = transpose(a)
         out[f"{path}.lora_b"] = transpose(b)
         mag = pairs[path].get("M")
@@ -6733,12 +6584,7 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
                 "config does not set use_dora; the artifact is inconsistent."
             )
         if mag is not None:
-            if getattr(mag, "ndim", 0) != 1 or int(mag.shape[0]) != int(b.shape[0]):
-                raise ValueError(
-                    f"Unsloth MLX: {path} magnitude shape "
-                    f"{tuple(getattr(mag, 'shape', ()))} does not match the "
-                    f"module out-dim {int(b.shape[0])}."
-                )
+            _check_dora_magnitude(path, mag, int(b.shape[0]))
             out[f"{path}.m"] = mag
         ranks[path] = rank
         scales[path] = _effective_scale(cfg, path, rank)
@@ -6756,8 +6602,7 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
             "scale": scales[any_path],
             "dropout": float(cfg.get("lora_dropout") or 0.0),
             # Pin the exact module set: without "keys", mlx-lm wraps every
-            # supported projection in the selected layers, growing the topology
-            # with zero-initialized extras.
+            # projection in the selected layers with zero-initialized extras.
             "keys": sorted(ranks),
         },
         "unsloth_mlx_lora_module_paths": sorted(ranks),
@@ -6780,44 +6625,148 @@ def convert_peft_dir_to_mlx(src, dst, base_config):
             "copy needs Unsloth to load (stock mlx-lm assumes one global "
             "rank/scale)."
         )
-    # Destination contract: the complete artifact is staged in a unique sibling
-    # directory and published by ONE atomic rename, so readers never observe a
-    # partial adapter: a crash leaves either nothing at dst or the complete
-    # artifact, never a half-written one. Claim-first designs
-    # were tried and rejected: a kill between claim and publish strands a
-    # partial destination that blocks retries. The rename refuses a concurrently
-    # created non-empty dst (ENOTEMPTY), so content is never replaced and
-    # formats never mix; the residual — adopting a ZERO-DATA entry (empty
-    # directory or bare symlink) created in the race window — is accepted, since
-    # two uncoordinated writers on one path are outside the contract under any
-    # protocol. dst is refused by the caller's spelling BEFORE resolving so a
-    # pre-planted dangling symlink is rejected rather than followed (trailing
-    # separators are stripped first — lexists("link/") follows the terminal
-    # symlink); resolution only normalizes parents, and the resolved path is
-    # re-checked in case a parent symlink retargeted it.
+    return _publish_adapter_dir(dst, MLX_WEIGHTS_FILE, out, mlx_cfg, save_file)
+
+
+def _names_embedding_or_head(path, weight=None, config=None):
+    """Whether a full-state path is the embedding or the output head. Callers
+    decide tie-ness from the config; this only identifies the module, by a row
+    count matching the declared vocabulary when a weight is at hand, else by
+    leaf spelling."""
+    shape = tuple(getattr(weight, "shape", ()) or ())
+    if len(shape) == 2:
+        for scope in ((config or {}).get("text_config") or {}, config or {}):
+            if isinstance(scope, dict) and scope.get("vocab_size"):
+                return int(shape[0]) == int(scope["vocab_size"]) or _leaf_in(
+                    path, _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES
+                )
+    return _leaf_in(path, _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES)
+
+
+def _full_state_owner(path, recorded):
+    """The recorded full-state module a path belongs to: the path itself, or
+    the module whose LoRA wrapper keeps its base under .embedding/.linear."""
+    if path in recorded:
+        return path
+    for inner in (".embedding", ".linear"):
+        if path.endswith(inner) and path[: -len(inner)] in recorded:
+            return path[: -len(inner)]
+    return None
+
+
+def _validate_full_state_origins(fs_origins):
+    bad = {
+        p: o for p, o in fs_origins.items()
+        if o not in ("modules_to_save", "embedding_auto")
+    }
+    if bad:
+        raise ValueError(
+            f"Unsloth MLX: full_state_modules carries unknown origin tag(s) "
+            f"{bad}; expected 'modules_to_save' or 'embedding_auto'."
+        )
+
+
+def _tensors_equal(a, b):
+    if tuple(getattr(a, "shape", ())) != tuple(getattr(b, "shape", ())):
+        return False
+    if getattr(a, "dtype", None) != getattr(b, "dtype", None):
+        return False
+    return bool((a == b).all())
+
+
+def _tied_head_fold_error(path, entries, emb_weight, equal):
+    """Why a tied base's auto-saved output-head snapshot cannot fold into the
+    embedding, or None when ``equal`` accepts it as a duplicate. On a tied base
+    the head tensor IS the embedding weight, so emitting it would restore a
+    duplicate the MLX tree may not even carry. ``equal`` is the caller's:
+    the converter demands an identical dtype, while a live attach compares in
+    the live dtype, since the loader may have cast the base."""
+    extra = sorted(set(entries) - {"__origin__", "weight"})
+    if extra:
+        return (
+            f"{path} (tied output-head snapshot carries {extra}; a tied "
+            "embedding has no slot for them)"
+        )
+    snapshot = entries.get("weight")
+    if snapshot is None or not _is_float_dtype(snapshot):
+        return (
+            f"{path} (tied output-head snapshot is missing or non-floating)"
+        )
+    if emb_weight is None or not equal(emb_weight, snapshot):
+        return (
+            f"{path} (tied output-head snapshot differs from the tied "
+            "embedding; a tied model has no independent head)"
+        )
+    return None
+
+
+def _lora_pair_rank(path, a, b, rank_axis):
+    """The rank a LoRA factor pair agrees on. ``rank_axis`` is 0 for peft's
+    [r,in]/[out,r] layout and 1 for mlx-lm's [in,r]/[r,out]; ``b`` is indexed
+    on the other axis. Messages use the direction's own key spelling."""
+    _a, _b, _why = (
+        ("lora_A", "lora_B", "not plain linear LoRA") if rank_axis == 0
+        else ("lora_a", "lora_b", "switch/MoE LoRA cannot be exported")
+    )
+    if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
+        raise ValueError(
+            f"Unsloth MLX: {path} carries non-2-D LoRA factors ({_a} ndim "
+            f"{getattr(a, 'ndim', '?')}, {_b} ndim {getattr(b, 'ndim', '?')}); "
+            f"{_why}."
+        )
+    rank = int(a.shape[rank_axis])
+    other = int(b.shape[1 - rank_axis])
+    if other != rank:
+        raise ValueError(
+            f"Unsloth MLX: {path} has {_a} rank {rank} but {_b} rank "
+            f"{other}; the adapter file is inconsistent."
+        )
+    return rank
+
+
+def _check_dora_magnitude(path, mag, out_dim):
+    if getattr(mag, "ndim", 0) != 1 or int(mag.shape[0]) != out_dim:
+        raise ValueError(
+            f"Unsloth MLX: {path} DoRA magnitude shape "
+            f"{tuple(getattr(mag, 'shape', ()))} does not match the module "
+            f"out-dim {out_dim}."
+        )
+
+
+def _publish_adapter_dir(dst, weights_name, tensors, cfg, save_file):
+    """Stage the whole artifact in a unique sibling directory and publish it
+    with ONE atomic rename, so a crash leaves either nothing at ``dst`` or the
+    complete adapter. Claim-first designs strand a partial destination that
+    blocks retries. The rename refuses a concurrently created non-empty dst,
+    so content is never replaced and formats never mix; adopting a zero-data
+    entry (empty directory or bare symlink) created in the race window is
+    accepted. dst is checked in the caller's spelling BEFORE resolving, so a
+    pre-planted dangling symlink is rejected rather than followed — trailing
+    separators go first, since lexists("link/") follows the terminal symlink —
+    and again after, in case a parent symlink retargeted it."""
     dst = os.fspath(dst)
     _require_fresh_destination(dst.rstrip(os.sep) or dst)
     dst = os.path.realpath(dst)
     _require_fresh_destination(dst)
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    _tmp = f"{dst}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    _tmp_created = False
+    tmp = f"{dst}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    created = False
     try:
-        os.makedirs(_tmp)
-        _tmp_created = True
-        save_file(os.path.join(_tmp, MLX_WEIGHTS_FILE), out)
-        with open(os.path.join(_tmp, "adapter_config.json"), "w") as f:
-            json.dump(mlx_cfg, f, indent=2, sort_keys=True)
+        os.makedirs(tmp)
+        created = True
+        save_file(os.path.join(tmp, weights_name), tensors)
+        with open(os.path.join(tmp, "adapter_config.json"), "w") as f:
+            json.dump(cfg, f, indent=2, sort_keys=True)
         try:
-            os.rename(_tmp, dst)
+            os.rename(tmp, dst)
         except OSError as exc:
             raise ValueError(
                 f"Unsloth MLX: destination {dst!r} appeared concurrently "
                 "and is not empty; refusing to mix adapter artifacts."
             ) from exc
     finally:
-        if _tmp_created:
-            shutil.rmtree(_tmp, ignore_errors=True)
+        if created:
+            shutil.rmtree(tmp, ignore_errors=True)
     return dst
 
 
@@ -6833,6 +6782,14 @@ _EMBEDDING_LEAF_NAMES = (
     "embed_in", "word_embeddings", "embeddings", "embedding",
 )
 _OUTPUT_HEAD_LEAF_NAMES = ("lm_head", "output", "embed_out")
+
+
+# peft trains an untied copy of a tied embedding or head, while the tied MLX
+# module both looks up inputs and projects output logits.
+_TIED_FULL_STATE_REASON = (
+    "full-module state for a tied embedding or output head, which peft and "
+    "mlx-lm cannot represent the same way"
+)
 
 
 def _leaf_in(path, names):
@@ -6871,67 +6828,21 @@ def _config_ties_word_embeddings(config):
     return True
 
 
-def _load_base_weight(source, key):
-    """Fetch one named tensor from a base-model snapshot: ``source`` is a
-    safetensors file or a directory of them (a sharded index is honored)."""
-    backend, load_file, _save, _transpose = _tensor_backend()
-    source = os.fspath(source)
-    candidates = []
-    if os.path.isdir(source):
-        index_path = os.path.join(source, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path, "r") as f:
-                weight_map = (json.load(f).get("weight_map") or {})
-            shard = weight_map.get(key)
-            if shard is not None:
-                candidates = [os.path.join(source, shard)]
-        if not candidates:
-            candidates = sorted(
-                os.path.join(source, name)
-                for name in os.listdir(source)
-                if name.endswith(".safetensors")
-            )
-    else:
-        candidates = [source]
-    from safetensors import safe_open
-    for path in candidates:
-        with safe_open(path, framework="numpy") as f:
-            if key not in f.keys():
-                continue
-        tensors = load_file(path)
-        return tensors[key]
-    raise ValueError(
-        f"Unsloth MLX: base_weights_source {source!r} does not contain "
-        f"{key!r}; cannot emit the auto-saved embedding weights."
-    )
-
-
-def convert_mlx_dir_to_peft(src, dst, module_types=None,
-                            base_weights_source=None, strip_prefix=None):
+def convert_mlx_dir_to_peft(src, dst, module_types=None):
     """Convert an mlx-lm adapter directory to a PEFT LoRA directory.
 
-    ``module_types`` optionally maps module paths to ``"linear"`` /
-    ``"embedding"``. An entry asserts what a weights file cannot establish:
-    the module's type on the live base, that the base does not route tied
-    output logits through it (see export_peft_adapter's base_config check),
-    and that the same dotted path exists in the Hugging Face tree — mlx-lm
-    renames some roots (GPT-2's ``model.h.*`` vs HF's ``transformer.h.*``), so
-    a mis-asserted path yields an adapter peft cannot bind. Directory-only
-    conversion also cannot verify full-state completeness the way a live tree
-    can (attach refuses truncated snapshots and walks every module a selector
-    matches), and a composite modules_to_save entry re-exports as its wrapped
-    submodules, which peft restores with identical state and trainability.
-    Without the map, only root-anchored ``model.layers.N.`` paths convert —
-    the one layout where mlx-lm mirrors the HF tree and every LoRA target is a
-    Linear — and
-    anything else is refused, pointing at the MLX-format fallback rather than
-    at this map, which only a caller able to make those assertions can supply.
+    ``module_types`` optionally declares LoRA target paths as ``"linear"``.
+    Such an entry asserts what a weights file cannot: that the same dotted
+    path exists in the Hugging Face tree. mlx-lm renames some roots (GPT-2's
+    ``model.h.*`` vs HF's ``transformer.h.*``), so a mis-asserted path yields
+    an adapter peft cannot bind. Without the map only root-anchored
+    ``model.layers.N.`` paths convert and anything else is refused.
     """
     for _path, _kind in (module_types or {}).items():
-        if _kind not in ("linear", "embedding"):
+        if _kind != "linear":
             raise ValueError(
                 f"Unsloth MLX: module_types[{_path!r}]={_kind!r}; expected "
-                "'linear' or 'embedding'."
+                "'linear'."
             )
     # Raises on a both-formats directory; the source must be unambiguous.
     detect_adapter_format(src)
@@ -6944,13 +6855,10 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
             f"Unsloth MLX: fine_tune_type={cfg.get('fine_tune_type')!r} "
             "adapters cannot be exported to PEFT format."
         )
-    if strip_prefix is None:
-        strip_prefix = cfg.get("unsloth_mlx_tree_prefix") or ""
     fs_origins = dict(cfg.get("full_state_modules") or {})
-    # PEFT expresses trainable module state ONLY as modules_to_save, and no
-    # module can be both a LoRA target and a modules_to_save entry, so a
-    # trainable auto-saved replacement has no faithful PEFT form; refuse rather
-    # than emit an artifact whose reload silently freezes it.
+    # PEFT expresses trainable module state only as modules_to_save, which
+    # cannot coexist with a LoRA target on one module, so a trainable
+    # auto-saved replacement has no faithful PEFT form.
     _trainable_auto = sorted(
         p for p in (cfg.get("full_state_trainable") or [])
         if fs_origins.get(p) != "modules_to_save"
@@ -6958,68 +6866,19 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
     if _trainable_auto:
         raise ValueError(
             f"Unsloth MLX: {_trainable_auto} carry trainable auto-saved "
-            "full-module state, which PEFT cannot represent (its trainable "
-            "module state is modules_to_save, which cannot coexist with a "
-            "LoRA target on the same module). Export the MLX adapter "
-            "instead."
+            "full-module state, which PEFT cannot represent. Export the MLX "
+            "adapter instead."
         )
-    _bad_origins = {
-        p: o for p, o in fs_origins.items()
-        if o not in ("modules_to_save", "embedding_auto")
-    }
-    if _bad_origins:
-        raise ValueError(
-            f"Unsloth MLX: full_state_modules carries unknown origin "
-            f"tag(s) {_bad_origins}; expected 'modules_to_save' or "
-            "'embedding_auto'."
-        )
+    _validate_full_state_origins(fs_origins)
     tensors = load_file(os.path.join(src, MLX_WEIGHTS_FILE))
-    if strip_prefix:
-        # An mlx-vlm tree nests the text tower one level deeper than the HF
-        # model it mirrors; normalize every keyed map to HF-native paths so the
-        # adapter binds in peft. A key without the nesting is left alone for the
-        # layout gate below rather than silently renamed.
-        def _unnest(key):
-            return key[len(strip_prefix):] if key.startswith(strip_prefix) else key
-
-        def _unnest_map(mapping, what):
-            out = {}
-            for key, value in mapping.items():
-                unnested = _unnest(key)
-                if unnested in out:
-                    raise ValueError(
-                        f"Unsloth MLX: unnesting {strip_prefix!r} collapses "
-                        f"{what} {key!r} onto {unnested!r}; the artifact "
-                        "carries entries for more than one tower, which a "
-                        "single PEFT adapter cannot represent."
-                    )
-                out[unnested] = value
-            return out
-
-        tensors = _unnest_map(tensors, "tensor")
-        fs_origins = _unnest_map(fs_origins, "full-state entry")
-        for _key in (
-            "unsloth_mlx_lora_module_scales", "unsloth_mlx_lora_module_ranks",
-        ):
-            if isinstance(cfg.get(_key), dict):
-                cfg[_key] = _unnest_map(cfg[_key], _key)
-        if isinstance(cfg.get("full_state_trainable"), list):
-            cfg["full_state_trainable"] = [
-                _unnest(k) for k in cfg["full_state_trainable"]
-            ]
     pairs = {}
     rejected = {}
     full_state_out = {}
     for key, tensor in tensors.items():
         fsm = re.match(r"^(.+)\.(weight|bias)$", key)
         if fsm is not None:
-            _fs_path = fsm.group(1)
-            # Wrapped modules persist their base under .embedding/.linear.
-            for _inner in (".embedding", ".linear"):
-                if _fs_path.endswith(_inner) and _fs_path[: -len(_inner)] in fs_origins:
-                    _fs_path = _fs_path[: -len(_inner)]
-                    break
-            if _fs_path in fs_origins:
+            _fs_path = _full_state_owner(fsm.group(1), fs_origins)
+            if _fs_path is not None:
                 if not _is_float_dtype(tensor):
                     raise ValueError(
                         f"Unsloth MLX: {key} holds non-floating "
@@ -7028,11 +6887,7 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
                     )
                 _slot = full_state_out.setdefault(_fs_path, {})
                 _prev = _slot.get(fsm.group(2))
-                if _prev is not None and (
-                    tuple(_prev.shape) != tuple(tensor.shape)
-                    or _prev.dtype != tensor.dtype
-                    or not bool((_prev == tensor).all())
-                ):
+                if _prev is not None and not _tensors_equal(_prev, tensor):
                     raise ValueError(
                         f"Unsloth MLX: {key} disagrees with another "
                         "spelling of the same module tensor; the adapter "
@@ -7048,36 +6903,20 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
         if m is None:
             rejected[key] = (
                 "not a LoRA/DoRA adapter tensor for this artifact's "
-                "fine_tune_type; full-weight/embedding state cannot be "
-                "exported, and a stray magnitude means the flag and "
-                "weights disagree"
+                "fine_tune_type; full-weight state cannot be exported"
             )
             continue
-        # Embedding LoRA shares the lora_a/lora_b key shape but PEFT stores it
-        # as lora_embedding_A/B, and a weights file alone cannot tell an
-        # Embedding from a Linear. An explicit module_types entry wins; else
-        # only the root-anchored stack below converts, where every LoRA target
-        # is a Linear, and anything else is refused rather than guessed.
         path = m.group(1)
-        declared = (module_types or {}).get(path)
-        if declared == "embedding":
-            pairs.setdefault(path, {})[m.group(2)] = tensor
-            pairs[path]["embedding"] = True
-            continue
-        if declared is None and re.match(
-            # Root-anchored `model.layers.N.` only: that is the layout mlx-lm
-            # mirrors from HF, so emitted paths bind in peft. GPT-2-style stacks
-            # rename roots (`model.h.*` vs HF `transformer.h.*`) and VLM
-            # wrappers reorder them (`language_model.model.layers.*` vs HF
-            # `model.language_model.layers.*`), so any unanchored heuristic
-            # would emit adapters peft cannot load.
+        if (module_types or {}).get(path) is None and re.match(
+            # Root-anchored `model.layers.N.` only: the layout mlx-lm mirrors
+            # from HF, so emitted paths bind in peft. GPT-2-style stacks rename
+            # roots, so an unanchored heuristic would emit unloadable adapters.
             r"^model\.layers\.\d+\.", path
         ) is None:
             rejected[key] = (
-                "outside a Hugging-Face-mirroring transformer stack, so its "
-                "Hugging Face path cannot be confirmed and PEFT export could "
-                "emit an adapter that binds to nothing — save this adapter "
-                "in MLX format instead"
+                "outside a Hugging-Face-mirroring transformer stack, so PEFT "
+                "export could emit an adapter that binds to nothing — save "
+                "this adapter in MLX format instead"
             )
             continue
         pairs.setdefault(path, {})[m.group(2)] = tensor
@@ -7115,21 +6954,7 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
             "exported; peft and mlx-lm apply DoRA dropout with different "
             "training-mode formulas."
         )
-    _emb_export = sorted(p for p in pairs if pairs[p].get("embedding"))
-    if _emb_export and dropout > 0:
-        raise ValueError(
-            f"Unsloth MLX: {_emb_export} carry embedding LoRA with nonzero "
-            "lora_dropout; peft applies no dropout on embedding adapters, "
-            "so exporting would silently change training behavior."
-        )
     _mag_paths = {p for p, v in pairs.items() if "m_vec" in v}
-    _emb_mags = sorted(p for p in _mag_paths if pairs[p].get("embedding"))
-    if _emb_mags:
-        raise ValueError(
-            f"Unsloth MLX: {_emb_mags} carry DoRA magnitudes on embedding "
-            "modules; peft and mlx-lm decompose embedding DoRA "
-            "incompatibly, so it cannot be exported."
-        )
     if _ft == "dora" and _mag_paths != set(pairs):
         raise ValueError(
             "Unsloth MLX: DoRA magnitudes present on only some modules; "
@@ -7138,43 +6963,19 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
         )
     for path in sorted(pairs):
         a, b = pairs[path]["a"], pairs[path]["b"]
-        if getattr(a, "ndim", 0) != 2 or getattr(b, "ndim", 0) != 2:
-            raise ValueError(
-                f"Unsloth MLX: {path} carries non-2-D LoRA factors "
-                f"(lora_a ndim={getattr(a, 'ndim', '?')}, "
-                f"lora_b ndim={getattr(b, 'ndim', '?')}); switch/MoE LoRA "
-                "cannot be exported to PEFT format yet."
-            )
-        rank = int(a.shape[1])
-        if int(b.shape[0]) != rank:
-            raise ValueError(
-                f"Unsloth MLX: {path} has lora_a rank {rank} but lora_b "
-                f"rank {int(b.shape[0])}; the adapter file is inconsistent."
-            )
-        # mlx-lm uses the same [in,r]/[r,out] layout for embedding and linear,
-        # so only peft's key names differ (lora_embedding_* has no .weight).
-        if pairs[path].get("embedding"):
-            out[f"{_PEFT_PREFIX}{path}.lora_embedding_A"] = transpose(a)
-            out[f"{_PEFT_PREFIX}{path}.lora_embedding_B"] = transpose(b)
-        else:
-            out[f"{_PEFT_PREFIX}{path}.lora_A.weight"] = transpose(a)
-            out[f"{_PEFT_PREFIX}{path}.lora_B.weight"] = transpose(b)
+        rank = _lora_pair_rank(path, a, b, 1)
+        out[f"{_PEFT_PREFIX}{path}.lora_A.weight"] = transpose(a)
+        out[f"{_PEFT_PREFIX}{path}.lora_B.weight"] = transpose(b)
         if "m_vec" in pairs[path]:
             _mv = pairs[path]["m_vec"]
-            if getattr(_mv, "ndim", 0) != 1 or int(_mv.shape[0]) != int(b.shape[1]):
-                raise ValueError(
-                    f"Unsloth MLX: {path} DoRA magnitude shape "
-                    f"{tuple(getattr(_mv, 'shape', ()))} does not match the "
-                    f"module out-dim {int(b.shape[1])}."
-                )
+            _check_dora_magnitude(path, _mv, int(b.shape[1]))
             # peft's on-disk form has no .weight suffix (stripped at save).
             out[f"{_PEFT_PREFIX}{path}.lora_magnitude_vector"] = _mv
         ranks[path] = rank
         scale = float(scale_map.get(path, global_scale))
         alphas[path] = scale * rank
-    # Modal values minimize pattern entries; peft's matcher
-    # re.match(r"(.*\.)?(key)$", name) is ^-anchored, giving exact-path
-    # semantics so overlapping dotted suffixes cannot shadow.
+    # Modal values minimize pattern entries; peft's ^-anchored matcher gives
+    # exact-path semantics, so overlapping dotted suffixes cannot shadow.
     from collections import Counter
     ref_rank = Counter(ranks.values()).most_common(1)[0][0]
     ref_alpha = Counter(alphas.values()).most_common(1)[0][0]
@@ -7187,10 +6988,9 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
         "bias": "none",
         "use_rslora": False,
         "use_dora": _ft == "dora",
-        # Full module paths, matched exactly by peft's list semantics. Leaf
-        # names would suffix-match EVERY layer's projection, so a layer-subset
-        # adapter would grow zero-initialized extras and train a different
-        # topology.
+        # Full module paths, matched exactly by peft's list semantics: leaf
+        # names would suffix-match every layer's projection, growing a
+        # layer-subset adapter into a different topology.
         "target_modules": sorted(ranks),
         "base_model_name_or_path": cfg.get("base_model_name_or_path", ""),
     }
@@ -7220,154 +7020,38 @@ def convert_mlx_dir_to_peft(src, dst, module_types=None,
     if _m2s_list:
         peft_cfg["modules_to_save"] = _m2s_list
     for _p, _entries in sorted(full_state_out.items()):
-        # peft's on-disk forms: plain {path}.{tensor} for modules_to_save
-        # snapshots and untargeted auto-saved embeddings (the infix is stripped
-        # at save), but a LoRA-wrapped module's base state sits under the
-        # wrapper's .base_layer path, since a plain key would not bind.
+        # peft's on-disk forms: plain {path}.{tensor} for snapshots and
+        # untargeted auto-saved embeddings, but a LoRA-wrapped module's base
+        # state sits under .base_layer, since a plain key would not bind.
         _wrapped = _p in pairs
         for _tname, _tensor in sorted(_entries.items()):
             if _wrapped:
                 out[f"{_PEFT_PREFIX}{_p}.base_layer.{_tname}"] = _tensor
             else:
                 out[f"{_PEFT_PREFIX}{_p}.{_tname}"] = _tensor
-    _unsourced_emb = sorted(
-        p for p in pairs
-        if pairs[p].get("embedding") and p not in full_state_out
-    )
-    if _unsourced_emb and base_weights_source is not None:
-        for _p in _unsourced_emb:
-            _w = _load_base_weight(base_weights_source, f"{_p}.weight")
-            _want = (int(pairs[_p]["a"].shape[0]), int(pairs[_p]["b"].shape[1]))
-            _got = tuple(int(x) for x in getattr(_w, "shape", ()))
-            if _got != _want or not _is_float_dtype(_w):
-                raise ValueError(
-                    f"Unsloth MLX: base_weights_source weight for {_p} has "
-                    f"shape {_got} / dtype {getattr(_w, 'dtype', '?')}; the "
-                    f"adapter factors imply a float {_want} embedding. The "
-                    "source does not match the adapter's base model."
-                )
-            out[f"{_PEFT_PREFIX}{_p}.base_layer.weight"] = _w
-    # An embedding adapter exported without base_weights_source simply omits
-    # those weights; peft resolves them from the base model. Nothing is logged
-    # here on purpose -- this module stays importable and usable without torch,
-    # and the shared logger pulls in a torch-importing module on first use.
-    # Same stage-then-atomic-rename destination contract as
-    # convert_peft_dir_to_mlx; see the note there.
-    dst = os.fspath(dst)
-    _require_fresh_destination(dst.rstrip(os.sep) or dst)
-    dst = os.path.realpath(dst)
-    _require_fresh_destination(dst)
-    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    _tmp = f"{dst}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    _tmp_created = False
-    try:
-        os.makedirs(_tmp)
-        _tmp_created = True
-        save_file(os.path.join(_tmp, PEFT_WEIGHTS_FILE), out)
-        with open(os.path.join(_tmp, "adapter_config.json"), "w") as f:
-            json.dump(peft_cfg, f, indent=2, sort_keys=True)
-        try:
-            os.rename(_tmp, dst)
-        except OSError as exc:
-            raise ValueError(
-                f"Unsloth MLX: destination {dst!r} appeared concurrently "
-                "and is not empty; refusing to mix adapter artifacts."
-            ) from exc
-    finally:
-        if _tmp_created:
-            shutil.rmtree(_tmp, ignore_errors=True)
-    return dst
+    return _publish_adapter_dir(dst, PEFT_WEIGHTS_FILE, out, peft_cfg, save_file)
 
 
-def export_peft_adapter(src, dst, *, base_config=None, module_types=None,
-                        base_weights_source=None):
+def export_peft_adapter(src, dst, *, base_config=None, module_types=None):
     """Public wrapper: convert an mlx-lm adapter directory to PEFT format.
 
     ``module_types`` follows convert_mlx_dir_to_peft. ``base_config`` adds the
-    tie_word_embeddings check for embedding exports, since a tied model routes
-    output logits through the embedding adapter in mlx-lm but not in peft.
-    ``base_weights_source`` (a safetensors file or snapshot directory) supplies
-    the PEFT-convention auto-saved embedding weights when the adapter targets
-    an embedding; without it they are omitted, which PEFT loads cleanly by
-    resolving embeddings from the base model.
+    tie_word_embeddings check that a modules_to_save snapshot of a tied
+    embedding cannot be exported.
     """
     if base_config is not None and _config_ties_word_embeddings(base_config):
         try:
             with open(os.path.join(os.fspath(src), "adapter_config.json")) as _f:
-                _src_fs = dict(
-                    (json.load(_f).get("full_state_modules") or {})
-                )
+                _src_fs = dict(json.load(_f).get("full_state_modules") or {})
         except OSError:
             _src_fs = {}
-        _vocab = None
-        for _scope in ((base_config or {}).get("text_config") or {},
-                       base_config or {}):
-            if isinstance(_scope, dict) and _scope.get("vocab_size"):
-                _vocab = int(_scope["vocab_size"])
-                break
-        _shapes = {}
-        if _src_fs:
-            try:
-                from safetensors import safe_open
-                with safe_open(
-                    os.path.join(os.fspath(src), MLX_WEIGHTS_FILE),
-                    framework="numpy",
-                ) as _f:
-                    _keys = set(_f.keys())
-                    for _p in _src_fs:
-                        for _k in (
-                            f"{_p}.weight",
-                            f"{_p}.embedding.weight",
-                            f"{_p}.linear.weight",
-                        ):
-                            if _k in _keys:
-                                _shapes[_p] = tuple(
-                                    _f.get_slice(_k).get_shape()
-                                )
-                                break
-            except OSError:
-                pass
-
-        def _looks_like_embedding(p):
-            shape = _shapes.get(p)
-            if (
-                _vocab is not None
-                and shape is not None
-                and len(shape) == 2
-                and int(shape[0]) == _vocab
-            ):
-                return True
-            return p.rsplit(".", 1)[-1] in (
-                _EMBEDDING_LEAF_NAMES + _OUTPUT_HEAD_LEAF_NAMES
-            )
-
         _m2s_emb = sorted(
             p for p, o in _src_fs.items()
-            if o == "modules_to_save" and _looks_like_embedding(p)
+            if o == "modules_to_save"
+            and _names_embedding_or_head(p)
         )
         if _m2s_emb:
             raise ValueError(
-                f"Unsloth MLX: {_m2s_emb} are modules_to_save replacements "
-                "of a tied embedding; peft would train an untied input "
-                "copy while the tied MLX embedding also projects output "
-                "logits, so no faithful export exists."
+                f"Unsloth MLX: {_m2s_emb} carry {_TIED_FULL_STATE_REASON}."
             )
-    _emb_declared = sorted(
-        p for p, t in (module_types or {}).items() if t == "embedding"
-    )
-    # The tie check is opt-in: without base_config there is no config to test,
-    # and a module_types entry already carries the caller's tied-routing
-    # assertion. An ABSENT key inside a provided config still means tied.
-    if _emb_declared and base_config is not None and (
-        _config_ties_word_embeddings(base_config)
-    ):
-        raise ValueError(
-            f"Unsloth MLX: {_emb_declared} carry embedding LoRA but the "
-            "base model ties word embeddings; mlx-lm applies the update "
-            "to the tied output projection while peft applies it to "
-            "input lookup only, so no faithful export exists."
-        )
-    return convert_mlx_dir_to_peft(
-        src, dst, module_types=module_types,
-        base_weights_source=base_weights_source,
-    )
+    return convert_mlx_dir_to_peft(src, dst, module_types=module_types)

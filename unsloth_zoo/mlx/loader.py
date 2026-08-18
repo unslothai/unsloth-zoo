@@ -3835,17 +3835,15 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
             _skipped_paths.append((name, "module_missing"))
             continue
         # Skip already-wrapped paths to avoid nesting LoRALinear(LoRALinear),
-        # unless per-path metadata disagrees with what mlx-lm's global rebuild
-        # produced: uniform ranks with per-module scales would silently reload
-        # with the wrong scales, per-module ranks would fail shape binding.
+        # unless per-path metadata disagrees with mlx-lm's global rebuild:
+        # those wrappers carry the wrong scale or the wrong shape.
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
             _want_rank = _per_path_ranks.get(name)
             _want_scale = _per_path_scales.get(name)
             _have_rank = None
             try:
-                # Routed (switch) wrappers keep rank on lora_b's last axis —
-                # lora_a's is the input width; plain LoRALinear stores
-                # (in_dims, rank), so its rank is lora_a's last axis.
+                # Routed (switch) wrappers keep rank on lora_b's last axis;
+                # plain LoRALinear stores (in_dims, rank), so it is lora_a's.
                 _b = getattr(module, "lora_b", None)
                 if hasattr(module, "num_experts") and getattr(_b, "ndim", 0) >= 3:
                     _have_rank = int(_b.shape[-1])
@@ -3862,9 +3860,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
                         and float(_have_scale) == float(_want_scale))
                 )
             except (TypeError, ValueError):
-                # A per-expert (array) scale cannot equal a scalar entry; leave
-                # the wrapper alone rather than rebuild from metadata that
-                # cannot describe it.
+                # A per-expert (array) scale cannot equal a scalar entry, so
+                # metadata cannot describe this wrapper; leave it alone.
                 _scale_ok = True
             _base_mod = (
                 getattr(module, "linear", None)
@@ -5927,9 +5924,8 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx
     _lora_names = [name for name, _ in iter_mlx_lora_modules(self)]
     _lora_prefixes = tuple(f"{name}." for name in _lora_names if name)
     _root_lora = any(name == "" for name in _lora_names)
-    # modules_to_save is trainable BY CONTRACT and representable in both
-    # formats, so it is not CPT evidence. embedding_auto is frozen by contract,
-    # so a trainable one means continued pretraining unfroze it and it counts.
+    # modules_to_save is trainable by contract, so it is not CPT evidence; a
+    # trainable embedding_auto means continued pretraining unfroze it.
     _fs_paths = frozenset(
         path
         for path, origin in (
@@ -5938,16 +5934,10 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx
         if origin == "modules_to_save"
     )
 
+    from unsloth_zoo.saving_utils import _full_state_owner
+
     def _is_adapter_full_state(key):
-        owner = key.rsplit(".", 1)[0]
-        if owner in _fs_paths:
-            return True
-        # LoRA wrappers keep the base under an inner path; strip that only
-        # when the exact path is not itself recorded.
-        for _inner in (".embedding", ".linear"):
-            if owner.endswith(_inner) and owner[: -len(_inner)] in _fs_paths:
-                return True
-        return False
+        return _full_state_owner(key.rsplit(".", 1)[0], _fs_paths) is not None
     # A tree nothing froze reports EVERY parameter trainable, which is not CPT
     # evidence: keep the LoRA-only writer. The wrapped-base filter matches
     # MLXTrainer.save_model, so a reload-leaked q_proj.weight does not count.
@@ -5960,8 +5950,7 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx
     if _has_full_module:
         if adapter_format == "peft":
             # The writer emits full module weights only the MLX artifact
-            # describes; PEFT would need each declared as modules_to_save,
-            # which this checkpoint does not record.
+            # describes; PEFT would need each declared as modules_to_save.
             raise ValueError(
                 "Unsloth MLX: this checkpoint trains full modules "
                 "(continued pretraining), which the PEFT adapter format "
@@ -7239,15 +7228,13 @@ class FastMLXModel:
             try:
                 with open(adapter_cfg_path, "r") as f:
                     adapter_cfg = json.load(f)
-                # PEFT-format adapters import through the interop path;
-                # validate the config now so unsupported features are refused
-                # by name before the base model is downloaded.
+                # Validate the PEFT config now, so unsupported features are
+                # refused by name before the base model is downloaded.
                 if os.path.exists(
                     os.path.join(local_path, "adapter_model.safetensors")
                 ) or os.path.exists(
                     # Sharded PEFT saves carry only the index plus shards;
-                    # route them here for the named rejection instead of a
-                    # missing-adapters.safetensors failure after the base loads.
+                    # route them here for the named rejection.
                     os.path.join(
                         local_path, "adapter_model.safetensors.index.json"
                     )
@@ -7392,11 +7379,10 @@ class FastMLXModel:
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
-                    # MLX adapters carry base quantization in metadata (applied
-                    # via mlx_quantization_config below), so the flags are pinned
-                    # off. PEFT configs carry none: honor the caller's flags as a
-                    # plain base load would, else every QLoRA-style import
-                    # silently loads a full-precision base.
+                    # MLX adapters carry base quantization in metadata, so the
+                    # flags are pinned off. PEFT configs carry none: honor the
+                    # caller's flags as a plain base load would, else every
+                    # QLoRA-style import loads a full-precision base.
                     _base_quant_flags = (
                         {
                             "load_in_4bit": load_in_4bit,
@@ -7405,9 +7391,8 @@ class FastMLXModel:
                             "load_in_fp8": load_in_fp8,
                             "load_in_mxfp4": load_in_mxfp4,
                             "load_in_nvfp4": load_in_nvfp4,
-                            # The richer controls must travel too: an explicit
-                            # config/predicate changes how the flags resolve, so
-                            # dropping it would quantize against the caller's ask.
+                            # The richer controls travel too: an explicit
+                            # config or predicate changes how flags resolve.
                             **{
                                 _qk: _qv
                                 for _qk, _qv in (
@@ -7438,10 +7423,9 @@ class FastMLXModel:
                         and adapter_cfg.get("_unsloth_peft_import")
                     ):
                         # bnb-remapped base: the generated 4-bit config is only
-                        # a default, so any explicit caller request wins
-                        # UNIFORMLY whatever its spelling (flag, q_* knob, config
-                        # dict). Otherwise the remap config applies and caller
-                        # dicts are dropped so the keyword is not passed twice.
+                        # a default, so any explicit caller request wins whatever
+                        # its spelling. Otherwise the remap config applies and
+                        # caller dicts are dropped, so nothing is passed twice.
                         _caller_quant_override = _peft_import_quant_override(_base_quant_flags)
                         if _caller_quant_override:
                             adapter_mlx_quant_config = None
@@ -7474,9 +7458,8 @@ class FastMLXModel:
                     )
                     _validate_mlx_adapter_base(model, adapter_cfg)
                     if adapter_cfg.get("_unsloth_peft_import"):
-                        # PEFT import: the weight file drives attachment (module
-                        # set, rank from shapes, scale from the validated config).
-                        # Binding is all-or-nothing inside the interop module,
+                        # PEFT import: the weight file drives attachment, and
+                        # binding is all-or-nothing inside the interop module,
                         # which also applies the freeze contract, so the
                         # mlx-format reload path below is skipped whole.
                         from .utils import attach_and_bind_peft_adapter
@@ -7494,11 +7477,9 @@ class FastMLXModel:
                             adapter_cfg.get("unsloth_mlx_lora_module_paths"),
                         )
                         # Saved exact paths win: build and shape-check those
-                        # wrappers before strict=False can mutate them. The
-                        # full-state shape snapshot must be taken here too —
-                        # afterwards the live tree reflects whatever the file
-                        # carried, and the resized-artifact check needs the
-                        # base's shapes.
+                        # wrappers before strict=False can mutate them. Snapshot
+                        # full-state shapes here too, while the live tree still
+                        # holds the base's.
                         _fs_prebind = {}
                         _fs_cfg_map = dict(
                             adapter_cfg.get("full_state_modules") or {}
@@ -7544,10 +7525,9 @@ class FastMLXModel:
                                 adapter_cfg,
                                 adapter_weights_file,
                             )
-                        # Catch a missing mlx_lm.tuner.dora before load_adapters
-                        # rebuilds plain LoRA and drops saved `.m` via
-                        # strict=False (distinct from the per-module post-check
-                        # in _apply_lora_at_paths).
+                        # Catch a missing mlx_lm.tuner.dora before
+                        # load_adapters rebuilds plain LoRA and drops saved
+                        # `.m` via strict=False.
                         if adapter_cfg.get("fine_tune_type") == "dora":
                             try:
                                 import mlx_lm.tuner.dora  # noqa: F401
@@ -7604,10 +7584,9 @@ class FastMLXModel:
                     # mlx-lm's load_adapters applies the adapter layers but,
                     # unlike get_peft_model, never freezes the base, so a fresh
                     # MLXTrainer would full-finetune it at a LoRA learning rate.
-                    # Skipped for full_finetuning; for PEFT imports, whose attach
-                    # already froze the base and left modules_to_save trainable;
-                    # and when there are no LoRA modules (fine_tune_type="full"),
-                    # which would otherwise freeze the model entirely.
+                    # Skipped for full_finetuning; for PEFT imports, whose
+                    # attach already applied the freeze contract; and with no
+                    # LoRA modules, which would freeze the model entirely.
                     if not full_finetuning and not adapter_cfg.get(
                         "_unsloth_peft_import"
                     ):
@@ -7630,37 +7609,10 @@ class FastMLXModel:
                         _unfreeze_saved_mlx_non_adapter_parameters(
                             model, adapter_weights_file,
                         )
-                    if adapter_cfg.get("unsloth_peft_converted") and not (
-                        adapter_cfg.get("_unsloth_peft_import")
-                    ):
-                        _emb_wrapped = sorted(
-                            _n for _n, _m in model.named_modules()
-                            if hasattr(_m, "lora_a")
-                            and getattr(_m, "embedding", None) is not None
-                        )
-                        if _emb_wrapped:
-                            from .utils import _model_ties_output_to_embedding
-                            if _model_ties_output_to_embedding(model):
-                                raise ValueError(
-                                    f"Unsloth MLX: {_emb_wrapped} carry "
-                                    "embedding adapters but this model "
-                                    "routes output logits through the "
-                                    "embedding; mlx-lm would apply the "
-                                    "update to output projection while "
-                                    "peft-side training applied it to "
-                                    "input lookup only. The artifact "
-                                    "cannot load faithfully."
-                                )
                     if adapter_cfg.get("unsloth_peft_converted"):
                         # Provenance survives load/save: derivatives keep their
                         # peft-parity guarantees.
                         model._unsloth_peft_converted = True
-                    if adapter_cfg.get("unsloth_mlx_tree_prefix"):
-                        # Same for the text-tower nesting, so a re-save keeps the
-                        # marker a later PEFT conversion needs.
-                        model._unsloth_tree_prefix = adapter_cfg[
-                            "unsloth_mlx_tree_prefix"
-                        ]
                     _fs_map = dict(adapter_cfg.get("full_state_modules") or {})
                     if _fs_map and not adapter_cfg.get("_unsloth_peft_import"):
                         # After the freeze, never before: restores
