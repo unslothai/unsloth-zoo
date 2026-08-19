@@ -726,30 +726,6 @@ def _resolve_processor_model_name(processor, model = None):
     return "this model"
 
 
-_AUTO_CHAT_TEMPLATE_KWARGS = object()
-_QWEN38_REASONING_SYSTEM_PROMPT = "Reasoning effort is set to"
-
-
-def _processor_chat_template(processor):
-    for target in (processor, getattr(processor, "tokenizer", None)):
-        if target is None:
-            continue
-        template = getattr(target, "chat_template", None)
-        if isinstance(template, str) and template.strip():
-            return template
-    return ""
-
-
-def _template_supports_enable_thinking(processor) -> bool:
-    return "enable_thinking" in _processor_chat_template(processor)
-
-
-def _default_chat_template_kwargs(processor):
-    if _template_supports_enable_thinking(processor):
-        return {"enable_thinking": False}
-    return {}
-
-
 def _merge_chat_template_kwargs(base_kwargs, example=None):
     merged = dict(base_kwargs or {})
     if isinstance(example, dict):
@@ -813,7 +789,7 @@ class UnslothVisionDataCollator:
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
-        chat_template_kwargs = _AUTO_CHAT_TEMPLATE_KWARGS,
+        chat_template_kwargs = None,
     ):
         if not hasattr(processor, "image_processor"):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
@@ -826,8 +802,6 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
-        if chat_template_kwargs is _AUTO_CHAT_TEMPLATE_KWARGS:
-            chat_template_kwargs = _default_chat_template_kwargs(processor)
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func

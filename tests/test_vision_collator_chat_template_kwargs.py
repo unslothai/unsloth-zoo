@@ -6,21 +6,17 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Qwen3.8-style chat_template_kwargs forwarding in UnslothVisionDataCollator."""
+"""chat_template_kwargs forwarding in UnslothVisionDataCollator."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
-import pytest
-
 from unsloth_zoo.vision_utils import (
     UnslothVisionDataCollator,
-    _QWEN38_REASONING_SYSTEM_PROMPT,
-    _default_chat_template_kwargs,
     _merge_chat_template_kwargs,
-    _template_supports_enable_thinking,
 )
+
+
+_QWEN38_REASONING_SYSTEM_PROMPT = "Reasoning effort is set to"
 
 
 class _FakeTokenizer:
@@ -35,44 +31,39 @@ class _FakeTokenizer:
 
 
 class _Qwen38LikeProcessor:
-  """Minimal processor whose template mirrors Qwen3.8 reasoning injection."""
+    """Minimal processor whose template mirrors Qwen3.8 reasoning injection."""
 
-  def __init__(self):
-      self.tokenizer = _FakeTokenizer(
-          "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}"
-          "{% if enable_thinking %}"
-          "<|im_start|>system\nReasoning effort is set to xhigh."
-          "{% endif %}"
-          "{{ messages[0]['content'][0]['text'] }}"
-      )
-      self.image_processor = object()
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer(
+            "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}"
+            "{% if enable_thinking %}"
+            "<|im_start|>system\nReasoning effort is set to xhigh."
+            "{% endif %}"
+            "{{ messages[0]['content'][0]['text'] }}"
+        )
+        self.image_processor = object()
 
-  def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
-      enable_thinking = kwargs.get("enable_thinking", True)
-      text = messages[0]["content"][0]["text"]
-      if enable_thinking:
-          return (
-              "<|im_start|>system\n"
-              "Reasoning effort is set to xhigh. Please think carefully.\n"
-              f"{text}"
-          )
-      return text
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
+        enable_thinking = kwargs.get("enable_thinking", True)
+        text = messages[0]["content"][0]["text"]
+        if enable_thinking:
+            return (
+                "<|im_start|>system\n"
+                "Reasoning effort is set to xhigh. Please think carefully.\n"
+                f"{text}"
+            )
+        return text
 
-  def __call__(self, text, padding=True, padding_side="right", return_tensors="pt", add_special_tokens=False, **kwargs):
-      import torch
-      rows = [[1, 2, 3]]
-      return {
-          "input_ids": torch.tensor(rows),
-          "attention_mask": torch.tensor([[1, 1, 1]]),
-      }
-
-
-_sentinel = object()
+    def __call__(self, text, padding=True, padding_side="right", return_tensors="pt", add_special_tokens=False, **kwargs):
+        import torch
+        rows = [[1, 2, 3]]
+        return {
+            "input_ids": torch.tensor(rows),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+        }
 
 
-def _make_collator(processor, chat_template_kwargs=_sentinel):
-    from unsloth_zoo.vision_utils import _AUTO_CHAT_TEMPLATE_KWARGS
-
+def _make_collator(processor, chat_template_kwargs=None):
     collator = UnslothVisionDataCollator.__new__(UnslothVisionDataCollator)
     collator.processor = processor
     collator.formatting_func = None
@@ -88,24 +79,8 @@ def _make_collator(processor, chat_template_kwargs=_sentinel):
     collator.assistant_single_content = False
     collator.snap_to_patch_size = False
     collator.size_func = lambda x: x
-    if chat_template_kwargs is _sentinel:
-        collator.chat_template_kwargs = _default_chat_template_kwargs(processor)
-    else:
-        collator.chat_template_kwargs = dict(chat_template_kwargs or {})
+    collator.chat_template_kwargs = dict(chat_template_kwargs or {})
     return collator
-
-
-def test_template_supports_enable_thinking_detects_qwen_style_template():
-    processor = _Qwen38LikeProcessor()
-    assert _template_supports_enable_thinking(processor) is True
-    assert _default_chat_template_kwargs(processor) == {"enable_thinking": False}
-
-
-def test_template_supports_enable_thinking_false_for_plain_template():
-    processor = MagicMock()
-    processor.tokenizer = MagicMock(chat_template="{{ messages }}")
-    assert _template_supports_enable_thinking(processor) is False
-    assert _default_chat_template_kwargs(processor) == {}
 
 
 def test_merge_chat_template_kwargs_prefers_example_override():
@@ -116,16 +91,24 @@ def test_merge_chat_template_kwargs_prefers_example_override():
     assert merged == {"enable_thinking": True}
 
 
-def test_render_chat_default_disables_qwen38_reasoning_system_prompt():
+def test_render_chat_default_does_not_inject_enable_thinking():
     processor = _Qwen38LikeProcessor()
     collator = _make_collator(processor)
+    messages = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
+    rendered = collator._apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    assert _QWEN38_REASONING_SYSTEM_PROMPT in rendered
+
+
+def test_render_chat_respects_explicit_enable_thinking_false():
+    processor = _Qwen38LikeProcessor()
+    collator = _make_collator(processor, chat_template_kwargs={"enable_thinking": False})
     messages = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
     rendered = collator._apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     assert _QWEN38_REASONING_SYSTEM_PROMPT not in rendered
     assert rendered == "Hello"
 
 
-def test_render_chat_respects_explicit_enable_thinking_override():
+def test_render_chat_respects_explicit_enable_thinking_true():
     processor = _Qwen38LikeProcessor()
     collator = _make_collator(processor, chat_template_kwargs={"enable_thinking": True})
     messages = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
@@ -133,14 +116,15 @@ def test_render_chat_respects_explicit_enable_thinking_override():
     assert _QWEN38_REASONING_SYSTEM_PROMPT in rendered
 
 
-def test_call_path_uses_chat_template_kwargs():
+def test_per_example_chat_template_kwargs_override_collator():
     processor = _Qwen38LikeProcessor()
-    collator = _make_collator(processor)
+    collator = _make_collator(processor, chat_template_kwargs={"enable_thinking": True})
     example = {
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Train me"}]},
         ],
         "images": [],
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     rendered = collator._apply_chat_template(
         example["messages"],
