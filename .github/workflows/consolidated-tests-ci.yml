@@ -25,14 +25,27 @@ permissions:
 
 jobs:
   # Python compatibility: pytest --collect-only per interpreter.
+  #
+  # Was a four-cell matrix, which is four runners for four interpreters that share
+  # every input but the interpreter. Measured on a main run: 118-132s of execution
+  # each, of which 71-83s is the identical torch-CPU + .[core] install, behind a
+  # queue whose median is 3986-5025s. Four slots, four queues, ~100s of actual work
+  # apiece -- and the assertion is `--collect-only`, so no wheel is even exercised.
+  #
+  # One runner now, four venvs, run concurrently. The concurrency is what keeps the
+  # wall clock near a single cell's rather than four times it, and these lanes are
+  # genuinely independent: separate venvs, no ports, no shared state but pip's HTTP
+  # cache, which is written through atomic renames.
+  #
+  # The lanes are collected rather than backgrounded-and-forgotten. A bare `&` would
+  # make the step's exit status the LAST lane's, so 3.10 could fail and the step
+  # still pass; every lane records its own status and the collect step reads all four.
   python-version-collect:
-    name: (Python ${{ matrix.python-version }})
+    name: (Python 3.10-3.13 collect)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+    # Four serial installs would be ~7 minutes; concurrently they are closer to one.
+    # Budgeted for the serial worst case so a slow mirror degrades to slow, not red.
+    timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
@@ -43,25 +56,107 @@ jobs:
         with:
           persist-credentials: false
 
+      # Four interpreters on one runner. Each `id` exposes python-path, which is how
+      # a lane addresses an interpreter that is no longer the one on PATH -- only the
+      # last of these wins PATH, and that is fine because no lane uses it.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        id: py310
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.10'
           cache: 'pip'
 
-      - name: Install CPU-only torch + zoo runtime deps
-        # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
-        # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
-        run: |
-          python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu \
-            "torch>=2.4.0,<2.11.0"
-          pip install -e .[core]
-          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-          pip install pytest==9.0.3
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        id: py311
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: pytest --collect-only
-        continue-on-error: true
-        run: python -m pytest tests/ --collect-only -q
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        id: py312
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        id: py313
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install and collect on every interpreter (concurrently)
+        env:
+          PY310: ${{ steps.py310.outputs.python-path }}
+          PY311: ${{ steps.py311.outputs.python-path }}
+          PY312: ${{ steps.py312.outputs.python-path }}
+          PY313: ${{ steps.py313.outputs.python-path }}
+        run: |
+          mkdir -p .lanes
+
+          # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
+          # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+          lane() {
+            version="$1"; interpreter="$2"
+            venv=".lanes/venv-$version"
+            log=".lanes/$version.log"
+            (
+              rc=0
+              {
+                "$interpreter" -m venv "$venv"
+                "$venv/bin/python" -m pip install --upgrade pip
+                "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
+                  "torch>=2.4.0,<2.11.0"
+                "$venv/bin/pip" install -e .[core]
+                "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+                "$venv/bin/pip" install pytest==9.0.3
+              } > "$log" 2>&1 || rc=$?
+              echo "$rc" > ".lanes/$version.install"
+
+              # Only if the environment stood up: collecting in a half-built venv
+              # reports an import error that says nothing about this interpreter.
+              if [ "$rc" -eq 0 ]; then
+                crc=0
+                "$venv/bin/python" -m pytest tests/ --collect-only -q >> "$log" 2>&1 || crc=$?
+                echo "$crc" > ".lanes/$version.collect"
+              else
+                echo "skipped" > ".lanes/$version.collect"
+              fi
+            ) < /dev/null > /dev/null 2>&1 &
+          }
+
+          lane 3.10 "$PY310"
+          lane 3.11 "$PY311"
+          lane 3.12 "$PY312"
+          lane 3.13 "$PY313"
+          wait
+          echo "all four lanes finished"
+
+      - name: What each interpreter said
+        if: always()
+        run: |
+          failed=0
+          for version in 3.10 3.11 3.12 3.13; do
+            echo "::group::Python $version"
+            cat ".lanes/$version.log" 2>/dev/null || echo "no log: the lane never started"
+            echo "::endgroup::"
+
+            # A lane that dies without recording a status is a failure, not a pass.
+            # Backgrounding is only safe if a missing result is loud.
+            install="$(cat ".lanes/$version.install" 2>/dev/null || echo missing)"
+            collect="$(cat ".lanes/$version.collect" 2>/dev/null || echo missing)"
+            echo "python $version: install=$install collect=$collect"
+
+            if [ "$install" != "0" ]; then
+              echo "::error::python $version: the environment could not be built (status $install)"
+              failed=1
+            elif [ "$collect" != "0" ]; then
+              # Same severity as the `continue-on-error: true` this replaces: a
+              # collection failure is reported, and does not fail the job. Changing
+              # that is a real decision and does not belong in a CI-shape change.
+              echo "::warning::python $version: pytest --collect-only exited $collect"
+            fi
+          done
+          [ "$failed" -eq 0 ] || exit 1
 
   # CPU-only repo tests. HARD GATE on tests/security.
   repo-tests-cpu:
