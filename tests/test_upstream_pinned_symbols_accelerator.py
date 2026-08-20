@@ -346,9 +346,9 @@ def test_stub_noop_call_raises_not_returns_none():
             sub()
 
 
-# Reads sys.modules rather than importing either package. Both stubs seed sys.modules
-# directly, so an import here would only let the regression under test surface as an
-# ImportError instead of as a wrong verdict below.
+# Reads sys.modules rather than importing either package: both stubs seed sys.modules
+# directly, so an import would surface the regression as an ImportError instead of as a
+# wrong verdict below.
 _GATE_PROBE = """
 import json, sys
 if {hide_bitsandbytes}:
@@ -403,8 +403,7 @@ def test_the_stub_gate_shadows_no_real_bitsandbytes_but_always_stubs_triton(
         capture_output = True, text = True, env = env, timeout = 300,
     )
     # No skip on failure: the gate runs during `import unsloth_zoo`, so a crash in the
-    # code under test and an unusable environment produce the same traceback. Every other
-    # test here already needs unsloth_zoo importable.
+    # code under test and an unusable environment produce the same traceback.
     assert run.returncode == 0, f"gate probe failed:\n{run.stderr[-2000:]}"
     result = json.loads(run.stdout.strip().splitlines()[-1])
 
@@ -437,8 +436,8 @@ def test_real_bitsandbytes_available_locates_without_importing(installed):
 
     from unsloth_zoo.stubs import bitsandbytes_stub
 
-    # A loader-bearing spec is what a real distribution produces; a loaderless one is a
-    # namespace package, which is not an install (see the namespace test below).
+    # A real distribution produces a loader-bearing spec; a loaderless one is a namespace
+    # package, which is not an install (see the namespace test below).
     spec = types.SimpleNamespace(loader = object()) if installed else None
     real_import = builtins.__import__
 
@@ -464,12 +463,12 @@ def test_real_bitsandbytes_available_locates_without_importing(installed):
 
 
 def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
-    """A bare `bitsandbytes/` directory with no __init__.py -- what a half-removed
-    install, or a source checkout sitting beside the script, leaves on sys.path.
+    """A bare `bitsandbytes/` directory with no __init__.py -- what a half-removed install
+    leaves on sys.path.
 
-    find_spec answers with a loaderless namespace spec, so treating "found" as
-    "installed" would stand aside for a package that imports to nothing: the caller then
-    has neither a working wheel nor the stub that used to cover for it.
+    find_spec answers with a loaderless namespace spec, so treating "found" as "installed"
+    stands aside for a package that imports to nothing, leaving the caller with neither a
+    wheel nor the stub.
     """
     from unsloth_zoo.stubs import bitsandbytes_stub
 
@@ -477,8 +476,8 @@ def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
     saved = {k: v for k, v in sys.modules.items() if k.startswith("bitsandbytes")}
     for k in saved:
         del sys.modules[k]
-    # A regular package anywhere later on the path beats a namespace portion, so an
-    # installed wheel on this runner would mask the case under test.
+    # A regular package later on the path beats a namespace portion, so an installed
+    # wheel on this runner would mask the case under test.
     saved_path = list(sys.path)
     sys.path[:] = [str(tmp_path)] + [p for p in sys.path if "site-packages" not in p]
     try:
@@ -493,8 +492,8 @@ def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
 
 
 def _mlx_loader():
-    """The MLX loader, or skip. Importing it pulls in mlx.core, and this file also runs
-    in the Linux upstream-regression lane, which installs no mlx."""
+    """The MLX loader, or skip: importing it pulls in mlx.core, and this file also runs in
+    the Linux upstream-regression lane, which installs no mlx."""
     pytest.importorskip("mlx")
     from unsloth_zoo.mlx import loader
 
@@ -569,9 +568,9 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
         assert sys.modules["bitsandbytes"] is stub, "the stub was not put back"
         assert "bitsandbytes.nn" in sys.modules, "a stub submodule was not put back"
         assert finder in sys.meta_path, "the stub's finder was not put back"
-        # The real wheel is cached so a second call need not re-import it, which is what
-        # re-registers its torch operators and raises. Caching the package root alone
-        # would leave those operator submodules to be imported again.
+        # Cached so a second call need not re-import it, which re-registers its torch
+        # operators and raises. Caching the package root alone would leave the operator
+        # submodules to be imported again.
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes"] is real
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes._ops"] is real_ops
 
@@ -583,8 +582,8 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
 
 
 def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
-    """Evicting a resident real wheel makes the next import re-execute it and
-    re-register its torch operators, which raises."""
+    """Evicting a resident real wheel makes the next import re-register its torch
+    operators, which raises."""
     loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
@@ -601,8 +600,8 @@ def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
             assert sys.meta_path == before_meta, (
                 "meta_path was disturbed with no stub to lift"
             )
-            # A dequant runs for minutes; another thread can install a finder or
-            # complete a submodule import meanwhile.
+            # A dequant runs for minutes; another thread can install a finder or finish a
+            # submodule import meanwhile.
             sys.meta_path.insert(0, late_finder)
             sys.modules["bitsandbytes.functional"] = late_submodule
         assert sys.modules["bitsandbytes"] is real, "the real wheel was evicted on exit"
@@ -618,10 +617,8 @@ def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
 
 
 def test_lifting_the_bnb_stub_keeps_a_wheel_first_imported_inside_the_block():
-    """The cold path: detection never imports, so a dequant can be the first consumer.
-
-    A restore that runs anyway drops the wheel the block just imported.
-    """
+    """The cold path: detection never imports, so a dequant can be the first consumer and
+    a restore that runs anyway drops the wheel the block just imported."""
     loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
@@ -639,10 +636,8 @@ def test_lifting_the_bnb_stub_keeps_a_wheel_first_imported_inside_the_block():
 
 
 def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
-    """The dequant must run inside the lift, not merely have one available.
-
-    Without it it imports whatever is resident, which on a stubbed host is the stub.
-    """
+    """The dequant must run inside the lift, not merely have one available: otherwise it
+    imports whatever is resident, which on a stubbed host is the stub."""
     import transformers
 
     loader = _mlx_loader()
@@ -664,8 +659,8 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
     class _FakeModelLoader:
         @staticmethod
         def from_pretrained(*a, **k):
-            # Recorded under its own key: the dequantization is this call, so a later
-            # tokenizer load seeing the real module must not stand in for it.
+            # Its own key: the dequantization is this call, so a later tokenizer load
+            # seeing the real module must not stand in for it.
             seen["model_load"] = sys.modules.get("bitsandbytes")
             return _FakeModel()
 
@@ -708,9 +703,8 @@ def test_lifting_the_bnb_stub_restores_after_the_block_raises():
 def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
     """The stubbed path must leave sys.meta_path alone apart from the stub's own finder.
 
-    The no-stub path above already declines to touch it for exactly this reason, and the
-    block is a multi-GB dequant that runs for minutes: restoring a whole snapshot taken
-    at entry silently drops whatever another thread installed in between.
+    The block is a multi-GB dequant running for minutes, so restoring a whole snapshot
+    taken at entry silently drops whatever another thread installed in between.
     """
     loader = _mlx_loader()
 

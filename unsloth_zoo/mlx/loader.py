@@ -4835,9 +4835,8 @@ def _bitsandbytes_is_stubbed():
 def _lifted_bitsandbytes_stub():
     """Make the real bitsandbytes importable for the duration of the block.
 
-    A no-op when no stub is in the way: the resident modules are then the real wheel, and
-    evicting them makes the next import re-execute it and re-register its torch
-    operators, which raises.
+    A no-op when no stub is in the way: evicting the resident real wheel would make the
+    next import re-register its torch operators, which raises.
     """
     global _REAL_BITSANDBYTES_MODULES
     if not _bitsandbytes_is_stubbed():
@@ -4845,9 +4844,8 @@ def _lifted_bitsandbytes_stub():
         return
     stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
     # Pull out only the stub's own finders and put those back afterwards. Restoring a
-    # whole snapshot of sys.meta_path instead would drop any finder another thread
-    # installed while the block ran, and the block is a multi-GB dequant that runs for
-    # minutes -- the same window the no-stub path above already declines to disturb.
+    # whole sys.meta_path snapshot would drop any finder another thread installed during
+    # the block, which is a multi-GB dequant running for minutes.
     lifted_finders = [
         (index, finder) for index, finder in enumerate(sys.meta_path)
         if type(finder).__name__ == "_BnbFinder"
@@ -4857,7 +4855,7 @@ def _lifted_bitsandbytes_stub():
     for name in _bnb_module_names():
         del sys.modules[name]
     # Reuse the already-initialized real bnb if we imported it earlier; only a cold
-    # process re-imports (and re-registers torch ops) for the first time.
+    # process re-imports (and re-registers torch ops).
     sys.modules.update(_REAL_BITSANDBYTES_MODULES)
     try:
         yield
@@ -4873,12 +4871,11 @@ def _lifted_bitsandbytes_stub():
 
 
 def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
-    """Dequantize a bitsandbytes (NF4) repo to fp16 and write a clean,
-    non-quantized copy to a temp dir, returning its path.
+    """Dequantize a bitsandbytes (NF4) repo to fp16 into a temp dir, returning its path.
 
-    bnb itself dequantizes the NF4 weights; the caller then re-quantizes via MLX's affine
-    path. Raises if bitsandbytes (or its dequant) is unavailable so the caller can fall
-    back to the clear bnb-unsupported error.
+    bnb itself dequantizes; the caller then re-quantizes via MLX's affine path. Raises if
+    bitsandbytes (or its dequant) is unavailable so the caller can fall back to the clear
+    bnb-unsupported error.
     """
     with _BNB_IMPORT_LOCK, _lifted_bitsandbytes_stub():
         import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
@@ -4887,11 +4884,9 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-        # Only text bnb repos reach here; VLM bnb repos are rejected by the
-        # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
-        # dequantizes the NF4 weights to fp16. Pass torch_dtype, not dtype:
-        # the supported transformers 4.x range only accepts torch_dtype (a
-        # `dtype` kwarg raises TypeError there), and 5.x still accepts it.
+        # Only text bnb repos reach here; the caller rejects VLM ones (mlx-vlm dequant is
+        # not wired up yet). Pass torch_dtype, not dtype: transformers 4.x raises
+        # TypeError on `dtype`, and 5.x still accepts torch_dtype.
         model = AutoModelForCausalLM.from_pretrained(
             source,
             torch_dtype=torch.float16,
@@ -4899,10 +4894,9 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
             token=token,
             trust_remote_code=trust_remote_code,
         ).dequantize()
-        # After dequantize, the model config still carries bnb's
-        # quantization_config plus _pre_quantization_dtype (a torch.dtype).
-        # The dtype is not JSON-serializable and breaks save_pretrained; the
-        # dequantized weights no longer need any of this metadata.
+        # The config still carries bnb's quantization_config and _pre_quantization_dtype,
+        # whose torch.dtype is not JSON-serializable and breaks save_pretrained. The
+        # dequantized weights need none of it.
         def _strip_quant_meta(cfg):
             if cfg is None:
                 return
@@ -4912,7 +4906,6 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
                         delattr(cfg, _attr)
                     except Exception:
                         pass
-            # Walk known sub-config attrs that models use to nest configs.
             for _sub in (
                 "vision_config", "text_config", "audio_config",
                 "speech_config", "image_config", "encoder_config",
@@ -4922,28 +4915,25 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
         _strip_quant_meta(model.config)
         tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
         try:
-            # transformers 5.x: the dequantized model still carries
-            # weight-name conversions that can't be reversed for quantized
-            # weights, so save_pretrained's revert_weight_conversion raises.
-            # The dequantized weights need no conversion; clear it. No-op on
-            # 4.x, where the attribute doesn't exist.
+            # transformers 5.x: leftover weight-name conversions can't be reversed for
+            # quantized weights, so save_pretrained's revert_weight_conversion raises.
+            # Dequantized weights need none. No-op on 4.x, which lacks the attribute.
             try:
                 model._weight_conversions = []
             except Exception:
                 pass
             model.save_pretrained(tmpdir, safe_serialization=True)
-            # Save the tokenizer so the downstream mlx-lm load can read it.
+            # Needed by the downstream mlx-lm load.
             AutoTokenizer.from_pretrained(
                 source, token=token, trust_remote_code=trust_remote_code,
             ).save_pretrained(tmpdir)
         except BaseException:
-            # Don't leak the multi-GB fp16 scratch copy: BaseException,
-            # because a Ctrl-C during the long safetensors write is the
-            # likeliest abort and must clean up too.
+            # Don't leak the multi-GB fp16 scratch copy. BaseException, because a Ctrl-C
+            # during the long safetensors write is the likeliest abort.
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
-        # Release the fp16 model and bnb's MPS allocator cache so the caller's
-        # MLX re-quantization (and any later loads) aren't starved of memory.
+        # Release the fp16 model and bnb's MPS allocator cache so the caller's MLX
+        # re-quantization isn't starved of memory.
         del model
         gc.collect()
         if device == "mps":

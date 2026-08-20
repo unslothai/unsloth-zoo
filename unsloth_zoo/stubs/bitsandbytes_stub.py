@@ -64,11 +64,9 @@ def _make_module(name, attrs=None):
     mod = _PermissiveModule(name)
     mod.__path__ = []
     mod.__package__ = name
-    # Carried by every stub module, not just the one aliased in by injection: a caller
-    # that evicts sys.modules["bitsandbytes"] and re-imports gets a finder-minted module,
-    # and without the flag `getattr(mod, "IS_UNSLOTH_STUB", False)` falls through to the
-    # permissive __getattr__ and answers with a _Noop, which is falsy. Every stub check
-    # would then read "this is a real wheel".
+    # Set on every stub module, including finder-minted ones: without a real attribute,
+    # the permissive __getattr__ answers the stub check with a falsy _Noop and every
+    # caller reads "this is a real wheel".
     mod.IS_UNSLOTH_STUB = True
     if attrs:
         for k, v in attrs.items():
@@ -112,8 +110,8 @@ def __getattr__(name):
 def real_bitsandbytes_available():
     """Whether a real (non-stub) bitsandbytes is installed.
 
-    Locates the distribution rather than importing it: importing pulls in torch, which
-    costs about a second on the hosts that skip GPU init to avoid exactly that.
+    Locates it rather than importing it: importing pulls in torch, which costs about a
+    second on the hosts that skip GPU init to avoid exactly that.
     """
     existing = sys.modules.get("bitsandbytes")
     if existing is not None:
@@ -122,10 +120,8 @@ def real_bitsandbytes_available():
         spec = importlib.util.find_spec("bitsandbytes")
     except Exception:  # noqa: BLE001 -- an unlocatable install is not usable either
         return False
-    # A namespace package -- a bare `bitsandbytes/` directory with no __init__.py, which
-    # is what a half-removed install or a source checkout beside the script leaves on the
-    # path -- has no loader and imports to an empty module. It is not an install, and
-    # standing aside for it would leave the caller with neither a wheel nor the stub.
+    # A namespace package (loaderless, e.g. a half-removed install) imports to an empty
+    # module; standing aside for it leaves the caller with neither a wheel nor the stub.
     return spec is not None and spec.loader is not None
 
 

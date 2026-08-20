@@ -180,9 +180,8 @@ else:
     del _is_mlx_only, is_mlx_available
 
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
-# download child), so they resolve to a loud no-op instead of a hard ImportError. Inert
-# in the download child, which never touches them. On a normal CUDA/CPU run
-# _SKIP_GPU_INIT is False and the real modules are untouched.
+# download child), so they resolve to a loud no-op instead of a hard ImportError. On a
+# normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
 if _SKIP_GPU_INIT:
     from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
