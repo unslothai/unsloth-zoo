@@ -795,9 +795,37 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     experts — not just the canonical 7. Walks a fake model whose
     named_modules emits the names we care about so we don't need real MLX.
     """
-    pytest.importorskip("mlx")  # the helper imports mlx.nn for isinstance
-    from unsloth_zoo.mlx_loader import _collect_all_linear_target_names
+    # Both packages, not just mlx. The helper reaches _mlx_lora_type_specs(), which does
+    # `from mlx_lm.models.switch_layers import ...` and `from mlx_lm.tuner.lora import ...`,
+    # and _collect_all_linear_target_names wraps the whole walk in a blanket
+    # `except Exception: return []` so that LoRA setup never raises. Guarding on mlx alone
+    # therefore let this test RUN against an mlx with no usable mlx_lm beside it, where the
+    # helper returns [] for a missing-dependency reason and the assertion below reports it
+    # as `assert {...} <= set()` -- indistinguishable from the coverage regression this test
+    # exists to catch, and pointing at the wrong file.
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+    from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _mlx_lora_base_types
     import mlx.nn as nn
+
+    # Prove the prerequisite BEFORE asserting on the output. An empty type tuple makes every
+    # isinstance() below false, so the helper returns nothing no matter how correct it is;
+    # that is a broken environment, not dropped targeting, and it must not be reported as one.
+    try:
+        base_types = _mlx_lora_base_types()
+    except Exception as exc:  # noqa: BLE001 - mirrors the helper's own blanket catch
+        pytest.skip(f"MLX LoRA base types unavailable ({exc!r}); the helper would return [] "
+                    f"for a reason unrelated to all-linear targeting")
+    # Both of these are degraded-environment conditions, not regressions, so they SKIP.
+    # Failing here would redden CI for a partial or stubbed MLX that says nothing about
+    # whether all-linear targeting is correct -- which is the bug this whole guard had.
+    if not base_types:
+        pytest.skip("_mlx_lora_base_types() resolved to an empty tuple, so nothing can match "
+                    "the isinstance walk and the helper returns [] regardless of its logic")
+    if not (isinstance(nn.Linear, type) and issubclass(nn.Linear, tuple(base_types))):
+        pytest.skip(f"mlx.nn.Linear is not among the types the helper matches on "
+                    f"({base_types}); a stand-in MLX left in sys.modules by another test "
+                    f"cannot exercise the walk")
 
     class FakeQwen3p5:
         """Minimal model whose named_modules() exposes the leaves that
@@ -825,8 +853,13 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     names = set(_collect_all_linear_target_names(FakeQwen3p5()))
     canonical = {"q_proj", "k_proj", "v_proj", "o_proj",
                  "gate_proj", "up_proj", "down_proj"}
-    # Canonical 7 still resolve.
-    assert canonical <= names
+    # Canonical 7 still resolve. Spelled with a message because the bare form renders as
+    # `assert {...} <= set()`, which says nothing about which of the two failure modes it is.
+    assert canonical <= names, (
+        f"all-linear lost canonical names {sorted(canonical - names)}; got {sorted(names)}. "
+        f"An EMPTY result here means the walk matched nothing at all -- check the MLX stack "
+        f"before suspecting the targeting logic."
+    )
     # Plus the extras the pre-fix collapse dropped.
     extras = {"in_proj_qkv", "in_proj_z", "out_proj",
               "router", "w1", "qkv"}
