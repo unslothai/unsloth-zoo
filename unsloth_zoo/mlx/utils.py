@@ -12752,10 +12752,9 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    # mx.load() arrays may be file-backed; saving over the source can truncate them
-    # before they materialize, so write beside and replace. Re-saving adapters into
-    # the directory they were loaded from is the ordinary switch/merge lifecycle, and
-    # mlx 0.32.1 turned it into "[read] Unable to read from file".
+    # mx.load() arrays stay file-backed, so saving over the source truncates them
+    # mid-read (mlx 0.32.1: "[read] Unable to read from file"). Re-saving into the
+    # directory an adapter came from is the ordinary switch/merge path.
     target = path / "adapters.safetensors"
     mx.eval(*tensors.values())
     tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
@@ -12763,7 +12762,6 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
         mx.save_safetensors(str(tmp_file), tensors)
         os.replace(tmp_file, target)
     except BaseException:
-        # Never leave a half-written temp beside a good adapter file.
         tmp_file.unlink(missing_ok=True)
         raise
 
@@ -12925,14 +12923,12 @@ def save_optimizer_state(optimizer, path):
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
     target = f"{path}/optimizer_state.safetensors"
-    # load_optimizer_state() hands mx.load()'s file-backed arrays straight back to the
-    # optimizer, so checkpointing into the directory a resume came from would truncate
-    # the source out from under them. Materialize, write beside, replace.
+    # load_optimizer_state() hands back mx.load()'s file-backed arrays, so checkpointing
+    # where a resume came from truncates the source under them. Write beside, replace.
     if flat:
         mx.eval(*flat.values())
     # ".tmp.safetensors", not ".safetensors.tmp": mx.save_safetensors appends
-    # ".safetensors" to any path lacking it, so the latter would quietly write to a
-    # third file and leave the real checkpoint untouched.
+    # ".safetensors" to any path lacking it, silently writing a third file.
     tmp_target = f"{path}/optimizer_state.tmp.safetensors"
     try:
         if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
@@ -12949,7 +12945,6 @@ def save_optimizer_state(optimizer, path):
             mx.save_safetensors(tmp_target, flat)
         os.replace(tmp_target, target)
     except BaseException:
-        # Never leave a half-written temp beside a good checkpoint.
         try:
             os.remove(tmp_target)
         except OSError:

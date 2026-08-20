@@ -16,16 +16,15 @@
 
 """Writing safetensors back over the file they were loaded from.
 
-mx.load() returns lazily file-backed arrays. Saving them to their own source path
-truncates the file before they are read, and from mlx 0.32.1 that surfaces as
-"RuntimeError: [read] Unable to read from file". It broke the Apple Silicon lane on
-2026-08-18, the day 0.32.1 shipped, with no change on our side.
+mx.load() returns lazily file-backed arrays; saving them to their own source path
+truncates the file before they are read. From mlx 0.32.1 that raises "[read] Unable
+to read from file", which took the Apple Silicon lane red on 2026-08-18 with no
+change on our side.
 
-Re-saving into the directory you loaded from is the ordinary lifecycle for both
-adapters (switch/merge) and optimizer state (resume, train, checkpoint), so each
-writer materializes its arrays and writes through a temp file. These tests pin that
-per writer, and pin the underlying mlx behaviour so a future version that makes
-save-over-source safe again is visible rather than silently relied upon.
+Re-saving into the directory you loaded from is the ordinary lifecycle for adapters
+(switch/merge) and optimizer state (resume, checkpoint), so each writer materializes
+and writes through a temp file. These tests pin that per writer, plus the upstream
+behaviour itself so a future mlx making save-over-source safe is visible.
 """
 
 import pytest
@@ -33,9 +32,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 # The Linux lane answers `import mlx.core` with the torch-backed simulation in
-# tests/mlx_simulation/, which saves eagerly through safetensors.torch and so has no
-# lazy file-backed arrays to protect. These tests are about real mlx's laziness, and
-# asserting them against the simulation would only pin the simulation.
+# tests/mlx_simulation/, which saves eagerly and so has no laziness to protect.
+# Asserting these against it would only pin the simulation.
 if mx.__name__ != "mlx.core":
     pytest.skip(
         "needs real mlx, not the torch-backed simulation", allow_module_level=True
@@ -52,9 +50,9 @@ def _adapter_tensors():
 def test_mlx_still_refuses_a_lazy_save_over_the_source(tmp_path):
     """The upstream behaviour the writers below defend against.
 
-    If this starts failing, mlx has made save-over-source safe again. That is good
-    news, not a reason to drop the temp-file writes: they are also what keeps a
-    crash mid-write from leaving a truncated checkpoint.
+    Failing here means mlx made save-over-source safe again. Good news, but not a
+    reason to drop the temp-file writes: they also keep a crash mid-write from
+    leaving a truncated checkpoint.
     """
     path = str(tmp_path / "w.safetensors")
     mx.save_safetensors(path, {"x": mx.zeros((2, 3))})
@@ -70,8 +68,7 @@ def test_saving_adapters_back_over_their_source_survives(tmp_path, monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.utils import _save_adapter_artifacts
 
-    # Config enrichment reads the live model through mlx_lm; this test is about the
-    # weights write, so keep it runnable on any lane that has mlx at all.
+    # Config enrichment needs mlx_lm and a live model; this test is about the write.
     monkeypatch.setattr(
         mlx_utils, "_enrich_mlx_adapter_config", lambda model, config: config
     )
