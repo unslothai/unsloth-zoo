@@ -12740,6 +12740,25 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     )
 
 
+def _inherit_target_permissions(tmp_file, target):
+    """Carry an existing target's permission bits onto the temp file replacing it.
+
+    os.replace() installs the temp file's inode, so the destination's mode would
+    otherwise be dropped for the umask default the temp file was created with. An
+    in-place write kept the mode, so without this a re-save widens a deliberately
+    restricted adapter (0600 -> 0644 under the usual umask). Same approach as
+    boltons' AtomicSaver, which chmods the part file before the rename.
+
+    First save has no target to inherit from; the umask default is then correct.
+    Ownership cannot be carried across without privileges, so only mode is.
+    """
+    try:
+        shutil.copymode(str(target), str(tmp_file))
+    except OSError:
+        # Target absent (first save), or a filesystem that will not take a chmod.
+        pass
+
+
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     # Refuse to write adapter_config.json without adapters.safetensors next
     # to it; mlx-lm reload chokes on the missing weights file.
@@ -12760,6 +12779,7 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
     try:
         mx.save_safetensors(str(tmp_file), tensors)
+        _inherit_target_permissions(tmp_file, target)
         os.replace(tmp_file, target)
     except BaseException:
         tmp_file.unlink(missing_ok=True)
@@ -12943,6 +12963,7 @@ def save_optimizer_state(optimizer, path):
                 mx.save_safetensors(tmp_target, flat)
         else:
             mx.save_safetensors(tmp_target, flat)
+        _inherit_target_permissions(tmp_target, target)
         os.replace(tmp_target, target)
     except BaseException:
         try:

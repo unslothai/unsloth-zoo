@@ -31,6 +31,9 @@ Re-saving into the directory you loaded from is the ordinary lifecycle for adapt
 and writes through a temp file. These tests pin that per writer.
 """
 
+import os
+import stat
+
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -102,3 +105,70 @@ def test_saving_optimizer_state_back_over_its_source_survives(tmp_path):
     load_optimizer_state(reread, str(tmp_path))
     assert int(reread.state["step"].item()) == 3
     assert not list(tmp_path.glob("*.tmp.safetensors")), "a temp file was left beside the checkpoint"
+
+
+def _mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_resaving_adapters_keeps_the_targets_permissions(tmp_path, monkeypatch):
+    """os.replace() installs a new inode, so the temp file must inherit the mode.
+
+    An in-place write kept whatever mode the adapter had. Without inheriting it, a
+    re-save of a deliberately private 0600 adapter widens it to the umask default.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.utils import _save_adapter_artifacts
+
+    monkeypatch.setattr(
+        mlx_utils, "_enrich_mlx_adapter_config", lambda model, config: config
+    )
+
+    _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    target = tmp_path / "adapters.safetensors"
+    os.chmod(target, 0o600)
+
+    _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    assert _mode(target) == 0o600, "re-saving widened a private adapter"
+
+    # Group-readable is the other mode people set deliberately, on shared checkouts.
+    os.chmod(target, 0o640)
+    _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    assert _mode(target) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_resaving_optimizer_state_keeps_the_targets_permissions(tmp_path):
+    from unsloth_zoo.mlx.utils import save_optimizer_state
+
+    class _Optimizer:
+        def __init__(self, state):
+            self.state = state
+
+    optimizer = _Optimizer({"step": mx.array(3)})
+    save_optimizer_state(optimizer, str(tmp_path))
+    target = tmp_path / "optimizer_state.safetensors"
+    os.chmod(target, 0o600)
+
+    save_optimizer_state(optimizer, str(tmp_path))
+    assert _mode(target) == 0o600, "checkpointing widened a private optimizer state"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_first_save_respects_the_umask(tmp_path, monkeypatch):
+    """No target to inherit from, so the umask default must stand, not 0600."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.utils import _save_adapter_artifacts
+
+    monkeypatch.setattr(
+        mlx_utils, "_enrich_mlx_adapter_config", lambda model, config: config
+    )
+
+    previous = os.umask(0o022)
+    try:
+        _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    finally:
+        os.umask(previous)
+
+    assert _mode(tmp_path / "adapters.safetensors") == 0o644
