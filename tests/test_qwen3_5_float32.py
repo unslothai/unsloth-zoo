@@ -29,8 +29,8 @@ import transformers.models.qwen3_5.modeling_qwen3_5 as qwen  # noqa: E402
 
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES  # noqa: E402
 from unsloth_zoo.temporary_patches.qwen3_5_float32 import (  # noqa: E402
-    _unsloth_fused_loss_kwargs,
-    _unsloth_is_default_causal_lm_loss,
+    _unsloth_cast_position_embeddings,
+    _unsloth_weight_dtype,
 )
 
 
@@ -97,113 +97,41 @@ def test_qwen3_5_attention_dtype_mismatch_fixed(monkeypatch):
     assert out.dtype == hidden.dtype
 
 
-def test_qwen3_5_for_causal_lm_dtype_mismatch_fixed(monkeypatch):
-    """``Qwen3_5ForCausalLM`` must complete forward passes with fp16 weights."""
+def test_qwen3_5_gated_delta_net_dtype_mismatch_fixed(monkeypatch):
+    """``Qwen3_5GatedDeltaNet`` must accept bf16 activations when weights are fp16."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     _apply_temporary_patches()
 
-    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
-    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
-    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    config = _tiny_text_config(layer_types=("linear_attention",))
+    block = qwen.Qwen3_5GatedDeltaNet(config, layer_idx=0).to(torch.float16)
+    x = torch.randn(2, 4, config.hidden_size, dtype=torch.bfloat16)
 
-    outputs = model(input_ids, use_cache=False)
-    assert outputs.logits.shape == (2, 4, config.vocab_size)
-
-    # The wrapper must preserve the standard Transformers tuple-output contract.
-    tuple_outputs = model(input_ids, use_cache=False, return_dict=False)
-    assert isinstance(tuple_outputs, tuple)
-    assert tuple_outputs[0].shape == (2, 4, config.vocab_size)
+    out = block(x)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
 
 
-def test_qwen3_5_for_causal_lm_respects_output_hidden_states_config(monkeypatch):
-    """`config.output_hidden_states=True` must propagate even without the kwarg."""
-    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
-    _apply_temporary_patches()
+def test_unsloth_weight_dtype_skips_quantized_and_missing():
+    """`_unsloth_weight_dtype` must refuse quantized or absent weights."""
+    assert _unsloth_weight_dtype(None) is None
 
-    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
-    config.output_hidden_states = True
-    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
-    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    linear = torch.nn.Linear(4, 4)
+    linear.weight = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.float32))
+    assert _unsloth_weight_dtype(linear) is torch.float32
 
-    outputs = model(input_ids, use_cache=False)
-    assert outputs.logits.shape == (2, 4, config.vocab_size)
-    assert outputs.hidden_states is not None
-
-
-def test_qwen3_5_for_causal_lm_custom_loss_does_not_receive_return_dict(monkeypatch):
-    """A custom loss must not see the wrapper's synthetic return_dict kwarg."""
-    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
-    _apply_temporary_patches()
-
-    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
-    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
-    received_kwargs = {}
-
-    def custom_loss(*, logits, labels, vocab_size, **kwargs):
-        received_kwargs.update(kwargs)
-        return torch.tensor(0.0, dtype=logits.dtype)
-
-    model.loss_function = custom_loss
-
-    input_ids = torch.randint(0, config.vocab_size, (2, 4))
-    labels = input_ids.clone()
-    out = model(input_ids, labels=labels, use_cache=False)
-    assert out.loss is not None
-    assert "return_dict" not in received_kwargs
+    # Fake quantized weight
+    param = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.float16))
+    param.quant_state = object()
+    linear.weight = param
+    assert _unsloth_weight_dtype(linear) is None
 
 
-def test_qwen3_5_for_causal_lm_honors_accepts_loss_kwargs(monkeypatch):
-    """Respect accepts_loss_kwargs=False by not passing extra kwargs to loss."""
-    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
-    _apply_temporary_patches()
+def test_unsloth_cast_position_embeddings():
+    """`_unsloth_cast_position_embeddings` casts cos/sin to the target dtype."""
+    cos = torch.randn(1, 8, 16, dtype=torch.float32)
+    sin = torch.randn(1, 8, 16, dtype=torch.float32)
+    out = _unsloth_cast_position_embeddings((cos, sin), torch.float16)
+    assert out[0].dtype is torch.float16
+    assert out[1].dtype is torch.float16
 
-    config = _tiny_text_config(layer_types=("full_attention", "full_attention"))
-    model = qwen.Qwen3_5ForCausalLM(config).to(torch.float16)
-    received_kwargs = {}
-
-    def custom_loss(*, logits, labels, vocab_size, **kwargs):
-        received_kwargs.update(kwargs)
-        return torch.tensor(0.0, dtype=logits.dtype)
-
-    model.loss_function = custom_loss
-    model.accepts_loss_kwargs = False
-
-    input_ids = torch.randint(0, config.vocab_size, (2, 4))
-    labels = input_ids.clone()
-    out = model(input_ids, labels=labels, use_cache=False, num_items_in_batch=8)
-    assert out.loss is not None
-    assert "num_items_in_batch" not in received_kwargs
-
-
-@pytest.mark.parametrize("name", ["ForCausalLMLoss", "UnslothForCausalLMLoss"])
-def test_default_causal_lm_loss_accepted(name):
-    """The default (and Unsloth-patched) loss names must take the fused path."""
-    fake_loss = type("_FakeLoss", (), {"__name__": name})()
-    assert _unsloth_is_default_causal_lm_loss(fake_loss) is True
-
-
-def test_custom_loss_rejected():
-    """Custom losses must fall back to the logits + loss_function branch."""
-    fake_loss = type("_FakeLoss", (), {"__name__": "CustomFocalLoss"})()
-    assert _unsloth_is_default_causal_lm_loss(fake_loss) is False
-
-
-def test_fused_loss_kwargs_filter():
-    """Model-only kwargs must not leak into the fused CE kernel."""
-    kwargs = {
-        "num_items_in_batch": 8,
-        "shift_labels": False,
-        "ignore_index": -100,
-        "label_smoothing": 0.1,
-        "output_attentions": True,
-        "output_hidden_states": True,
-        "return_dict": True,
-        "use_cache": True,
-    }
-    filtered = _unsloth_fused_loss_kwargs(kwargs)
-    assert filtered == {
-        "num_items_in_batch": 8,
-        "shift_labels": False,
-        "ignore_index": -100,
-        "label_smoothing": 0.1,
-    }
+    assert _unsloth_cast_position_embeddings(None, torch.float16) is None
