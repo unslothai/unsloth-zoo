@@ -16,9 +16,8 @@
 
 """Run pytest, then exit without interpreter finalization.
 
-mlx 0.32.1 segfaults during interpreter shutdown when a fused Metal custom
-kernel is the last thing a process touched. Every test passes and the crash
-lands after the run, so the job dies with exit 139 on a fully green suite.
+mlx 0.32.1 segfaults at interpreter shutdown when a fused Metal custom kernel is
+the last thing a process touched, so a fully green suite dies with exit 139.
 
 Measured on an Apple Silicon runner, three samples each, using the shape from
 tests/test_qwen35_vjp_metal.py::test_disable_fused_mrope_fixes_rotary_grad:
@@ -28,14 +27,11 @@ tests/test_qwen35_vjp_metal.py::test_disable_fused_mrope_fixes_rotary_grad:
       + gc.collect() registered at exit               exit 139, 139, 139
       + os._exit() after the work                     exit   0,   0,   0
 
-So it is not ours to fix from Python: releasing everything we hold and flushing
-the stream still crashes, because the fault is in mlx's own static destruction
-after our cleanup. mlx 0.32.0 does not crash on the same tree, which dates it to
-0.32.1 exactly, the release that also broke saving over a loaded file.
+Not fixable from Python: the fault is in mlx's own static destruction, after any
+cleanup we can do. mlx 0.32.0 is clean on the same tree, dating it to 0.32.1.
 
-This exits with pytest's own return code, so a failing test still fails the job.
-The only thing skipped is interpreter finalization. Drop this wrapper once mlx
-ships a fix and call pytest directly again.
+Exits with pytest's own return code, so a failing test still fails the job; only
+finalization is skipped. Drop this wrapper once mlx ships a fix.
 """
 
 import os
