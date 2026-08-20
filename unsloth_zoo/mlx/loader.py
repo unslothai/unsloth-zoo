@@ -4843,11 +4843,17 @@ def _lifted_bitsandbytes_stub():
     if not _bitsandbytes_is_stubbed():
         yield
         return
-    saved_meta = list(sys.meta_path)
     stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
-    sys.meta_path[:] = [
-        finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
+    # Pull out only the stub's own finders and put those back afterwards. Restoring a
+    # whole snapshot of sys.meta_path instead would drop any finder another thread
+    # installed while the block ran, and the block is a multi-GB dequant that runs for
+    # minutes -- the same window the no-stub path above already declines to disturb.
+    lifted_finders = [
+        (index, finder) for index, finder in enumerate(sys.meta_path)
+        if type(finder).__name__ == "_BnbFinder"
     ]
+    for _, finder in lifted_finders:
+        sys.meta_path.remove(finder)
     for name in _bnb_module_names():
         del sys.modules[name]
     # Reuse the already-initialized real bnb if we imported it earlier; only a cold
@@ -4862,7 +4868,8 @@ def _lifted_bitsandbytes_stub():
         for name in _bnb_module_names():
             del sys.modules[name]
         sys.modules.update(stub_modules)
-        sys.meta_path[:] = saved_meta
+        for index, finder in lifted_finders:
+            sys.meta_path.insert(min(index, len(sys.meta_path)), finder)
 
 
 def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):

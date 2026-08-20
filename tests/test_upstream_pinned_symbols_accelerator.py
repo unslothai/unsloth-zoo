@@ -437,7 +437,9 @@ def test_real_bitsandbytes_available_locates_without_importing(installed):
 
     from unsloth_zoo.stubs import bitsandbytes_stub
 
-    spec = object() if installed else None
+    # A loader-bearing spec is what a real distribution produces; a loaderless one is a
+    # namespace package, which is not an install (see the namespace test below).
+    spec = types.SimpleNamespace(loader = object()) if installed else None
     real_import = builtins.__import__
 
     def guarded_import(name, *a, **kw):
@@ -461,8 +463,46 @@ def test_real_bitsandbytes_available_locates_without_importing(installed):
         sys.modules.update(saved)
 
 
-def test_bitsandbytes_is_stubbed_only_reports_the_unsloth_stub():
+def test_a_namespace_bitsandbytes_directory_is_not_a_real_install(tmp_path):
+    """A bare `bitsandbytes/` directory with no __init__.py -- what a half-removed
+    install, or a source checkout sitting beside the script, leaves on sys.path.
+
+    find_spec answers with a loaderless namespace spec, so treating "found" as
+    "installed" would stand aside for a package that imports to nothing: the caller then
+    has neither a working wheel nor the stub that used to cover for it.
+    """
+    from unsloth_zoo.stubs import bitsandbytes_stub
+
+    (tmp_path / "bitsandbytes").mkdir()
+    saved = {k: v for k, v in sys.modules.items() if k.startswith("bitsandbytes")}
+    for k in saved:
+        del sys.modules[k]
+    # A regular package anywhere later on the path beats a namespace portion, so an
+    # installed wheel on this runner would mask the case under test.
+    saved_path = list(sys.path)
+    sys.path[:] = [str(tmp_path)] + [p for p in sys.path if "site-packages" not in p]
+    try:
+        spec = bitsandbytes_stub.importlib.util.find_spec("bitsandbytes")
+        assert spec is not None and spec.loader is None, "not a namespace package"
+        assert bitsandbytes_stub.real_bitsandbytes_available() is False
+    finally:
+        sys.path[:] = saved_path
+        for k in [k for k in sys.modules if k.startswith("bitsandbytes")]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+
+
+def _mlx_loader():
+    """The MLX loader, or skip. Importing it pulls in mlx.core, and this file also runs
+    in the Linux upstream-regression lane, which installs no mlx."""
+    pytest.importorskip("mlx")
     from unsloth_zoo.mlx import loader
+
+    return loader
+
+
+def test_bitsandbytes_is_stubbed_only_reports_the_unsloth_stub():
+    loader = _mlx_loader()
 
     stubbed = types.ModuleType("bitsandbytes")
     stubbed.IS_UNSLOTH_STUB = True
@@ -482,7 +522,7 @@ def test_bitsandbytes_is_stubbed_only_reports_the_unsloth_stub():
 @contextlib.contextmanager
 def _bnb_modules(entries):
     """Run with exactly ``entries`` as the resident bitsandbytes modules."""
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     saved = {k: v for k, v in sys.modules.items() if k.startswith("bitsandbytes")}
     saved_real = loader._REAL_BITSANDBYTES_MODULES
@@ -502,7 +542,7 @@ def _bnb_modules(entries):
 
 def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
     """The swap must lift the stub, cache what the block imported, and restore."""
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     stub = types.ModuleType("bitsandbytes")
     stub.IS_UNSLOTH_STUB = True
@@ -545,7 +585,7 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
 def test_lifting_the_bnb_stub_is_a_no_op_when_no_stub_is_resident():
     """Evicting a resident real wheel makes the next import re-execute it and
     re-register its torch operators, which raises."""
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
     ops = types.ModuleType("bitsandbytes._ops")
@@ -582,7 +622,7 @@ def test_lifting_the_bnb_stub_keeps_a_wheel_first_imported_inside_the_block():
 
     A restore that runs anyway drops the wheel the block just imported.
     """
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     real = types.ModuleType("bitsandbytes")
     ops = types.ModuleType("bitsandbytes._ops")
@@ -605,7 +645,7 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
     """
     import transformers
 
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     stub = types.ModuleType("bitsandbytes")
     stub.IS_UNSLOTH_STUB = True
@@ -652,7 +692,7 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
 
 
 def test_lifting_the_bnb_stub_restores_after_the_block_raises():
-    from unsloth_zoo.mlx import loader
+    loader = _mlx_loader()
 
     stub = types.ModuleType("bitsandbytes")
     stub.IS_UNSLOTH_STUB = True
@@ -663,6 +703,34 @@ def test_lifting_the_bnb_stub_restores_after_the_block_raises():
             with loader._lifted_bitsandbytes_stub():
                 raise ImportError("no real wheel here")
         assert sys.modules["bitsandbytes"] is stub, "the stub was lost on the error path"
+
+
+def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
+    """The stubbed path must leave sys.meta_path alone apart from the stub's own finder.
+
+    The no-stub path above already declines to touch it for exactly this reason, and the
+    block is a multi-GB dequant that runs for minutes: restoring a whole snapshot taken
+    at entry silently drops whatever another thread installed in between.
+    """
+    loader = _mlx_loader()
+
+    stub = types.ModuleType("bitsandbytes")
+    stub.IS_UNSLOTH_STUB = True
+
+    class _BnbFinder:  # the swap filters meta_path by this class name
+        pass
+
+    stub_finder = _BnbFinder()
+    late_finder = types.SimpleNamespace()
+
+    with _bnb_modules({"bitsandbytes": stub}):
+        loader._REAL_BITSANDBYTES_MODULES = {}
+        sys.meta_path.insert(0, stub_finder)
+        with loader._lifted_bitsandbytes_stub():
+            assert stub_finder not in sys.meta_path, "the stub finder was not lifted"
+            sys.meta_path.insert(0, late_finder)   # another thread, mid-dequant
+        assert late_finder in sys.meta_path, "a concurrently installed finder was dropped"
+        assert stub_finder in sys.meta_path, "the stub finder was not put back"
 
 
 # ---------------------------------------------------------------------------
