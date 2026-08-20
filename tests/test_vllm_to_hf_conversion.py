@@ -1013,7 +1013,7 @@ def test_finalize_routes_vision_tower_rotary_to_vision_config_by_module_path():
     )
 
 
-def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint():
+def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint(monkeypatch):
     # Regression: `mid = ba_weight.shape[0] // 2` was computed on the packed
     # uint8 buffer then reused to slice the dequantized full tensor (shape[0] =
     # out_features); when they differ, in_proj_b/a got wrong rows.
@@ -1070,14 +1070,38 @@ def test_extract_gdn_layers_dequantize_uses_unpacked_midpoint():
             )
             self.out_proj = _PlainProj(self.hidden_size, self.value_dim)
 
-    bnb = sys.modules.setdefault("bitsandbytes", types.ModuleType("bitsandbytes"))
+    # monkeypatch.setitem, not a bare assignment: these entries have to come back
+    # out of sys.modules when the test ends.
+    #
+    # The stub carries dequantize_4bit and nothing else, so while it is installed
+    # `from bitsandbytes.functional import QuantState` fails with "cannot import
+    # name 'QuantState' from 'bitsandbytes.functional' (unknown location)" -- the
+    # "unknown location" being this module having no file behind it. That is
+    # precisely what unsloth_zoo/temporary_patches/moe_utils_bnb4bit.py:735 does at
+    # import time, so leaving the stub in place breaks every later test that
+    # reaches it, in a process that has already left this file.
+    #
+    # Serially that never showed: this file sorts after
+    # test_moe_bnb4bit_per_expert_conversions.py, so the victim always ran first.
+    # Under pytest-xdist a worker can take them in the other order, and six tests
+    # there failed with that ImportError while the same run passed serially. The
+    # order was the trigger; the missing cleanup was the bug.
+    #
+    # The vllm stubs further down this file already save and restore. This one was
+    # the exception, not the convention.
+    # setdefault leaked too, in the case where it does anything: on a runner without
+    # bitsandbytes it inserted a bare parent module and left it there, which shadows
+    # the real package for anything that installs later in the same process.
+    if "bitsandbytes" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "bitsandbytes", types.ModuleType("bitsandbytes"))
+    bnb = sys.modules["bitsandbytes"]
     bnb_fn = types.ModuleType("bitsandbytes.functional")
 
     def fake_dequantize_4bit(data, quant_state=None):
         return torch.arange(24, dtype=torch.float32).reshape(24, 1)
 
     bnb_fn.dequantize_4bit = fake_dequantize_4bit
-    sys.modules["bitsandbytes.functional"] = bnb_fn
+    monkeypatch.setitem(sys.modules, "bitsandbytes.functional", bnb_fn)
 
     def _fake_get_state_dict(prefix, kk, sd, module, slice_weights=True):
         sd[f"{prefix}.weight"] = module.weight.data

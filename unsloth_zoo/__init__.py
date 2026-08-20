@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.8.12"
+__version__ = "2026.8.13"
 
 import os
 import platform
@@ -179,16 +179,22 @@ else:
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
 
-# Inject triton & bitsandbytes stubs whenever GPU init is skipped (MLX host or the
-# opt-in download child), so unsloth's CUDA-only imports resolve to a loud no-op stub
-# instead of a hard ImportError. Inert in the download child, which never touches them.
-# On a normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
+# Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
+# download child), so they resolve to a loud no-op instead of a hard ImportError. On a
+# normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
 if _SKIP_GPU_INIT:
     from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
-    from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
-    _inject_bnb()
-    del _inject_triton, _inject_bnb
+    # bitsandbytes, unlike triton, ships a working arm64 macOS wheel, and shadowing a
+    # real install makes bnb-quantized checkpoints unloadable. Locating it imports
+    # nothing, so the download-only child can take this path too.
+    from unsloth_zoo.stubs.bitsandbytes_stub import (
+        inject_into_sys_modules as _inject_bnb,
+        real_bitsandbytes_available as _real_bnb,
+    )
+    if not _real_bnb():
+        _inject_bnb()
+    del _inject_triton, _inject_bnb, _real_bnb
 
 # Lazy bridge for downstream code that still imports the old flat MLX module
 # names. Installed on every host so external scripts don't hit a hard
