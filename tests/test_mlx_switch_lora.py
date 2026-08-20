@@ -471,6 +471,11 @@ def test_switch_adapter_public_lifecycle(
         assert config["base_resolved_quantization_map_supports_switch"] is True
     weights_path = adapter / "adapters.safetensors"
     weights = mx.load(str(weights_path))
+    # mx.load() is lazy and the arrays stay backed by weights_path, which the corrupt
+    # branches below rewrite in place. Materialize first, or the save truncates the
+    # source before these arrays are read and mlx raises "[read] Unable to read from
+    # file" instead of the corruption this test means to set up.
+    mx.eval(*weights.values())
     assert {value.ndim for value in weights.values()} == (
         {1, 3} if external_case else {3}
     )

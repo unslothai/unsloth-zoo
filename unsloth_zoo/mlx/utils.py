@@ -12752,7 +12752,20 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+    # mx.load() arrays may be file-backed; saving over the source can truncate them
+    # before they materialize, so write beside and replace. Re-saving adapters into
+    # the directory they were loaded from is the ordinary switch/merge lifecycle, and
+    # mlx 0.32.1 turned it into "[read] Unable to read from file".
+    target = path / "adapters.safetensors"
+    mx.eval(*tensors.values())
+    tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
+    try:
+        mx.save_safetensors(str(tmp_file), tensors)
+        os.replace(tmp_file, target)
+    except BaseException:
+        # Never leave a half-written temp beside a good adapter file.
+        tmp_file.unlink(missing_ok=True)
+        raise
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
@@ -12912,17 +12925,36 @@ def save_optimizer_state(optimizer, path):
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
     target = f"{path}/optimizer_state.safetensors"
-    if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
-        metadata = {
-            "quantized_moment_group_size" : str(optimizer.group_size),
-            "quantized_moment_bits"       : str(optimizer.bits),
-        }
+    # load_optimizer_state() hands mx.load()'s file-backed arrays straight back to the
+    # optimizer, so checkpointing into the directory a resume came from would truncate
+    # the source out from under them. Materialize, write beside, replace.
+    if flat:
+        mx.eval(*flat.values())
+    # ".tmp.safetensors", not ".safetensors.tmp": mx.save_safetensors appends
+    # ".safetensors" to any path lacking it, so the latter would quietly write to a
+    # third file and leave the real checkpoint untouched.
+    tmp_target = f"{path}/optimizer_state.tmp.safetensors"
+    try:
+        if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
+            metadata = {
+                "quantized_moment_group_size" : str(optimizer.group_size),
+                "quantized_moment_bits"       : str(optimizer.bits),
+            }
+            try:
+                mx.save_safetensors(tmp_target, flat, metadata = metadata)
+            except TypeError:
+                # backend without metadata support; fall through
+                mx.save_safetensors(tmp_target, flat)
+        else:
+            mx.save_safetensors(tmp_target, flat)
+        os.replace(tmp_target, target)
+    except BaseException:
+        # Never leave a half-written temp beside a good checkpoint.
         try:
-            mx.save_safetensors(target, flat, metadata = metadata)
-            return
-        except TypeError:
-            pass  # backend without metadata support; fall through
-    mx.save_safetensors(target, flat)
+            os.remove(tmp_target)
+        except OSError:
+            pass
+        raise
 
 
 def load_optimizer_state(optimizer, path):
