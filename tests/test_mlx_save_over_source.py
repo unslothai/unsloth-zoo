@@ -156,6 +156,35 @@ def test_resaving_optimizer_state_keeps_the_targets_permissions(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_resaving_keeps_the_targets_group(tmp_path, monkeypatch):
+    """A group-shared checkpoint must not move to the writer's primary group.
+
+    os.replace() installs the temp file's inode, and outside a setgid directory
+    that inode carries the writer's primary group, so a 0640 checkpoint shared
+    with collaborators via its group silently stops being readable by them.
+    Restoring a different owner needs privileges, but the group does not.
+    """
+    others = [g for g in os.getgroups() if g != os.getgid()]
+    if not others:
+        pytest.skip("needs a second group to move the file between")
+    from unsloth_zoo.mlx import utils as mlx_utils
+    from unsloth_zoo.mlx.utils import _save_adapter_artifacts
+
+    monkeypatch.setattr(
+        mlx_utils, "_enrich_mlx_adapter_config", lambda model, config: config
+    )
+
+    _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    target = tmp_path / "adapters.safetensors"
+    os.chown(target, -1, others[0])
+    os.chmod(target, 0o640)
+
+    _save_adapter_artifacts(None, tmp_path, _adapter_tensors())
+    assert os.stat(target).st_gid == others[0], "re-saving changed the group"
+    assert _mode(target) == 0o640
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_first_save_respects_the_umask(tmp_path, monkeypatch):
     """No target to inherit from, so the umask default must stand, not 0600."""
     from unsloth_zoo.mlx import utils as mlx_utils

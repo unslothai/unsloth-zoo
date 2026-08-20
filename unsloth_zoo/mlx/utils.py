@@ -12741,22 +12741,35 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
 
 
 def _inherit_target_permissions(tmp_file, target):
-    """Carry an existing target's permission bits onto the temp file replacing it.
+    """Carry an existing target's access bits onto the temp file replacing it.
 
-    os.replace() installs the temp file's inode, so the destination's mode would
-    otherwise be dropped for the umask default the temp file was created with. An
-    in-place write kept the mode, so without this a re-save widens a deliberately
-    restricted adapter (0600 -> 0644 under the usual umask). Same approach as
-    boltons' AtomicSaver, which chmods the part file before the rename.
+    os.replace() installs the temp file's inode, so the destination's mode and
+    group would otherwise be dropped for whatever the temp file was created with.
+    An in-place write kept both, so without this a re-save widens a deliberately
+    restricted adapter (0600 -> 0644 under the usual umask), and in a directory
+    that is not setgid it also moves the file to the writer's primary group,
+    which is how collaborators lose access to a group-shared checkpoint.
 
     First save has no target to inherit from; the umask default is then correct.
-    Ownership cannot be carried across without privileges, so only mode is.
+
+    Only mode and group are carried. Restoring a different owner needs privileges
+    we do not have, and POSIX ACLs have no interface in the standard library, so
+    a checkpoint relying on either is outside what this can preserve.
     """
     try:
-        shutil.copymode(str(target), str(tmp_file))
+        info = os.stat(str(target))
     except OSError:
-        # Target absent (first save), or a filesystem that will not take a chmod.
-        pass
+        return  # First save, or an unreadable target; the umask default stands.
+    try:
+        # Group before mode: chown clears the setgid bit on some systems, so
+        # applying the mode afterwards is what keeps it. Owner is left alone.
+        os.chown(str(tmp_file), -1, info.st_gid)
+    except OSError:
+        pass  # Not a member of that group, or a filesystem without ownership.
+    try:
+        os.chmod(str(tmp_file), info.st_mode & 0o7777)
+    except OSError:
+        pass  # Filesystem that will not take a chmod.
 
 
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
