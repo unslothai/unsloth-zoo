@@ -17,14 +17,18 @@
 """Writing safetensors back over the file they were loaded from.
 
 mx.load() returns lazily file-backed arrays; saving them to their own source path
-truncates the file before they are read. From mlx 0.32.1 that raises "[read] Unable
-to read from file", which took the Apple Silicon lane red on 2026-08-18 with no
-change on our side.
+truncates the file before they are read. From mlx 0.32.1 that surfaces as "[read]
+Unable to read from file", which took the Apple Silicon lane red on 2026-08-18 with
+no change on our side.
+
+How it surfaces depends on the backend, which matters when reading a failure here.
+On CPU the bad save raises on the spot. On Metal it returns quietly and leaves the
+failed read pending on the graph, so it lands on the NEXT mx.eval touching
+file-backed arrays, which can be an unrelated later test in the same process.
 
 Re-saving into the directory you loaded from is the ordinary lifecycle for adapters
 (switch/merge) and optimizer state (resume, checkpoint), so each writer materializes
-and writes through a temp file. These tests pin that per writer, plus the upstream
-behaviour itself so a future mlx making save-over-source safe is visible.
+and writes through a temp file. These tests pin that per writer.
 """
 
 import pytest
@@ -47,20 +51,10 @@ def _adapter_tensors():
     }
 
 
-def test_mlx_still_refuses_a_lazy_save_over_the_source(tmp_path):
-    """The upstream behaviour the writers below defend against.
-
-    Failing here means mlx made save-over-source safe again. Good news, but not a
-    reason to drop the temp-file writes: they also keep a crash mid-write from
-    leaving a truncated checkpoint.
-    """
-    path = str(tmp_path / "w.safetensors")
-    mx.save_safetensors(path, {"x": mx.zeros((2, 3))})
-
-    loaded = mx.load(path)
-    lazy = {key: value.astype(mx.bfloat16) for key, value in loaded.items()}
-    with pytest.raises(RuntimeError, match="Unable to read from file"):
-        mx.save_safetensors(path, lazy)
+# There is deliberately no test that performs a bare save-over-source to pin the
+# upstream behaviour. On Metal that call does not raise; it poisons the graph, and
+# the error then lands on whichever test evaluates file-backed arrays next. Such a
+# test fails on the platform it is meant to protect and takes its neighbours with it.
 
 
 def test_saving_adapters_back_over_their_source_survives(tmp_path, monkeypatch):
