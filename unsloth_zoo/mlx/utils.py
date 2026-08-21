@@ -8968,6 +8968,31 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+def _mlx_rng_key():
+    """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
+
+    Unreadable covers the torch simulation shim, whose state is a callable.
+    Deciding it here is what lets the restore below stay unconditional.
+    """
+    try:
+        words = mx.random.state[0].tolist()
+    except Exception:
+        return None
+    return (int(words[0]), int(words[1])) if len(words) == 2 else None
+
+
+def _restore_mlx_rng_key(words):
+    """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
+
+    mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
+    ``mx.random.key`` packs a seed as its two 32-bit halves, so reseeding with a
+    key's own words restores it exactly, over the whole unsigned 64-bit range.
+    """
+    if words is None:
+        return
+    mx.random.seed((words[0] << 32) | words[1])
+
+
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
@@ -8997,15 +9022,7 @@ def _preserved_preprocessing_rng():
             ))
         except Exception:
             pass
-    mx_state = None
-    try:
-        mx_random_state = mx.random.state
-        if isinstance(mx_random_state, list) and mx_random_state:
-            mx_state = mx.array(
-                mx_random_state[0].tolist(), dtype=mx.uint32,
-            )
-    except Exception:
-        mx_state = None
+    mx_state = _mlx_rng_key()
     try:
         yield
     finally:
@@ -9014,11 +9031,7 @@ def _preserved_preprocessing_rng():
                 restore(snapshot)
             except Exception:
                 pass
-        if mx_state is not None:
-            try:
-                mx.random.state[0] = mx_state
-            except Exception:
-                pass
+        _restore_mlx_rng_key(mx_state)
 
 
 def _vlm_file_identity(path):
