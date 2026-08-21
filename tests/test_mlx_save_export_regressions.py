@@ -1992,7 +1992,7 @@ def test_gguf_install_fallback_reraises_non_aptget_runtimeerror(monkeypatch, tmp
         )
 
 
-def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
+def test_push_to_hub_gguf_forwards_export_options(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
     calls = {}
@@ -2028,10 +2028,14 @@ def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
         save_directory,
         quantization_method="fast_quantized",
         first_conversion=None,
+        token=None,
+        imatrix_file=None,
     ):
         calls["save"] = {
             "quantization_method": quantization_method,
             "first_conversion": first_conversion,
+            "imatrix_file": imatrix_file,
+            "token": token,
         }
         Path(save_directory).mkdir(parents=True, exist_ok=True)
         (Path(save_directory) / "model.F16.gguf").write_bytes(b"GGUF")
@@ -2047,11 +2051,14 @@ def test_push_to_hub_gguf_forwards_first_conversion(monkeypatch, tmp_path):
         first_conversion="f16",
         token="hf_token",
         private=True,
+        imatrix_file="/path/to/imatrix.dat",
     )
 
     assert calls["save"] == {
         "quantization_method": "not_quantized",
         "first_conversion": "f16",
+        "imatrix_file": "/path/to/imatrix.dat",
+        "token": "hf_token",
     }
     assert calls["token"] == "hf_token"
     assert calls["repo"] == {
@@ -2155,3 +2162,381 @@ def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
 
     assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
     assert (folder / "CMakeLists.txt").is_file()
+
+
+def _stub_gguf_export(monkeypatch, tmp_path):
+    """Stub llama.cpp and the merge so save_pretrained_gguf runs with no model or binaries, and
+    record "merged", "quantize" (llama-quantize's kwargs) and "imatrix_bytes" into the result."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+
+    llama_root = tmp_path / "llama.cpp"
+    llama_root.mkdir()
+    (llama_root / "convert_hf_to_gguf.py").write_text("# converter", encoding="utf-8")
+    quantizer = llama_root / "llama-quantize"
+    quantizer.write_text("# quantizer", encoding="utf-8")
+
+    calls = {}
+
+    def fake_save_merged_model(model, tokenizer, path, dequantize=False):
+        calls["merged"] = True
+        Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "config.json").write_text("{}", encoding="utf-8")
+
+    def fake_convert_to_gguf(**kwargs):
+        output = Path(f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"GGUF")
+
+    def fake_quantize_gguf(**kwargs):
+        calls["quantize"] = kwargs
+        # The imatrix only has to exist while llama-quantize runs, so read it here.
+        imatrix = kwargs.get("imatrix")
+        calls["imatrix_bytes"] = Path(imatrix).read_bytes() if imatrix else None
+        Path(kwargs["output_gguf"]).write_bytes(b"GGUF")
+
+    monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(
+        llama_cpp, "check_llama_cpp", lambda folder: (str(quantizer), str(llama_root / "convert_hf_to_gguf.py"))
+    )
+    monkeypatch.setattr(
+        llama_cpp,
+        "_download_convert_hf_to_gguf",
+        lambda: (str(llama_root / "convert_hf_to_gguf.py"), None, None),
+    )
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", fake_convert_to_gguf)
+    monkeypatch.setattr(llama_cpp, "quantize_gguf", fake_quantize_gguf)
+    return calls
+
+
+def _export(save_directory, **kwargs):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = types.SimpleNamespace(_hf_repo="unsloth/TestModel")
+    mutils.save_pretrained_gguf(model, object(), save_directory, **kwargs)
+
+# Both export paths glob save_directory/*.gguf, so a copy left there would be uploaded and
+# reported as an exported model.
+@pytest.mark.parametrize(
+    "source_name, resolved_name, inside",
+    [
+        ("imatrix_unsloth.dat", "imatrix_unsloth.dat", False),
+        ("imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf", False),  # llama.cpp rejects .gguf_file
+        ("imatrix_unsloth.gguf", "imatrix_unsloth.gguf", True),  # already .gguf, and in the way
+    ],
+)
+def test_the_imatrix_copy_lands_outside_the_export_directory(monkeypatch, tmp_path, source_name,
+                                                             resolved_name, inside):
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    source = (out if inside else tmp_path) / source_name
+    source.write_bytes(b"IMAT")
+
+    _export(out, quantization_method="iq2_xxs", imatrix_file=str(source))
+
+    used = Path(calls["quantize"]["imatrix"])
+    assert calls["quantize"]["quant_type"] == "iq2_xxs"
+    assert used.name == resolved_name and used != source
+    assert calls["imatrix_bytes"] == b"IMAT"
+    assert out not in used.parents
+    assert source.exists(), "the caller's file must be copied, not moved"
+    left_behind = [source_name] if inside else []
+    assert sorted(p.name for p in out.rglob("*.gguf")) == sorted(["TestModel.IQ2_XXS.gguf"] + left_behind)
+
+
+# "BF16" is spelled either way: the converter lowercases, so these checks have to as well.
+@pytest.mark.parametrize("quantization_method", ["not_quantized", "bf16", "BF16"])
+def test_a_direct_conversion_drops_the_imatrix_instead_of_resolving_it(
+    monkeypatch, tmp_path, quantization_method
+):
+    # bf16/f16/f32 never reach llama-quantize, so resolving risks a Hub failure for nothing.
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+    seen = {}
+    monkeypatch.setattr(
+        llama_cpp, "resolve_imatrix_file", lambda imatrix_file, **k: seen.setdefault("arg", imatrix_file)
+    )
+
+    with pytest.warns(UserWarning, match="ignoring imatrix_file"):
+        _export(tmp_path / "out", quantization_method=quantization_method, imatrix_file=True)
+
+    # Resolution was reached with None, so no repo lookup happened, and llama-quantize -- which
+    # only the uppercase spelling still reaches -- is handed no imatrix either way.
+    assert seen["arg"] is None
+    assert calls.get("quantize", {}).get("imatrix") is None
+
+
+# Left: needs an imatrix for every model. Right: some model can produce it without one, so
+# refusing up front would reject an export that works -- iq3_xs is on the right for that reason.
+@pytest.mark.parametrize(
+    "quant, required",
+    [(q, True) for q in (
+        "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m", "iq3_xxs", "q2_k_s",
+    )] + [(q, False) for q in (
+        "iq3_xs", "iq3_s", "iq3_m", "iq4_nl", "iq4_xs",
+        "q2_k", "q4_k_m", "q8_0", "bf16", "f16",
+    )],
+)
+def test_quant_requires_imatrix_matches_llama_cpp(quant, required):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    assert llama_cpp.quant_requires_imatrix(quant) is required
+    assert llama_cpp.quant_requires_imatrix(quant.upper()) is required
+
+
+# llama.cpp's tensor_requires_imatrix rejects every one of these outright (src/llama-quant.cpp).
+@pytest.mark.parametrize("quant", ["iq1_s", "iq2_xxs", "iq2_m", "iq3_xxs", "q2_k_s"])
+def test_imatrix_only_quants_are_refused_before_the_merge(monkeypatch, tmp_path, quant):
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError, match="importance matrix"):
+        _export(tmp_path / "out", quantization_method=quant)
+
+    assert "merged" not in calls, "must fail before paying for the merge and conversion"
+    assert not (tmp_path / "out").exists(), "a refused export must not leave a directory behind"
+
+
+# The counterpart: each of these is reachable without an imatrix for some model, so the export
+# must run rather than be refused.
+@pytest.mark.parametrize("quant", ["iq3_xs", "iq4_xs", "iq4_nl", "iq3_s", "iq3_m", "q4_k_m"])
+def test_quants_not_refused_up_front(monkeypatch, tmp_path, quant):
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+
+    _export(tmp_path / "out", quantization_method=quant)
+
+    assert calls["quantize"]["quant_type"] == quant
+    assert calls["quantize"]["imatrix"] is None
+
+
+def _fake_hub(monkeypatch, tmp_path, upstream_name, hosted_by="unsloth/TestModel-GGUF"):
+    """Stand in for the Hub: only `hosted_by` exists, and only it ships `upstream_name`."""
+    cached = tmp_path / "cache" / upstream_name
+    cached.parent.mkdir(exist_ok=True)
+    cached.write_bytes(b"UPSTREAM")
+    seen = {"looked_up": []}
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            seen["token"] = token
+
+        def list_repo_files(self, repo_id):
+            seen["looked_up"].append(repo_id)
+            if repo_id != hosted_by:
+                raise RuntimeError("404")
+            return ["config.json", upstream_name]
+
+    def fake_download(repo_id, filename, token=None):
+        seen["downloaded"] = {"repo_id": repo_id, "filename": filename, "token": token}
+        return str(cached.parent / filename)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = FakeHfApi
+    fake_hub.hf_hub_download = fake_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    return seen
+
+
+# Both upstream spellings must resolve: .dat is the classic llama.cpp format, .gguf_file the
+# GGUF one the Hub would otherwise list as a model.
+@pytest.mark.parametrize(
+    "upstream_name, expected_local",
+    [
+        ("imatrix_unsloth.dat", "imatrix_unsloth.dat"),
+        ("imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf"),
+    ],
+)
+def test_imatrix_file_true_resolves_the_upstream_gguf_repo(monkeypatch, tmp_path, upstream_name,
+                                                          expected_local):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    seen = _fake_hub(monkeypatch, tmp_path, upstream_name)
+
+    resolved = llama_cpp.resolve_imatrix_file(
+        True, dest_dir=str(tmp_path / "dest"), token="hf_token",
+        repo_candidates=["unsloth/Missing-GGUF", "unsloth/TestModel-GGUF"],
+    )
+
+    assert seen["looked_up"] == ["unsloth/Missing-GGUF", "unsloth/TestModel-GGUF"]
+    assert seen["token"] == "hf_token"
+    # The download must be authenticated too, and aimed at the repo that actually had the file.
+    assert seen["downloaded"] == {
+        "repo_id": "unsloth/TestModel-GGUF", "filename": upstream_name, "token": "hf_token",
+    }
+    assert Path(resolved).name == expected_local
+    assert Path(resolved).read_bytes() == b"UPSTREAM"
+
+
+def test_gguf_export_resolves_the_imatrix_from_the_models_own_repo(monkeypatch, tmp_path):
+    """The automatic path end to end: model -> candidate repos -> download -> llama-quantize."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+    seen = _fake_hub(monkeypatch, tmp_path, "imatrix_unsloth.dat")
+
+    mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo="mlx-community/TestModel-4bit"), object(), tmp_path / "out",
+        quantization_method="iq2_xxs", imatrix_file=True, token="hf_token",
+    )
+
+    # The 4bit repackaging is tried first, then the base model it was quantized from.
+    assert seen["looked_up"] == ["unsloth/TestModel-4bit-GGUF", "unsloth/TestModel-GGUF"]
+    assert seen["token"] == "hf_token"
+    assert seen["downloaded"]["repo_id"] == "unsloth/TestModel-GGUF"
+    assert seen["downloaded"]["token"] == "hf_token"
+    assert Path(calls["quantize"]["imatrix"]).name == "imatrix_unsloth.dat"
+    assert calls["imatrix_bytes"] == b"UPSTREAM"
+
+
+def _unauthorized(self, repo_id):
+    raise PermissionError("401 Unauthorized")
+
+
+@pytest.mark.parametrize(
+    "list_repo_files, expected",
+    [
+        # Nothing upstream: the error has to name the repo it looked in.
+        (lambda self, repo_id: ["config.json"], "unsloth/TestModel-GGUF"),
+        # A bad token or an outage must not read as "this model has no imatrix".
+        (_unauthorized, "401 Unauthorized"),
+    ],
+)
+def test_upstream_resolution_failure_names_its_cause(monkeypatch, tmp_path, list_repo_files, expected):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.HfApi = type(
+        "FakeHfApi", (), {"__init__": lambda self, token=None: None, "list_repo_files": list_repo_files}
+    )
+    fake_hub.hf_hub_download = lambda **kwargs: pytest.fail("nothing to download")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    with pytest.raises(RuntimeError, match=expected):
+        llama_cpp.resolve_imatrix_file(
+            True, dest_dir=str(tmp_path / "dest"), repo_candidates=["unsloth/TestModel-GGUF"]
+        )
+
+
+def test_missing_imatrix_path_is_rejected(tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    with pytest.raises(FileNotFoundError):
+        llama_cpp.resolve_imatrix_file(str(tmp_path / "absent.dat"), dest_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "repo, expected",
+    [
+        ("unsloth/Qwen3.5-0.8B", ["unsloth/Qwen3.5-0.8B-GGUF"]),
+        ("Qwen/Qwen3.5-0.8B", ["unsloth/Qwen3.5-0.8B-GGUF"]),
+        ("unsloth/Qwen3.5-0.8B-GGUF", ["unsloth/Qwen3.5-0.8B-GGUF"]),
+        (None, []),
+        # A repackaged repo is tried verbatim first, then peeled one marker at a time down to the
+        # base the imatrix is published against. -MTP survives: it names a different model.
+        ("mlx-community/Llama-3.2-1B-Instruct-4bit",
+         ["unsloth/Llama-3.2-1B-Instruct-4bit-GGUF", "unsloth/Llama-3.2-1B-Instruct-GGUF"]),
+        ("mlx-community/Qwen3.5-2B-MLX-8bit",
+         ["unsloth/Qwen3.5-2B-MLX-8bit-GGUF", "unsloth/Qwen3.5-2B-MLX-GGUF",
+          "unsloth/Qwen3.5-2B-GGUF"]),
+        ("mlx-community/Qwen3.5-9B-MTP-4bit",
+         ["unsloth/Qwen3.5-9B-MTP-4bit-GGUF", "unsloth/Qwen3.5-9B-MTP-GGUF"]),
+        ("mlx-community/Qwen3-8B-4bit-AWQ",
+         ["unsloth/Qwen3-8B-4bit-AWQ-GGUF", "unsloth/Qwen3-8B-4bit-GGUF",
+          "unsloth/Qwen3-8B-GGUF"]),
+        ("some-org/Model-GPTQ-Int4",
+         ["unsloth/Model-GPTQ-Int4-GGUF", "unsloth/Model-GPTQ-GGUF", "unsloth/Model-GGUF"]),
+        ("unsloth/Qwen3-8B-unsloth-bnb-4bit",
+         ["unsloth/Qwen3-8B-unsloth-bnb-4bit-GGUF", "unsloth/Qwen3-8B-unsloth-bnb-GGUF",
+          "unsloth/Qwen3-8B-unsloth-GGUF", "unsloth/Qwen3-8B-GGUF"]),
+    ],
+)
+def test_imatrix_repo_candidates_map_onto_the_unsloth_gguf_namespace(repo, expected):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = types.SimpleNamespace(_hf_repo=repo)
+    assert mutils._gguf_imatrix_repo_candidates(model) == expected
+
+
+def test_imatrix_repo_candidates_fall_back_to_the_config_name(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    # A local checkpoint on its own names no upstream repo.
+    assert mutils._gguf_imatrix_repo_candidates(types.SimpleNamespace(_hf_repo=str(tmp_path))) == []
+
+    model = types.SimpleNamespace(
+        _hf_repo=None, config=types.SimpleNamespace(_name_or_path="Qwen/Qwen3.5-0.8B")
+    )
+    assert mutils._gguf_imatrix_repo_candidates(model) == ["unsloth/Qwen3.5-0.8B-GGUF"]
+
+    # Both sources contribute, in order, without duplicates.
+    model = types.SimpleNamespace(
+        _hf_repo="mlx-community/Qwen3.5-0.8B-4bit",
+        config=types.SimpleNamespace(_name_or_path="Qwen/Qwen3.5-0.8B"),
+    )
+    assert mutils._gguf_imatrix_repo_candidates(model) == [
+        "unsloth/Qwen3.5-0.8B-4bit-GGUF", "unsloth/Qwen3.5-0.8B-GGUF",
+    ]
+
+    # A local directory skips _hf_repo, and MLX keeps a text config as a dict, so _config is the
+    # only route left to the upstream repo.
+    model = types.SimpleNamespace(
+        _hf_repo=str(tmp_path), _config={"_name_or_path": "Qwen/Qwen3.5-0.8B"}
+    )
+    assert mutils._gguf_imatrix_repo_candidates(model) == ["unsloth/Qwen3.5-0.8B-GGUF"]
+
+
+@pytest.mark.parametrize(
+    "binding, target, destination, forwarded",
+    [
+        # The credential travels with the imatrix: resolving one reads a Hub repo.
+        ("_mlx_save_pretrained_gguf", "save_pretrained_gguf", "out",
+         {"imatrix_file": True, "token": "hf_token"}),
+        ("_mlx_push_to_hub_gguf", "push_to_hub_gguf", "org/model",
+         {"imatrix_file": "/path/to/imatrix.dat"}),
+    ],
+)
+def test_bound_gguf_apis_forward_imatrix_file(monkeypatch, tmp_path, binding, target, destination, forwarded):
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+    monkeypatch.setattr(
+        mutils,
+        target,
+        lambda model, tokenizer, save_directory, *rest, quantization_method=None, repo_id=None,
+        **kwargs: calls.update(kwargs),
+    )
+
+    destination = str(tmp_path) if destination == "out" else destination
+    model = types.SimpleNamespace(_tokenizer=object())
+    getattr(loader, binding)(model, destination, quantization_method="iq2_xxs", **forwarded)
+
+    assert calls == forwarded
+
+
+# Every binding that filters kwargs must name what it dropped, not just the GGUF save path.
+@pytest.mark.parametrize(
+    "binding, target, args",
+    [
+        ("_mlx_save_pretrained_gguf", "save_pretrained_gguf", ("out",)),
+        ("_mlx_save_pretrained_merged", "save_pretrained_merged", ("out",)),
+        ("_mlx_push_to_hub_gguf", "push_to_hub_gguf", ("org/model",)),
+        ("_mlx_push_to_hub", "save_pretrained_merged", ("org/model",)),
+    ],
+)
+def test_dropped_kwargs_are_announced(monkeypatch, tmp_path, binding, target, args):
+    import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setattr(mutils, target, lambda *a, **kw: None)
+    monkeypatch.setattr(mutils, "collect_mlx_lora_adapter_tensors", lambda model: {})
+    model = types.SimpleNamespace(_tokenizer=object())
+    args = tuple(str(tmp_path / a) if a == "out" else a for a in args)
+
+    with pytest.warns(UserWarning, match="maximum_memory_usage"):
+        getattr(loader, binding)(model, *args, maximum_memory_usage=0.5)

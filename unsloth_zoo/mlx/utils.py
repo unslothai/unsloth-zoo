@@ -39,6 +39,7 @@ import textwrap
 import numpy as np
 import os
 import random
+import re
 import sys
 import shutil
 import struct
@@ -14662,12 +14663,52 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+# Markers naming a repackaging rather than a different model; the imatrix is published against
+# the base, so they are stripped after the verbatim name has been tried. One per match, applied
+# repeatedly, so compounds like -unsloth-bnb-4bit peel all the way down.
+_REPACKAGED_MODEL_SUFFIX = re.compile(
+    r"-(?:\d+bit|int\d+|bf16|fp16|f16|fp8|mxfp4|mlx|awq|gptq|hqq|bnb|unsloth)$", re.IGNORECASE
+)
+
+
+def _gguf_imatrix_repo_candidates(model):
+    """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
+    repos = []
+    sources = (
+        getattr(model, "_hf_repo", None),
+        # Text models keep their config as a dict in _config; VLMs expose an object as .config.
+        _config_get(getattr(model, "_config", None), "_name_or_path"),
+        _config_get(getattr(model, "config", None), "_name_or_path"),
+    )
+    for raw in sources:
+        name = str(raw or "").strip()
+        if not name or os.path.isdir(name):
+            continue
+        if name.endswith("-GGUF"):
+            stems = [name]
+        else:
+            stem = name.split("/")[-1]
+            stems = [stem]
+            while True:
+                stripped = _REPACKAGED_MODEL_SUFFIX.sub("", stems[-1])
+                if stripped == stems[-1] or not stripped:
+                    break
+                stems.append(stripped)
+            stems = [f"unsloth/{s}-GGUF" for s in stems]
+        for repo in stems:
+            if repo not in repos:
+                repos.append(repo)
+    return repos
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
     save_directory,
     quantization_method="fast_quantized",
     first_conversion=None,
+    token=None,
+    imatrix_file=None,
 ):
     """Save LoRA-fused model in GGUF format for llama.cpp inference.
 
@@ -14692,18 +14733,22 @@ def save_pretrained_gguf(
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
+        token: HuggingFace token for reading the upstream imatrix.
+        imatrix_file: None = off; a path = that file; True = download the
+            upstream unsloth/<base>-GGUF imatrix. Quants that need one
+            whatever the model are refused up front (IMATRIX_REQUIRED_QUANTS);
+            the rest are left to llama.cpp.
     """
     from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
+        quant_requires_imatrix,
+        resolve_imatrix_file,
         check_llama_cpp,
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
-
-    save_directory = Path(save_directory)
-    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Map friendly names to llama.cpp quant types
     quant_map = {
@@ -14713,6 +14758,17 @@ def save_pretrained_gguf(
         None: "q8_0",
     }
     quant_type = quant_map.get(quantization_method, quantization_method)
+
+    # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
+    if quant_requires_imatrix(quant_type) and not imatrix_file:
+        raise RuntimeError(
+            f"Unsloth: '{quant_type}' cannot be quantized without an importance matrix. "
+            "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
+            "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+        )
+
+    save_directory = Path(save_directory)
+    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
@@ -14724,6 +14780,19 @@ def save_pretrained_gguf(
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
+
+    # llama-quantize below runs only when the target differs from the direct conversion; without
+    # it an imatrix has nothing to weight, so drop it rather than resolve an unusable one. The
+    # comparison is case-insensitive because the converter accepts either spelling.
+    target = str(quant_type).strip().lower()
+    if imatrix_file and (
+        target in ("bf16", "f16", "f32") or str(first_conversion).strip().lower() == target
+    ):
+        warnings.warn(
+            f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "
+            "so llama-quantize never runs."
+        )
+        imatrix_file = None
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
@@ -14737,6 +14806,15 @@ def save_pretrained_gguf(
 
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Before the merge so a bad path fails in seconds, and outside save_directory so the
+        # result is never mistaken for an exported model.
+        imatrix = resolve_imatrix_file(
+            imatrix_file,
+            dest_dir=os.path.join(tmp_dir, "imatrix"),
+            repo_candidates=_gguf_imatrix_repo_candidates(model),
+            token=token,
+        )
+
         tmp_path = Path(tmp_dir) / "merged"
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
@@ -14884,6 +14962,7 @@ def save_pretrained_gguf(
                 quant_type=quant_type,
                 quantizer_location=quantizer,
                 print_output=True,
+                imatrix=imatrix,
             )
             # Remove intermediate bf16 gguf to save space
             if os.path.exists(base_gguf) and base_gguf != final_gguf:
@@ -15052,6 +15131,7 @@ def push_to_hub_gguf(
     token=None,
     private=None,
     first_conversion=None,
+    imatrix_file=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -15066,6 +15146,7 @@ def push_to_hub_gguf(
         first_conversion: Optional intermediate GGUF dtype passed through to
             save_pretrained_gguf. Placed after the pre-existing arguments so
             positional callers keep their meaning.
+        imatrix_file: Importance matrix passed through to save_pretrained_gguf.
     """
     from huggingface_hub import HfApi
 
@@ -15078,6 +15159,8 @@ def push_to_hub_gguf(
         save_directory,
         quantization_method=quantization_method,
         first_conversion=first_conversion,
+        token=token,
+        imatrix_file=imatrix_file,
     )
 
     # Upload GGUF files
