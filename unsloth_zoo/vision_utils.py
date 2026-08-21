@@ -726,6 +726,15 @@ def _resolve_processor_model_name(processor, model = None):
     return "this model"
 
 
+def _merge_chat_template_kwargs(base_kwargs, example=None):
+    merged = dict(base_kwargs or {})
+    if isinstance(example, dict):
+        example_kwargs = example.get("chat_template_kwargs")
+        if example_kwargs:
+            merged.update(example_kwargs)
+    return merged
+
+
 def _raise_chat_template_error(error, processor, model = None):
     """Turn an apply_chat_template failure into an actionable Unsloth error (usually a base
     checkpoint whose processor has no chat template)."""
@@ -757,6 +766,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "chat_template_kwargs",
     )
 
     def __init__(
@@ -779,6 +789,7 @@ class UnslothVisionDataCollator:
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
+        chat_template_kwargs = None,
     ):
         if not hasattr(processor, "image_processor"):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
@@ -791,6 +802,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
@@ -923,6 +935,15 @@ class UnslothVisionDataCollator:
             self.padding_token_ids = self.padding_token_ids.to(device)
         return self.padding_token_ids
 
+    def _chat_template_kwargs_for(self, example=None):
+        return _merge_chat_template_kwargs(self.chat_template_kwargs, example)
+
+    def _apply_chat_template(self, messages, example=None, **kwargs):
+        return self.processor.apply_chat_template(
+            messages,
+            **{**self._chat_template_kwargs_for(example), **kwargs},
+        )
+
     def __call__(self, examples):
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
@@ -948,8 +969,9 @@ class UnslothVisionDataCollator:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
 
-            message = self.processor.apply_chat_template(
+            message = self._apply_chat_template(
                 messages,
+                example = example,
                 tokenize = False,
                 add_generation_prompt = False,
             )
@@ -1065,9 +1087,13 @@ class UnslothVisionDataCollator:
                         message["content"] = content[0]["text"]
         return messages
 
-    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
-        return self.processor.apply_chat_template(
-            prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
+    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False, example=None):
+        return self._apply_chat_template(
+            prompt_messages + (completion_messages or []),
+            example = example,
+            tokenize = False,
+            add_generation_prompt = add_generation_prompt,
+            continue_final_message = continue_final_message,
         )
 
     def _extract_images_videos_for_example(self, example, messages):
@@ -1434,7 +1460,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
-                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
 
@@ -1443,7 +1469,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
                 c = self._clean_none_keys(c)
-                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
+                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # some models append common template items so this removes them.
                 # see trl/data_utils.py
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
