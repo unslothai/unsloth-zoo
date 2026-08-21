@@ -8125,3 +8125,34 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+
+def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
+    """The single-process retry is exercised for real in
+    tests/test_mlx_training_e2e_metal.py; its DDP twin needs a distributed group no
+    unit test here can raise, so both are pinned by structure instead.
+    """
+    import inspect
+    import re
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    source = inspect.getsource(MLXTrainer._train_inner)
+    captures = source.count("= _mlx_rng_key()")
+    restores = source.count("_restore_mlx_rng_key(rng_state_before)")
+    assert captures == 2 and restores == 2, (
+        f"expected both compile fallbacks to capture and restore, "
+        f"found {captures} captures and {restores} restores"
+    )
+
+    # Both branches announce themselves with this line, so it locates the two
+    # runtime fallbacks without matching the eager paths chosen up front.
+    announcements = [
+        m.end() for m in re.finditer(r"mx\.compile failed at runtime", source)
+    ]
+    assert len(announcements) == 2
+    for announced in announcements:
+        branch = source[announced - 400 : source.index("step_fn(", announced)]
+        assert "_restore_mlx_rng_key(rng_state_before)" in branch, (
+            "an eager fallback re-runs the step without rewinding the RNG"
+        )
