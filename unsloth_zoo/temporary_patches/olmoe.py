@@ -112,26 +112,13 @@ def patch_olmoe_moe():
 
     # Deterministic grouped_mm layout for the square-dims arch (#849): model_type on
     # the class routes preprocess_weight through the registry instead of shape
-    # inference, which is ambiguous for OLMoE's square gate_up.
+    # inference, which is ambiguous for OLMoE's square gate_up. (Since #913 the
+    # sibling vote resolves it from the non-square down_proj as well; the explicit
+    # registration keeps the layout deterministic and covers a forward with no
+    # readable sibling.)
     OlmoeExperts._unsloth_model_type = "olmoe"
     if get_weight_preprocessor("olmoe") is None:
         register_weight_preprocessor("olmoe", _olmoe_weight_preprocessor)
-
-    # get_forward_moe_backend() prefers the unsloth_compiled_cache copy of moe_utils —
-    # a distinct module object with its own (empty) _WEIGHT_PREPROCESSORS, where the
-    # package registration above is invisible and square gate_up falls back to shape
-    # inference (#849). Register through the executing namespace's own API as well.
-    forward_backend = get_forward_moe_backend()
-    backend_ns = getattr(forward_backend, "__globals__", None) or {}
-    ns_get = backend_ns.get("get_weight_preprocessor")
-    ns_register = backend_ns.get("register_weight_preprocessor")
-    if (
-        callable(ns_get)
-        and callable(ns_register)
-        and ns_get is not get_weight_preprocessor
-        and ns_get("olmoe") is None
-    ):
-        ns_register("olmoe", _olmoe_weight_preprocessor)
 
     _olmoe_lora_extractor = _make_olmoe_moe_lora_extractor()
     OlmoeExperts._unsloth_lora_extractor_fn = staticmethod(_olmoe_lora_extractor)
@@ -142,7 +129,7 @@ def patch_olmoe_moe():
     # signature (or postpones annotations into strings), patch_function returns False — in
     # that case the native forward would still crash on 4-bit (#850), so say why loudly and
     # leave the sentinel unset instead of recording success that didn't happen.
-    if not patch_function(OlmoeExperts, "forward", forward_backend):
+    if not patch_function(OlmoeExperts, "forward", get_forward_moe_backend()):
         print(
             "Unsloth: could not install the MoE forward on OlmoeExperts (signature "
             "drift in this transformers version?). OLMoE load_in_4bit will crash on "
