@@ -1030,6 +1030,12 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
         ("vision_tower.weight", "model.vision_tower.weight"),
         ("embed_audio.weight", "model.embed_audio.weight"),
         ("embed_vision.weight", "model.embed_vision.weight"),
+        # The projector shares the encoder's namespace; a converter that takes only the
+        # canonical name drops it, and the mmproj it writes then holds the encoder alone
+        # and is refused at load for the missing projector tensor.
+        ("vision_adapter.fc1.weight", "model.vision_adapter.fc1.weight"),
+        ("vision_adapter.fc2.weight", "model.vision_adapter.fc2.weight"),
+        ("vision_projection.weight", "model.vision_projection.weight"),
     ],
 )
 def test_vlm_gguf_candidates_prefer_canonical_model_namespace(mlx_name, hf_name):
@@ -1808,6 +1814,7 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
             f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
         )
         output.write_bytes(b"GGUF")
+        return [str(output)], False
 
     monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
     monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
@@ -1855,6 +1862,12 @@ def test_save_pretrained_gguf_anchors_patcher_to_checked_llama_cpp_root(
     assert calls["convert_config"]["unsloth_fixed_mtp"] is True
     assert (out / "TestModel.F16.gguf").read_bytes() == b"GGUF"
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == old_scripts_dir
+
+
+def _write_single_gguf(path):
+    """An unsplit conversion, in convert_to_gguf's (files, is_vlm) return shape."""
+    Path(path).write_bytes(b"GGUF")
+    return [str(path)], False
 
 
 @pytest.mark.parametrize(
@@ -1927,9 +1940,9 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
     )
     monkeypatch.setattr(
         llama_cpp, "convert_to_gguf",
-        lambda **kw: Path(
+        lambda **kw: _write_single_gguf(
             f"{kw['model_name']}.{kw['quantization_type'].upper()}.gguf"
-        ).write_bytes(b"GGUF"),
+        ),
     )
     monkeypatch.setattr(llama_cpp, "quantize_gguf", lambda **kw: None)
 
