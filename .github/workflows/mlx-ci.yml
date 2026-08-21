@@ -88,6 +88,11 @@ jobs:
         # Real-runtime routed LoRA training and adapter lifecycle coverage.
         run: python -m pytest tests/test_mlx_switch_lora.py -v -rs
 
+      - name: tests/test_mlx_save_over_source.py
+        # Saving safetensors back over the file they were loaded from. mlx 0.32.1
+        # made that fail, which is what took this job red on 2026-08-18.
+        run: python -m pytest tests/test_mlx_save_over_source.py -v -rs
+
       - name: tests/test_qwen35_vjp_metal.py
         # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
         run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rs
