@@ -332,6 +332,48 @@ def test_the_corrected_config_is_re_uploaded_when_pushing():
     )
 
 
+def test_the_mxfp4_rewrite_counts_a_seeded_head(tmp_path):
+    """An mxfp4 base with save_method='merged_16bit' routes to _merge_and_overwrite_lora_mxfp4,
+    whose every `count += 1` was gated on lora_A. A seeded head has no lora_A, so it counted
+    zero there while the Step-7 `_count_backed_lora_modules` counted it as backed, and the
+    export aborted on the count mismatch. The dense path has always had this branch.
+    """
+    import collections
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import LoraStats, _merge_and_overwrite_lora_mxfp4
+
+    head = torch.full((3, 4), 0.5)
+
+    class _Saved(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            linear = torch.nn.Linear(4, 3, bias=False)
+            with torch.no_grad():
+                linear.weight.copy_(head)
+            self.modules_to_save = torch.nn.ModuleDict({"default": linear})
+
+    stats = LoraStats(None, None, None, 0)
+    stats.module = _Saved()
+    lora_weights = collections.defaultdict(lambda: None)
+    lora_weights["score"] = stats
+
+    # A 16-bit tensor coexisting with the mxfp4 pair is exactly where a seeded head lands.
+    fname = "model.safetensors"
+    save_file({"score.weight": torch.zeros(3, 4, dtype=torch.bfloat16)},
+              str(tmp_path / fname), metadata={"format": "pt"})
+
+    count, keys = _merge_and_overwrite_lora_mxfp4(
+        save_directory=str(tmp_path), filename=fname, lora_weights=lora_weights,
+        output_dtype=torch.bfloat16, model_class_name="LlamaForSequenceClassification",
+    )
+    assert count == 1, (
+        f"the mxfp4 rewrite counted {count} saved modules for one modules_to_save head; "
+        "Step-7 would see one more backed module than saved and abort the export"
+    )
+    written = H.read_safetensors_dir(str(tmp_path))["score.weight"]
+    assert torch.equal(written.float(), head), "the trained head was not written"
+
+
 def test_appending_to_a_shard_leaves_the_existing_tensors_byte_identical(tmp_path):
     """`_stream_rewrite_resized_shard` gained an append path; the copy path must not move."""
     from safetensors.torch import save_file

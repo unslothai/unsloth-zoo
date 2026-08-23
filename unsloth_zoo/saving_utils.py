@@ -2226,6 +2226,23 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     count += 1
                     W = _merge_lora(W, lora_stats, output_key)
                     action_logged = True
+            elif (W is not None and lora_stats is not None and not action_logged
+                  and getattr(lora_stats, "lora_A", None) is None
+                  and getattr(lora_stats, "module", None) is not None):
+                # modules_to_save with no LoRA delta, e.g. a seeded classification head. The
+                # dense path writes and counts these; without the same branch here the Step-7
+                # check sees one more backed module than were saved and the export aborts.
+                saved_weight = _get_modules_to_save_weight(lora_stats.module)
+                if saved_weight is None and hasattr(lora_stats.module, "weight"):
+                    saved_weight = lora_stats.module.weight
+                if saved_weight is not None:
+                    W = saved_weight.to(
+                        W.device,
+                        dtype = output_dtype if output_dtype is not None else W.dtype,
+                        non_blocking = True,
+                    )
+                    count += 1
+                    action_logged = True
 
             if W is None:
                 continue
