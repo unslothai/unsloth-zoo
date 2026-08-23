@@ -2877,6 +2877,62 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _text_configs(config):
+    # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
+    # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
+    holders = []
+    try: holders.append(config.get_text_config())
+    except Exception: pass
+    holders.append(getattr(config, "text_config", None))
+    seen = []
+    for holder in holders:
+        if holder is not None and not any(holder is s for s in seen): seen.append(holder)
+    return seen
+pass
+
+
+def _config_vocab_size(config):
+    # Nested first: a composite can carry both, and `resize_token_embeddings` updates only the
+    # nested one (PaliGemma leaves a stale top-level copy that would read as "no resize").
+    for holder in _text_configs(config):
+        if holder is config: continue
+        vocab_size = getattr(holder, "vocab_size", None)
+        if vocab_size is not None: return vocab_size
+    pass
+    return getattr(config, "vocab_size", None)
+pass
+
+
+def _carry_over_vocab_size(base_config, trained_config):
+    # The merge writes the trained (possibly resized) embeddings, so the base checkpoint's own
+    # `vocab_size` would rebuild smaller layers and fail the reload. Only the text vocab moves.
+    trained_vocab_size = _config_vocab_size(trained_config)
+    if trained_vocab_size is None: return
+    holders = [h for h in _text_configs(base_config) if h is not base_config]
+    base_vocab_size = getattr(base_config, "vocab_size", None)
+    # A top level mirroring the text vocab is a compatibility copy and moves with it (PaliGemma).
+    # One that differs is a DIFFERENT vocabulary: Ovis2 ships 151643 against a text 151936 and
+    # sizes its lm_head from the top level, so writing there breaks the reload this protects.
+    if base_vocab_size is not None and all(
+        getattr(holder, "vocab_size", base_vocab_size) == base_vocab_size for holder in holders
+    ):
+        holders.append(base_config)
+    for holder in holders:
+        if getattr(holder, "vocab_size", None) is None: continue
+        try: holder.vocab_size = trained_vocab_size
+        except Exception: pass  # read-only on some composite configs
+    pass
+    # Never silently ship a config that disagrees with the rows we are about to write.
+    if _config_vocab_size(base_config) != trained_vocab_size:
+        warnings.warn(
+            f"Unsloth: could not set vocab_size={trained_vocab_size} on the base config of "
+            f"`{getattr(base_config, 'model_type', '?')}`; the exported config may not match "
+            f"the embedding rows written."
+        )
+    pass
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3214,7 +3270,27 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config.save_pretrained(save_directory)
+        # `config` is `model.config`, already the nested text config under `text_only = True`,
+        # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
+        # a text-only config beside VLM weights and every tensor was silently re-initialized on
+        # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
+        from transformers import AutoConfig
+        try:
+            base_config = AutoConfig.from_pretrained(
+                model_name,
+                token = token,
+                trust_remote_code = False,
+            )
+        except Exception as base_config_error:
+            warnings.warn(
+                f"Unsloth: Could not read the base config from `{model_name}` "
+                f"({base_config_error}). Falling back to the in-memory config, which might not "
+                f"describe the exported weights (see #969)."
+            )
+            base_config = config
+        else:
+            _carry_over_vocab_size(base_config, config)
+        base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.
@@ -3230,7 +3306,7 @@ def merge_and_overwrite_lora(
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
             model_name,
-            token = None,
+            token = token,  # was None, which cannot read a gated or private base
             trust_remote_code = False,
         )
         model_config.save_pretrained(save_directory)
