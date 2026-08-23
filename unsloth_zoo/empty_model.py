@@ -573,6 +573,20 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     return new_model, original_meta_model, num_layers, layer_names
 
 
+def _set_module_attribute(root, path, value):
+    """ Assigns `value` at a dotted module path, e.g. `visual.blocks.0.norm.weight` """
+    parts = path.split(".")
+    obj = root
+    for part in parts[:-1]:
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    last = parts[-1]
+    if last.isdigit():
+        obj[int(last)] = value
+    else:
+        setattr(obj, last, value)
+pass
+
+
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
     def _unwrap_tensor(val):
@@ -667,17 +681,29 @@ def set_additional_modules(new_model, quant_state_dict, config):
     print(f'Performing substitution for {additional_keys=}')
 
     for key in additional_keys:
-        # May live under new_model.model. instead of new_model.
-        for prefix in ['new_', 'new_model.']:
+        val = quant_state_dict[key]
+        val = _unwrap_tensor(val)
+        if isinstance(val, torch.Tensor):
+            val = torch.nn.Parameter(val, requires_grad = False)
+        # May live under new_model.model. instead of new_model. Keys arrive as
+        # dotted module paths, so walk them instead of exec-ing an assignment:
+        # exec cannot express numeric indices (blocks.0.weight) and a failed
+        # walk here is reported rather than swallowed.
+        candidates = []
+        if key.startswith("model."):
+            candidates.append(key[len("model."):])
+        candidates.append(key)
+        errors = []
+        for path in candidates:
             try:
-                val = quant_state_dict[key]
-                val = _unwrap_tensor(val)
-                if isinstance(val, torch.Tensor):
-                    val = torch.nn.Parameter(val,requires_grad=False)
-                exec(f"{prefix}{key} = val")
+                _set_module_attribute(new_model, path, val)
                 break
-            except:
-                continue
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exception:
+                errors.append(f"{path}: {exception}")
+        else:
+            logger.warning(
+                f"Unsloth: could not set `{key}` on the model - tried {', '.join(errors)}"
+            )
 
     pass
 pass

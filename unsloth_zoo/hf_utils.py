@@ -215,6 +215,10 @@ def get_transformers_model_type(config, trust_remote_code=False):
         model_type = model_type.replace("-", "_")
         model_type = model_type.replace("/", "_")
         model_type = model_type.replace(".", "_")
+        # model_type is interpolated into an import path, so reject anything
+        # that is not a plain module name
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
         final_model_types.append(model_type)
     final_model_types = sorted(final_model_types)
 
