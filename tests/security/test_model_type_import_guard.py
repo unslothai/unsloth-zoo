@@ -3,16 +3,13 @@
 
 """`model_type` comes off a downloaded config.json and is interpolated into code.
 
-`unsloth_compile_transformers` builds `transformers.models.{model_type}.modeling_{model_type}`
-and imports it, and `create_new_function` builds the compiled-cache filename
-`unsloth_compiled_module_{model_type}.py` from the same string. A config carrying
-`"model_type": "llama'); import os; os.system(...)"` therefore used to reach an
-`exec`. `get_transformers_model_type` now rejects anything that is not a plain
-module name, which is the single choke point: every caller in unsloth
-(`models/loader.py`) takes its `model_type` from this function.
+`unsloth_compile_transformers` imports `transformers.models.{model_type}.modeling_{model_type}`,
+and `create_new_function` names the compiled cache file from the same string, so a config
+carrying `"model_type": "llama'); import os; os.system(...)"` used to reach an `exec`.
+`get_transformers_model_type` is the single choke point every caller goes through.
 
-CPU-only and network-free - configs are stubs whose `to_dict` returns the payload,
-which is exactly how a trust_remote_code config surfaces an arbitrary model_type.
+CPU-only and network-free: a stub whose `to_dict` returns the payload is exactly how a
+trust_remote_code config surfaces an arbitrary model_type.
 """
 
 import re

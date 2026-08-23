@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`set_additional_modules` used to assign weights with
-`exec(f"{prefix}{key} = val")`, where prefix was "new_" or "new_model.".
+"""`set_additional_modules` used to assign weights via `exec(f"{prefix}{key} = val")`.
 
-That is a string trick: "new_" + "model.visual.x" spells `new_model.visual.x`, so
-the two candidates mean "key with the leading `model.` consumed" and "key as-is".
-The walk below keeps both candidates in the same order, and additionally handles
-numeric segments - `a.0.weight` is a syntax error for exec, so keys addressing a
-ModuleList entry were always silently skipped and their parameter left unset.
+The prefixes "new_" and "new_model." were a string trick: "new_" + "model.visual.x" spells
+`new_model.visual.x`, so they meant "key with the leading `model.` consumed" and "key as is".
+The walk keeps both candidates in that order and additionally handles numeric segments, since
+`a.0.weight` is a syntax error for exec and such keys were silently skipped.
 
 CPU-only and network-free.
 """

@@ -685,10 +685,9 @@ def set_additional_modules(new_model, quant_state_dict, config):
         val = _unwrap_tensor(val)
         if isinstance(val, torch.Tensor):
             val = torch.nn.Parameter(val, requires_grad = False)
-        # May live under new_model.model. instead of new_model. Keys arrive as
-        # dotted module paths, so walk them instead of exec-ing an assignment:
-        # exec cannot express numeric indices (blocks.0.weight) and a failed
-        # walk here is reported rather than swallowed.
+        # May live under new_model.model. instead of new_model. Walking the dotted
+        # path beats exec: exec cannot express blocks.0.weight, and a failure here
+        # is reported instead of swallowed.
         candidates = []
         if key.startswith("model."):
             candidates.append(key[len("model."):])
