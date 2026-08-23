@@ -8968,6 +8968,49 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+# Problem kinds already reported, so an unsupported key layout costs one message
+# per process rather than one per training step. Both trainer captures sit inside
+# the per-batch loop, so without this a run that is otherwise fine emits a warning
+# per batch. Keyed on the kind and not the rendered text: the message interpolates
+# the offending word, so a value that changes between draws would defeat both the
+# `warnings` registry and the stderr fallback below, which has no registry at all.
+# A plain set is enough here; two threads racing costs a duplicate message, never
+# a lost one.
+_reported_unrewindable_keys = set()
+
+
+def _warn_unrewindable_key(kind, message):
+    """Report a key we cannot rewind, at most once per kind, without ever raising.
+
+    Every caller reads the key *before* entering the `try` that a raise here
+    would land in: both trainer captures sit above their compile-fallback
+    `try`, and `_preserved_preprocessing_rng` captures before it yields. This
+    path is documented as declining rather than failing, so under
+    `PYTHONWARNINGS=error` (or any filter promoting RuntimeWarning) the
+    diagnostic must not become the abort it is warning about.
+
+    Not `catch_warnings` + `simplefilter`: that mutates a process-global filter
+    list, and MLX training runs these paths from more than one thread, where it
+    would briefly disarm another thread's warnings-as-errors. Falling back to
+    stderr keeps the message instead of swallowing it.
+    """
+    if kind in _reported_unrewindable_keys:
+        return
+    _reported_unrewindable_keys.add(kind)
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel = 3)
+    except Exception:
+        # A filter promoted the warning, so say it on stderr rather than lose it.
+        # Guarded too, though: stderr can be closed (a daemonised Studio backend,
+        # or a test runner tearing down its capture) or a stream whose write
+        # raises, and this helper is called ABOVE the `try` that would contain
+        # such a raise. An unreportable diagnostic must not become the abort.
+        try:
+            print(message, file = sys.stderr)
+        except Exception:
+            pass
+
+
 def _mlx_rng_key():
     """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
 
@@ -8982,19 +9025,45 @@ def _mlx_rng_key():
     except Exception:
         return None
     if len(words) != 2:
-        warnings.warn(
+        _warn_unrewindable_key(
+            "word-count",
             f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
             "can only rewind the two-word form, so a run that falls back from "
             "mx.compile to eager will not have its RNG restored and may diverge "
-            "from an eager run of the same seed.",
-            RuntimeWarning,
-            stacklevel = 2,
+            "from an eager run of the same seed."
         )
         return None
-    # Masked, not just converted: mx.random.seed takes a uint64 and raises
-    # outside [0, 2**64), and that raise would land in a `finally` or a
-    # compile-failure handler. A no-op for real uint32 keys.
-    return (int(words[0]) & 0xFFFFFFFF, int(words[1]) & 0xFFFFFFFF)
+    return _as_uint32_pair(int(words[0]), int(words[1]))
+
+
+def _as_uint32_pair(high, low):
+    """Both words as uint32, or None if either is not a 32-bit word at all.
+
+    mx.random.seed takes a uint64 and raises outside [0, 2**64), and that raise
+    would land in a `finally` or a compile-failure handler. Range-checking here
+    is what lets the restore below stay unguarded.
+
+    Range-checked rather than masked, though. A negative reads as the two's
+    complement of the uint32 mlx stores, so reinterpreting it loses nothing. A
+    value at or above 2**32 is not a 32-bit word under any reading, and masking
+    it would turn a key we cannot represent into a plausible wrong one:
+    (2**32, 0) would restore as (0, 0), so the fallback would look like it had
+    rewound the RNG while actually diverging. Declining says so instead, and is
+    the outcome every caller already handles.
+    """
+    converted = []
+    for word in (high, low):
+        if not -(2**31) <= word < 2**32:
+            _warn_unrewindable_key(
+                "word-range",
+                f"Unsloth: MLX exposed a random key word of {word}, which is not "
+                "a 32-bit word. Unsloth cannot rewind this key, so a run that "
+                "falls back from mx.compile to eager will not have its RNG "
+                "restored and may diverge from an eager run of the same seed."
+            )
+            return None
+        converted.append(word & 0xFFFFFFFF)
+    return (converted[0], converted[1])
 
 
 def _restore_mlx_rng_key(words):
@@ -9003,15 +9072,16 @@ def _restore_mlx_rng_key(words):
     mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
     Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
     key's own words restores it exactly over the whole unsigned 64-bit range.
-    Unguarded on purpose: the masking above removes the only way this can raise,
-    and a blanket ``except`` would be a failure indistinguishable from an
-    intentional no-op, which is the defect this fixes.
+    Unguarded on purpose: the range check in ``_as_uint32_pair`` removes the only
+    way this can raise, and a blanket ``except`` would be a failure
+    indistinguishable from an intentional no-op, which is the defect this fixes.
     """
     if words is None:
         return
-    high = int(words[0]) & 0xFFFFFFFF
-    low = int(words[1]) & 0xFFFFFFFF
-    mx.random.seed((high << 32) | low)
+    pair = _as_uint32_pair(int(words[0]), int(words[1]))
+    if pair is None:
+        return
+    mx.random.seed((pair[0] << 32) | pair[1])
 
 
 @contextlib.contextmanager
