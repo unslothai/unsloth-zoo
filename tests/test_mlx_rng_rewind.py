@@ -49,8 +49,12 @@ _SPLIT_KEY_SEED = 0xFEDCBA9876543210
 class _NoItemAssignment:
     """``mx.random.state`` as mlx >= 0.32.1 exposes it: readable, not writable."""
 
-    def __init__(self, words = None):
+    def __init__(self, words = None, dtype = None):
         self._words = words
+        # uint32 is what mlx stores today. A wider dtype is the only way a word
+        # outside the 32-bit range can reach the capture at all, and is what a
+        # future upstream key layout would look like from here.
+        self._dtype = dtype
 
     def __len__(self):
         return 1
@@ -60,7 +64,7 @@ class _NoItemAssignment:
             raise IndexError("random state index out of range")
         if self._words is None:
             return mx.random.key(_SPLIT_KEY_SEED)
-        return mx.array(list(self._words), dtype = mx.uint32)
+        return mx.array(list(self._words), dtype = self._dtype or mx.uint32)
 
     def __iter__(self):
         return iter([self[0]])
@@ -170,24 +174,50 @@ def test_shadowing_the_state_does_not_outlive_the_test():
     _draw()
 
 
-@pytest.mark.parametrize("words", [
-    (-1, -2), (-2147483648, 5), (0, -1), (2**32, 0), (0, 2**32),
-])
-def test_restore_normalises_words_outside_the_unsigned_32_bit_range(words):
+@pytest.mark.parametrize("words", [(-1, -2), (-2147483648, 5), (0, -1)])
+def test_restore_reinterprets_signed_words(words):
     """`mx.random.seed` takes a uint64 and hard-raises outside [0, 2**64).
 
     The restore is unguarded on purpose, since a blanket `except` would be a
     failure indistinguishable from an intentional no-op. That holds only if the
-    words cannot put it out of range, and capture no longer type-checks the
-    state, so the masking is what makes "cannot raise" true. A raise would land
-    in `_preserved_preprocessing_rng`'s `finally`, or replace the compile error
-    a fallback is recovering from.
+    words cannot put it out of range, and capture does not type-check the state,
+    so this conversion is what makes "cannot raise" true. A raise would land in
+    `_preserved_preprocessing_rng`'s `finally`, or replace the compile error a
+    fallback is recovering from.
+
+    A negative word is the two's complement of the uint32 mlx stores, so
+    reinterpreting it is lossless and the round trip must survive it.
     """
     _restore_mlx_rng_key(words)
     assert _mlx_rng_key() == (words[0] & 0xFFFFFFFF, words[1] & 0xFFFFFFFF)
 
 
-def test_capture_masks_a_state_whose_words_are_not_unsigned():
+@pytest.mark.parametrize("words", [
+    (2**32, 0), (0, 2**32), (2**62, 1), (-(2**31) - 1, 0), (0, -(2**40)),
+])
+def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
+    """Masking these would be worse than declining them.
+
+    (2**32, 0) masks to (0, 0), so a key that cannot be represented becomes a
+    plausible wrong one and a compile fallback looks like it rewound the RNG
+    while actually diverging. Declining is the outcome every caller already
+    handles, and it is the only one that says so out loud.
+    """
+    _restore_mlx_rng_key((0, 0))
+    before = _mlx_rng_key()
+
+    with _shadowing_random_state(_NoItemAssignment(words, dtype = mx.int64)):
+        with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
+            assert _mlx_rng_key() is None
+
+    # Restore is total: a caller that hands it these words directly must get a
+    # no-op and a warning, never a raise into a `finally` and never a wrong key.
+    with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
+        _restore_mlx_rng_key(words)
+    assert _mlx_rng_key() == before
+
+
+def test_capture_reinterprets_a_state_whose_words_are_not_unsigned():
     with _shadowing_random_state(_NoItemAssignment((0xFFFFFFFF, 0xFFFFFFFE))):
         words = _mlx_rng_key()
     assert words == (0xFFFFFFFF, 0xFFFFFFFE)

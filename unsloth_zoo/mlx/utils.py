@@ -8991,10 +8991,38 @@ def _mlx_rng_key():
             stacklevel = 2,
         )
         return None
-    # Masked, not just converted: mx.random.seed takes a uint64 and raises
-    # outside [0, 2**64), and that raise would land in a `finally` or a
-    # compile-failure handler. A no-op for real uint32 keys.
-    return (int(words[0]) & 0xFFFFFFFF, int(words[1]) & 0xFFFFFFFF)
+    return _as_uint32_pair(int(words[0]), int(words[1]))
+
+
+def _as_uint32_pair(high, low):
+    """Both words as uint32, or None if either is not a 32-bit word at all.
+
+    mx.random.seed takes a uint64 and raises outside [0, 2**64), and that raise
+    would land in a `finally` or a compile-failure handler. Range-checking here
+    is what lets the restore below stay unguarded.
+
+    Range-checked rather than masked, though. A negative reads as the two's
+    complement of the uint32 mlx stores, so reinterpreting it loses nothing. A
+    value at or above 2**32 is not a 32-bit word under any reading, and masking
+    it would turn a key we cannot represent into a plausible wrong one:
+    (2**32, 0) would restore as (0, 0), so the fallback would look like it had
+    rewound the RNG while actually diverging. Declining says so instead, and is
+    the outcome every caller already handles.
+    """
+    converted = []
+    for word in (high, low):
+        if not -(2**31) <= word < 2**32:
+            warnings.warn(
+                f"Unsloth: MLX exposed a random key word of {word}, which is not "
+                "a 32-bit word. Unsloth cannot rewind this key, so a run that "
+                "falls back from mx.compile to eager will not have its RNG "
+                "restored and may diverge from an eager run of the same seed.",
+                RuntimeWarning,
+                stacklevel = 3,
+            )
+            return None
+        converted.append(word & 0xFFFFFFFF)
+    return (converted[0], converted[1])
 
 
 def _restore_mlx_rng_key(words):
@@ -9003,15 +9031,16 @@ def _restore_mlx_rng_key(words):
     mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
     Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
     key's own words restores it exactly over the whole unsigned 64-bit range.
-    Unguarded on purpose: the masking above removes the only way this can raise,
-    and a blanket ``except`` would be a failure indistinguishable from an
-    intentional no-op, which is the defect this fixes.
+    Unguarded on purpose: the range check in ``_as_uint32_pair`` removes the only
+    way this can raise, and a blanket ``except`` would be a failure
+    indistinguishable from an intentional no-op, which is the defect this fixes.
     """
     if words is None:
         return
-    high = int(words[0]) & 0xFFFFFFFF
-    low = int(words[1]) & 0xFFFFFFFF
-    mx.random.seed((high << 32) | low)
+    pair = _as_uint32_pair(int(words[0]), int(words[1]))
+    if pair is None:
+        return
+    mx.random.seed((pair[0] << 32) | pair[1])
 
 
 @contextlib.contextmanager
