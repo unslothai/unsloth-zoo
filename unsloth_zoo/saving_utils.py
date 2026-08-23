@@ -2878,10 +2878,9 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
 def _config_vocab_size(config):
-    # VLM configs keep the text vocab on the nested text config, plain LM configs at the top level.
-    # Some composite configs carry both, and `resize_token_embeddings` only updates the nested one
-    # (PaliGemma leaves its top-level compatibility `vocab_size` behind), so the nested value wins:
-    # reading a stale top-level size would look like "no resize happened".
+    # Nested first: composite configs can carry both, and `resize_token_embeddings` updates
+    # only the nested one (PaliGemma leaves its top-level copy behind), so reading a stale
+    # top level would look like "no resize happened".
     vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     if vocab_size is None:
         vocab_size = getattr(config, "vocab_size", None)
@@ -2890,18 +2889,24 @@ pass
 
 
 def _carry_over_vocab_size(base_config, trained_config):
-    # `resize_token_embeddings`, or a `modules_to_save` embed_tokens / lm_head, grows the vocab and
-    # updates the in-memory config. The merge writes those expanded tensors, but a config read from
-    # the base checkpoint still carries the original `vocab_size`, which would rebuild smaller
-    # layers and fail the reload on a size mismatch. Carry the trained size across.
+    # The merge writes the trained (possibly resized) embeddings, so the base checkpoint's own
+    # `vocab_size` would rebuild smaller layers and fail the reload. Set every level the base
+    # already exposes, so a stale top-level copy cannot survive a nested-only resize.
     trained_vocab_size = _config_vocab_size(trained_config)
     if trained_vocab_size is None: return
-    if _config_vocab_size(base_config) == trained_vocab_size: return
-    if getattr(base_config, "vocab_size", None) is not None:
-        base_config.vocab_size = trained_vocab_size
-    text_config = getattr(base_config, "text_config", None)
-    if getattr(text_config, "vocab_size", None) is not None:
-        text_config.vocab_size = trained_vocab_size
+    for holder in (base_config, getattr(base_config, "text_config", None)):
+        if getattr(holder, "vocab_size", None) is None: continue
+        try: holder.vocab_size = trained_vocab_size
+        except Exception: pass  # read-only on some composite configs
+    pass
+    # Never silently ship a config that disagrees with the rows we are about to write.
+    if _config_vocab_size(base_config) != trained_vocab_size:
+        warnings.warn(
+            f"Unsloth: could not set vocab_size={trained_vocab_size} on the base config of "
+            f"`{getattr(base_config, 'model_type', '?')}`; the exported config may not match "
+            f"the embedding rows written."
+        )
+    pass
 pass
 
 
@@ -3242,12 +3247,11 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        # `config` is `model.config`, which is already the nested text config when the model was
-        # loaded with `text_only = True`. The weights below come from `model_name` (the resolved
-        # base checkpoint) and still carry the full VLM prefixes, so saving `config` here writes a
-        # text-only config beside VLM weights and every tensor is silently re-initialized on
-        # reload. Take the config from the same checkpoint the weights come from, matching what the
-        # `mxfp4` branch below already does.
+        # `config` is `model.config`, already the nested text config under `text_only = True`,
+        # while the weights come from `model_name` and keep their full VLM prefixes. Saving it
+        # wrote a text-only config beside VLM weights, and every tensor was then silently
+        # re-initialized on reload (#969). Read the config from the checkpoint the weights come
+        # from, as the `mxfp4` branch below already does.
         from transformers import AutoConfig
         try:
             base_config = AutoConfig.from_pretrained(
@@ -3259,7 +3263,7 @@ def merge_and_overwrite_lora(
             warnings.warn(
                 f"Unsloth: Could not read the base config from `{model_name}` "
                 f"({base_config_error}). Falling back to the in-memory config, which might not "
-                f"describe the exported weights."
+                f"describe the exported weights (see #969)."
             )
             base_config = config
         else:
@@ -3280,7 +3284,7 @@ def merge_and_overwrite_lora(
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
             model_name,
-            token = None,
+            token = token,  # was None, which cannot read a gated or private base
             trust_remote_code = False,
         )
         model_config.save_pretrained(save_directory)
