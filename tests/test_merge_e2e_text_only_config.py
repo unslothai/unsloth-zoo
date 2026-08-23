@@ -291,6 +291,33 @@ def test_carry_over_does_not_invent_fields():
     assert not hasattr(bare, "text_config")
 
 
+@pytest.mark.parametrize("family", ["qwen2_5_omni", "qwen3_omni_moe", "colqwen2", "t5gemma"])
+def test_carry_over_reaches_text_configs_not_named_text_config(family):
+    """Some composite configs nest the text section under another name, so `.text_config`
+    misses it entirely. `get_text_config()` is the documented accessor."""
+    import transformers as T
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size, _config_vocab_size
+
+    if not H.family_available(family):
+        pytest.skip(f"{family} unavailable in this transformers")
+    try:
+        base, trained = T.CONFIG_MAPPING[family](), T.CONFIG_MAPPING[family]()
+    except Exception as e:
+        pytest.skip(f"{family} will not instantiate bare: {type(e).__name__}")
+    if getattr(base, "text_config", None) is not None:
+        pytest.skip(f"{family} exposes .text_config on this version")
+
+    target = _config_vocab_size(trained)
+    if target is None:
+        pytest.skip(f"{family} has no vocab_size to carry")
+    target += 8
+    trained.get_text_config().vocab_size = target
+
+    assert _config_vocab_size(trained) == target, "nested vocab not read via get_text_config()"
+    _carry_over_vocab_size(base, trained)
+    assert base.get_text_config().vocab_size == target, "nested vocab not written"
+
+
 def test_carry_over_on_real_transformers_configs():
     """Guard the precedence against config classes rather than stand-ins."""
     import transformers as T

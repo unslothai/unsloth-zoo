@@ -2877,14 +2877,31 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _text_configs(config):
+    # Where a composite config keeps its text vocab. `get_text_config()` is the documented
+    # accessor and finds sections not named `text_config` (qwen2_5_omni, qwen3_omni_moe,
+    # colqwen2, t5gemma); it returns `config` itself for a plain LM.
+    holders = []
+    try: holders.append(config.get_text_config())
+    except Exception: pass
+    holders.append(getattr(config, "text_config", None))
+    seen = []
+    for holder in holders:
+        if holder is not None and not any(holder is s for s in seen): seen.append(holder)
+    return seen
+pass
+
+
 def _config_vocab_size(config):
     # Nested first: composite configs can carry both, and `resize_token_embeddings` updates
     # only the nested one (PaliGemma leaves its top-level copy behind), so reading a stale
     # top level would look like "no resize happened".
-    vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
-    if vocab_size is None:
-        vocab_size = getattr(config, "vocab_size", None)
-    return vocab_size
+    for holder in _text_configs(config):
+        if holder is config: continue
+        vocab_size = getattr(holder, "vocab_size", None)
+        if vocab_size is not None: return vocab_size
+    pass
+    return getattr(config, "vocab_size", None)
 pass
 
 
@@ -2894,7 +2911,7 @@ def _carry_over_vocab_size(base_config, trained_config):
     # already exposes, so a stale top-level copy cannot survive a nested-only resize.
     trained_vocab_size = _config_vocab_size(trained_config)
     if trained_vocab_size is None: return
-    for holder in (base_config, getattr(base_config, "text_config", None)):
+    for holder in [base_config] + _text_configs(base_config):
         if getattr(holder, "vocab_size", None) is None: continue
         try: holder.vocab_size = trained_vocab_size
         except Exception: pass  # read-only on some composite configs
