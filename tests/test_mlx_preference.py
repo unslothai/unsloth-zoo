@@ -1323,3 +1323,29 @@ def test_generation_prompt_rejects_a_budget_with_no_room():
             {"prompt": "p", "chosen": "", "rejected": ""},
             max_seq_length=8, max_new_tokens=8,
         )
+
+
+def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
+    """Three rows at batch_size 2 leave a one-pair tail. Weighting each batch
+    equally would give that tail the same say as the two pairs before it."""
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, make_preference_eval_fn,
+    )
+
+    options = dict(max_seq_length=64, num_epochs=1, grad_accum=1,
+                   preserve_dataset_order=True)
+    split = create_preference_batch_plan(
+        rows(3), Tokenizer(), batch_size=2, **options)
+    whole = create_preference_batch_plan(
+        rows(3), Tokenizer(), batch_size=3, **options)
+    assert len(split) == 2 and len(whole) == 1
+    model = TinyModel()
+    eval_fn = make_preference_eval_fn("dpo", beta=0.1, reference_free=True)
+    total, weight = 0.0, 0
+    for index in range(len(split)):
+        loss, pairs, _stats = eval_fn(model, *split[index])
+        total += float(loss) * int(pairs)
+        weight += int(pairs)
+    assert weight == 3, "every pair is weighted once"
+    assert math.isclose(total / weight, float(eval_fn(model, *whole[0])[0]),
+                        rel_tol=2e-5, abs_tol=2e-5)
