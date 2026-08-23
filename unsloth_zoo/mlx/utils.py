@@ -8968,6 +8968,27 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+def _warn_unrewindable_key(message):
+    """Report a key we cannot rewind, without ever raising.
+
+    Every caller reads the key *before* entering the `try` that a raise here
+    would land in: both trainer captures sit above their compile-fallback
+    `try`, and `_preserved_preprocessing_rng` captures before it yields. This
+    path is documented as declining rather than failing, so under
+    `PYTHONWARNINGS=error` (or any filter promoting RuntimeWarning) the
+    diagnostic must not become the abort it is warning about.
+
+    Not `catch_warnings` + `simplefilter`: that mutates a process-global filter
+    list, and MLX training runs these paths from more than one thread, where it
+    would briefly disarm another thread's warnings-as-errors. Falling back to
+    stderr keeps the message instead of swallowing it.
+    """
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel = 3)
+    except Exception:
+        print(message, file = sys.stderr)
+
+
 def _mlx_rng_key():
     """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
 
@@ -8982,13 +9003,11 @@ def _mlx_rng_key():
     except Exception:
         return None
     if len(words) != 2:
-        warnings.warn(
+        _warn_unrewindable_key(
             f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
             "can only rewind the two-word form, so a run that falls back from "
             "mx.compile to eager will not have its RNG restored and may diverge "
-            "from an eager run of the same seed.",
-            RuntimeWarning,
-            stacklevel = 2,
+            "from an eager run of the same seed."
         )
         return None
     return _as_uint32_pair(int(words[0]), int(words[1]))
@@ -9012,13 +9031,11 @@ def _as_uint32_pair(high, low):
     converted = []
     for word in (high, low):
         if not -(2**31) <= word < 2**32:
-            warnings.warn(
+            _warn_unrewindable_key(
                 f"Unsloth: MLX exposed a random key word of {word}, which is not "
                 "a 32-bit word. Unsloth cannot rewind this key, so a run that "
                 "falls back from mx.compile to eager will not have its RNG "
-                "restored and may diverge from an eager run of the same seed.",
-                RuntimeWarning,
-                stacklevel = 3,
+                "restored and may diverge from an eager run of the same seed."
             )
             return None
         converted.append(word & 0xFFFFFFFF)

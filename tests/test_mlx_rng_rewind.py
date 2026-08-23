@@ -29,6 +29,8 @@ never run on a pull request. The Linux CPU lane gates these on every push.
 import contextlib
 from types import SimpleNamespace
 
+import warnings
+
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -215,6 +217,26 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
     with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
         _restore_mlx_rng_key(words)
     assert _mlx_rng_key() == before
+
+
+@pytest.mark.parametrize("state,expect_words", [
+    ((2**32, 0), False),
+    ((1, 2, 3), False),
+])
+def test_warnings_as_errors_does_not_turn_declining_into_raising(state, expect_words):
+    """`PYTHONWARNINGS=error` must not promote the diagnostic into the abort.
+
+    Every caller reads the key before entering the `try` a raise would land in,
+    so a filter that turns RuntimeWarning into an exception would abort training
+    or preprocessing on exactly the path documented as declining safely.
+    """
+    dtype = mx.int64 if len(state) == 2 else mx.uint32
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with _shadowing_random_state(_NoItemAssignment(state, dtype = dtype)):
+            assert _mlx_rng_key() is None            # must not raise
+        _restore_mlx_rng_key(state[:2])              # must not raise either
+    assert expect_words is False
 
 
 def test_capture_reinterprets_a_state_whose_words_are_not_unsigned():
