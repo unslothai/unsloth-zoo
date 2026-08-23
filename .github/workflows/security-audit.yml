@@ -247,15 +247,26 @@ jobs:
         # requires unsloth and torch, so on the bare install this job has been
         # failing collection, and with it every push to main since 2026-08-22.
         #
-        # Mirrors the install in consolidated-tests-ci.yml's tests/security lane,
-        # which is why that copy of this gate is green. CPU torch from
-        # download.pytorch.org rather than the CUDA build on PyPI: the CUDA wheel is
-        # multiple GB and nothing here needs a device.
+        # CPU torch from download.pytorch.org rather than the CUDA build on PyPI:
+        # the CUDA wheel is multiple GB and nothing here needs a device.
+        #
+        # Deliberately NOT the `unsloth @ git+...@main` install that
+        # consolidated-tests-ci.yml's copy of this lane uses. This is a hard
+        # security gate: a mutable branch ref means any upstream commit changes
+        # what the gate runs without touching the revision under test, and a VCS
+        # operand runs that project's build backend at install time, inside the
+        # one job whose whole purpose is supply-chain hygiene. The env var below
+        # removes the need for it entirely.
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.4.0,<2.13.0"
           pip install -e .[core]
-          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main"
 
       - name: Run security regression tests
+        env:
+          # Skips the GPU/device init that ends in `find_spec("unsloth") is None
+          # -> ImportError`, which is the only reason this job would need unsloth
+          # present. tests/security exercises pure-Python guards, so nothing here
+          # touches what that init sets up.
+          UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
         run: python3 -m pytest tests/security -v
