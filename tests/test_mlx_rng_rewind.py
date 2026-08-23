@@ -101,9 +101,7 @@ def _draw_after_seed(seed):
     return _draw()
 
 
-# ---------------------------------------------------------------------------
-# Key arithmetic
-# ---------------------------------------------------------------------------
+# --- Key arithmetic ---
 
 @pytest.mark.parametrize("seed", [
     0, 1, 2**31 - 1, 2**31, 2**32 - 1, 2**32, 2**63 - 1, 2**63, 2**64 - 1,
@@ -147,8 +145,7 @@ def test_restore_works_where_the_state_refuses_item_assignment():
 
 
 def test_capture_reads_nothing_where_the_state_is_not_indexable():
-    # The torch simulation shim exposes a callable, which must stay a no-op
-    # rather than raise or reseed.
+    # The torch simulation shim's state is a callable: a no-op, not a raise.
     with _shadowing_random_state(lambda: {"counter": 0}):
         assert _mlx_rng_key() is None
 
@@ -221,9 +218,7 @@ def test_an_unreadable_state_does_not_warn():
             assert _mlx_rng_key() is None
 
 
-# ---------------------------------------------------------------------------
-# _preserved_preprocessing_rng
-# ---------------------------------------------------------------------------
+# --- _preserved_preprocessing_rng ---
 
 def test_preserved_preprocessing_rng_rewinds_the_mlx_key():
     mx.random.seed(99)
@@ -262,9 +257,7 @@ def test_preserved_preprocessing_rng_is_inert_when_the_state_is_unreadable():
                 raise KeyError("inner")
 
 
-# ---------------------------------------------------------------------------
-# Compile fallback
-# ---------------------------------------------------------------------------
+# --- Compile fallback ---
 
 class _TinyLM(nn.Module):
     def __init__(self):
@@ -394,10 +387,9 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
             node = parents[node]
             yield node
 
-    # Both restores must sit on a recovery branch and precede the eager retry
-    # there. The single-process fallback recovers inside `except`; the DDP one
-    # has to agree across ranks first and so recovers inside an `if` after the
-    # try, which is why the branch type is not pinned to one construct.
+    # Both restores must sit on a recovery branch and precede its eager retry.
+    # The branch type is not pinned: single-process recovers inside `except`,
+    # DDP inside an `if` after the try (it syncs ranks first).
     for restore in restores:
         recovery = [a for a in ancestors(restore)
                     if isinstance(a, (ast.ExceptHandler, ast.If))]
