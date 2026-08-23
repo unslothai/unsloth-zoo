@@ -241,13 +241,35 @@ def test_carry_over_nested_only_and_top_only():
     assert top_base.vocab_size == 72
 
 
-def test_carry_over_syncs_a_stale_base_level_that_already_agrees():
-    """Base ships inconsistent levels and the nested one already matches: the top level
-    must still be synced rather than left behind."""
+def test_carry_over_leaves_a_distinct_top_level_vocabulary_alone():
+    """A top level that already differs from the text vocab is a DIFFERENT vocabulary, not a
+    stale copy, so it must not be overwritten."""
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     base = _shape(top=64, nested=72)
-    _carry_over_vocab_size(base, _shape(nested=72))
-    assert (base.vocab_size, base.text_config.vocab_size) == (72, 72)
+    _carry_over_vocab_size(base, _shape(nested=80))
+    assert base.text_config.vocab_size == 80, "text vocab was not carried over"
+    assert base.vocab_size == 64, "a distinct top-level vocabulary was clobbered"
+
+
+def test_carry_over_preserves_ovis2_top_level_vocabulary():
+    """Ovis2 sizes its lm_head from the top-level vocab_size and ships it deliberately
+    different from text_config.vocab_size, so writing one value to both breaks the reload."""
+    import transformers as T
+    from unsloth_zoo.saving_utils import _carry_over_vocab_size
+
+    if not H.family_available("ovis2"):
+        pytest.skip("ovis2 unavailable in this transformers")
+    base, trained = T.CONFIG_MAPPING["ovis2"](), T.CONFIG_MAPPING["ovis2"]()
+    top_before = base.vocab_size
+    assert top_before != base.text_config.vocab_size, "fixture no longer has distinct levels"
+
+    _carry_over_vocab_size(base, trained)          # no resize at all
+    assert base.vocab_size == top_before, "no-resize carry-over moved the top-level vocab"
+
+    trained.text_config.vocab_size += 8
+    _carry_over_vocab_size(base, trained)
+    assert base.text_config.vocab_size == trained.text_config.vocab_size
+    assert base.vocab_size == top_before, "resize moved the lm_head vocabulary too"
 
 
 def test_carry_over_warns_instead_of_raising_when_vocab_is_read_only():

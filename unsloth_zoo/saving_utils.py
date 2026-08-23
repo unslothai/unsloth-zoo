@@ -2907,11 +2907,20 @@ pass
 
 def _carry_over_vocab_size(base_config, trained_config):
     # The merge writes the trained (possibly resized) embeddings, so the base checkpoint's own
-    # `vocab_size` would rebuild smaller layers and fail the reload. Set every level the base
-    # already exposes, so a stale top-level copy cannot survive a nested-only resize.
+    # `vocab_size` would rebuild smaller layers and fail the reload. Only the text vocab moves.
     trained_vocab_size = _config_vocab_size(trained_config)
     if trained_vocab_size is None: return
-    for holder in [base_config] + _text_configs(base_config):
+    holders = [h for h in _text_configs(base_config) if h is not base_config]
+    base_vocab_size = getattr(base_config, "vocab_size", None)
+    # A top level that already mirrors the text vocab is a compatibility copy and moves with it
+    # (PaliGemma). One that differs is a DIFFERENT vocabulary, not a stale copy: Ovis2 ships
+    # vocab_size=151643 against text_config.vocab_size=151936 and sizes its lm_head from the
+    # top level, so overwriting it there would break the very reload this protects.
+    if base_vocab_size is not None and all(
+        getattr(holder, "vocab_size", base_vocab_size) == base_vocab_size for holder in holders
+    ):
+        holders.append(base_config)
+    for holder in holders:
         if getattr(holder, "vocab_size", None) is None: continue
         try: holder.vocab_size = trained_vocab_size
         except Exception: pass  # read-only on some composite configs
