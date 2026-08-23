@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -16,11 +16,10 @@
 
 """The weight-preprocessor registry is one dict across every loaded copy of moe_utils.
 
-moe_utils.py copies itself into unsloth_compiled_cache at import, and
-get_forward_moe_backend() prefers the forward from that copy, a separate module object
-that used to carry its own _WEIGHT_PREPROCESSORS. So a registration through the package
-never reached the forward that ran, leaving a square expert weight to layout inference
-(#849). These tests load a real cache copy and check both copies share one registry.
+get_forward_moe_backend() prefers the forward from the unsloth_compiled_cache copy, a
+separate module object that used to carry its own _WEIGHT_PREPROCESSORS, so a
+registration through the package never reached the forward that ran and a square expert
+weight fell back to layout inference (#849). These load a real copy and check both ways.
 """
 
 import os
@@ -38,8 +37,7 @@ _CACHED_NAME = "unsloth_cached_moe_utils"
 def cache_copy(tmp_path_factory):
     """moe_utils loaded from a scratch compile location, as the cache copy is.
 
-    One copy per module, as in a real process. Any copy resolved earlier in the
-    session is set aside for the duration and put back afterwards."""
+    One copy per module, as in a real process; any earlier one is set aside."""
     patch = pytest.MonkeyPatch()
     patch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path_factory.mktemp("compile_location")))
     moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py")
@@ -59,8 +57,8 @@ def cache_copy(tmp_path_factory):
 
 
 def test_backend_resolves_to_the_cache_copy(cache_copy):
-    # The premise: the installed forward runs with the copy's globals, not the
-    # package's, so a registry local to the package would never be consulted by it.
+    # The premise: the installed forward runs with the copy's globals, so a registry
+    # local to the package would never be consulted by it.
     forward = moe_utils.get_forward_moe_backend()
     assert forward is cache_copy.forward_moe_backend
     assert forward.__globals__ is cache_copy.__dict__
@@ -79,8 +77,8 @@ def test_package_registration_is_visible_from_the_cache_copy(cache_copy, capsys)
     moe_utils.register_weight_preprocessor(key, fn)
     try:
         assert cache_copy.get_weight_preprocessor(key) is fn
-        # Square weight, no experts_module: unregistered, the copy's preprocess_weight
-        # would warn and guess (#849); registered, it dispatches before any shape logic.
+        # Square weight, no experts_module: unregistered this would warn and guess
+        # (#849); registered it dispatches before any shape logic.
         out = cache_copy.preprocess_weight(torch.randn(4, 64, 64), "gate_up", 64, model_type=key)
         assert out is sentinel
         assert "ambiguous" not in capsys.readouterr().err.lower()
