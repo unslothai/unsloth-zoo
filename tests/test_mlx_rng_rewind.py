@@ -34,6 +34,14 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
+# `importorskip` is not enough: most tests/test_mlx_*.py files install the torch-backed
+# tests/mlx_simulation stub into sys.modules and never remove it, so in a full-suite run
+# `mlx.core` can be that stub. Everything below pins real mlx >= 0.32.1 semantics (a
+# `mx.random.state` sentinel refusing item assignment), which the stub does not model.
+if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
+    pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
+                allow_module_level = True)
+
 from mlx.utils import tree_map                                     # noqa: E402
 
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig  # noqa: E402
