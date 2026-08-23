@@ -8971,14 +8971,11 @@ def _vlm_family_divergence(expected, observed, path="batch"):
 def _mlx_rng_key():
     """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
 
-    Unreadable covers the torch simulation shim, whose state is a callable.
-    Deciding it here is what lets the restore below stay unconditional.
-
-    A key that is readable but not two words is a different thing entirely: it
-    means this rewind no longer works on the installed mlx, and returning a bare
-    None for it would make every compile fallback stop restoring with nothing
-    reported -- the same silent divergence the type guard used to cause. So it
-    says so once and then declines.
+    Unreadable covers the torch simulation shim, whose state is a callable;
+    deciding that here is what lets the restore below stay unconditional. A
+    readable key that is not two words is different: the rewind no longer works
+    on the installed mlx, and a bare None would leave every compile fallback
+    silently not restoring, so it warns once and declines.
     """
     try:
         words = mx.random.state[0].tolist()
@@ -8994,11 +8991,9 @@ def _mlx_rng_key():
             stacklevel = 2,
         )
         return None
-    # Masked, not merely converted: the restore below feeds these to
-    # mx.random.seed, which takes a uint64 and hard-raises outside [0, 2**64).
-    # Real mlx keys are uint32 so this is a no-op for them, but the guard on the
-    # state's type is gone, and a raise here would land inside a `finally` or a
-    # compile-failure handler and replace the error being recovered from.
+    # Masked, not just converted: mx.random.seed takes a uint64 and raises
+    # outside [0, 2**64), and that raise would land in a `finally` or a
+    # compile-failure handler. A no-op for real uint32 keys.
     return (int(words[0]) & 0xFFFFFFFF, int(words[1]) & 0xFFFFFFFF)
 
 
@@ -9006,14 +9001,11 @@ def _restore_mlx_rng_key(words):
     """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
 
     mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
-    ``mx.random.key`` packs a seed as its two 32-bit halves -- upstream builds it
-    as ``{seed >> 32, (uint32) seed}`` -- so reseeding with a key's own words
-    restores it exactly, over the whole unsigned 64-bit range.
-
-    Unguarded on purpose: masking the words removes the one way this could
-    raise, so there is no failure to swallow, and a blanket ``except`` here would
-    reintroduce exactly the defect this fixes -- a failure indistinguishable from
-    an intentional no-op.
+    Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
+    key's own words restores it exactly over the whole unsigned 64-bit range.
+    Unguarded on purpose: the masking above removes the only way this can raise,
+    and a blanket ``except`` would be a failure indistinguishable from an
+    intentional no-op, which is the defect this fixes.
     """
     if words is None:
         return

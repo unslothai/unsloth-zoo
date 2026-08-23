@@ -422,10 +422,9 @@ jobs:
           fi
 
       - name: tests/test_mlx_rng_rewind.py (HARD GATE)
-        # PRNG capture/rewind across the compile fallbacks. Needs mlx core only,
-        # no Metal, so it belongs on this lane rather than the opt-in Apple
-        # Silicon one -- which is usually skipped, and a rewind guarded only
-        # there is a rewind nothing guards on a pull request.
+        # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
+        # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
+        # skipped, which guards nothing on a pull request.
         run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
 
       - name: Fail if the RNG rewind tests skipped

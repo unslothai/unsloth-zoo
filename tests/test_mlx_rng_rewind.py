@@ -16,16 +16,14 @@
 
 """Capture and rewind of the MLX global PRNG key.
 
-Deliberately NOT in tests/test_mlx_training_e2e_metal.py. Nothing here needs
-Metal - it is key arithmetic, a context manager, and a trainer driven with
-`mx.compile` rigged to fail - and the Apple Silicon lane is opt-in and usually
-skipped, so tests parked behind it never run on a pull request. Here they are
-guarded by the Linux CPU lane on every push.
+mlx 0.32.1 made `mx.random.state` a sentinel that refuses item assignment, so
+the key is rewound by reseeding with the captured key's own two 32-bit words;
+`mx.random.key` builds `{seed >> 32, (uint32) seed}`, making that exact over the
+whole unsigned 64-bit range.
 
-What is being pinned: mlx 0.32.1 made `mx.random.state` a sentinel that refuses
-item assignment, so the key is rewound by reseeding with the captured key's own
-two 32-bit words. `mx.random.key` builds `{seed >> 32, (uint32) seed}`, so that
-reconstruction is exact over the whole unsigned 64-bit range.
+Deliberately not in tests/test_mlx_training_e2e_metal.py: none of this needs
+Metal, and that lane is opt-in and usually skipped, so tests parked behind it
+never run on a pull request. The Linux CPU lane gates these on every push.
 """
 
 import contextlib
@@ -72,18 +70,13 @@ class _NoItemAssignment:
 def _shadowing_random_state(replacement):
     """Swap ``mx.random.state`` for a stand-in and put the original back.
 
-    Which "back" that is depends on the mlx version, and getting it wrong
-    poisons the rest of the pytest process rather than failing here:
-
-    * mlx >= 0.31.2 serves ``state`` from a module ``__getattr__``, so it is not
-      in ``mx.random.__dict__`` and the shadow must be deleted -- restoring by
-      assignment would shadow the hook for the remainder of the run.
-    * mlx < 0.31.2 keeps ``state`` as a real module attribute, so deleting it
-      removes the PRNG state itself and every later ``mx.random.state`` read
-      raises AttributeError -- which ``_mlx_rng_key`` turns into None, so the
-      damage surfaces as unrelated tests quietly no longer rewinding.
-
-    pyproject declares ``mlx>=0.22.0``; both eras are in support.
+    Which "back" depends on the mlx version, and getting it wrong poisons the
+    rest of the pytest process rather than failing here. mlx >= 0.31.2 serves
+    ``state`` from a module ``__getattr__``, so the shadow must be deleted or it
+    hides the hook for the whole run; mlx < 0.31.2 keeps it as a real module
+    attribute, so deleting it removes the PRNG state itself and every later read
+    raises AttributeError, which ``_mlx_rng_key`` turns into None. pyproject
+    declares ``mlx>=0.22.0``, so both eras are in support.
     """
     sentinel = object()
     original = mx.random.__dict__.get("state", sentinel)
@@ -117,8 +110,8 @@ def _draw_after_seed(seed):
     _SPLIT_KEY_SEED,
 ])
 def test_the_key_packing_is_exactly_invertible(seed):
-    """Half of all real keys have the high bit set, so the high half is checked
-    rather than assumed: a signed packing anywhere would break those runs."""
+    """Half of all real keys have the high bit set, so a signed packing anywhere
+    would break those runs. Checked, not assumed."""
     words = mx.random.key(seed).tolist()
     assert words == [seed >> 32, seed & 0xFFFFFFFF]
     assert ((int(words[0]) << 32) | int(words[1])) == seed
@@ -140,9 +133,8 @@ def test_restore_reproduces_the_draws_that_followed_the_capture():
 
 
 def test_restore_works_where_the_state_refuses_item_assignment():
-    """A stand-in with mlx 0.32.1's shape -- ``__len__``, ``__getitem__``,
-    ``__iter__``, no ``__setitem__`` -- pins the contract on whichever mlx is
-    installed, including the older ones where the real state is still a list."""
+    """A stand-in with mlx 0.32.1's shape (no ``__setitem__``) pins the contract
+    on whichever mlx is installed, including ones where state is still a list."""
     expected = _draw_after_seed(_SPLIT_KEY_SEED)
 
     mx.random.seed(1)
@@ -187,13 +179,12 @@ def test_shadowing_the_state_does_not_outlive_the_test():
 def test_restore_normalises_words_outside_the_unsigned_32_bit_range(words):
     """`mx.random.seed` takes a uint64 and hard-raises outside [0, 2**64).
 
-    The restore is unguarded on purpose -- a blanket `except` there would be a
-    failure indistinguishable from an intentional no-op, which is the defect
-    this whole mechanism exists to remove. That only holds if the words cannot
-    put it out of range, and capture no longer type-checks the state, so the
-    masking is what makes "cannot raise" true. A raise here would land inside
-    `_preserved_preprocessing_rng`'s `finally` and replace the caller's own
-    exception, or replace the compile error a fallback is recovering from.
+    The restore is unguarded on purpose, since a blanket `except` would be a
+    failure indistinguishable from an intentional no-op. That holds only if the
+    words cannot put it out of range, and capture no longer type-checks the
+    state, so the masking is what makes "cannot raise" true. A raise would land
+    in `_preserved_preprocessing_rng`'s `finally`, or replace the compile error
+    a fallback is recovering from.
     """
     _restore_mlx_rng_key(words)
     assert _mlx_rng_key() == (words[0] & 0xFFFFFFFF, words[1] & 0xFFFFFFFF)
@@ -209,9 +200,8 @@ def test_capture_masks_a_state_whose_words_are_not_unsigned():
 
 @pytest.mark.parametrize("n", [1, 3, 4])
 def test_a_key_that_is_not_two_words_is_reported_rather_than_swallowed(n):
-    """Returning a bare None here would make every compile fallback stop
-    rewinding with nothing logged -- the same silent divergence the old
-    `isinstance(state, list)` guard caused."""
+    """A bare None here would leave every compile fallback silently not
+    rewinding, as the old `isinstance(state, list)` guard did."""
     class _WideKey:
         def __len__(self): return 1
         def __getitem__(self, index): return mx.array([1] * n, dtype = mx.uint32)
@@ -366,9 +356,9 @@ def test_a_runtime_compile_failure_retries_eagerly_from_the_captured_key(tmp_pat
 
 def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
     """The single-process retry is exercised for real above; its DDP twin needs
-    a distributed group no unit test here can raise, so it is pinned
-    structurally -- on the parse tree rather than on substring counts, so that
-    a harmless refactor does not fail it and a misplaced restore does.
+    a distributed group no unit test can raise, so it is pinned structurally.
+    On the parse tree, not substring counts: a harmless refactor must not fail
+    this, and a misplaced restore must.
     """
     import ast
     import inspect
