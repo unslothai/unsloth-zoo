@@ -9000,7 +9000,15 @@ def _warn_unrewindable_key(kind, message):
     try:
         warnings.warn(message, RuntimeWarning, stacklevel = 3)
     except Exception:
-        print(message, file = sys.stderr)
+        # A filter promoted the warning, so say it on stderr rather than lose it.
+        # Guarded too, though: stderr can be closed (a daemonised Studio backend,
+        # or a test runner tearing down its capture) or a stream whose write
+        # raises, and this helper is called ABOVE the `try` that would contain
+        # such a raise. An unreportable diagnostic must not become the abort.
+        try:
+            print(message, file = sys.stderr)
+        except Exception:
+            pass
 
 
 def _mlx_rng_key():

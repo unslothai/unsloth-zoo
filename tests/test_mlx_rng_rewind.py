@@ -29,6 +29,8 @@ never run on a pull request. The Linux CPU lane gates these on every push.
 import contextlib
 from types import SimpleNamespace
 
+import io
+import sys
 import warnings
 
 import pytest
@@ -505,3 +507,43 @@ def test_an_unsupported_key_is_reported_once_not_once_per_step():
                 assert _mlx_rng_key() is None
     runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
     assert len(runtime) == 1, [str(w.message) for w in runtime]
+
+
+@pytest.mark.parametrize("stderr_factory,label", [
+    (lambda: _closed_stream(), "closed stderr"),
+    (lambda: _hostile_stream(), "stderr.write raises"),
+])
+def test_an_unreportable_diagnostic_still_does_not_raise(stderr_factory, label):
+    """The helper's contract is that it never raises, and callers rely on it.
+
+    Both trainer captures and `_preserved_preprocessing_rng` read the key above
+    the `try` that would contain a raise, so if the stderr fallback itself throws
+    the unsupported key aborts the run anyway, which is the whole thing this
+    helper exists to prevent.
+    """
+    _reported_unrewindable_keys.clear()
+    original = sys.stderr
+    sys.stderr = stderr_factory()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with _shadowing_random_state(
+                _NoItemAssignment((2**32, 0), dtype = mx.int64)
+            ):
+                assert _mlx_rng_key() is None      # must not raise, label: 
+    finally:
+        sys.stderr = original
+
+
+def _closed_stream():
+    stream = io.StringIO()
+    stream.close()
+    return stream
+
+
+def _hostile_stream():
+    class _Hostile(io.TextIOBase):
+        def write(self, _s):
+            raise OSError("stream is gone")
+
+    return _Hostile()
