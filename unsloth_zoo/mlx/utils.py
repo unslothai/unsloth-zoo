@@ -8968,8 +8968,19 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
-def _warn_unrewindable_key(message):
-    """Report a key we cannot rewind, without ever raising.
+# Problem kinds already reported, so an unsupported key layout costs one message
+# per process rather than one per training step. Both trainer captures sit inside
+# the per-batch loop, so without this a run that is otherwise fine emits a warning
+# per batch. Keyed on the kind and not the rendered text: the message interpolates
+# the offending word, so a value that changes between draws would defeat both the
+# `warnings` registry and the stderr fallback below, which has no registry at all.
+# A plain set is enough here; two threads racing costs a duplicate message, never
+# a lost one.
+_reported_unrewindable_keys = set()
+
+
+def _warn_unrewindable_key(kind, message):
+    """Report a key we cannot rewind, at most once per kind, without ever raising.
 
     Every caller reads the key *before* entering the `try` that a raise here
     would land in: both trainer captures sit above their compile-fallback
@@ -8983,6 +8994,9 @@ def _warn_unrewindable_key(message):
     would briefly disarm another thread's warnings-as-errors. Falling back to
     stderr keeps the message instead of swallowing it.
     """
+    if kind in _reported_unrewindable_keys:
+        return
+    _reported_unrewindable_keys.add(kind)
     try:
         warnings.warn(message, RuntimeWarning, stacklevel = 3)
     except Exception:
@@ -9004,6 +9018,7 @@ def _mlx_rng_key():
         return None
     if len(words) != 2:
         _warn_unrewindable_key(
+            "word-count",
             f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
             "can only rewind the two-word form, so a run that falls back from "
             "mx.compile to eager will not have its RNG restored and may diverge "
@@ -9032,6 +9047,7 @@ def _as_uint32_pair(high, low):
     for word in (high, low):
         if not -(2**31) <= word < 2**32:
             _warn_unrewindable_key(
+                "word-range",
                 f"Unsloth: MLX exposed a random key word of {word}, which is not "
                 "a 32-bit word. Unsloth cannot rewind this key, so a run that "
                 "falls back from mx.compile to eager will not have its RNG "

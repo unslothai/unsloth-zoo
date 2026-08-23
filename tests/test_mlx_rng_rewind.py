@@ -41,6 +41,7 @@ from mlx.utils import tree_map                                     # noqa: E402
 from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig  # noqa: E402
 from unsloth_zoo.mlx.utils import (                                # noqa: E402
     FiniteTextBatchPlan, _FiniteTextRow, _mlx_rng_key,
+    _reported_unrewindable_keys,
     _preserved_preprocessing_rng, _restore_mlx_rng_key,
 )
 
@@ -70,6 +71,15 @@ class _NoItemAssignment:
 
     def __iter__(self):
         return iter([self[0]])
+
+
+@pytest.fixture(autouse = True)
+def _forget_reported_key_problems():
+    """The report-once set is process-global, so without this the first test to
+    trip a warning silences it for every test after it."""
+    _reported_unrewindable_keys.clear()
+    yield
+    _reported_unrewindable_keys.clear()
 
 
 @contextlib.contextmanager
@@ -214,6 +224,9 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
 
     # Restore is total: a caller that hands it these words directly must get a
     # no-op and a warning, never a raise into a `finally` and never a wrong key.
+    # Cleared first so this asserts the restore path reports on its own, rather
+    # than riding on the report the capture above already made.
+    _reported_unrewindable_keys.clear()
     with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
         _restore_mlx_rng_key(words)
     assert _mlx_rng_key() == before
@@ -453,3 +466,34 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
             assert restore.lineno < retry.lineno, (
                 "an eager fallback re-runs the step without rewinding the RNG"
             )
+
+
+def test_an_unsupported_key_is_reported_once_not_once_per_step():
+    """Both trainer captures run inside the per-batch loop.
+
+    The message interpolates the offending word, so a value that changes between
+    draws makes every message unique and the `warnings` registry can never
+    suppress it. The stderr fallback has no registry at all. Without dedup an
+    otherwise fine run emits one warning per batch.
+    """
+    seen = []
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        for word in range(2**32, 2**32 + 25):
+            with _shadowing_random_state(
+                _NoItemAssignment((word, 0), dtype = mx.int64)
+            ):
+                assert _mlx_rng_key() is None
+            seen.append(word)
+    assert len(seen) == 25
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime) == 1, [str(w.message) for w in runtime]
+
+    # A different kind still gets its own single report.
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(5):
+            with _shadowing_random_state(_NoItemAssignment((1, 2, 3))):
+                assert _mlx_rng_key() is None
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime) == 1, [str(w.message) for w in runtime]
