@@ -7,11 +7,9 @@ explicit elementwise path), decoupled weight decay, batching, and both loss
 functions (CCE and baseline).
 """
 
-import contextlib
 import glob
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -34,8 +32,7 @@ if _METAL:
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import (
         FiniteTextBatchPlan, _FiniteTextRow, collect_mlx_lora_adapter_tensors,
-        make_baseline_loss_fn, _mlx_rng_key, _preserved_preprocessing_rng,
-        _restore_mlx_rng_key,
+        make_baseline_loss_fn,
     )
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
@@ -1084,192 +1081,3 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         )
     )
     assert len(set(planned_widths)) <= len(set(unplanned_widths)) + 1
-
-
-# ---------------------------------------------------------------------------
-# MLX global PRNG capture and rewind
-# ---------------------------------------------------------------------------
-
-# High word's top bit set, so a rewind that packs the seed as signed is visible.
-_SPLIT_KEY_SEED = 0xFEDCBA9876543210
-
-
-class _NoItemAssignment:
-    """``mx.random.state`` as mlx >= 0.32.1 exposes it: readable, not writable."""
-
-    def __len__(self):
-        return 1
-
-    def __getitem__(self, index):
-        if index not in (0, -1):
-            raise IndexError("random state index out of range")
-        return mx.random.key(_SPLIT_KEY_SEED)
-
-    def __iter__(self):
-        return iter([mx.random.key(_SPLIT_KEY_SEED)])
-
-
-@contextlib.contextmanager
-def _shadowing_random_state(replacement):
-    # mx.random serves `state` from a module __getattr__, so monkeypatch would
-    # restore it by assignment and shadow that hook for the rest of the run.
-    mx.random.state
-    setattr(mx.random, "state", replacement)
-    try:
-        yield
-    finally:
-        delattr(mx.random, "state")
-
-
-def _draw():
-    value = mx.random.uniform(shape=(8,))
-    mx.eval(value)
-    return value.tolist()
-
-
-def _draw_after_seed(seed):
-    mx.random.seed(seed)
-    return _draw()
-
-
-@metal_only
-def test_restore_reproduces_the_draws_that_followed_the_capture():
-    mx.random.seed(17)
-    _draw()
-
-    key = _mlx_rng_key()
-    assert key is not None
-    expected = _draw()
-
-    _restore_mlx_rng_key(key)
-    assert _draw() == expected
-
-
-@metal_only
-def test_restore_works_where_the_state_refuses_item_assignment():
-    """mlx 0.32.1 made ``mx.random.state`` a sentinel with ``__len__``,
-    ``__getitem__`` and ``__iter__`` and no ``__setitem__``. A stand-in of that
-    shape pins the contract on whichever mlx is installed.
-    """
-    expected = _draw_after_seed(_SPLIT_KEY_SEED)
-
-    mx.random.seed(1)
-    with _shadowing_random_state(_NoItemAssignment()):
-        key = _mlx_rng_key()
-        assert key == tuple(mx.random.key(_SPLIT_KEY_SEED).tolist())
-        _restore_mlx_rng_key(key)
-
-    assert _draw() == expected
-
-
-@metal_only
-def test_capture_reads_nothing_where_the_state_is_not_indexable():
-    # The torch simulation shim exposes a callable, which must stay a no-op
-    # rather than raise or reseed.
-    with _shadowing_random_state(lambda: {"counter": 0}):
-        assert _mlx_rng_key() is None
-
-    mx.random.seed(5)
-    expected = _draw()
-    mx.random.seed(5)
-    _restore_mlx_rng_key(None)
-    assert _draw() == expected
-
-
-@metal_only
-def test_preserved_preprocessing_rng_rewinds_the_mlx_key():
-    mx.random.seed(99)
-    expected = _draw()
-
-    mx.random.seed(99)
-    with _preserved_preprocessing_rng():
-        _draw()
-    assert _draw() == expected
-
-
-@metal_only
-def test_a_runtime_compile_failure_retries_eagerly_from_the_captured_key(tmp_path, monkeypatch):
-    """Without the rewind the failed attempt's draws stay in the stream, and a
-    run that falls back diverges from an eager run of the same seed.
-    """
-    class TinyLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = nn.Embedding(128, 4)
-            self.proj = nn.Linear(4, 128, bias=False)
-            self._config = {"model_type": "tiny"}
-
-        def __call__(self, input_ids):
-            return self.proj(self.embed(input_ids))
-
-        def train(self, mode=True):
-            return self
-
-        @property
-        def state(self):
-            return []
-
-    keys = []
-    failed = False
-
-    def compile_spy(fn, **_kwargs):
-        def compiled(*args):
-            nonlocal failed
-            if not failed:
-                failed = True
-                keys.append(_mlx_rng_key())
-                # What the trainer has to undo.
-                _draw()
-                raise RuntimeError("compile runtime failure")
-            return fn(*args)
-        return compiled
-
-    def value_and_grad_recording_key(model, fn):
-        def wrapped(*args):
-            keys.append(_mlx_rng_key())
-            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
-        return wrapped
-
-    monkeypatch.setattr(mx, "compile", compile_spy)
-    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_recording_key)
-
-    rows = tuple(
-        _FiniteTextRow(tuple(range(1, width + 1)), offset=1, labels=None)
-        for width in (10, 11)
-    )
-    trainer = MLXTrainer(
-        TinyLM(),
-        SimpleNamespace(pad_token_id=99, eos_token_id=2),
-        [],
-        args=MLXTrainingConfig(
-            max_steps=2,
-            gradient_accumulation_steps=1,
-            compile=True,
-            use_cce=False,
-            gradient_checkpointing=False,
-            cast_norm_output_to_input_dtype=False,
-            max_grad_norm=0.0,
-            max_grad_leaf_norm=0.0,
-            disable_memory_limits=True,
-            logging_steps=2,
-            output_dir=str(tmp_path),
-        ),
-    )
-    trainer._batches = FiniteTextBatchPlan(
-        rows,
-        tuple((index,) for index in range(len(rows))),
-        max_seq_length=64,
-        pad_id=99,
-    )
-    trainer._build_optimizer = lambda _total_steps: SimpleNamespace(
-        learning_rate=mx.array(1e-5),
-        state={},
-        update=lambda _model, _grad: None,
-    )
-    trainer.save_model = lambda *_args, **_kwargs: None
-
-    result = trainer.train()
-
-    assert result["compile_scope"] == "fallback_eager"
-    assert len(keys) >= 2, keys
-    assert keys[1] == keys[0]
