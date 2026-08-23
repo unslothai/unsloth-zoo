@@ -57,8 +57,8 @@ def cache_copy(tmp_path_factory):
 
 
 def test_backend_resolves_to_the_cache_copy(cache_copy):
-    # The premise: the installed forward runs with the copy's globals, so a registry
-    # local to the package would never be consulted by it.
+    # The premise: it runs with the copy's globals, so a package-local registry is
+    # never consulted by it.
     forward = moe_utils.get_forward_moe_backend()
     assert forward is cache_copy.forward_moe_backend
     assert forward.__globals__ is cache_copy.__dict__
@@ -77,8 +77,8 @@ def test_package_registration_is_visible_from_the_cache_copy(cache_copy, capsys)
     moe_utils.register_weight_preprocessor(key, fn)
     try:
         assert cache_copy.get_weight_preprocessor(key) is fn
-        # Square weight, no experts_module: unregistered this would warn and guess
-        # (#849); registered it dispatches before any shape logic.
+        # Square, no experts_module: unregistered this guesses (#849), registered it
+        # dispatches before any shape logic.
         out = cache_copy.preprocess_weight(torch.randn(4, 64, 64), "gate_up", 64, model_type=key)
         assert out is sentinel
         assert "ambiguous" not in capsys.readouterr().err.lower()
@@ -97,8 +97,8 @@ def test_cache_copy_registration_lands_in_the_package(cache_copy):
 
 
 def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
-    # A third copy: compiler.py puts the compile location on sys.path and generated
-    # modules do a bare `from moe_utils import ...`, so that name is its own module too.
+    # A third copy: compiler.py puts the compile location on sys.path, so the bare
+    # `from moe_utils import ...` generated modules do is its own module too.
     monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
     monkeypatch.delitem(sys.modules, "moe_utils", raising=False)
     import moe_utils as bare
