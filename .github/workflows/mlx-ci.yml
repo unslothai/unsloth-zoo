@@ -71,6 +71,27 @@ jobs:
           # remote processor code that imports timm, which .[mlx] does not pull.
           pip install timm
 
+      - name: Adopt the newest MLX (unattended runs only)
+        # pyproject pins mlx and mlx-lm exactly so that nobody installing
+        # unsloth_zoo is upgraded into a broken release unattended. That pin also
+        # holds `.[mlx]` above at the pinned versions forever, and this job is the
+        # only lane that runs real MLX on Apple Silicon, so without this step the
+        # pin would silently remove the very check that is supposed to tell us
+        # whether the next release is safe to adopt. On the nightly and on manual
+        # dispatch we therefore deliberately install past the pin; PR runs keep the
+        # pinned set, which is what users actually get.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          pip install --upgrade mlx mlx-lm
+          python - <<'PY'
+          from importlib.metadata import version
+          for name in ("mlx", "mlx-lm", "mlx-vlm"):
+              try:
+                  print(f"{name}=={version(name)}")
+              except Exception as error:
+                  print(f"{name}: {error}")
+          PY
+
       - name: MLX module import smoke
         run: |
           python -c "import unsloth_zoo.mlx_loader; print('mlx_loader OK')"
