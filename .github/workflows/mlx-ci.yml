@@ -84,6 +84,12 @@ jobs:
         # on Apple Silicon; on Linux runners it would run against tests/mlx_simulation/ stubs.
         run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
 
+      - name: tests/test_mlx_rng_rewind.py
+        # PRNG capture and rewind across the mx.compile fallbacks. The Linux CPU
+        # lane gates this too, but the mlx 0.32.1 sentinel that broke it shipped
+        # in the Metal wheel first, so this is where a repeat surfaces earliest.
+        run: python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+
       - name: tests/test_mlx_switch_lora.py
         # Real-runtime routed LoRA training and adapter lifecycle coverage.
         run: python -m pytest tests/test_mlx_switch_lora.py -v -rs
