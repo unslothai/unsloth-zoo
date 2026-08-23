@@ -23,6 +23,7 @@ never reached the forward that ran, leaving a square expert weight to layout inf
 (#849). These tests load a real cache copy and check both copies share one registry.
 """
 
+import os
 import sys
 
 import pytest
@@ -93,5 +94,22 @@ def test_cache_copy_registration_lands_in_the_package(cache_copy):
     cache_copy.register_weight_preprocessor(key, fn)
     try:
         assert moe_utils.get_weight_preprocessor(key) is fn
+    finally:
+        moe_utils._WEIGHT_PREPROCESSORS.pop(key, None)
+
+
+def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
+    # A third copy: compiler.py puts the compile location on sys.path and generated
+    # modules do a bare `from moe_utils import ...`, so that name is its own module too.
+    monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
+    monkeypatch.delitem(sys.modules, "moe_utils", raising=False)
+    import moe_utils as bare
+    monkeypatch.setitem(sys.modules, "moe_utils", bare)
+    assert bare is not moe_utils and bare is not cache_copy
+    key = "unit_test_registry_shared_arch_bare"
+    fn = lambda weight, proj_type, hidden_dim: weight
+    moe_utils.register_weight_preprocessor(key, fn)
+    try:
+        assert bare.get_weight_preprocessor(key) is fn
     finally:
         moe_utils._WEIGHT_PREPROCESSORS.pop(key, None)
