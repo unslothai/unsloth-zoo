@@ -34,12 +34,10 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-# `importorskip` is not enough here. Most of the tests/test_mlx_*.py files install the
-# torch-backed simulation from tests/mlx_simulation into sys.modules and never take it out,
-# so by the time this module is collected in a full-suite run `mlx.core` can be that stub
-# rather than the real package, and `importorskip` happily returns it. Everything below pins
-# real mlx >= 0.32.1 semantics (a `mx.random.state` sentinel that refuses item assignment),
-# which the simulation does not model, so running against the stub asserts nothing and fails.
+# `importorskip` is not enough: most tests/test_mlx_*.py files install the torch-backed
+# tests/mlx_simulation stub into sys.modules and never remove it, so in a full-suite run
+# `mlx.core` can be that stub. Everything below pins real mlx >= 0.32.1 semantics (a
+# `mx.random.state` sentinel refusing item assignment), which the stub does not model.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
                 allow_module_level = True)
