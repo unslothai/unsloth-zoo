@@ -16,16 +16,14 @@
 
 """The merged_16bit config must describe the weights the merge actually writes (#969).
 
-`merge_and_overwrite_lora` downloads its weights from the resolved base checkpoint but
-used to save `model.config`, which `text_only = True` has already replaced with the
-nested text config. That wrote a `gemma3_text` config with no `architectures` next to
-full VLM weights. Nothing raised: every tensor was silently re-initialized on reload,
-so a finetune could be saved, reloaded and served untrained.
+`merge_and_overwrite_lora` takes its weights from the resolved base checkpoint but used to
+save `model.config`, which `text_only = True` has already replaced with the nested text
+config, so a `gemma3_text` config landed next to full VLM weights. Nothing raised: every
+tensor was silently re-initialized on reload, so a finetune could be served untrained.
 
-The shape reproduced here is the real one: a text-only decoder in memory whose
-`_name_or_path` points at a full VLM checkpoint on disk. Passing is not "no exception"
--- the original bug threw none -- it is the saved architecture matching the written
-tensors and a reload reporting no missing / unexpected / mismatched keys.
+The fixture is the real shape -- a text-only decoder whose `_name_or_path` points at a VLM
+checkpoint. Passing is not "no exception" (the bug threw none) but the saved architecture
+matching the written tensors and a reload reporting no missing/unexpected/mismatched keys.
 """
 
 from __future__ import annotations

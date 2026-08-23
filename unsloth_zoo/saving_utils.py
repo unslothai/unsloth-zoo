@@ -2878,9 +2878,8 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
 def _text_configs(config):
-    # Where a composite config keeps its text vocab. `get_text_config()` is the documented
-    # accessor and finds sections not named `text_config` (qwen2_5_omni, qwen3_omni_moe,
-    # colqwen2, t5gemma); it returns `config` itself for a plain LM.
+    # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
+    # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
     holders = []
     try: holders.append(config.get_text_config())
     except Exception: pass
@@ -2893,9 +2892,8 @@ pass
 
 
 def _config_vocab_size(config):
-    # Nested first: composite configs can carry both, and `resize_token_embeddings` updates
-    # only the nested one (PaliGemma leaves its top-level copy behind), so reading a stale
-    # top level would look like "no resize happened".
+    # Nested first: a composite can carry both, and `resize_token_embeddings` updates only the
+    # nested one (PaliGemma leaves a stale top-level copy that would read as "no resize").
     for holder in _text_configs(config):
         if holder is config: continue
         vocab_size = getattr(holder, "vocab_size", None)
@@ -2912,10 +2910,9 @@ def _carry_over_vocab_size(base_config, trained_config):
     if trained_vocab_size is None: return
     holders = [h for h in _text_configs(base_config) if h is not base_config]
     base_vocab_size = getattr(base_config, "vocab_size", None)
-    # A top level that already mirrors the text vocab is a compatibility copy and moves with it
-    # (PaliGemma). One that differs is a DIFFERENT vocabulary, not a stale copy: Ovis2 ships
-    # vocab_size=151643 against text_config.vocab_size=151936 and sizes its lm_head from the
-    # top level, so overwriting it there would break the very reload this protects.
+    # A top level mirroring the text vocab is a compatibility copy and moves with it (PaliGemma).
+    # One that differs is a DIFFERENT vocabulary: Ovis2 ships 151643 against a text 151936 and
+    # sizes its lm_head from the top level, so writing there breaks the reload this protects.
     if base_vocab_size is not None and all(
         getattr(holder, "vocab_size", base_vocab_size) == base_vocab_size for holder in holders
     ):
@@ -3274,10 +3271,9 @@ def merge_and_overwrite_lora(
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
-        # while the weights come from `model_name` and keep their full VLM prefixes. Saving it
-        # wrote a text-only config beside VLM weights, and every tensor was then silently
-        # re-initialized on reload (#969). Read the config from the checkpoint the weights come
-        # from, as the `mxfp4` branch below already does.
+        # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
+        # a text-only config beside VLM weights and every tensor was silently re-initialized on
+        # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
         from transformers import AutoConfig
         try:
             base_config = AutoConfig.from_pretrained(
