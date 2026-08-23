@@ -284,6 +284,54 @@ def test_an_unsharded_export_has_no_index_to_touch(tmp_path):
     assert _add_keys_to_index(str(tmp_path), {"score.weight": "model.safetensors"}) is False
 
 
+def test_seeding_refuses_rather_than_dropping_the_head_when_disk_is_short(tmp_path, monkeypatch):
+    """Adding a key rewrites the shard through a temp copy, and appending moves every offset
+    so there is no in-place fallback. Refusing beats silently dropping the head, which is the
+    bug this whole path exists to fix."""
+    import collections
+    import shutil as _shutil
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import LoraStats, _seed_unbacked_trained_tensors
+
+    save_file({"model.embed_tokens.weight": torch.zeros(4, 4)},
+              str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
+
+    class _Saved(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.modules_to_save = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 3)})
+
+    stats = LoraStats(None, None, None, 0)
+    stats.module = _Saved()
+    lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    lora_weights["score"] = stats
+
+    monkeypatch.setattr(_shutil, "disk_usage",
+                        lambda _p: type("U", (), {"free": 1024})())
+    with pytest.raises(RuntimeError, match="not enough free disk"):
+        _seed_unbacked_trained_tensors(str(tmp_path), ["model.safetensors"],
+                                       lora_weights, "LlamaForCausalLM")
+    # The shard must be left exactly as it was, not half-rewritten.
+    assert set(H.read_safetensors_dir(str(tmp_path))) == {"model.embed_tokens.weight"}
+    assert not list(tmp_path.glob("*.unsloth_seed_tmp"))
+
+
+def test_the_corrected_config_is_re_uploaded_when_pushing():
+    """Step 2 uploads config.json before the head exists and Step 7's folder re-upload is
+    skipped in low-disk mode, so without this the remote keeps the causal-LM config beside
+    shards that hold the head."""
+    import inspect
+    from unsloth_zoo.saving_utils import merge_and_overwrite_lora
+
+    src = inspect.getsource(merge_and_overwrite_lora)
+    seeded = src.split("_seeded_head_keys", 1)[1]
+    block = seeded.split("for filename in ProgressBar", 1)[0]
+    assert 'upload_items("config.json")' in block, (
+        "the seeding block no longer re-uploads config.json; a low-disk push would leave "
+        "the remote config describing the base architecture instead of the trained head."
+    )
+
+
 def test_appending_to_a_shard_leaves_the_existing_tensors_byte_identical(tmp_path):
     """`_stream_rewrite_resized_shard` gained an append path; the copy path must not move."""
     from safetensors.torch import save_file

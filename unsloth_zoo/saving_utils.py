@@ -3566,6 +3566,11 @@ def merge_and_overwrite_lora(
         print(f"Unsloth: Writing {len(_seeded_head_keys)} trained tensor(s) absent from the "
               f"base checkpoint: {', '.join(sorted(_seeded_head_keys))}")
         _carry_over_trained_head_config(save_directory, model, _merge_model_class_name)
+        # Step 2 uploaded config.json before the head existed and Step 7's folder re-upload
+        # is skipped in low-disk mode, so push the corrected one now. Otherwise the remote
+        # keeps a causal-LM config beside shards that do hold the head, which is the same
+        # config/weights mismatch this seeding exists to remove.
+        if push_to_hub: upload_items("config.json")
         # The index was copied (and, when pushing, already uploaded) before the seeding, so
         # re-upload it if the new key had to be added there.
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
@@ -4631,6 +4636,24 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     # cheapest place to put a head measured in kilobytes.
     target = min(sizes, key = sizes.get)
     path = os.path.join(save_directory, target)
+
+    # safetensors is a flat format, so adding a key means rewriting the shard through a temp
+    # copy, and a transient second copy of it has to fit. There is no in-place fallback the
+    # way a resize has: appending moves every offset. Refuse loudly rather than drop the head,
+    # since dropping it silently is the bug this is here to fix.
+    needed = sizes[target] + sum(t.numel() * t.element_size() for t in tensors.values())
+    margin = 64 * 1024 * 1024
+    try: free_bytes = shutil.disk_usage(save_directory).free
+    except OSError: free_bytes = None
+    if free_bytes is not None and free_bytes < needed + margin:
+        raise RuntimeError(
+            f"Unsloth: not enough free disk to write the trained tensor(s) "
+            f"{', '.join(sorted(tensors))} into {target} (free={free_bytes}, "
+            f"need~={needed + margin}). They exist only in memory, so the export would "
+            f"otherwise reload with a randomly initialized head. Free disk space, or point "
+            f"the save directory at a larger volume."
+        )
+
     with open(path, "rb") as f:
         length_of_header = int.from_bytes(f.read(8), "little")
         header_metadata = json.loads(f.read(length_of_header))
