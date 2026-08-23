@@ -110,8 +110,7 @@ def test_text_only_export_config_matches_written_weights(tmp_path):
     pm = _attach_lora(_text_only_model(cfg, base_dir))
     H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
 
-    # transformers 5 flattens the VLM prefixes, so match on substrings rather than the
-    # top-level key name.
+    # transformers 5 flattens the VLM prefixes, so match on a substring, not the key name.
     written = list(H.read_safetensors_dir(out_dir))
     assert any("vision" in k for k in written), f"fixture wrote no vision weights: {written[:4]}"
 
@@ -190,9 +189,7 @@ def test_base_config_read_failure_falls_back_with_a_warning(tmp_path, monkeypatc
         "the fallback must not lose the export it is protecting"
 
 
-# --------------------------------------------------------------------------------
 # vocab-size helpers, config-level only
-# --------------------------------------------------------------------------------
 
 _MISSING = object()
 
