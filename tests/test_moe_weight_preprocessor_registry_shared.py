@@ -16,14 +16,11 @@
 
 """The weight-preprocessor registry is one dict across every loaded copy of moe_utils.
 
-moe_utils.py installs a copy of itself into unsloth_compiled_cache at import, and
-get_forward_moe_backend() prefers the forward_moe_backend loaded from that copy, a
-separate module object. Each copy used to carry its own module-level
-_WEIGHT_PREPROCESSORS, so a preprocessor registered through the package
-(register_weight_preprocessor) was invisible to the forward that actually ran, and a
-square expert weight there fell back to layout inference (#849; found on #915). These
-tests load a real cache copy the way get_forward_moe_backend() does and check that
-both copies read and write the same registry.
+moe_utils.py copies itself into unsloth_compiled_cache at import, and
+get_forward_moe_backend() prefers the forward from that copy, a separate module object
+that used to carry its own _WEIGHT_PREPROCESSORS. So a registration through the package
+never reached the forward that ran, leaving a square expert weight to layout inference
+(#849). These tests load a real cache copy and check both copies share one registry.
 """
 
 import sys

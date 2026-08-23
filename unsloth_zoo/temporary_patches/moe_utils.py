@@ -1100,15 +1100,12 @@ def _should_use_separated_lora() -> bool:
 # Model-specific weight preprocessing hooks: each model registers a transposition
 # function so the generic backend works across weight layouts.
 #
-# Every loaded copy of this module reads ONE registry: the package module's. This
-# file is also installed into unsloth_compiled_cache (install_to_cache above) and
-# loaded from there as a separate module object -- unsloth_cached_moe_utils, whose
-# forward get_forward_moe_backend() prefers, and the bare `moe_utils` the compiled
-# model modules import. A module-level dict starts empty in each of those copies, so
-# a register_weight_preprocessor() call made through the package was invisible to the
-# forward that actually ran, and a square expert weight there fell back to layout
-# inference (#849). Resolving through the package keeps registration and lookup on
-# the same dict whichever copy executes.
+# This file is also copied into unsloth_compiled_cache and loaded from there as
+# separate module objects (unsloth_cached_moe_utils, whose forward
+# get_forward_moe_backend() prefers, and the bare `moe_utils` compiled modules
+# import), each with its own empty dict. Resolving through the package module keeps
+# registration and lookup on one dict whichever copy runs, so a registration is not
+# silently ignored and left to layout inference (#849).
 
 _WEIGHT_PREPROCESSORS = {}
 
@@ -1117,7 +1114,7 @@ def _weight_preprocessor_registry():
     """The registry shared by every loaded copy of this module (see above)."""
     package_module = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
     if package_module is None:
-        # The package copy is not loaded, so nothing was registered through it.
+        # Package copy not loaded, so nothing was registered through it.
         return _WEIGHT_PREPROCESSORS
     return getattr(package_module, "_WEIGHT_PREPROCESSORS", _WEIGHT_PREPROCESSORS)
 
@@ -1233,9 +1230,12 @@ def preprocess_weight(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    registry = _weight_preprocessor_registry()
-    if model_type and model_type in registry:
-        return registry[model_type](weight, proj_type, hidden_dim)
+    # Guarded so the shipped models, which pass model_type=None, keep the old cost:
+    # this runs per projection per MoE forward, and again in recompute backward.
+    if model_type:
+        registry = _weight_preprocessor_registry()
+        if model_type in registry:
+            return registry[model_type](weight, proj_type, hidden_dim)
 
     # Non-square shapes reveal layout directly.
     needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)
