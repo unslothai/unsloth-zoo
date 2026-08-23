@@ -40,7 +40,6 @@ class _StubConfig:
     "llama)",
     "llama #",
     "lll as x; import os",
-    "",
 ])
 def test_injected_model_type_rejected(model_type):
     with pytest.raises(ValueError, match = "Invalid model_type"):
@@ -78,6 +77,28 @@ def test_every_shipped_model_type_accepted():
         except ValueError as exception:
             rejected.append((name, str(exception)))
     assert not rejected, f"guard rejected legitimate model types: {rejected}"
+
+
+@pytest.mark.parametrize("name", ["dbrx", "got_ocr2", "qwen3_omni_moe"])
+def test_composite_config_with_empty_nested_sentinels(name):
+    """`PretrainedConfig.model_type` defaults to "", so a nested sub-config that does not
+    override it serialises as an empty string. The recursive walk collects those alongside
+    the real top-level type, and they must not be mistaken for an injected module name."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.for_model(name)
+    assert name in get_transformers_model_type(config)
+
+
+def test_all_empty_model_types_is_unresolved():
+    """Nothing but sentinels means the architecture is still unknown, which is the
+    existing "cannot determine" case rather than an injection."""
+    class OnlySentinels:
+        def to_dict(self):
+            return {"model_type": "", "text_config": {"model_type": ""}}
+
+    with pytest.raises(TypeError, match = "Cannot determine model type"):
+        get_transformers_model_type(OnlySentinels())
 
 
 def test_plain_config_unchanged():
