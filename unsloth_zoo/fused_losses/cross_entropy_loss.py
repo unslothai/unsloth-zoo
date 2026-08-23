@@ -163,7 +163,7 @@ def _get_chunk_multiplier(
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
             device = torch.device(device)
-            
+
         if device.type == "cuda":
             rng_state = torch.cuda.get_rng_state(device)
         else:
@@ -178,11 +178,11 @@ def _get_chunk_multiplier(
             hidden = torch.randn(1, dummy_qlen, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
             weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
             target = torch.randint(0, vocab_size, (dummy_qlen,), device=device)
-            
+
             with torch.enable_grad():
                 logits = torch.nn.functional.linear(hidden, weight)
                 logits_fp32 = logits.view(-1, vocab_size).float()
-                
+
                 if logit_scale_multiply != 0 and logit_scale_multiply is not None:
                     logits_fp32 = logits_fp32 * logit_scale_multiply
                 if logit_scale_divide != 0 and logit_scale_divide is not None:
@@ -198,10 +198,10 @@ def _get_chunk_multiplier(
             mem_after = torch.cuda.max_memory_allocated(device)
             peak_used = mem_after - mem_before
             measured_bytes = peak_used / (dummy_qlen * vocab_size)
-            
+
             print(f"[CALIBRATION] measured_bytes = {measured_bytes:.2f} bytes/element")
             bytes_per_element = max(float(measured_bytes), 4.0)
-                
+
             del hidden, weight, target, logits, logits_fp32, loss
     except Exception as e:
         print(f"[CALIBRATION] failed, using fallback: {e}")
