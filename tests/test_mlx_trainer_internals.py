@@ -2640,6 +2640,30 @@ def test_resolved_best_metric_name_mirrors_hf_lookup():
         assert trainer._resolved_best_metric_name() == expected
 
 
+def test_best_metric_direction_is_inferred_when_it_is_not_set():
+    # A preference run selects on rewards/accuracies, where "better" is upward.
+    # An unset direction defaulting to False would keep the worst checkpoint.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric, expected in [
+        ("eval_loss", False),
+        ("eval_nll_loss", False),
+        ("eval_rewards/accuracies", True),
+        (None, False),
+    ]:
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is expected
+
+    args.metric_for_best_model = "eval_rewards/accuracies"
+    for explicit in (True, False):
+        args.greater_is_better = explicit
+        assert _resolve_greater_is_better(args) is explicit
+
+
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils

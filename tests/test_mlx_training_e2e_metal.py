@@ -589,7 +589,6 @@ def test_compiled_clip_accum_matches_eager_bitwise(tmp_path, capsys):
         assert np.array_equal(eager_snap[key][1], comp_snap[key][1]), key
 
 
-
 @metal_only
 def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch, capsys):
     import functools
@@ -625,7 +624,6 @@ def test_evaluation_failure_propagates_without_eager_retry(tmp_path, monkeypatch
                     overrides={"compile_mode": "best_effort"})
     assert state["step_ran"] and state["raised"]
     assert "falling back to eager" not in capsys.readouterr().out
-
 
 
 @metal_only
@@ -1140,3 +1138,80 @@ def test_preference_generate_during_eval_samples_through_the_real_engine(tmp_pat
     assert all(
         module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
     ), "the reference sample restored every adapter scale"
+
+
+@metal_only
+def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
+    """Evaluation must score the model, not a noised copy of it.
+
+    The gate is the embedding's own training flag, which only a real
+    mlx.nn.Module tree propagates, so nothing short of a real run tells a
+    working gate from an absent one -- and a broken one moves an eval number
+    without failing anything.
+    """
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import MLXORPOConfig, MLXORPOTrainer
+
+    def pairs(start, stop):
+        return [{"prompt": f"### Question: {i} plus {i}?\n### Answer:",
+                 "chosen": f" {2 * i}.", "rejected": f" {2 * i + 3}."}
+                for i in range(start, stop)]
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    trainer = MLXORPOTrainer(
+        model=model, tokenizer=tokenizer,
+        train_dataset=pairs(0, 4), eval_dataset=pairs(4, 6),
+        args=MLXORPOConfig(
+            per_device_train_batch_size=2, gradient_accumulation_steps=1,
+            max_steps=1, learning_rate=1e-5, logging_steps=1,
+            output_dir=str(tmp_path), report_to="none", max_seq_length=256,
+            seed=3407, eval_steps=1, neftune_noise_alpha=5.0,
+        ),
+    )
+
+    observed, restored, noised = [], [], []
+    evaluating = {"now": False}
+    install = trainer._install_neftune
+
+    def install_and_watch():
+        install()
+        embed = trainer._neftune_emb
+        assert embed is not None, "NEFTune never attached to the embedding"
+        noisy, base = type(embed), trainer._neftune_base_cls
+        # Eager, before any transform traces the forward: without this the run
+        # below cannot tell a working gate from an embedding that never noises.
+        probe, was_training = mx.array([[1, 2, 3]]), embed.training
+        embed.train(True)
+        noised.append(
+            not mx.allclose(embed(probe), base.__call__(embed, probe)).item())
+        embed.train(was_training)
+
+        class _Recorder(noisy):
+            def __call__(self, x):
+                observed.append((bool(self.training), evaluating["now"]))
+                return noisy.__call__(self, x)
+
+        _Recorder.__name__ = noisy.__name__
+        embed.__class__ = _Recorder
+
+    trainer._install_neftune = install_and_watch
+    evaluate = trainer._evaluate
+
+    def evaluate_and_watch(*args, **kwargs):
+        evaluating["now"] = True
+        try:
+            return evaluate(*args, **kwargs)
+        finally:
+            evaluating["now"] = False
+            restored.append(bool(trainer.model.training))
+
+    trainer._evaluate = evaluate_and_watch
+    trainer.train()
+
+    assert noised == [True], "the embedding never noised, so the run proves nothing"
+    in_eval = [training for training, evaluated in observed if evaluated]
+    assert any(t for t, evaluated in observed if not evaluated), "never trained"
+    assert in_eval, "evaluation never reached the embedding"
+    assert not any(in_eval), "NEFTune noise leaked into the eval forward"
+    assert restored == [True], "_evaluate left the model in eval mode"
