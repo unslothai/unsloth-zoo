@@ -280,8 +280,7 @@ def _get_modules_to_save_weight(module, attr = "weight"):
     if modules_to_save is None:
         return None
 
-    # `attr` so a head's bias travels with its weight; defaulted, so existing callers
-    # keep asking for the weight alone.
+    # `attr` so a head's bias travels with its weight; defaulted for existing callers.
     # Prefer the default adapter, else first entry with a weight
     for key in ("default",):
         try:
@@ -655,8 +654,8 @@ except:
     }
 pass
 
-# For a tensor appended to a shard, which has no source header entry to copy a label from.
-# Reversed rather than hand-written so it cannot drift from the table above.
+# Labels a tensor appended to a shard, which has no header entry to copy from. Reversed so
+# it cannot drift from the table above.
 _SAFETENSORS_DTYPE_NAMES = {v : k for k, v in SAFETENSORS_DTYPES.items()}
 
 @torch.inference_mode
@@ -2229,9 +2228,8 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             elif (W is not None and lora_stats is not None and not action_logged
                   and getattr(lora_stats, "lora_A", None) is None
                   and getattr(lora_stats, "module", None) is not None):
-                # modules_to_save with no LoRA delta, e.g. a seeded classification head. The
-                # dense path writes and counts these; without the same branch here the Step-7
-                # check sees one more backed module than were saved and the export aborts.
+                # modules_to_save with no LoRA delta (a seeded head). The dense path writes and
+                # counts these; without the same branch Step-7 sees one extra backed module and aborts.
                 saved_weight = _get_modules_to_save_weight(lora_stats.module)
                 if saved_weight is None and hasattr(lora_stats.module, "weight"):
                     saved_weight = lora_stats.module.weight
@@ -3571,10 +3569,9 @@ def merge_and_overwrite_lora(
     _fp8_prerewrite_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list) if _fp8_post_cleanup else set()
     _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
 
-    # A trained head the base checkpoint never had (sequence classification on a causal-LM
-    # base) is invisible to the in-place shard rewrite, so put it on disk before the loop
-    # runs. Scoped to merged_16bit: the mxfp4 and native-quant paths preserve packed base
-    # tensors rather than rewriting them, so seeding a 16bit head there would not reload.
+    # A trained head the base checkpoint never had is invisible to the in-place shard rewrite,
+    # so put it on disk before the loop. Scoped to merged_16bit: the mxfp4 and native-quant
+    # paths preserve packed base tensors, so a seeded 16bit head there would not reload.
     _seeded_head_keys = _seed_unbacked_trained_tensors(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         output_dtype = output_dtype, tie_word_embeddings = _merge_tie_word_embeddings,
@@ -3583,10 +3580,9 @@ def merge_and_overwrite_lora(
         print(f"Unsloth: Writing {len(_seeded_head_keys)} trained tensor(s) absent from the "
               f"base checkpoint: {', '.join(sorted(_seeded_head_keys))}")
         _carry_over_trained_head_config(save_directory, model, _merge_model_class_name)
-        # Step 2 uploaded config.json before the head existed and Step 7's folder re-upload
-        # is skipped in low-disk mode, so push the corrected one now. Otherwise the remote
-        # keeps a causal-LM config beside shards that do hold the head, which is the same
-        # config/weights mismatch this seeding exists to remove.
+        # Step 2 uploaded config.json before the head existed and Step 7's folder re-upload is
+        # skipped in low-disk mode, so push the corrected one now. Otherwise the remote keeps a
+        # causal-LM config beside shards that do hold the head.
         if push_to_hub: upload_items("config.json")
         # The index was copied (and, when pushing, already uploaded) before the seeding, so
         # re-upload it if the new key had to be added there.
@@ -4579,10 +4575,9 @@ def _backed_lora_keys(converted, safetensor_keys_seen, tie_word_embeddings,
 pass
 
 
-# Backbone tensors, never a task head. They belong to the base architecture, so when the
-# merge decides it cannot place one (tied embeddings, or a composite-VLM prefix it will not
-# bridge) a bare top-level copy is wrong: gemma3 ties its text embeddings, and seeding
-# `lm_head.weight` there puts a key in the export that the model has no slot for.
+# Backbone tensors, never a task head. When the merge cannot place one (tied embeddings, or a
+# composite-VLM prefix it will not bridge) a bare top-level copy is wrong: gemma3 ties its text
+# embeddings, so seeding `lm_head.weight` puts a key in the export with no slot for it.
 _NEVER_SEEDED = ("lm_head", "embed_tokens")
 
 
@@ -4654,10 +4649,9 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     target = min(sizes, key = sizes.get)
     path = os.path.join(save_directory, target)
 
-    # safetensors is a flat format, so adding a key means rewriting the shard through a temp
-    # copy, and a transient second copy of it has to fit. There is no in-place fallback the
-    # way a resize has: appending moves every offset. Refuse loudly rather than drop the head,
-    # since dropping it silently is the bug this is here to fix.
+    # safetensors is flat, so adding a key rewrites the shard through a temp copy that has to
+    # fit. Appending moves every offset, so there is no in-place fallback like a resize has.
+    # Refuse loudly rather than drop the head, since a silent drop is the bug this fixes.
     needed = sizes[target] + sum(t.numel() * t.element_size() for t in tensors.values())
     margin = 64 * 1024 * 1024
     try: free_bytes = shutil.disk_usage(save_directory).free
@@ -4714,9 +4708,8 @@ def _add_keys_to_index(save_directory, seeded_keys):
 pass
 
 
-# Fields that describe the head rather than the backbone. Written only alongside the head's
-# own tensors: advertising a classifier whose weights are not there is the same silent
-# failure in reverse, since the reload then builds a random one and reports nothing.
+# Fields describing the head, not the backbone. Written only alongside the head's own tensors:
+# advertising a classifier whose weights are absent is the same silent failure in reverse.
 _TRAINED_HEAD_CONFIG_FIELDS = ("id2label", "label2id", "problem_type")
 
 
