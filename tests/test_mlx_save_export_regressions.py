@@ -1097,6 +1097,192 @@ def test_vlm_rewrite_prefers_hf_alias_before_current_name(monkeypatch):
     assert mutils._mlx_arrays_match(new_tensor, tensor)
 
 
+_MTP_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+_MTP_SHIFTED_KEYS = (
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.1.post_attention_layernorm.weight",
+    "model.layers.0.self_attn.q_norm.weight",
+    "model.layers.0.self_attn.k_norm.weight",
+    "model.norm.weight",
+)
+
+
+class _MtpGatedNormSanitizer:
+    """Shaped like the MTP families': an MTP shard or a still-unsanitized
+    conv1d marks the source as HF convention, which one tensor cannot show."""
+
+    def __init__(self, src_path):
+        self._src_path = str(src_path)
+
+    def sanitize(self, weights):
+        shift = any("mtp." in key for key in weights) or any(
+            "conv1d.weight" in key and value.shape[-1] != 1
+            for key, value in weights.items()
+        )
+        sanitized = {}
+        for key, value in weights.items():
+            if "mtp." in key:
+                continue
+            if "conv1d.weight" in key and value.shape[-1] != 1:
+                value = value.moveaxis(2, 1)
+            if shift and value.ndim == 1 and key.endswith(_MTP_NORM_SUFFIXES):
+                value = value + 1.0
+            sanitized[key] = value
+        return sanitized
+
+
+def _mtp_source_weights(mx, *, gate):
+    """``gate`` selects what puts the source in HF convention, if anything."""
+    weights = {key: mx.array([0.5, 0.25]) for key in _MTP_SHIFTED_KEYS}
+    weights.update({
+        # Norm-named but unshifted: catches a correction keyed on the name.
+        "model.layers.0.linear_attn.norm.weight": mx.array([0.5, 0.25]),
+        "vision_tower.blocks.0.norm1.weight": mx.array([0.5, 0.25]),
+        # 1-D float but not a norm: catches a blanket 1-D correction.
+        "model.layers.0.linear_attn.dt_bias": mx.array([0.5, 0.25]),
+        "model.layers.0.self_attn.q_proj.weight": mx.array([[0.5, 0.25]]),
+    })
+    if gate == "mtp":
+        weights["mtp.0.input_layernorm.weight"] = mx.array([0.5, 0.25])
+    elif gate == "conv1d":
+        weights["model.layers.0.linear_attn.conv1d.weight"] = mx.zeros((2, 1, 4))
+    return weights
+
+
+def _write_weights(mx, directory, weights):
+    directory.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(directory / "model.safetensors"), weights)
+
+
+@pytest.mark.parametrize("gate", ["mtp", "conv1d", None])
+def test_norm_offsets_follow_the_source_checkpoint_gate(tmp_path, gate):
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    src = tmp_path / "src"
+    _write_weights(mx, src, _mtp_source_weights(mx, gate=gate))
+
+    offsets = mutils._mlx_sanitizer_norm_offsets(_MtpGatedNormSanitizer(src))
+
+    expected = dict.fromkeys(_MTP_SHIFTED_KEYS, 1.0) if gate else {}
+    assert offsets == expected
+
+
+@pytest.mark.parametrize("gate", ["mtp", "conv1d", None])
+def test_gguf_export_restores_the_hf_norm_convention(tmp_path, gate):
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    src = tmp_path / "src"
+    source_weights = _mtp_source_weights(mx, gate=gate)
+    _write_weights(mx, src, source_weights)
+    model = _MtpGatedNormSanitizer(src)
+
+    export = tmp_path / "export"
+    merged = model.sanitize(dict(source_weights))
+    _write_weights(mx, export, merged)
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    rewritten = mutils._prepare_mlx_gguf_export_directory(
+        export, model=model, replay_sanitizers=False
+    )
+
+    assert rewritten == (len(_MTP_SHIFTED_KEYS) if gate else 0)
+    exported = mx.load(str(export / "model.safetensors"))
+    assert sorted(exported) == sorted(merged)
+    for key, value in exported.items():
+        # conv1d is relayouted rather than offset.
+        expected = source_weights[key]
+        if "conv1d.weight" in key:
+            expected = merged[key]
+        assert mutils._mlx_arrays_match(value, expected), key
+
+
+def test_gguf_export_does_not_subtract_a_replayed_offset_twice(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class RenamingNormSanitizer:
+        """Renames and shifts, so the single-tensor replay recovers the value
+        on its own and the measured offset must not be applied again."""
+
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+
+        def sanitize(self, weights):
+            sanitized = {}
+            for key, value in weights.items():
+                key = key.replace("model.", "renamed.", 1)
+                if value.ndim == 1 and key.endswith(_MTP_NORM_SUFFIXES):
+                    value = value + 1.0
+                sanitized[key] = value
+            return sanitized
+
+    src = tmp_path / "src"
+    source_weights = {
+        "model.layers.0.input_layernorm.weight": mx.array([0.5, 0.25]),
+        "model.layers.0.linear_attn.dt_bias": mx.array([0.5, 0.25]),
+    }
+    _write_weights(mx, src, source_weights)
+    model = RenamingNormSanitizer(src)
+
+    export = tmp_path / "export"
+    _write_weights(mx, export, model.sanitize(dict(source_weights)))
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    mutils._prepare_mlx_gguf_export_directory(export, model=model)
+
+    exported = mx.load(str(export / "model.safetensors"))
+    assert mutils._mlx_arrays_match(
+        exported["renamed.layers.0.input_layernorm.weight"],
+        source_weights["model.layers.0.input_layernorm.weight"],
+    )
+    assert mutils._mlx_arrays_match(
+        exported["renamed.layers.0.linear_attn.dt_bias"],
+        source_weights["model.layers.0.linear_attn.dt_bias"],
+    )
+
+
+class _StopAfterExportPrep(Exception):
+    """Ends save_pretrained_gguf once the export prep has been observed."""
+
+
+@pytest.mark.parametrize("is_vlm", [True, False])
+def test_gguf_save_prepares_the_export_directory_for_every_model(
+    monkeypatch, tmp_path, is_vlm
+):
+    import unsloth_zoo.mlx.utils as mutils
+
+    calls = {}
+
+    def fake_prepare(path, model=None, replay_sanitizers=True):
+        calls["path"] = Path(path)
+        calls["model"] = model
+        calls["replay_sanitizers"] = replay_sanitizers
+        raise _StopAfterExportPrep
+
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda _model: is_vlm)
+    monkeypatch.setattr(
+        mutils, "save_merged_model", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(mutils, "_prepare_mlx_gguf_export_directory", fake_prepare)
+
+    model = object()
+    with pytest.raises(_StopAfterExportPrep):
+        mutils.save_pretrained_gguf(model, object(), tmp_path / "out")
+
+    assert calls["model"] is model
+    assert calls["replay_sanitizers"] is is_vlm
+
+
 def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):
     import torch
     import unsloth_zoo.mlx.utils as mutils
@@ -1630,7 +1816,7 @@ def test_save_merged_model_detects_nested_vlm_config(monkeypatch, tmp_path):
     assert calls["config"]["thinker_config"]["vision_config"]["hidden_size"] == 8
 
 
-def test_prepare_vlm_gguf_export_directory_writes_nextn_config_without_tensors(
+def test_prepare_mlx_gguf_export_directory_writes_nextn_config_without_tensors(
     monkeypatch,
     tmp_path,
 ):
@@ -1659,7 +1845,7 @@ def test_prepare_vlm_gguf_export_directory_writes_nextn_config_without_tensors(
         lambda config, model=None: [],
     )
 
-    rewritten = mutils._prepare_vlm_gguf_export_directory(tmp_path, model=object())
+    rewritten = mutils._prepare_mlx_gguf_export_directory(tmp_path, model=object())
 
     assert rewritten == 0
     updated = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1668,7 +1854,7 @@ def test_prepare_vlm_gguf_export_directory_writes_nextn_config_without_tensors(
     assert "nextn_predict_layers" not in updated["text_config"]
 
 
-def test_prepare_vlm_gguf_export_directory_ignores_malformed_thinker_config(
+def test_prepare_mlx_gguf_export_directory_ignores_malformed_thinker_config(
     monkeypatch,
     tmp_path,
 ):
@@ -1696,7 +1882,7 @@ def test_prepare_vlm_gguf_export_directory_ignores_malformed_thinker_config(
         lambda config, model=None: [],
     )
 
-    assert mutils._prepare_vlm_gguf_export_directory(tmp_path, model=object()) == 0
+    assert mutils._prepare_mlx_gguf_export_directory(tmp_path, model=object()) == 0
 
 
 def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
