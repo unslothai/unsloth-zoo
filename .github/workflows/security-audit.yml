@@ -209,6 +209,12 @@ jobs:
         with:
           egress-policy: block
           disable-sudo: true
+          # Both PyTorch hosts. download.pytorch.org hands the actual wheel fetch
+          # off to PyTorch's R2-backed download-r2.pytorch.org, so allow-listing
+          # only the first fails the install with a bare connection refused that
+          # reads like an upstream outage rather than an egress denial. Upstream's
+          # own guidance is to allow-list the pair:
+          # https://dev-discuss.pytorch.org/t/heads-up-libtorch-downloads-now-redirect-to-download-r2-pytorch-org-by-default-use-curl-l/3395
           allowed-endpoints: >
             api.github.com:443
             github.com:443
@@ -217,6 +223,7 @@ jobs:
             pypi.org:443
             files.pythonhosted.org:443
             download.pytorch.org:443
+            download-r2.pytorch.org:443
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
