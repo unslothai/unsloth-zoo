@@ -75,18 +75,25 @@ TRL_ANCHOR_TAGS = ("v0.22.2", "v0.27.1", "v1.0.0")
 # without failing.
 # ---------------------------------------------------------------------------
 def _try_load_fetch_shim():
-    """Locate ``_postmerge_audit/tests/version_compat/_fetch.py`` and
-    return its (fetch_text, has_def) helpers. Returns ``None`` if the
-    shim isn't present on this machine; the parametrized fetch-based
-    tests then ``pytest.skip`` instead of crashing on import."""
+    """Return ``_fetch.py``'s (fetch_text, has_def) helpers, or ``None`` so the
+    fetch-based tests skip.
+
+    The shim lives outside the repo, so its path must be derived from
+    ``__file__``; a hardcoded absolute path made collection depend on one
+    machine. ``is_file()`` raises rather than returning False when a parent
+    directory denies traversal, turning "not present, skip" into a
+    ``PermissionError`` that pytest treats as a fatal collection error for the
+    whole session -- hence ``OSError`` is swallowed per candidate.
+    """
     candidates = [
-        # Sister workspace layout the parent agent uses
-        Path("/mnt/disks/unslothai/ubuntu/workspace_6/_postmerge_audit/tests/version_compat/_fetch.py"),
-        # Generic relative layout (zoo_clone/.. sibling)
         Path(__file__).resolve().parents[2] / "_postmerge_audit/tests/version_compat/_fetch.py",
     ]
     for path in candidates:
-        if path.is_file():
+        try:
+            reachable = path.is_file()
+        except OSError:
+            continue
+        if reachable:
             spec_dir = str(path.parent)
             if spec_dir not in sys.path:
                 sys.path.insert(0, spec_dir)

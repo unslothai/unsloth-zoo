@@ -68,8 +68,19 @@ def _vlm_load_config(*args, **kwargs):
     return {}
 
 
+def _prepare_inputs(*args, **kwargs):
+    return {}
+
+
+def _process_image(image, *args, **kwargs):
+    return image
+
+
 utils_module.skip_multimodal_module = _skip_multimodal_module
 utils_module.load_config = _vlm_load_config
+# The batched vision adapter binds both at construction time.
+utils_module.prepare_inputs = _prepare_inputs
+utils_module.process_image = _process_image
 
 prompt_utils_module = _pkg("mlx_vlm.prompt_utils")
 models_module = _pkg("mlx_vlm.models")

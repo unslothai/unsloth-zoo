@@ -115,9 +115,17 @@ def get_transformers_model_type(config, trust_remote_code=False):
     model_types = None
 
     from peft import PeftConfig
-    # Handle model.peft_config["default"]
-    if type(config) is dict and "default" in config:
-        config = config["default"]
+    # Handle model.peft_config, which maps adapter name -> config. "default" wins when
+    # present. Otherwise a single-adapter dict is unambiguous and unwraps whatever its
+    # key is, since get_peft_model(..., adapter_name = ...) names the adapter freely.
+    # A multi-adapter dict without "default" stays ambiguous - adapters may carry
+    # different base models - so leave it be and let the guard below raise rather than
+    # silently pick a winner.
+    if type(config) is dict:
+        if "default" in config:
+            config = config["default"]
+        elif len(config) == 1:
+            config = next(iter(config.values()))
     
     retry_config = False
     if issubclass(type(config), PeftConfig):
@@ -195,7 +203,10 @@ def get_transformers_model_type(config, trust_remote_code=False):
                     stack.extend(obj)
         model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
-    if model_types is None:
+    # `find` above returns a list, so an unresolved config arrives here as [], never
+    # None - an `is None` check would let it through and every consumer indexes [0]
+    # or joins the list. Treat empty and None the same.
+    if not model_types:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     # Standardize model_type
     final_model_types = []
@@ -204,7 +215,18 @@ def get_transformers_model_type(config, trust_remote_code=False):
         model_type = model_type.replace("-", "_")
         model_type = model_type.replace("/", "_")
         model_type = model_type.replace(".", "_")
+        # PretrainedConfig.model_type defaults to "", so any nested sub-config that does
+        # not override it (dbrx attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up
+        # here as an empty sentinel that says nothing about the architecture
+        if not model_type.strip():
+            continue
+        # model_type is interpolated into an import path, so it must be a plain module name
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
         final_model_types.append(model_type)
+    # Every candidate was an empty sentinel, so the architecture is still unknown
+    if not final_model_types:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     final_model_types = sorted(final_model_types)
 
     # Check if model type is correct

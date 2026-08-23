@@ -17,6 +17,8 @@ from __future__ import annotations
 import inspect
 from typing import Iterable
 
+import importlib
+
 import pytest
 
 try:
@@ -42,6 +44,56 @@ def _skip_if_transformers_5x(reason: str) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
+    """Did the import fail because OUR target is gone, rather than a dependency?
+
+    ``exc.name`` is the deepest package that could not be found, which for a
+    removed model package is the PARENT, not the module we asked for: dropping
+    ``transformers/models/siglip/`` makes importing
+    ``transformers.models.siglip.modeling_siglip`` raise with
+    ``name == "transformers.models.siglip"``. Comparing only against the full
+    path and the top-level package therefore read a removed target as a broken
+    dependency and skipped, hiding real drift. Any package prefix counts.
+
+    The trailing dot keeps this a PACKAGE prefix: without it
+    ``transformers.models.siglip`` would also claim
+    ``transformers.models.siglipx.modeling_x``.
+    """
+    name = exc.name or ""
+    return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
+
+
+def _import_or_skip(dotted_module: str, *names):
+    """Import ``names`` from ``dotted_module``, or skip with the real reason.
+
+    A bare inline import turns any failure on the way in into a signature-drift
+    failure, and those are different findings. gemma3n showed it: its config
+    does ``from timm.data import ImageNetInfo``, which a newer timm dropped, and
+    four signature tests failed here for a reason unrelated to the signatures
+    they check or to the transformers version installed. A module that has
+    genuinely gone away still raises, since that IS drift; only a module that
+    exists and raises is skipped.
+
+    Other direct imports in this file have the same shape and can move here.
+    """
+    try:
+        mod = importlib.import_module(dotted_module)
+    except ModuleNotFoundError as exc:
+        if _names_the_target(exc, dotted_module):
+            raise
+        pytest.skip(
+            f"{dotted_module!r} raised on import, so nothing can be said about "
+            f"signature drift here: {type(exc).__name__}: {exc}"
+        )
+    except Exception as exc:
+        pytest.skip(
+            f"{dotted_module!r} raised on import, so nothing can be said about "
+            f"signature drift here: {type(exc).__name__}: {exc}"
+        )
+    got = tuple(getattr(mod, name) for name in names)
+    return got[0] if len(got) == 1 else got
+
 
 def _param_names(func) -> list[str]:
     try:
@@ -587,8 +639,8 @@ def test_Gemma3Attention_forward_signature():
 def test_Gemma3nMultimodalEmbedder_forward_signature():
     """gemma3n.py:88 patches
     ``Gemma3nMultimodalEmbedder.forward(self, input_ids, inputs_embeds)``."""
-    from transformers.models.gemma3n.modeling_gemma3n import (
-        Gemma3nMultimodalEmbedder,
+    Gemma3nMultimodalEmbedder = _import_or_skip(
+        "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nMultimodalEmbedder",
     )
     _assert_params_superset(
         Gemma3nMultimodalEmbedder.forward,
@@ -600,7 +652,9 @@ def test_Gemma3nMultimodalEmbedder_forward_signature():
 def test_Gemma3nTextAltUp_predict_signature():
     """gemma3n.py:122 patches
     ``Gemma3nTextAltUp.predict(self, hidden_states)``."""
-    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    Gemma3nTextAltUp = _import_or_skip(
+        "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nTextAltUp",
+    )
     sig = inspect.signature(Gemma3nTextAltUp.predict)
     params = [p.name for p in sig.parameters.values() if p.name != "self"]
     if "hidden_states" not in params:
@@ -614,7 +668,9 @@ def test_Gemma3nTextAltUp_predict_signature():
 def test_Gemma3nTextAltUp_correct_signature():
     """gemma3n.py:146 patches
     ``Gemma3nTextAltUp.correct(self, predictions, activated)``."""
-    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
+    Gemma3nTextAltUp = _import_or_skip(
+        "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nTextAltUp",
+    )
     _assert_params_superset(
         Gemma3nTextAltUp.correct,
         required=["predictions", "activated"],
@@ -625,7 +681,9 @@ def test_Gemma3nTextAltUp_correct_signature():
 def test_Gemma3nModel_get_placeholder_mask_signature():
     """gemma3n.py:201 patches ``Gemma3nModel.get_placeholder_mask`` with
     match_level='relaxed'."""
-    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nModel
+    Gemma3nModel = _import_or_skip(
+        "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nModel",
+    )
     _assert_params_superset(
         Gemma3nModel.get_placeholder_mask,
         required=["input_ids", "inputs_embeds"],

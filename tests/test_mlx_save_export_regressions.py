@@ -25,9 +25,90 @@ import json
 import os
 import sys
 import types
+from copy import copy
 from pathlib import Path
 
 import pytest
+
+
+AutoProcessor = load_model = load_processor = nn = skip_multimodal_module = None
+_to_mx_array = None
+
+
+def _test_bound_load_processor(model_path, **kwargs):
+    return AutoProcessor.from_pretrained(model_path, **kwargs)
+
+
+def _test_bound_load_model(paths, weights):
+    return load_model(paths, weights)
+
+
+def _test_bound_vlm_load(model_path, paths=None, weights=None, **kwargs):
+    if paths is not None:
+        load_model(paths, weights)
+    return load_processor(model_path, **kwargs)
+
+
+def _test_make_streaming_detokenizer(processor):
+    detokenizer = copy(processor.detokenizer)
+    detokenizer.reset()
+    return detokenizer
+
+
+def _test_naive_detokenizer_init(self, tokenizer):
+    self._tokenizer, self._tokens = tokenizer, []
+
+
+def _test_naive_detokenizer_reset(self):
+    self._tokens = []
+
+
+def _test_legacy_projector_load(paths, weights):
+    skip_vision = True
+    config = {"quantization": {}}
+
+    def get_class_predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if p in config["quantization"]:
+            return config["quantization"][p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        return f"{p}.scales" in weights
+
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_aware_projector_load(paths, weights):
+    skip_vision = True
+
+    def get_class_predicate(path, module):
+        if skip_multimodal_module(path) and skip_vision and f"{path}.scales" not in weights:
+            return False
+        return f"{path}.scales" in weights
+
+    return nn.quantize(paths, class_predicate=get_class_predicate)
+
+
+def _test_lfm_projector_init(self, config):
+    self.projector_use_layernorm = config.projector_use_layernorm
+    self.layer_norm = lambda x: ("normalized", x)
+
+
+def _test_lfm_projector_call(self, x):
+    return self.layer_norm(x) if self.projector_use_layernorm else x
+
+
+def _test_minicpmo_legacy_vision(self, pixel_values, tgt_sizes):
+    dtype = self.language_model.model.embed_tokens.weight.dtype
+    return _to_mx_array(pixel_values, dtype=dtype)
+
+
+def _test_minicpmo_fixed_vision(self, pixel_values, tgt_sizes):
+    dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
+    return _to_mx_array(pixel_values, dtype=dtype)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -355,6 +436,385 @@ def test_tokenizer_wrapper_chat_template_return_dict_expands_for_generate():
     assert encoded.to("cpu")["input_ids"] == [1, 2, 3]
     assert tokenizer.apply_chat_template([], tokenize=False, return_dict=True) == "rendered"
     assert tokenizer("hi") == {"called": True}
+
+
+def test_vlm_prompt_patch_preserves_model_specific_media_markers(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    marker, state = "<|image_1|>Describe it.", {"result": None}
+    def original(*_args, **_kwargs):
+        if isinstance(state["result"], Exception):
+            raise state["result"]
+        return marker if state["result"] is None else state["result"]
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(prompt_utils, "_get_role_content", lambda item: (item["role"], item["content"]), raising=False)
+    monkeypatch.setattr(prompt_utils, "get_chat_template", lambda *_a, **_k: "fallback", raising=False)
+    monkeypatch.setattr(prompt_utils, "MODEL_CONFIG", {"phi3_v": object()}, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    for name in ("mlx_vlm.chat", "mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar", "mlx_vlm.server", "mlx_vlm.evals.utils"):
+        if name in sys.modules:
+            monkeypatch.setattr(sys.modules[name], "apply_chat_template", original, raising=False)
+    loader._ensure_vlm_prompt_utils_patched()
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe it."}]}]
+    render = lambda value, model_type="phi3_v", **kwargs: prompt_utils.apply_chat_template(object(), {"model_type": model_type}, value, **kwargs)
+
+    assert render([{"role": "user", "content": [{"type": "audio"}]}], num_audios=2) == "fallback"
+    assert render(messages, num_images=2) == "fallback"
+    assert render(messages, model_type="unknown", num_images=1) == "fallback"
+    assert render(messages + [{"role": "user", "content": "Again."}], num_images=1) == "fallback"
+    nested = [{"role": "user", "content": [{"type": "group", "content": messages[0]["content"]}]}]
+    assert render(nested, num_images=1) == "fallback"
+    nested_text = [{"type": "group", "content": [{"type": "text", "text": "Policy"}]}]
+    assert render([{"role": "system", "content": nested_text}] + messages, num_images=1) == "fallback"
+    assert render([{"role": "User", "content": messages[0]["content"]}], num_images=1) == "fallback"
+    tool_calls = [{"function": {"name": "inspect", "arguments": '{"detail":"full"}'}}]
+    normalized_calls = [{"function": {"name": "inspect", "arguments": {"detail": "full"}}}]
+    monkeypatch.setattr(prompt_utils, "_normalize_tool_call_arguments", lambda message: {**message, **({"tool_calls": normalized_calls} if "tool_calls" in message else {})}, raising=False)
+    tool_messages = [{**messages[0], "tool_calls": tool_calls}]
+    assert render(tool_messages, num_images=1, return_messages=True) == [{**messages[0], "tool_calls": normalized_calls}]
+    assert tool_messages[0]["tool_calls"] == tool_calls
+    assert render([{"role": "user", "content": [{"type": "IMAGE"}, {"type": "TEXT", "text": "Describe it."}]}], num_images=1) == "fallback"
+    for video_type in ("video", "input_video", "video_url"):
+        assert render([{"role": "user", "content": [{"type": video_type}]}]) == "fallback"
+    assert render(messages, num_images=1, video="clip.mp4") == "fallback"
+    assert render(messages, num_images=1, return_messages=True) == messages
+    for state["result"] in ("", ValueError("rejected")):
+        assert render(messages, num_images=1) == "fallback"
+    monkeypatch.setattr(prompt_utils, "extract_text_from_content", lambda content: content, raising=False)
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_args, **_kwargs: "anchored", raising=False)
+    string_messages = ["Plain.", {"role": "user", "content": "Plain dict."}, {"role": "user", "content": "Describe.", "name": "owner"}, {"role": "assistant", "content": "", "tool_calls": tool_calls}]
+    expected = ["anchored", "anchored", {**string_messages[2], "content": "anchored"}, {**string_messages[3], "content": "anchored", "tool_calls": normalized_calls}]
+    assert render(string_messages, num_images=1, return_messages=True) == expected
+
+
+def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
+    """No loaded mlx-vlm module may keep the original chat-template callable.
+
+    The hard-coded list only force-imports mlx-vlm's entry points, so aliases in
+    modules that are already loaded -- `mlx_vlm` itself re-exports this one --
+    survive the patch and render multi-turn prompts the old way.
+    """
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    def original(*_args, **_kwargs):
+        return "original"
+
+    monkeypatch.setattr(prompt_utils, "apply_chat_template", original, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+
+    # Aliases mlx-vlm really holds: the package re-export and a submodule that
+    # any `import mlx_vlm` already pulls in through mlx_vlm/trainer/__init__.py.
+    aliased = ("mlx_vlm", "mlx_vlm.trainer.datasets")
+    for name in aliased:
+        module = sys.modules.get(name) or types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setattr(module, "apply_chat_template", original, raising=False)
+
+    # A same-named alias outside mlx-vlm must stay untouched.
+    outsider = types.ModuleType("mlx_vlm_extension")
+    outsider.apply_chat_template = original
+    monkeypatch.setitem(sys.modules, outsider.__name__, outsider)
+
+    loader._ensure_vlm_prompt_utils_patched()
+
+    patched = prompt_utils.apply_chat_template
+    assert patched is not original
+    stale = [name for name in aliased if sys.modules[name].apply_chat_template is original]
+    assert stale == [], f"stale mlx-vlm chat-template aliases: {stale}"
+    assert outsider.apply_chat_template is original
+
+
+def _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader, **overrides):
+    attrs = {
+        "apply_chat_template": lambda *_args, **_kwargs: "count-rendered",
+        "get_message_json": lambda _model, text, role="user", **_kwargs: {
+            "role": role, "content": [{"type": "text", "text": text}],
+        },
+        "_get_role_content": lambda item: (item["role"], item["content"]),
+        "extract_text_from_content": lambda content: content,
+        "MODEL_CONFIG": {"qwen3_omni_moe": object()},
+        **overrides,
+    }
+    for name, value in attrs.items():
+        monkeypatch.setattr(prompt_utils, name, value, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+
+def _render_qwen(prompt_utils, prompt, processor=None, **kwargs):
+    processor = object() if processor is None else processor
+    config = {"model_type": "qwen3_omni_moe"}
+    return prompt_utils.apply_chat_template(processor, config, prompt, **kwargs)
+
+
+def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    configured = "nemotronh_nano_omni_reasoning_v3"
+    calls = []
+    def original(_processor, config, prompt, **kwargs):
+        model_type = config["model_type"]
+        calls.append((model_type, prompt, kwargs.get("num_audios")))
+        return "configured" if model_type in prompt_utils.MODEL_CONFIG else "text-only"
+    _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader,
+                               apply_chat_template=original,
+                               MODEL_CONFIG={configured: object()})
+    rendered = prompt_utils.apply_chat_template(object(), {
+        "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+    }, "Transcribe this audio.", num_audios=1)
+    assert rendered == "configured"
+    assert calls == [(configured, "Transcribe this audio.", 1)]
+
+
+def test_vlm_prompt_patch_places_counted_qwen3_omni_audio_before_text(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    rendered_messages = []
+    def render(_processor, messages, _add_generation_prompt, **_kwargs):
+        rendered_messages.append(messages)
+        return "structured-rendered"
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader, get_chat_template=render,
+    )
+    result = _render_qwen(prompt_utils, "Transcribe the audio into text.", num_audios=1)
+    assert result == "structured-rendered"
+    assert [x["type"] for x in rendered_messages[0][0]["content"]] == ["audio", "text"]
+
+
+def test_vlm_prompt_patch_preserves_qwen3_omni_video_with_audio(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    def video_message(_model_type, text, **kwargs):
+        video = {"type": "video", "video": kwargs["video"], "fps": kwargs["fps"]}
+        return {"role": "user", "content": [video, {"type": "text", "text": text}]}
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader, get_message_json=video_message,
+    )
+    messages = _render_qwen(prompt_utils, "Describe both inputs.",
+                            return_messages=True, num_audios=1,
+                            video="clip.mp4", fps=2)
+    assert [x["type"] for x in messages[0]["content"]] == ["video", "audio", "text"]
+    assert messages[0]["content"][0] == {"type": "video", "video": "clip.mp4", "fps": 2}
+
+
+def test_vlm_prompt_patch_honors_qwen3_omni_media_suppression(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader)
+    text = "Describe the input."
+    counted = {"role": "user", "content": text}
+    cases = (
+        (text, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (text, {"skip_image_token": True}, "user", ["audio", "text"]),
+        (text, {"role": "assistant"}, "assistant", ["text"]),
+        (counted, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (counted, {"skip_image_token": True}, "user", ["audio", "text"]),
+    )
+    for prompt, options, role, expected_types in cases:
+        message = _render_qwen(prompt_utils, prompt, return_messages=True,
+                               num_images=1, num_audios=1, **options)[0]
+        assert message["role"] == role
+        assert [item["type"] for item in message["content"]] == expected_types
+
+
+def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    rendered_messages = []
+
+    def counted_message(_model, text, role="user", **kwargs):
+        videos = [{"type": "video", "video": kwargs["video"]}] if kwargs.get("video") else []
+        return {"role": role, "content": videos + [{"type": "text", "text": text}]}
+
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=(
+            lambda _processor, messages, _add_generation_prompt, **_kwargs:
+                rendered_messages.append(messages) or "structured-rendered"
+        ),
+        get_message_json=counted_message,
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_video", "video": "clip.mp4"},
+                {"type": "video"},
+                {"type": "image", "image": "frame.png"},
+                {"type": "image"},
+                {"type": "input_audio", "audio": "first.wav"},
+                {"audio": "key-only.wav"},
+                {"type": "audio"},
+                {
+                    "type": "group",
+                    "content": [
+                        {"type": "input_audio", "audio": "nested.wav"},
+                    ],
+                },
+                {"type": "text", "text": "Transcribe the audio into text."},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image": "second.png"},
+                {"type": "input_audio", "audio": "second.wav"},
+                {"type": "text", "text": "Continue."},
+            ],
+        },
+    ]
+    result = _render_qwen(prompt_utils, messages, num_images=4, num_audios=5)
+
+    plain_prompt = [
+        {"role": "user", "content": "First."},
+        messages[1],
+    ]
+    plain = _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=2,
+        num_audios=2,
+    )
+    key_only_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"audio": "only.wav", "metadata": {"source": "fixture"}},
+                {"audio_url": "second.wav"},
+                {"type": "text", "text": "Keep me."},
+            ],
+        },
+    ]
+    key_only = _render_qwen(
+        prompt_utils,
+        key_only_prompt,
+        return_messages=True,
+        num_audios=2,
+    )
+    complete_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe."},
+                {"type": "audio"},
+            ],
+        },
+    ]
+    complete = _render_qwen(
+        prompt_utils,
+        complete_prompt,
+        return_messages=True,
+        num_audios=1,
+    )
+    nested_prompt = [
+        {
+            "role": "user",
+            "content": (
+                messages[0]["content"][4:5]
+                + messages[0]["content"][7:]
+            ),
+        },
+    ]
+    nested = _render_qwen(
+        prompt_utils,
+        nested_prompt,
+        return_messages=True,
+        num_audios=2,
+    )
+
+    assert [item["type"] for item in plain[0]["content"]] == [
+        "image",
+        "audio",
+        "text",
+    ]
+    assert plain[0]["content"][-1]["text"] == "First."
+    assert plain[1] == messages[1]
+    assert key_only == key_only_prompt
+    assert [item["type"] for item in complete[0]["content"]] == [
+        "audio",
+        "text",
+    ]
+    assert [item["type"] for item in nested[0]["content"]] == [
+        "input_audio",
+        "audio",
+        "group",
+        "text",
+    ]
+    assert _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=1,
+        num_audios=1,
+    ) == plain_prompt
+    assert _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=2,
+        num_audios=2,
+        skip_image_token=True,
+        skip_audio_token=True,
+    ) == plain_prompt
+
+    counted = {"role": "user", "content": "Transcribe the audio."}
+    for prompt in (counted, [counted]):
+        _render_qwen(prompt_utils, prompt, num_audios=1)
+    conversation = [
+        {"role": "system", "content": "Follow instructions."},
+        {"role": "HuMaN", "content": "Describe all inputs."},
+        {"role": "assistant", "content": "Ready."},
+    ]
+    anchored = _render_qwen(prompt_utils, conversation, return_messages=True,
+                            num_images=1, num_audios=1, video="clip.mp4")
+
+    assert result == "structured-rendered"
+    assert rendered_messages[0][0]["content"] == (
+        messages[0]["content"][:4]
+        + [{"type": "image"}]
+        + messages[0]["content"][4:7]
+        + [{"type": "audio"}]
+        + messages[0]["content"][7:]
+    )
+    assert rendered_messages[0][1] == messages[1]
+    assert len(rendered_messages) == 3
+    for rendered in rendered_messages[1:]:
+        assert [item["type"] for item in rendered[0]["content"]] == ["audio", "text"]
+    assert [[item["type"] for item in turn["content"]] for turn in anchored] == [
+        ["text"], ["video", "image", "audio", "text"], ["text"],
+    ]
+
+
+def test_vlm_prompt_patch_uses_qwen3_omni_native_non_thinking_template(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    native_calls = []
+    class Processor:
+        def apply_chat_template(
+            self, _messages, *, tokenize, add_generation_prompt, **kwargs,
+        ):
+            native_calls.append((tokenize, kwargs))
+            return "native-rendered"
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=lambda *_args, **_kwargs: "generic-rendered",
+    )
+    prompt = "Transcribe the audio into text."
+    result = _render_qwen(prompt_utils, prompt, Processor(), num_audios=1)
+    explicit_result = _render_qwen(prompt_utils, prompt, Processor(),
+                                   num_audios=1, enable_thinking=True)
+    tokenized_result = _render_qwen(prompt_utils, prompt, Processor(),
+                                    num_audios=1, tokenize=True)
+    assert (result, explicit_result, tokenized_result) == ("native-rendered",) * 3
+    assert native_calls == [(False, {}), (False, {"enable_thinking": True}), (True, {})]
 
 
 def test_vlm_generate_hf_kwargs(monkeypatch):
@@ -795,6 +1255,252 @@ def test_repair_degraded_vlm_processor_rebuilds_from_sidecar_configs(
     assert repaired.tokenizer is tokenizer
     assert repaired.chat_template == "{{ messages }}"
     assert tokenizer.chat_template == "{{ messages }}"
+
+
+def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
+    monkeypatch,
+    tmp_path,
+):
+    import unsloth_zoo.mlx.loader as loader
+
+    native, calls = object(), []
+
+    class FakeAutoProcessor:
+        error = ValueError("Unrecognized processing class")
+
+        @classmethod
+        def from_pretrained(cls, _path, **kwargs):
+            calls.append(kwargs["trust_remote_code"])
+            raise cls.error
+
+    monkeypatch.setitem(globals(), "AutoProcessor", FakeAutoProcessor)
+    monkeypatch.setattr(loader, "_ensure_vlm_detokenizer_copy", lambda: None)
+    monkeypatch.setattr(loader, "_load_declared_mlx_vlm_processor", lambda *_a, **_k: native)
+    (tmp_path / "config.json").write_text('{"model_type":"native"}', encoding="utf-8")
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    scoped = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    trusted = loader._bind_mlx_vlm_processor_loader(
+        _test_bound_vlm_load, allow_remote_code=True
+    )
+    assert scoped(tmp_path) is native and trusted(tmp_path) is native
+    assert calls == [False, True] and load_processor is _test_bound_load_processor
+    assert AutoProcessor is FakeAutoProcessor
+    FakeAutoProcessor.error = RuntimeError("unrelated")
+    with pytest.raises(RuntimeError, match="unrelated"):
+        scoped(tmp_path)
+
+
+def test_legacy_detokenizer_copy_is_reset_and_inherited_native_copy_wins(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module_name = "mlx_vlm.tokenizer_utils"
+    base = type(
+        "StreamingDetokenizer",
+        (),
+        {"__module__": module_name, "__slots__": ("text", "tokens", "offset")},
+    )
+    legacy = type(
+        "NaiveStreamingDetokenizer",
+        (base,),
+        {
+            "__module__": module_name,
+            "__init__": _test_naive_detokenizer_init,
+            "reset": _test_naive_detokenizer_reset,
+            "text": property(lambda self: ""),
+        },
+    )
+    module = types.SimpleNamespace(
+        __name__=module_name,
+        StreamingDetokenizer=base,
+        NaiveStreamingDetokenizer=legacy,
+        make_streaming_detokenizer=_test_make_streaming_detokenizer,
+    )
+    monkeypatch.setattr(loader.importlib, "import_module", lambda _name: module)
+    source_hash = loader._source_token_sha256(loader._safe_getsource(_test_make_streaming_detokenizer))
+    monkeypatch.setattr(loader, "_MLX_VLM_DETOKENIZER_COPY_TOKEN_SHA256", source_hash)
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    original = legacy(object())
+    original._tokens.append(1)
+    assert copy(original)._tokens == [] and original._tokens == [1]
+    del legacy.__copy__
+    base.__copy__ = lambda self: self
+    loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    inherited = legacy(object())
+    assert copy(inherited) is inherited
+    assert "__copy__" not in legacy.__dict__
+
+
+def test_quantized_projector_binding_is_call_scoped_and_fail_closed(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    paths = ["multi_modal_projector.quantized", "multi_modal_projector.dense", "vision.quantized"]
+    weights = {f"{paths[0]}.scales": object(), f"{paths[2]}.scales": object()}
+    skip = lambda path: path.startswith(("multi_modal_projector", "vision"))
+    module = types.SimpleNamespace(to_quantized=True, weight=types.SimpleNamespace(size=64))
+    quantize = lambda values, class_predicate: [class_predicate(path, module) for path in values]
+    monkeypatch.setitem(globals(), "nn", types.SimpleNamespace(quantize=quantize))
+    monkeypatch.setitem(globals(), "skip_multimodal_module", skip)
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_projector_load)
+    original = _test_bound_load_model
+    scoped = loader._bind_mlx_vlm_quantized_projector_loader(original)
+    assert scoped(paths, weights) == [True, False, False]
+    assert load_model is _test_legacy_projector_load and skip_multimodal_module is skip
+    monkeypatch.setitem(globals(), "load_model", _test_aware_projector_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(original) is original
+    monkeypatch.setitem(globals(), "load_model", _test_legacy_projector_load)
+    monkeypatch.setitem(globals(), "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *_a, **_k: "processor"))
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    processor_bound = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    assert loader._bind_mlx_vlm_quantized_projector_loader(processor_bound)(
+        "model", paths=paths, weights=weights
+    ) == "processor"
+
+
+def test_lfm_disabled_projector_norm_is_loader_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module_name = "mlx_vlm.models.lfm2_vl.lfm2_vl"
+    Projector = type(
+        "Lfm2VlMultiModalProjector", (), {"__module__": module_name,
+        "__init__": _test_lfm_projector_init, "__call__": _test_lfm_projector_call},
+    )
+    module = types.ModuleType(module_name)
+    module.Lfm2VlMultiModalProjector = Projector
+    monkeypatch.setitem(sys.modules, module_name, module)
+    init_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_init))
+    call_hash = loader._source_token_sha256(loader._safe_getsource(_test_lfm_projector_call))
+    original = Projector.__init__
+    incompatible_contracts = (
+        ("unknown", call_hash, Projector.__name__),
+        (init_hash, "unknown", Projector.__name__),
+        (init_hash, call_hash, "OtherProjector"),
+    )
+    for init_token, call_token, class_name in incompatible_contracts:
+        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_token)
+        monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_token)
+        Projector.__name__ = class_name
+        loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+        assert Projector.__init__ is original
+
+    Projector.__name__ = "Lfm2VlMultiModalProjector"
+    monkeypatch.setattr(loader, "_LFM2_PROJECTOR_INIT_TOKEN_SHA256", init_hash)
+    monkeypatch.setattr(loader, "_LFM2_PROJECTOR_CALL_TOKEN_SHA256", call_hash)
+    loader._bind_mlx_vlm_quantized_projector_loader(lambda: None, model_type="lfm2_vl")
+    disabled = Projector(types.SimpleNamespace(projector_use_layernorm=False))
+    enabled = Projector(types.SimpleNamespace(projector_use_layernorm=True))
+    assert not hasattr(disabled, "layer_norm") and enabled("x") == ("normalized", "x")
+
+
+def test_minicpmo_mlx_sanitize_is_complete_and_loader_gated(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    class MiniCPM:
+        __module__ = "mlx_vlm.models.minicpmo.minicpmo"
+        def sanitize(self, weights):
+            output = {}
+            for key, value in weights.items():
+                for source, target in zip(
+                    ("llm.", "vpm.", "apm."),
+                    ("language_model.", "vision_tower.", "audio_tower."),
+                ):
+                    if key.startswith(source):
+                        key = target + key[len(source) :]
+                        break
+                else:
+                    if not key.startswith(("resampler.", "audio_projection_layer.")):
+                        continue
+                if key == "resampler.attn.in_proj_weight":
+                    output.update({
+                        f"resampler.attn.{name}_proj.weight": part
+                        for name, part in zip(("q", "k", "v"), value)
+                    })
+                elif key.endswith("embeddings.patch_embedding.weight"):
+                    output[key] = ("vision-layout", value)
+                elif key.endswith("audio_tower.conv1.weight"):
+                    output[key] = ("audio-layout", value)
+                elif key != "language_model.lm_head.weight":
+                    output[key] = value
+            return output
+
+    sanitize_weights = lambda _model, weights: weights
+
+    def affected_load_model(model, weights):
+        return sanitize_weights(model, weights)
+
+    load_source = "def load_model(model, weights):\n    weights = sanitize_weights(model, weights)\n    return weights\n"
+    sources = {affected_load_model: load_source}
+    original_getsource = loader._safe_getsource
+
+    def getsource(obj):
+        return sources[obj] if obj in sources else original_getsource(obj)
+
+    expected_hash = loader._source_token_sha256(getsource(MiniCPM.sanitize))
+    monkeypatch.setattr(loader, "_MINICPM_SANITIZE_TOKEN_SHA256", expected_hash)
+    monkeypatch.setattr(loader, "_safe_getsource", getsource)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: MiniCPM)
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.load_model = affected_load_model
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+
+    original = MiniCPM.sanitize
+    loader._ensure_minicpmo_mlx_sanitize("minicpmo")
+    assert MiniCPM.sanitize.__wrapped__ is original
+    language, vision, audio = object(), object(), object()
+    values = {
+        "language_model.model.norm.weight": language,
+        "vision_tower.embeddings.patch_embedding.weight": vision,
+        "audio_tower.conv1.weight": audio,
+        "resampler.attn.in_proj_weight": ("q", "k", "v"),
+        "language_model.lm_head.weight": object(),
+    }
+    result = MiniCPM().sanitize(values)
+    assert result["language_model.model.norm.weight"] is language and result["vision_tower.embeddings.patch_embedding.weight"] == ("vision-layout", vision)
+    assert result["audio_tower.conv1.weight"] == ("audio-layout", audio) and "language_model.lm_head.weight" not in result
+    assert tuple(result[f"resampler.attn.{name}_proj.weight"] for name in ("q", "k", "v")) == ("q", "k", "v")
+    with pytest.raises(ValueError, match="mixes source and MLX tower names"):
+        MiniCPM().sanitize({"llm.x": 1, "language_model.x": 2})
+    assert MiniCPM().sanitize({"language_model.x": 1}) == {}
+    loader._ensure_minicpmo_mlx_sanitize("minicpmo")
+    assert MiniCPM.sanitize.__wrapped__ is original
+
+
+def test_minicpmo_vision_dtype_adapter_is_scoped_and_fail_closed(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    convert = lambda value, dtype=None: (value, dtype)
+    owner = "mlx_vlm.models.minicpmo.minicpmo"
+    functions = (
+        (convert, "_to_mx_array"),
+        (_test_minicpmo_legacy_vision, "get_vision_embedding"),
+        (_test_minicpmo_fixed_vision, "get_vision_embedding"),
+    )
+    for function, name in functions:
+        monkeypatch.setattr(function, "__module__", owner)
+        monkeypatch.setattr(function, "__name__", name)
+    monkeypatch.setitem(globals(), "_to_mx_array", convert)
+    fingerprint = loader._source_token_sha256(
+        loader._safe_getsource(_test_minicpmo_legacy_vision)
+    )
+    monkeypatch.setattr(loader, "_MINICPM_LEGACY_VISION_TOKEN_SHA256", fingerprint)
+    language = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            embed_tokens=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="uint32"))
+        )
+    )
+    vision = types.SimpleNamespace(
+        embeddings=types.SimpleNamespace(
+            patch_embedding=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="float16"))
+        )
+    )
+    model = types.SimpleNamespace(language_model=language, vision_tower=vision)
+    adapted = loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision)
+    assert _test_minicpmo_legacy_vision(model, "pixels", None) == ("pixels", "uint32")
+    assert adapted(model, "pixels", None) == ("pixels", "float16")
+    assert _to_mx_array is convert and adapted.__wrapped__ is _test_minicpmo_legacy_vision
+    assert loader._minicpmo_vision_dtype_adapter(adapted) is adapted
+    assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_fixed_vision) is _test_minicpmo_fixed_vision
+    monkeypatch.setattr(_test_minicpmo_legacy_vision, "__module__", "foreign")
+    assert loader._minicpmo_vision_dtype_adapter(_test_minicpmo_legacy_vision) is _test_minicpmo_legacy_vision
 
 
 def test_read_json_file_returns_empty_for_missing_or_malformed_files(tmp_path):
