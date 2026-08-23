@@ -8968,6 +8968,52 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+def _mlx_rng_key():
+    """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
+
+    Unreadable covers the torch simulation shim, whose state is a callable;
+    deciding that here is what lets the restore below stay unconditional. A
+    readable key that is not two words is different: the rewind no longer works
+    on the installed mlx, and a bare None would leave every compile fallback
+    silently not restoring, so it warns once and declines.
+    """
+    try:
+        words = mx.random.state[0].tolist()
+    except Exception:
+        return None
+    if len(words) != 2:
+        warnings.warn(
+            f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
+            "can only rewind the two-word form, so a run that falls back from "
+            "mx.compile to eager will not have its RNG restored and may diverge "
+            "from an eager run of the same seed.",
+            RuntimeWarning,
+            stacklevel = 2,
+        )
+        return None
+    # Masked, not just converted: mx.random.seed takes a uint64 and raises
+    # outside [0, 2**64), and that raise would land in a `finally` or a
+    # compile-failure handler. A no-op for real uint32 keys.
+    return (int(words[0]) & 0xFFFFFFFF, int(words[1]) & 0xFFFFFFFF)
+
+
+def _restore_mlx_rng_key(words):
+    """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
+
+    mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
+    Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
+    key's own words restores it exactly over the whole unsigned 64-bit range.
+    Unguarded on purpose: the masking above removes the only way this can raise,
+    and a blanket ``except`` would be a failure indistinguishable from an
+    intentional no-op, which is the defect this fixes.
+    """
+    if words is None:
+        return
+    high = int(words[0]) & 0xFFFFFFFF
+    low = int(words[1]) & 0xFFFFFFFF
+    mx.random.seed((high << 32) | low)
+
+
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
@@ -8997,15 +9043,7 @@ def _preserved_preprocessing_rng():
             ))
         except Exception:
             pass
-    mx_state = None
-    try:
-        mx_random_state = mx.random.state
-        if isinstance(mx_random_state, list) and mx_random_state:
-            mx_state = mx.array(
-                mx_random_state[0].tolist(), dtype=mx.uint32,
-            )
-    except Exception:
-        mx_state = None
+    mx_state = _mlx_rng_key()
     try:
         yield
     finally:
@@ -9014,11 +9052,7 @@ def _preserved_preprocessing_rng():
                 restore(snapshot)
             except Exception:
                 pass
-        if mx_state is not None:
-            try:
-                mx.random.state[0] = mx_state
-            except Exception:
-                pass
+        _restore_mlx_rng_key(mx_state)
 
 
 def _vlm_file_identity(path):

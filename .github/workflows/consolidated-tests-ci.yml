@@ -421,6 +421,19 @@ jobs:
             echo "real mlx is installed but the numeric tests skipped"; exit 1
           fi
 
+      - name: tests/test_mlx_rng_rewind.py (HARD GATE)
+        # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
+        # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
+        # skipped, which guards nothing on a pull request.
+        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+
+      - name: Fail if the RNG rewind tests skipped
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -q -rs | tee rng.txt
+          if grep -qiE '[0-9]+ skipped' rng.txt; then
+            echo "real mlx is installed but the RNG rewind tests skipped"; exit 1
+          fi
+
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
       - name: tests/test_mlx_shape_guard.py
