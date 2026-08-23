@@ -213,6 +213,11 @@ jobs:
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
         #
+        # The two MoE registry files pin preprocess_weight's layout resolution (#849)
+        # and that the weight-preprocessor registry is one dict across the package
+        # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
+        # neither was executed by any job before.
+        #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
         # model, which is what stops save_pretrained_merged from writing nothing
@@ -269,6 +274,8 @@ jobs:
             tests/test_find_common_token_ids_no_match.py \
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
+            tests/test_moe_preprocess_weight_transpose.py \
+            tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
