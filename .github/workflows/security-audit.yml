@@ -200,7 +200,9 @@ jobs:
   tests-security:
     name: pytest tests/security
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was sized for the pytest-and-pyyaml install this job used to do. Importing
+    # the real torch/transformers stack costs several minutes on its own.
+    timeout-minutes: 25
     steps:
       - name: Harden runner (egress block)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
@@ -214,6 +216,7 @@ jobs:
             objects.githubusercontent.com:443
             pypi.org:443
             files.pythonhosted.org:443
+            download.pytorch.org:443
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -228,6 +231,24 @@ jobs:
         # by tests/security/test_lint_workflow_triggers.py. (See unsloth PR #5397: without
         # pyyaml the lint script exits 2.)
         run: pip install pytest==9.0.3 pyyaml==6.0.2
+
+      - name: Install unsloth_zoo so tests/security can import what it guards
+        # tests/security was dependency-free until #1083 added
+        # test_model_type_import_guard.py, which imports unsloth_zoo.hf_utils to
+        # exercise get_transformers_model_type, the choke point that keeps a
+        # config-supplied model_type out of an import path. unsloth_zoo/__init__.py
+        # requires unsloth and torch, so on the bare install this job has been
+        # failing collection, and with it every push to main since 2026-08-22.
+        #
+        # Mirrors the install in consolidated-tests-ci.yml's tests/security lane,
+        # which is why that copy of this gate is green. CPU torch from
+        # download.pytorch.org rather than the CUDA build on PyPI: the CUDA wheel is
+        # multiple GB and nothing here needs a device.
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.13.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main"
 
       - name: Run security regression tests
         run: python3 -m pytest tests/security -v
