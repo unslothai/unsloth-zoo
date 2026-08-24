@@ -13986,6 +13986,16 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
+    # Pre-fold text-tower names. Sanitizers that decide the RMSNorm shift from
+    # the key, as the Qwen3.5 family does, only apply it under these, so they
+    # are what lets the replay recover the shift from an already-converted MLX
+    # checkpoint, where nothing was shifted at load and the measurement is bare.
+    if name.startswith("language_model.model."):
+        suffix = name[len("language_model.model."):]
+        add(f"model.language_model.{suffix}")
+    if name.startswith("language_model.lm_head"):
+        add(name[len("language_model."):])
+
     add(name)
     return candidates
 

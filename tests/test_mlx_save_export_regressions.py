@@ -1251,6 +1251,65 @@ def test_gguf_export_does_not_subtract_a_replayed_offset_twice(tmp_path):
     )
 
 
+class _KeyGatedNormSanitizer:
+    """Shaped like the Qwen3.5 family's: the RMSNorm shift is decided by the
+    pre-sanitize key, so it survives a checkpoint that was already converted."""
+
+    def __init__(self, src_path):
+        self._src_path = str(src_path)
+
+    def sanitize(self, weights):
+        sanitized = {}
+        for original_key, value in weights.items():
+            key = original_key
+            if key.startswith("model.language_model."):
+                key = "language_model.model." + key[len("model.language_model."):]
+            if (
+                value.ndim == 1
+                and key.endswith(_MTP_NORM_SUFFIXES)
+                and not original_key.startswith("language_model.")
+            ):
+                value = value + 1.0
+            sanitized[key] = value
+        return sanitized
+
+
+@pytest.mark.parametrize("source_convention", ["hf", "mlx"])
+def test_gguf_export_unshifts_an_already_converted_source(tmp_path, source_convention):
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    hf_weights = {
+        "model.language_model.layers.0.input_layernorm.weight": mx.array([0.5, 0.25]),
+        "model.language_model.norm.weight": mx.array([0.125, 0.75]),
+        "model.language_model.layers.0.linear_attn.dt_bias": mx.array([0.5, 0.25]),
+    }
+    model_of = _KeyGatedNormSanitizer
+
+    src = tmp_path / "src"
+    if source_convention == "hf":
+        _write_weights(mx, src, hf_weights)
+    else:
+        # An mlx-community style checkpoint: already sanitized, so reloading it
+        # shifts nothing and the measurement comes back bare.
+        _write_weights(mx, src, model_of(src).sanitize(dict(hf_weights)))
+    model = model_of(src)
+
+    if source_convention == "mlx":
+        assert mutils._mlx_sanitizer_norm_offsets(model) == {}
+
+    export = tmp_path / "export"
+    _write_weights(mx, export, model.sanitize(dict(hf_weights)))
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    mutils._prepare_mlx_gguf_export_directory(export, model=model)
+
+    exported = mx.load(str(export / "model.safetensors"))
+    for key, expected in hf_weights.items():
+        assert key in exported, key
+        assert mutils._mlx_arrays_match(exported[key], expected), key
+
+
 class _StopAfterExportPrep(Exception):
     """Ends save_pretrained_gguf once the export prep has been observed."""
 
