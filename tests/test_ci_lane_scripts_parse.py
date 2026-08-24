@@ -134,22 +134,15 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
     )
 
 
-# A lane runs in the background and records its own exit status, so the status it
-# records is the only thing the job ever learns about it. That capture is
+# A lane records its own exit status in the background, and that status is all the
+# job ever learns about it. The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`,
+# and a brace group reports only cmdN -- so every earlier failure was recorded as
+# rc=0, the "could not be built" guard never fired, and the job continued with a
+# half-built venv. A truncated mlx download surfaced two steps later as
+# ModuleNotFoundError, with the build step green.
 #
-#     { cmd1; cmd2; ...; cmdN } > "$log" 2>&1 || rc=$?
-#
-# and a brace group reports only cmdN. Written that way, every failure except the
-# last one is invisible: the lane records rc=0, the "environment could not be
-# built" guard never fires, and the job walks into the next step with a half-built
-# venv. That is exactly how a truncated mlx download surfaced two steps later as
-# `ModuleNotFoundError: No module named 'mlx'` from an assert step, with the build
-# step green.
-#
-# `set -e` inside the group does NOT fix it: the group sits on the left of
-# `|| rc=$?`, and POSIX says errexit is ignored for a compound command in a
-# `&&`/`||` list. The fix that works is `&&`-chaining, so the first failure both
-# stops the lane and becomes the recorded status.
+# `set -e` inside the group does NOT help: it sits on the left of `|| rc=$?`, where
+# POSIX ignores errexit. `&&`-chaining does, so the first failure becomes rc.
 
 def _capture_groups(run: str) -> list[str]:
     """Bodies of every `{ ... } > ... || rc=$?` status-capture group in a lane."""

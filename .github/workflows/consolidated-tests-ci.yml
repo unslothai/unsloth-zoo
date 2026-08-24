@@ -92,16 +92,12 @@ jobs:
         run: |
           mkdir -p .lanes
 
-          # A lane records its own exit status, so every command in it has to be
-          # able to set that status. A brace group reports only its LAST command,
-          # and `set -e` inside it would be ignored because the group sits on the
-          # left of `|| rc=$?` (POSIX: errexit does not apply there). So the steps
-          # are `&&`-chained: the first failure both stops the lane and becomes rc.
+          # `&&`-chained, not newline-separated: a brace group reports only its LAST
+          # command, and `set -e` would be ignored here because the group sits on
+          # the left of `|| rc=$?`. Chaining makes the first failure the lane's rc.
           #
-          # retry(): pip's own --retries only covers ESTABLISHING a connection, so
-          # a response body truncated mid-download (ProtocolError / IncompleteRead)
-          # is never retried and the install just dies. Wrap the network-bound
-          # installs so a truncated wheel costs a retry instead of a red run.
+          # retry(): pip's --retries only covers ESTABLISHING a connection, so a
+          # body truncated mid-download (IncompleteRead) is never retried.
           retry() {
             attempt=1
             until "$@"; do
