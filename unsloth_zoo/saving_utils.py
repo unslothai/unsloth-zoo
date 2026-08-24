@@ -2954,7 +2954,6 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
-
 class TextOnlyRemapError(RuntimeError):
     """The text-only key remap could not be derived, so the merge keeps the VLM tensors."""
 pass
@@ -3160,6 +3159,7 @@ def _export_text_only_config(save_directory, config, architecture):
     _remove_quantization_config(config_path = Path(save_directory) / "config.json")
     _remove_transformers_version(config_path = Path(save_directory) / "config.json")
 pass
+
 
 @torch.inference_mode
 def merge_and_overwrite_lora(
@@ -3885,11 +3885,11 @@ def merge_and_overwrite_lora(
             )
         else:
             _text_only_key_plan = None
+            _text_only_before = _shard_keys_on_disk(save_directory, final_safetensors_list)
             try:
                 _text_only_keys, _text_only_architecture = _text_only_expected_keys(config)
                 _text_only_key_plan = _text_only_key_map(
-                    _text_only_keys,
-                    _shard_keys_on_disk(save_directory, final_safetensors_list),
+                    _text_only_keys, _text_only_before,
                     tie_word_embeddings = _merge_tie_word_embeddings,
                 )
             except Exception as text_only_error:
@@ -3902,7 +3902,6 @@ def merge_and_overwrite_lora(
                 )
             pass
             if _text_only_key_plan is not None:
-                _before = len(_shard_keys_on_disk(save_directory, final_safetensors_list))
                 _kept_files = _rewrite_shards_text_only(
                     save_directory, final_safetensors_list, _text_only_key_plan,
                 )
@@ -3923,7 +3922,8 @@ def merge_and_overwrite_lora(
                 # Step 7 uploads by name, and the names just changed.
                 safetensors_list = final_safetensors_list
                 print(
-                    f"Unsloth: text_only export dropped {_before - len(_written)} vision/audio "
+                    f"Unsloth: text_only export dropped "
+                    f"{len(_text_only_before) - len(_written)} vision/audio "
                     f"tensor(s) and kept {len(_written)} as {_text_only_architecture}."
                 )
                 if push_to_hub: upload_items("config.json")
