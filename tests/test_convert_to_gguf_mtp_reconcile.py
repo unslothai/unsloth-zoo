@@ -469,3 +469,145 @@ def test_convert_to_gguf_still_strips_the_declaration_for_legacy_converters(llam
     assert "mtp_num_hidden_layers" not in updated["text_config"]
     command, = _read_converter_commands(tmp_path)
     assert "--no-mtp" not in command
+
+
+def _write_asserting_converter(path: Path) -> Path:
+    """A stub that fails with llama.cpp's MTP assertion until `--no-mtp` is passed.
+
+    It replays the traceback rather than re-deriving it, so it pins the retry
+    wiring, not the upstream condition.
+    """
+    converter = path / "asserting_convert.py"
+    command_log = path / "converter_commands.jsonl"
+    converter.write_text(
+        textwrap.dedent(
+            f"""
+            import argparse
+            import json
+            import sys
+            from pathlib import Path
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--outfile")
+            parser.add_argument("--outtype")
+            parser.add_argument("--split-max-size")
+            parser.add_argument("--no-mtp", action="store_true")
+            parser.add_argument("--mmproj", action="store_true")
+            parser.add_argument("model_dir")
+            args = parser.parse_args()
+            with Path({str(command_log)!r}).open("a", encoding="utf-8") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
+            if not args.no_mtp:
+                sys.stderr.write(
+                    'Traceback (most recent call last):\\n'
+                    '  File "conversion/qwen.py", line 303, in __init__\\n'
+                    '    assert self.opt_num_mtp_layers != 0\\n'
+                    'AssertionError\\n'
+                )
+                raise SystemExit(1)
+            Path(args.outfile).write_bytes(b"GGUF")
+            """
+        ).strip() + "\n",
+        encoding = "utf-8",
+    )
+    return converter
+
+
+def _write_headless_model(model_dir: Path) -> None:
+    """A merged MLX save: no declaration left, and no `mtp.*` tensors."""
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "text_config": {"num_hidden_layers": 24},
+            }
+        ),
+        encoding = "utf-8",
+    )
+    _write_index(model_dir, "model.language_model.layers.23.self_attn.q_proj.weight")
+
+
+def test_convert_to_gguf_retries_with_no_mtp_after_the_inference_assertion(llama_cpp, tmp_path, capsys):
+    model_dir = tmp_path / "model"
+    _write_headless_model(model_dir)
+
+    llama_cpp.convert_to_gguf(
+        model_name = str(tmp_path / "output.gguf"),
+        input_folder = str(model_dir),
+        converter_location = str(_write_asserting_converter(tmp_path)),
+        quantization_type = "bf16",
+    )
+
+    first, second = _read_converter_commands(tmp_path)
+    assert "--no-mtp" not in first
+    assert "--no-mtp" in second
+    # The model directory stays the trailing positional argument.
+    assert second[-1] == str(model_dir)
+    assert (tmp_path / "output.gguf").exists()
+    # Dropping the head is the one thing this retry does that a user cannot see.
+    assert "--no-mtp" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("captured", "expected"),
+    (
+        ("  File \"qwen.py\", line 303\n    assert self.opt_num_mtp_layers != 0\nAssertionError\n", True),
+        ("AssertionError: something else entirely\n", False),
+        ("INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n", False),
+        # Both words, different lines: a checkpoint whose head was recognised and
+        # which then failed for another reason keeps it.
+        (
+            "INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n"
+            "AssertionError: tensor shape mismatch\n",
+            False,
+        ),
+        # Same line, but a different invariant over the same counter.
+        ("    assert self.opt_num_mtp_layers == len(recognized)\n", False),
+        # An unterminated stream spliced onto the next one.
+        ("INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1AssertionError: boom\n", False),
+        ("", False),
+        (None, False),
+    ),
+)
+def test_converter_needs_no_mtp_matches_only_the_inference_assertion(llama_cpp, captured, expected):
+    assert llama_cpp._converter_needs_no_mtp(captured) is expected
+
+
+def test_convert_to_gguf_does_not_splice_unterminated_converter_streams(llama_cpp, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_headless_model(model_dir)
+    command_log = tmp_path / "converter_commands.jsonl"
+    converter = tmp_path / "splicing_convert.py"
+    converter.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import sys
+            from pathlib import Path
+
+            with Path({str(command_log)!r}).open("a", encoding="utf-8") as log:
+                log.write(json.dumps(sys.argv[1:]) + "\\n")
+            # No trailing newline, so a naive concatenation splices the streams.
+            sys.stderr.write("INFO:opt_num_mtp_layers resolved to 1")
+            sys.stdout.write("AssertionError: unrelated failure\\n")
+            raise SystemExit(1)
+            """
+        ).strip() + "\n",
+        encoding = "utf-8",
+    )
+
+    with pytest.raises(RuntimeError):
+        llama_cpp.convert_to_gguf(
+            model_name = str(tmp_path / "output.gguf"),
+            input_folder = str(model_dir),
+            converter_location = str(converter),
+            quantization_type = "bf16",
+        )
+
+    # One run: the unrelated failure must not be read as the MTP assertion.
+    assert len(_read_converter_commands(tmp_path)) == 1
+
+
+def test_add_no_mtp_refuses_to_loop(llama_cpp):
+    assert llama_cpp._add_no_mtp(["python", "conv.py", "--no-mtp", "/model"]) is None

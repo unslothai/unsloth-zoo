@@ -2387,6 +2387,23 @@ def _converter_was_oom_killed(exc):
     return "sigkill" in f"{exc}".lower()
 
 
+# Matched with its comparison: a failure that merely names the counter leaves
+# the checkpoint's head intact, and retrying without it would drop that head.
+_MTP_INFERENCE_ASSERTION = re.compile(
+    r"\bassert\b[^\r\n]*\bopt_num_mtp_layers\s*!=\s*0"
+)
+
+
+def _converter_needs_no_mtp(text):
+    """Did the converter abort inferring an MTP head the checkpoint does not have?
+
+    The assertion is what proves the head is absent: a declaration would have
+    skipped the branch, and a recognised `mtp.layers.<i>` made the count positive.
+    """
+    if not text: return False
+    return _MTP_INFERENCE_ASSERTION.search(text) is not None
+
+
 def _converter_rejected_no_mtp(text):
     """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
     if not text: return False
@@ -2403,6 +2420,13 @@ def _drop_no_mtp(command):
     """The same command without `--no-mtp`, or None when it has none to drop."""
     if "--no-mtp" not in command: return None
     return [token for token in command if token != "--no-mtp"]
+
+
+def _add_no_mtp(command):
+    """The same command with `--no-mtp`, or None when it already has it."""
+    if "--no-mtp" in command: return None
+    # The positional model directory must stay last.
+    return command[:-1] + ["--no-mtp", command[-1]]
 
 
 def _retry_with_temp_file(command):
@@ -2692,6 +2716,7 @@ def convert_to_gguf(
         attempted_repair = False
         attempted_temp_file = False
         attempted_no_mtp_drop = False
+        attempted_no_mtp_add = False
         repair_note = ""
         optional_failed = False
         while True:
@@ -2733,6 +2758,20 @@ def convert_to_gguf(
                     retry = _drop_no_mtp(command)
                     if retry is not None:
                         attempted_no_mtp_drop = True
+                        command = retry
+                        continue
+
+                # The converter indexed the tensors and found no head to keep.
+                if not attempted_no_mtp_add and _converter_needs_no_mtp(captured):
+                    retry = _add_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_add = True
+                        # Otherwise the head is dropped silently.
+                        print(
+                            "Unsloth: The GGUF converter found no multi-token "
+                            "prediction (MTP) head in this checkpoint. Retrying "
+                            "with --no-mtp; the GGUF will have no MTP head."
+                        )
                         command = retry
                         continue
 
