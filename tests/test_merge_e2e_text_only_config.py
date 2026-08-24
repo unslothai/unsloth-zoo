@@ -192,6 +192,26 @@ def test_index_and_shards_agree_after_the_drop(tmp_path):
         "the index and the shards disagree about which tensors exist")
 
 
+def test_low_disk_space_still_drops_without_a_push(tmp_path):
+    """Only the upload half of low_disk_space_usage blocks the drop, so keep the guard narrow.
+
+    That combination uploads and removes each shard inside the merge loop under a name chosen
+    before the drop changes how many shards there are, which is why it stands down. Saving to
+    a local directory removes nothing early, so there is no reason to give up the drop there.
+    """
+    H.set_offline_cpu_env()
+    base_dir, cfg = _write_vlm_base(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+
+    pm = _attach_lora(_text_only_model(cfg, base_dir))
+    H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32, low_disk_space_usage=True)
+
+    written = list(H.read_safetensors_dir(out_dir))
+    assert written, "the export wrote nothing"
+    assert not [k for k in written if "vision" in k], "low_disk_space_usage skipped the drop"
+    _assert_clean_reload(out_dir)
+
+
 def test_remap_failure_keeps_the_whole_checkpoint(tmp_path, monkeypatch):
     """When the text weights cannot be placed, fall back to #1073 rather than guess.
 
