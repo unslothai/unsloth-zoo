@@ -2954,6 +2954,99 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
+
+class TextOnlyRemapError(RuntimeError):
+    """The text-only key remap could not be derived, so the merge keeps the VLM tensors."""
+pass
+
+
+def _is_text_only_export(config, base_config):
+    """True when the in-memory config is the text section of a composite base config.
+
+    That is the `text_only = True` signature seen from inside the merge: the weights come
+    from a composite checkpoint while `model.config` has already been replaced by its
+    nested text config. A normal VLM save has `config is` the composite one, so this is
+    False and nothing below runs.
+    """
+    if config is None or base_config is None or config is base_config: return False
+    base_text = None
+    for holder in _text_configs(base_config):
+        if holder is not base_config: base_text = holder; break
+    if base_text is None: return False
+    base_type = getattr(base_config, "model_type", None)
+    text_type = getattr(base_text, "model_type", None)
+    this_type = getattr(config, "model_type", None)
+    if this_type is None or text_type is None or base_type is None: return False
+    return this_type == text_type and this_type != base_type
+pass
+
+
+def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
+    """Map every expected text-only key onto its key in the composite base checkpoint.
+
+    Published VLM checkpoints put the text weights in at least four different places, and
+    the arrangement is fixed when the checkpoint is written rather than by the installed
+    transformers, so nothing here may be hardcoded:
+
+        language_model.model.*                     gemma3 (no lm_head at all, tied)
+        model.text_model.*      + lm_head.weight   idefics3
+        thinker.model.*         + thinker.lm_head  qwen2_5_omni
+        model.language_model.*  + lm_head.weight   gemma3 built in-memory today
+
+    Every one of them is the text key with a SINGLE path component inserted at a fixed
+    index, and `lm_head` either takes the same insertion or is already top level. So derive
+    that one (component, index) from the two key sets instead of guessing it: collect the
+    candidate insertions each unmatched text key admits, intersect, and require the result
+    to name exactly one. Anything else raises, which is the caller's signal to leave the
+    export alone rather than write a checkpoint whose weights it could not place.
+    """
+    base_keys = set(base_keys)
+    # Every way of deleting one component from a base key, so a text key can be looked up
+    # directly instead of scanned for.
+    without_one = {}
+    for key in base_keys:
+        parts = key.split(".")
+        if len(parts) < 2: continue
+        for i in range(len(parts)):
+            without_one.setdefault(tuple(parts[:i] + parts[i+1:]), []).append((key, parts[i], i))
+    pass
+
+    verbatim = {k for k in text_keys if k in base_keys}
+    # A tied head has no tensor of its own anywhere: gemma3 ships 883 keys and not one of
+    # them is an lm_head. Reloading reties it from the embeddings, so its absence is the
+    # checkpoint being correct rather than a key this map failed to place.
+    tied = {k for k in text_keys if tie_word_embeddings and k.rpartition(".")[0].rpartition(".")[2] == "lm_head"}
+    candidates = None
+    for key in text_keys:
+        if key in verbatim or key in tied: continue
+        options = {(name, i) for _, name, i in without_one.get(tuple(key.split(".")), ())}
+        if not options:
+            raise TextOnlyRemapError(f"no tensor in the base checkpoint corresponds to `{key}`")
+        candidates = options if candidates is None else (candidates & options)
+        if not candidates:
+            raise TextOnlyRemapError("the text weights are not under one common prefix in the base checkpoint")
+    pass
+    if candidates is None:
+        # Every text key already matches verbatim, so there is no composite prefix to strip
+        # and dropping by this map would be a no-op the caller should not run.
+        raise TextOnlyRemapError("the base checkpoint is already text-only")
+    if len(candidates) != 1:
+        raise TextOnlyRemapError(f"the text prefix is ambiguous between {sorted(candidates)}")
+    name, index = next(iter(candidates))
+
+    key_map = {}
+    for key in text_keys:
+        if key in verbatim: key_map[key] = key; continue
+        parts = key.split(".")
+        candidate = ".".join(parts[:index] + [name] + parts[index:])
+        if candidate not in base_keys:
+            if key in tied: continue
+            raise TextOnlyRemapError(f"no tensor in the base checkpoint corresponds to `{key}`")
+        key_map[key] = candidate
+    pass
+    return key_map
+pass
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
