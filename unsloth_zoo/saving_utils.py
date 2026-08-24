@@ -3872,9 +3872,11 @@ def merge_and_overwrite_lora(
     # `text_only = True` asked for a text model. #1073 made the export loadable by declaring
     # the VLM architecture the weights actually carry; this brings the weights to the request
     # instead, dropping the vision and audio tensors and renaming what is left into the
-    # text-only namespace, so the checkpoint is the model that was asked for at roughly half
-    # the size (#969, second direction). Anything that cannot be mapped leaves the export
-    # exactly as #1073 writes it.
+    # text-only namespace, so the checkpoint is the model that was asked for (#969, second
+    # direction). How much smaller that makes it is entirely the model's business: it is 10%
+    # off gemma-3-4b-it, whose SigLIP tower is small next to the decoder, and far more off an
+    # omni model carrying audio and speech stacks. Anything that cannot be mapped leaves the
+    # export exactly as #1073 writes it.
     if save_method == "merged_16bit" and _is_text_only_export(config, _text_only_base_config):
         if low_disk_space_usage and push_to_hub:
             warnings.warn(
