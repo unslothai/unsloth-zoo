@@ -77,14 +77,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    # Unsloth: backported from fla PR #1077. N*HV used to sit on grid axis 1,
-    # which CUDA caps at 65535 blocks, so a batch of more than 65535/HV sequences
-    # failed the launch with "Triton Error [CUDA]: invalid argument". With HV=32
-    # that is 2047 packed documents in one varlen batch, which sequence packing
-    # reaches easily. Decode both indices from a flattened axis 0 instead.
-    # Keeping i_v as the fastest-varying index preserves the dispatch order of the
-    # old 2D grid, so the V-blocks of a sequence-head pair still land adjacently
-    # and their shared k / w loads stay in L2.
+    # Unsloth: backported from fla PR #1077. N*HV on grid axis 1 hit the 65535
+    # block cap, so a varlen batch of more than 65535/HV sequences failed to
+    # launch (2047 at HV=32, which sequence packing reaches). i_v stays
+    # fastest-varying, preserving the old dispatch order and the L2 reuse of a
+    # sequence-head pair's shared k / w loads.
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v, i_nh = pid % NV, (pid // NV).to(tl.int64)
@@ -364,14 +361,11 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    # Unsloth: backported from fla PR #1077. N*HV used to sit on grid axis 1,
-    # which CUDA caps at 65535 blocks, so a batch of more than 65535/HV sequences
-    # failed the launch with "Triton Error [CUDA]: invalid argument". With HV=32
-    # that is 2047 packed documents in one varlen batch, which sequence packing
-    # reaches easily. Decode both indices from a flattened axis 0 instead.
-    # Keeping i_v as the fastest-varying index preserves the dispatch order of the
-    # old 2D grid, so the V-blocks of a sequence-head pair still land adjacently
-    # and their shared k / w loads stay in L2.
+    # Unsloth: backported from fla PR #1077. N*HV on grid axis 1 hit the 65535
+    # block cap, so a varlen batch of more than 65535/HV sequences failed to
+    # launch (2047 at HV=32, which sequence packing reaches). i_v stays
+    # fastest-varying, preserving the old dispatch order and the L2 reuse of a
+    # sequence-head pair's shared k / w loads.
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v, i_nh = pid % NV, (pid // NV).to(tl.int64)

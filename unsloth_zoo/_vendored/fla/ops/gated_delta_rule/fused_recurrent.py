@@ -63,10 +63,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     APPLY_BETA_SIGMOID: tl.constexpr,
     ALLOW_NEG_EIGVAL: tl.constexpr,
 ):
-    # Unsloth: backported from fla PR #1097. Same 65535 grid-axis-1 cap as the
-    # state kernels (PR #1077): a decode batch of more than 65535/HV sequences
-    # failed the launch with "Triton Error [CUDA]: invalid argument". Decode both
-    # indices from a flattened axis 0, keeping i_v fastest-varying.
+    # Unsloth: backported from fla PR #1097. Same 65535 grid cap as the state
+    # kernels (PR #1077): a decode batch of more than 65535/HV sequences failed
+    # to launch. i_v stays fastest-varying.
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
     i_v, i_nh = pid % NV, (pid // NV).to(tl.int64)
