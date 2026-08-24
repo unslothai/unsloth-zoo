@@ -140,6 +140,19 @@ def test_a_text_key_with_no_counterpart_is_an_error():
         _text_only_key_map(TEXT_KEYS, base_keys, tie_word_embeddings = False)
 
 
+def test_two_complete_readings_are_an_error():
+    """Qwen Omni carries a second decoder under `talker`, and it only fails to match because
+    it is a different shape. One that matched would give two equally valid answers, and
+    picking either would be a coin flip over which model the user gets.
+    """
+    base_keys = set()
+    for tower in ("thinker.", "talker."):
+        base_keys |= {tower + k for k in TEXT_KEYS - {"lm_head.weight"}}
+        base_keys.add(tower + "lm_head.weight")
+    with pytest.raises(TextOnlyRemapError):
+        _text_only_key_map(TEXT_KEYS, base_keys, tie_word_embeddings = False)
+
+
 def test_an_already_text_only_checkpoint_is_an_error():
     """There is nothing to drop, and an identity map would rewrite every shard to achieve it."""
     with pytest.raises(TextOnlyRemapError):
