@@ -3881,9 +3881,9 @@ def merge_and_overwrite_lora(
         if low_disk_space_usage and push_to_hub:
             warnings.warn(
                 "Unsloth: keeping the vision/audio tensors in this `text_only` export, "
-                "because `low_disk_space_usage` uploads and removes each shard inside the "
-                "merge loop and the shards cannot be renumbered once the drop changes how "
-                "many there are. The checkpoint is correct, just larger than asked for (#969)."
+                "because `low_disk_space_usage` uploads and deletes each shard inside the "
+                "merge loop, so there is nothing left on disk here to read the text weights "
+                "out of. The checkpoint is correct, just larger than asked for (#969)."
             )
         else:
             _text_only_key_plan = None
@@ -3917,7 +3917,9 @@ def merge_and_overwrite_lora(
                         f"Unsloth: the text_only export wrote {len(_written)} tensor(s) but "
                         f"its config describes {len(_expected)}. Missing: "
                         f"{sorted(_expected - _written)[:4]}. Unexpected: "
-                        f"{sorted(_written - _expected)[:4]}. Please file a bug report!"
+                        f"{sorted(_written - _expected)[:4]}. The shards in "
+                        f"`{save_directory}` have already been rewritten, so delete it and "
+                        f"merge again rather than loading it. Please file a bug report!"
                     )
                 _write_text_only_index(save_directory, final_safetensors_list)
                 _export_text_only_config(save_directory, config, _text_only_architecture)
