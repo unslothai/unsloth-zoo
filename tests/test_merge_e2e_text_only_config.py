@@ -153,7 +153,9 @@ def test_text_only_export_drops_the_vision_tower(tmp_path):
 
 
 def test_text_only_export_is_smaller_than_the_base(tmp_path):
-    """Halving the checkpoint is the point of the drop, so measure it rather than assume it."""
+    """The saving is the point, so measure it. How large it is depends on the model: the
+    tower is 10% of gemma-3-4b-it and most of an omni checkpoint, so only pin the direction.
+    """
     H.set_offline_cpu_env()
     base_dir, cfg = _write_vlm_base(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
