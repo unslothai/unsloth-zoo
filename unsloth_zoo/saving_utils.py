@@ -2984,67 +2984,84 @@ pass
 def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
     """Map every expected text-only key onto its key in the composite base checkpoint.
 
-    Published VLM checkpoints put the text weights in at least four different places, and
-    the arrangement is fixed when the checkpoint is written rather than by the installed
-    transformers, so nothing here may be hardcoded:
+    Where a VLM keeps its text weights is decided when the checkpoint is written, not by the
+    installed transformers, and the arrangements genuinely differ. Observed on real files:
 
-        language_model.model.*                     gemma3 (no lm_head at all, tied)
-        model.text_model.*      + lm_head.weight   idefics3
-        thinker.model.*         + thinker.lm_head  qwen2_5_omni
-        model.language_model.*  + lm_head.weight   gemma3 built in-memory today
+        language_model.model.*                     gemma3 on the Hub (tied, so no lm_head)
+        model.text_model.*      + lm_head.weight   idefics3 on the Hub
+        thinker.model.*         + thinker.lm_head  qwen2_5_omni on the Hub
+        model.language_model.*  + lm_head.weight   gemma3 in memory
+        model.language_model.model.*               gemma3 written by save_pretrained on 4.57/5.5
 
-    Every one of them is the text key with a SINGLE path component inserted at a fixed
-    index, and `lm_head` either takes the same insertion or is already top level. So derive
-    that one (component, index) from the two key sets instead of guessing it: collect the
-    candidate insertions each unmatched text key admits, intersect, and require the result
-    to name exactly one. Anything else raises, which is the caller's signal to leave the
-    export alone rather than write a checkpoint whose weights it could not place.
+    All five are the text key with one prefix swapped for another, so derive that pair from
+    the two key sets rather than hardcoding any of them: for each text key the base does not
+    already hold, offer every (text prefix, base prefix) that lands it on a real tensor, keep
+    only the pairs every such key agrees on, and require the survivors to describe the same
+    mapping. Anything else raises, which tells the caller to leave the export alone instead of
+    writing a checkpoint whose weights it could not place.
     """
     base_keys = set(base_keys)
-    # Every way of deleting one component from a base key, so a text key can be looked up
-    # directly instead of scanned for.
-    without_one = {}
+    text_keys = set(text_keys)
+    # A tied head owns no tensor anywhere: gemma3 ships 883 keys and not one is an lm_head,
+    # because the reload reties it from the embeddings. Its absence is the checkpoint being
+    # right, not a key this failed to place.
+    tied = {
+        key for key in text_keys
+        if tie_word_embeddings and key.rpartition(".")[0].rpartition(".")[2] == "lm_head"
+    }
+
+    # Component suffix -> the prefixes it appears under, so a text key can be looked up.
+    by_suffix = {}
     for key in base_keys:
         parts = key.split(".")
-        if len(parts) < 2: continue
         for i in range(len(parts)):
-            without_one.setdefault(tuple(parts[:i] + parts[i+1:]), []).append((key, parts[i], i))
+            by_suffix.setdefault(".".join(parts[i:]), set()).add(".".join(parts[:i] + [""]) if i else "")
     pass
 
-    verbatim = {k for k in text_keys if k in base_keys}
-    # A tied head has no tensor of its own anywhere: gemma3 ships 883 keys and not one of
-    # them is an lm_head. Reloading reties it from the embeddings, so its absence is the
-    # checkpoint being correct rather than a key this map failed to place.
-    tied = {k for k in text_keys if tie_word_embeddings and k.rpartition(".")[0].rpartition(".")[2] == "lm_head"}
     candidates = None
-    for key in text_keys:
-        if key in verbatim or key in tied: continue
-        options = {(name, i) for _, name, i in without_one.get(tuple(key.split(".")), ())}
+    for key in text_keys - base_keys - tied:
+        parts = key.split(".")
+        options = set()
+        for i in range(len(parts)):
+            text_prefix = ".".join(parts[:i] + [""]) if i else ""
+            for base_prefix in by_suffix.get(".".join(parts[i:]), ()):
+                if base_prefix != text_prefix: options.add((text_prefix, base_prefix))
+        pass
         if not options:
             raise TextOnlyRemapError(f"no tensor in the base checkpoint corresponds to `{key}`")
         candidates = options if candidates is None else (candidates & options)
         if not candidates:
-            raise TextOnlyRemapError("the text weights are not under one common prefix in the base checkpoint")
+            raise TextOnlyRemapError(
+                "the text weights are not under one common prefix in the base checkpoint"
+            )
     pass
     if candidates is None:
-        # Every text key already matches verbatim, so there is no composite prefix to strip
-        # and dropping by this map would be a no-op the caller should not run.
+        # Nothing to strip, so dropping by this map would be a no-op the caller must not run.
         raise TextOnlyRemapError("the base checkpoint is already text-only")
-    if len(candidates) != 1:
-        raise TextOnlyRemapError(f"the text prefix is ambiguous between {sorted(candidates)}")
-    name, index = next(iter(candidates))
 
-    key_map = {}
-    for key in text_keys:
-        if key in verbatim: key_map[key] = key; continue
-        parts = key.split(".")
-        candidate = ".".join(parts[:index] + [name] + parts[index:])
-        if candidate not in base_keys:
-            if key in tied: continue
-            raise TextOnlyRemapError(f"no tensor in the base checkpoint corresponds to `{key}`")
-        key_map[key] = candidate
+    def _build(text_prefix, base_prefix):
+        key_map = {}
+        for key in text_keys:
+            if text_prefix and not key.startswith(text_prefix): candidate = key
+            else: candidate = base_prefix + key[len(text_prefix):]
+            if candidate in base_keys: key_map[key] = candidate
+            elif key not in tied: return None
+        return key_map
     pass
-    return key_map
+
+    # Several prefix pairs can describe the same rewrite (a longer text prefix against a
+    # correspondingly longer base one). That is harmless while they agree; disagreeing means
+    # the checkpoint admits two readings and guessing between them is how #969 happened.
+    resolved = []
+    for text_prefix, base_prefix in sorted(candidates):
+        key_map = _build(text_prefix, base_prefix)
+        if key_map is not None and key_map not in resolved: resolved.append(key_map)
+    pass
+    if not resolved:
+        raise TextOnlyRemapError("no prefix places every text tensor in the base checkpoint")
+    if len(resolved) != 1:
+        raise TextOnlyRemapError("the base checkpoint admits more than one text-weight prefix")
+    return resolved[0]
 pass
 
 
