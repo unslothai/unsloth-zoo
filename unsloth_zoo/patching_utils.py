@@ -464,7 +464,23 @@ def patch_model_and_tokenizer(
             if key == "torch_dtype" or key == "dtype":
                 setattr(config, key, correct_dtype)
             else:
-                __fix_dtype(getattr(config, key, None))
+                # getattr's default only covers AttributeError, and transformers
+                # >= 5.15 raises AmbiguousGlobalPerLayerAttributeError straight
+                # out of PretrainedConfig.__getattribute__ for any attribute
+                # that varies per layer on a heterogeneous config. So reading a
+                # key that to_dict() itself just listed can raise, and it kills
+                # the whole load: unsloth/gemma-4-E2B-it on transformers 5.15.1
+                # dies here on 'head_dim' before a single weight is touched.
+                #
+                # Not fatal, because of what this walk is FOR. It descends
+                # looking for nested config objects that might carry a dtype
+                # key; a per-layer scalar like head_dim is never one, so an
+                # unreadable key has nothing to contribute either way.
+                try:
+                    child = getattr(config, key, None)
+                except Exception:
+                    continue
+                __fix_dtype(child)
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "dtype"):
