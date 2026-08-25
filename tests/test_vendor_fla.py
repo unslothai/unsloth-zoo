@@ -338,9 +338,8 @@ def test_decode_alias_never_overwrites_a_real_export(monkeypatch):
 
 
 def test_decode_alias_noop_on_partial_fla(monkeypatch):
-    """Nothing to alias from means no name is bound, rather than a name bound to
-    nothing -- an AttributeError at decoration time would be worse than the slow
-    path it replaces."""
+    """Nothing to alias from binds no name: an AttributeError at decoration time
+    would be worse than the slow path it replaces."""
     fake = _FakeGatedDeltaModule(chunk_gated_delta_rule=lambda: "chunk")
     added = _alias_into(fake, monkeypatch)
 
