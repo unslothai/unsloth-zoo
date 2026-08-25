@@ -221,6 +221,44 @@ def _is_messages(value):
     )
 
 
+def _extract_prompt(chosen, rejected):
+    """Recover the prompt as the common prefix of the two completions.
+
+    Mirrors TRL's extract_prompt, including its stop one element short when the
+    completions never diverge, so a row splits alike on either backend.
+    """
+    limit = min(len(chosen), len(rejected))
+    if not limit:
+        raise ValueError(
+            "Unsloth MLX preference: chosen and rejected must be non-empty to "
+            "recover a prompt from them."
+        )
+    for index in range(limit):
+        if chosen[index] != rejected[index]:
+            if chosen[index - 1] == " ":
+                index -= 1
+            break
+    return chosen[:index], chosen[index:], rejected[index:]
+
+
+def _maybe_extract_prompt(row):
+    """Fill in a prompt the row leaves implicit in its two completions.
+
+    Also reports whether it was recovered: only an explicit assistant-ended
+    prompt may be a partial turn its completions continue.
+    """
+    missing = {"chosen", "rejected"} - set(row)
+    if missing:
+        raise ValueError(
+            "Unsloth MLX preference: every row requires chosen and rejected "
+            f"fields; missing {sorted(missing)!r}."
+        )
+    if "prompt" in row and _is_messages(row["prompt"]) == _is_messages(row["chosen"]):
+        return row, False
+    prompt, chosen, rejected = _extract_prompt(row["chosen"], row["rejected"])
+    return {**row, "prompt": prompt, "chosen": chosen, "rejected": rejected}, True
+
+
 def _chat_template(tokenizer, messages, *, tools, kwargs, **mode):
     options = dict(kwargs or {})
     if tools is not None:
@@ -230,12 +268,14 @@ def _chat_template(tokenizer, messages, *, tools, kwargs, **mode):
     )
 
 
+def _continues_assistant(*completions):
+    return all(
+        completion and completion[0].get("role") == "assistant"
+        for completion in completions
+    )
+
+
 def _append_to_assistant(prompt, completion):
-    if not completion or completion[0].get("role") != "assistant":
-        raise ValueError(
-            "Unsloth MLX preference: an assistant-ended prompt requires each "
-            "completion to start with an assistant message."
-        )
     merged = [dict(message) for message in prompt]
     merged[-1]["content"] = (
         str(merged[-1].get("content", ""))
@@ -245,11 +285,14 @@ def _append_to_assistant(prompt, completion):
     return merged
 
 
-def _render_preference_row(tokenizer, row):
+def _render_preference_row(tokenizer, row, *, extracted=False):
     prompt = row["prompt"]
     chosen = row["chosen"]
     rejected = row["rejected"]
-    kinds = (_is_messages(prompt), _is_messages(chosen), _is_messages(rejected))
+    # An empty prompt carries no kind of its own, so it follows the completions.
+    kinds = [_is_messages(chosen), _is_messages(rejected)]
+    if prompt:
+        kinds.append(_is_messages(prompt))
     if any(kinds) and not all(kinds):
         raise ValueError(
             "Unsloth MLX preference: prompt, chosen, and rejected must all be "
@@ -262,42 +305,58 @@ def _render_preference_row(tokenizer, row):
             )
         return prompt, prompt + chosen, prompt + rejected
 
-    prompt = _normalize_mlx_messages(prompt, is_vlm=False)
     chosen = _normalize_mlx_messages(chosen, is_vlm=False)
     rejected = _normalize_mlx_messages(rejected, is_vlm=False)
-    role = prompt[-1].get("role")
     tools = row.get("tools")
     kwargs = row.get("chat_template_kwargs")
-    if role == "user":
+    if not prompt:
+        return (
+            "",
+            _chat_template(
+                tokenizer, chosen, tools=tools, kwargs=kwargs,
+                add_generation_prompt=False,
+            ),
+            _chat_template(
+                tokenizer, rejected, tools=tools, kwargs=kwargs,
+                add_generation_prompt=False,
+            ),
+        )
+    prompt = _normalize_mlx_messages(prompt, is_vlm=False)
+    role = prompt[-1].get("role")
+    if role == "assistant":
+        prompt_text = _chat_template(
+            tokenizer, prompt, tools=tools, kwargs=kwargs,
+            continue_final_message=True,
+        )
+        if not extracted and _continues_assistant(chosen, rejected):
+            # The completions finish this partial turn, so they join its message.
+            chosen_messages = _append_to_assistant(prompt, chosen)
+            rejected_messages = _append_to_assistant(prompt, rejected)
+        else:
+            # A whole turn instead, so its closing marker falls to the response.
+            chosen_messages = prompt + chosen
+            rejected_messages = prompt + rejected
+    elif role == "user":
         prompt_text = _chat_template(
             tokenizer, prompt, tools=tools, kwargs=kwargs,
             add_generation_prompt=True,
         )
         chosen_messages = prompt + chosen
         rejected_messages = prompt + rejected
-    elif role == "assistant":
-        prompt_text = _chat_template(
-            tokenizer, prompt, tools=tools, kwargs=kwargs,
-            continue_final_message=True,
-        )
-        chosen_messages = _append_to_assistant(prompt, chosen)
-        rejected_messages = _append_to_assistant(prompt, rejected)
     else:
         raise ValueError(
             "Unsloth MLX preference: a conversational prompt must end with a "
             "user or assistant message."
         )
-    return (
-        prompt_text,
-        _chat_template(
-            tokenizer, chosen_messages, tools=tools, kwargs=kwargs,
-            add_generation_prompt=False,
-        ),
-        _chat_template(
-            tokenizer, rejected_messages, tools=tools, kwargs=kwargs,
-            add_generation_prompt=False,
-        ),
+    chosen_text = _chat_template(
+        tokenizer, chosen_messages, tools=tools, kwargs=kwargs,
+        add_generation_prompt=False,
     )
+    rejected_text = _chat_template(
+        tokenizer, rejected_messages, tools=tools, kwargs=kwargs,
+        add_generation_prompt=False,
+    )
+    return prompt_text, chosen_text, rejected_text
 
 
 def tokenize_preference_row(
@@ -306,23 +365,27 @@ def tokenize_preference_row(
     """Tokenize one row and preserve a shared prompt boundary."""
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
-    missing = {"prompt", "chosen", "rejected"} - set(row)
-    if missing:
-        raise ValueError(
-            "Unsloth MLX preference: every row requires explicit prompt, chosen, "
-            f"and rejected fields; missing {sorted(missing)!r}."
-        )
-    prompt_text, chosen_text, rejected_text = _render_preference_row(tokenizer, row)
+    row, extracted = _maybe_extract_prompt(row)
+    prompt_text, chosen_text, rejected_text = _render_preference_row(
+        tokenizer, row, extracted=extracted,
+    )
     chosen = _encode_mlx_prompt_completion(
         tokenizer, prompt_text, chosen_text, append_eos=append_eos,
     )
     rejected = _encode_mlx_prompt_completion(
         tokenizer, prompt_text, rejected_text, append_eos=append_eos,
     )
-    chosen_prompt = list(chosen.input_ids[:chosen.prompt_length])
-    rejected_prompt = list(rejected.input_ids[:rejected.prompt_length])
-    chosen_response = list(chosen.input_ids[chosen.prompt_length:])
-    rejected_response = list(rejected.input_ids[rejected.prompt_length:])
+    boundaries = [chosen.prompt_length, rejected.prompt_length]
+    if not all(
+        text.startswith(prompt_text) for text in (chosen_text, rejected_text)
+    ):
+        # One branch can leave the prompt earlier than the other, and both mask
+        # the same prompt, so neither keeps more than both prove shared.
+        boundaries = [min(boundaries)] * 2
+    chosen_prompt = list(chosen.input_ids[:boundaries[0]])
+    rejected_prompt = list(rejected.input_ids[:boundaries[1]])
+    chosen_response = list(chosen.input_ids[boundaries[0]:])
+    rejected_response = list(rejected.input_ids[boundaries[1]:])
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "

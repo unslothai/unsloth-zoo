@@ -250,6 +250,8 @@ def test_prompt_mismatch_before_the_boundary_is_rejected():
 PROMPT, CHOSEN, REJECTED = "abcdefghijklmnopqrst", "uvwxyzABCD", "EFGH"
 LONG_ROW = {"prompt": PROMPT, "chosen": CHOSEN, "rejected": REJECTED}
 SWAPPED = {"prompt": PROMPT, "chosen": REJECTED, "rejected": CHOSEN}
+TURN = [{"role": "user", "content": "Q1"}, {"role": "assistant", "content": "A1"}]
+ANSWER, OTHER = {"role": "assistant", "content": "A2"}, {"role": "assistant", "content": "A3"}
 
 
 def encoded(text, *, eos=False):
@@ -361,6 +363,25 @@ def test_the_resolved_budget_matches_each_objectives_arithmetic(
     assert length_policy.max_seq_length == overrides.get("max_seq_length", 2048)
     assert length_policy.max_completion_length is None
     assert warning in said if warning else "no longer leaves room" not in said
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        # The prompt is the common prefix less its joining space. It splits on
+        # whole messages, and a wrong-kind prompt is re-derived.
+        ({"chosen": "The sky is blue.", "rejected": "The sky is green."},
+         ("The sky is", " blue.", " green.")),
+        ({"prompt": "Q1", "chosen": TURN + [ANSWER], "rejected": TURN + [OTHER]},
+         (TURN, [ANSWER], [OTHER])),
+    ],
+)
+def test_an_implicit_prompt_is_recovered_the_way_trl_recovers_it(row, expected):
+    from unsloth_zoo.mlx.preference import _maybe_extract_prompt
+
+    recovered, was_recovered = _maybe_extract_prompt(dict(row))
+    keys = ("prompt", "chosen", "rejected")
+    assert (*(recovered[key] for key in keys), was_recovered) == (*expected, True)
 
 
 def test_content_parts_and_chat_template_options_are_preserved():

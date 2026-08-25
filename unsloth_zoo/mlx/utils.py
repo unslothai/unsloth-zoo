@@ -4421,12 +4421,22 @@ class _MLXPromptCompletionTokens:
     prompt_length: int
 
 
-def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
-    """Locate the completion after tolerating one boundary-merged token."""
+def _mlx_prompt_completion_boundary(prompt_ids, input_ids, *, strict=True):
+    """Locate the completion after tolerating one boundary-merged token.
+
+    Without ``strict`` it may fall wherever the two tokenizations stop agreeing.
+    """
     prompt_ids = tuple(prompt_ids)
     input_ids = tuple(input_ids)
     if input_ids[:len(prompt_ids)] == prompt_ids:
         return len(prompt_ids)
+    if not strict:
+        shared = 0
+        while shared < min(len(prompt_ids), len(input_ids)):
+            if prompt_ids[shared] != input_ids[shared]:
+                break
+            shared += 1
+        return shared
     prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
     if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
         raise ValueError(
@@ -4455,7 +4465,11 @@ def _encode_mlx_prompt_completion(
     return _MLXPromptCompletionTokens(
         prompt_ids,
         input_ids,
-        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
+        # A template can re-render the prompt's last message once a completion
+        # follows it, leaving the prompt no longer even a text prefix.
+        _mlx_prompt_completion_boundary(
+            prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
+        ),
     )
 
 
