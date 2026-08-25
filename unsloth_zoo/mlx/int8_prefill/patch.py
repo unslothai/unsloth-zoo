@@ -136,6 +136,34 @@ def _patched_qmm(x, w, /, *args, **kwargs):
 _patched_qmm.__unsloth_int8_prefill__ = True
 
 
+# Modules whose `quantized_matmul` attribute is worth probing during the rebind sweep.
+#
+# Probing every entry in sys.modules is not safe: transformers installs a lazy module
+# __getattr__ that imports a submodule for any attribute name it recognises, so a bare
+# getattr for an unrelated name can raise ModuleNotFoundError from deep inside somebody
+# else's optional dependency (observed: "No module named 'torchvision'" while reverting
+# the patch). Restricting the sweep by module name is also what the rest of Unsloth does
+# for the same reason, and nothing outside these packages could hold the symbol anyway.
+_SWEEP_PREFIXES = ("mlx", "mlx_lm", "mlx_vlm", "unsloth", "unsloth_zoo")
+
+
+def _sweep_rebind(old, new):
+    """Repoint any module that captured `old` by value at import time.
+
+    Verified that nothing in mlx, mlx-lm or unsloth_zoo currently does this, so the sweep
+    is insurance against a future `from mlx.core import quantized_matmul`, not a present
+    requirement. It must therefore never be the thing that raises.
+    """
+    for name, mod in tuple(sys.modules.items()):
+        if mod is None or not name.startswith(_SWEEP_PREFIXES):
+            continue
+        try:
+            if getattr(mod, "quantized_matmul", None) is old:
+                setattr(mod, "quantized_matmul", new)
+        except Exception:
+            continue
+
+
 def is_patched():
     return getattr(mx.quantized_matmul, "__unsloth_int8_prefill__", False)
 
@@ -145,12 +173,7 @@ def apply():
     if is_patched():
         return False
     mx.quantized_matmul = _patched_qmm
-    for mod in tuple(sys.modules.values()):
-        if mod is not None and getattr(mod, "quantized_matmul", None) is _ORIG_QMM:
-            try:
-                setattr(mod, "quantized_matmul", _patched_qmm)
-            except Exception:
-                pass
+    _sweep_rebind(_ORIG_QMM, _patched_qmm)
     logger.info(
         "Unsloth: MLX int8 prefill patch applied (row threshold %d, backend %s)",
         ROW_THRESHOLD, backends.select().__name__.rsplit(".", 1)[-1],
@@ -163,12 +186,7 @@ def revert():
     if not is_patched():
         return False
     mx.quantized_matmul = _ORIG_QMM
-    for mod in tuple(sys.modules.values()):
-        if mod is not None and getattr(mod, "quantized_matmul", None) is _patched_qmm:
-            try:
-                setattr(mod, "quantized_matmul", _ORIG_QMM)
-            except Exception:
-                pass
+    _sweep_rebind(_patched_qmm, _ORIG_QMM)
     return True
 
 

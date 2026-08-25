@@ -142,6 +142,57 @@ class TestCapability:
         assert "boom" in capability.reason()
 
 
+class TestModuleSweep:
+    """The rebind sweep must never be the thing that raises.
+
+    Regression: apply() and revert() probed `quantized_matmul` on every entry in
+    sys.modules. transformers installs a lazy module __getattr__ that imports a submodule
+    for any attribute name it recognises, so a bare getattr for an unrelated name raised
+    ModuleNotFoundError from inside somebody else's optional dependency. Observed in CI as
+    "No module named 'torchvision'" during teardown, turning a passing test into an error.
+    """
+
+    def test_survives_a_module_whose_getattr_explodes(self, make_ql):
+        import sys
+        import types
+
+        hostile = types.ModuleType("mlx_hostile_probe")
+
+        def _boom(name):
+            raise ModuleNotFoundError(f"No module named 'not_installed' (probing {name})")
+
+        hostile.__getattr__ = _boom
+        sys.modules["mlx_hostile_probe"] = hostile
+        try:
+            assert int8_prefill.enable(force = True) is True
+            int8_prefill.disable()
+            assert mx.quantized_matmul is patch._ORIG_QMM
+        finally:
+            sys.modules.pop("mlx_hostile_probe", None)
+
+    def test_sweep_skips_unrelated_packages(self):
+        """Narrow by name as well as guarding, so unrelated lazy imports are never even
+        triggered. Only mlx and unsloth packages could hold the symbol."""
+        import sys
+        import types
+
+        probed = []
+        watcher = types.ModuleType("totally_unrelated_pkg")
+
+        def _record(name):
+            probed.append(name)
+            raise AttributeError(name)
+
+        watcher.__getattr__ = _record
+        sys.modules["totally_unrelated_pkg"] = watcher
+        try:
+            int8_prefill.enable(force = True)
+            int8_prefill.disable()
+        finally:
+            sys.modules.pop("totally_unrelated_pkg", None)
+        assert probed == [], f"sweep touched an unrelated package: {probed}"
+
+
 class TestEligibility:
     @pytest.mark.parametrize("group_size", [32, 64, 128])
     def test_4bit_all_group_sizes_accepted(self, group_size):
