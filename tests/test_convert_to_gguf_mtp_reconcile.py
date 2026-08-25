@@ -472,10 +472,9 @@ def test_convert_to_gguf_still_strips_the_declaration_for_legacy_converters(llam
 
 
 def _write_asserting_converter(path: Path) -> Path:
-    """A stub that fails with llama.cpp's MTP assertion until `--no-mtp` is passed.
+    """Fails with llama.cpp's MTP assertion until `--no-mtp` is passed.
 
-    It replays the traceback rather than re-deriving it, so it pins the retry
-    wiring, not the upstream condition.
+    Replays the traceback, so it pins the retry wiring, not the upstream condition.
     """
     converter = path / "asserting_convert.py"
     command_log = path / "converter_commands.jsonl"
@@ -542,10 +541,10 @@ def test_convert_to_gguf_retries_with_no_mtp_after_the_inference_assertion(llama
     first, second = _read_converter_commands(tmp_path)
     assert "--no-mtp" not in first
     assert "--no-mtp" in second
-    # The model directory stays the trailing positional argument.
+    # The model directory stays the trailing positional.
     assert second[-1] == str(model_dir)
     assert (tmp_path / "output.gguf").exists()
-    # Dropping the head is the one thing this retry does that a user cannot see.
+    # Dropping the head is the one effect a user cannot otherwise see.
     assert "--no-mtp" in capsys.readouterr().out
 
 
@@ -555,8 +554,8 @@ def test_convert_to_gguf_retries_with_no_mtp_after_the_inference_assertion(llama
         ("  File \"qwen.py\", line 303\n    assert self.opt_num_mtp_layers != 0\nAssertionError\n", True),
         ("AssertionError: something else entirely\n", False),
         ("INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n", False),
-        # Both words, different lines: a checkpoint whose head was recognised and
-        # which then failed for another reason keeps it.
+        # Both words, different lines: a recognised head that then failed for
+        # another reason keeps it.
         (
             "INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n"
             "AssertionError: tensor shape mismatch\n",
@@ -614,14 +613,13 @@ def test_add_no_mtp_refuses_to_loop(llama_cpp):
 
 
 def test_convert_to_gguf_refuses_to_retry_when_the_checkpoint_has_mtp_tensors(llama_cpp, tmp_path):
-    """The assertion proves the converter recognised zero canonical
-    `mtp.layers.<i>`, not that there is nothing to keep. `--no-mtp` makes it
-    discard every `mtp.*`, so a checkpoint that does carry a head must surface
-    the disagreement instead of exporting a quietly reduced GGUF."""
+    """The assertion proves zero *recognised* `mtp.layers.<i>`, not a headless
+    checkpoint. `--no-mtp` discards every `mtp.*`, so a checkpoint that does
+    carry a head must surface the disagreement, not export a reduced GGUF."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    # No declaration -- exactly the shape that reaches the assertion -- but the
-    # head is there, indexed past the trunk.
+    # No declaration, the shape that reaches the assertion, but the head is
+    # there, indexed past the trunk.
     (model_dir / "config.json").write_text(
         json.dumps(
             {
@@ -659,7 +657,7 @@ def test_convert_to_gguf_refuses_to_retry_when_the_checkpoint_has_mtp_tensors(ll
 
 def test_convert_to_gguf_never_sends_no_mtp_to_the_projector(llama_cpp, tmp_path):
     """`--no-mtp` was always kept off the mmproj command; the retry must not
-    reintroduce it there just because the projector pass quoted the assertion."""
+    reintroduce it when the projector pass quotes the assertion."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     command_log = tmp_path / "converter_commands.jsonl"
@@ -711,8 +709,8 @@ def test_convert_to_gguf_never_sends_no_mtp_to_the_projector(llama_cpp, tmp_path
 
 
 def test_converter_needs_no_mtp_will_not_straddle_a_line_break(llama_cpp):
-    """`captured` joins stderr and stdout. A comparison split across that join
-    is two unrelated fragments, not the assertion."""
+    """A comparison split across the stderr/stdout join is two unrelated
+    fragments, not the assertion."""
     assert llama_cpp._converter_needs_no_mtp(
         "    assert self.opt_num_mtp_layers !=\n 0 tensors were written\n") is False
     assert llama_cpp._converter_needs_no_mtp(
@@ -755,8 +753,8 @@ def test_convert_to_gguf_joins_converter_streams_on_a_newline(llama_cpp, tmp_pat
 
 def test_convert_to_gguf_clears_the_failed_attempts_output_before_retrying(llama_cpp, tmp_path):
     """The converter truncates `--outfile` at header time and, when splitting,
-    writes shards beside it. Callers scan the output directory for `*.gguf`, so
-    anything the failed attempt left would be shipped as if it were valid."""
+    writes shards beside it. Callers scan for `*.gguf`, so anything the failed
+    attempt left would be shipped as valid."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     output_dir = tmp_path / "out"
@@ -807,8 +805,8 @@ def test_convert_to_gguf_clears_the_failed_attempts_output_before_retrying(llama
 
 
 def test_convert_to_gguf_keeps_the_first_failure_when_the_retry_also_fails(llama_cpp, tmp_path):
-    """A converter that has the assertion but not the flag turns the retry into
-    an argparse error. The assertion is the useful half; keep both."""
+    """A converter with the assertion but not the flag turns the retry into an
+    argparse error. The assertion is the useful half; keep both."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     command_log = tmp_path / "converter_commands.jsonl"
