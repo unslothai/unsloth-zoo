@@ -111,3 +111,55 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
             assert vllm_utils._can_link_libcuda() is False
         finally:
             os.chdir(here)
+
+
+# ------------------------------------------------------------ platform scope
+
+
+def test_windows_looks_for_cuda_lib_not_a_posix_stub(tmp_path):
+    """Windows links `cuda.lib` from the toolkit and searches LIB. Probing for
+    libcuda.so there would find nothing and disable FlashInfer on a platform
+    where it works, which is worse than not checking at all."""
+    libdir = tmp_path / "lib" / "x64"
+    libdir.mkdir(parents = True)
+    (libdir / "cuda.lib").write_bytes(b"")
+    with mock.patch.object(vllm_utils.sys, "platform", "win32"), \
+         mock.patch.dict(os.environ, {"CUDA_PATH": str(tmp_path), "CUDA_HOME": "",
+                                      "LIB": ""}, clear = False):
+        assert vllm_utils._can_link_libcuda() is True
+
+
+def test_windows_without_cuda_lib_is_not_linkable(tmp_path):
+    root = tmp_path / "cuda"
+    (root / "lib" / "x64").mkdir(parents = True)
+    with mock.patch.object(vllm_utils.sys, "platform", "win32"), \
+         mock.patch.dict(os.environ, {"CUDA_PATH": str(root), "CUDA_HOME": "",
+                                      "LIB": ""}, clear = False):
+        assert vllm_utils._can_link_libcuda() is False
+
+
+def test_windows_with_nothing_to_go_on_does_not_claim_failure():
+    """No CUDA_PATH and no LIB means no evidence either way. Returning False
+    would disable FlashInfer on the strength of a missing env var."""
+    with mock.patch.object(vllm_utils.sys, "platform", "win32"), \
+         mock.patch.dict(os.environ, {"CUDA_PATH": "", "CUDA_HOME": "",
+                                      "LIB": ""}, clear = False):
+        assert vllm_utils._can_link_libcuda() is True
+
+
+def test_macos_never_claims_the_link_will_fail():
+    """CUDA is not in play on Darwin, so a negative would be an invention. This
+    keeps behaviour byte-identical to before the check existed."""
+    with mock.patch.object(vllm_utils.sys, "platform", "darwin"):
+        assert vllm_utils._can_link_libcuda() is True
+
+
+def test_wsl_is_linux_and_is_checked(tmp_path):
+    """WSL reports sys.platform == "linux" and uses the POSIX toolchain, so it
+    must take the Linux branch rather than be treated as Windows."""
+    (tmp_path / "libcuda.so.1").write_bytes(b"")
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
+         mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
+                                      "LIBRARY_PATH": ""}, clear = False):
+        assert vllm_utils._can_link_libcuda() is False

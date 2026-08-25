@@ -2031,12 +2031,19 @@ def _install_vllm_decompose_size_nodes_fix():
     return True
 
 
-# The directories `-L` reaches when FlashInfer links its JIT-compiled objects.
-# `/usr/local/cuda/compat` is deliberately NOT among them upstream, which is
-# what makes the check below necessary rather than paranoid.
+# The directories `-L` reaches when FlashInfer links its JIT-compiled objects
+# ON LINUX. `/usr/local/cuda/compat` is deliberately NOT among them upstream,
+# which is what makes the check below necessary rather than paranoid.
 _FLASHINFER_LINK_DIRS = (
     "/usr/local/cuda/lib64",
     "/usr/local/cuda/lib64/stubs",
+)
+
+# Windows links `cuda.lib` out of the toolkit, not a driver stub, and the
+# linker's search path comes from LIB rather than LIBRARY_PATH.
+_FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS = (
+    os.path.join("lib", "x64"),
+    os.path.join("lib", "Win32"),
 )
 
 
@@ -2044,8 +2051,8 @@ def _can_link_libcuda() -> bool:
     """Can a FlashInfer JIT build actually LINK, not merely compile?
 
     nvcc and ninja being present says the compile step will work. It says
-    nothing about the link, which passes `-lcuda` and therefore needs the
-    driver STUB `libcuda.so` -- not the runtime `libcuda.so.1` that every
+    nothing about the link, which on Linux passes `-lcuda` and therefore needs
+    the driver STUB `libcuda.so` -- not the runtime `libcuda.so.1` that every
     machine with a driver has.
 
     Container images routinely ship the runtime and omit the stub. On those,
@@ -2060,11 +2067,32 @@ def _can_link_libcuda() -> bool:
     FlashInfer SAMPLER simply moves the build to the attention kernels, and
     vLLM exposes no prefill-specific opt-out.
 
-    So probe for the stub the linker will actually look for, and treat its
-    absence exactly like a missing compiler: skip FlashInfer and use a backend
-    that works. A false negative here costs some throughput; a false positive
-    costs the whole run.
+    PLATFORM SCOPE MATTERS, and getting it wrong would be worse than not
+    checking at all. The `-lcuda`/`libcuda.so` mechanism is a Linux one. On
+    Windows the link resolves `cuda.lib` from the toolkit and searches LIB, so
+    a probe for `libcuda.so` there would find nothing and disable FlashInfer on
+    a platform where it works. Anywhere this cannot be checked positively --
+    macOS, or any future platform -- return True, i.e. do not claim the link
+    will fail. That keeps behaviour identical to before this check existed
+    everywhere except where the failure was actually observed.
     """
+    if sys.platform.startswith("win"):
+        search = [d for d in os.environ.get("LIB", "").split(os.pathsep) if d]
+        for var in ("CUDA_PATH", "CUDA_HOME"):
+            root = os.environ.get(var, "")
+            if root:
+                search += [os.path.join(root, sub)
+                           for sub in _FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS]
+        if not search:
+            # Nothing to go on. Stay out of the way rather than guess.
+            return True
+        return any(os.path.exists(os.path.join(d, "cuda.lib")) for d in search)
+
+    if not sys.platform.startswith("linux"):
+        # macOS and anything else: CUDA is not in play, and a negative here
+        # would be an invention rather than an observation.
+        return True
+
     search = list(_FLASHINFER_LINK_DIRS)
     for var in ("CUDA_HOME", "CUDA_PATH"):
         root = os.environ.get(var, "")
@@ -2075,7 +2103,6 @@ def _can_link_libcuda() -> bool:
     # that has already supplied a stub there is correctly treated as fine.
     search += [d for d in os.environ.get("LIBRARY_PATH", "").split(os.pathsep) if d]
     return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
-
 
 def _clear_flashinfer_env_on_hip():
     # AMD ROCm: FlashInfer requires the CUDA nvcc compiler and never applies here.
