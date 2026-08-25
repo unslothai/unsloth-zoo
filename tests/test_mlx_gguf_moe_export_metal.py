@@ -93,3 +93,40 @@ def test_moe_staging_holds_no_more_shards_open_as_a_checkpoint_is_split(
     # retention that scales with the checkpoint shows. The small checkpoint goes
     # first so warm-up lands in the baseline.
     assert descriptor_growth(2) >= descriptor_growth(32)
+
+
+STEP3P5_CONFIG = dict(
+    model_type="step3p5", vocab_size=256, hidden_size=64, intermediate_size=128,
+    moe_intermediate_size=32, num_hidden_layers=2, num_attention_heads=4,
+    num_key_value_heads=4, num_attention_groups=1, moe_num_experts=4, moe_top_k=2,
+    rms_norm_eps=1e-5, rope_theta=1e4, head_dim=16, max_position_embeddings=512,
+    share_expert_dim=32, moe_layers_enum="0,1", tie_word_embeddings=False,
+)
+
+
+@metal_only
+def test_moe_staging_recovers_names_a_real_sanitizer_only_renamed(tmp_path):
+    """step3p5 keeps its experts fused in HF and is renamed, never un-stacked."""
+    import unsloth_zoo.mlx.utils as mutils
+    from mlx_lm.models import step3p5
+
+    model = step3p5.Model(step3p5.ModelArgs.from_dict(STEP3P5_CONFIG))
+    staged = {n: t.astype(mx.bfloat16) for n, t in tree_flatten(model.parameters())}
+    mx.eval(*staged.values())
+    path = tmp_path / "merged"
+    path.mkdir()
+    mx.save_safetensors(str(path / "model.safetensors"), staged, {"format": "mlx"})
+
+    rewritten = mutils._prepare_moe_gguf_export_directory(path, model=model)
+    # Every MLX-only name, plus the norms whose stored value is one above the
+    # checkpoint convention llama.cpp reads.
+    assert rewritten == len([n for n in staged if ".mlp." in n or "norm" in n])
+
+    rewritten = mx.load(str(path / "model.safetensors"))
+    assert "model.layers.0.moe.gate_proj.weight" in rewritten
+    assert "model.layers.0.share_expert.down_proj.weight" in rewritten
+    # The expert tensors stay fused: llama.cpp reads them in exactly this shape.
+    assert rewritten["model.layers.0.moe.gate_proj.weight"].ndim == 3
+    restored = model.sanitize(dict(rewritten))
+    for name, tensor in staged.items():
+        assert bool(mx.array_equal(restored[name], tensor)), name

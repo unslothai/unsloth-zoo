@@ -1653,7 +1653,7 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
 
     calls = {}
 
-    def fake_prepare(path, model=None, replay_sanitizers=True):
+    def fake_prepare(path, model=None, replay_sanitizers=True, norm_offsets=None):
         calls["path"] = Path(path)
         calls["model"] = model
         calls["replay_sanitizers"] = replay_sanitizers
@@ -3806,3 +3806,279 @@ def test_save_pretrained_gguf_hands_the_converter_per_expert_moe_tensors(
 
     assert "model.layers.0.mlp.experts.2.gate_proj.weight" in converted["tensors"]
     assert not any(".switch_mlp." in name for name in converted["tensors"])
+
+
+def test_moe_gguf_export_recovers_names_a_sanitizer_only_renamed(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES)
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+
+    tensors = _staged_tensors(path)
+    assert not any(".switch_mlp." in name for name in tensors)
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.moe.gate_proj.weight"],
+        model.expected["model.layers.1.mlp.switch_mlp.gate_proj.weight"],
+    )
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.moe.router_bias.weight"],
+        model.expected["model.layers.1.mlp.gate.router_bias.weight"],
+    )
+    index = json.loads((path / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(tensors)
+
+
+def test_moe_gguf_export_keeps_a_recovered_name_a_later_substitution_could_undo(
+    tmp_path
+):
+    # Recovering `.mlp.share_expert.` to `.share_expert.` makes the reverse
+    # substitution available, and applying it restores the name the checkpoint
+    # already holds, leaving a replay with nothing to prove.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES)
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+    assert mutils._mlx_arrays_match(
+        _staged_tensors(path)["model.layers.1.share_expert.down_proj.weight"],
+        model.expected["model.layers.1.mlp.share_expert.down_proj.weight"],
+    )
+
+
+def test_moe_gguf_export_leaves_a_sanitizer_with_no_readable_names_alone(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES, readable=False)
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+def test_moe_gguf_export_skips_substituting_a_fragment_every_tensor_carries():
+    import unsloth_zoo.mlx.utils as mutils
+
+    names = [f"model.layers.{layer}.{leaf}.weight" for layer in range(4)
+             for leaf in ("mlp.gate", "self_attn.q_proj", "self_attn.k_proj")]
+    offered = set(mutils._mlx_moe_rename_candidates(
+        (".weight", ".mlp.gate.", ".moe."), names
+    ))
+    # `.weight` names the checkpoint's shape rather than one block's layout, so
+    # substituting it can only produce nonsense to replay.
+    assert not any(replaced == ".weight" for replaced, _ in offered)
+    assert (".mlp.gate.", ".moe.") in offered
+
+
+RENAMED_LEAVES = ("mlp.switch_mlp.gate_proj", "mlp.gate.router_bias",
+                  "mlp.share_expert.down_proj")
+
+
+def _make_quirky_moe_model(quirk=None, leaves=("mlp.switch_mlp.gate_proj",),
+                           extra=(), width=1, num_layers=2, readable=True):
+    """A model whose sanitize also shifts or moves what it renames."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    shape = (4,) if width == 1 else (4, width)
+
+    class Model:
+        def __init__(self):
+            self.expected = {
+                f"model.layers.{layer}.{leaf}.weight": mx.reshape(
+                    mx.arange(4 * width, dtype=mx.float32), shape
+                ) + layer
+                for layer in range(num_layers)
+                for leaf in leaves + extra
+            }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            # A literal table, as mlx-lm writes them: the names live in this function's
+            # constants, which is where the rewrite reads them from.
+            remappings = (
+                (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
+                (".moe.router_bias.", ".mlp.gate.router_bias."),
+                (".share_expert.down_proj.", ".mlp.share_expert.down_proj."),
+                ("model.mtp.", "model.discarded."),
+            )
+            renamed, vanilla = {}, False
+            for name, tensor in weights.items():
+                for source, target in remappings:
+                    if source in name and target not in name:
+                        name, vanilla = name.replace(source, target), True
+                        break
+                if quirk == "drops" and "discarded" in name:
+                    continue
+                renamed[name] = tensor
+            if quirk == "swaps":
+                first, second = (
+                    f"model.layers.{n}.mlp.switch_mlp.gate_proj.weight"
+                    for n in (0, 1)
+                )
+                if first in renamed and second in renamed:
+                    renamed[first], renamed[second] = renamed[second], renamed[first]
+            elif vanilla and quirk:
+                for name in [n for n in renamed if "layernorm" in n or "gate.weight" in n]:
+                    tensor = renamed[name]
+                    if quirk in ("constant", "wide"):
+                        tensor = tensor + 1.0
+                    elif quirk == "scaled":
+                        tensor = tensor * 2.0
+                    elif quirk == "stepped":
+                        # Uniform across the first two elements only, so a corner probe reads it as +1.
+                        tensor = tensor + mx.reshape(mx.concatenate(
+                            [mx.ones(2, dtype=tensor.dtype),
+                             mx.full((tensor.size - 2,), 2.0, dtype=tensor.dtype)]
+                        ), tensor.shape)
+                    else:
+                        tensor = tensor + mx.reshape(
+                            mx.arange(tensor.size, dtype=tensor.dtype), tensor.shape
+                        )
+                    renamed[name] = tensor
+            return renamed
+
+    model = Model()
+    if not readable:
+        # A sanitize with no reachable constants must leave the checkpoint alone.
+        model.sanitize = lambda weights: dict(weights)
+        type(model).sanitize = None
+    return model
+
+
+def test_moe_gguf_export_undoes_a_constant_a_sanitizer_adds(tmp_path):
+    # llama.cpp adds the same constant back, so exporting the stored value would
+    # double it: a silently wrong GGUF rather than a failed conversion.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model("constant", extra=("input_layernorm",))
+    path = _stage_moe_directory(tmp_path, model)
+
+    # Two names recovered and two norms corrected: a tensor whose value moved is
+    # rewritten as surely as one whose name did.
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
+    tensors = _staged_tensors(path)
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.input_layernorm.weight"],
+        model.expected["model.layers.1.input_layernorm.weight"] - 1.0,
+    )
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.moe.gate_proj.weight"],
+        model.expected["model.layers.1.mlp.switch_mlp.gate_proj.weight"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("quirk", "shape"),
+    [
+        # A scaling reads differently from each probe; a per-element shift reads
+        # alike from both but is no single constant; and a shift uniform across
+        # the first two elements only would read as +1 from a sampled corner.
+        ("scaled", {"extra": ("input_layernorm",)}),
+        ("elementwise", {"extra": ("input_layernorm",)}),
+        ("stepped", {"extra": ("input_layernorm",)}),
+        # Carrying a wide tensor whole would materialize the checkpoint, so a
+        # constant measured from its corner is not proof of one anywhere else.
+        ("wide", {"extra": ("mlp.gate",), "width": 4}),
+        # Every probe used to carry one value, so any same-shaped tensor
+        # satisfied any other's expectation; probes spread alike then leave a
+        # swap of two neighbours looking like a constant offset.
+        ("swaps", {"extra": ("self_attn.q_proj", "self_attn.k_proj")}),
+    ],
+)
+def test_moe_gguf_export_refuses_what_it_cannot_prove(tmp_path, quirk, shape):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(quirk, **shape)
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+def test_moe_gguf_export_does_not_undo_an_offset_the_source_already_gave_up(tmp_path):
+    # The norm convention is restored before this runs, from the source
+    # checkpoint. Measuring from the sanitizer alone reaches a source that never
+    # revealed one, so the two measurements must not both be subtracted.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model("constant", extra=("input_layernorm",))
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(
+        path, model=model,
+        source_norm_offsets={"model.layers.1.input_layernorm.weight": 1.0},
+    ) == 3
+    tensors = _staged_tensors(path)
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.input_layernorm.weight"],
+        model.expected["model.layers.1.input_layernorm.weight"],
+    )
+    # The layer the source did not cover still has to be corrected here.
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.0.input_layernorm.weight"],
+        model.expected["model.layers.0.input_layernorm.weight"] - 1.0,
+    )
+
+
+def test_moe_gguf_export_leaves_a_tensor_the_sanitizer_drops_unnamed(tmp_path):
+    # A dropped tensor is reproduced under neither spelling, so nothing about a
+    # rename of it is ever proved. Renaming it anyway can turn a name llama.cpp
+    # reads into one it does not.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model("drops", extra=("mtp",), num_layers=1)
+    model.expected["model.mtp.0.weight"] = model.expected.pop(
+        "model.layers.0.mtp.weight"
+    )
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 1
+    tensors = _staged_tensors(path)
+    assert "model.layers.0.moe.gate_proj.weight" in tensors
+    assert "model.mtp.0.weight" in tensors
+
+
+def test_moe_gguf_export_treats_a_failed_source_measurement_as_an_answer(
+    monkeypatch, tmp_path
+):
+    # None means the source could not be read, which is a measurement. Re-reading
+    # it here could succeed where the caller's read failed, and then the two
+    # passes would be subtracting against different answers.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model("constant", extra=("input_layernorm",))
+    path = _stage_moe_directory(tmp_path, model)
+    monkeypatch.setattr(
+        mutils, "_mlx_sanitizer_norm_offsets",
+        lambda model: pytest.fail("re-read a source the caller had already read"),
+    )
+
+    assert mutils._prepare_moe_gguf_export_directory(
+        path, model=model, source_norm_offsets=None
+    ) == 4
+    assert mutils._mlx_arrays_match(
+        _staged_tensors(path)["model.layers.1.input_layernorm.weight"],
+        model.expected["model.layers.1.input_layernorm.weight"] - 1.0,
+    )
+
+
+def test_moe_gguf_export_builds_each_probe_once_for_the_whole_search(monkeypatch):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES)
+    staged = {n: mutils.mx.zeros(t.shape, dtype=t.dtype)
+              for n, t in model.expected.items()}
+    built, real = [], mutils._mlx_moe_offset_probe
+    monkeypatch.setattr(mutils, "_mlx_moe_offset_probe",
+                        lambda shape, value: built.append(value) or real(shape, value))
+    mutils._build_mlx_moe_rename_plan(model, staged, None)
+    # At most two probes per tensor however many candidates were tried: one
+    # cache outlives the whole search, rather than one per candidate.
+    assert len(built) <= 2 * len(staged)
