@@ -2031,6 +2031,52 @@ def _install_vllm_decompose_size_nodes_fix():
     return True
 
 
+# The directories `-L` reaches when FlashInfer links its JIT-compiled objects.
+# `/usr/local/cuda/compat` is deliberately NOT among them upstream, which is
+# what makes the check below necessary rather than paranoid.
+_FLASHINFER_LINK_DIRS = (
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda/lib64/stubs",
+)
+
+
+def _can_link_libcuda() -> bool:
+    """Can a FlashInfer JIT build actually LINK, not merely compile?
+
+    nvcc and ninja being present says the compile step will work. It says
+    nothing about the link, which passes `-lcuda` and therefore needs the
+    driver STUB `libcuda.so` -- not the runtime `libcuda.so.1` that every
+    machine with a driver has.
+
+    Container images routinely ship the runtime and omit the stub. On those,
+    every check above passes, FlashInfer compiles each .cu file cleanly, and
+    the build dies at the final step with
+
+        /usr/bin/ld: cannot find -lcuda
+
+    surfacing as `RuntimeError: Ninja build failed` after minutes of nvcc work.
+    Four separate Kaggle sessions were spent on that failure before the cause
+    was identified, and no environment variable avoids it: disabling the
+    FlashInfer SAMPLER simply moves the build to the attention kernels, and
+    vLLM exposes no prefill-specific opt-out.
+
+    So probe for the stub the linker will actually look for, and treat its
+    absence exactly like a missing compiler: skip FlashInfer and use a backend
+    that works. A false negative here costs some throughput; a false positive
+    costs the whole run.
+    """
+    search = list(_FLASHINFER_LINK_DIRS)
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        root = os.environ.get(var, "")
+        if root:
+            search.append(os.path.join(root, "lib64"))
+            search.append(os.path.join(root, "lib64", "stubs"))
+    # LIBRARY_PATH is what the linker consults beyond its defaults, so a caller
+    # that has already supplied a stub there is correctly treated as fine.
+    search += [d for d in os.environ.get("LIBRARY_PATH", "").split(os.pathsep) if d]
+    return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
+
+
 def _clear_flashinfer_env_on_hip():
     # AMD ROCm: FlashInfer requires the CUDA nvcc compiler and never applies here.
     # Remove any forced FlashInfer selection unconditionally, even when the package
@@ -2456,11 +2502,14 @@ def load_vllm(
             or os.path.isfile("/usr/local/cuda/bin/nvcc")
         )
         _has_ninja = shutil.which("ninja") is not None
+        # Compiling is not the same as linking; see _can_link_libcuda.
+        _can_link = _can_link_libcuda()
 
-        if not _has_nvcc or not _has_ninja:
+        if not _has_nvcc or not _has_ninja or not _can_link:
             _missing = []
             if not _has_nvcc:  _missing.append("nvcc (CUDA compiler)")
             if not _has_ninja: _missing.append("ninja (build tool)")
+            if not _can_link:  _missing.append("libcuda.so (the CUDA driver stub that -lcuda needs)")
             print(
                 f"Unsloth: FlashInfer requires JIT compilation but {' and '.join(_missing)} "
                 f"{'is' if len(_missing) == 1 else 'are'} not found.\n"
@@ -2468,6 +2517,10 @@ def load_vllm(
                 f"  To enable FlashInfer, install the missing tools:\n"
                 f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
                 f"    ninja - pip install ninja\n"
+                f"    libcuda.so - this image has the CUDA runtime but not the driver stub.\n"
+                f"      Install cuda-compat / the CUDA toolkit's stubs, or point LIBRARY_PATH\n"
+                f"      at a directory containing libcuda.so (a symlink to libcuda.so.1 or to\n"
+                f"      /usr/local/cuda/compat/libcuda.so is enough).\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
             # Clear any externally-set FlashInfer env vars so vLLM uses defaults
