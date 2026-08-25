@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   mlx-smoke:
-    name: MLX install + import smoke (Apple Silicon)
+    name: MLX install + import smoke (Apple Silicon, ${{ matrix.mlx }})
     # Opt-in: schedule / workflow_dispatch always run; PR runs only with `mlx` label.
     if: >-
       github.event_name == 'schedule' ||
@@ -35,6 +35,21 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-15   # Apple Silicon (M1) hosted runner
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # `pinned` is the gate: the exact MLX set pyproject ships, which is what
+        # users actually install, so it runs on every execution of this job.
+        # `latest` is the detection leg answering "is the next release safe to
+        # adopt", added only where nothing is waiting on the answer. Both are
+        # needed: with only `pinned` the pin goes stale unnoticed, and with only
+        # `latest` the supported combination is never exercised on Apple hardware
+        # at all, since PR runs are opt-in behind the `mlx` label.
+        mlx: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["pinned", "latest"]' || '["pinned"]') }}
+    # The detection leg reports, it does not gate. It deliberately installs
+    # combinations nobody supports yet, so letting it fail the workflow would
+    # turn every upstream release into a red main until someone bumps the pin.
+    continue-on-error: ${{ matrix.mlx == 'latest' }}
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
@@ -71,6 +86,32 @@ jobs:
           # remote processor code that imports timm, which .[mlx] does not pull.
           pip install timm
 
+      - name: Adopt the newest MLX (detection leg only)
+        # pyproject pins mlx and mlx-lm exactly so nobody installing unsloth_zoo is
+        # upgraded into a broken release unattended. That pin also holds `.[mlx]`
+        # above at the pinned versions forever, and this job is the only lane that
+        # runs real MLX on Apple Silicon, so without this leg the pin would
+        # silently remove the very check that is supposed to tell us whether the
+        # next release is safe to adopt.
+        #
+        # mlx-vlm is upgraded past its `<0.7.0` ceiling too. The ceiling exists
+        # because the current mlx-vlm wants transformers>=5.14.0 against this
+        # repo's `transformers<=5.5.0` cap, and leaving it out would mean the one
+        # lane that could ever justify lifting that ceiling never tests the
+        # version it would be lifted to. Letting transformers move with it is the
+        # point of this leg, and is why it does not gate.
+        if: matrix.mlx == 'latest'
+        run: |
+          pip install --upgrade mlx mlx-lm mlx-vlm
+          python - <<'PY'
+          from importlib.metadata import version
+          for name in ("mlx", "mlx-lm", "mlx-vlm"):
+              try:
+                  print(f"{name}=={version(name)}")
+              except Exception as error:
+                  print(f"{name}: {error}")
+          PY
+
       - name: MLX module import smoke
         run: |
           python -c "import unsloth_zoo.mlx_loader; print('mlx_loader OK')"
@@ -84,13 +125,27 @@ jobs:
         # on Apple Silicon; on Linux runners it would run against tests/mlx_simulation/ stubs.
         run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
 
+      - name: tests/test_mlx_rng_rewind.py
+        # PRNG capture and rewind across the mx.compile fallbacks. The Linux CPU
+        # lane gates this too, but the mlx 0.32.1 sentinel that broke it shipped
+        # in the Metal wheel first, so this is where a repeat surfaces earliest.
+        run: python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+
       - name: tests/test_mlx_switch_lora.py
         # Real-runtime routed LoRA training and adapter lifecycle coverage.
         run: python -m pytest tests/test_mlx_switch_lora.py -v -rs
 
+      - name: tests/test_mlx_save_over_source.py
+        # Saving safetensors back over the file they were loaded from. mlx 0.32.1
+        # made that fail, which is what took this job red on 2026-08-18.
+        run: python -m pytest tests/test_mlx_save_over_source.py -v -rs
+
       - name: tests/test_qwen35_vjp_metal.py
         # Metal VJP regressions for the qwen3_5 training patches (issue 6002).
-        run: python -m pytest tests/test_qwen35_vjp_metal.py -v -rs
+        # Not plain pytest: on mlx 0.32.1 this file exits 139 at interpreter
+        # shutdown with every test passing. The wrapper returns pytest's own exit
+        # code, so real failures still fail. See its docstring; revert once fixed.
+        run: python tests/_run_then_exit_hard.py tests/test_qwen35_vjp_metal.py -v -rs
 
       - name: tests/test_mlx_training_e2e_metal.py
         # Real LoRA training smoke: tiny 4-bit model through FastMLXModel +

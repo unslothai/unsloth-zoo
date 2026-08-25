@@ -92,6 +92,25 @@ jobs:
         run: |
           mkdir -p .lanes
 
+          # `&&`-chained, not newline-separated: a brace group reports only its LAST
+          # command, and `set -e` would be ignored here because the group sits on
+          # the left of `|| rc=$?`. Chaining makes the first failure the lane's rc.
+          #
+          # retry(): pip's --retries only covers ESTABLISHING a connection, so a
+          # body truncated mid-download (IncompleteRead) is never retried.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
           # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
           lane() {
@@ -101,14 +120,14 @@ jobs:
             (
               rc=0
               {
-                "$interpreter" -m venv "$venv"
-                "$venv/bin/python" -m pip install --upgrade pip
-                "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
-                  "torch>=2.4.0,<2.11.0"
-                "$venv/bin/pip" install -e .[core]
-                "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-                "$venv/bin/pip" install pytest==9.0.3
+                "$interpreter" -m venv "$venv" &&
+                "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
+                  "torch>=2.4.0,<2.11.0" &&
+                retry "$venv/bin/pip" install -e .[core] &&
+                { "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install pytest==9.0.3
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$version.install"
 
@@ -213,6 +232,11 @@ jobs:
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
         #
+        # The two MoE registry files pin preprocess_weight's layout resolution (#849)
+        # and that the weight-preprocessor registry is one dict across the package
+        # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
+        # neither was executed by any job before.
+        #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
         # model, which is what stops save_pretrained_merged from writing nothing
@@ -269,6 +293,8 @@ jobs:
             tests/test_find_common_token_ids_no_match.py \
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
+            tests/test_moe_preprocess_weight_transpose.py \
+            tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
@@ -335,18 +361,35 @@ jobs:
         run: |
           mkdir -p .lanes
 
+          # See the interpreter lane for why these are `&&`-chained and what retry()
+          # is for: a brace group reports only its last command, `set -e` is
+          # ignored on the left of `|| rc=$?`, and pip's --retries does not cover a
+          # download truncated mid-body.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # numerics: minimal on purpose -- mlx core only, no mlx-lm / mlx-vlm.
           (
             rc=0
             {
-              python -m venv .lanes/venv-numerics
-              .lanes/venv-numerics/bin/python -m pip install --upgrade pip
-              .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
-                "torch>=2.4.0,<2.11.0"
-              .lanes/venv-numerics/bin/pip install -e .[core]
-              .lanes/venv-numerics/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-              .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
+              python -m venv .lanes/venv-numerics &&
+              .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+                "torch>=2.4.0,<2.11.0" &&
+              retry .lanes/venv-numerics/bin/pip install -e .[core] &&
+              { .lanes/venv-numerics/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
             } > .lanes/numerics-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/numerics.install
           ) < /dev/null > /dev/null 2>&1 &
@@ -360,15 +403,15 @@ jobs:
           (
             rc=0
             {
-              python -m venv .lanes/venv-suites
-              .lanes/venv-suites/bin/python -m pip install --upgrade pip
-              .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
-                "torch>=2.4.0,<2.11.0"
-              .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4"
-              .lanes/venv-suites/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-              .lanes/venv-suites/bin/pip install pytest==9.0.3
+              python -m venv .lanes/venv-suites &&
+              .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+                "torch>=2.4.0,<2.11.0" &&
+              retry .lanes/venv-suites/bin/pip install -e .[core] \
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4" &&
+              { .lanes/venv-suites/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-suites/bin/pip install pytest==9.0.3
             } > .lanes/suites-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/suites.install
           ) < /dev/null > /dev/null 2>&1 &
@@ -419,6 +462,19 @@ jobs:
           .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
           if grep -qiE '[0-9]+ skipped' out.txt; then
             echo "real mlx is installed but the numeric tests skipped"; exit 1
+          fi
+
+      - name: tests/test_mlx_rng_rewind.py (HARD GATE)
+        # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
+        # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
+        # skipped, which guards nothing on a pull request.
+        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+
+      - name: Fail if the RNG rewind tests skipped
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -q -rs | tee rng.txt
+          if grep -qiE '[0-9]+ skipped' rng.txt; then
+            echo "real mlx is installed but the RNG rewind tests skipped"; exit 1
           fi
 
       # One pytest process per file: tests/mlx_simulation/ replaces
@@ -516,6 +572,21 @@ jobs:
           PY
           }
 
+          # See the interpreter lane for why these are `&&`-chained and what retry()
+          # is for.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # Two-phase install, exactly as the matrix job did it: `-e .[core]` for the
           # pyproject defaults, then `-U <resolved>` to override. The -U is what lets
           # pip DOWNGRADE transformers for the 4.57.6 cell.
@@ -525,31 +596,30 @@ jobs:
             (
               rc=0
               {
-                set -x
-                specs="$(resolve "$@")"
-                spec_t="$(echo "$specs" | sed -n 1p)"
-                spec_r="$(echo "$specs" | sed -n 2p)"
-                spec_p="$(echo "$specs" | sed -n 3p)"
-                echo "resolved: $spec_t | $spec_r | $spec_p"
-
-                python -m venv "$venv"
-                "$venv/bin/python" -m pip install --upgrade pip
+                set -x &&
+                specs="$(resolve "$@")" &&
+                spec_t="$(echo "$specs" | sed -n 1p)" &&
+                spec_r="$(echo "$specs" | sed -n 2p)" &&
+                spec_p="$(echo "$specs" | sed -n 3p)" &&
+                echo "resolved: $spec_t | $spec_r | $spec_p" &&
+                python -m venv "$venv" &&
+                "$venv/bin/python" -m pip install --upgrade pip &&
                 # torchvision: transformers' qwen2_vl / qwen2_5_vl image processors
                 # import it at module top, so without it the existence probes go red
                 # on ModuleNotFoundError rather than on drift. CPU build is plenty.
-                "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
-                  "torch>=2.4.0,<2.11.0" "torchvision<0.26"
-                "$venv/bin/pip" install -e .[core]
-                "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-                "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p"
+                retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
+                  "torch>=2.4.0,<2.11.0" "torchvision<0.26" &&
+                retry "$venv/bin/pip" install -e .[core] &&
+                { "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p" &&
                 # bitsandbytes: imported at module scope in saving_utils.py.
                 # IPython + ipywidgets: logging_utils.py:50 imports
                 # transformers.utils.notebook. Both so the drift detector fires on
                 # real drift and not on a missing CI dep.
-                "$venv/bin/pip" install 'bitsandbytes>=0.45' 'ipython>=8' 'ipywidgets>=8'
-                "$venv/bin/pip" install pytest==9.0.3 packaging
-                set +x
+                retry "$venv/bin/pip" install 'bitsandbytes>=0.45' 'ipython>=8' 'ipywidgets>=8' &&
+                retry "$venv/bin/pip" install pytest==9.0.3 packaging &&
+                set +x &&
                 "$venv/bin/pip" show transformers trl peft torch
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$id.install"

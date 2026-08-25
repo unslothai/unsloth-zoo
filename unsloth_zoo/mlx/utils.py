@@ -8968,6 +8968,122 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+# Problem kinds already reported, so an unsupported key layout costs one message
+# per process rather than one per training step. Both trainer captures sit inside
+# the per-batch loop, so without this a run that is otherwise fine emits a warning
+# per batch. Keyed on the kind and not the rendered text: the message interpolates
+# the offending word, so a value that changes between draws would defeat both the
+# `warnings` registry and the stderr fallback below, which has no registry at all.
+# A plain set is enough here; two threads racing costs a duplicate message, never
+# a lost one.
+_reported_unrewindable_keys = set()
+
+
+def _warn_unrewindable_key(kind, message):
+    """Report a key we cannot rewind, at most once per kind, without ever raising.
+
+    Every caller reads the key *before* entering the `try` that a raise here
+    would land in: both trainer captures sit above their compile-fallback
+    `try`, and `_preserved_preprocessing_rng` captures before it yields. This
+    path is documented as declining rather than failing, so under
+    `PYTHONWARNINGS=error` (or any filter promoting RuntimeWarning) the
+    diagnostic must not become the abort it is warning about.
+
+    Not `catch_warnings` + `simplefilter`: that mutates a process-global filter
+    list, and MLX training runs these paths from more than one thread, where it
+    would briefly disarm another thread's warnings-as-errors. Falling back to
+    stderr keeps the message instead of swallowing it.
+    """
+    if kind in _reported_unrewindable_keys:
+        return
+    _reported_unrewindable_keys.add(kind)
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel = 3)
+    except Exception:
+        # A filter promoted the warning, so say it on stderr rather than lose it.
+        # Guarded too, though: stderr can be closed (a daemonised Studio backend,
+        # or a test runner tearing down its capture) or a stream whose write
+        # raises, and this helper is called ABOVE the `try` that would contain
+        # such a raise. An unreportable diagnostic must not become the abort.
+        try:
+            print(message, file = sys.stderr)
+        except Exception:
+            pass
+
+
+def _mlx_rng_key():
+    """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
+
+    Unreadable covers the torch simulation shim, whose state is a callable;
+    deciding that here is what lets the restore below stay unconditional. A
+    readable key that is not two words is different: the rewind no longer works
+    on the installed mlx, and a bare None would leave every compile fallback
+    silently not restoring, so it warns once and declines.
+    """
+    try:
+        words = mx.random.state[0].tolist()
+    except Exception:
+        return None
+    if len(words) != 2:
+        _warn_unrewindable_key(
+            "word-count",
+            f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
+            "can only rewind the two-word form, so a run that falls back from "
+            "mx.compile to eager will not have its RNG restored and may diverge "
+            "from an eager run of the same seed."
+        )
+        return None
+    return _as_uint32_pair(int(words[0]), int(words[1]))
+
+
+def _as_uint32_pair(high, low):
+    """Both words as uint32, or None if either is not a 32-bit word at all.
+
+    mx.random.seed takes a uint64 and raises outside [0, 2**64), and that raise
+    would land in a `finally` or a compile-failure handler. Range-checking here
+    is what lets the restore below stay unguarded.
+
+    Range-checked rather than masked, though. A negative reads as the two's
+    complement of the uint32 mlx stores, so reinterpreting it loses nothing. A
+    value at or above 2**32 is not a 32-bit word under any reading, and masking
+    it would turn a key we cannot represent into a plausible wrong one:
+    (2**32, 0) would restore as (0, 0), so the fallback would look like it had
+    rewound the RNG while actually diverging. Declining says so instead, and is
+    the outcome every caller already handles.
+    """
+    converted = []
+    for word in (high, low):
+        if not -(2**31) <= word < 2**32:
+            _warn_unrewindable_key(
+                "word-range",
+                f"Unsloth: MLX exposed a random key word of {word}, which is not "
+                "a 32-bit word. Unsloth cannot rewind this key, so a run that "
+                "falls back from mx.compile to eager will not have its RNG "
+                "restored and may diverge from an eager run of the same seed."
+            )
+            return None
+        converted.append(word & 0xFFFFFFFF)
+    return (converted[0], converted[1])
+
+
+def _restore_mlx_rng_key(words):
+    """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
+
+    mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
+    Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
+    key's own words restores it exactly over the whole unsigned 64-bit range.
+    Unguarded on purpose: the range check in ``_as_uint32_pair`` removes the only
+    way this can raise, and a blanket ``except`` would be a failure
+    indistinguishable from an intentional no-op, which is the defect this fixes.
+    """
+    if words is None:
+        return
+    pair = _as_uint32_pair(int(words[0]), int(words[1]))
+    if pair is None:
+        return
+    mx.random.seed((pair[0] << 32) | pair[1])
+
+
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
@@ -8997,15 +9113,7 @@ def _preserved_preprocessing_rng():
             ))
         except Exception:
             pass
-    mx_state = None
-    try:
-        mx_random_state = mx.random.state
-        if isinstance(mx_random_state, list) and mx_random_state:
-            mx_state = mx.array(
-                mx_random_state[0].tolist(), dtype=mx.uint32,
-            )
-    except Exception:
-        mx_state = None
+    mx_state = _mlx_rng_key()
     try:
         yield
     finally:
@@ -9014,11 +9122,7 @@ def _preserved_preprocessing_rng():
                 restore(snapshot)
             except Exception:
                 pass
-        if mx_state is not None:
-            try:
-                mx.random.state[0] = mx_state
-            except Exception:
-                pass
+        _restore_mlx_rng_key(mx_state)
 
 
 def _vlm_file_identity(path):
@@ -12740,6 +12844,38 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     )
 
 
+def _inherit_target_permissions(tmp_file, target):
+    """Carry an existing target's access bits onto the temp file replacing it.
+
+    os.replace() installs the temp file's inode, so the destination's mode and
+    group would otherwise be dropped for whatever the temp file was created with.
+    An in-place write kept both, so without this a re-save widens a deliberately
+    restricted adapter (0600 -> 0644 under the usual umask), and in a directory
+    that is not setgid it also moves the file to the writer's primary group,
+    which is how collaborators lose access to a group-shared checkpoint.
+
+    First save has no target to inherit from; the umask default is then correct.
+
+    Only mode and group are carried. Restoring a different owner needs privileges
+    we do not have, and POSIX ACLs have no interface in the standard library, so
+    a checkpoint relying on either is outside what this can preserve.
+    """
+    try:
+        info = os.stat(str(target))
+    except OSError:
+        return  # First save, or an unreadable target; the umask default stands.
+    try:
+        # Group before mode: chown clears the setgid bit on some systems, so
+        # applying the mode afterwards is what keeps it. Owner is left alone.
+        os.chown(str(tmp_file), -1, info.st_gid)
+    except OSError:
+        pass  # Not a member of that group, or a filesystem without ownership.
+    try:
+        os.chmod(str(tmp_file), info.st_mode & 0o7777)
+    except OSError:
+        pass  # Filesystem that will not take a chmod.
+
+
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     # Refuse to write adapter_config.json without adapters.safetensors next
     # to it; mlx-lm reload chokes on the missing weights file.
@@ -12752,7 +12888,19 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+    # mx.load() arrays stay file-backed, so saving over the source truncates them
+    # mid-read (mlx 0.32.1: "[read] Unable to read from file"). Re-saving into the
+    # directory an adapter came from is the ordinary switch/merge path.
+    target = path / "adapters.safetensors"
+    mx.eval(*tensors.values())
+    tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
+    try:
+        mx.save_safetensors(str(tmp_file), tensors)
+        _inherit_target_permissions(tmp_file, target)
+        os.replace(tmp_file, target)
+    except BaseException:
+        tmp_file.unlink(missing_ok=True)
+        raise
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
@@ -12912,17 +13060,34 @@ def save_optimizer_state(optimizer, path):
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
     target = f"{path}/optimizer_state.safetensors"
-    if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
-        metadata = {
-            "quantized_moment_group_size" : str(optimizer.group_size),
-            "quantized_moment_bits"       : str(optimizer.bits),
-        }
+    # load_optimizer_state() hands back mx.load()'s file-backed arrays, so checkpointing
+    # where a resume came from truncates the source under them. Write beside, replace.
+    if flat:
+        mx.eval(*flat.values())
+    # ".tmp.safetensors", not ".safetensors.tmp": mx.save_safetensors appends
+    # ".safetensors" to any path lacking it, silently writing a third file.
+    tmp_target = f"{path}/optimizer_state.tmp.safetensors"
+    try:
+        if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
+            metadata = {
+                "quantized_moment_group_size" : str(optimizer.group_size),
+                "quantized_moment_bits"       : str(optimizer.bits),
+            }
+            try:
+                mx.save_safetensors(tmp_target, flat, metadata = metadata)
+            except TypeError:
+                # backend without metadata support; fall through
+                mx.save_safetensors(tmp_target, flat)
+        else:
+            mx.save_safetensors(tmp_target, flat)
+        _inherit_target_permissions(tmp_target, target)
+        os.replace(tmp_target, target)
+    except BaseException:
         try:
-            mx.save_safetensors(target, flat, metadata = metadata)
-            return
-        except TypeError:
-            pass  # backend without metadata support; fall through
-    mx.save_safetensors(target, flat)
+            os.remove(tmp_target)
+        except OSError:
+            pass
+        raise
 
 
 def load_optimizer_state(optimizer, path):

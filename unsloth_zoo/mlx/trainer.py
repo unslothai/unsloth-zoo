@@ -552,6 +552,8 @@ from .utils import (
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
     _preserved_preprocessing_rng,
+    _mlx_rng_key,
+    _restore_mlx_rng_key,
     iterate_vlm_training_batches,
     normalize_mlx_chat_template,
     normalize_vlm_processor_chat_template,
@@ -6499,10 +6501,7 @@ class MLXTrainer:
             result = None
             rng_state_before = None
             if _ddp_compile_local_grad:
-                rng_state_before = mx.array(
-                    mx.random.state[0].tolist(),
-                    dtype=mx.uint32,
-                )
+                rng_state_before = _mlx_rng_key()
             try:
                 result = step_fn(batch_data, prev_state, do_update)
                 _eval_local_result(result)
@@ -6531,8 +6530,7 @@ class MLXTrainer:
                         compile_error,
                         peer=compile_error is None,
                     )
-                if rng_state_before is not None:
-                    mx.random.state[0] = rng_state_before
+                _restore_mlx_rng_key(rng_state_before)
                 _main_print(
                     "Unsloth: mx.compile failed at runtime; "
                     "falling back to eager mode on all DDP ranks."
@@ -6824,21 +6822,11 @@ class MLXTrainer:
                     grad_norm = _apply_update(grad, toks_f)
                     grad_accum_state = None
             else:
-                # Compiled full step threads mx.random.state through its outputs;
-                # snapshot it so an eager retry after a trace-time failure resumes
-                # from the pre-call RNG (mirrors the DDP local-grad path). Guard on
-                # the list form so the torch-sim test shim (callable state) is a no-op.
+                # The compiled step threads mx.random.state through its
+                # outputs, so an eager retry must resume from the pre-call key.
                 rng_state_before = None
-                _rng_state = mx.random.state
-                if (
-                    _use_compile
-                    and not _ddp_compile_local_grad
-                    and isinstance(_rng_state, list)
-                    and _rng_state
-                ):
-                    rng_state_before = mx.array(
-                        _rng_state[0].tolist(), dtype=mx.uint32,
-                    )
+                if _use_compile and not _ddp_compile_local_grad:
+                    rng_state_before = _mlx_rng_key()
                 try:
                     lvalue, toks, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
@@ -6862,8 +6850,7 @@ class MLXTrainer:
                         _compile_fallback_reason = "runtime_error"
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
-                        if rng_state_before is not None:
-                            mx.random.state[0] = rng_state_before
+                        _restore_mlx_rng_key(rng_state_before)
                         state = [model.state, optimizer.state, mx.random.state]
                         lvalue, toks, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,

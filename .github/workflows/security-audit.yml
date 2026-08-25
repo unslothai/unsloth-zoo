@@ -200,13 +200,21 @@ jobs:
   tests-security:
     name: pytest tests/security
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 was sized for the pytest-and-pyyaml install this job used to do. Importing
+    # the real torch/transformers stack costs several minutes on its own.
+    timeout-minutes: 25
     steps:
       - name: Harden runner (egress block)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
           egress-policy: block
           disable-sudo: true
+          # Both PyTorch hosts. download.pytorch.org hands the actual wheel fetch
+          # off to PyTorch's R2-backed download-r2.pytorch.org, so allow-listing
+          # only the first fails the install with a bare connection refused that
+          # reads like an upstream outage rather than an egress denial. Upstream's
+          # own guidance is to allow-list the pair:
+          # https://dev-discuss.pytorch.org/t/heads-up-libtorch-downloads-now-redirect-to-download-r2-pytorch-org-by-default-use-curl-l/3395
           allowed-endpoints: >
             api.github.com:443
             github.com:443
@@ -214,6 +222,8 @@ jobs:
             objects.githubusercontent.com:443
             pypi.org:443
             files.pythonhosted.org:443
+            download.pytorch.org:443
+            download-r2.pytorch.org:443
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -229,5 +239,34 @@ jobs:
         # pyyaml the lint script exits 2.)
         run: pip install pytest==9.0.3 pyyaml==6.0.2
 
+      - name: Install unsloth_zoo so tests/security can import what it guards
+        # tests/security was dependency-free until #1083 added
+        # test_model_type_import_guard.py, which imports unsloth_zoo.hf_utils to
+        # exercise get_transformers_model_type, the choke point that keeps a
+        # config-supplied model_type out of an import path. unsloth_zoo/__init__.py
+        # requires unsloth and torch, so on the bare install this job has been
+        # failing collection, and with it every push to main since 2026-08-22.
+        #
+        # CPU torch from download.pytorch.org rather than the CUDA build on PyPI:
+        # the CUDA wheel is multiple GB and nothing here needs a device.
+        #
+        # Deliberately NOT the `unsloth @ git+...@main` install that
+        # consolidated-tests-ci.yml's copy of this lane uses. This is a hard
+        # security gate: a mutable branch ref means any upstream commit changes
+        # what the gate runs without touching the revision under test, and a VCS
+        # operand runs that project's build backend at install time, inside the
+        # one job whose whole purpose is supply-chain hygiene. The env var below
+        # removes the need for it entirely.
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.13.0"
+          pip install -e .[core]
+
       - name: Run security regression tests
+        env:
+          # Skips the GPU/device init that ends in `find_spec("unsloth") is None
+          # -> ImportError`, which is the only reason this job would need unsloth
+          # present. tests/security exercises pure-Python guards, so nothing here
+          # touches what that init sets up.
+          UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
         run: python3 -m pytest tests/security -v

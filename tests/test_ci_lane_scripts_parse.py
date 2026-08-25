@@ -132,3 +132,114 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
         "the pytest output is no longer redirected into the lane log, so a failing "
         "lane would report a status with nothing to read"
     )
+
+
+# A lane records its own exit status in the background, and that status is all the
+# job ever learns about it. The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`,
+# and a brace group reports only cmdN -- so every earlier failure was recorded as
+# rc=0, the "could not be built" guard never fired, and the job continued with a
+# half-built venv. A truncated mlx download surfaced two steps later as
+# ModuleNotFoundError, with the build step green.
+#
+# `set -e` inside the group does NOT help: it sits on the left of `|| rc=$?`, where
+# POSIX ignores errexit. `&&`-chaining does, so the first failure becomes rc.
+
+def _capture_groups(run: str) -> list[str]:
+    """Bodies of every `{ ... } > ... || rc=$?` status-capture group in a lane."""
+    lines = run.splitlines()
+    groups, buf, depth = [], [], 0
+    for line in lines:
+        stripped = line.strip()
+        if depth == 0 and stripped == "{":
+            depth, buf = 1, []
+            continue
+        if depth:
+            if stripped.startswith("}") and "rc=$?" in stripped:
+                groups.append("\n".join(buf))
+                depth = 0
+            else:
+                buf.append(line)
+    return groups
+
+
+def _statements(body: str) -> list[str]:
+    """Logical statements: continuations joined, blanks and comment lines dropped.
+
+    A comment between two `&&`-chained commands is legal shell (the newline after
+    `&&` may be followed by comments), so it is not a statement for this purpose.
+    """
+    joined = body.replace("\\\n", " ")
+    return [
+        ln.strip() for ln in joined.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+
+
+def test_lane_status_capture_sees_every_failure() -> None:
+    """
+    Every command in a status-capture group must be `&&`-chained to the next, so a
+    failure anywhere becomes the lane's recorded status rather than being masked by
+    a later command that happens to succeed.
+    """
+    checked = 0
+    for workflow, job, name, run in _lane_steps():
+        for body in _capture_groups(run):
+            statements = _statements(body)
+            assert statements, f"{workflow}: job '{job}' step '{name}' has an empty capture group"
+            checked += 1
+            for stmt in statements[:-1]:
+                assert stmt.endswith("&&"), (
+                    f"{workflow}: job '{job}' step '{name}': the status-capture group has a "
+                    f"statement that is not chained to the next one:\n    {stmt}\n"
+                    "A brace group reports only its last command, so this failure would be "
+                    "recorded as success. Chain it with `&&` (`set -e` does not work here: "
+                    "errexit is ignored on the left of `|| rc=$?`)."
+                )
+            assert not statements[-1].endswith("&&"), (
+                f"{workflow}: job '{job}' step '{name}': capture group ends with a dangling `&&`"
+            )
+    assert checked >= 3, f"only {checked} status-capture groups found; the detector looks broken"
+
+
+def test_the_chaining_idiom_actually_propagates_failure() -> None:
+    """
+    Pins the shell semantics the test above relies on, so the reasoning is checked
+    rather than asserted: the old form swallows, `set -e` does not rescue it, and
+    `&&`-chaining does, while still tolerating a deliberate `|| true` step.
+    """
+    def rc_of(script: str) -> int:
+        return subprocess.run(
+            [ "bash", "-c", f"rc=0; {script} || rc=$?; exit $rc" ],
+            capture_output = True, text = True,
+        ).returncode
+
+    assert rc_of("{ false; true; }") == 0, "brace group should mask an early failure"
+    assert rc_of("( set -e; false; true; )") == 0, "errexit is ignored left of ||"
+    assert rc_of("{ false && true; }") != 0, "&&-chaining must propagate the failure"
+    assert rc_of("{ true && { false || true; } && false; }") != 0, (
+        "a real failure after a tolerated `|| true` step must still propagate"
+    )
+    assert rc_of("{ true && { false || true; } && true; }") == 0, (
+        "an all-succeeding chain with a tolerated step must stay green"
+    )
+
+
+def test_network_bound_installs_are_retried() -> None:
+    """
+    pip's `--retries` only covers establishing a connection, so a body truncated
+    mid-download (ProtocolError / IncompleteRead) is not retried and the install
+    dies. The lanes wrap those installs in retry().
+    """
+    for workflow, job, name, run in _lane_steps():
+        for body in _capture_groups(run):
+            installs = [
+                stmt for stmt in _statements(body)
+                if "pip" in stmt and " install " in stmt
+                and "--upgrade pip" not in stmt
+                and "--no-deps" not in stmt      # deliberately `|| true`
+            ]
+            for stmt in installs:
+                assert stmt.startswith("retry "), (
+                    f"{workflow}: job '{job}' step '{name}': network-bound install is not "
+                    f"wrapped in retry():\n    {stmt}"
+                )

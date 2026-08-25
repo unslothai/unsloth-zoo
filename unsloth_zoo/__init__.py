@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.8.13"
+__version__ = "2026.8.14"
 
 import os
 import platform

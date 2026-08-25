@@ -4294,10 +4294,11 @@ def unsloth_compile_transformers(
 
     model_location = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
-        exec(f"import {model_location}", globals())
+        modeling_file = importlib.import_module(model_location)
     except ModuleNotFoundError:
         return
-    modeling_file = eval(model_location)
+    # Later `eval(model_location)` calls need `transformers` bound in globals
+    exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
