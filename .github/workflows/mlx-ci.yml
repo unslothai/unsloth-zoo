@@ -199,3 +199,82 @@ jobs:
         run: |
           python -m pytest tests/test_mlx_batching_and_decay.py -v -rs \
             --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present
+
+      # int8 W8A8 prefill. Added to this job rather than to a new workflow: macOS
+      # concurrency is capped at 5 jobs account-wide, and this runner already has the
+      # MLX stack provisioned, so a second workflow would spend a slot to reinstall
+      # what is already here.
+      #
+      # What this leg can and cannot show. The int8 path needs the M5 neural
+      # accelerators, and no GitHub runner tier offers one, so nothing here measures
+      # performance. What it does establish, and the Linux leg cannot:
+      #
+      #   1. The capability probe declines on a real Metal device that lacks M5 int8
+      #      tensor ops, and enabling the module then changes a model forward not at
+      #      all. That is the configuration every current Mac user is in, so it is the
+      #      assertion that matters most.
+      #   2. The activation-quant and weight-requant Metal kernels compile and run for
+      #      real. They deliberately carry no MetalPerformancePrimitives include, so
+      #      they execute here even though the GEMM cannot, and their packed-nibble and
+      #      word-boundary arithmetic is the likeliest source of a silent wrong-answer
+      #      bug. Linux cannot check it at all.
+      #
+      # Measured on macos-15/26: mpp::tensor_ops::matmul2d with int8 operands does not
+      # load on M1 ("[metal::Device] Unable to load kernel") while a trivial Metal
+      # kernel JITs fine on the same runner, so the GEMM stays M5-only by nature rather
+      # than by choice.
+      - name: tests/test_mlx_int8_prefill_dispatch.py
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tests
+        run: python -m pytest tests/test_mlx_int8_prefill_dispatch.py -v -rs
+
+      - name: tests/test_mlx_int8_prefill_numerics.py
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tests
+        run: python -m pytest tests/test_mlx_int8_prefill_numerics.py -v -rs
+
+      - name: tests/test_mlx_int8_prefill_safety.py
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tests
+        run: python -m pytest tests/test_mlx_int8_prefill_safety.py -v -rs
+
+      - name: int8 prefill Metal kernels vs reference
+        # The two MetalPerformancePrimitives-free kernels, checked against the plain-MLX
+        # implementations of the same arithmetic. A tolerance of one int8 LSB, because
+        # Metal's rint rounds halves to even while mx.round does not, so ties can differ
+        # by one and nothing else may.
+        run: |
+          python -c "
+          import mlx.core as mx, mlx.nn as nn
+          from unsloth_zoo.mlx.int8_prefill import scales
+          from unsloth_zoo.mlx.int8_prefill.backends import metal_mpp, portable
+
+          failures = []
+          for bits, gs in [(4, 32), (4, 64), (4, 128)]:
+              ql = nn.QuantizedLinear.from_linear(
+                  nn.Linear(1024, 2048, bias = False), group_size = gs, bits = bits)
+              ws = scales.channel_scale_bound(ql['scales'], ql['biases'], bits)
+              mx.eval(ws)
+              got = metal_mpp.requantize_weight(
+                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
+              want = portable.requantize_weight(
+                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
+              mx.eval(got, want)
+              diff = int(mx.abs(got.astype(mx.int32) - want.astype(mx.int32)).max().item())
+              print(f'requant bits={bits} gs={gs}: max abs diff = {diff}')
+              if diff > 1:
+                  failures.append(f'requant bits={bits} gs={gs} diff={diff}')
+
+          x = mx.random.normal((640, 1024)).astype(mx.bfloat16)
+          gq, gsc = metal_mpp.quantize_rows(x)
+          wq, wsc = portable.quantize_rows(x)
+          mx.eval(gq, gsc, wq, wsc)
+          qdiff = int(mx.abs(gq.astype(mx.int32) - wq.astype(mx.int32)).max().item())
+          sdiff = float(mx.abs(gsc - wsc).max().item())
+          print(f'row quant: max abs q diff = {qdiff}, max abs scale diff = {sdiff:.3e}')
+          if qdiff > 1 or sdiff > 1e-6:
+              failures.append(f'row quant qdiff={qdiff} sdiff={sdiff}')
+
+          assert not failures, failures
+          print('OK: Metal quant and requant kernels match the reference')
+          "
