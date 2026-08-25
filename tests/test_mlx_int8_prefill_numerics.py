@@ -122,14 +122,6 @@ class TestPortableBackend:
     @pytest.mark.parametrize("bits,group_size", [(4, 32), (4, 64), (4, 128)])
     def test_close_to_mlx_reference(self, bits, group_size):
         """W8A8 is lossy by design; the bar is that it stays close to the 4-bit op."""
-        # MLX 0.32.1's CUDA backend raises cuGraphAddKernelNode "invalid argument" for
-        # `mx.quantized_matmul` at group_size 128 -- stock MLX, reproducible without any
-        # of our code, and absent on Metal where MLX is primarily developed. Our own
-        # path evaluates fine at gs=128; it is the reference we cannot build here. So
-        # skip the comparison rather than weaken it, and let the macOS job cover it.
-        if group_size == 128 and not mx.metal.is_available():
-            pytest.skip("mx.quantized_matmul gs=128 is broken on the MLX CUDA backend")
-
         K, N, M = 1024, 2048, 640
         lin = nn.Linear(K, N, bias=False)
         ql = nn.QuantizedLinear.from_linear(lin, group_size=group_size, bits=bits)
@@ -142,7 +134,17 @@ class TestPortableBackend:
         want = mx.quantized_matmul(
             x, ql["weight"], ql["scales"], ql["biases"], True, group_size, bits
         ).astype(mx.float32)
-        mx.eval(got, want)
+        try:
+            mx.eval(got, want)
+        except RuntimeError as exc:
+            # MLX 0.32.1's CUDA backend raises cuGraphAddKernelNode "invalid argument"
+            # for mx.quantized_matmul at group_size 128. That is stock MLX, reproducible
+            # with none of this module loaded, and absent on the CPU and Metal backends.
+            # Skipping on the reference we cannot build, rather than on a guess about the
+            # backend, keeps the coverage everywhere the reference does build.
+            if "cuGraph" not in str(exc):
+                raise
+            pytest.skip(f"stock mx.quantized_matmul cannot evaluate here: {exc}")
 
         rel = (mx.abs(got - want).max() / mx.abs(want).max()).item()
         assert rel < 0.15, f"max relative error {rel:.4f}"
