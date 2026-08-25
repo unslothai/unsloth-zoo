@@ -418,25 +418,20 @@ def patch_model_and_tokenizer(
             if "bias" in name:
                 module.to(setted_dtype)
         pass
-        # empty_cache() used to run here, once per module, and that corrupted memory on
-        # a model dispatched across more than one GPU.
-        #
-        # The casts above are asynchronous. empty_cache() releases cached blocks against
-        # the CURRENT device and does not synchronise the others, so on a model whose
-        # weights live on cuda:1 while cuda:0 is current it can reclaim memory that
-        # in-flight device-1 work is still writing into. The result is a CUDA illegal
-        # memory access that surfaces later, at an unrelated synchronising call, and
-        # disappears under CUDA_LAUNCH_BLOCKING -- an async cross-device race, not a bad
-        # address. Reproduced on Kaggle 2 x T4 loading Qwen3.8-27B: 1297 calls, one per
-        # module. Only architectures in FORCE_FLOAT32 reach this pass, which is why
-        # llama never showed it.
-        #
-        # Synchronise, then release once. Measured on the same 2 x T4: peak reserved is
-        # unchanged (12.998 GB vs 13.020 GB per card), and training runs at full speed
-        # -- 559 s against 587 s under CUDA_LAUNCH_BLOCKING for the same five steps.
-        if torch.cuda.is_available():
-            for _device_index in range(torch.cuda.device_count()):
-                torch.cuda.synchronize(_device_index)
+        # empty_cache() used to run here once per module, and that corrupted memory on a
+        # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
+        # cached blocks on EVERY device with no device guard, while cudaFree only
+        # synchronises the current one. Blocks on the other card went back to the driver
+        # mid-write, surfacing as an illegal memory access at a later, unrelated sync.
+        # Only FORCE_FLOAT32 architectures reach this pass, which is why llama never
+        # showed it. Sync the devices this model occupies, then release once -- taking the
+        # set from the model rather than device_count() keeps a DDP rank from creating a
+        # CUDA context on a card it never uses.
+        _model_devices  = {p.device for p in model.parameters() if p.device.type == "cuda"}
+        _model_devices |= {b.device for b in model.buffers()    if b.device.type == "cuda"}
+        for _device in _model_devices:
+            torch.cuda.synchronize(_device)
+        if _model_devices:
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
