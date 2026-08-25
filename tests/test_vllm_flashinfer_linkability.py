@@ -16,10 +16,10 @@
 
 """FlashInfer needs to LINK, not merely compile.
 
-The pre-existing guard checks that nvcc and ninja exist. Both do on plenty of
-container images that still cannot build FlashInfer, because the link passes
-`-lcuda` and therefore needs the driver STUB `libcuda.so` -- not the runtime
-`libcuda.so.1` that every machine with a driver has.
+The pre-existing guard checks nvcc and ninja exist. Both do on container images
+that still cannot build FlashInfer, because the link passes `-lcuda` and so
+needs the driver STUB `libcuda.so`, not the runtime `libcuda.so.1` that every
+machine with a driver has.
 
 Observed on Kaggle's GPU image: nvcc present, ninja present, every .cu file
 compiled cleanly for sm_75, and the final step died on
@@ -27,9 +27,9 @@ compiled cleanly for sm_75, and the final step died on
     /usr/bin/ld: cannot find -lcuda
 
 reported as `RuntimeError: Ninja build failed` after minutes of nvcc work. No
-environment variable avoids it: `VLLM_USE_FLASHINFER_SAMPLER=0` merely moves
-the build from the sampler kernels to the attention kernels, and vLLM exposes
-no prefill-specific opt-out.
+env var avoids it: `VLLM_USE_FLASHINFER_SAMPLER=0` merely moves the build from
+the sampler kernels to the attention kernels, and vLLM exposes no
+prefill-specific opt-out.
 """
 
 import contextlib
@@ -47,20 +47,18 @@ def _stub(tmp_path, name = "libcuda.so"):
 
 @contextlib.contextmanager
 def _no_ambient_cuda():
-    """Neutralise the two sources that come from the HOST rather than from the
-    environment: the nvcc-inferred CUDA root and the linker's own defaults.
-
-    The machine running the tests very often has both a real toolkit and a real
-    driver stub, so without this every negative assertion below would pass or
-    fail depending on who ran it."""
+    """Neutralise the two HOST-derived sources: the nvcc-inferred CUDA root and
+    the linker's own defaults. The test machine often has both a real toolkit
+    and a real driver stub, so without this the negative assertions below would
+    pass or fail depending on who ran them."""
     with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs", lambda: ()):
         yield
 
 
 def test_a_runtime_libcuda_without_the_stub_is_not_linkable(tmp_path):
-    """The exact shape of the image that motivated this: libcuda.so.1 present,
-    libcuda.so absent. Every other check passes and the link cannot."""
+    """The image that motivated this: libcuda.so.1 present, libcuda.so absent.
+    Every other check passes and the link still cannot."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     with _no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
@@ -81,9 +79,8 @@ def test_the_stub_beside_the_runtime_is_linkable(tmp_path):
 
 def test_a_stub_supplied_through_library_path_counts(tmp_path):
     """LIBRARY_PATH is what the linker consults beyond its defaults, so a caller
-    who has already supplied a stub there must not be told FlashInfer is
-    unavailable. Unsloth's own Kaggle GRPO payload does exactly this, which is
-    why that path works where a bare probe does not."""
+    who supplied a stub there must not be told FlashInfer is unavailable.
+    Unsloth's own Kaggle GRPO payload does exactly this."""
     supplied = tmp_path / "shim"
     supplied.mkdir()
     _stub(supplied)
@@ -111,17 +108,13 @@ def test_cuda_home_stubs_count(tmp_path):
 
 
 def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
-    """`LIBRARY_PATH=""` splits to [""], and os.path.join("", "libcuda.so") is a
-    RELATIVE path -- which exists whenever THIS process happens to be running in
-    a directory that has one.
-
-    GCC really does treat an empty LIBRARY_PATH component as the current
-    directory, but the current directory that matters is not this one:
-    FlashInfer runs the link through `ninja -C <build_dir>` with
-    `cwd=<build_dir>`, so `c++` resolves a relative -L against its own JIT cache
-    directory, never against the directory Python was started in. Filtering
-    empties is therefore correct -- honouring them would answer a question about
-    the wrong directory."""
+    """`LIBRARY_PATH=""` splits to [""], and os.path.join("", "libcuda.so") is
+    RELATIVE, so it exists whenever THIS process runs in a directory that has
+    one. GCC does treat an empty component as the current directory, but the
+    one that matters is not this one: FlashInfer links via `ninja -C
+    <build_dir>` with `cwd=<build_dir>`, so `c++` resolves a relative -L
+    against its JIT cache directory. Honouring empties would answer a question
+    about the wrong directory."""
     empty = tmp_path / "nothing"
     empty.mkdir()
     cwd = tmp_path / "cwd"
@@ -141,18 +134,18 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
 
 # ------------------------------------------- false negatives are the bad kind
 #
-# Answering False when the link would have succeeded silently disables
-# FlashInfer on a machine where it works. Answering True when the link then
-# fails merely restores the behaviour that existed before this check. The two
-# tests below cover the two ways the first, dangerous mistake was reachable.
+# False when the link would have succeeded silently disables FlashInfer on a
+# machine where it works; True when the link then fails merely restores the
+# pre-check behaviour. The two tests below cover the two ways the first,
+# dangerous mistake was reachable.
 
 
 def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
     """`c++ ... -lcuda` searches ld's built-in SEARCH_DIRs with no -L at all,
     and the NVIDIA driver installer puts the unversioned libcuda.so symlink in
-    one of them (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu). A toolkit whose
-    stubs directory is absent still links fine there, so reporting False would
-    disable a working FlashInfer."""
+    one of them (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu). A toolkit with no
+    stubs directory still links there, so False would disable a working
+    FlashInfer."""
     default = tmp_path / "usr-lib"
     default.mkdir()
     _stub(default)
@@ -170,7 +163,7 @@ def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
 def test_the_cuda_root_inferred_from_nvcc_counts(tmp_path):
     """With neither CUDA_HOME nor CUDA_PATH set, FlashInfer's get_cuda_path()
     falls back to dirname(dirname(which nvcc)). A toolkit at /opt/cuda or in a
-    conda prefix therefore links against its own lib64/stubs, and checking only
+    conda prefix links against its own lib64/stubs, so checking only
     /usr/local/cuda would call that machine unlinkable."""
     root = tmp_path / "opt-cuda"
     stubs = root / "lib64" / "stubs"
@@ -209,8 +202,8 @@ def test_no_nvcc_means_no_inferred_root():
 
 
 def test_linker_defaults_never_come_back_empty():
-    """A parse failure must widen to the fallback list, never narrow to nothing:
-    an empty tuple would silently reintroduce the false negative."""
+    """A parse failure must widen to the fallback list: an empty tuple would
+    silently reintroduce the false negative."""
     vllm_utils._linker_default_dirs.cache_clear()
     try:
         with mock.patch.object(vllm_utils, "re") as fake_re:
@@ -226,7 +219,7 @@ def test_linker_defaults_never_come_back_empty():
 def test_windows_looks_for_cuda_lib_not_a_posix_stub(tmp_path):
     """Windows links `cuda.lib` from the toolkit and searches LIB. Probing for
     libcuda.so there would find nothing and disable FlashInfer on a platform
-    where it works, which is worse than not checking at all."""
+    where it works."""
     libdir = tmp_path / "lib" / "x64"
     libdir.mkdir(parents = True)
     (libdir / "cuda.lib").write_bytes(b"")
@@ -246,8 +239,8 @@ def test_windows_without_cuda_lib_is_not_linkable(tmp_path):
 
 
 def test_windows_with_nothing_to_go_on_does_not_claim_failure():
-    """No CUDA_PATH and no LIB means no evidence either way. Returning False
-    would disable FlashInfer on the strength of a missing env var."""
+    """No CUDA_PATH and no LIB is no evidence either way. False would disable
+    FlashInfer on the strength of a missing env var."""
     with mock.patch.object(vllm_utils.sys, "platform", "win32"), \
          mock.patch.dict(os.environ, {"CUDA_PATH": "", "CUDA_HOME": "",
                                       "LIB": ""}, clear = False):
@@ -255,15 +248,14 @@ def test_windows_with_nothing_to_go_on_does_not_claim_failure():
 
 
 def test_macos_never_claims_the_link_will_fail():
-    """CUDA is not in play on Darwin, so a negative would be an invention. This
-    keeps behaviour byte-identical to before the check existed."""
+    """CUDA is not in play on Darwin, so a negative would be an invention."""
     with mock.patch.object(vllm_utils.sys, "platform", "darwin"):
         assert vllm_utils._can_link_libcuda() is True
 
 
 def test_wsl_is_linux_and_is_checked(tmp_path):
     """WSL reports sys.platform == "linux" and uses the POSIX toolchain, so it
-    must take the Linux branch rather than be treated as Windows."""
+    must take the Linux branch, not the Windows one."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     with _no_ambient_cuda(), \
          mock.patch.object(vllm_utils.sys, "platform", "linux"), \
