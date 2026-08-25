@@ -34,7 +34,13 @@ prefill-specific opt-out.
 
 import contextlib
 import os
+import platform
+import subprocess
+import sys
+import sysconfig
 from unittest import mock
+
+import pytest
 
 from unsloth_zoo import vllm_utils
 
@@ -211,6 +217,79 @@ def test_linker_defaults_never_come_back_empty():
             assert vllm_utils._linker_default_dirs() == vllm_utils._FALLBACK_LINKER_DIRS
     finally:
         vllm_utils._linker_default_dirs.cache_clear()
+
+
+def test_multiarch_dirs_cover_the_debian_ubuntu_driver_location():
+    """`/usr/lib/x86_64-linux-gnu` is where the NVIDIA driver puts the
+    unversioned `libcuda.so`, and it is in ld's built-in SEARCH_DIRs, so
+    `c++ ... -lcuda` resolves there with no -L at all."""
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(platform, "machine", lambda: "x86_64"), \
+         mock.patch.object(sysconfig, "get_config_var",
+                           lambda name: "x86_64-linux-gnu" if name == "MULTIARCH" else None):
+        dirs = vllm_utils._multiarch_linker_dirs()
+    assert "/usr/lib/x86_64-linux-gnu" in dirs
+    assert "/lib/x86_64-linux-gnu" in dirs
+
+
+def test_multiarch_dirs_cover_aarch64_without_a_configured_triplet():
+    """manylinux and conda interpreters have no MULTIARCH; the triplet is then
+    derived from the machine so Jetson / GH200 are still covered."""
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(platform, "machine", lambda: "aarch64"), \
+         mock.patch.object(sysconfig, "get_config_var", lambda name: None):
+        dirs = vllm_utils._multiarch_linker_dirs()
+    assert "/usr/lib/aarch64-linux-gnu" in dirs
+
+
+def test_multiarch_dirs_are_empty_off_linux():
+    """Windows and macOS never reach the `-lcuda` branch; do not invent paths."""
+    for fake in ("win32", "darwin"):
+        with mock.patch.object(vllm_utils.sys, "platform", fake):
+            assert vllm_utils._multiarch_linker_dirs() == ()
+
+
+def test_the_fallback_includes_the_multiarch_dir_when_ld_cannot_be_consulted():
+    """The regression. `ld --verbose` is unavailable whenever the image has no
+    binutils, or whenever `ld` is really lld -- lld carries no built-in linker
+    script and so emits no SEARCH_DIR (llvm/llvm-project#101661). The fallback
+    is then the entire default-directory search, and it used to list only
+    /usr/lib, /lib, /usr/lib64, /lib64, /usr/local/lib, /usr/local/lib64 --
+    none of which is where Debian/Ubuntu keep libcuda.so. On such a host
+    `_can_link_libcuda()` answered False while `c++ -shared -lcuda` links."""
+    vllm_utils._linker_default_dirs.cache_clear()
+    try:
+        with mock.patch.object(subprocess, "run",
+                               side_effect = FileNotFoundError("no ld")):
+            dirs = vllm_utils._linker_default_dirs()
+    finally:
+        vllm_utils._linker_default_dirs.cache_clear()
+    assert dirs == vllm_utils._FALLBACK_LINKER_DIRS
+    if not sys.platform.startswith("linux"):
+        pytest.skip("multiarch layout is Linux-only")
+    triplet = sysconfig.get_config_var("MULTIARCH") or (platform.machine() + "-linux-gnu")
+    assert "/usr/lib/" + triplet in dirs
+    # The pre-existing entries must survive: RHEL/Fedora and the .run installer
+    # use /usr/lib64, which has no triplet.
+    for kept in ("/usr/lib", "/lib", "/usr/lib64", "/lib64",
+                 "/usr/local/lib", "/usr/local/lib64"):
+        assert kept in dirs
+
+
+def test_a_runtime_only_multiarch_dir_is_still_not_linkable(tmp_path):
+    """The Kaggle constraint, restated against the widened fallback: adding
+    /usr/lib/<triplet> must not make a runtime-only image look linkable.
+    `libcuda.so.1` present and `libcuda.so` absent stays False."""
+    multiarch = tmp_path / "usr-lib-x86_64-linux-gnu"
+    multiarch.mkdir()
+    (multiarch / "libcuda.so.1").write_bytes(b"")
+    with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
+         mock.patch.object(vllm_utils, "_linker_default_dirs",
+                           lambda: (str(multiarch),)), \
+         mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", ()), \
+         mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
+                                      "LIBRARY_PATH": ""}, clear = False):
+        assert vllm_utils._can_link_libcuda() is False
 
 
 # ------------------------------------------------------------ platform scope
