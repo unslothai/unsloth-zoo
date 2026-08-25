@@ -52,12 +52,20 @@ def _stub(tmp_path, name = "libcuda.so"):
 
 
 @contextlib.contextmanager
-def _no_ambient_cuda():
-    """Neutralise the two HOST-derived sources: the nvcc-inferred CUDA root and
-    the linker's own defaults. The test machine often has both a real toolkit
-    and a real driver stub, so without this the negative assertions below would
-    pass or fail depending on who ran them."""
-    with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
+def _linux_with_no_ambient_cuda():
+    """Everything below asserts LINUX semantics, so pin the platform and
+    neutralise the two HOST-derived sources: the nvcc-inferred CUDA root and
+    the linker's own defaults.
+
+    Both halves are load-bearing, and the platform pin was learned the hard
+    way. On macOS and Windows `_can_link_libcuda` returns before any of this
+    runs, so unpinned these tests silently answered a different question: on a
+    macOS runner the two negative assertions went red (darwin returns True) and
+    the positive ones went green for the wrong reason. A test that passes
+    because the function short-circuited is worse than one that fails.
+    """
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs", lambda: ()):
         yield
 
@@ -66,7 +74,7 @@ def test_a_runtime_libcuda_without_the_stub_is_not_linkable(tmp_path):
     """The image that motivated this: libcuda.so.1 present, libcuda.so absent.
     Every other check passes and the link still cannot."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
                                       "LIBRARY_PATH": ""}, clear = False):
@@ -76,7 +84,7 @@ def test_a_runtime_libcuda_without_the_stub_is_not_linkable(tmp_path):
 def test_the_stub_beside_the_runtime_is_linkable(tmp_path):
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     _stub(tmp_path)
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
                                       "LIBRARY_PATH": ""}, clear = False):
@@ -92,7 +100,7 @@ def test_a_stub_supplied_through_library_path_counts(tmp_path):
     _stub(supplied)
     empty = tmp_path / "cuda"
     empty.mkdir()
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(empty),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
                                       "LIBRARY_PATH": str(supplied)}, clear = False):
@@ -106,7 +114,7 @@ def test_cuda_home_stubs_count(tmp_path):
     _stub(stubs)
     empty = tmp_path / "nothing"
     empty.mkdir()
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(empty),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": str(root), "CUDA_PATH": "",
                                       "LIBRARY_PATH": ""}, clear = False):
@@ -126,7 +134,7 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     _stub(cwd)
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(empty),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
                                       "LIBRARY_PATH": ""}, clear = False):
@@ -157,7 +165,8 @@ def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
     _stub(default)
     empty = tmp_path / "nothing"
     empty.mkdir()
-    with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs",
                            lambda: (str(default),)), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(empty),)), \
@@ -177,7 +186,8 @@ def test_the_cuda_root_inferred_from_nvcc_counts(tmp_path):
     _stub(stubs)
     empty = tmp_path / "nothing"
     empty.mkdir()
-    with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc",
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc",
                            lambda: (str(root),)), \
          mock.patch.object(vllm_utils, "_linker_default_dirs", lambda: ()), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(empty),)), \
@@ -283,7 +293,8 @@ def test_a_runtime_only_multiarch_dir_is_still_not_linkable(tmp_path):
     multiarch = tmp_path / "usr-lib-x86_64-linux-gnu"
     multiarch.mkdir()
     (multiarch / "libcuda.so.1").write_bytes(b"")
-    with mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
+    with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
+         mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs",
                            lambda: (str(multiarch),)), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", ()), \
@@ -336,7 +347,7 @@ def test_wsl_is_linux_and_is_checked(tmp_path):
     """WSL reports sys.platform == "linux" and uses the POSIX toolchain, so it
     must take the Linux branch, not the Windows one."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
-    with _no_ambient_cuda(), \
+    with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils.sys, "platform", "linux"), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
          mock.patch.dict(os.environ, {"CUDA_HOME": "", "CUDA_PATH": "",
