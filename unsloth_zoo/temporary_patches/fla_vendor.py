@@ -1050,23 +1050,36 @@ def _resolved_implementation(wrapper):
     return None
 
 
+def _live_gated_delta_kernel(name):
+    """The kernel ``name`` currently resolves to on the live fla, or None."""
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    return getattr(module, name, None) if module is not None else None
+
+
 def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     """Re-resolve the kernel-hub decorators on modeling modules imported before us.
 
     Since huggingface/transformers#47630 the gated-delta kernels are bound by
     ``use_kernel_func_from_hub_with_fallback``, which resolves the implementation at
-    *decoration time* and closes over it. A modeling module imported before fla is
-    live therefore freezes the pure-PyTorch fallback into that closure, and no amount
-    of fixing ``fla`` afterwards can reach it: ``_repair_already_imported_modeling``
-    only rebinds module globals, which these modules no longer have.
+    *decoration time* and closes over it. A modeling module imported before we ran
+    therefore froze whatever was live then, and no amount of fixing ``fla`` afterwards
+    can reach it: ``_repair_already_imported_modeling`` only rebinds module globals,
+    which these modules no longer have.
 
-    Re-applying the decorator to the undecorated function is what makes this correct
-    rather than poking ``cell_contents``. The wrapper also closes over the
-    implementation's parameter names, and those differ between the fallback and the
-    kernel (10 against 16 for chunk), so patching the implementation alone would
-    silently filter out arguments the kernel needs.
+    Two things get frozen. The pure-PyTorch fallback, when no fla was importable yet.
+    Or a real user install's kernel, when one was live and ``UNSLOTH_FORCE_VENDORED_FLA``
+    (or the Hopper #640 switch) has since purged it -- the case ``replaced_real``
+    exists for, and the one that matters most, since that kernel is exactly the
+    miscompiled backward we replaced it to avoid. So the test is against the fla that
+    is live *now*, not against the fallback: anything else is stale.
 
-    Scoped to ``_REPAIR_MODELING``: olmo_hybrid is deliberately not vendor-covered.
+    Re-applying the decorator rather than poking ``cell_contents`` is what makes this
+    correct. The wrapper also closes over the implementation's parameter names, and
+    those differ between the fallback and the kernel (10 against 16 for chunk), so
+    patching the implementation alone would filter out arguments the kernel needs.
+
+    Scoped to ``_REPAIR_MODELING``: olmo_hybrid is deliberately not vendor-covered,
+    and ``_disable_already_imported_gated_delta`` handles it instead.
     """
     try:
         from transformers.integrations.hub_kernels import (
@@ -1085,21 +1098,26 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
             original = getattr(wrapper, "__wrapped__", None)
             if original is None:
                 continue        # not decorated on this transformers
-            if _resolved_implementation(wrapper) is not original:
-                continue        # already dispatching to a real kernel
+            current = _resolved_implementation(wrapper)
+            live = _live_gated_delta_kernel(kernel)
+            if live is not None and current is live:
+                continue        # already dispatching to the fla that is live now
             try:
                 rebuilt = use_kernel_func_from_hub_with_fallback(kernel, "fla")(original)
             except Exception:
                 continue
-            if _resolved_implementation(rebuilt) is original:
-                continue        # still nothing to bind; keep what was there
+            if _resolved_implementation(rebuilt) is current:
+                continue        # nothing would change
+            # Reached with a stale kernel and no live replacement too, where the
+            # rebuild resolves to the fallback. Taking it is the point: pure torch
+            # beats calling into an install that has been purged.
             setattr(module, attribute, rebuilt)
             repaired.append(f"{package}.{attribute}")
 
     if repaired and UNSLOTH_ENABLE_LOGGING:
         logger.info(
             f"Unsloth: re-resolved the fla kernels on {', '.join(repaired)}, which "
-            f"were imported before fla was available."
+            f"were bound before the live fla was in place."
         )
     return tuple(repaired)
 
