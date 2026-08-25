@@ -20,6 +20,7 @@ from .utils import (
     _normalize_seed,
     _torch_randperm_order,
     collect_mlx_lora_adapter_tensors,
+    encode_mlx_text,
     iter_mlx_lora_modules,
 )
 
@@ -359,6 +360,45 @@ def _render_preference_row(tokenizer, row, *, extracted=False):
     return prompt_text, chosen_text, rejected_text
 
 
+def _shared_prefix(prompt_text, *full_texts):
+    """Clip the rendered prompt to what every full rendering still agrees with."""
+    shared = len(prompt_text)
+    for text in full_texts:
+        matched = 0
+        for left, right in zip(prompt_text[:shared], text):
+            if left != right:
+                break
+            matched += 1
+        shared = matched
+    return prompt_text[:shared]
+
+
+def _encode_dpo_branches(
+    tokenizer, prompt_text, chosen_text, rejected_text, *, append_eos,
+):
+    """Tokenize the prompt and each completion apart, as TRL's DPOTrainer does.
+
+    ORPO re-tokenizes prompt and completion together and folds a merged
+    boundary token back into the completion; DPO never sees the pair, so a
+    prompt ending mid-token simply splits there.
+    """
+    prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
+    prompt_ids = [int(x) for x in encode_mlx_text(tokenizer, prompt_text)]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+
+    def response(text):
+        ids = [int(x) for x in encode_mlx_text(
+            tokenizer, text[len(prompt_text):], add_special_tokens=False,
+        )]
+        if append_eos and eos_id is not None and (
+            not ids or ids[-1] != int(eos_id)
+        ):
+            ids.append(int(eos_id))
+        return ids
+
+    return prompt_ids, response(chosen_text), response(rejected_text)
+
+
 def tokenize_preference_row(
     tokenizer, row, *, length_policy, append_eos=True,
 ):
@@ -369,23 +409,30 @@ def tokenize_preference_row(
     prompt_text, chosen_text, rejected_text = _render_preference_row(
         tokenizer, row, extracted=extracted,
     )
-    chosen = _encode_mlx_prompt_completion(
-        tokenizer, prompt_text, chosen_text, append_eos=append_eos,
-    )
-    rejected = _encode_mlx_prompt_completion(
-        tokenizer, prompt_text, rejected_text, append_eos=append_eos,
-    )
-    boundaries = [chosen.prompt_length, rejected.prompt_length]
-    if not all(
-        text.startswith(prompt_text) for text in (chosen_text, rejected_text)
-    ):
-        # One branch can leave the prompt earlier than the other, and both mask
-        # the same prompt, so neither keeps more than both prove shared.
-        boundaries = [min(boundaries)] * 2
-    chosen_prompt = list(chosen.input_ids[:boundaries[0]])
-    rejected_prompt = list(rejected.input_ids[:boundaries[1]])
-    chosen_response = list(chosen.input_ids[boundaries[0]:])
-    rejected_response = list(rejected.input_ids[boundaries[1]:])
+    if length_policy.kind == "dpo":
+        chosen_prompt, chosen_response, rejected_response = _encode_dpo_branches(
+            tokenizer, prompt_text, chosen_text, rejected_text,
+            append_eos=append_eos,
+        )
+        rejected_prompt = list(chosen_prompt)
+    else:
+        chosen = _encode_mlx_prompt_completion(
+            tokenizer, prompt_text, chosen_text, append_eos=append_eos,
+        )
+        rejected = _encode_mlx_prompt_completion(
+            tokenizer, prompt_text, rejected_text, append_eos=append_eos,
+        )
+        boundaries = [chosen.prompt_length, rejected.prompt_length]
+        if not all(
+            text.startswith(prompt_text) for text in (chosen_text, rejected_text)
+        ):
+            # One branch can leave the prompt earlier than the other, and both
+            # mask the same prompt, so neither keeps more than both prove shared.
+            boundaries = [min(boundaries)] * 2
+        chosen_prompt = list(chosen.input_ids[:boundaries[0]])
+        rejected_prompt = list(rejected.input_ids[:boundaries[1]])
+        chosen_response = list(chosen.input_ids[boundaries[0]:])
+        rejected_response = list(rejected.input_ids[boundaries[1]:])
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "

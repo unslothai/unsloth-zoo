@@ -3736,12 +3736,13 @@ def _guard_host_token_output(value, state, context):
     return value
 
 
-def encode_mlx_text(tokenizer, text, state=None):
+def encode_mlx_text(tokenizer, text, state=None, *, add_special_tokens=None):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
-    add_special_tokens = True
-    bos_token = getattr(tokenizer, "bos_token", None)
-    if bos_token is not None and text.startswith(bos_token):
-        add_special_tokens = False
+    if add_special_tokens is None:
+        add_special_tokens = True
+        bos_token = getattr(tokenizer, "bos_token", None)
+        if bos_token is not None and text.startswith(bos_token):
+            add_special_tokens = False
 
     try:
         encoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)

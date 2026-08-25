@@ -190,7 +190,7 @@ def test_prompt_only_eos_does_not_consume_first_response_token():
         ),
     ],
 )
-def test_boundary_merges_preserve_each_branch(mapping, row, expected):
+def test_orpo_boundary_merges_preserve_each_branch(mapping, row, expected):
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan,
         tokenize_preference_row,
@@ -198,14 +198,14 @@ def test_boundary_merges_preserve_each_branch(mapping, row, expected):
 
     tokenizer = MappingTokenizer(mapping)
     tokenized = tokenize_preference_row(
-        tokenizer, row, length_policy=policy(max_length=8),
+        tokenizer, row, length_policy=policy("orpo", max_length=8),
     )
     chosen, rejected, prompt_lengths = expected
     assert tokenized.chosen == chosen
     assert tokenized.rejected == rejected
 
     _, lengths, _ = create_preference_batch_plan(
-        [row], tokenizer, batch_size=1, length_policy=policy(max_length=8),
+        [row], tokenizer, batch_size=1, length_policy=policy("orpo", max_length=8),
         num_batches=1, grad_accum=1, dataset_order="sequential",
     )[0]
     assert lengths.tolist() == [
@@ -227,7 +227,7 @@ def test_sft_and_preference_share_boundary_merge_tolerance():
 
 
 
-def test_prompt_mismatch_before_the_boundary_is_rejected():
+def test_orpo_rejects_a_prompt_mismatch_before_the_boundary():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
     tokenizer = MappingTokenizer(
@@ -242,7 +242,7 @@ def test_prompt_mismatch_before_the_boundary_is_rejected():
         tokenize_preference_row(
             tokenizer,
             {"prompt": "abc", "chosen": "d", "rejected": "e"},
-            length_policy=policy(max_length=8),
+            length_policy=policy("orpo", max_length=8),
         )
 
 
@@ -382,6 +382,19 @@ def test_an_implicit_prompt_is_recovered_the_way_trl_recovers_it(row, expected):
     recovered, was_recovered = _maybe_extract_prompt(dict(row))
     keys = ("prompt", "chosen", "rejected")
     assert (*(recovered[key] for key in keys), was_recovered) == (*expected, True)
+
+
+def test_dpo_tokenizes_the_prompt_and_each_completion_the_way_trl_does():
+    # DPO never tokenizes the pair the way ORPO does, so a prompt recovered from
+    # plain text -- a character prefix, so mid-token here -- splits there rather
+    # than the row being refused.
+    tokenized = tokenize(
+        {"chosen": "foobar", "rejected": "foobaz"}, max_length=16,
+        tokenizer=MappingTokenizer({"fooba": [1, 2], "foobar": [3], "foobaz": [4],
+                                    "r": [5], "z": [6]}),
+    )
+    assert (tokenized.chosen, tokenized.rejected) == ((1, 2, 5), (1, 2, 6))
+    assert tokenized.chosen_prompt_ids == tokenized.rejected_prompt_ids == (1, 2)
 
 
 def test_content_parts_and_chat_template_options_are_preserved():
