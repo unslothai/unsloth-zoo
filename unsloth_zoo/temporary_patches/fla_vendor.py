@@ -971,11 +971,93 @@ def _warn_hopper_optout_degraded():
     )
 
 
+# Names Transformers resolves out of fla that fla does not actually export.
+#
+# Since huggingface/transformers#47630 the gated-delta kernels are selected by
+# ``use_kernel_func_from_hub_with_fallback(func, "fla")``, which resolves
+# ``fla.ops.gated_delta_rule.<func>`` with importlib *at decoration time* and
+# silently keeps Transformers' pure-PyTorch implementation when the lookup comes
+# back None. For the single-token decode step it asks for
+# ``recurrent_gated_delta_rule`` -- a name neither this vendored snapshot nor
+# upstream fla has ever exported. Upstream calls it
+# ``fused_recurrent_gated_delta_rule`` and aliases that to ``fused_recurrent_gdn``.
+#
+# So on every Transformers new enough to use the decorator, every cached decode
+# step of every gated-deltanet model runs a float32 Python loop instead of the
+# Triton kernel. Nothing reports it: ``is_flash_linear_attention_available()``
+# still answers True and the chunked prefill/training path is unaffected, so the
+# only visible symptom is that generation is slower than it should be.
+#
+# Measured on Qwen3.8-27B (48 gated-delta layers), greedy, 64 new tokens:
+# without the alias fla is entered 48 times (the prefill chunk call only); with
+# it, 48 + 3024 -- i.e. all 48 layers on each of the 63 decode steps.
+_MISSING_GATED_DELTA_ALIASES = {
+    "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
+}
+
+
+def _alias_missing_gated_delta_names():
+    """Additively supply the gated-delta names Transformers looks up.
+
+    Applied to whichever fla is live, vendored or a user's install we deferred to,
+    because the decode path is equally dead on both -- and the install is the more
+    common case, since the Qwen3.5-family notebooks pip-install fla themselves.
+
+    Strictly additive. A name that already resolves is never replaced, so a future
+    fla that exports it upstream keeps its own implementation and nothing that
+    exists today changes meaning. Returns the names added, for logging and tests.
+    """
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    if module is None:
+        try:
+            module = importlib.import_module("fla.ops.gated_delta_rule")
+        except Exception:
+            return ()
+
+    added = []
+    for wanted, source in _MISSING_GATED_DELTA_ALIASES.items():
+        if getattr(module, wanted, None) is not None:
+            continue
+        implementation = getattr(module, source, None)
+        if implementation is None:
+            # A pruned or partial fla; leave the pure-torch fallback alone rather
+            # than binding a name to nothing.
+            continue
+        setattr(module, wanted, implementation)
+        exported = getattr(module, "__all__", None)
+        if isinstance(exported, list) and wanted not in exported:
+            exported.append(wanted)
+        added.append(wanted)
+
+    if added and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: aliased {', '.join(added)} onto fla.ops.gated_delta_rule "
+            f"so the Triton decode kernel is reachable."
+        )
+    return tuple(added)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
+    try:
+        return _patch_vendor_fla(phase)
+    finally:
+        # Every early return above this line leaves *some* fla live -- the
+        # vendored tree, or a user install we deliberately deferred to, or one we
+        # patched in place. All of them are missing the decode name, so the alias
+        # belongs on the way out rather than at any one of those returns, where
+        # the next early return added would quietly skip it.
+        try:
+            _alias_missing_gated_delta_names()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+
+
+def _patch_vendor_fla(phase=None):
     # Correctness switch, checked before the source-preference flags below. On
     # Hopper + Triton [3.4.0, 3.7.1) *every* fla on the host has the #640 backward
     # miscompile except our vendored copy, which steps around it. A user who does
