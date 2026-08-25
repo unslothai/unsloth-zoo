@@ -14887,11 +14887,32 @@ def _mlx_moe_sanitizers(model):
     return sanitizers
 
 
-def _mlx_moe_expert_names(name, num_experts, group, leaf_alias):
+def _mlx_moe_expert_names(name, num_experts, group, leaf_alias, parent=("", "")):
     base, param = name.rsplit(".", 1)
     prefix, _container, leaf = base.rsplit(".", 2)
+    replaced, replacement = parent
+    if replaced:
+        if replaced not in prefix:
+            return None
+        prefix = prefix.replace(replaced, replacement)
     leaf = leaf_alias.get(leaf, leaf)
     return [f"{prefix}.{group}.{e}.{leaf}.{param}" for e in range(num_experts)]
+
+
+def _mlx_moe_parent_substitutions(renames):
+    """The module relocations a set of proved renames is made of.
+
+    A relocated block moves its router and shared experts too, and those are plain
+    renames, so the relocation is read off them once rather than per candidate.
+    """
+    substitutions = [("", "")]
+    for name, renamed in renames.items():
+        head = len(os.path.commonprefix([name, renamed]))
+        tail = len(os.path.commonprefix([name[::-1], renamed[::-1]]))
+        replaced, replacement = name[head:len(name) - tail], renamed[head:len(renamed) - tail]
+        if replaced and (replaced, replacement) not in substitutions:
+            substitutions.append((replaced, replacement))
+    return substitutions
 
 
 def _mlx_moe_probe_tensor(shape, value):
@@ -14912,23 +14933,28 @@ def _mlx_moe_probe_is_stacked_in_order(stacked, num_experts):
         return False
 
 
-def _candidate_mlx_moe_unstack_plans(stacked):
+def _candidate_mlx_moe_unstack_plans(stacked, parents=(("", ""),)):
     """Yield per-expert naming plans to try, most trustworthy first."""
-    for group in _MOE_EXPERT_GROUPS:
-        for leaf_alias in _MOE_EXPERT_LEAF_ALIASES:
-            yield {
-                name: _mlx_moe_expert_names(name, num_experts, group, leaf_alias)
-                for name, num_experts in stacked.items()
-            }
+    for parent in parents:
+        for group in _MOE_EXPERT_GROUPS:
+            for leaf_alias in _MOE_EXPERT_LEAF_ALIASES:
+                plan = {
+                    name: _mlx_moe_expert_names(
+                        name, num_experts, group, leaf_alias, parent
+                    )
+                    for name, num_experts in stacked.items()
+                }
+                if all(names is not None for names in plan.values()):
+                    yield plan
 
 
-def _build_mlx_moe_expert_unstack_plan(model, stacked, staged):
+def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", ""),)):
     """Recover per-expert HF names, then prove them by replaying sanitize()."""
     sanitizers = _mlx_moe_sanitizers(model)
     # Sanitizers read non-expert weights too, so replay against the whole
     # checkpoint. Only the markers are evaluated; MLX keeps the rest lazy.
     others = {name: tensor for name, tensor in staged.items() if name not in stacked}
-    for plan in _candidate_mlx_moe_unstack_plans(stacked):
+    for plan in _candidate_mlx_moe_unstack_plans(stacked, parents):
         probe = dict(others)
         for name, expert_names in plan.items():
             slice_shape = tuple(staged[name].shape)[1:]
@@ -14977,11 +15003,15 @@ def _mlx_sanitizer_vocabulary(sanitizers):
     return sorted(f for f in found if len(f) > 1 and not f.isspace())
 
 
-def _mlx_moe_rename_candidates(vocabulary, names):
-    """Substitutions worth trying, as (replaced, replacement) pairs."""
+def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
+    """Substitutions worth trying, as (replaced, replacement) pairs.
+
+    ``ubiquity`` of 1 offers every fragment, which is right once the names have
+    been narrowed to the few a candidate could not account for.
+    """
     # A fragment carried by most tensors names the checkpoint's shape, not one
     # block's layout, so substituting it can only produce nonsense to replay.
-    limit = max(1, int(len(names) * _MOE_VOCABULARY_UBIQUITY))
+    limit = max(1, int(len(names) * ubiquity))
     for replaced in vocabulary:
         if sum(replaced in name for name in names) not in range(1, limit + 1):
             continue
@@ -15008,18 +15038,23 @@ def _mlx_moe_renamed(names, replaced, replacement):
 _MOE_PROBE_MARKERS = ((3.0, 1.0), (5.0, 7.0))
 
 
-def _mlx_moe_offset_probe(shape, value):
-    """A marker for offset measurement, full width where a shift can hide.
+def _mlx_moe_offset_probe(shape, value, truncated=True, dtype=None):
+    """A marker for replay measurement, full width where a shift can hide.
 
-    Every RMSNorm weight is 1-D, and so is every value shift mlx-lm applies, so
-    those are carried whole: a shift that varies along the tensor would read as
-    a constant from a truncated corner and be subtracted from the wrong halves.
-    Wider tensors stay truncated because carrying them whole would materialize
-    the checkpoint.
+    1-D tensors are carried whole, since a shift varying along one would read as a
+    constant from a truncated corner. Wider ones are truncated to avoid materializing
+    the checkpoint, and counted rather than filled so an axis move shows: truncation
+    can leave two axes equal, and a filled marker would read a transpose as no change.
     """
     if len(shape) == 1:
-        return mx.full(shape, value, dtype=mx.float32)
-    return _mlx_moe_probe_tensor(shape, value)
+        return mx.full(shape, value, dtype=dtype or mx.float32)
+    if truncated:
+        shape = tuple(min(dim, 2) for dim in shape)
+    size = 1
+    for dim in shape:
+        size *= dim
+    marker = mx.reshape(mx.arange(size, dtype=mx.float32), shape) + value
+    return marker if dtype is None else marker.astype(dtype)
 
 
 def _mlx_moe_constant_offset(sanitized, marker):
@@ -15044,13 +15079,42 @@ def _mlx_moe_constant_offset(sanitized, marker):
         return None
 
 
-def _mlx_moe_replayed_offsets(sanitizers, proposal, staged, markers=None):
-    """For each saved tensor a sanitizer still produces, the constant it adds.
+# Axis pairs an mlx-lm sanitizer moves, as (source, destination) HF to MLX. Kimi
+# Linear's KDA convolutions are stored (d_inner, d_conv, 1) where the checkpoint
+# holds (d_inner, 1, d_conv).
+_MOE_TENSOR_LAYOUTS = ((2, 1), (1, 0), (2, 0))
 
-    mlx-lm sanitizers do not only rename: step3p5 stores a norm weight one
-    greater than the checkpoint it was loaded from, and llama.cpp adds the same
-    one back, so exporting the stored value would double it. Measuring the offset
-    from two markers inverts it exactly and rejects anything not affine.
+
+def _mlx_moe_replay_match(sanitized, marker):
+    """What a sanitizer did to one marker: a constant added and an axis moved.
+
+    Measured with the name rather than after it, since a sanitizer that re-lays a
+    tensor out cannot be inverted by renaming. None when neither explains it.
+    """
+    if sanitized is marker:
+        return 0.0, None
+    if sanitized is None:
+        return None
+    constant = _mlx_moe_constant_offset(sanitized, marker)
+    if constant is not None:
+        return constant, None
+    shape = tuple(getattr(sanitized, "shape", ()))
+    if sorted(shape) != sorted(tuple(marker.shape)):
+        return None
+    for source, destination in _MOE_TENSOR_LAYOUTS:
+        if max(source, destination) >= len(marker.shape):
+            continue
+        if _mlx_arrays_match(sanitized, mx.moveaxis(marker, source, destination)):
+            return 0.0, (source, destination)
+    return None
+
+
+def _mlx_moe_replayed_offsets(sanitizers, proposal, staged, markers=None, required=()):
+    """For each saved tensor a sanitizer still produces, how it produced it.
+
+    Sanitizers do more than rename: step3p5 stores a norm weight one greater than
+    the checkpoint and llama.cpp adds the same one back, so exporting the stored
+    value would double it, and Kimi Linear's KDA convolutions arrive transposed.
     """
     markers = {} if markers is None else markers
     for sanitizer in sanitizers:
@@ -15065,15 +15129,21 @@ def _mlx_moe_replayed_offsets(sanitizers, proposal, staged, markers=None):
                     markers[shape, value] = _mlx_moe_offset_probe(shape, value)
                 probe[proposed] = markers[shape, value]
             try:
-                replays.append((probe, sanitizer.sanitize(dict(probe))))
+                sanitized = sanitizer.sanitize(dict(probe))
             except Exception:
                 replays = []
                 break
+            # A candidate already short of what it has to keep costs one replay and no
+            # comparisons rather than two and all; nothing below recovers a missing name.
+            if not required <= set(sanitized):
+                replays = []
+                break
+            replays.append((probe, sanitized))
         if not replays:
             continue
         for name, proposed in proposal.items():
             found = {
-                _mlx_moe_constant_offset(sanitized.get(name), probe[proposed])
+                _mlx_moe_replay_match(sanitized.get(name), probe[proposed])
                 for probe, sanitized in replays
             }
             if len(found) == 1 and None not in found:
@@ -15083,12 +15153,83 @@ def _mlx_moe_replayed_offsets(sanitizers, proposal, staged, markers=None):
     return {}
 
 
-def _build_mlx_moe_rename_plan(model, staged, split_plan):
+def _completed_mlx_moe_rename_candidate(candidate, offsets, unproven, vocabulary, replay):
+    """Try to finish a candidate with a second substitution on what it missed."""
+    for replaced, replacement in _mlx_moe_rename_candidates(
+        vocabulary, [candidate[name] for name in unproven], ubiquity=1
+    ):
+        repaired = dict(candidate)
+        fixed = _mlx_moe_renamed(
+            [candidate[name] for name in unproven], replaced, replacement
+        )
+        if not fixed:
+            continue
+        for name in unproven:
+            repaired[name] = fixed.get(candidate[name], candidate[name])
+        # A second substitution putting a name back to the one already saved proves
+        # nothing: that name is reproduced by definition.
+        if any(repaired[name] == name for name in unproven):
+            continue
+        if len(set(repaired.values())) != len(repaired):
+            continue
+        repaired_offsets = replay(repaired, unproven)
+        if unproven <= set(repaired_offsets):
+            return repaired, repaired_offsets
+    return candidate, offsets
+
+
+def _confirmed_mlx_moe_rewrite(sanitizers, proposal, constants, layouts, staged,
+                               required):
+    """Whether replaying the whole rewrite hands the staged checkpoint back.
+
+    On the checkpoint rather than on markers: at bfloat16's eight significant bits a
+    marker stops being distinguishable, and two tensors the sanitizer cannot tell apart
+    are two the rewrite cannot get wrong.
+
+    Each reconstruction was proved alone; what reaches the sanitizer is all of them at
+    once, and two that hold apart need not hold together. Doing nothing is the floor: a
+    tensor the sanitizer already does not reproduce is not the rewrite's to lose, and
+    every tensor the rewrite claims has to come back whatever the floor says. One the
+    source checkpoint already corrected is held to neither.
+    """
+    for sanitizer in sanitizers:
+        for base, spread in _MOE_PROBE_MARKERS:
+            probe, expected = {}, {}
+            for position, (name, proposed) in enumerate(proposal.items()):
+                tensor = staged[name]
+                marker = _mlx_moe_offset_probe(
+                    tuple(tensor.shape),
+                    base + position * spread,
+                    False,
+                    getattr(tensor, "dtype", None),
+                )
+                expected[name] = marker
+                constant, layout = constants.get(name), layouts.get(name)
+                if constant:
+                    marker = marker - constant
+                if layout:
+                    marker = mx.moveaxis(marker, layout[1], layout[0])
+                probe[proposed] = marker
+            try:
+                sanitized = sanitizer.sanitize(dict(probe))
+            except Exception:
+                break
+            if any(
+                not _mlx_arrays_match(sanitized.get(name), expected[name])
+                for name in required
+            ):
+                break
+        else:
+            return True
+    return False
+
+
+def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
     """Recover names and values a sanitizer changed, proving each by replaying it."""
     sanitizers = _mlx_moe_sanitizers(model)
     vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
     if not vocabulary:
-        return {}, {}
+        return {}, {}, {}
 
     # Architectures that relocate a whole MoE block rename its experts and its
     # router together, so the probe has to carry both reconstructions at once.
@@ -15103,14 +15244,18 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan):
     # candidate re-marks the same tensors.
     markers = {}
 
-    def replay(proposal):
+    def replay(proposal, required=frozenset()):
         probe = dict(proposal)
         probe.update((name, name) for name in claimed)
         return _mlx_moe_replayed_offsets(
-            sanitizers, probe, {**staged, **claimed}, markers
+            sanitizers, probe, {**staged, **claimed}, markers, required
         )
 
-    open_names = [name for name in staged if name not in (split_plan or {})]
+    # A stacked expert tensor is recovered by splitting, not renaming, so a
+    # substitution must not be judged on whether it also names one. Leaving them out
+    # lets the relocation be read off the router tensors before the split plan.
+    held = set(split_plan or {}) | set(exclude)
+    open_names = [name for name in staged if name not in held]
     proposal = {name: name for name in open_names}
     # The floor: whatever the sanitizer reproduces from the checkpoint must survive.
     offsets = replay(proposal)
@@ -15131,14 +15276,33 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan):
             continue
         if not recovered > {name for name, p in proposal.items() if p != name}:
             continue
-        candidate_offsets = replay(candidate)
+        # Names this candidate leaves alone must keep coming back and the ones it renamed
+        # must not: falling short on exactly those is what the completion reads.
+        candidate_offsets = replay(candidate, baseline - recovered)
+        # One relocation can leave a tensor short by moving two ways at once: Kimi Linear's
+        # router bias changes parent module and gains a `.gate.` component. Completing for
+        # exactly the names it missed reaches those without trying every pair.
+        unproven = (baseline | recovered) - set(candidate_offsets)
+        if unproven and unproven <= recovered:
+            candidate, candidate_offsets = _completed_mlx_moe_rename_candidate(
+                candidate, candidate_offsets, unproven, vocabulary, replay
+            )
+            recovered = {name for name, p in candidate.items() if p != name}
         # Both halves matter: the floor keeps what the sanitizer already reproduces, and
         # `recovered` makes each new name earn its place -- a name the sanitizer drops is
         # reproduced under neither spelling, so it would be renamed on no evidence at all.
         if set(candidate_offsets) >= baseline | recovered:
             proposal, offsets = candidate, candidate_offsets
+    constants = {name: constant for name, (constant, _) in offsets.items() if constant}
+    layouts = {name: layout for name, (_, layout) in offsets.items() if layout}
+    probe = dict(proposal)
+    probe.update((name, name) for name in claimed)
+    if not _confirmed_mlx_moe_rewrite(
+        sanitizers, probe, constants, layouts, {**staged, **claimed}, set(offsets)
+    ):
+        return {}, {}, {}
     renames = {name: p for name, p in proposal.items() if p != name}
-    return renames, {name: c for name, c in offsets.items() if c}
+    return renames, constants, layouts
 
 
 def _mlx_staged_tensor_stubs(files):
@@ -15166,17 +15330,24 @@ def _plan_mlx_moe_expert_unstacking(model, files):
 def _plan_mlx_moe_gguf_rewrite(model, files):
     staged = _mlx_staged_tensor_stubs(files)
     stacked = _mlx_stacked_expert_tensor_names(model, staged)
+    # A block relocation shows on its router and shared experts, which are ordinary
+    # renames, so learn it there before spending it on the expert tensors.
+    parents = _mlx_moe_parent_substitutions(
+        _build_mlx_moe_rename_plan(model, staged, None, exclude=stacked)[0]
+    )
     # Architectures whose stacked layout llama.cpp already maps (Llama 4 keeps
     # its experts fused in HF too) have no per-expert names to recover. Leaving
     # them exactly as saved is what keeps their working export working.
     split = (
-        _build_mlx_moe_expert_unstack_plan(model, stacked, staged) if stacked else None
+        _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents)
+        if stacked
+        else None
     )
-    renames, offsets = _build_mlx_moe_rename_plan(model, staged, split)
+    renames, offsets, layouts = _build_mlx_moe_rename_plan(model, staged, split)
     plan = dict(split or {})
     # A rename is a one-name split, so the rewrite below needs no second path.
     plan.update((name, [renamed]) for name, renamed in renames.items())
-    return plan, offsets
+    return plan, offsets, layouts
 
 
 def _prepare_moe_gguf_export_directory(
@@ -15189,7 +15360,7 @@ def _prepare_moe_gguf_export_directory(
     """
     path = Path(path)
     files = sorted(path.glob("*.safetensors"))
-    plan, offsets = _plan_mlx_moe_gguf_rewrite(model, files)
+    plan, offsets, layouts = _plan_mlx_moe_gguf_rewrite(model, files)
     if not plan:
         return 0
     # The norm convention has already been restored for every offset the source
@@ -15217,6 +15388,9 @@ def _prepare_moe_gguf_export_directory(
             offset = offsets.get(name)
             if offset:
                 tensor = (tensor - offset).astype(tensor.dtype)
+            layout = layouts.get(name)
+            if layout:
+                tensor = mx.moveaxis(tensor, layout[1], layout[0])
             expert_names = plan.get(name)
             if expert_names is None:
                 updated[name] = tensor

@@ -4076,9 +4076,95 @@ def test_moe_gguf_export_builds_each_probe_once_for_the_whole_search(monkeypatch
     staged = {n: mutils.mx.zeros(t.shape, dtype=t.dtype)
               for n, t in model.expected.items()}
     built, real = [], mutils._mlx_moe_offset_probe
-    monkeypatch.setattr(mutils, "_mlx_moe_offset_probe",
-                        lambda shape, value: built.append(value) or real(shape, value))
+    monkeypatch.setattr(
+        mutils, "_mlx_moe_offset_probe",
+        lambda *args: built.append(args[1]) or real(*args))
     mutils._build_mlx_moe_rename_plan(model, staged, None)
-    # At most two probes per tensor however many candidates were tried: one
-    # cache outlives the whole search, rather than one per candidate.
-    assert len(built) <= 2 * len(staged)
+    # Two probes per tensor for the search however many candidates were tried,
+    # because one cache outlives all of them, and two more for the single pass
+    # that confirms the plan that won.
+    assert len(built) <= 4 * len(staged)
+
+
+def _make_probe_reading_moe_model(moves_when, dtype=None):
+    """A model whose sanitize decides on an axis move by the tensor it is handed."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    dtype = dtype or mx.float32
+
+    class Model:
+        def __init__(self):
+            self.expected = {
+                f"model.layers.{layer}.self_attn.{leaf}": (value + layer).astype(dtype)
+                for layer in range(2)
+                for leaf, value in (
+                    ("conv.conv.weight", mx.reshape(mx.arange(24, dtype=mx.float32), (2, 4, 3))),
+                    ("q_proj.weight", mx.zeros((4, 4))),
+                    ("o_proj.weight", mx.zeros((4, 4))),
+                )
+            }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            remappings = ((".moved.", ".conv.conv."),)
+            out = {}
+            for name, tensor in weights.items():
+                for source, target in remappings:
+                    if source in name and getattr(tensor, "ndim", 0) == 3:
+                        if moves_when(tensor):
+                            tensor = mx.moveaxis(tensor, 2, 1)
+                        name = name.replace(source, target)
+                        break
+                out[name] = tensor
+            return out
+
+    return Model()
+
+
+@pytest.mark.parametrize(
+    "moves_when, staged_dtype",
+    (
+        # Only for the corner a probe carries, never for the tensor written.
+        (lambda t: t.shape[1] == 2, None),
+        # Only for the tensor written, which a corner cannot show. The plan this
+        # produces is a plain rename, so it is not an axis move that goes wrong.
+        (lambda t: t.shape[1] > t.shape[2], None),
+        # Only for the dtype a probe carries, never for the checkpoint's own.
+        (lambda t: t.dtype.size == 4, "float16"),
+    ),
+    ids=("only_for_a_corner", "only_for_the_tensor_written", "only_for_a_probes_dtype"),
+)
+def test_moe_gguf_export_refuses_what_only_a_probe_shows(
+    moves_when, staged_dtype, tmp_path
+):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_probe_reading_moe_model(
+        moves_when, staged_dtype and getattr(mutils.mx, staged_dtype)
+    )
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+def test_moe_gguf_export_keeps_an_axis_move_the_written_tensor_also_shows(tmp_path):
+    # The confirmation must not refuse everything it cannot see from a corner:
+    # this sanitizer moves the axis for the reconstruction as well, so the plan
+    # holds and the checkpoint comes back from it exactly.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_probe_reading_moe_model(lambda t: t.shape[1] <= t.shape[2])
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    rewritten = _staged_tensors(path)
+    moved = rewritten["model.layers.1.self_attn.moved.weight"]
+    assert tuple(moved.shape) == (2, 3, 4)
+    restored = model.sanitize(dict(rewritten))
+    for name, tensor in model.expected.items():
+        assert mutils._mlx_arrays_match(restored[name], tensor), name

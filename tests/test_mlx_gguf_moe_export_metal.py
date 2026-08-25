@@ -130,3 +130,83 @@ def test_moe_staging_recovers_names_a_real_sanitizer_only_renamed(tmp_path):
     restored = model.sanitize(dict(rewritten))
     for name, tensor in staged.items():
         assert bool(mx.array_equal(restored[name], tensor)), name
+
+
+KIMI_LINEAR_CONFIG = dict(
+    model_type="kimi_linear", vocab_size=256, hidden_size=64, intermediate_size=128,
+    moe_intermediate_size=32, num_hidden_layers=2, num_attention_heads=4,
+    num_key_value_heads=4, num_experts=4, first_k_dense_replace=0, rms_norm_eps=1e-5,
+    rope_theta=1e4, max_position_embeddings=512, head_dim=16, kv_lora_rank=16,
+    num_experts_per_token=2, num_shared_experts=1, qk_nope_head_dim=16,
+    qk_rope_head_dim=16, v_head_dim=16, model_max_length=512,
+    tie_word_embeddings=False, routed_scaling_factor=1.0,
+    linear_attn_config={"kda_layers": [1], "short_conv_kernel_size": 4,
+                        "head_dim": 16, "num_heads": 4},
+)
+
+
+def _stage_real_model(path, module, config, shards=1):
+    """Write what save_merged_model produces for one real mlx-lm model."""
+    model = module.Model(module.ModelArgs.from_dict(config))
+    staged = {n: t.astype(mx.bfloat16) for n, t in tree_flatten(model.parameters())}
+    mx.eval(*staged.values())
+    path.mkdir(parents=True, exist_ok=True)
+    names, weight_map = sorted(staged), {}
+    for shard in range(shards):
+        part = {n: staged[n] for i, n in enumerate(names) if i % shards == shard}
+        file = f"model-{shard + 1:05d}-of-{shards:05d}.safetensors"
+        mx.save_safetensors(str(path / file), part, metadata={"format": "mlx"})
+        weight_map.update({n: file for n in part})
+    index = json.dumps({"weight_map": weight_map})
+    (path / "model.safetensors.index.json").write_text(index)
+    return model, staged
+
+
+def _restores_bitwise(model, path, staged):
+    """Assert mlx-lm's own sanitize maps the rewritten directory back exactly.
+
+    Also checks the index still names the shard each tensor is really in.
+    """
+    rewritten = {}
+    index = json.loads((path / "model.safetensors.index.json").read_text())
+    for file in sorted(path.glob("*.safetensors")):
+        held = mx.load(str(file))
+        for name in held:
+            assert index["weight_map"].get(name) == file.name, name
+        rewritten.update(held)
+    assert set(index["weight_map"]) == set(rewritten)
+
+    restored = model.sanitize(dict(rewritten))
+    # Exactly the checkpoint, not a superset: a tensor left behind under its MLX
+    # name is invisible to the round-trip, because the sanitizer overwrites it
+    # from the one that replaced it, and llama.cpp rejects what it cannot map.
+    assert set(restored) == set(staged)
+    for name, tensor in staged.items():
+        assert bool(mx.array_equal(restored[name], tensor)), name
+    return rewritten
+
+
+@metal_only
+def test_moe_staging_restores_a_layout_a_real_sanitizer_moved(tmp_path):
+    """Kimi Linear renames its KDA convolutions and swaps two of their axes."""
+    import unsloth_zoo.mlx.utils as mutils
+    from mlx_lm.models import kimi_linear
+
+    path = tmp_path / "merged"
+    model, staged = _stage_real_model(path, kimi_linear, KIMI_LINEAR_CONFIG)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model)
+
+    rewritten = _restores_bitwise(model, path, staged)
+    moved = rewritten["model.layers.0.self_attn.k_conv1d.weight"]
+    staged_conv = staged["model.layers.0.self_attn.k_conv.conv.weight"]
+    assert tuple(moved.shape) == (staged_conv.shape[0], 1, staged_conv.shape[1])
+    # The whole MoE block is relocated, not only the expert tensors, and only
+    # the converter-side spellings of all of it are mappable.
+    for leaf in ("experts.3.w2.weight", "gate.weight", "gate.e_score_correction_bias",
+                 "shared_experts.down_proj.weight"):
+        assert f"model.layers.1.block_sparse_moe.{leaf}" in rewritten
+    assert not any(
+        ".mlp." in name or ".switch_mlp." in name or "_conv.conv." in name
+        for name in rewritten
+    )
