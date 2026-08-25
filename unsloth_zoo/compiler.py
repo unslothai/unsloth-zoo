@@ -143,6 +143,11 @@ DISABLE_COMPILE_FUNCTIONS = [
     "torch_recurrent_gated_delta_rule",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
+    # The decode-kernel name fla_vendor.py aliases onto fla. Modeling sources reach
+    # it through the kernel-hub decorator rather than spelling it, so this matches
+    # nothing today; it is here so one that goes back to importing it by name, the
+    # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
+    "recurrent_gated_delta_rule",
 ]
 
 # Re-exported from .model_lists so callers can keep using

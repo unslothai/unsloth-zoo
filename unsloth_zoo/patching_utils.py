@@ -417,6 +417,21 @@ def patch_model_and_tokenizer(
                 module.to(setted_dtype)
             if "bias" in name:
                 module.to(setted_dtype)
+        pass
+        # empty_cache() used to run here once per module, and that corrupted memory on a
+        # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
+        # cached blocks on EVERY device with no device guard, while cudaFree only
+        # synchronises the current one. Blocks on the other card went back to the driver
+        # mid-write, surfacing as an illegal memory access at a later, unrelated sync.
+        # Only FORCE_FLOAT32 architectures reach this pass, which is why llama never
+        # showed it. Sync the devices this model occupies, then release once -- taking the
+        # set from the model rather than device_count() keeps a DDP rank from creating a
+        # CUDA context on a card it never uses.
+        _model_devices  = {p.device for p in model.parameters() if p.device.type == "cuda"}
+        _model_devices |= {b.device for b in model.buffers()    if b.device.type == "cuda"}
+        for _device in _model_devices:
+            torch.cuda.synchronize(_device)
+        if _model_devices:
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters

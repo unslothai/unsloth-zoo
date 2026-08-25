@@ -283,6 +283,140 @@ def test_import_hygiene_subprocess():
 
 
 # ---------------------------------------------------------------------------
+# The decode-kernel name Transformers resolves but fla does not export
+# ---------------------------------------------------------------------------
+
+class _FakeGatedDeltaModule:
+    """Stand-in for fla.ops.gated_delta_rule, so the additivity rules can be
+    checked without injecting anything into this interpreter."""
+
+    def __init__(self, **names):
+        self.__all__ = list(names)
+        for k, v in names.items():
+            setattr(self, k, v)
+
+
+def _alias_into(fake, monkeypatch):
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setitem(sys.modules, "fla.ops.gated_delta_rule", fake)
+    return fla_vendor._alias_missing_gated_delta_names()
+
+
+def test_decode_alias_added_when_missing(monkeypatch):
+    def fused_recurrent_gated_delta_rule():
+        return "fused"
+
+    fake = _FakeGatedDeltaModule(
+        chunk_gated_delta_rule=lambda: "chunk",
+        fused_recurrent_gated_delta_rule=fused_recurrent_gated_delta_rule,
+    )
+    added = _alias_into(fake, monkeypatch)
+
+    assert added == ("recurrent_gated_delta_rule",), added
+    # This is the exact lookup transformers' use_kernel_func_from_hub_with_fallback
+    # performs; before the alias it returns None and the decorator silently keeps
+    # the pure-PyTorch loop.
+    assert fake.recurrent_gated_delta_rule is fused_recurrent_gated_delta_rule
+    assert "recurrent_gated_delta_rule" in fake.__all__
+
+
+def test_decode_alias_never_overwrites_a_real_export(monkeypatch):
+    """A future fla that exports the name itself must keep its own implementation."""
+    def upstream():
+        return "upstream"
+
+    fake = _FakeGatedDeltaModule(
+        fused_recurrent_gated_delta_rule=lambda: "fused",
+        recurrent_gated_delta_rule=upstream,
+    )
+    added = _alias_into(fake, monkeypatch)
+
+    assert added == (), added
+    assert fake.recurrent_gated_delta_rule is upstream
+    assert fake.__all__.count("recurrent_gated_delta_rule") == 1
+
+
+def test_decode_alias_noop_on_partial_fla(monkeypatch):
+    """Nothing to alias from binds no name: an AttributeError at decoration time
+    would be worse than the slow path it replaces."""
+    fake = _FakeGatedDeltaModule(chunk_gated_delta_rule=lambda: "chunk")
+    added = _alias_into(fake, monkeypatch)
+
+    assert added == (), added
+    assert not hasattr(fake, "recurrent_gated_delta_rule")
+
+
+def test_decode_alias_is_idempotent(monkeypatch):
+    fake = _FakeGatedDeltaModule(
+        fused_recurrent_gated_delta_rule=lambda: "fused",
+    )
+    assert _alias_into(fake, monkeypatch) == ("recurrent_gated_delta_rule",)
+    assert _alias_into(fake, monkeypatch) == ()
+    assert fake.__all__.count("recurrent_gated_delta_rule") == 1
+
+
+def test_decode_alias_survives_absent_fla(monkeypatch):
+    """No fla at all (pure-torch host) must not raise."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.delitem(sys.modules, "fla.ops.gated_delta_rule", raising=False)
+    monkeypatch.setattr(
+        fla_vendor.importlib, "import_module",
+        lambda *a, **k: (_ for _ in ()).throw(ImportError("no fla")),
+    )
+    assert fla_vendor._alias_missing_gated_delta_names() == ()
+
+
+_DECODE_ALIAS_SUBPROCESS = textwrap.dedent(
+    """
+    import os, sys
+    os.environ["UNSLOTH_IS_PRESENT"] = "1"
+    os.environ.pop("UNSLOTH_VENDORED_FLA_NO_AUTORUN", None)
+
+    from unsloth_zoo.temporary_patches.fla_vendor import patch_vendor_fla
+    patch_vendor_fla()
+
+    import fla.ops.gated_delta_rule as gdr
+    assert gdr.recurrent_gated_delta_rule is gdr.fused_recurrent_gated_delta_rule
+
+    # The lookup Transformers actually performs, when it is new enough to do it.
+    try:
+        from transformers.integrations.hub_kernels import resolve_internal_import
+    except ImportError:
+        print("DECODE_ALIAS_OK (transformers predates the kernel-hub resolver)")
+    else:
+        import importlib
+        resolved = resolve_internal_import(
+            importlib.import_module("fla"),
+            "ops.gated_delta_rule.recurrent_gated_delta_rule",
+        )
+        assert resolved is not None, "transformers still cannot resolve the decode kernel"
+        assert resolved is gdr.fused_recurrent_gated_delta_rule
+        print("DECODE_ALIAS_OK")
+    """
+)
+
+
+@pytest.mark.skipif(
+    not _injection_supported(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
+def test_decode_alias_resolves_through_transformers_subprocess():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env.pop("UNSLOTH_VENDORED_FLA_NO_AUTORUN", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _DECODE_ALIAS_SUBPROCESS],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "DECODE_ALIAS_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
+    assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
 # Caller-aware availability probe (uncovered models keep the pure-torch path)
 # ---------------------------------------------------------------------------
 

@@ -971,11 +971,82 @@ def _warn_hopper_optout_degraded():
     )
 
 
+# Names Transformers resolves out of fla that fla does not actually export.
+#
+# Since huggingface/transformers#47630 the gated-delta kernels come from
+# ``use_kernel_func_from_hub_with_fallback(func, "fla")``, which resolves
+# ``fla.ops.gated_delta_rule.<func>`` at decoration time and silently keeps the
+# pure-PyTorch fallback when the lookup returns None. For decode it asks for
+# ``recurrent_gated_delta_rule``, which no fla has ever exported -- upstream
+# calls it ``fused_recurrent_gated_delta_rule``.
+#
+# So every cached decode step of every gated-deltanet model runs a float32 Python
+# loop instead of Triton, and nothing reports it: availability still answers True
+# and prefill/training are unaffected, so it only looks like slow generation.
+# Measured on Qwen3.8-27B (48 layers, greedy, 64 new tokens): fla is entered 48
+# times without the alias (prefill only), 48 + 3024 with it.
+_MISSING_GATED_DELTA_ALIASES = {
+    "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
+}
+
+
+def _alias_missing_gated_delta_names():
+    """Additively supply the gated-delta names Transformers looks up.
+
+    Applied to whichever fla is live, vendored or a user install we deferred to,
+    since the decode path is equally dead on both. A name that already resolves is
+    never replaced, so a future fla that exports it upstream wins. Returns the
+    names added, for logging and tests.
+    """
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    if module is None:
+        try:
+            module = importlib.import_module("fla.ops.gated_delta_rule")
+        except Exception:
+            return ()
+
+    added = []
+    for wanted, source in _MISSING_GATED_DELTA_ALIASES.items():
+        if getattr(module, wanted, None) is not None:
+            continue
+        implementation = getattr(module, source, None)
+        if implementation is None:
+            # A pruned or partial fla; leave the pure-torch fallback alone rather
+            # than binding a name to nothing.
+            continue
+        setattr(module, wanted, implementation)
+        exported = getattr(module, "__all__", None)
+        if isinstance(exported, list) and wanted not in exported:
+            exported.append(wanted)
+        added.append(wanted)
+
+    if added and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: aliased {', '.join(added)} onto fla.ops.gated_delta_rule "
+            f"so the Triton decode kernel is reachable."
+        )
+    return tuple(added)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
+    try:
+        return _patch_vendor_fla(phase)
+    finally:
+        # Every early return in _patch_vendor_fla leaves some fla live, and all of
+        # them are missing the decode name, so the alias goes on the way out rather
+        # than at each return, where the next one added would quietly skip it.
+        try:
+            _alias_missing_gated_delta_names()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+
+
+def _patch_vendor_fla(phase=None):
     # Correctness switch, checked before the source-preference flags below. On
     # Hopper + Triton [3.4.0, 3.7.1) *every* fla on the host has the #640 backward
     # miscompile except our vendored copy, which steps around it. A user who does
