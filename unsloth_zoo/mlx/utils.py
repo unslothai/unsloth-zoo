@@ -14823,6 +14823,187 @@ def _prepare_mlx_gguf_export_directory(path, model=None, replay_sanitizers=True)
     return rewritten
 
 
+# mlx-lm stacks an MoE block's per-expert HF tensors into one SwitchLinear parameter,
+# whose name llama.cpp cannot map. Legacy leaf names come first and the identity map
+# last: where a sanitizer renames then stacks (LFM2 turns w1/w2/w3 into gate/down/up)
+# both replay, and only the legacy one names tensors the converter reads.
+_MOE_EXPERT_GROUPS = ("experts", "mlp")
+_MOE_EXPERT_LEAF_ALIASES = (
+    {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"},
+    {"fc1": "up_proj", "fc2": "down_proj"},
+    {},
+)
+_MOE_EXPERT_PARAMS = ("weight", "bias")
+
+
+def _is_mlx_switch_expert_module(module):
+    num_experts = getattr(module, "num_experts", None)
+    if not isinstance(num_experts, int):
+        return False
+    shape = getattr(getattr(module, "weight", None), "shape", None)
+    return shape is not None and len(shape) == 3 and shape[0] == num_experts
+
+
+def _mlx_stacked_expert_tensor_names(model, tensor_names):
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return {}
+
+    stacked = {}
+    for path, module in named_modules():
+        if not path or not _is_mlx_switch_expert_module(module):
+            continue
+        # LoRA keeps the base SwitchLinear at ".linear", so the module path is
+        # one or more components longer than the saved parameter path.
+        while path and f"{path}.weight" not in tensor_names:
+            path = path.rsplit(".", 1)[0] if "." in path else ""
+        if not path or path.count(".") < 2:
+            continue
+        for param in _MOE_EXPERT_PARAMS:
+            name = f"{path}.{param}"
+            if name in tensor_names:
+                stacked[name] = module.num_experts
+    return stacked
+
+
+def _mlx_moe_sanitizers(model):
+    """Sanitizers that may own an MoE block's expert stacking."""
+    sanitizers = []
+    for owner in (model, getattr(model, "language_model", None),
+                  getattr(model, "text_model", None)):
+        if owner is None or getattr(owner, "sanitize", None) is None:
+            continue
+        if all(existing is not owner for existing in sanitizers):
+            sanitizers.append(owner)
+    return sanitizers
+
+
+def _mlx_moe_expert_names(name, num_experts, group, leaf_alias):
+    base, param = name.rsplit(".", 1)
+    prefix, _container, leaf = base.rsplit(".", 2)
+    leaf = leaf_alias.get(leaf, leaf)
+    return [f"{prefix}.{group}.{e}.{leaf}.{param}" for e in range(num_experts)]
+
+
+def _mlx_moe_probe_tensor(shape, value):
+    """A marker tensor of the same rank as a per-expert slice, but tiny."""
+    return mx.full(tuple(min(dim, 2) for dim in shape), value, dtype=mx.float32)
+
+
+def _mlx_moe_probe_is_stacked_in_order(stacked, num_experts):
+    shape = getattr(stacked, "shape", None)
+    if shape is None or len(shape) < 1 or shape[0] != num_experts:
+        return False
+    try:
+        markers = mx.reshape(stacked, (num_experts, -1))[:, 0]
+        return bool(
+            mx.array_equal(markers, mx.arange(num_experts, dtype=markers.dtype))
+        )
+    except Exception:
+        return False
+
+
+def _candidate_mlx_moe_unstack_plans(stacked):
+    """Yield per-expert naming plans to try, most trustworthy first."""
+    for group in _MOE_EXPERT_GROUPS:
+        for leaf_alias in _MOE_EXPERT_LEAF_ALIASES:
+            yield {
+                name: _mlx_moe_expert_names(name, num_experts, group, leaf_alias)
+                for name, num_experts in stacked.items()
+            }
+
+
+def _build_mlx_moe_expert_unstack_plan(model, stacked, staged):
+    """Recover per-expert HF names, then prove them by replaying sanitize()."""
+    sanitizers = _mlx_moe_sanitizers(model)
+    # Sanitizers read non-expert weights too, so replay against the whole
+    # checkpoint. Only the markers are evaluated; MLX keeps the rest lazy.
+    others = {name: tensor for name, tensor in staged.items() if name not in stacked}
+    for plan in _candidate_mlx_moe_unstack_plans(stacked):
+        probe = dict(others)
+        for name, expert_names in plan.items():
+            slice_shape = tuple(staged[name].shape)[1:]
+            for expert, expert_name in enumerate(expert_names):
+                probe[expert_name] = _mlx_moe_probe_tensor(slice_shape, expert)
+        if len(probe) != len(others) + sum(len(v) for v in plan.values()):
+            continue
+        for sanitizer in sanitizers:
+            try:
+                sanitized = sanitizer.sanitize(dict(probe))
+            except Exception:
+                continue
+            if all(
+                _mlx_moe_probe_is_stacked_in_order(sanitized.get(name), stacked[name])
+                for name in plan
+            ):
+                return plan
+    return None
+
+
+def _plan_mlx_moe_expert_unstacking(model, files):
+    """Plan the per-expert rewrite without holding the whole checkpoint open."""
+    # Planning needs every tensor's name, shape and dtype, never its values, so
+    # stand-ins let each shard close again. Keeping the real ones would hold a
+    # descriptor and a mapping per shard for the length of the plan.
+    staged = {}
+    for file in files:
+        for name, tensor in mx.load(str(file)).items():
+            staged[name] = mx.zeros(tensor.shape, dtype=tensor.dtype)
+    stacked = _mlx_stacked_expert_tensor_names(model, staged)
+    if not stacked:
+        return None
+    # Architectures whose stacked layout llama.cpp already maps (Llama 4 keeps its
+    # experts fused in HF too) have no per-expert names to recover.
+    return _build_mlx_moe_expert_unstack_plan(model, stacked, staged)
+
+
+def _prepare_moe_gguf_export_directory(path, model=None):
+    """Split stacked MLX MoE experts back into per-expert HF tensors."""
+    path = Path(path)
+    files = sorted(path.glob("*.safetensors"))
+    plan = _plan_mlx_moe_expert_unstacking(model, files)
+    if not plan:
+        return 0
+
+    name_map = {}
+    for file in files:
+        # One shard at a time: mx.eval below materializes everything this shard
+        # holds, so keeping earlier shards alive would scale with the model.
+        tensors = mx.load(str(file))
+        if not any(name in plan for name in tensors):
+            continue
+        updated = {}
+        for name, tensor in tensors.items():
+            expert_names = plan.get(name)
+            if expert_names is None:
+                updated[name] = tensor
+                continue
+            for expert, expert_name in enumerate(expert_names):
+                updated[expert_name] = tensor[expert]
+            name_map[name] = expert_names
+        # mx.load() arrays may be file-backed; saving over the source can
+        # truncate them before they materialize, so write beside and replace.
+        mx.eval(*updated.values())
+        tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
+        mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
+        os.replace(tmp_file, file)
+        del updated, tensors
+
+    index_path = path / "model.safetensors.index.json"
+    if name_map and index_path.exists():
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = {}
+        for name, shard in index_data.get("weight_map", {}).items():
+            for expert_name in name_map.get(name, (name,)):
+                weight_map[expert_name] = shard
+        index_data["weight_map"] = dict(sorted(weight_map.items()))
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, indent=4)
+
+    return len(name_map)
+
+
 _CORE_SAVE_FILENAMES = {
     "config.json",
     "model.safetensors.index.json",
@@ -15653,6 +15834,9 @@ def save_pretrained_gguf(
         rewritten = _prepare_mlx_gguf_export_directory(
             tmp_path, model=model, replay_sanitizers=is_vlm_model
         )
+        # After the norm convention is restored, so the offsets it measures are
+        # still keyed by the names the merged save wrote.
+        rewritten += _prepare_moe_gguf_export_directory(tmp_path, model=model)
         if rewritten:
             print(
                 f"Unsloth: Rewrote {rewritten} MLX tensors "

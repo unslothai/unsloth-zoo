@@ -3513,3 +3513,296 @@ def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, t
             folder = value  # exactly what LLAMA_CPP_DEFAULT_DIR would hold
         assert _trusted(monkeypatch, folder, home, env_value=value) is True, \
             f"UNSLOTH_LLAMA_CPP_PATH={value!r} should stay trusted"
+
+def _make_moe_model(container="switch_mlp", group="experts", leaf_alias=None,
+                    wrap_in_lora=False, reverse_experts=False, stacks=True,
+                    with_bias=False, rename_leaves=None, hf_parent="mlp",
+                    num_experts=3, num_layers=2):
+    """A minimal MLX-shaped MoE model whose sanitize stacks per-expert weights."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    leaf_alias = leaf_alias or {}
+    leaves = ("gate_proj", "up_proj", "down_proj")
+    params = ("weight", "bias") if with_bias else ("weight",)
+
+    def marked(marker, *shape):
+        size = num_experts
+        for dim in shape:
+            size *= dim
+        return marker + mx.reshape(
+            mx.arange(size, dtype=mx.float32), (num_experts, *shape)
+        )
+
+    class SwitchLinear:
+        def __init__(self, marker):
+            self.weight = marked(marker, 4, 2)
+            if with_bias:
+                self.bias = marked(marker, 4)
+
+        @property
+        def num_experts(self):
+            return self.weight.shape[0]
+
+    class LoraWrapper:
+        def __init__(self, linear):
+            self.linear = linear
+
+    class Model:
+        def __init__(self):
+            self.switch_modules = {}
+            self.expected = {}
+            for layer in range(num_layers):
+                for offset, leaf in enumerate(leaves):
+                    path = f"model.layers.{layer}.mlp.{container}.{leaf}"
+                    module = SwitchLinear(10 * layer + offset)
+                    self.switch_modules[path] = module
+                    for param in params:
+                        self.expected[f"{path}.{param}"] = getattr(module, param)
+
+        def named_modules(self):
+            yield "", self
+            for path, module in self.switch_modules.items():
+                if wrap_in_lora:
+                    yield path, LoraWrapper(module)
+                    yield f"{path}.linear", module
+                else:
+                    yield path, module
+
+        def sanitize(self, weights):
+            if not stacks:
+                return weights
+            for legacy, canonical in (rename_leaves or {}).items():
+                for old in [n for n in weights if f".{legacy}." in n]:
+                    new = old.replace(f".{legacy}.", f".{canonical}.")
+                    weights[new] = weights.pop(old)
+            for layer in range(num_layers):
+                prefix = f"model.layers.{layer}.mlp"
+                source_prefix = f"model.layers.{layer}.{hf_parent}"
+                for leaf in leaves:
+                    source = leaf_alias.get(leaf, leaf)
+                    for param in params:
+                        keys = [
+                            f"{source_prefix}.{group}.{expert}.{source}.{param}"
+                            for expert in range(num_experts)
+                        ]
+                        if not all(key in weights for key in keys):
+                            continue
+                        joined = [weights.pop(key) for key in keys]
+                        if reverse_experts:
+                            joined.reverse()
+                        weights[f"{prefix}.{container}.{leaf}.{param}"] = mx.stack(
+                            joined
+                        )
+            return weights
+
+    return Model()
+
+
+def _stage_moe_directory(tmp_path, model, shards=1):
+    import unsloth_zoo.mlx.utils as mutils
+
+    path = tmp_path / "merged"
+    path.mkdir(exist_ok=True)
+    names = sorted(model.expected)
+    weight_map = {}
+    for shard in range(shards):
+        part = {
+            name: model.expected[name]
+            for index, name in enumerate(names)
+            if index % shards == shard
+        }
+        file = f"model-{shard + 1:05d}-of-{shards:05d}.safetensors"
+        mutils.mx.save_safetensors(str(path / file), part, metadata={"format": "mlx"})
+        weight_map.update({name: file for name in part})
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    return path
+
+
+def _staged_shards(path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    return {f.name: mutils.mx.load(str(f)) for f in sorted(path.glob("*.safetensors"))}
+
+
+def _staged_tensors(path):
+    return {n: t for shard in _staged_shards(path).values() for n, t in shard.items()}
+
+
+def test_moe_gguf_export_splits_stacked_experts_into_hf_tensors(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model()
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+
+    tensors = _staged_tensors(path)
+    assert not any(".switch_mlp." in name for name in tensors)
+    for stacked_name, stacked in model.expected.items():
+        prefix, leaf = stacked_name.split(".switch_mlp.")
+        leaf = leaf.removesuffix(".weight")
+        for expert in range(stacked.shape[0]):
+            assert mutils._mlx_arrays_match(
+                tensors[f"{prefix}.experts.{expert}.{leaf}.weight"], stacked[expert]
+            )
+
+    index = json.loads((path / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(tensors)
+
+
+def test_moe_gguf_export_splits_sharded_experts_and_biases(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model(with_bias=True, num_layers=4)
+    path = _stage_moe_directory(tmp_path, model, shards=3)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 24
+
+    shards = _staged_shards(path)
+    assert len(shards) == 3
+    tensors = _staged_tensors(path)
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.3.mlp.experts.2.up_proj.bias"],
+        model.expected["model.layers.3.mlp.switch_mlp.up_proj.bias"][2],
+    )
+    # Every rewritten tensor has to be indexed to the shard that now holds it.
+    weight_map = json.loads((path / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    assert set(weight_map) == set(tensors)
+    assert all(name in shards[shard] for name, shard in weight_map.items())
+
+
+@pytest.mark.parametrize(
+    ("model_kwargs", "restored_name"),
+    [
+        ({"container": "experts"}, "model.layers.1.mlp.experts.2.down_proj.weight"),
+        ({"leaf_alias": {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}},
+         "model.layers.1.mlp.experts.2.w2.weight"),
+        ({"group": "mlp"}, "model.layers.1.mlp.mlp.2.down_proj.weight"),
+        # LFM2 renames w1/w2/w3 to gate/down/up before stacking, so both namings
+        # replay cleanly; only the legacy one names tensors llama.cpp reads.
+        ({"rename_leaves": {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}},
+         "model.layers.1.mlp.experts.2.w2.weight"),
+    ],
+)
+def test_moe_gguf_export_recovers_expert_naming_conventions(
+    tmp_path, model_kwargs, restored_name
+):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model(**model_kwargs)
+    container = model_kwargs.get("container", "switch_mlp")
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+    assert mutils._mlx_arrays_match(
+        _staged_tensors(path)[restored_name],
+        model.expected[f"model.layers.1.mlp.{container}.down_proj.weight"][2],
+    )
+
+
+def test_moe_gguf_export_finds_switch_modules_behind_lora_wrappers(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model(wrap_in_lora=True)
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+    assert mutils._mlx_arrays_match(
+        _staged_tensors(path)["model.layers.1.mlp.experts.1.up_proj.weight"],
+        model.expected["model.layers.1.mlp.switch_mlp.up_proj.weight"][1],
+    )
+
+
+@pytest.mark.parametrize(
+    "model_kwargs",
+    [{"stacks": False}, {"reverse_experts": True}, {"hf_parent": "block_sparse_moe"}],
+)
+def test_moe_gguf_export_leaves_unrecoverable_expert_layouts_untouched(
+    tmp_path, model_kwargs
+):
+    # Llama 4 stacks its experts in HF too and llama.cpp maps that layout
+    # already, so a layout we cannot invert has to survive exactly as saved.
+    # Kimi Linear reads block_sparse_moe.experts and writes mlp.switch_mlp; a
+    # relocated parent module is not recoverable from the stacked name.
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model(**model_kwargs)
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+def test_moe_gguf_export_leaves_models_without_stacked_experts_alone(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    class Conv:
+        def __init__(self, weight):
+            self.weight = weight
+
+    class Model:
+        def __init__(self):
+            weight = mutils.mx.zeros((4, 2, 3))
+            self.conv = Conv(weight)
+            self.expected = {"vision_tower.patch_embed.proj.weight": weight}
+
+        def named_modules(self):
+            yield "", self
+            yield "vision_tower.patch_embed.proj", self.conv
+
+    model = Model()
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+def test_save_pretrained_gguf_hands_the_converter_per_expert_moe_tensors(
+    monkeypatch, tmp_path
+):
+    import unsloth_zoo.llama_cpp as llama_cpp
+    import unsloth_zoo.mlx.utils as mutils
+
+    monkeypatch.setitem(sys.modules, "gguf", types.ModuleType("gguf"))
+
+    llama_root = tmp_path / "llama.cpp"
+    llama_root.mkdir()
+    for name in ("convert_hf_to_gguf.py", "llama-quantize"):
+        (llama_root / name).write_text("# stub", encoding="utf-8")
+    converted = {}
+
+    def fake_save_merged_model(model, tokenizer, path, dequantize=False):
+        _stage_moe_directory(Path(path).parent, model).rename(path)
+        (Path(path) / "config.json").write_text("{}", encoding="utf-8")
+
+    def fake_convert_to_gguf(**kwargs):
+        converted["tensors"] = sorted(_staged_tensors(Path(kwargs["input_folder"])))
+        Path(f"{kwargs['model_name']}.F16.gguf").write_bytes(b"GGUF")
+
+    converter = str(llama_root / "convert_hf_to_gguf.py")
+    monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(llama_root))
+    monkeypatch.setattr(llama_cpp, "check_llama_cpp",
+        lambda folder: (str(llama_root / "llama-quantize"), converter))
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf",
+        lambda: (converter, set(), set()))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", fake_convert_to_gguf)
+
+    mutils.save_pretrained_gguf(
+        _make_moe_model(),
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        quantization_method="not_quantized",
+        first_conversion="f16",
+    )
+
+    assert "model.layers.0.mlp.experts.2.gate_proj.weight" in converted["tensors"]
+    assert not any(".switch_mlp." in name for name in converted["tensors"])
