@@ -1028,6 +1028,82 @@ def _alias_missing_gated_delta_names():
     return tuple(added)
 
 
+# The fla kernels Transformers pulls in through the kernel-hub decorator, keyed by
+# the module attribute holding the decorated wrapper. Identical across every model in
+# _REPAIR_MODELING. The causal_conv1d decorators in the same modules are deliberately
+# absent: we do not vendor that package, so there is nothing to re-resolve them to.
+_KERNEL_HUB_DECORATED = {
+    "torch_chunk_gated_delta_rule": "chunk_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule": "recurrent_gated_delta_rule",
+}
+
+
+def _resolved_implementation(wrapper):
+    """The callable a kernel-hub wrapper will actually dispatch to, or None."""
+    for cell in getattr(wrapper, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:      # empty cell
+            continue
+        if callable(value):
+            return value
+    return None
+
+
+def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
+    """Re-resolve the kernel-hub decorators on modeling modules imported before us.
+
+    Since huggingface/transformers#47630 the gated-delta kernels are bound by
+    ``use_kernel_func_from_hub_with_fallback``, which resolves the implementation at
+    *decoration time* and closes over it. A modeling module imported before fla is
+    live therefore freezes the pure-PyTorch fallback into that closure, and no amount
+    of fixing ``fla`` afterwards can reach it: ``_repair_already_imported_modeling``
+    only rebinds module globals, which these modules no longer have.
+
+    Re-applying the decorator to the undecorated function is what makes this correct
+    rather than poking ``cell_contents``. The wrapper also closes over the
+    implementation's parameter names, and those differ between the fallback and the
+    kernel (10 against 16 for chunk), so patching the implementation alone would
+    silently filter out arguments the kernel needs.
+
+    Scoped to ``_REPAIR_MODELING``: olmo_hybrid is deliberately not vendor-covered.
+    """
+    try:
+        from transformers.integrations.hub_kernels import (
+            use_kernel_func_from_hub_with_fallback,
+        )
+    except Exception:
+        return ()               # transformers predates the decorator
+
+    repaired = []
+    for package in packages:
+        module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
+        if module is None:
+            continue
+        for attribute, kernel in _KERNEL_HUB_DECORATED.items():
+            wrapper = getattr(module, attribute, None)
+            original = getattr(wrapper, "__wrapped__", None)
+            if original is None:
+                continue        # not decorated on this transformers
+            if _resolved_implementation(wrapper) is not original:
+                continue        # already dispatching to a real kernel
+            try:
+                rebuilt = use_kernel_func_from_hub_with_fallback(kernel, "fla")(original)
+            except Exception:
+                continue
+            if _resolved_implementation(rebuilt) is original:
+                continue        # still nothing to bind; keep what was there
+            setattr(module, attribute, rebuilt)
+            repaired.append(f"{package}.{attribute}")
+
+    if repaired and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: re-resolved the fla kernels on {', '.join(repaired)}, which "
+            f"were imported before fla was available."
+        )
+    return tuple(repaired)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
@@ -1039,11 +1115,17 @@ def patch_vendor_fla(phase=None):
         # Every early return in _patch_vendor_fla leaves some fla live, and all of
         # them are missing the decode name, so the alias goes on the way out rather
         # than at each return, where the next one added would quietly skip it.
+        # The closure repair follows the alias, since it resolves through it.
         try:
             _alias_missing_gated_delta_names()
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+        try:
+            _repair_kernel_hub_closures()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
 
 
 def _patch_vendor_fla(phase=None):
