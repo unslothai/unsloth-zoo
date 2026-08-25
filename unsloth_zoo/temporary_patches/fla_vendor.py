@@ -973,24 +973,18 @@ def _warn_hopper_optout_degraded():
 
 # Names Transformers resolves out of fla that fla does not actually export.
 #
-# Since huggingface/transformers#47630 the gated-delta kernels are selected by
+# Since huggingface/transformers#47630 the gated-delta kernels come from
 # ``use_kernel_func_from_hub_with_fallback(func, "fla")``, which resolves
-# ``fla.ops.gated_delta_rule.<func>`` with importlib *at decoration time* and
-# silently keeps Transformers' pure-PyTorch implementation when the lookup comes
-# back None. For the single-token decode step it asks for
-# ``recurrent_gated_delta_rule`` -- a name neither this vendored snapshot nor
-# upstream fla has ever exported. Upstream calls it
-# ``fused_recurrent_gated_delta_rule`` and aliases that to ``fused_recurrent_gdn``.
+# ``fla.ops.gated_delta_rule.<func>`` at decoration time and silently keeps the
+# pure-PyTorch fallback when the lookup returns None. For decode it asks for
+# ``recurrent_gated_delta_rule``, which no fla has ever exported -- upstream
+# calls it ``fused_recurrent_gated_delta_rule``.
 #
-# So on every Transformers new enough to use the decorator, every cached decode
-# step of every gated-deltanet model runs a float32 Python loop instead of the
-# Triton kernel. Nothing reports it: ``is_flash_linear_attention_available()``
-# still answers True and the chunked prefill/training path is unaffected, so the
-# only visible symptom is that generation is slower than it should be.
-#
-# Measured on Qwen3.8-27B (48 gated-delta layers), greedy, 64 new tokens:
-# without the alias fla is entered 48 times (the prefill chunk call only); with
-# it, 48 + 3024 -- i.e. all 48 layers on each of the 63 decode steps.
+# So every cached decode step of every gated-deltanet model runs a float32 Python
+# loop instead of Triton, and nothing reports it: availability still answers True
+# and prefill/training are unaffected, so it only looks like slow generation.
+# Measured on Qwen3.8-27B (48 layers, greedy, 64 new tokens): fla is entered 48
+# times without the alias (prefill only), 48 + 3024 with it.
 _MISSING_GATED_DELTA_ALIASES = {
     "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
 }
@@ -999,13 +993,10 @@ _MISSING_GATED_DELTA_ALIASES = {
 def _alias_missing_gated_delta_names():
     """Additively supply the gated-delta names Transformers looks up.
 
-    Applied to whichever fla is live, vendored or a user's install we deferred to,
-    because the decode path is equally dead on both -- and the install is the more
-    common case, since the Qwen3.5-family notebooks pip-install fla themselves.
-
-    Strictly additive. A name that already resolves is never replaced, so a future
-    fla that exports it upstream keeps its own implementation and nothing that
-    exists today changes meaning. Returns the names added, for logging and tests.
+    Applied to whichever fla is live, vendored or a user install we deferred to,
+    since the decode path is equally dead on both. A name that already resolves is
+    never replaced, so a future fla that exports it upstream wins. Returns the
+    names added, for logging and tests.
     """
     module = sys.modules.get("fla.ops.gated_delta_rule")
     if module is None:
@@ -1045,11 +1036,9 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
-        # Every early return above this line leaves *some* fla live -- the
-        # vendored tree, or a user install we deliberately deferred to, or one we
-        # patched in place. All of them are missing the decode name, so the alias
-        # belongs on the way out rather than at any one of those returns, where
-        # the next early return added would quietly skip it.
+        # Every early return in _patch_vendor_fla leaves some fla live, and all of
+        # them are missing the decode name, so the alias goes on the way out rather
+        # than at each return, where the next one added would quietly skip it.
         try:
             _alias_missing_gated_delta_names()
         except Exception as e:
