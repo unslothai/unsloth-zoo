@@ -1,5 +1,6 @@
 """MLX text preference tokenization, finite batching, and objectives."""
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -39,6 +40,172 @@ class TokenizedPreferenceRow:
     @property
     def rejected(self):
         return self.rejected_prompt_ids + self.rejected_ids
+
+
+TRUNCATION_MODES = ("keep_end", "keep_start")
+
+
+@dataclass(frozen=True)
+class PreferenceLengthPolicy:
+    """Resolved length budget for one preference objective.
+
+    ``kind`` picks the truncation algorithm; DPO's and ORPO's differ.
+    """
+
+    kind: str
+    max_length: int
+    max_prompt_length: int | None
+    max_completion_length: int | None
+    truncation_mode: str
+    # The width every row must fit; max_length is the budget spent inside it.
+    max_seq_length: int
+
+
+def _token_budget(value, name):
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise ValueError(
+            f"Unsloth MLX preference: {name} must be a positive token count."
+        )
+    return value
+
+
+def resolve_preference_length_policy(kind, args, *, max_seq_length):
+    """Resolve the four length bounds the way the matching TRL trainer does.
+
+    max_seq_length has no TRL counterpart: it is the width a batch can hold, so
+    it caps max_length, and for ORPO it can pull max_prompt_length down with it.
+    """
+    truncation_mode = getattr(args, "truncation_mode", "keep_end")
+    if truncation_mode not in TRUNCATION_MODES:
+        raise ValueError(
+            f"Unsloth MLX preference: unknown truncation_mode "
+            f"{truncation_mode!r}; expected one of {list(TRUNCATION_MODES)}."
+        )
+    max_seq_length = int(max_seq_length)
+    max_length = _token_budget(getattr(args, "max_length", None), "max_length")
+    max_prompt_length = _token_budget(
+        getattr(args, "max_prompt_length", None), "max_prompt_length",
+    )
+    max_completion_length = _token_budget(
+        getattr(args, "max_completion_length", None), "max_completion_length",
+    )
+    if kind == "orpo":
+        # ORPO divides the budget between prompt and answer, so neither bound
+        # can be left open.
+        if max_length is None:
+            max_length = 512
+            warnings.warn(
+                "Unsloth MLX ORPO: max_length is not set; defaulting to 512.",
+                RuntimeWarning, stacklevel=2,
+            )
+        if max_prompt_length is None:
+            max_prompt_length = 128
+            warnings.warn(
+                "Unsloth MLX ORPO: max_prompt_length is not set; defaulting "
+                "to 128.",
+                RuntimeWarning, stacklevel=2,
+            )
+        if max_completion_length is not None:
+            warnings.warn(
+                "Unsloth MLX ORPO: max_completion_length only applies to "
+                "encoder-decoder models and is ignored here. A branch whose "
+                "capped prompt plus the longer answer still overruns max_length "
+                "has its answer sliced to max_length minus max_prompt_length "
+                "instead, which trims the answer's tail when max_prompt_length "
+                "stands above max_length.",
+                RuntimeWarning, stacklevel=2,
+            )
+            max_completion_length = None
+    if max_length is None:
+        max_length = max_seq_length
+    elif max_length > max_seq_length:
+        warnings.warn(
+            f"Unsloth MLX preference: max_length={max_length} exceeds "
+            f"max_seq_length={max_seq_length}, which bounds the batched "
+            "sequences; using max_seq_length.",
+            RuntimeWarning, stacklevel=2,
+        )
+        before_clamp = max_length
+        max_length = max_seq_length
+        if kind == "orpo" and before_clamp > max_prompt_length >= max_length:
+            # ORPO spends max_length minus max_prompt_length on the answer, so
+            # a budget clamped down to the prompt bound leaves the answer none
+            # and clamped below it erases any answer no longer than the gap.
+            # A bound the caller themselves set at or above their own
+            # max_length is theirs to mean, and TRL's slice is reproduced.
+            max_prompt_length = max(1, max_length // 2)
+            warnings.warn(
+                f"Unsloth MLX ORPO: max_prompt_length no longer leaves room for "
+                f"an answer inside max_length={max_length}; using "
+                f"{max_prompt_length}.",
+                RuntimeWarning, stacklevel=2,
+            )
+    # For DPO the prompt bound is a cap rather than reserved room, so it may
+    # stand above max_length.
+    return PreferenceLengthPolicy(
+        kind, max_length, max_prompt_length, max_completion_length,
+        truncation_mode, max_seq_length,
+    )
+
+
+def _truncate_dpo_branch(prompt_ids, response_ids, policy):
+    """Cap the prompt's end and the response's start, then the concatenation.
+
+    DPOTrainer truncates the concatenation in the forward pass, where the batch
+    is prompt-left- and completion-right-padded, so each row is one contiguous
+    block and its batched slice is exactly this per-row slice.
+    """
+    if policy.max_prompt_length is not None:
+        prompt_ids = prompt_ids[-policy.max_prompt_length:]
+    if policy.max_completion_length is not None:
+        response_ids = response_ids[:policy.max_completion_length]
+    overflow = len(prompt_ids) + len(response_ids) - policy.max_length
+    if overflow > 0:
+        if policy.truncation_mode == "keep_start":
+            prompt_ids = prompt_ids[:policy.max_length]
+            response_ids = response_ids[:policy.max_length - len(prompt_ids)]
+        else:
+            dropped = min(overflow, len(prompt_ids))
+            prompt_ids = prompt_ids[dropped:]
+            response_ids = response_ids[overflow - dropped:]
+    return prompt_ids, response_ids
+
+
+def _truncate_orpo(
+    chosen_prompt, chosen_ids, rejected_prompt, rejected_ids, policy,
+):
+    """Cap both prompts against the longer response, then cut each answer's tail.
+
+    Mirrors ORPOTrainer, whose answer cut spends the whole prompt budget rather
+    than the prompt's real length.
+    """
+    longer = max(len(chosen_ids), len(rejected_ids))
+    keep = policy.max_prompt_length
+
+    def fits(prompt_ids):
+        return len(prompt_ids) + longer <= policy.max_length
+
+    def cap_prompt(prompt_ids):
+        if fits(prompt_ids):
+            return prompt_ids
+        if policy.truncation_mode == "keep_start":
+            return prompt_ids[:keep]
+        return prompt_ids[-keep:]
+
+    def cap_response(prompt_ids, response_ids):
+        if fits(prompt_ids):
+            return response_ids
+        return response_ids[:policy.max_length - keep]
+
+    chosen_prompt = cap_prompt(chosen_prompt)
+    rejected_prompt = cap_prompt(rejected_prompt)
+    return (
+        chosen_prompt, cap_response(chosen_prompt, chosen_ids),
+        rejected_prompt, cap_response(rejected_prompt, rejected_ids),
+    )
 
 
 def _is_messages(value):
@@ -134,7 +301,7 @@ def _render_preference_row(tokenizer, row):
 
 
 def tokenize_preference_row(
-    tokenizer, row, *, max_seq_length, append_eos=True,
+    tokenizer, row, *, length_policy, append_eos=True,
 ):
     """Tokenize one row and preserve a shared prompt boundary."""
     if not isinstance(row, Mapping):
@@ -161,25 +328,55 @@ def tokenize_preference_row(
             "Unsloth MLX preference: chosen and rejected must each contain at "
             "least one response token."
         )
-    max_response = max(len(chosen_response), len(rejected_response))
-    if max_response >= max_seq_length:
-        chosen_response = chosen_response[:max_seq_length - 1]
-        rejected_response = rejected_response[:max_seq_length - 1]
-        chosen_prompt = chosen_prompt[-1:]
-        rejected_prompt = rejected_prompt[-1:]
+    if length_policy.kind == "orpo":
+        (
+            chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+        ) = _truncate_orpo(
+            chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+            length_policy,
+        )
     else:
-        prompt_budget = max_seq_length - max_response
-        chosen_prompt = chosen_prompt[-prompt_budget:]
-        rejected_prompt = rejected_prompt[-prompt_budget:]
-    if (
-        not chosen.prompt_ids
-        or not rejected.prompt_ids
-        or not chosen_response
-        or not rejected_response
-    ):
+        chosen_prompt, chosen_response = _truncate_dpo_branch(
+            chosen_prompt, chosen_response, length_policy,
+        )
+        rejected_prompt, rejected_response = _truncate_dpo_branch(
+            rejected_prompt, rejected_response, length_policy,
+        )
+    # A response token is only scoreable if something precedes it to predict
+    # from. ORPO averages a branch's log probability over that branch alone, so
+    # one unscoreable branch makes the whole row meaningless; DPO only ever sums
+    # it, and an unscoreable branch cancels against the reference, leaving the
+    # other branch's gradient intact. So DPO needs one scoreable branch, ORPO both.
+    unscoreable = [
+        len(prompt) + len(response) < 2 or not response
+        for prompt, response in (
+            (chosen_prompt, chosen_response),
+            (rejected_prompt, rejected_response),
+        )
+    ]
+    if all(unscoreable) if length_policy.kind == "dpo" else any(unscoreable):
         raise ValueError(
-            "Unsloth MLX preference: max_seq_length leaves no trainable prompt "
-            "and response tokens."
+            "Unsloth MLX preference: this row leaves a branch without one "
+            "response token that has anything before it to predict from, and "
+            f"{length_policy.kind} scores that branch on its own. Raise "
+            "max_length or lower max_prompt_length if the length budget cut it "
+            "down; otherwise the row itself is too short to train on."
+        )
+    # A prompt bound above max_length turns ORPO's answer cut into a tail cut,
+    # which can leave the row wider than the batch. Materializing that would
+    # silently drop the response tokens past the width, and once the prompt
+    # alone is wider it would report a prompt longer than the row, masking the
+    # response out of the loss entirely.
+    kept = max(
+        len(chosen_prompt) + len(chosen_response),
+        len(rejected_prompt) + len(rejected_response),
+    )
+    if kept > length_policy.max_seq_length:
+        raise ValueError(
+            f"Unsloth MLX preference: this row keeps {kept} tokens, more than "
+            f"the {length_policy.max_seq_length} a batch can hold, because "
+            f"max_prompt_length={length_policy.max_prompt_length} is not below "
+            f"max_length={length_policy.max_length}. Lower max_prompt_length."
         )
     return TokenizedPreferenceRow(
         tuple(chosen_prompt), tuple(chosen_response),
@@ -311,7 +508,7 @@ def create_preference_batch_plan(
     tokenizer,
     *,
     batch_size,
-    max_seq_length,
+    length_policy,
     num_batches=None,
     num_epochs=None,
     grad_accum=None,
@@ -330,7 +527,7 @@ def create_preference_batch_plan(
                 "Unsloth MLX preference: formatting_func must return a mapping."
             )
         rows.append(tokenize_preference_row(
-            tokenizer, row, max_seq_length=max_seq_length, append_eos=append_eos,
+            tokenizer, row, length_policy=length_policy, append_eos=append_eos,
         ))
     if not rows:
         raise ValueError("Unsloth MLX preference: the training dataset is empty.")
@@ -381,7 +578,7 @@ def create_preference_batch_plan(
         rows, schedule,
         normalizers=_window_normalizers(rows, schedule, cycle_length, grad_accum),
         cycle_length=cycle_length,
-        max_seq_length=max_seq_length,
+        max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
     )
 

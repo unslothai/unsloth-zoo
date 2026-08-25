@@ -588,6 +588,7 @@ from .preference import (
     create_preference_batch_plan,
     make_dpo_loss_fn,
     make_orpo_loss_fn,
+    resolve_preference_length_policy,
 )
 from .compile import (
     build_compile_policy,
@@ -1248,6 +1249,10 @@ class MLXTrainingConfig:
             "disable_dropout",
             "reference_free",
             "label_smoothing",
+            "max_length",
+            "max_prompt_length",
+            "max_completion_length",
+            "truncation_mode",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1303,10 +1308,21 @@ class MLXTrainingConfig:
 
 @dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXORPOTrainer."""
+    """Configuration owned by MLXORPOTrainer.
+
+    max_completion_length only applies to encoder-decoder models, so it is inert
+    here. A branch whose capped prompt plus the longer answer still overruns
+    max_length has its answer sliced to max_length minus max_prompt_length
+    instead, which trims the answer's tail when max_prompt_length stands above
+    max_length.
+    """
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
 
 
 @dataclass(init=False)
@@ -1317,6 +1333,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
 
 
 def _shape_guard_report(
@@ -7501,7 +7521,10 @@ class MLXTrainer:
                 train_dataset,
                 self.tokenizer,
                 batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
+                length_policy=resolve_preference_length_policy(
+                    self.preference_kind, args,
+                    max_seq_length=args.max_seq_length,
+                ),
                 num_batches=total_batches_needed,
                 num_epochs=preference_epochs,
                 grad_accum=args.gradient_accumulation_steps,
