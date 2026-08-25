@@ -2046,6 +2046,79 @@ _FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS = (
     os.path.join("lib", "Win32"),
 )
 
+# The only two `-L` directories FlashInfer emits, verbatim from its generated
+# build.ninja: `-L$cuda_home/lib64 -L$cuda_home/lib64/stubs`. Matching it
+# exactly rather than guessing extra layouts keeps this predicate honest.
+_CUDA_ROOT_LIB_SUBDIRS = (
+    "lib64",
+    os.path.join("lib64", "stubs"),
+)
+
+# Last-resort default linker directories, used only when `ld --verbose` cannot
+# be run. Deliberately generous: a directory that does not exist costs nothing,
+# a missing one costs a working FlashInfer.
+_FALLBACK_LINKER_DIRS = (
+    "/usr/lib",
+    "/lib",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+)
+
+
+def _cuda_roots_from_nvcc() -> "Tuple[str, ...]":
+    """The CUDA root FlashInfer infers when neither CUDA_HOME nor CUDA_PATH is
+    set: the grandparent of whichever nvcc is on PATH.
+
+    flashinfer/jit/cpp_ext.py get_cuda_path() is CUDA_HOME, then CUDA_PATH,
+    then `dirname(dirname(which nvcc))`, then /usr/local/cuda. Without this
+    third case a toolkit installed anywhere other than /usr/local/cuda --
+    /opt/cuda on Arch, a conda prefix -- has its stubs directory missed
+    entirely and FlashInfer is disabled on a machine that links fine.
+
+    Both the literal and the symlink-resolved grandparent are returned:
+    FlashInfer does not resolve symlinks, but a /usr/bin/nvcc shim pointing
+    into the real toolkit is common enough that ignoring it would reintroduce
+    the same false negative.
+    """
+    nvcc = shutil.which("nvcc")
+    if not nvcc: return ()
+    roots = []
+    for path in (nvcc, os.path.realpath(nvcc)):
+        root = os.path.dirname(os.path.dirname(path))
+        if root and root not in roots: roots.append(root)
+    return tuple(roots)
+
+
+@functools.cache
+def _linker_default_dirs() -> "Tuple[str, ...]":
+    """The directories `ld` searches with no -L at all.
+
+    The NVIDIA driver installer creates the unversioned `libcuda.so` symlink in
+    a default directory (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu), so
+    `c++ ... -lcuda` frequently succeeds with no toolkit stubs directory in
+    sight. Ignoring these paths turns those machines into false negatives,
+    which is the one direction this predicate must never get wrong.
+
+    `ld --verbose` prints the built-in linker script, whose SEARCH_DIR entries
+    are exactly that list; the leading `=` on each is the sysroot placeholder
+    and is empty for a native link.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ld", "--verbose"],
+            capture_output = True, text = True, timeout = 20,
+        ).stdout
+    except Exception:
+        out = ""
+    dirs = [d.replace("=", "", 1) if d.startswith("=") else d
+            for d in re.findall(r'SEARCH_DIR\("([^"]*)"\)', out)]
+    # Never return an empty tuple on a parse failure; fall back rather than
+    # silently narrowing the search.
+    return tuple(dirs) if dirs else _FALLBACK_LINKER_DIRS
+
 
 def _can_link_libcuda() -> bool:
     """Can a FlashInfer JIT build actually LINK, not merely compile?
@@ -2094,14 +2167,19 @@ def _can_link_libcuda() -> bool:
         return True
 
     search = list(_FLASHINFER_LINK_DIRS)
-    for var in ("CUDA_HOME", "CUDA_PATH"):
-        root = os.environ.get(var, "")
-        if root:
-            search.append(os.path.join(root, "lib64"))
-            search.append(os.path.join(root, "lib64", "stubs"))
+    roots = [os.environ.get(var, "") for var in ("CUDA_HOME", "CUDA_PATH")]
+    # Neither variable set is the common case, and then FlashInfer infers the
+    # root from nvcc rather than assuming /usr/local/cuda.
+    roots += list(_cuda_roots_from_nvcc())
+    for root in roots:
+        if not root: continue
+        search += [os.path.join(root, sub) for sub in _CUDA_ROOT_LIB_SUBDIRS]
     # LIBRARY_PATH is what the linker consults beyond its defaults, so a caller
     # that has already supplied a stub there is correctly treated as fine.
     search += [d for d in os.environ.get("LIBRARY_PATH", "").split(os.pathsep) if d]
+    # And the defaults themselves, which is where the driver's own unversioned
+    # libcuda.so lives on a normal bare-metal install.
+    search += list(_linker_default_dirs())
     return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
 
 def _clear_flashinfer_env_on_hip():
