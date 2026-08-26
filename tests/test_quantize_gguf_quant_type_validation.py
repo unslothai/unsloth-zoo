@@ -19,14 +19,22 @@ from types import SimpleNamespace
 import pytest
 
 
+_MODULE = None
+
+
 def _load_llama_cpp_module():
-    repo_root = Path(__file__).resolve().parents[1]
-    module_path = repo_root / "unsloth_zoo" / "llama_cpp.py"
-    spec = importlib.util.spec_from_file_location("llama_cpp_under_test", module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    """Loaded once per session: re-executing llama_cpp for every test churns
+    global torch state and slows the suite down for no extra coverage."""
+    global _MODULE
+    if _MODULE is None:
+        repo_root = Path(__file__).resolve().parents[1]
+        module_path = repo_root / "unsloth_zoo" / "llama_cpp.py"
+        spec = importlib.util.spec_from_file_location("llama_cpp_under_test", module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _MODULE = module
+    return _MODULE
 
 
 def _install_fake_subprocess_run(monkeypatch, llama_cpp):
