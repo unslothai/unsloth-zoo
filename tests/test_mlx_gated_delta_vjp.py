@@ -40,6 +40,8 @@ if not _HAS_REAL_MLX:
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
 
+from unsloth_zoo.mlx.loader import (  # noqa: E402
+    _disable_fused_input_projections, _disable_fused_mrope)
 from unsloth_zoo.mlx.utils import (  # noqa: E402
     _MLX_INDEX_OP_NAMES, acquire_mlx_training_patches, mlx_training_patches_active,
     pause_mlx_training_patches, release_mlx_training_patches,
@@ -570,3 +572,62 @@ def test_qwen35_attention_detection_follows_the_mro():
     subclass = type("Qwen4ExpAttention", (base,), {})
     assert model_has_qwen35_attention_layers(_FakeModel(subclass()))
     assert not model_has_qwen35_attention_layers(_FakeModel(object()))
+
+
+@pytest.mark.parametrize("disable, flag, extra", [
+    (_disable_fused_input_projections, "fuse_in", {"_fused_ready": True}),
+    (_disable_fused_mrope, "fused_apply", {}),
+])
+def test_disabling_a_fusion_targets_only_fused_modules(disable, flag, extra):
+    """The returned modules are what the trainer re-fuses once training is over."""
+    fused = types.SimpleNamespace(**{flag: True}, **extra)
+    plain = types.SimpleNamespace()
+    assert disable(_FakeModel(fused, plain)) == [fused]
+    assert getattr(fused, flag) is False
+    assert not hasattr(plain, flag)
+    # The projection fusion also drops the concatenation it cached.
+    assert not extra or fused._fused_ready is False
+    assert disable(_FakeModel(fused, plain)) == []
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mlx_vlm.models.glm5_next") is None
+    or not _HAS_REAL_MLX,
+    reason="needs mlx-vlm with glm5_next on real MLX",
+)
+def test_unfused_projection_matches_the_fused_one():
+    if sys.modules.get("mlx.core") is not mx:
+        pytest.skip("another suite installed the MLX shim")
+    from mlx_vlm.models.glm5_next.config import TextConfig
+    from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+
+    config = TextConfig(
+        model_type="glm5_next_text", vocab_size=64, hidden_size=64, intermediate_size=128,
+        moe_intermediate_size=64, num_hidden_layers=1, num_attention_heads=4,
+        num_key_value_heads=4, n_shared_experts=1, n_routed_experts=4, index_topk=8,
+        routed_scaling_factor=1.0, kv_lora_rank=16, q_lora_rank=32, qk_rope_head_dim=0,
+        v_head_dim=32, qk_nope_head_dim=32, num_experts_per_tok=2, index_n_heads=2,
+        first_k_dense_replace=0, max_position_embeddings=256, rms_norm_eps=1e-5,
+        index_head_dim=32, layer_types=["linear_attention"], mlp_layer_types=["dense"],
+        linear_attn_config={"num_heads": 2, "head_dim": 32,
+                            "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
+    )
+    module = Glm5NextLinearAttention(config)
+    mx.eval(module.parameters())
+    x = mx.random.normal((1, 16, config.hidden_size))
+
+    fused = module(x)
+    mx.eval(fused)
+
+    # A zero-initialized adapter leaves the output unchanged, but the fusion
+    # reads `.weight` off the projection and LoRALinear has none.
+    from mlx_lm.tuner.lora import LoRALinear
+    module.update_modules({"q_proj": LoRALinear.from_base(module.q_proj, r=4)})
+    module._fused_ready = False
+    with pytest.raises(AttributeError):
+        module(x)
+
+    assert _disable_fused_input_projections(_FakeModel(module)) == [module]
+    unfused = module(x)
+    mx.eval(unfused)
+    assert mx.allclose(fused, unfused, atol=1e-5, rtol=1e-5).item()

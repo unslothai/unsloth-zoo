@@ -2562,19 +2562,38 @@ _VLM_MODEL_FIXUPS = (
 
 
 def _disable_fused_mrope(model):
-    """Flip fused_apply off so MRoPE training uses the differentiable
-    cos/sin fallback; the fused Metal kernel has no VJP."""
-    count = 0
+    """The fused MRoPE Metal kernel has no VJP; training needs the cos/sin fallback."""
+    changed = []
     try:
         modules = model.modules()
     except Exception:
-        return
+        return changed
     for module in modules:
         if getattr(module, "fused_apply", False):
             module.fused_apply = False
-            count += 1
-    if count:
-        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {len(changed)} modules for training (no VJP).")
+    return changed
+
+
+def _disable_fused_input_projections(model):
+    """GLM-5.x linear attention concatenates the raw `.weight` of its six input
+    projections once and caches it: a LoRA wrapper has no `.weight` to read, and a
+    full fine-tune would keep the pre-training copy."""
+    changed = []
+    try:
+        modules = model.modules()
+    except Exception:
+        return changed
+    for module in modules:
+        if getattr(module, "fuse_in", False) and hasattr(module, "_fused_ready"):
+            module.fuse_in = False
+            module._fused_ready = False
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused input projections on {len(changed)} modules.")
+    return changed
 
 
 def _safe_getsource(obj) -> str:
@@ -8222,6 +8241,8 @@ class FastMLXModel:
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
+        # Adapters are invisible to a cached weight fusion.
+        _disable_fused_input_projections(model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):

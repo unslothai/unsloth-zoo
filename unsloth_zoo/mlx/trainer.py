@@ -4548,6 +4548,8 @@ class MLXTrainer:
             iter_mlx_norm_output_cast_classes(model)
         )
         _training_patches_held = False
+        _unfused_projection_modules = []
+        _unfused_mrope_modules = []
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -4849,12 +4851,15 @@ class MLXTrainer:
             if model_has_qwen35_attention_layers(model):
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
-                _disable_fused_mrope(model)
+                _unfused_mrope_modules = _disable_fused_mrope(model)
+            # Full fine-tuning updates projections a fusion cached once.
+            from .loader import _disable_fused_input_projections
+            _unfused_projection_modules = _disable_fused_input_projections(model)
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
                 from .loader import _disable_fused_mrope
-                _disable_fused_mrope(model)
+                _unfused_mrope_modules += _disable_fused_mrope(model)
 
             # Register W&B/TensorBoard reporters after arg auto-tuning so the
             # W&B config snapshot reflects the settings actually used (e.g. VLM
@@ -4905,6 +4910,10 @@ class MLXTrainer:
                 pass
             if _training_patches_held:
                 release_mlx_training_patches()
+            for _module in _unfused_projection_modules:
+                _module.fuse_in = True
+            for _module in _unfused_mrope_modules:
+                _module.fused_apply = True
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
