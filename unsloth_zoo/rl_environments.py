@@ -486,25 +486,73 @@ pass
 
 # Importable by generated code. Excludes any stdlib module that reaches the
 # filesystem, network or another process (os, subprocess, socket, ctypes, ...).
+# Also excludes two that look harmless but are not: `operator`, whose attrgetter
+# takes a dotted string and so walks dunders without the AST check ever seeing
+# them, and `dataclasses`, which resolves annotations through
+# sys.modules[cls.__module__] and cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
-    "abc", "array", "bisect", "cmath", "collections", "copy", "dataclasses",
+    "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
-    "numbers", "operator", "random", "re", "statistics", "string", "textwrap",
-    "typing", "unicodedata",
+    "numbers", "random", "re", "statistics", "string", "textwrap", "typing",
+    "unicodedata",
 })
+
+
+class _SafeModule:
+    """
+    Facade over an allowlisted module.
+
+    Handing back the real module object is not enough, because modules
+    re-export other modules: `random._os` and `typing.sys` both lead straight
+    back to the process and filesystem capabilities the allowlist removes. So
+    deny private names, and deny nested modules unless their dotted name is
+    itself allowlisted.
+    """
+    __slots__ = ("_module", "_name")
+
+    def __init__(self, module, name):
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_"):
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        value = getattr(self._module, attr)
+        if isinstance(value, types.ModuleType):
+            dotted = f"{self._name}.{attr}"
+            if dotted not in _SAFE_IMPORT_MODULES:
+                raise AttributeError(
+                    f"Access to module '{dotted}' is not allowed in generated code."
+                )
+            return _SafeModule(value, dotted)
+        return value
+
+    def __repr__(self):
+        return f"<safe module '{self._name}'>"
+pass
 
 
 def _safe_import(name, globals = None, locals = None, fromlist = (), level = 0):
     """
     __import__ replacement for generated code: only _SAFE_IMPORT_MODULES
-    resolve. Covers `import math` and `from typing import X` alike, since both
-    call __import__ with the top-level name.
+    resolve, and always behind a _SafeModule facade.
+
+    Dotted names reach here in full (`import collections.abc` passes
+    "collections.abc"), so allowlist membership is checked on the whole name.
     """
     if level != 0:
         raise ImportError("Relative imports are not allowed in generated code.")
     if name not in _SAFE_IMPORT_MODULES:
         raise ImportError(f"Import of '{name}' is not allowed in generated code.")
-    return importlib.import_module(name)
+    if fromlist:
+        return _SafeModule(importlib.import_module(name), name)
+    # A bare `import a.b` binds `a`, so hand back the root; the facade re-checks
+    # `a.b` when the attribute is reached.
+    root = name.split(".")[0]
+    importlib.import_module(name)
+    return _SafeModule(importlib.import_module(root), root)
 pass
 
 

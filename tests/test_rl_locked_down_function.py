@@ -29,6 +29,13 @@ BLOCKED = [
     # The dunder is a string constant here, so the AST check does not see it.
     # It fails anyway because getattr is not in the allowlist at all.
     ("getattr", 'def matmul(A, B):\n    return getattr(A, "__class__")\n', NameError),
+    # Allowlisted modules re-export unsafe ones: random keeps a private handle
+    # on os, and typing keeps sys. The facade has to deny both.
+    ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', AttributeError),
+    ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
+    # attrgetter takes a dotted string, so it walks dunders without the AST
+    # check ever seeing them. operator is therefore not allowlisted.
+    ("operator", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__")(1)\n', ImportError),
 ]
 
 
@@ -46,6 +53,32 @@ def test_safe_stdlib_imports_still_work():
         '    return "W"\n'
     )
     assert create_locked_down_function(source)([[0]]) == "W"
+
+
+def test_allowlisted_dotted_submodule_works_both_forms():
+    from_form = (
+        "def strategy(board):\n"
+        "    from collections.abc import Iterable\n"
+        "    return isinstance(board, Iterable)\n"
+    )
+    bare_form = (
+        "def strategy(board):\n"
+        "    import collections.abc\n"
+        "    return isinstance(board, collections.abc.Iterable)\n"
+    )
+    assert create_locked_down_function(from_form)([[0]]) is True
+    assert create_locked_down_function(bare_form)([[0]]) is True
+
+
+def test_public_members_of_allowlisted_modules_still_work():
+    source = (
+        "def strategy(board):\n"
+        "    import math\n"
+        "    import random\n"
+        "    random.seed(0)\n"
+        "    return math.floor(2.7) + random.choice([0])\n"
+    )
+    assert create_locked_down_function(source)([[0]]) == 2
 
 
 def test_generated_matmul_still_runs():
