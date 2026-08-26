@@ -30,6 +30,7 @@ __all__ = [
 import torch
 import re
 import os
+import functools
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
@@ -480,35 +481,62 @@ def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = get_model_type(config)
 
+    import transformers
+    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
+    # on the transformers namespace followed by a call is an unbounded gadget: nothing
+    # here requires it to name a model class. Restrict it to the architectures the auto
+    # mappings actually register.
+    #
+    # Checked BEFORE the SiglipVisionModel patch below, not after. That patch replaces
+    # `_init_weights` on a class shared by the whole process and undoes it at the end of
+    # this function, so raising in between would leave every later SigLIP model skipping
+    # weight init. Validate first, then touch global state.
+    architecture = config.architectures[0]
+    if not _is_known_architecture(architecture):
+        raise ValueError(
+            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
+            f"a model architecture transformers registers."
+        )
+    model_cls = getattr(transformers, architecture)
+
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
     # Patch SiglipVisionModel to skip weight init on meta device.
-    if not hasattr(SiglipVisionModel, "_original_initialize_weights"):
+    #
+    # `_init_weights` lives on a class shared by the whole process, so the restore has to
+    # be in a `finally`. `except Exception` does not cover KeyboardInterrupt, and
+    # cancelling a cell mid-load is an ordinary thing to do in a notebook: without this,
+    # one cancel leaves weight init disabled for every SigLIP model built afterwards,
+    # silently and far from the cause.
+    #
+    # `patched_here` rather than the sentinel alone, so a nested or re-entrant call that
+    # found the patch already installed does not restore it out from under the outer call
+    # that owns it.
+    patched_here = not hasattr(SiglipVisionModel, "_original_initialize_weights")
+    if patched_here:
         SiglipVisionModel._original_initialize_weights = SiglipVisionModel._init_weights
         def _init_weights(self, module):
             return
         SiglipVisionModel._init_weights = _init_weights
 
-    import transformers
-    model_cls = getattr(transformers, config.architectures[0])
-
     try:
-        # accelerate's init_empty_weights, not transformers.modeling_utils.
-        # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
-        # as real tensors so inference-time attribute access works.
-        from accelerate import init_empty_weights
-        with init_empty_weights():
-            original_meta_model = model_cls(config)
-    except Exception as e:
-        print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
-        import traceback
-        traceback.print_exc()
-        original_meta_model = None
-
-    # Restore original SiglipVisionModel weight init
-    if hasattr(SiglipVisionModel, "_original_initialize_weights"):
-        SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
-        del SiglipVisionModel._original_initialize_weights
+        try:
+            # accelerate's init_empty_weights, not transformers.modeling_utils.
+            # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
+            # as real tensors so inference-time attribute access works.
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                original_meta_model = model_cls(config)
+        except Exception as e:
+            print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
+            import traceback
+            traceback.print_exc()
+            original_meta_model = None
+    finally:
+        # Restore original SiglipVisionModel weight init
+        if patched_here and hasattr(SiglipVisionModel, "_original_initialize_weights"):
+            SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
+            del SiglipVisionModel._original_initialize_weights
 
 
     new_config = deepcopy(config)
@@ -571,6 +599,96 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     layer_names = sum(layer_templates.values(), [])
 
     return new_model, original_meta_model, num_layers, layer_names
+
+
+@functools.lru_cache(maxsize = 1)
+def _registered_architectures():
+    """Every model class name the transformers auto mappings register.
+
+    `MODEL_*_MAPPING_NAMES` maps a model_type to a *model* class name, which is what
+    `config.architectures` holds. `CONFIG_MAPPING_NAMES` lives in the same module and
+    maps to config classes, so it is excluded by the `MODEL_` prefix.
+    """
+    from transformers.models.auto import modeling_auto
+
+    names = set()
+    for attribute in dir(modeling_auto):
+        if not (attribute.startswith("MODEL_") and attribute.endswith("_MAPPING_NAMES")):
+            continue
+        mapping = getattr(modeling_auto, attribute, None)
+        if not isinstance(mapping, dict): continue
+        for value in mapping.values():
+            if isinstance(value, str): names.add(value)
+            elif isinstance(value, (list, tuple)):
+                names.update(v for v in value if isinstance(v, str))
+    return frozenset(names)
+pass
+
+
+def _is_known_architecture(architecture):
+    """Is `architecture` a name we are willing to resolve on the transformers namespace?
+
+    `config.architectures[0]` is a raw string off a downloaded config.json, and
+    `getattr(transformers, name)` followed by a call is an unbounded gadget - nothing
+    otherwise requires it to name a model. Two ways to qualify:
+
+      - the auto mappings register it. This is the primary check and it deliberately
+        admits the lazy `Placeholder` transformers substitutes when a model's optional
+        dependency is missing, so transformers' own "install X" error still surfaces
+        instead of being masked by ours.
+      - it is a PreTrainedModel subclass. Covers a class that exists but is not in the
+        mappings on this version.
+    """
+    import transformers
+
+    if not isinstance(architecture, str) or not architecture.isidentifier():
+        return False
+    if architecture in _registered_architectures():
+        return True
+    candidate = getattr(transformers, architecture, None)
+    return isinstance(candidate, type) and issubclass(candidate, transformers.PreTrainedModel)
+pass
+
+
+# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts. The name part
+# is "anything without brackets" rather than an ASCII identifier, because Python
+# identifiers are not ASCII-only and PyTorch registers a submodule under a Unicode name
+# without complaint. Only the subscripts are constrained, which is what keeps this a
+# name-and-index walk; the name itself is handed straight to getattr, exactly as the
+# eval this replaces did.
+_INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
+_INDEX = re.compile(r"\[(\d+)\]")
+
+
+def _get_module_attribute(root, path):
+    """ Reads a dotted module path, e.g. `visual.blocks.0.norm.weight`
+
+    The read counterpart of `_set_module_attribute`. Replaces `eval(f"model.{path}")`:
+    same result for every path an attribute expression could express, plus numeric
+    segments, and no way for a path component to be Python rather than a name.
+    An empty `path` returns `root`, matching what `eval("model")` used to give.
+
+    Bracket components (`blocks[0]`) are resolved as well. `peft_utils` rewrites
+    `.0.` to `[0].` before splitting, and one of its two call sites can hand back a
+    path whose last component still carries the brackets, which `eval` indexed happily
+    and a bare `getattr` cannot. Indices are digits only, so this stays a name-and-index
+    walk rather than an expression.
+    """
+    if path == "": return root
+    obj = root
+    for part in path.split("."):
+        if part.isdigit():
+            obj = obj[int(part)]
+            continue
+        match = _INDEXED_COMPONENT.fullmatch(part)
+        if match is None:
+            obj = getattr(obj, part)
+            continue
+        obj = getattr(obj, match.group(1))
+        for index in _INDEX.findall(match.group(2)):
+            obj = obj[int(index)]
+    return obj
+pass
 
 
 def _set_module_attribute(root, path, value):
