@@ -128,14 +128,12 @@ UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
 
 # Spelled out, not left to ipaddress alone: is_private is documented False for
-# the RFC 6598 range 100.64.0.0/10, so only an explicit list answers the same on
-# every interpreter.
+# the RFC 6598 range 100.64.0.0/10, and only a list answers the same everywhere.
 _BLOCKED_CIDRS = (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
     "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
     "224.0.0.0/4", "240.0.0.0/4",
-    # fec0::/10 is deprecated site-local, still routed on some networks, and
-    # ipaddress reports it only through is_site_local, not is_private.
+    # fec0::/10 is deprecated but still routed, and only is_site_local sees it.
     "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 )
 
@@ -187,10 +185,9 @@ def _is_blocked_ip(ip) -> bool:
 def _resolve_host(host: str):
     """Addresses for `host`, or None when this machine cannot resolve it.
 
-    Deliberately not cached. Caching would let a validation answer outlive the
-    DNS record it came from, so a host that resolved publicly once would keep
-    passing while the connection resolved somewhere else entirely. The OS
-    resolver already absorbs the repeat cost.
+    Deliberately uncached: a remembered answer would outlive its DNS record, so
+    a host that resolved publicly once would keep passing while the connection
+    resolved elsewhere. The OS resolver absorbs the repeat cost.
     """
     import ipaddress
     import socket
@@ -238,18 +235,17 @@ def assert_fetchable_url(url: str) -> str:
             f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
             f"Only http and https URLs are fetched; use a local path for local files."
         )
-    # A backslash anywhere in the authority is a parser differential: urlparse
-    # reads `http://127.0.0.1\@example.com/` as userinfo plus host example.com,
-    # while the client turns the backslash into a path separator and connects to
-    # 127.0.0.1. It is not legal in an authority at all, so refuse it outright.
+    # Parser differential: urlparse reads `http://127.0.0.1\@example.com/` as
+    # userinfo plus host example.com, the client makes the backslash a path
+    # separator and connects to 127.0.0.1. Not legal in an authority anyway.
     if "\\" in parsed.netloc:
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{url}` since its authority contains "
             f"a backslash, which HTTP clients and URL parsers disagree about."
         )
-    # Percent escapes are the same story for the host (`http://%31%32%37.0.0.1/`
-    # checks as unresolvable then fetches 127.0.0.1) but are legitimate in
-    # userinfo, as in `https://user:p%40ss@example.com/`, so only screen the host.
+    # Same story for an encoded host (`http://%31%32%37.0.0.1/` checks as
+    # unresolvable then fetches 127.0.0.1), but userinfo may legitimately carry
+    # escapes, so screen only the host.
     if "%" in parsed.netloc.rpartition("@")[2]:
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{url}` since its host is "
@@ -264,9 +260,8 @@ def assert_fetchable_url(url: str) -> str:
             f"loopback, private, link-local or otherwise internal address. "
             f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
         )
-    # An unresolvable host is normally harmless, since the request cannot go
-    # anywhere either. Behind a proxy it can: the proxy resolves the name for
-    # us, so nothing was ever checked.
+    # Unresolvable is harmless on its own, since the request goes nowhere either.
+    # Behind a proxy it is not: the proxy resolves the name, so nothing was checked.
     if _resolve_host(host) is None and _proxy_applies(url):
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
@@ -287,8 +282,8 @@ def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
     max_bytes = _max_media_download_bytes()
     written = 0
     current = url
-    # One session for the whole chain: requests used to follow redirects itself
-    # and carry the cookie jar with it, which signed-cookie CDNs rely on.
+    # One session for the chain: requests used to carry the cookie jar across
+    # hops itself, and signed-cookie CDNs rely on it.
     with requests.Session() as session:
         for _ in range(_MAX_MEDIA_REDIRECTS + 1):
             assert_fetchable_url(current)
@@ -329,11 +324,10 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
 def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
     """Download an http(s) URL through the guard and return a temp file path.
 
-    Handing a decoder the URL is not enough, even after resolving its redirects:
-    the decoder issues its own request, and a server that answered ours cleanly
-    can redirect that one to an internal address. ffmpeg follows redirects by
-    default and exposes no way to refuse them, so the only way to bind the
-    decoder to a checked destination is to fetch the bytes ourselves.
+    Handing over the URL is not enough even after resolving redirects: the
+    decoder makes its own request, and a server that answered ours cleanly can
+    redirect that one inward. ffmpeg follows redirects with no way to refuse, so
+    fetching the bytes ourselves is the only way to bind it to a checked source.
     """
     import tempfile
     from urllib.parse import urlparse
@@ -679,8 +673,7 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
-        # Pick the decoder before downloading: if none is installed this raises,
-        # and a temp file created first would be stranded.
+        # Pick the decoder first: if none is installed, a temp file would strand.
         video_reader_backend = get_video_reader_backend()
         # The decoders fetch remote URLs themselves and follow redirects with no
         # way to refuse, so download through the guard and decode a local file.
