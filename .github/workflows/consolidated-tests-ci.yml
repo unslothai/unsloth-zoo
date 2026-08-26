@@ -59,6 +59,21 @@ jobs:
       # Four interpreters on one runner. Each `id` exposes python-path, which is how
       # a lane addresses an interpreter that is no longer the one on PATH -- only the
       # last of these wins PATH, and that is fine because no lane uses it.
+      #
+      # `cache: 'pip'` is on the FIRST step only, and must stay that way. All four
+      # interpreters share one `~/.cache/pip` on the runner, so four cache-enabled
+      # steps do not cache four things: they save the identical directory four times
+      # under four python-version keys. Observed on main 2026-08-23, where the 3.10
+      # and 3.13 entries were byte-identical at 2011216266 and 3.11 differed by 1524
+      # bytes -- 3.8 GiB of exact duplicates, against a 20 GiB repo ceiling. (3.12
+      # looked small only because repo-tests-cpu had already written that key four
+      # minutes earlier and the duplicate save was skipped; same-key saves are
+      # first-writer-wins.)
+      #
+      # One restore before any lane installs is all this job needs: the restore lands
+      # in the shared directory ahead of the install step below, so every lane reads
+      # the wheels of every interpreter from it regardless of which step carried the
+      # key. Re-adding `cache:` to the other three buys nothing and costs the ceiling.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py310
         with:
@@ -69,19 +84,16 @@ jobs:
         id: py311
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py312
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py313
         with:
           python-version: '3.13'
-          cache: 'pip'
 
       - name: Install and collect on every interpreter (concurrently)
         env:
