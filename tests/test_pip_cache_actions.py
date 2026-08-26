@@ -16,20 +16,15 @@
 
 """Pins the pip-cache restore/save contract for every workflow.
 
-The failure this guards is invisible at runtime. `actions/setup-python`'s
-built-in `cache: 'pip'` is read-write and saves from its post-step on
-WHATEVER REF the job ran on, and a cache written on a pull_request ref can
-only be restored by re-runs of that same pull request. So every PR writes a
-copy nobody else can ever read, which then competes for the repo's 20 GiB
-budget against main's copy, which every PR CAN read.
+`actions/setup-python`'s built-in `cache: 'pip'` saves from its post-step on
+whatever ref the job ran on, and a cache written on a pull_request ref can only
+be restored by re-runs of that same PR. So every PR writes a copy nobody else
+can read, competing for the 20 GiB budget against main's copy, which every PR
+can read. Measured 2026-08-26: 19.97 of 20 GiB, merged PR #1084 holding 6.6 GiB
+of it. Nothing failed; CI just got slower.
 
-Measured on this repo 2026-08-26: 19.97 of 20 GiB, of which merged PR #1084
-alone held 6.6 GiB on refs/pull/1084/merge. Nothing failed. Over quota GitHub
-deletes whole entries by last access date, so main's copy goes, the next PR
-misses, downloads, and writes its own copy. CI just gets slower.
-
-Nothing about re-adding `cache: 'pip'` looks wrong in review -- it is the
-documented way to do this -- which is why it is asserted here instead.
+Re-adding `cache: 'pip'` looks right in review -- it is the documented way to
+do this -- which is why it is asserted here instead.
 """
 
 import re
@@ -94,9 +89,8 @@ def test_restore_and_save_are_paired(path):
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
 def test_save_is_not_gated_behind_a_failing_step(path):
     # A composite step with no `if:` is SKIPPED once an earlier step failed, so
-    # the save action's own always() only covers the steps between the pair.
-    # Anything that can exit non-zero between the install and the save throws
-    # away wheels that were downloaded successfully.
+    # the save's own always() covers only what sits between the pair. Anything
+    # that can exit non-zero in there discards a completed install.
     for job, steps in _jobs(path):
         restores, saves = _indices(steps, RESTORE), _indices(steps, SAVE)
         if not restores or not saves:
@@ -130,9 +124,9 @@ def test_restore_inputs_are_well_formed(path):
 
 
 def test_cache_names_are_unique_across_all_jobs():
-    # Two jobs sharing a name share a key prefix, which is the exact defect this
-    # `name` input exists to avoid: the janitor cannot then tell two live caches
-    # apart from two generations of one, and pruning deletes a live entry.
+    # A shared name is a shared prefix, which is the defect `name` exists to
+    # avoid: the janitor cannot tell two live caches from two generations of one,
+    # and pruning then deletes a live entry.
     seen = {}
     for path in WORKFLOWS:
         for job, steps in _jobs(path):
@@ -148,17 +142,15 @@ def test_cache_names_are_unique_across_all_jobs():
 
 
 def test_the_janitor_ranks_the_pip_family():
-    # The keys this action mints are `pip-<name>-...`, which matched none of the
-    # janitor's original arms and so fell through to `*) continue`. Left that way,
-    # every pyproject.toml edit strands the previous multi-GB entry on main with
-    # nothing able to rank it -- and once every job here uses the restore/save
-    # pair, nothing writes a setup-python-* key again, so the janitor would prune
-    # no pip cache at all. Caught in review on #1109.
+    # These keys are `pip-<name>-...`, which matched none of the janitor's
+    # original arms and fell through to `*) continue`. Left that way, every
+    # pyproject.toml edit strands the previous multi-GB entry on main unrankable
+    # -- and once every job uses the restore/save pair nothing writes a
+    # setup-python-* key again, so no pip cache would be pruned at all.
     #
-    # Asserted by MATCHING a representative key against the arms, not by looking
-    # for the text `pip-*)`. That substring is already inside
-    # `setup-python-*-pip-*)`, so a textual check passes on the broken version and
-    # proves nothing.
+    # Asserted by MATCHING a representative key against the arms, not by grepping
+    # for `pip-*)`: that substring already sits inside `setup-python-*-pip-*)`,
+    # so a textual check passes on the broken version and proves nothing.
     janitor = (REPO / ".github/workflows/cache-janitor.yml").read_text()
     block = re.search(r'case "\$key" in(.+?)\n\s*esac', janitor, re.S)
     assert block, "the janitor's key dispatch moved; this assertion is stale"
