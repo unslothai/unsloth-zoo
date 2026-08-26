@@ -87,7 +87,7 @@
       "sink": "eval",
       "kind": "f-string",
       "hash": "41335056252b5222",
-      "reason": "`module` is a class name every caller takes from dir(modeling_file) or a `class X(...)` regex over inspect.getsource of the installed modeling file."
+      "reason": "`module` comes from names scraped out of the installed modeling file. `model_location` is a parameter, but this function is NOT exported: it is absent from compiler.__all__ (5 names), and all 5 call sites are in this file and pass f\"transformers.models.{model_type}.modeling_{model_type}\" built from a model_type that get_transformers_model_type already validated. So the interpolated value is internal on every reachable path. Noting explicitly that this justification covers model_location as well as module, since a caller outside this file would invalidate it."
     },
     {
       "path": "unsloth_zoo/compiler.py",
