@@ -161,6 +161,9 @@ def _max_media_download_bytes() -> int:
         megabytes = float(os.environ.get(UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR, 256))
     except ValueError:
         megabytes = 256.0
+    # float() happily accepts "inf" and "nan", which int() then refuses. Someone
+    # writing inf means "no cap", so treat both like any other unusable value.
+    if not math.isfinite(megabytes): megabytes = 0.0
     if megabytes <= 0: return 0  # 0 disables the cap
     return int(megabytes * 1024 * 1024)
 
@@ -219,6 +222,16 @@ def assert_fetchable_url(url: str) -> str:
             f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
             f"Only http and https URLs are fetched; use a local path for local files."
         )
+    # urlparse leaves the authority percent-encoded while the HTTP client
+    # decodes it before connecting, so `http://%31%32%37.0.0.1/` would be
+    # checked as an unresolvable name and then fetched from 127.0.0.1. A real
+    # hostname never contains either character (IDNs arrive as xn-- punycode).
+    for character in ("%", "\\"):
+        if character in parsed.netloc:
+            raise ValueError(
+                f"Unsloth: Refusing to fetch media from `{url}` since its host contains "
+                f"`{character}`, which HTTP clients and URL parsers disagree about."
+            )
     host = parsed.hostname
     if host is None:
         raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
@@ -263,6 +276,36 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
         finally:
             # Close every hop: the collator fetches thousands of images and a
             # leaked streaming response holds its connection open.
+            response.close()
+    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
+
+
+def resolve_media_redirects(url: str, timeout: int = 30) -> str:
+    """Walk an http(s) redirect chain, checking every hop, and return the final URL.
+
+    For video the decoder does its own I/O (decord and torchcodec go through
+    ffmpeg, whose http protocol follows redirects by default), so validating
+    only the URL we were handed would let a public host bounce the decoder to
+    an internal one. Following the chain here means the decoder is handed a
+    destination that has already been checked.
+    """
+    from urllib.parse import urljoin
+
+    current = url
+    for _ in range(_MAX_MEDIA_REDIRECTS + 1):
+        assert_fetchable_url(current)
+        try:
+            response = requests.get(current, stream = True, timeout = timeout, allow_redirects = False)
+        except requests.RequestException:
+            # Unreachable now is the decoder's error to report, not ours.
+            return current
+        try:
+            if not (response.is_redirect or response.is_permanent_redirect):
+                return current
+            location = response.headers.get("location")
+            if not location: return current
+            current = urljoin(current, location)
+        finally:
             response.close()
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
@@ -595,9 +638,11 @@ def get_video_reader_backend() -> str:
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
         # The backends (torchvision / decord / torchcodec+ffmpeg) fetch remote
-        # URLs themselves, so vet the destination before handing it over.
+        # URLs themselves and follow redirects internally, so resolve the whole
+        # chain here (checking every hop) and hand over the settled URL.
         if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
-            assert_fetchable_url(ele["video"])
+            ele = dict(ele)
+            ele["video"] = resolve_media_redirects(ele["video"])
         video_reader_backend = get_video_reader_backend()
         try:
             video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

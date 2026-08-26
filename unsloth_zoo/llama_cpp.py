@@ -1578,6 +1578,37 @@ def _extract_archs_from_monolith_source(source_bytes):
             if not names: continue
             if _is_mmproj(node, decorator): vision_archs.update(names)
             else: text_archs.update(names)
+
+    # A converter may also seed the registry literally,
+    # `_model_classes = {ModelType.TEXT: {"LlamaForCausalLM": ...}, ...}`,
+    # instead of (or as well as) decorating. The import-based introspection saw
+    # those entries, so harvest them too rather than reporting an empty
+    # allowlist for such a checkout.
+    def _bucket_for(key_node):
+        name = None
+        if   isinstance(key_node, ast.Attribute): name = key_node.attr
+        elif isinstance(key_node, ast.Name):      name = key_node.id
+        elif isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+            name = key_node.value
+        if name is None: return None
+        return vision_archs if "mmproj" in name.lower() else text_archs
+
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else \
+                  [node.target] if isinstance(node, ast.AnnAssign) else []
+        named = any(
+            (isinstance(t, ast.Name) and t.id == "_model_classes") or
+            (isinstance(t, ast.Attribute) and t.attr == "_model_classes")
+            for t in targets
+        )
+        if not named or not isinstance(node.value, ast.Dict): continue
+        for key, value in zip(node.value.keys, node.value.values):
+            bucket = _bucket_for(key)
+            if bucket is None or not isinstance(value, ast.Dict): continue
+            bucket.update(
+                k.value for k in value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            )
     return text_archs, vision_archs
 pass
 

@@ -271,3 +271,104 @@ def test_fetch_video_rejects_internal_url_before_touching_a_backend(monkeypatch)
     monkeypatch.setattr(vision_utils, "get_video_reader_backend", boom)
     with pytest.raises(ValueError):
         vision_utils.fetch_video({"video": "http://127.0.0.1:9/clip.mp4"})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://%31%32%37.0.0.1:8080/x.png",
+        "http://127%2e0%2e0%2e1:8080/x.png",
+        "http://%6c%6f%63%61%6c%68%6f%73%74:8080/x.png",
+        "http://example.com\\@127.0.0.1/x.png",
+        "http://%31%32%37.0.0.1/x.png",
+    ],
+)
+def test_percent_encoded_authority_is_refused(url, no_network):
+    """urlparse leaves the authority encoded while requests decodes it before
+    connecting, so an encoded host would be checked as an unresolvable name and
+    then fetched from 127.0.0.1."""
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": url})
+    assert no_network == []
+
+
+def test_percent_escapes_in_the_path_are_still_fine(monkeypatch, public_dns):
+    seen = []
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: seen.append(url) or _FakeResponse(_png_bytes()),
+    )
+    image = vision_utils.fetch_image({"image": "https://example.com/a%20b/logo%20black.png"})
+    assert image.size[0] > 0 and seen == ["https://example.com/a%20b/logo%20black.png"]
+
+
+@pytest.mark.parametrize("value", ["inf", "INF", "nan", "1e400", "-inf", "abc", "0"])
+def test_non_finite_size_limits_do_not_break_every_fetch(monkeypatch, public_dns, value):
+    """float() accepts inf and nan, int() then refuses them, which used to make
+    every remote image raise before its request was issued."""
+    monkeypatch.setenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", value)
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(_png_bytes()),
+    )
+    assert vision_utils.fetch_image({"image": "https://example.com/a.png"}).size[0] > 0
+
+
+def test_video_redirect_chain_is_resolved_and_checked(monkeypatch, public_dns):
+    """The decoders follow redirects internally, so the chain has to be walked
+    here or a public host could bounce ffmpeg to an internal one."""
+    hops = []
+
+    def fake_get(url, **kwargs):
+        hops.append(url)
+        if url.endswith("/public.mp4"):
+            return _FakeResponse(redirect_to="http://127.0.0.1:9/internal.mp4")
+        return _FakeResponse(b"")
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+    monkeypatch.setattr(
+        vision_utils, "get_video_reader_backend",
+        lambda: pytest.fail("the decoder must not be reached"),
+    )
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": "https://example.com/public.mp4"})
+    assert hops == ["https://example.com/public.mp4"]
+
+
+def test_video_redirect_to_a_public_host_is_followed(monkeypatch, public_dns):
+    resolved = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/public.mp4"):
+            return _FakeResponse(redirect_to="https://cdn.example.com/real.mp4")
+        return _FakeResponse(b"")
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+
+    def backend(ele):
+        resolved["url"] = ele["video"]
+        raise RuntimeError("stop here, the URL is what we are asserting")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", backend)
+    with pytest.raises(Exception):
+        vision_utils.fetch_video({"video": "https://example.com/public.mp4"})
+    assert resolved["url"] == "https://cdn.example.com/real.mp4"
+
+
+def test_fetch_video_does_not_mutate_the_caller_dict(monkeypatch, public_dns):
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(b""),
+    )
+    def backend(ele):
+        raise RuntimeError("decoded nothing, that is fine")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", backend)
+    ele = {"video": "https://example.com/clip.mp4"}
+    try:
+        vision_utils.fetch_video(ele)
+    except Exception:
+        pass
+    assert ele["video"] == "https://example.com/clip.mp4"

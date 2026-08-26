@@ -96,3 +96,52 @@ def test_unparseable_source_yields_empty_sets():
 def test_no_in_process_module_loader_remains():
     llama_cpp = _load_llama_cpp_module()
     assert not hasattr(llama_cpp, "_load_module_from_path")
+
+
+STATIC_REGISTRY = '''
+from enum import IntEnum
+
+
+class ModelType(IntEnum):
+    TEXT = 0
+    MMPROJ = 1
+
+
+class ModelBase:
+    _model_classes = {
+        ModelType.TEXT: {"LlamaForCausalLM": object, "MistralForCausalLM": object},
+        ModelType.MMPROJ: {"Gemma3ForConditionalGeneration": object},
+    }
+'''
+
+
+def test_statically_initialized_registries_are_harvested():
+    """Some converters seed _model_classes literally instead of decorating; the
+    old import-based introspection saw those entries, so the parser must too."""
+    llama_cpp = _load_llama_cpp_module()
+    text, vision = llama_cpp._extract_archs_from_monolith_source(STATIC_REGISTRY.encode())
+
+    assert text == {"LlamaForCausalLM", "MistralForCausalLM"}
+    assert vision == {"Gemma3ForConditionalGeneration"}
+
+
+def test_static_and_decorated_registries_combine():
+    llama_cpp = _load_llama_cpp_module()
+    text, vision = llama_cpp._extract_archs_from_monolith_source(
+        (STATIC_REGISTRY + MONOLITH).encode()
+    )
+
+    assert {"LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM"} <= text
+    assert {"Gemma3ForConditionalGeneration", "UltravoxModel"} <= vision
+
+
+def test_the_repo_monolith_fixture_still_yields_its_arch():
+    """tests/test_convert_hf_to_gguf_patcher.py models a converter of exactly
+    this shape; it must not regress to an empty allowlist."""
+    llama_cpp = _load_llama_cpp_module()
+    fixture = Path(__file__).with_name("test_convert_hf_to_gguf_patcher.py").read_text()
+    start = fixture.index('_MONOLITH = b"""\\\n') + len('_MONOLITH = b"""\\\n')
+    body = fixture[start:fixture.index('"""', start)]
+
+    text, _ = llama_cpp._extract_archs_from_monolith_source(body.encode())
+    assert "LlamaForCausalLM" in text
