@@ -67,9 +67,7 @@ BLOCKED_URLS = [
 def _default_policy(monkeypatch):
     monkeypatch.delenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", raising=False)
     monkeypatch.delenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", raising=False)
-    vision_utils._resolve_host.cache_clear()
     yield
-    vision_utils._resolve_host.cache_clear()
 
 
 @pytest.fixture
@@ -292,7 +290,10 @@ def test_address_classification_is_explicit(address, blocked):
     assert vision_utils._is_blocked_ip(ipaddress.ip_address(address)) is blocked
 
 
-def test_host_lookup_is_cached(monkeypatch):
+def test_host_resolution_is_not_cached(monkeypatch):
+    """A cached answer would outlive the DNS record it came from, so a host that
+    resolved publicly once would keep passing validation while the connection
+    resolved somewhere else."""
     calls = []
     real = __import__("socket").getaddrinfo
 
@@ -301,13 +302,12 @@ def test_host_lookup_is_cached(monkeypatch):
         return real("127.0.0.1", *args, **kwargs)
 
     monkeypatch.setattr(__import__("socket"), "getaddrinfo", counting)
-    vision_utils._resolve_host.cache_clear()
-    for _ in range(20):
+    for _ in range(3):
         assert vision_utils._is_blocked_address("repeated.example") is True
-    assert len(calls) == 1, "the collator must not re-resolve once per image"
+    assert len(calls) == 3, "each validation must use a fresh answer"
 
 
-def test_resolution_failure_is_cached_too(monkeypatch):
+def test_resolution_failure_is_not_cached_either(monkeypatch):
     calls = []
 
     def failing(host, *args, **kwargs):
@@ -315,10 +315,9 @@ def test_resolution_failure_is_cached_too(monkeypatch):
         raise OSError("no such host")
 
     monkeypatch.setattr(__import__("socket"), "getaddrinfo", failing)
-    vision_utils._resolve_host.cache_clear()
-    for _ in range(10):
+    for _ in range(3):
         assert vision_utils._resolve_host("missing.example") is None
-    assert len(calls) == 1
+    assert len(calls) == 3
 
 
 def test_response_is_closed_on_every_path(monkeypatch, public_dns):
@@ -507,7 +506,6 @@ def test_unresolvable_host_behind_a_proxy_fails_closed(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.delenv("no_proxy", raising=False)
-    vision_utils._resolve_host.cache_clear()
     with pytest.raises(ValueError, match="proxy"):
         vision_utils.assert_fetchable_url("http://intranet.corp.invalid/x.png")
 
@@ -518,7 +516,6 @@ def test_unresolvable_host_without_a_proxy_is_left_to_the_client(monkeypatch):
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                 "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(var, raising=False)
-    vision_utils._resolve_host.cache_clear()
     assert vision_utils.assert_fetchable_url("http://nonexistent.invalid/x.png")
 
 
@@ -554,3 +551,21 @@ def test_video_backend_missing_leaves_no_download(monkeypatch, public_dns, tmp_p
     with pytest.raises(ValueError):
         vision_utils.fetch_video({"video": "https://example.com/clip.mp4"})
     assert glob.glob(str(tmp_path / "unsloth_media_*")) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1\\@example.com/x.png",
+        "http://127.0.0.1:8080\\@example.com/x.png",
+        "http://example.com\\@127.0.0.1/x.png",
+        "https://user\\@evil@example.com/x.png",
+    ],
+)
+def test_backslash_anywhere_in_the_authority_is_refused(url, no_network):
+    """urlparse reads the prefix as userinfo and reports the trailing host,
+    while the client turns the backslash into a path separator and connects to
+    the prefix, so screening only the apparent host misses it."""
+    with pytest.raises(ValueError, match="backslash"):
+        vision_utils.fetch_image({"image": url})
+    assert no_network == []

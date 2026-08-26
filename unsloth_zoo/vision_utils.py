@@ -184,11 +184,13 @@ def _is_blocked_ip(ip) -> bool:
     return False
 
 
-@lru_cache(maxsize = 1024)
 def _resolve_host(host: str):
     """Addresses for `host`, or None when this machine cannot resolve it.
 
-    Cached: the collator would otherwise re-resolve per image per epoch.
+    Deliberately not cached. Caching would let a validation answer outlive the
+    DNS record it came from, so a host that resolved publicly once would keep
+    passing while the connection resolved somewhere else entirely. The OS
+    resolver already absorbs the repeat cost.
     """
     import ipaddress
     import socket
@@ -236,17 +238,23 @@ def assert_fetchable_url(url: str) -> str:
             f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
             f"Only http and https URLs are fetched; use a local path for local files."
         )
-    # urlparse leaves the authority encoded, the client decodes it, so
-    # `http://%31%32%37.0.0.1/` would check as unresolvable then fetch 127.0.0.1.
-    # Only the host is examined: percent escapes are legitimate in userinfo,
-    # as in `https://user:p%40ss@example.com/`.
-    host_part = parsed.netloc.rpartition("@")[2]
-    for character in ("%", "\\"):
-        if character in host_part:
-            raise ValueError(
-                f"Unsloth: Refusing to fetch media from `{url}` since its host contains "
-                f"`{character}`, which HTTP clients and URL parsers disagree about."
-            )
+    # A backslash anywhere in the authority is a parser differential: urlparse
+    # reads `http://127.0.0.1\@example.com/` as userinfo plus host example.com,
+    # while the client turns the backslash into a path separator and connects to
+    # 127.0.0.1. It is not legal in an authority at all, so refuse it outright.
+    if "\\" in parsed.netloc:
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{url}` since its authority contains "
+            f"a backslash, which HTTP clients and URL parsers disagree about."
+        )
+    # Percent escapes are the same story for the host (`http://%31%32%37.0.0.1/`
+    # checks as unresolvable then fetches 127.0.0.1) but are legitimate in
+    # userinfo, as in `https://user:p%40ss@example.com/`, so only screen the host.
+    if "%" in parsed.netloc.rpartition("@")[2]:
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{url}` since its host is "
+            f"percent-encoded, which HTTP clients and URL parsers disagree about."
+        )
     host = parsed.hostname
     if host is None:
         raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
