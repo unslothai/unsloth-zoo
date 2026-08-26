@@ -38,7 +38,35 @@ BLOCKED = [
     # attrgetter takes a dotted string, so it walks dunders without the AST
     # check ever seeing them. operator is therefore not allowlisted.
     ("operator", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__")(1)\n', ImportError),
+    # Formatter.get_field resolves a dotted string and returns the object, so
+    # it recovers the real __import__. str.format walks attributes the same way
+    # but only returns text, which is why only this one matters.
+    ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),
 ]
+
+
+def test_typing_get_type_hints_is_denied():
+    # Annotations are compiled to strings, and get_type_hints evaluates them,
+    # so this executes without a single dunder appearing in the source.
+    source = (
+        "def matmul(A, B):\n"
+        "    import typing\n"
+        "    class C:\n"
+        '        x: "__import__(chr(111)+chr(115)).system(chr(88))"\n'
+        "    return typing.get_type_hints(C)\n"
+    )
+    with pytest.raises(AttributeError):
+        create_locked_down_function(source)([], [])
+
+
+def test_rest_of_typing_still_works():
+    # typing stays allowlisted because the notebooks' own samples import it.
+    source = (
+        "def strategy(board):\n"
+        "    from typing import Callable\n"
+        '    return "W"\n'
+    )
+    assert create_locked_down_function(source)([[0]]) == "W"
 
 
 @pytest.mark.parametrize("label,source,expected", BLOCKED, ids=[b[0] for b in BLOCKED])

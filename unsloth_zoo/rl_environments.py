@@ -485,15 +485,34 @@ pass
 
 
 # Importable by generated code. Excludes anything reaching the filesystem,
-# network or another process (os, subprocess, socket, ctypes, ...), plus two
-# that only look harmless: `operator`, whose attrgetter takes a dotted string
-# and so walks dunders unseen by the AST check, and `dataclasses`, which
-# resolves annotations via sys.modules[cls.__module__] and cannot work here.
+# network or another process (os, subprocess, socket, ctypes, ...).
+#
+# Also excludes every module that resolves attributes from a RUNTIME STRING and
+# hands back the object, because _reject_dunder_access works on the AST and
+# there is nothing in the source for it to match:
+#   operator.attrgetter("__class__.__bases__")(x)
+#   string.Formatter().get_field("0.get_field.__globals__[...]", (x,), {})
+# Both walk straight back to the real builtins. str.format resolves attributes
+# the same way but only ever returns the formatted text, never the object, so
+# it is not an execution path.
+#
+# dataclasses is excluded for a different reason: it resolves annotations via
+# sys.modules[cls.__module__], which cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
-    "numbers", "random", "re", "statistics", "string", "textwrap", "typing",
+    "numbers", "random", "re", "statistics", "textwrap", "typing",
     "unicodedata",
+})
+
+# Public members of otherwise-safe modules that turn a runtime string into an
+# object, or evaluate one. Same blind spot as the excluded modules above, but
+# these live in modules worth keeping: typing.get_type_hints evaluates string
+# annotations, and since this module compiles annotations to strings, a class
+# annotated with "__import__('os').system(...)" executes on the call.
+# typing itself stays, because the notebooks' own samples import from it.
+_DENIED_MODULE_ATTRS = frozenset({
+    "typing.get_type_hints",
 })
 
 
@@ -514,6 +533,10 @@ class _SafeModule:
 
     def __getattr__(self, attr):
         if attr.startswith("_"):
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        if f"{self._name}.{attr}" in _DENIED_MODULE_ATTRS:
             raise AttributeError(
                 f"Access to '{self._name}.{attr}' is not allowed in generated code."
             )
