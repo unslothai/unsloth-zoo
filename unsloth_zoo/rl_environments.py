@@ -521,14 +521,35 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     `assigned` argument, so assigned=("__globals__",) plus a class with a
 #     custom __setattr__ captures a real module globals dict, and indexing
 #     "__builtins__" out of it recovers the unrestricted __import__.
+#   time.clock_settime and clock_settime_ns mutate the host clock. They need
+#     privilege, which a container running as root has, and no generated
+#     strategy needs to set the time. The read-only clocks stay.
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
+    "time.clock_settime",
+    "time.clock_settime_ns",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+})
+
+# Attributes that walk the interpreter's own object graph. None of these start
+# with an underscore, and none of them go through a module, so neither the
+# private-attribute rule nor the import allowlist can see them: a running
+# generator reaches gi_frame.f_back.f_back.f_builtins, which is the trusted
+# caller's real builtins, and indexing "__import__" out of it restores
+# everything. Frames, generators, coroutines, async generators and tracebacks
+# all expose the same walk.
+_DENIED_ATTR_NAMES = frozenset({
+    "ag_await", "ag_code", "ag_frame",
+    "cr_await", "cr_code", "cr_frame", "cr_origin",
+    "f_back", "f_builtins", "f_code", "f_globals", "f_lasti", "f_lineno",
+    "f_locals", "f_trace",
+    "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
+    "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
 
 # Dunder methods a generated helper class may define. A method name is
@@ -635,6 +656,10 @@ def _allowlist_builtins():
         "ZeroDivisionError",
     )
     exposed = {name: getattr(_py_builtins, name) for name in names}
+    # The comparison and arithmetic dunders allowed below are expected to
+    # return NotImplemented for operands they do not handle, so the singleton
+    # has to be reachable. It is a value, not a capability.
+    exposed["NotImplemented"] = _py_builtins.NotImplemented
     # Required for `class` statements.
     exposed["__build_class__"] = _py_builtins.__build_class__
     exposed["__name__"] = "__user_code__"
@@ -661,6 +686,10 @@ def _reject_dunder_access(tree):
         # One underscore for attributes: private ones reach modules and
         # internals just as well (random._os, ABCMeta._abc_impl).
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise RuntimeError(
+                f"Attribute '{node.attr}' is not allowed in generated code."
+            )
+        if isinstance(node, ast.Attribute) and node.attr in _DENIED_ATTR_NAMES:
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )

@@ -256,3 +256,56 @@ def test_functools_reduce_still_works():
         "    return functools.reduce(lambda a, b: a + b, [1, 2, 3])\n"
     )
     assert create_locked_down_function(source)([], []) == 6
+
+
+def test_frame_traversal_is_denied():
+    # A running generator reaches gi_frame.f_back.f_back.f_builtins, which is
+    # the trusted caller's real builtins. No module is involved and no name
+    # starts with an underscore, so this needs its own rule.
+    source = (
+        "def matmul(A, B):\n"
+        "    holder = []\n"
+        "    def g():\n"
+        "        fr = holder[0].gi_frame.f_back.f_back\n"
+        "        yield fr.f_builtins\n"
+        "    gen = g()\n"
+        "    holder.append(gen)\n"
+        '    return next(gen)["__import__"]("os")\n'
+    )
+    with pytest.raises(RuntimeError):
+        create_locked_down_function(source)([], [])
+
+
+def test_ordinary_generators_still_work():
+    source = (
+        "def matmul(A, B):\n"
+        "    def g():\n"
+        "        yield 1\n"
+        "        yield 2\n"
+        "    return sum(g())\n"
+    )
+    assert create_locked_down_function(source)([], []) == 3
+
+
+def test_clock_setters_denied_but_clocks_readable():
+    with pytest.raises(AttributeError):
+        create_locked_down_function(
+            "def matmul(A, B):\n    import time\n    return time.clock_settime\n"
+        )([], [])
+    readable = "def matmul(A, B):\n    import time\n    return time.monotonic() > 0\n"
+    assert create_locked_down_function(readable)([], []) is True
+
+
+def test_not_implemented_is_available():
+    # The comparison dunders we allow are expected to return NotImplemented
+    # for operands they do not handle.
+    source = (
+        "def matmul(A, B):\n"
+        "    class N:\n"
+        "        def __eq__(self, o):\n"
+        "            if not isinstance(o, N):\n"
+        "                return NotImplemented\n"
+        "            return True\n"
+        "    return N() == 5\n"
+    )
+    assert create_locked_down_function(source)([], []) is False
