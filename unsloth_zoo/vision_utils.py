@@ -129,6 +129,26 @@ UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
 UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
 
+# Spelled out rather than relying only on ipaddress properties. is_private is
+# documented to be False for the RFC 6598 shared address space 100.64.0.0/10
+# (both is_private and is_global are False there), and that classification was
+# backported across the 3.8 - 3.13 series, so an explicit list is the only way
+# to get the same answer on every interpreter.
+_BLOCKED_CIDRS = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+    "224.0.0.0/4", "240.0.0.0/4",
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+)
+
+# Cloud metadata services answer on a fixed name as well as a fixed IP. The
+# name matters when an HTTP proxy is configured, because then the proxy, not
+# this process, does the DNS resolution.
+_BLOCKED_HOSTNAMES = frozenset((
+    "metadata.google.internal", "metadata.goog", "metadata",
+    "instance-data", "instance-data.ec2.internal",
+))
+
 
 def _allow_private_url_fetch() -> bool:
     # Read at call time, not import time: notebooks routinely set the env var
@@ -145,10 +165,34 @@ def _max_media_download_bytes() -> int:
     return int(megabytes * 1024 * 1024)
 
 
+@lru_cache(maxsize = 1)
+def _blocked_networks():
+    import ipaddress
+    return tuple(ipaddress.ip_network(cidr) for cidr in _BLOCKED_CIDRS)
+
+
+def _is_blocked_ip(ip) -> bool:
+    if (
+        ip.is_loopback or ip.is_private or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    ):
+        return True
+    for network in _blocked_networks():
+        if ip.version == network.version and ip in network: return True
+    # IPv4-mapped / 6to4 wrappers around an internal v4 address
+    mapped = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None)
+    if mapped is not None and _is_blocked_ip(mapped): return True
+    return False
+
+
+@lru_cache(maxsize = 1024)
 def _is_blocked_address(host: str) -> bool:
+    # Cached: a URL dataset hits the same handful of hosts thousands of times
+    # and this runs inside the collator, once per image per epoch.
     import ipaddress
     import socket
 
+    if host.lower().rstrip(".") in _BLOCKED_HOSTNAMES: return True
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -160,18 +204,7 @@ def _is_blocked_address(host: str) -> bool:
             ip = ipaddress.ip_address(address.split("%", 1)[0])
         except ValueError:
             continue
-        if (
-            ip.is_loopback or ip.is_private or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-        ):
-            return True
-        # IPv4-mapped/6to4 wrappers around a private v4 address
-        mapped = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None)
-        if mapped is not None and (
-            mapped.is_loopback or mapped.is_private or mapped.is_link_local
-            or mapped.is_reserved or mapped.is_multicast or mapped.is_unspecified
-        ):
-            return True
+        if _is_blocked_ip(ip): return True
     return False
 
 
@@ -207,26 +240,30 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
     for _ in range(_MAX_MEDIA_REDIRECTS + 1):
         assert_fetchable_url(current)
         response = requests.get(current, stream = True, timeout = timeout, allow_redirects = False)
-        if response.is_redirect or response.is_permanent_redirect:
-            location = response.headers.get("location")
+        try:
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
+                current = urljoin(current, location)
+                continue
+            response.raise_for_status()
+            data = BytesIO()
+            for chunk in response.iter_content(chunk_size = 1024 * 1024):
+                if not chunk: continue
+                data.write(chunk)
+                if max_bytes and data.tell() > max_bytes:
+                    raise ValueError(
+                        f"Unsloth: Media at `{url}` is larger than the "
+                        f"{max_bytes} byte limit. Raise "
+                        f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
+                    )
+            data.seek(0)
+            return data
+        finally:
+            # Close every hop: the collator fetches thousands of images and a
+            # leaked streaming response holds its connection open.
             response.close()
-            if not location:
-                raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
-            current = urljoin(current, location)
-            continue
-        response.raise_for_status()
-        data = BytesIO()
-        for chunk in response.iter_content(chunk_size = 1024 * 1024):
-            if not chunk: continue
-            data.write(chunk)
-            if max_bytes and data.tell() > max_bytes:
-                response.close()
-                raise ValueError(
-                    f"Unsloth: Media at `{url}` exceeds {max_bytes // (1024 * 1024)}MB. "
-                    f"Raise {UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
-                )
-        data.seek(0)
-        return data
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 

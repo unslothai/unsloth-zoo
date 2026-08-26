@@ -130,6 +130,29 @@ def test_surrounding_whitespace_is_trimmed_not_rejected(monkeypatch):
     assert captured["cmd"].endswith("q4_k_m 4")
 
 
+@pytest.mark.parametrize("is_windows", [False, True])
+def test_command_is_byte_identical_across_platforms(monkeypatch, is_windows):
+    """The validated token is inserted bare, so cmd.exe and every POSIX shell
+    see exactly the command previous releases produced."""
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", is_windows)
+
+    if is_windows:
+        quantizer = "C:\\llama\\llama-quantize.exe"
+        src, dst = "C:\\models\\m.BF16.gguf", "C:\\models\\m.Q4_K_M.gguf"
+        expected = f'"{quantizer}" "{src}" "{dst}" q4_k_m 6'
+    else:
+        quantizer = "/usr/bin/llama-quantize"
+        src, dst = "/models/m.BF16.gguf", "/models/m.Q4_K_M.gguf"
+        expected = f"{quantizer} {src} {dst} q4_k_m 6"
+
+    llama_cpp.quantize_gguf(input_gguf=src, output_gguf=dst, quant_type="q4_k_m",
+                            quantizer_location=quantizer, n_threads=6, print_output=False)
+    assert captured["cmd"] == expected
+
+
 def test_n_threads_is_coerced_to_int(monkeypatch):
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)

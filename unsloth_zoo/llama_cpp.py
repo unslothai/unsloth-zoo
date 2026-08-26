@@ -1562,7 +1562,9 @@ def _extract_archs_from_monolith_source(source_bytes):
             elif isinstance(value, ast.Name): name = value.id
             elif isinstance(value, ast.Constant) and isinstance(value.value, str):
                 name = value.value
-            if name is not None and "mmproj" in name.lower(): return True
+            # An explicit model_type wins over the base classes: a vision model
+            # registered as TEXT is a text entry however it is spelled.
+            if name is not None: return "mmproj" in name.lower()
         return _inherits_mmproj(class_node.name)
 
     for node in ast.walk(tree):
@@ -3009,7 +3011,11 @@ def quantize_gguf(
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
-        f"{_quote(input_gguf)} {_quote(output_gguf)} {_quote(quant_type)} {n_threads}"
+        # quant_type is validated at the top of this function to be a bare
+        # token, so it needs no quoting; leaving it bare also keeps the command
+        # byte-identical to previous releases on cmd.exe, which would otherwise
+        # see an extra pair of quotes.
+        f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
     )
 
     if print_output:

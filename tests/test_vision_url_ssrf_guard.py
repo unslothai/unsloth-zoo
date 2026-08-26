@@ -23,11 +23,24 @@ BLOCKED_URLS = [
     "http://127.0.0.1:9/x.png",
     "http://localhost:8080/x.png",
     "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "http://metadata.google.internal/computeMetadata/v1/",
     "http://10.0.0.5/x.png",
     "http://192.168.1.10/x.png",
     "http://172.16.3.4/x.png",
+    "http://172.31.255.254/x.png",
     "http://[::1]:8000/x.png",
+    "http://[fd00::1]/x.png",
+    "http://[fe80::1]/x.png",
+    "http://[::ffff:127.0.0.1]/x.png",
     "http://0.0.0.0/x.png",
+    "http://127.1/x.png",
+    "http://2130706433/x.png",
+    "http://user:pass@127.0.0.1/x.png",
+    # RFC 6598 carrier-grade NAT: ipaddress.is_private is False for it on
+    # every Python from 3.9 to 3.13, so the guard needs its own entry.
+    "http://100.64.0.1/x.png",
+    "http://224.0.0.1/x.png",
+    "http://240.0.0.1/x.png",
 ]
 
 
@@ -35,6 +48,9 @@ BLOCKED_URLS = [
 def _default_policy(monkeypatch):
     monkeypatch.delenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", raising=False)
     monkeypatch.delenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", raising=False)
+    vision_utils._is_blocked_address.cache_clear()
+    yield
+    vision_utils._is_blocked_address.cache_clear()
 
 
 @pytest.fixture
@@ -197,6 +213,55 @@ def test_local_paths_and_data_uris_are_untouched(tmp_path, no_network):
     import base64
     encoded = base64.b64encode(_png_bytes()).decode()
     assert vision_utils.fetch_image({"image": f"data:image/png;base64,{encoded}"}).size[0] > 0
+
+
+@pytest.mark.parametrize(
+    "address,blocked",
+    [
+        ("127.0.0.1", True), ("10.1.2.3", True), ("172.20.0.1", True),
+        ("192.168.0.1", True), ("169.254.169.254", True), ("100.64.0.1", True),
+        ("0.0.0.0", True), ("224.0.0.1", True), ("240.0.0.1", True),
+        ("192.0.0.1", True), ("198.18.0.1", True), ("::1", True),
+        ("fd00::1", True), ("fe80::1", True), ("::ffff:10.0.0.1", True), ("::", True),
+        ("1.1.1.1", False), ("8.8.8.8", False), ("93.184.216.34", False),
+        ("140.82.121.4", False), ("2606:4700:4700::1111", False),
+        ("2001:4860:4860::8888", False),
+    ],
+)
+def test_address_classification_is_explicit(address, blocked):
+    """Pinned so a stdlib change to ipaddress cannot silently widen the guard."""
+    import ipaddress
+    assert vision_utils._is_blocked_ip(ipaddress.ip_address(address)) is blocked
+
+
+def test_host_lookup_is_cached(monkeypatch):
+    calls = []
+    real = __import__("socket").getaddrinfo
+
+    def counting(host, *args, **kwargs):
+        calls.append(host)
+        return real("127.0.0.1", *args, **kwargs)
+
+    monkeypatch.setattr(__import__("socket"), "getaddrinfo", counting)
+    vision_utils._is_blocked_address.cache_clear()
+    for _ in range(20):
+        assert vision_utils._is_blocked_address("repeated.example") is True
+    assert len(calls) == 1, "the collator must not re-resolve once per image"
+
+
+def test_response_is_closed_on_every_path(monkeypatch, public_dns):
+    closed = []
+
+    class Tracking(_FakeResponse):
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: Tracking(_png_bytes()),
+    )
+    vision_utils.fetch_image({"image": "https://example.com/a.png"})
+    assert closed, "a streaming response must not be left open"
 
 
 def test_fetch_video_rejects_internal_url_before_touching_a_backend(monkeypatch):
