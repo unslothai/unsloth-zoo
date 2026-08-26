@@ -119,21 +119,17 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
-# Dataset rows can carry arbitrary http(s) URLs (`{"type": "image_url", ...}`),
-# and the collators fetch them server side. Without a destination check that is
-# an SSRF primitive: a dataset can make the training worker hit 127.0.0.1, a
-# LAN host, or the cloud metadata endpoint. Public URLs and every local-file
-# form keep working exactly as before; users who really do serve training media
-# from localhost or a private host set UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
+# Dataset rows carry arbitrary http(s) URLs and the collators fetch them server
+# side, so without a destination check a row can reach 127.0.0.1, the LAN or the
+# metadata endpoint. Public URLs and local files are unaffected; serving media
+# from a private host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
 UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
 UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
 
-# Spelled out rather than relying only on ipaddress properties. is_private is
-# documented to be False for the RFC 6598 shared address space 100.64.0.0/10
-# (both is_private and is_global are False there), and that classification was
-# backported across the 3.8 - 3.13 series, so an explicit list is the only way
-# to get the same answer on every interpreter.
+# Spelled out, not left to ipaddress alone: is_private is documented False for
+# the RFC 6598 range 100.64.0.0/10, so only an explicit list answers the same on
+# every interpreter.
 _BLOCKED_CIDRS = (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
     "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
@@ -141,9 +137,8 @@ _BLOCKED_CIDRS = (
     "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
 )
 
-# Cloud metadata services answer on a fixed name as well as a fixed IP. The
-# name matters when an HTTP proxy is configured, because then the proxy, not
-# this process, does the DNS resolution.
+# Metadata services answer on a fixed name too, which is what a configured HTTP
+# proxy resolves instead of us.
 _BLOCKED_HOSTNAMES = frozenset((
     "metadata.google.internal", "metadata.goog", "metadata",
     "instance-data", "instance-data.ec2.internal",
@@ -151,8 +146,7 @@ _BLOCKED_HOSTNAMES = frozenset((
 
 
 def _allow_private_url_fetch() -> bool:
-    # Read at call time, not import time: notebooks routinely set the env var
-    # after `import unsloth`.
+    # Read per call: notebooks set the env var after `import unsloth`.
     return os.environ.get(UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR, "0") == "1"
 
 
@@ -161,8 +155,7 @@ def _max_media_download_bytes() -> int:
         megabytes = float(os.environ.get(UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR, 256))
     except ValueError:
         megabytes = 256.0
-    # float() happily accepts "inf" and "nan", which int() then refuses. Someone
-    # writing inf means "no cap", so treat both like any other unusable value.
+    # float() accepts inf and nan, int() then refuses them; inf means no cap.
     if not math.isfinite(megabytes): megabytes = 0.0
     if megabytes <= 0: return 0  # 0 disables the cap
     return int(megabytes * 1024 * 1024)
@@ -190,8 +183,7 @@ def _is_blocked_ip(ip) -> bool:
 
 @lru_cache(maxsize = 1024)
 def _is_blocked_address(host: str) -> bool:
-    # Cached: a URL dataset hits the same handful of hosts thousands of times
-    # and this runs inside the collator, once per image per epoch.
+    # Cached: the collator would otherwise re-resolve per image per epoch.
     import ipaddress
     import socket
 
@@ -222,10 +214,9 @@ def assert_fetchable_url(url: str) -> str:
             f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
             f"Only http and https URLs are fetched; use a local path for local files."
         )
-    # urlparse leaves the authority percent-encoded while the HTTP client
-    # decodes it before connecting, so `http://%31%32%37.0.0.1/` would be
-    # checked as an unresolvable name and then fetched from 127.0.0.1. A real
-    # hostname never contains either character (IDNs arrive as xn-- punycode).
+    # urlparse leaves the authority encoded, the client decodes it, so
+    # `http://%31%32%37.0.0.1/` would check as unresolvable then fetch 127.0.0.1.
+    # A real host has neither character (IDNs arrive as xn-- punycode).
     for character in ("%", "\\"):
         if character in parsed.netloc:
             raise ValueError(
@@ -274,8 +265,7 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
             data.seek(0)
             return data
         finally:
-            # Close every hop: the collator fetches thousands of images and a
-            # leaked streaming response holds its connection open.
+            # Close every hop; a leaked streaming response holds its connection.
             response.close()
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
@@ -283,11 +273,9 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
 def resolve_media_redirects(url: str, timeout: int = 30) -> str:
     """Walk an http(s) redirect chain, checking every hop, and return the final URL.
 
-    For video the decoder does its own I/O (decord and torchcodec go through
-    ffmpeg, whose http protocol follows redirects by default), so validating
-    only the URL we were handed would let a public host bounce the decoder to
-    an internal one. Following the chain here means the decoder is handed a
-    destination that has already been checked.
+    The video decoders do their own I/O through ffmpeg, which follows redirects
+    by default, so checking only the handed-in URL would let a public host bounce
+    them to an internal one.
     """
     from urllib.parse import urljoin
 
@@ -637,9 +625,8 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
-        # The backends (torchvision / decord / torchcodec+ffmpeg) fetch remote
-        # URLs themselves and follow redirects internally, so resolve the whole
-        # chain here (checking every hop) and hand over the settled URL.
+        # The decoders fetch and follow redirects themselves, so settle the chain
+        # here and hand over a destination that has been checked.
         if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
             ele = dict(ele)
             ele["video"] = resolve_media_redirects(ele["video"])

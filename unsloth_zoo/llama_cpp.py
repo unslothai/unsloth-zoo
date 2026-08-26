@@ -1502,15 +1502,11 @@ pass
 
 
 def _extract_archs_from_monolith_source(source_bytes):
-    """AST-parse a monolithic convert_hf_to_gguf.py for its registered
-    architectures, returning (text_archs, vision_archs).
+    """Read (text_archs, vision_archs) out of a monolithic convert_hf_to_gguf.py.
 
-    Reads the `@ModelBase.register("Arch", ...)` / `@Model.register(...)`
-    decorators statically. Parsing rather than importing matters: the file is
-    downloaded from llama.cpp's master branch at runtime, and importing it
-    would execute whatever that download happens to contain inside this
-    process. Mirrors _extract_dict_keys_from_conversion_init, which already
-    does the same for the newer conversion/ package layout.
+    Parsed, not imported: the file is downloaded from llama.cpp master at
+    runtime, so importing it would execute whatever the download contained.
+    Mirrors _extract_dict_keys_from_conversion_init for the package layout.
     """
     try:
         tree = ast.parse(source_bytes)
@@ -1536,8 +1532,7 @@ def _extract_archs_from_monolith_source(source_bytes):
             elif isinstance(base, ast.Name):      names.append(base.id)
         return names
 
-    # class name -> base names, so `class X(WhisperEncoderModel)` is still
-    # recognised as an mmproj model two hops away from MmprojModel.
+    # class -> bases, so a class two hops below MmprojModel still counts as vision.
     class_bases = {
         node.name : _base_names(node)
         for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
@@ -1562,8 +1557,7 @@ def _extract_archs_from_monolith_source(source_bytes):
             elif isinstance(value, ast.Name): name = value.id
             elif isinstance(value, ast.Constant) and isinstance(value.value, str):
                 name = value.value
-            # An explicit model_type wins over the base classes: a vision model
-            # registered as TEXT is a text entry however it is spelled.
+            # An explicit model_type wins over the base classes.
             if name is not None: return "mmproj" in name.lower()
         return _inherits_mmproj(class_node.name)
 
@@ -1579,11 +1573,8 @@ def _extract_archs_from_monolith_source(source_bytes):
             if _is_mmproj(node, decorator): vision_archs.update(names)
             else: text_archs.update(names)
 
-    # A converter may also seed the registry literally,
-    # `_model_classes = {ModelType.TEXT: {"LlamaForCausalLM": ...}, ...}`,
-    # instead of (or as well as) decorating. The import-based introspection saw
-    # those entries, so harvest them too rather than reporting an empty
-    # allowlist for such a checkout.
+    # A converter may seed `_model_classes` literally instead of decorating. The
+    # import path saw those entries, so harvest them rather than report nothing.
     def _bucket_for(key_node):
         name = None
         if   isinstance(key_node, ast.Attribute): name = key_node.attr
@@ -1846,11 +1837,8 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     "allowlist will be empty; conversion will still attempt to run."
                 )
         else:
-            # Monolith layout: archs come from AST-parsing the
-            # @ModelBase.register(...) decorators in the entrypoint itself.
-            # This file is downloaded from llama.cpp master at runtime, so it
-            # is read, never imported - importing it would execute whatever
-            # the download contained inside this process.
+            # Monolith layout: read the registrations out of the entrypoint. It is
+            # downloaded from llama.cpp master at runtime, so parse, never import.
             text_archs, vision_archs = _extract_archs_from_monolith_source(original_content)
             supported_types.update(text_archs)
             supported_types.update(vision_archs)
@@ -2631,8 +2619,7 @@ def convert_to_gguf(
             )
     pass
 
-    # An empty set means "we could not determine the allowlist", not "nothing is
-    # supported" - matching the text-arch check above, don't gate on it.
+    # Empty means the allowlist is unknown, not that nothing is supported.
     if is_vlm and supported_vision_archs:
         if "architectures" in config_file:
             arch = config_file["architectures"][0]
@@ -2977,10 +2964,8 @@ def quantize_gguf(
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
 
-    # quant_type lands in a shell command below, and callers pass it straight
-    # through from user facing arguments (`quantization_method=...`). Every
-    # legitimate value is a bare token like q4_k_m / iq3_xxs / bf16, so reject
-    # anything else rather than letting shell metacharacters through.
+    # quant_type reaches the shell command below straight from the user facing
+    # quantization_method, and every real value is a bare token, so require one.
     if not isinstance(quant_type, str) or \
         re.fullmatch(r"[A-Za-z0-9_.\-]+", quant_type.strip()) is None:
         raise ValueError(
@@ -3042,10 +3027,8 @@ def quantize_gguf(
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
-        # quant_type is validated at the top of this function to be a bare
-        # token, so it needs no quoting; leaving it bare also keeps the command
-        # byte-identical to previous releases on cmd.exe, which would otherwise
-        # see an extra pair of quotes.
+        # Validated above as a bare token, so quoting would only add a pair of
+        # quotes that cmd.exe did not see in previous releases.
         f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
     )
 
