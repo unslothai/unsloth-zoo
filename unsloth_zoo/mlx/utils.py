@@ -397,6 +397,101 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
+# MLX raises instead of returning zero when a backward pass reaches a
+# gather/scatter index, aborting every graph that derives indices from activations:
+# MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
+# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+_MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
+_MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
+    "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
+    "gather_mm": (2, 3), "gather_qmm": (4, 5)}
+_MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
+_MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
+_MLX_INDEX_GRADIENT_LOCK = threading.RLock()
+_MLX_TRAINING_PATCH_DEPTH = 0
+# MLX differentiates integer arrays, so only real index positions are detached.
+_MLX_INTEGER_DTYPES = frozenset((mx.int8, mx.int16, mx.int32, mx.int64,
+                                 mx.uint8, mx.uint16, mx.uint32, mx.uint64))
+
+
+def _detach_if_index(value):
+    return (mx.stop_gradient(value)
+            if getattr(value, "dtype", None) in _MLX_INTEGER_DTYPES else value)
+
+
+def _wrap_mlx_index_op(name, original):
+    positions = _MLX_INDEX_CONSUMERS.get(name)
+
+    @wraps(original)
+    def wrapper(*args, **kwargs):
+        if positions is None:  # producer: the result is entirely an index
+            return mx.stop_gradient(original(*args, **kwargs))
+        return original(
+            *(_detach_if_index(arg) if i in positions else arg
+              for i, arg in enumerate(args)),
+            **{key: _detach_if_index(value) if key in _MLX_INDEX_KEYWORDS
+               else value for key, value in kwargs.items()},
+        )
+
+    wrapper._unsloth_index_stop_gradient = True
+    wrapper._unsloth_index_original = original
+    return wrapper
+
+
+def _set_mlx_index_gradient_stop(enabled: bool) -> None:
+    for name in _MLX_INDEX_OP_NAMES:
+        current = getattr(mx, name, None)
+        if current is None:
+            continue
+        patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+        if enabled and not patched:
+            setattr(mx, name, _wrap_mlx_index_op(name, current))
+        elif not enabled and patched:
+            setattr(mx, name, current._unsloth_index_original)
+
+
+def acquire_mlx_training_patches() -> None:
+    """Reference-counted: the `mlx.core` patches are process-wide while trainer
+    runs are not, so an inner run must not unpatch an outer one."""
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+        _MLX_TRAINING_PATCH_DEPTH += 1
+
+
+def release_mlx_training_patches() -> None:
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            return
+        _MLX_TRAINING_PATCH_DEPTH -= 1
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(False)
+
+
+def pause_mlx_training_patches() -> bool:
+    """Evaluation runs under `model.eval()` but inside the trainer's window, which
+    would otherwise route it down the training paths. Refused while another run
+    holds the window, since unpatching is process-wide."""
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH != 1:
+            return False
+        _MLX_TRAINING_PATCH_DEPTH = 0
+        _set_mlx_index_gradient_stop(False)
+        return True
+
+
+def resume_mlx_training_patches(paused: bool) -> None:
+    if paused:
+        acquire_mlx_training_patches()
+
+
+def mlx_training_patches_active() -> bool:
+    return _MLX_TRAINING_PATCH_DEPTH > 0
+
+
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 

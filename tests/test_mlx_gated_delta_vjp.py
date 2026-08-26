@@ -21,6 +21,8 @@
 #     B >= 2 (mx `.at[:, t].add` corrupted rows past the first on mlx 0.31,
 #     fixed by ml-explore/mlx#3483). Metal-only.
 #   * kernel routing: training calls must reach the fused-kernel VJP.
+#   * the training window that turns those patches on, the index detachment it
+#     installs, and the fusions it must disable.
 
 from __future__ import annotations
 
@@ -38,10 +40,16 @@ if not _HAS_REAL_MLX:
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
 
+from unsloth_zoo.mlx.utils import (  # noqa: E402
+    _MLX_INDEX_OP_NAMES, acquire_mlx_training_patches, mlx_training_patches_active,
+    pause_mlx_training_patches, release_mlx_training_patches,
+    resume_mlx_training_patches)
+
 _HAS_METAL = _HAS_REAL_MLX and mx.metal.is_available()
 requires_metal = pytest.mark.skipif(
     not _HAS_METAL, reason="needs Apple Silicon Metal GPU"
 )
+requires_real_mlx = pytest.mark.skipif(not _HAS_REAL_MLX, reason="needs real MLX")
 
 # Snapshot the REAL mlx/mlx_lm modules now, before sibling test files install
 # the mlx_simulation torch-stub into sys.modules, so the code under test
@@ -349,3 +357,97 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
     bad_v = mx.zeros((1, 8, 2, 30))
     assert gv.gated_delta_kernel_supported(q, g, None, ok_v)
     assert not gv.gated_delta_kernel_supported(q, g, None, bad_v)
+
+
+# -- training window and index detachment -------------------------------------
+
+@pytest.fixture
+def index_stop():
+    acquire_mlx_training_patches()
+    try:
+        yield
+    finally:
+        release_mlx_training_patches()
+
+
+def test_window_depth_accounting():
+    """Trainer runs overlap and the patches are global: an inner window must not
+    unpatch an outer one, and a pause must refuse while anyone else holds it."""
+    originals = {name: getattr(mx, name) for name in _MLX_INDEX_OP_NAMES}
+    assert not mlx_training_patches_active()
+    acquire_mlx_training_patches()
+    acquire_mlx_training_patches()
+    # The outer run still needs the window, so this pause must be refused.
+    assert pause_mlx_training_patches() is False
+    assert mlx_training_patches_active() and mx.take_along_axis._unsloth_index_stop_gradient
+    release_mlx_training_patches()
+    assert pause_mlx_training_patches() is True
+    assert not mlx_training_patches_active()
+    assert not hasattr(mx.take_along_axis, "_unsloth_index_stop_gradient")
+    resume_mlx_training_patches(True)
+    assert all(getattr(mx, n)._unsloth_index_stop_gradient for n in _MLX_INDEX_OP_NAMES)
+    release_mlx_training_patches()
+    assert not mlx_training_patches_active()
+    assert all(getattr(mx, n) is originals[n] for n in _MLX_INDEX_OP_NAMES)
+    # Outside a run there is nothing to close, and nothing to reopen.
+    resume_mlx_training_patches(pause_mlx_training_patches())
+    assert not mlx_training_patches_active()
+
+
+@requires_real_mlx
+def test_router_gradient_matches_detached_reference(index_stop):
+    """Top-k routing in the shape every MoE block uses. An all-zero grad would
+    mean the score path was severed with the index path, leaving it untrained."""
+    x, w = mx.random.normal((4, 8)), mx.random.normal((8, 6))
+    raw = mx.argpartition._unsloth_index_original
+
+    def router(w, argpartition=mx.argpartition, detach=lambda i: i):
+        gates = mx.softmax(x @ w, axis=-1)
+        inds = detach(argpartition(gates, kth=-2, axis=-1)[..., -2:])
+        return mx.take_along_axis(gates, inds, axis=-1).sum()
+
+    grad = mx.grad(router)(w)
+    expected = mx.grad(lambda w: router(w, raw, mx.stop_gradient))(w)
+    mx.eval(grad, expected)
+    assert mx.allclose(grad, expected, atol=1e-6).item()
+    assert mx.abs(grad).sum().item() > 0
+
+
+def _gather_sort_loss(w):
+    """SwitchGLU's `x[argsort(indices)]` produces the index inside __getitem__."""
+    h = mx.random.normal((8, 4)) @ w
+    return h[mx.argsort(h[:, 0])].sum()
+
+
+def _sparse_mask_loss(w):
+    """GLM-5.x's mask index never passes through an arg* op at all."""
+    h = mx.random.normal((2, 6)) @ w
+    safe = mx.where(h[:, :2] > 0, mx.array([[0, 2], [1, 3]]), 3)
+    scattered = mx.put_along_axis(mx.zeros_like(h), safe, mx.array(1.0), axis=-1)
+    return (h * scattered).sum()
+
+
+@requires_real_mlx
+@pytest.mark.parametrize("loss, shape",
+                         [(_gather_sort_loss, (4, 4)), (_sparse_mask_loss, (6, 4))])
+def test_index_derived_graphs_stay_differentiable(loss, shape, index_stop):
+    grad = mx.grad(loss)(mx.random.normal(shape))
+    mx.eval(grad)
+    assert mx.abs(grad).sum().item() > 0
+
+
+@requires_real_mlx
+def test_only_the_index_argument_is_detached(index_stop):
+    """MLX differentiates integer arrays; detaching every one would drop a real gradient."""
+    data = mx.array([[10, 20], [30, 40]])
+    grad = mx.grad(
+        lambda d: mx.take_along_axis(d * 2, mx.array([[0], [1]]), axis=-1).sum()
+    )(data)
+    mx.eval(grad)
+    assert grad.tolist() == [[2, 0], [0, 2]]
+
+    # SwitchGLU's quantized path passes lhs_indices=None, which must not detach.
+    a, b = mx.random.normal((4, 3, 5)), mx.random.normal((4, 5, 2))
+    rhs = mx.array([0, 2, 1, 3], dtype=mx.uint32)
+    assert mx.gather_mm(a, b, None, rhs).shape == (4, 3, 2)
+    assert mx.gather_mm(a, b, lhs_indices=None, rhs_indices=rhs).shape == (4, 3, 2)
