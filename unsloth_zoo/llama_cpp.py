@@ -2619,8 +2619,7 @@ def convert_to_gguf(
             )
     pass
 
-    # Empty means the allowlist is unknown, not that nothing is supported.
-    if is_vlm and supported_vision_archs:
+    if is_vlm and supported_vision_archs is not None:
         if "architectures" in config_file:
             arch = config_file["architectures"][0]
         else:

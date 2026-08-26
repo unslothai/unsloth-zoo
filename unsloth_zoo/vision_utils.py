@@ -134,7 +134,9 @@ _BLOCKED_CIDRS = (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
     "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
     "224.0.0.0/4", "240.0.0.0/4",
-    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+    # fec0::/10 is deprecated site-local, still routed on some networks, and
+    # ipaddress reports it only through is_site_local, not is_private.
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 )
 
 # Metadata services answer on a fixed name too, which is what a configured HTTP
@@ -171,6 +173,7 @@ def _is_blocked_ip(ip) -> bool:
     if (
         ip.is_loopback or ip.is_private or ip.is_link_local
         or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        or getattr(ip, "is_site_local", False)
     ):
         return True
     for network in _blocked_networks():
@@ -182,25 +185,44 @@ def _is_blocked_ip(ip) -> bool:
 
 
 @lru_cache(maxsize = 1024)
-def _is_blocked_address(host: str) -> bool:
-    # Cached: the collator would otherwise re-resolve per image per epoch.
+def _resolve_host(host: str):
+    """Addresses for `host`, or None when this machine cannot resolve it.
+
+    Cached: the collator would otherwise re-resolve per image per epoch.
+    """
     import ipaddress
     import socket
 
-    if host.lower().rstrip(".") in _BLOCKED_HOSTNAMES: return True
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
-        # Unresolvable: let the HTTP client produce its own error.
-        return False
+        return None
+    addresses = []
     for info in infos:
-        address = info[4][0]
         try:
-            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            addresses.append(ipaddress.ip_address(info[4][0].split("%", 1)[0]))
         except ValueError:
             continue
-        if _is_blocked_ip(ip): return True
-    return False
+    return tuple(addresses)
+
+
+def _proxy_applies(url: str) -> bool:
+    """True when requests would send `url` through an environment proxy."""
+    try:
+        from requests.utils import get_environ_proxies
+        from urllib.parse import urlparse
+
+        proxies = get_environ_proxies(url, no_proxy = None)
+        return bool(proxies.get(urlparse(url).scheme) or proxies.get("all"))
+    except Exception:
+        return False
+
+
+def _is_blocked_address(host: str) -> bool:
+    if host.lower().rstrip(".") in _BLOCKED_HOSTNAMES: return True
+    addresses = _resolve_host(host)
+    if addresses is None: return False  # unresolvable, see assert_fetchable_url
+    return any(_is_blocked_ip(ip) for ip in addresses)
 
 
 def assert_fetchable_url(url: str) -> str:
@@ -216,9 +238,11 @@ def assert_fetchable_url(url: str) -> str:
         )
     # urlparse leaves the authority encoded, the client decodes it, so
     # `http://%31%32%37.0.0.1/` would check as unresolvable then fetch 127.0.0.1.
-    # A real host has neither character (IDNs arrive as xn-- punycode).
+    # Only the host is examined: percent escapes are legitimate in userinfo,
+    # as in `https://user:p%40ss@example.com/`.
+    host_part = parsed.netloc.rpartition("@")[2]
     for character in ("%", "\\"):
-        if character in parsed.netloc:
+        if character in host_part:
             raise ValueError(
                 f"Unsloth: Refusing to fetch media from `{url}` since its host contains "
                 f"`{character}`, which HTTP clients and URL parsers disagree about."
@@ -231,6 +255,15 @@ def assert_fetchable_url(url: str) -> str:
             f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
             f"loopback, private, link-local or otherwise internal address. "
             f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
+        )
+    # An unresolvable host is normally harmless, since the request cannot go
+    # anywhere either. Behind a proxy it can: the proxy resolves the name for
+    # us, so nothing was ever checked.
+    if _resolve_host(host) is None and _proxy_applies(url):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
+            f"resolve it and a proxy is configured, so its address is never checked. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 if the proxy is trusted."
         )
     return url
 
@@ -246,31 +279,34 @@ def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
     max_bytes = _max_media_download_bytes()
     written = 0
     current = url
-    for _ in range(_MAX_MEDIA_REDIRECTS + 1):
-        assert_fetchable_url(current)
-        response = requests.get(current, stream = True, timeout = timeout, allow_redirects = False)
-        try:
-            if response.is_redirect or response.is_permanent_redirect:
-                location = response.headers.get("location")
-                if not location:
-                    raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
-                current = urljoin(current, location)
-                continue
-            response.raise_for_status()
-            for chunk in response.iter_content(chunk_size = 1024 * 1024):
-                if not chunk: continue
-                sink.write(chunk)
-                written += len(chunk)
-                if max_bytes and written > max_bytes:
-                    raise ValueError(
-                        f"Unsloth: Media at `{url}` is larger than the "
-                        f"{max_bytes} byte limit. Raise "
-                        f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
-                    )
-            return written
-        finally:
-            # Close every hop; a leaked streaming response holds its connection.
-            response.close()
+    # One session for the whole chain: requests used to follow redirects itself
+    # and carry the cookie jar with it, which signed-cookie CDNs rely on.
+    with requests.Session() as session:
+        for _ in range(_MAX_MEDIA_REDIRECTS + 1):
+            assert_fetchable_url(current)
+            response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
+            try:
+                if response.is_redirect or response.is_permanent_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size = 1024 * 1024):
+                    if not chunk: continue
+                    sink.write(chunk)
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise ValueError(
+                            f"Unsloth: Media at `{url}` is larger than the "
+                            f"{max_bytes} byte limit. Raise "
+                            f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
+                        )
+                return written
+            finally:
+                # Close every hop; a leaked streaming response holds its connection.
+                response.close()
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
@@ -635,6 +671,9 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
+        # Pick the decoder before downloading: if none is installed this raises,
+        # and a temp file created first would be stranded.
+        video_reader_backend = get_video_reader_backend()
         # The decoders fetch remote URLs themselves and follow redirects with no
         # way to refuse, so download through the guard and decode a local file.
         downloaded = None
@@ -642,7 +681,6 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
             downloaded = fetch_remote_media_to_file(ele["video"])
             ele = dict(ele)
             ele["video"] = downloaded
-        video_reader_backend = get_video_reader_backend()
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

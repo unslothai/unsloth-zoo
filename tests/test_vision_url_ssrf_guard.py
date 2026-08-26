@@ -67,9 +67,9 @@ BLOCKED_URLS = [
 def _default_policy(monkeypatch):
     monkeypatch.delenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", raising=False)
     monkeypatch.delenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", raising=False)
-    vision_utils._is_blocked_address.cache_clear()
+    vision_utils._resolve_host.cache_clear()
     yield
-    vision_utils._is_blocked_address.cache_clear()
+    vision_utils._resolve_host.cache_clear()
 
 
 @pytest.fixture
@@ -113,6 +113,45 @@ class _FakeResponse:
 
     def close(self):
         pass
+
+
+class _FakeSession:
+    """Forwards to requests.get so tests can keep patching that one symbol."""
+
+    instances = []
+
+    def __init__(self):
+        type(self).instances.append(self)
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        return vision_utils.requests.get(url, **kwargs)
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@pytest.fixture(autouse=True)
+def _fake_session(monkeypatch):
+    _FakeSession.instances = []
+    monkeypatch.setattr(vision_utils.requests, "Session", _FakeSession)
+    return _FakeSession
+
+
+def _decoder_must_not_run(monkeypatch):
+    """Backend selection happens before the download now, so the assertion has
+    to sit on the decoder itself rather than on the selector."""
+    def boom(ele):
+        raise AssertionError(f"the decoder must not be reached, got {ele['video']!r}")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
+    monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", boom)
 
 
 @pytest.fixture
@@ -262,10 +301,24 @@ def test_host_lookup_is_cached(monkeypatch):
         return real("127.0.0.1", *args, **kwargs)
 
     monkeypatch.setattr(__import__("socket"), "getaddrinfo", counting)
-    vision_utils._is_blocked_address.cache_clear()
+    vision_utils._resolve_host.cache_clear()
     for _ in range(20):
         assert vision_utils._is_blocked_address("repeated.example") is True
     assert len(calls) == 1, "the collator must not re-resolve once per image"
+
+
+def test_resolution_failure_is_cached_too(monkeypatch):
+    calls = []
+
+    def failing(host, *args, **kwargs):
+        calls.append(host)
+        raise OSError("no such host")
+
+    monkeypatch.setattr(__import__("socket"), "getaddrinfo", failing)
+    vision_utils._resolve_host.cache_clear()
+    for _ in range(10):
+        assert vision_utils._resolve_host("missing.example") is None
+    assert len(calls) == 1
 
 
 def test_response_is_closed_on_every_path(monkeypatch, public_dns):
@@ -283,13 +336,11 @@ def test_response_is_closed_on_every_path(monkeypatch, public_dns):
     assert closed, "a streaming response must not be left open"
 
 
-def test_fetch_video_rejects_internal_url_before_touching_a_backend(monkeypatch):
-    def boom(*args, **kwargs):
-        raise AssertionError("video backend must not be reached")
-
-    monkeypatch.setattr(vision_utils, "get_video_reader_backend", boom)
+def test_fetch_video_rejects_internal_url_before_touching_a_decoder(monkeypatch, no_network):
+    _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError):
         vision_utils.fetch_video({"video": "http://127.0.0.1:9/clip.mp4"})
+    assert no_network == []
 
 
 @pytest.mark.parametrize(
@@ -346,10 +397,7 @@ def test_video_download_is_guarded_not_delegated(monkeypatch, public_dns):
         return _FakeResponse(b"")
 
     monkeypatch.setattr(vision_utils.requests, "get", fake_get)
-    monkeypatch.setattr(
-        vision_utils, "get_video_reader_backend",
-        lambda: pytest.fail("the decoder must not be reached"),
-    )
+    _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError):
         vision_utils.fetch_video({"video": "https://example.com/public.mp4"})
     assert hops == ["https://example.com/public.mp4"]
@@ -390,10 +438,7 @@ def test_video_download_honours_the_size_cap(monkeypatch, public_dns):
         vision_utils.requests, "get",
         lambda url, **kwargs: _FakeResponse(b"x" * 4096),
     )
-    monkeypatch.setattr(
-        vision_utils, "get_video_reader_backend",
-        lambda: pytest.fail("not reached"),
-    )
+    _decoder_must_not_run(monkeypatch)
     with pytest.raises(ValueError):
         vision_utils.fetch_video({"video": "https://example.com/big.mp4"})
 
@@ -406,10 +451,7 @@ def test_failed_video_download_leaves_no_temp_file(monkeypatch, public_dns, tmp_
         vision_utils.requests, "get",
         lambda url, **kwargs: _FakeResponse(b"", status=500),
     )
-    monkeypatch.setattr(
-        vision_utils, "get_video_reader_backend",
-        lambda: pytest.fail("not reached"),
-    )
+    _decoder_must_not_run(monkeypatch)
     with pytest.raises(Exception):
         vision_utils.fetch_video({"video": "https://example.com/broken.mp4"})
     assert glob.glob(str(tmp_path / "unsloth_media_*")) == []
@@ -431,3 +473,84 @@ def test_fetch_video_does_not_mutate_the_caller_dict(monkeypatch, public_dns):
     except Exception:
         pass
     assert ele["video"] == "https://example.com/clip.mp4"
+
+
+def test_site_local_ipv6_is_blocked():
+    """fec0::/10 is deprecated but still routed in places, and ipaddress reports
+    it only through is_site_local, not is_private."""
+    import ipaddress
+    assert vision_utils._is_blocked_ip(ipaddress.ip_address("fec0::1")) is True
+
+
+def test_percent_escapes_in_credentials_are_allowed(monkeypatch, public_dns):
+    """`https://user:p%40ss@example.com/x.png` is a valid authenticated URL that
+    worked before the guard existed; only the host portion is suspect."""
+    seen = []
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: seen.append(url) or _FakeResponse(_png_bytes()),
+    )
+    image = vision_utils.fetch_image({"image": "https://user:p%40ss@example.com/x.png"})
+    assert image.size[0] > 0
+    assert seen == ["https://user:p%40ss@example.com/x.png"]
+
+
+def test_encoded_host_still_refused_even_with_credentials(no_network):
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": "http://user:pass@%31%32%37.0.0.1/x.png"})
+    assert no_network == []
+
+
+def test_unresolvable_host_behind_a_proxy_fails_closed(monkeypatch):
+    """A proxy resolves the name instead of us, so nothing was ever checked."""
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.internal:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    vision_utils._resolve_host.cache_clear()
+    with pytest.raises(ValueError, match="proxy"):
+        vision_utils.assert_fetchable_url("http://intranet.corp.invalid/x.png")
+
+
+def test_unresolvable_host_without_a_proxy_is_left_to_the_client(monkeypatch):
+    """No proxy means the request cannot reach anywhere either, so the HTTP
+    client should report its own error rather than us inventing one."""
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    vision_utils._resolve_host.cache_clear()
+    assert vision_utils.assert_fetchable_url("http://nonexistent.invalid/x.png")
+
+
+def test_one_session_spans_the_whole_redirect_chain(monkeypatch, public_dns, _fake_session):
+    """requests used to carry the cookie jar across hops itself, and
+    signed-cookie CDNs depend on that."""
+    def fake_get(url, **kwargs):
+        if url.endswith("/signed.png"):
+            return _FakeResponse(redirect_to="https://cdn.example.com/real.png")
+        return _FakeResponse(_png_bytes())
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+    image = vision_utils.fetch_image({"image": "https://example.com/signed.png"})
+    assert image.size[0] > 0
+    assert len(_fake_session.instances) == 1, "every hop must share one session"
+    assert _fake_session.instances[0].closed, "the session must be closed"
+
+
+def test_video_backend_missing_leaves_no_download(monkeypatch, public_dns, tmp_path):
+    """Backend selection happens before the download, so a machine with no
+    decoder installed does not strand a file."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path), raising=False)
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(b"video bytes"),
+    )
+
+    def no_backend():
+        raise ValueError("Unsloth: No video reader backend available")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", no_backend)
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": "https://example.com/clip.mp4"})
+    assert glob.glob(str(tmp_path / "unsloth_media_*")) == []
