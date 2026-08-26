@@ -86,7 +86,7 @@ def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
 def test_every_allowlist_entry_has_a_justification():
     # An empty allowlist is a legitimate state: it means no interpolated dynamic
     # execution is left in this repo at all.
-    entries = json.loads(ALLOWLIST.read_text())["allowed"]
+    entries = json.loads(ALLOWLIST.read_text(encoding = "utf-8"))["allowed"]
     unjustified = [
         e for e in entries
         if e.get("reason", "").strip().upper() in ("", "REVIEW ME")
@@ -96,7 +96,7 @@ def test_every_allowlist_entry_has_a_justification():
 
 def test_allowlist_entries_are_keyed_on_content_not_lines():
     """Line numbers drift; a justification keyed on one would silently detach."""
-    entries = json.loads(ALLOWLIST.read_text())["allowed"]
+    entries = json.loads(ALLOWLIST.read_text(encoding = "utf-8"))["allowed"]
     assert all("hash" in e for e in entries)
     assert all("line" not in e for e in entries)
 
@@ -124,7 +124,7 @@ def test_editing_an_allowlisted_call_revokes_its_justification(tmp_path):
 def _isolated_lint(tmp_path, allowlist):
     """A copy of the lint whose allowlist is `allowlist` (it reads the one beside it)."""
     script = tmp_path / "lint_dynamic_exec.py"
-    script.write_text(SCRIPT.read_text())
+    script.write_text(SCRIPT.read_text(encoding = "utf-8"))
     (tmp_path / "dynamic_exec_allowlist.json").write_text(json.dumps(allowlist))
     return script
 

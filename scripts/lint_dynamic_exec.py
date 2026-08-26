@@ -48,6 +48,10 @@ ALLOWLIST_PATH = Path(__file__).resolve().parent / "dynamic_exec_allowlist.json"
 DEFAULT_TARGETS = ("unsloth_zoo", "unsloth", "studio", "scripts")
 
 
+class ScanError(Exception):
+    """A file the checker could not finish reading. The gate fails rather than guess."""
+
+
 def _relative(path: Path) -> str:
     """Repo-relative where possible; absolute for the self-test's temp files.
 
@@ -58,6 +62,17 @@ def _relative(path: Path) -> str:
         return path.relative_to(REPO_ROOT).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+# Methods that build a string out of values. `format_map` is `format` with the
+# fields taken from a mapping instead of keyword arguments - same interpolation,
+# same shape, so leaving it out let `exec("import {m}".format_map(cfg))` through.
+_BUILDERS = ("format", "format_map", "join")
+
+# Conversions that hand the same source on in another type. `exec`, `eval` and
+# `compile` all accept bytes as well as str, so `exec(f"import {name}".encode())`
+# executes exactly the payload the f-string built.
+_CONVERSIONS = ("encode", "decode")
 
 
 def _is_interpolated(node: ast.AST) -> str | None:
@@ -74,8 +89,12 @@ def _is_interpolated(node: ast.AST) -> str | None:
             return "string concatenation"
     if isinstance(node, ast.Call):
         function = node.func
-        if isinstance(function, ast.Attribute) and function.attr in ("format", "join"):
-            return f".{function.attr}()"
+        if isinstance(function, ast.Attribute):
+            if function.attr in _BUILDERS:
+                return f".{function.attr}()"
+            # Unwrap the receiver: the conversion changes the type, not the syntax.
+            if function.attr in _CONVERSIONS:
+                return _is_interpolated(function.value)
     return None
 
 
@@ -148,12 +167,29 @@ class _Visitor(ast.NodeVisitor):
         """
         reason = _is_interpolated(node.value)
         for target in node.targets:
-            if not isinstance(target, ast.Name): continue
-            if reason is None:
-                self.tainted[-1].pop(target.id, None)
-            else:
-                self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
+            self._bind(target, reason)
         self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        """Same tracking for `payload: str = f"...{x}..."`.
+
+        An annotated assignment is an `ast.AnnAssign`, a sibling of `ast.Assign`, and
+        `NodeVisitor` dispatches on the exact class name - so `visit_Assign` never saw
+        it and adding a type hint was enough to hide the binding. `node.value` is
+        optional: a bare `payload: str` declares nothing and must leave taint alone
+        rather than clear it.
+        """
+        if node.value is not None:
+            self._bind(node.target, _is_interpolated(node.value))
+        self.generic_visit(node)
+
+    def _bind(self, target: ast.AST, reason: str | None) -> None:
+        if not isinstance(target, ast.Name):
+            return
+        if reason is None:
+            self.tainted[-1].pop(target.id, None)
+        else:
+            self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
 
     def visit_Call(self, node: ast.Call):
         sink = _sink_name(node.func)
@@ -205,18 +241,27 @@ def scan_file(path: Path) -> list[dict]:
     try:
         visitor.visit(tree)
     except RecursionError:
-        # A deeply nested literal can exhaust the stack during the walk, after parse
-        # succeeded. Report nothing rather than taking the gate down; compileall still
-        # sees the file.
-        return []
+        # A deeply nested expression can exhaust the stack during the walk, after parse
+        # succeeded. Returning [] here reported the file as clean, which is a bypass:
+        # 500 nested `not` in front of an interpolated exec compiled fine and the gate
+        # passed with zero findings. An unfinishable walk is an unknown, and a security
+        # gate reports an unknown as a failure, not as a pass.
+        raise ScanError(
+            f"{_relative(path)}: too deeply nested to walk, so this file could not be "
+            f"checked for interpolated dynamic execution"
+        ) from None
     return visitor.findings
 
 
-def scan(paths: list[Path]) -> list[dict]:
-    findings = []
+def scan(paths: list[Path]) -> tuple[list[dict], list[str]]:
+    """Findings, plus the files the checker could not finish. Both fail the gate."""
+    findings, errors = [], []
     for path in sorted(paths):
-        findings.extend(scan_file(path))
-    return findings
+        try:
+            findings.extend(scan_file(path))
+        except ScanError as error:
+            errors.append(str(error))
+    return findings, errors
 
 
 def collect_paths(targets: list[str]) -> list[Path]:
@@ -230,15 +275,33 @@ def collect_paths(targets: list[str]) -> list[Path]:
             # points at one are skipped rather than read.
             paths.extend(
                 p for p in root.rglob("*.py")
-                if p.is_file() and "tests" not in p.relative_to(REPO_ROOT).parts
+                if p.is_file() and "tests" not in _exclusion_parts(p, root)
             )
     return paths
+
+
+def _exclusion_parts(path: Path, root: Path) -> tuple[str, ...]:
+    """Path components the tests exclusion is matched against.
+
+    Repo-relative when the file is in the repo, so the default scan keeps excluding
+    `<target>/tests/...` exactly as before. A directory passed through `--paths` may
+    sit outside the checkout - a pytest tmp_path, a vendored tree - and
+    `relative_to(REPO_ROOT)` raises `ValueError` for every file under it, which took
+    the whole run down with a traceback before any finding was printed. External
+    single files already worked, so this only makes directories agree with them.
+    """
+    for base in (REPO_ROOT, root):
+        try:
+            return path.relative_to(base).parts
+        except ValueError:
+            continue
+    return path.parts
 
 
 def load_allowlist() -> dict[str, dict]:
     if not ALLOWLIST_PATH.exists():
         return {}
-    data = json.loads(ALLOWLIST_PATH.read_text())
+    data = json.loads(ALLOWLIST_PATH.read_text(encoding = "utf-8"))
     return {key_of(entry): entry for entry in data.get("allowed", [])}
 
 
@@ -297,6 +360,10 @@ def f(model_type):
     compile("x = %s" % value, "<x>", "exec")
     exec("a.{}.b".format(name))
     compile(source = f"y = {value}", filename = "<x>", mode = "exec")
+    exec("import {module}".format_map(values))
+    exec(f"import {name}".encode())
+    annotated: str = f"import {name}"
+    exec(annotated)
 """
 
 _GOOD = """
@@ -321,8 +388,13 @@ def self_test() -> int:
         bad.write_text(_BAD)
         findings = scan_file(bad)
         kinds = sorted(f["reason"] for f in findings)
-        if kinds != ["%-format", ".format()", "f-string", "f-string", "string concatenation"]:
-            failures.append(f"expected all four shapes plus the keyword call, got {kinds}")
+        expected = [
+            "%-format", ".format()", ".format_map()",
+            "f-string", "f-string", "f-string",
+            "f-string via `annotated`", "string concatenation",
+        ]
+        if kinds != expected:
+            failures.append(f"expected {expected}, got {kinds}")
         if any(f["qualname"] != "f" for f in findings):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
 
@@ -346,6 +418,30 @@ def self_test() -> int:
             failures.append("reformatting changed the hash")
         if h1 == h3:
             failures.append("changing the interpolation did not change the hash")
+
+        # An AST too deep to walk must fail the gate, not report the file clean.
+        deep = Path(directory) / "deep.py"
+        deep.write_text(
+            "def f(user):\n"
+            "    x = " + "not " * 500 + "True\n"
+            '    exec(f"import {user}")\n'
+        )
+        try:
+            scan_file(deep)
+            failures.append("a file too deep to walk was reported clean")
+        except ScanError:
+            pass
+        _, errors = scan([deep])
+        if len(errors) != 1:
+            failures.append(f"scan() should surface the unscannable file, got {errors}")
+
+        # A directory outside the repo must scan rather than crash on relative_to.
+        external = Path(directory) / "external"
+        external.mkdir()
+        (external / "x.py").write_text('def f(m):\n    exec(f"import {m}")\n')
+        found, errors = scan(collect_paths([str(external)]))
+        if len(found) != 1 or errors:
+            failures.append(f"external directory not scanned: {found}, {errors}")
 
     for failure in failures:
         print(f"self-test: {failure}", file = sys.stderr)
@@ -374,9 +470,15 @@ def main() -> int:
         return self_test()
 
     targets = args.paths if args.paths else list(DEFAULT_TARGETS)
-    findings = scan(collect_paths(targets))
+    findings, errors = scan(collect_paths(targets))
 
     if args.update:
+        # An allowlist written from an incomplete scan would bake in the gap.
+        if errors:
+            for error in errors:
+                print(f"scan error: {error}", file = sys.stderr)
+            print("\nFAIL: refusing to rewrite the allowlist from an incomplete scan.", file = sys.stderr)
+            return 1
         write_allowlist(findings, reason = "REVIEW ME")
         print(f"wrote {len(findings)} entries to {ALLOWLIST_PATH.name}")
         return 0
@@ -411,11 +513,13 @@ def main() -> int:
             f"{entry['qualname']} no longer matches any call - re-run --update",
             file = sys.stderr,
         )
+    for error in errors:
+        print(f"scan error: {error}", file = sys.stderr)
 
-    if unreviewed or pending or stale:
+    if unreviewed or pending or stale or errors:
         print(
             f"\nFAIL: {len(unreviewed)} unreviewed, {len(pending)} unjustified, "
-            f"{len(stale)} stale.\n"
+            f"{len(stale)} stale, {len(errors)} unscannable.\n"
             f"Fix the call, or run --update and write down why the interpolated value "
             f"cannot be attacker controlled.",
             file = sys.stderr,
