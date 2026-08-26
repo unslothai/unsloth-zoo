@@ -484,9 +484,8 @@ def validate_single_function_source(
 pass
 
 
-# Modules a generated function may import. Deliberately excludes every stdlib
-# module that can touch the filesystem, the network or another process, so
-# os / subprocess / socket / shutil / ctypes / importlib are all unreachable.
+# Importable by generated code. Excludes any stdlib module that reaches the
+# filesystem, network or another process (os, subprocess, socket, ctypes, ...).
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "copy", "dataclasses",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -497,11 +496,9 @@ _SAFE_IMPORT_MODULES = frozenset({
 
 def _safe_import(name, globals = None, locals = None, fromlist = (), level = 0):
     """
-    Replacement for __import__ exposed to generated code.
-
-    Only top-level modules in _SAFE_IMPORT_MODULES resolve; everything else
-    raises ImportError. Handles both `import math` and `from typing import X`,
-    since both call __import__ with the top-level module name.
+    __import__ replacement for generated code: only _SAFE_IMPORT_MODULES
+    resolve. Covers `import math` and `from typing import X` alike, since both
+    call __import__ with the top-level name.
     """
     if level != 0:
         raise ImportError("Relative imports are not allowed in generated code.")
@@ -513,13 +510,10 @@ pass
 
 def _allowlist_builtins():
     """
-    A small safe builtins mapping for generated code.
-
-    Covers what the RL notebook prompts actually ask the model to use (list and
-    numeric work, comprehensions, sorting, exception handling) while omitting
-    every capability primitive: no __import__ except the shim above, and no
-    open / eval / exec / compile / input / getattr / setattr / globals / vars /
-    locals / breakpoint / memoryview.
+    Safe builtins for generated code: enough for the list/numeric/sorting work
+    the RL prompts ask for, minus every capability primitive (open, eval, exec,
+    compile, input, getattr, globals, vars, breakpoint, and __import__ except
+    the shim above).
     """
     names = (
         "abs", "all", "any", "ascii", "bin", "bool", "bytes", "callable", "chr",
@@ -528,7 +522,7 @@ def _allowlist_builtins():
         "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
         "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
         "str", "sum", "tuple", "type", "zip",
-        # Exception machinery: generated code routinely uses try/except.
+        # Generated code routinely uses try/except.
         "ArithmeticError", "AssertionError", "AttributeError", "BaseException",
         "Exception", "FloatingPointError", "IndexError", "KeyError",
         "MemoryError", "NotImplementedError", "OverflowError", "RecursionError",
@@ -536,7 +530,7 @@ def _allowlist_builtins():
         "ZeroDivisionError",
     )
     exposed = {name: getattr(_py_builtins, name) for name in names}
-    # Needed for `class` statements inside the generated function.
+    # Required for `class` statements.
     exposed["__build_class__"] = _py_builtins.__build_class__
     exposed["__name__"] = "__user_code__"
     exposed["__import__"] = _safe_import
@@ -546,13 +540,10 @@ pass
 
 def _reject_dunder_access(tree):
     """
-    Reject dunder attribute/name access in generated code.
-
-    Restricting builtins alone does not contain the classic escape
-    `().__class__.__bases__[0].__subclasses__()`, which walks from any literal
-    to arbitrary already-imported classes (subprocess.Popen among them) using
-    nothing but attribute access. Generated matmul/strategy code has no reason
-    to touch dunders, so refuse them outright.
+    Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
+    which walks from any literal to already-imported classes (subprocess.Popen
+    included) using only attribute access. Generated code has no reason to touch
+    dunders, so refuse them outright.
     """
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
@@ -622,20 +613,18 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     """
     Creates a singular Python function which disallows globals.
 
-    Defaults to the "allowlist" builtins policy, so model-generated code cannot
-    reach __import__ / open / eval / exec / compile, cannot import anything
-    outside _SAFE_IMPORT_MODULES, and cannot walk dunder attributes. Pass
-    builtins_policy = "full" to restore the old permissive behaviour.
+    Defaults to builtins_policy = "allowlist": generated code cannot reach
+    __import__ / open / eval / exec / compile, import outside
+    _SAFE_IMPORT_MODULES, or walk dunder attributes. Pass "full" for the old
+    permissive behaviour.
 
-    This is defence in depth, not a real sandbox: it does not bound CPU, memory
-    or recursion, and it is not a substitute for OS-level isolation. Run
-    genuinely untrusted code in a container.
+    Defence in depth, not a real sandbox. It does not bound CPU, memory or
+    recursion. Run genuinely untrusted code in a container.
     """
     f = load_single_function(function, builtins_policy = builtins_policy)
-    # Lock the function down to only the builtins the policy allows. Binding to
-    # an empty dict is not sufficient: CPython injects the real builtins module
-    # into any globals mapping that has no __builtins__ key, which would hand
-    # back everything the policy just removed.
+    # Binding to an empty dict is not enough: CPython injects the real builtins
+    # module into any globals mapping without a __builtins__ key, handing back
+    # everything the policy just removed.
     exposed_builtins = (
         _py_builtins.__dict__ if builtins_policy == "full" else _allowlist_builtins()
     )
