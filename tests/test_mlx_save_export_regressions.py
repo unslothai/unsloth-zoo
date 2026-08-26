@@ -2183,8 +2183,9 @@ def _make_source_tree_with_gguf_py(folder):
 
 def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
     # `pip install <dir>` runs that directory's build backend, so a checkout we
-    # neither manage nor were pointed at must never be installed from. The export
-    # still works: gguf comes from the package index instead.
+    # neither manage nor were pointed at must never be installed from. gguf comes
+    # from the package index instead; conversion itself is unaffected either way,
+    # since the converter loads its own sibling gguf-py.
     import unsloth_zoo.llama_cpp as lcpp
 
     monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
