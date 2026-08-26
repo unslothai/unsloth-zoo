@@ -3965,3 +3965,50 @@ def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it
     mutils._prepare_moe_gguf_export_directory(path, model=model)
     assert model.language_model.tied is False
     assert model.language_model["lm_head"] == "the head this model was trained with"
+
+
+def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
+    """A split into one tensor per expert, which no pair of parts can propose.
+
+    DBRX names the parts by index, so no vocabulary fragment stands for one and
+    the merge family cannot reach them. The second leaf keeps a recipe proved on
+    the first from standing for both: only `w2` is transposed as well as split.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"blocks.{layer}.ffn.experts.mlp.{leaf}":
+                    mx.arange(24, dtype=mx.float32).reshape(12, 2) + layer
+                for layer in range(2)
+                for leaf in ("w1", "w2")
+            }
+            self.expected = self.sanitize(dict(self.checkpoint))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                if "experts.mlp" not in name:
+                    out[name] = tensor
+                    continue
+                for expert, part in enumerate(mx.split(tensor, 3, axis=0)):
+                    out[name.replace(".mlp", f".{expert}") + ".weight"] = (
+                        part.T if name.endswith("w2") else part
+                    )
+            return out
+
+    model = Model()
+    assert len(model.expected) == 12
+    assert all(name.endswith(".weight") for name in model.expected)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 12
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    for name, tensor in model.checkpoint.items():
+        assert rewritten[name].tolist() == tensor.tolist()

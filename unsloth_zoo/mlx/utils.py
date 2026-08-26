@@ -15239,14 +15239,10 @@ def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabu
     return candidate, corrections
 
 
-# The splits reached here are in two: a gate/up pair, or an MLA key/value pair.
-# Of the installed sanitizers, four split in two and one -- DBRX -- splits into
-# one tensor per expert, which this grouping does not reach and which leaves that
-# checkpoint as it stands rather than rewriting it wrongly. Widening the grouping
-# costs a factor of the vocabulary per extra part. The
-# merge is probed with a truncated last axis first so a shape-agnostic split
-# costs a corner rather than the whole tensor, and rounds bound how many
-# siblings one failure at a time can pull into a grouping.
+# The splits reached here are in two: a gate/up pair, or an MLA key/value pair. DBRX
+# splits per expert instead, which the stack family reaches -- widening this grouping
+# would cost a factor of the vocabulary per part, and a per-expert split's parts carry no
+# name to substitute.
 _MOE_MERGE_PARTS = 2
 _MOE_MERGE_PROBE_WIDTHS = (2, None)
 _MOE_MERGE_ROUNDS = 4
@@ -15572,6 +15568,121 @@ def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
             continue
         restored[target] = (parts, *recipe)
     return restored
+
+
+def _mlx_moe_expert_stacks(staged):
+    """Staged names alike but for one component spelling a run of experts.
+
+    DBRX builds each part's name with an f-string, leaving no fragment standing
+    for the index, so the run itself is what identifies them.
+    """
+    runs = {}
+    for name in staged:
+        components = name.split(".")
+        for position, component in enumerate(components):
+            if component.isdigit() and str(int(component)) == component:
+                key = (".".join(components[:position]),
+                       ".".join(components[position + 1:]))
+                runs.setdefault(key, {})[int(component)] = name
+    return {key: [found[index] for index in range(len(found))]
+            for key, found in runs.items()
+            if len(found) > 1 and sorted(found) == list(range(len(found)))}
+
+
+def _mlx_moe_stack_recipes(rank, count):
+    """Every concatenation of the parts one split produced, arranged alike.
+
+    A sanitizer splits every expert the same way, so one layout stands for all and the
+    search stays layouts times axes rather than layouts to the expert count.
+    """
+    choices = [None] + [layout for layout in _MOE_TENSOR_LAYOUTS
+                        if max(layout) < rank]
+    for layout in choices:
+        for axis in range(rank):
+            for flattened in (True, False):
+                if flattened and (axis == 0 or axis + 1 == rank):
+                    continue
+                yield (layout,) * count, axis, flattened
+
+
+def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
+                                 recipes):
+    """The rewrite one fragment proves, for every group of experts it names."""
+    stripped = fragment.strip(".")
+    if not stripped or "." in stripped:
+        return None
+    # The checkpoint may or may not carry the `.weight` mlx-lm appends -- DBRX's
+    # converter reads the fused name only without it -- so the two spellings are
+    # separate proposals.
+    for trimmed in (False, True):
+        groups = {}
+        for head, parts in heads.items():
+            target = ".".join(filter(None, (head, stripped, tail)))
+            if trimmed:
+                if not target.endswith(".weight"):
+                    break
+                target = target[: -len(".weight")]
+            groups[target] = parts
+        # Short when the spelling did not apply to every head, and a spelling
+        # only some of them can take is not one.
+        if len(groups) != len(heads):
+            continue
+        # A group cannot rebuild one of its own parts, which a fragment spelling an index
+        # in the run reaches. Nothing else refuses it: the floor holds the parts out, so
+        # it cannot see the rest written away.
+        if any(target in parts for target, parts in groups.items()):
+            continue
+        for width in _MOE_MERGE_PROBE_WIDTHS:
+            for sanitizer in sanitizers:
+                for recipe, _ in _proved_mlx_moe_merge_recipe(
+                    sanitizer, staged, groups, recipes, width
+                ):
+                    if recipe is None or not any(
+                        confirmed is not None
+                        for confirmed, _ in _proved_mlx_moe_merge_recipe(
+                            sanitizer, staged, groups, [recipe], None, native=True
+                        )
+                    ):
+                        continue
+                    return {target: (parts, *recipe)
+                            for target, parts in groups.items()}
+    return None
+
+
+def _build_mlx_moe_expert_stack_plan(model, staged):
+    """Recover a checkpoint tensor a sanitizer split into one tensor per expert.
+
+    Neither a rename nor a merge reaches DBRX's: the parts are told apart by index
+    rather than by name, and there are as many as the model has experts, which no
+    arrangement of a pair can propose. So the run of indices finds a group, the
+    vocabulary only names what it restores to, and the parts go in index order.
+    """
+    sanitizers = _mlx_moe_sanitizers(model)
+    vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
+    if not vocabulary:
+        return {}
+    # Grouping by the tail the indexed component precedes is what separates a
+    # run of expert indices from the run of layer indices beside it.
+    by_tail = {}
+    for (head, tail), parts in _mlx_moe_expert_stacks(staged).items():
+        by_tail.setdefault(tail, {})[head] = parts
+
+    plan = {}
+    for tail, heads in sorted(by_tail.items()):
+        # Rank rather than extent, as a merge reads it.
+        ranks = {len(staged[part].shape) for parts in heads.values() for part in parts}
+        counts = {len(parts) for parts in heads.values()}
+        if len(ranks) != 1 or len(counts) != 1:
+            continue
+        recipes = list(_mlx_moe_stack_recipes(ranks.pop(), counts.pop()))
+        for fragment in vocabulary:
+            proved = _proved_mlx_moe_expert_stack(
+                sanitizers, staged, heads, tail, fragment, recipes
+            )
+            if proved:
+                plan.update(proved)
+                break
+    return plan
 
 
 def _mlx_moe_merge_placement(files, merges):
@@ -15958,7 +16069,8 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
     )
     # Tensors a sanitizer split apart have no staged counterpart to rename, so
     # they are rebuilt first and then kept out of the rename search.
-    merges = _build_mlx_moe_merge_plan(model, staged)
+    merges = _build_mlx_moe_expert_stack_plan(model, staged)
+    merges.update(_build_mlx_moe_merge_plan(model, staged))
     consumed = {part for parts, *_ in merges.values() for part in parts}
     renames, offsets, layouts = _build_mlx_moe_rename_plan(
         model, staged, split, exclude=consumed
