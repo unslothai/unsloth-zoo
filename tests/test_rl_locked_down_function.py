@@ -30,8 +30,10 @@ BLOCKED = [
     # It fails anyway because getattr is not in the allowlist at all.
     ("getattr", 'def matmul(A, B):\n    return getattr(A, "__class__")\n', NameError),
     # Allowlisted modules re-export unsafe ones: random keeps a private handle
-    # on os, and typing keeps sys. The facade has to deny both.
-    ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', AttributeError),
+    # on os, and typing keeps sys. random._os is caught statically by the
+    # private-attribute rule; typing.sys is not private, so the facade is what
+    # stops it. Both layers are load bearing.
+    ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', RuntimeError),
     ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
     # attrgetter takes a dotted string, so it walks dunders without the AST
     # check ever seeing them. operator is therefore not allowlisted.
@@ -68,6 +70,27 @@ def test_allowlisted_dotted_submodule_works_both_forms():
     )
     assert create_locked_down_function(from_form)([[0]]) is True
     assert create_locked_down_function(bare_form)([[0]]) is True
+
+
+def test_private_attribute_access_is_rejected():
+    # Single underscore, not two: private attributes reach modules and
+    # internals just as well as dunders do.
+    source = "def matmul(A, B):\n    import abc\n    return abc.ABCMeta._abc_impl\n"
+    with pytest.raises(RuntimeError):
+        create_locked_down_function(source)([], [])
+
+
+def test_underscore_locals_are_still_allowed():
+    # The Name check stays at two underscores, so ordinary throwaway and
+    # private-ish locals keep working.
+    source = (
+        "def strategy(board):\n"
+        "    _total = 0\n"
+        "    for _ in board:\n"
+        "        _total += 1\n"
+        "    return _total\n"
+    )
+    assert create_locked_down_function(source)([[0], [0], [0]]) == 3
 
 
 def test_public_members_of_allowlisted_modules_still_work():

@@ -594,10 +594,15 @@ def _reject_dunder_access(tree):
     dunders, so refuse them outright.
     """
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+        # Attributes are checked on a single underscore, not two: private
+        # attributes reach modules and internals just as well (random._os,
+        # ABCMeta._abc_impl), and generated code never needs them.
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Names stay at two, because a bare `_` or `_total` local is ordinary
+        # in generated code and reaches nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
