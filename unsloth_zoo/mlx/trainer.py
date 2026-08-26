@@ -623,6 +623,7 @@ from .compile import (
     explain_compile_support,
     get_compile_qualification,
     model_has_gated_delta_layers,
+    model_has_qwen35_attention_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -4834,16 +4835,21 @@ class MLXTrainer:
             # and marks the process as inside a training run.
             acquire_mlx_training_patches()
             _training_patches_held = True
-            # Qwen3.5-specific fixes
+            # Routed by module tree, not model_type: qwen4_exp reuses the Qwen3.5
+            # classes under its own name.
             config = getattr(model, "_config", {})
             model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-            gated_delta_patched = False
-            if "qwen3_5" in model_type:
+            if model_has_gated_delta_layers(model):
+                from unsloth_zoo.gated_delta_vjp import (
+                    patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared)
+                # mlx-vlm's copies first, or patch_gated_delta's sweep warns about them.
+                patch_gated_delta_vlm()
+                patch_gated_delta_vlm_shared()
+                patch_gated_delta()
+            if model_has_qwen35_attention_layers(model):
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
                 _disable_fused_mrope(model)
-                from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
-                patch_gated_delta()
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):

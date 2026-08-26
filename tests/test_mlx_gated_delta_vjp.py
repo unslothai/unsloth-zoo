@@ -213,6 +213,30 @@ def test_structural_detection():
     assert not model_has_gated_delta_layers(_Broken())
 
 
+def test_structural_detection_matches_unnamed_linear_attention(monkeypatch):
+    """GLM-5.x holds the gate-decay pair on a `Glm5NextForgetGate` under a mixer
+    named `Glm5NextLinearAttention`; what separates it from an SSM gate carrying the
+    same parameters is that its defining module binds `gated_delta_update`."""
+    from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
+
+    class _ForgetGate:
+        A_log = dt_bias = object()
+
+    class _SelfAttn: pass       # same module, no gate decay: must NOT match
+
+    _model = lambda *m: types.SimpleNamespace(named_modules=lambda: list(enumerate(m)))
+
+    for suffix, binds_update in (("linear_attention", True), ("ssm", False)):
+        module = types.ModuleType(f"fake_pkg.{suffix}")
+        if binds_update:
+            module.gated_delta_update = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        _ForgetGate.__module__ = _SelfAttn.__module__ = module.__name__
+        mixer, gate, attn = types.SimpleNamespace(), _ForgetGate(), _SelfAttn()
+        assert bool(model_has_gated_delta_layers(_model(mixer, gate))) is binds_update
+        assert not model_has_gated_delta_layers(_model(mixer, attn))
+
+
 # -- gradient parity vs plain autodiff (Metal only) ---------------------------
 
 
@@ -276,7 +300,8 @@ def test_vjp_matches_plain_autodiff(impl, case):
 
 @requires_metal
 def test_patched_update_routes_training_to_kernel_path(monkeypatch):
-    """state=None + no mask must take the kernel VJP."""
+    """A call site asking for the differentiable path, or an open window, takes the
+    kernel VJP; an empty cache alone must not. Only the spy proves which ran."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     called = {}
@@ -298,9 +323,20 @@ def test_patched_update_routes_training_to_kernel_path(monkeypatch):
     b = mx.random.normal((B, T, Hv))
     A_log = mx.random.normal((Hv,))
     dt_bias = mx.random.normal((Hv,))
-    y, s = gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=None)
-    mx.eval(y, s)
+    mx.eval(gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=None))
+    assert not called, "uncached inference was routed to the training VJP"
+
+    acquire_mlx_training_patches()
+    try:
+        mx.eval(gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=None))
+    finally:
+        release_mlx_training_patches()
     assert called.get("kernel"), "training call did not route to kernel VJP"
+
+    called.clear()
+    mx.eval(gd.gated_delta_update(q, k, v, a, b, A_log, dt_bias, state=None,
+                                  use_kernel=False))
+    assert called.get("kernel"), "use_kernel=False did not get the efficient VJP"
 
 
 def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
@@ -451,3 +487,86 @@ def test_only_the_index_argument_is_detached(index_stop):
     rhs = mx.array([0, 2, 1, 3], dtype=mx.uint32)
     assert mx.gather_mm(a, b, None, rhs).shape == (4, 3, 2)
     assert mx.gather_mm(a, b, lhs_indices=None, rhs_indices=rhs).shape == (4, 3, 2)
+
+
+# -- the shared mlx-vlm gated-delta module ------------------------------------
+
+# mlx-vlm 0.6.5 keeps the shared module under `text_models`; 0.6.6 moved it up.
+_SHARED_GATED_DELTA = ("mlx_vlm.models.gated_delta",
+                       "mlx_vlm.models.text_models.gated_delta")
+
+
+@pytest.mark.parametrize("shared_name", _SHARED_GATED_DELTA)
+def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, monkeypatch):
+    seen = {}
+
+    def original(q, k, v, a, b, A_log, dt_bias,
+                 state=None, mask=None, use_kernel=True, **kw):
+        seen["kw"] = kw
+        return "cached", state
+
+    shared = types.ModuleType(shared_name)
+    consumer = types.ModuleType("mlx_vlm.models.glm5_next.language")
+    models_pkg = types.ModuleType("mlx_vlm.models")
+    shared.gated_delta_update = consumer.gated_delta_update = original
+    models_pkg.gated_delta = shared
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models", models_pkg)
+    # Mutually exclusive layouts: hide whichever one is not under test.
+    for _name in _SHARED_GATED_DELTA:
+        monkeypatch.delitem(sys.modules, _name, raising=False)
+    monkeypatch.setitem(sys.modules, shared_name, shared)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.glm5_next.language", consumer)
+
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm_shared
+    patch_gated_delta_vlm_shared()
+
+    patched = shared.gated_delta_update
+    assert patched is not original
+    assert consumer.gated_delta_update is patched
+    assert shared._unsloth_gated_delta_patched
+
+    # A cached call keeps the fused kernel and must carry the gate lower bound.
+    assert patched(*[object()] * 7, state="kv", lower_bound=-5.0) == ("cached", "kv")
+    assert seen["kw"] == {"lower_bound": -5.0}
+
+    # Prefill is uncached too, so an empty state is not a training signal.
+    assert patched(*[object()] * 7) == ("cached", None)
+    # mlx-vlm had no `lower_bound` here before 0.6.9; do not invent one for it.
+    assert seen["kw"] == {}
+
+    # Inside a window it takes the training branch, which must gate through
+    # `compute_g_safe`: GLM-5.x clamps the decay and qwen3_5 does not.
+    import unsloth_zoo.gated_delta_vjp as gv
+    shared.compute_g = lambda *a: pytest.fail("bounded gate took the plain path")
+    shared.compute_g_safe = lambda A_log, a, dt, lb: seen.setdefault("bound", lb)
+    monkeypatch.setattr(gv, "gated_delta_kernel_supported", lambda *a: False)
+    monkeypatch.setattr(gv, "gated_delta_ops_efficient", lambda *a: "vjp")
+    z = mx.zeros((1, 4, 2, 8))
+    acquire_mlx_training_patches()
+    try:
+        assert patched(*[z] * 7, lower_bound=-5.0) == "vjp"
+    finally:
+        release_mlx_training_patches()
+    assert seen["bound"] == -5.0
+
+
+# -- fusions and caches the trainer must turn off -----------------------------
+
+class _FakeModel:
+    def __init__(self, *modules):
+        self._modules = modules
+
+    def modules(self):
+        return list(self._modules)
+
+    def named_modules(self):
+        return [(f"layers.{i}", m) for i, m in enumerate(self._modules)]
+
+
+def test_qwen35_attention_detection_follows_the_mro():
+    from unsloth_zoo.mlx.compile import model_has_qwen35_attention_layers
+
+    base = type("Qwen3_5Attention", (), {})
+    subclass = type("Qwen4ExpAttention", (base,), {})
+    assert model_has_qwen35_attention_layers(_FakeModel(subclass()))
+    assert not model_has_qwen35_attention_layers(_FakeModel(object()))

@@ -255,6 +255,14 @@ def gated_delta_ops_efficient(
 _WARNED_FOREIGN_GATED_DELTA: set[str] = set()
 
 
+def _is_training_call(state, use_kernel):
+    """An empty cache does not mark a training call -- prefill has one too. Call
+    sites say so with `use_kernel=not self.training`; GLM-5.x's passes neither, so
+    an open training window speaks for it."""
+    from .mlx.utils import mlx_training_patches_active
+    return state is None and (not use_kernel or mlx_training_patches_active())
+
+
 def patch_gated_delta():
     """Monkey-patch mlx_lm's gated_delta module to use our efficient VJP.
 
@@ -274,9 +282,7 @@ def patch_gated_delta():
             q, k, v, a, b, A_log, dt_bias,
             state=None, mask=None, use_kernel=True,
         ):
-            # state=None marks a training call (no cache); route it through
-            # the custom VJP, since gated_delta_kernel has none.
-            is_training_call = state is None
+            is_training_call = _is_training_call(state, use_kernel)
             beta = mx.sigmoid(b)
             g = gated_delta.compute_g(A_log, a, dt_bias)
             if state is None:
@@ -350,6 +356,10 @@ def patch_gated_delta_vlm():
     mlx_vlm (0.4.x - 0.5.x) from-imports mlx_lm's function instead;
     the sweep in patch_gated_delta() already rebinds those.
     """
+    import sys
+    # Importing it here would drag the mlx-vlm model packages into a text-only run.
+    if not any(name.startswith("mlx_vlm.models.qwen3_5") for name in sys.modules):
+        return
     try:
         from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
     except ImportError:
@@ -384,8 +394,7 @@ def patch_gated_delta_vlm():
         q, k, v, a, b, A_log, dt_bias,
         state=None, mask=None, use_kernel=True,
     ):
-        # state=None is training (use the VJP); inference keeps the kernel.
-        if state is not None:
+        if not _is_training_call(state, use_kernel):
             return original_update(
                 q, k, v, a, b, A_log, dt_bias,
                 state=state, mask=mask, use_kernel=use_kernel,
@@ -404,6 +413,53 @@ def patch_gated_delta_vlm():
         vlm_language.gated_delta_update = patched_vlm_gated_delta_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
+
+
+def patch_gated_delta_vlm_shared():
+    """Patch mlx_vlm's shared gated-delta update, wherever it lives.
+
+    GLM-5.x linear attention binds this rather than the per-model copy
+    `patch_gated_delta_vlm` covers, and never passes `use_kernel=not self.training`,
+    so training would reach the fused Metal kernel, which has no VJP."""
+    import sys
+    # 0.6.5 kept this under `text_models`; 0.6.6 moved it up to `models`.
+    vlm_gated_delta = (sys.modules.get("mlx_vlm.models.gated_delta")
+                       or sys.modules.get("mlx_vlm.models.text_models.gated_delta"))
+    if vlm_gated_delta is None:
+        return
+    if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
+        return
+    original_update = vlm_gated_delta.gated_delta_update
+
+    def patched_shared_gated_delta_update(q, k, v, a, b, A_log, dt_bias,
+            state=None, mask=None, use_kernel=True, lower_bound=None):
+        if not _is_training_call(state, use_kernel):
+            # Pre-0.6.9 mlx-vlm has no `lower_bound` here, and no caller passes one.
+            bound = {} if lower_bound is None else {"lower_bound": lower_bound}
+            return original_update(q, k, v, a, b, A_log, dt_bias,
+                                   state=state, mask=mask, use_kernel=use_kernel, **bound)
+        beta = mx.sigmoid(b)
+        g = (vlm_gated_delta.compute_g(A_log, a, dt_bias) if lower_bound is None
+             else vlm_gated_delta.compute_g_safe(A_log, a, dt_bias, lower_bound))
+        B, Dk = q.shape[0], q.shape[-1]
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        if gated_delta_kernel_supported(q, g, mask, v):
+            return gated_delta_kernel_efficient(q, k, v, g, beta, state, mask)
+        return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
+
+    vlm_gated_delta.gated_delta_update = patched_shared_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_patched = True
+    # Consumers from-import the function; rebind their stale references.
+    rebound = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("mlx_vlm.models"): continue
+        if getattr(module, "gated_delta_update", None) is original_update:
+            module.gated_delta_update = patched_shared_gated_delta_update
+            rebound.append(name)
+    if rebound:
+        print(f"Unsloth: Rebound gated_delta_update in {', '.join(sorted(rebound))}.")
+    print("Unsloth: Patched shared mlx-vlm GatedDeltaNet with custom VJP.")
 
 
 # --------------------------------------------------------------------------
