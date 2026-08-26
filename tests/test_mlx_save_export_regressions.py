@@ -2182,10 +2182,9 @@ def _make_source_tree_with_gguf_py(folder):
 
 
 def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
-    # `pip install <dir>` executes that directory's build backend, so a llama.cpp
-    # checkout we neither manage nor were pointed at (eg a ./llama.cpp that just
-    # happens to sit in the working directory) must never be installed from. The
-    # export still works: gguf comes from the package index instead.
+    # `pip install <dir>` runs that directory's build backend, so a checkout we
+    # neither manage nor were pointed at must never be installed from. The export
+    # still works: gguf comes from the package index instead.
     import unsloth_zoo.llama_cpp as lcpp
 
     monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
@@ -2388,10 +2387,9 @@ def test_macos_helper_defaults_to_the_managed_checkout(monkeypatch, tmp_path):
 
 
 def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, tmp_path):
-    # The guarantee that nothing changes for real users: save_pretrained_gguf only
-    # ever passes LLAMA_CPP_DEFAULT_DIR, which is UNSLOTH_LLAMA_CPP_PATH verbatim
-    # or ~/.unsloth/llama.cpp. Every spelling of that variable has to come back
-    # trusted, or somebody's export quietly stops using their own gguf-py.
+    # Why nothing changes for real users: save_pretrained_gguf only ever passes
+    # LLAMA_CPP_DEFAULT_DIR, so every spelling of that variable must read as
+    # trusted, or an export quietly stops using the user's own gguf-py.
     home = tmp_path / ".unsloth"
     home.mkdir(parents=True)
     custom = tmp_path / "custom" / "llama.cpp"
