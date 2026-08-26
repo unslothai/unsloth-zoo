@@ -213,3 +213,46 @@ def test_full_policy_remains_available():
         builtins_policy = "full",
     )
     assert isinstance(fn([], []), str)
+
+
+def test_dunder_method_definitions_are_denied():
+    # A method name is FunctionDef.name, not a Name or Attribute node, so the
+    # walk cannot see it. Without the fail-closed rule, a custom __setattr__
+    # captures what functools.update_wrapper copies.
+    source = (
+        "def matmul(A, B):\n"
+        "    import functools\n"
+        "    import statistics\n"
+        "    box = []\n"
+        "    class W:\n"
+        "        def __setattr__(self, k, v):\n"
+        "            box.append(v)\n"
+        "    w = W()\n"
+        '    functools.update_wrapper(w, statistics.mean, assigned=("__globals__",), updated=())\n'
+        '    return box[0]["__builtins__"]["__import__"]("os")\n'
+    )
+    with pytest.raises(RuntimeError):
+        create_locked_down_function(source)([], [])
+
+
+def test_ordinary_dunder_methods_still_allowed():
+    # __init__ and the comparison protocol are ordinary in helper classes.
+    source = (
+        "def matmul(A, B):\n"
+        "    class Node:\n"
+        "        def __init__(self, v):\n"
+        "            self.v = v\n"
+        "        def __lt__(self, o):\n"
+        "            return self.v < o.v\n"
+        "    return sorted([Node(3), Node(1)])[0].v\n"
+    )
+    assert create_locked_down_function(source)([], []) == 1
+
+
+def test_functools_reduce_still_works():
+    source = (
+        "def matmul(A, B):\n"
+        "    import functools\n"
+        "    return functools.reduce(lambda a, b: a + b, [1, 2, 3])\n"
+    )
+    assert create_locked_down_function(source)([], []) == 6

@@ -517,12 +517,32 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     entry point is the private _evaluate and the private-attribute rule
 #     already covers it, but this package supports up to 3.14, so deny the
 #     names outright rather than have the hole open on the newer runtime.
+#   functools.update_wrapper and wraps copy attributes named by their
+#     `assigned` argument, so assigned=("__globals__",) plus a class with a
+#     custom __setattr__ captures a real module globals dict, and indexing
+#     "__builtins__" out of it recovers the unrestricted __import__.
 _DENIED_MODULE_ATTRS = frozenset({
+    "functools.update_wrapper",
+    "functools.wraps",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+})
+
+# Dunder methods a generated helper class may define. A method name is
+# FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
+# it; without this, generated code defines __setattr__ or __getattr__ and hooks
+# the attribute machinery that copy helpers drive. __init__ and the comparison
+# and arithmetic protocol are ordinary in helper classes, so they stay.
+_ALLOWED_DUNDER_DEFS = frozenset({
+    "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
+    "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
+    "__gt__", "__hash__", "__index__", "__init__", "__int__", "__iter__",
+    "__le__", "__len__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__",
+    "__next__", "__pos__", "__pow__", "__repr__", "__round__", "__setitem__",
+    "__str__", "__sub__", "__truediv__",
 })
 
 
@@ -631,6 +651,13 @@ def _reject_dunder_access(tree):
     dunders, so refuse them outright.
     """
     for node in ast.walk(tree):
+        # Definition names are strings on the node, invisible to the Name and
+        # Attribute checks below, so they get their own fail-closed rule.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name.startswith("__") and node.name not in _ALLOWED_DUNDER_DEFS:
+                raise RuntimeError(
+                    f"Defining '{node.name}' is not allowed in generated code."
+                )
         # One underscore for attributes: private ones reach modules and
         # internals just as well (random._os, ABCMeta._abc_impl).
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
