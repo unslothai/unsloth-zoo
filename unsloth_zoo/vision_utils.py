@@ -235,11 +235,16 @@ def assert_fetchable_url(url: str) -> str:
     return url
 
 
-def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
-    """Fetch an http(s) URL into memory, checking every redirect hop."""
+def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
+    """Write an http(s) body into `sink`, checking every redirect hop.
+
+    Single implementation of the fetch policy: scheme and destination checked on
+    the original URL and on each hop, size capped, response always closed.
+    """
     from urllib.parse import urljoin
 
     max_bytes = _max_media_download_bytes()
+    written = 0
     current = url
     for _ in range(_MAX_MEDIA_REDIRECTS + 1):
         assert_fetchable_url(current)
@@ -252,49 +257,54 @@ def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
                 current = urljoin(current, location)
                 continue
             response.raise_for_status()
-            data = BytesIO()
             for chunk in response.iter_content(chunk_size = 1024 * 1024):
                 if not chunk: continue
-                data.write(chunk)
-                if max_bytes and data.tell() > max_bytes:
+                sink.write(chunk)
+                written += len(chunk)
+                if max_bytes and written > max_bytes:
                     raise ValueError(
                         f"Unsloth: Media at `{url}` is larger than the "
                         f"{max_bytes} byte limit. Raise "
                         f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
                     )
-            data.seek(0)
-            return data
+            return written
         finally:
             # Close every hop; a leaked streaming response holds its connection.
             response.close()
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
-def resolve_media_redirects(url: str, timeout: int = 30) -> str:
-    """Walk an http(s) redirect chain, checking every hop, and return the final URL.
+def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
+    """Fetch an http(s) URL into memory, checking every redirect hop."""
+    data = BytesIO()
+    _stream_guarded_media(url, data, timeout = timeout)
+    data.seek(0)
+    return data
 
-    The video decoders do their own I/O through ffmpeg, which follows redirects
-    by default, so checking only the handed-in URL would let a public host bounce
-    them to an internal one.
+
+def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
+    """Download an http(s) URL through the guard and return a temp file path.
+
+    Handing a decoder the URL is not enough, even after resolving its redirects:
+    the decoder issues its own request, and a server that answered ours cleanly
+    can redirect that one to an internal address. ffmpeg follows redirects by
+    default and exposes no way to refuse them, so the only way to bind the
+    decoder to a checked destination is to fetch the bytes ourselves.
     """
-    from urllib.parse import urljoin
+    import tempfile
+    from urllib.parse import urlparse
 
-    current = url
-    for _ in range(_MAX_MEDIA_REDIRECTS + 1):
-        assert_fetchable_url(current)
-        try:
-            response = requests.get(current, stream = True, timeout = timeout, allow_redirects = False)
-        except requests.RequestException:
-            # Unreachable now is the decoder's error to report, not ours.
-            return current
-        try:
-            if not (response.is_redirect or response.is_permanent_redirect):
-                return current
-            location = response.headers.get("location")
-            if not location: return current
-            current = urljoin(current, location)
-        finally:
-            response.close()
+    # Keep the extension: ffmpeg and torchvision sniff the container from it.
+    suffix = os.path.splitext(urlparse(url).path)[1][:16] or ".bin"
+    handle = tempfile.NamedTemporaryFile(prefix = "unsloth_media_", suffix = suffix, delete = False)
+    try:
+        with handle as sink:
+            _stream_guarded_media(url, sink, timeout = timeout)
+    except BaseException:
+        try: os.unlink(handle.name)
+        except OSError: pass
+        raise
+    return handle.name
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
@@ -625,18 +635,25 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
-        # The decoders fetch and follow redirects themselves, so settle the chain
-        # here and hand over a destination that has been checked.
+        # The decoders fetch remote URLs themselves and follow redirects with no
+        # way to refuse, so download through the guard and decode a local file.
+        downloaded = None
         if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
+            downloaded = fetch_remote_media_to_file(ele["video"])
             ele = dict(ele)
-            ele["video"] = resolve_media_redirects(ele["video"])
+            ele["video"] = downloaded
         video_reader_backend = get_video_reader_backend()
         try:
-            video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
-            video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+            try:
+                video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
+                video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+        finally:
+            if downloaded is not None:
+                try: os.unlink(downloaded)
+                except OSError: pass
 
         nframes, _, height, width = video.shape
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)

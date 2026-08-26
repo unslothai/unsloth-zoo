@@ -25,7 +25,10 @@ URLs and every local-file form must keep working unchanged.
 
 from __future__ import annotations
 
+import glob
 import io
+import os
+import tempfile
 
 import pytest
 
@@ -330,9 +333,10 @@ def test_non_finite_size_limits_do_not_break_every_fetch(monkeypatch, public_dns
     assert vision_utils.fetch_image({"image": "https://example.com/a.png"}).size[0] > 0
 
 
-def test_video_redirect_chain_is_resolved_and_checked(monkeypatch, public_dns):
-    """The decoders follow redirects internally, so the chain has to be walked
-    here or a public host could bounce ffmpeg to an internal one."""
+def test_video_download_is_guarded_not_delegated(monkeypatch, public_dns):
+    """The decoders follow redirects with no way to refuse, so a server that
+    answers our probe cleanly could still bounce them internally. The bytes are
+    fetched here instead and the decoder only ever sees a local file."""
     hops = []
 
     def fake_get(url, **kwargs):
@@ -351,25 +355,64 @@ def test_video_redirect_chain_is_resolved_and_checked(monkeypatch, public_dns):
     assert hops == ["https://example.com/public.mp4"]
 
 
-def test_video_redirect_to_a_public_host_is_followed(monkeypatch, public_dns):
-    resolved = {}
+def test_video_decoder_receives_a_local_file_not_a_url(monkeypatch, public_dns, tmp_path):
+    """Even for a wholly public chain the decoder gets a downloaded file, so a
+    second request it makes cannot be answered differently."""
+    seen = {}
+    payload = b"\x00\x00\x00\x20ftypisom fake container bytes"
 
     def fake_get(url, **kwargs):
         if url.endswith("/public.mp4"):
             return _FakeResponse(redirect_to="https://cdn.example.com/real.mp4")
-        return _FakeResponse(b"")
+        return _FakeResponse(payload)
 
     monkeypatch.setattr(vision_utils.requests, "get", fake_get)
 
     def backend(ele):
-        resolved["url"] = ele["video"]
-        raise RuntimeError("stop here, the URL is what we are asserting")
+        seen["path"] = ele["video"]
+        seen["bytes"] = open(ele["video"], "rb").read()
+        raise RuntimeError("stop here, the handed-over path is what we assert")
 
     monkeypatch.setattr(vision_utils, "get_video_reader_backend", lambda: "torchvision")
     monkeypatch.setitem(vision_utils.VIDEO_READER_BACKENDS, "torchvision", backend)
     with pytest.raises(Exception):
         vision_utils.fetch_video({"video": "https://example.com/public.mp4"})
-    assert resolved["url"] == "https://cdn.example.com/real.mp4"
+
+    assert not seen["path"].startswith("http"), seen["path"]
+    assert seen["path"].endswith(".mp4"), "the container extension must survive"
+    assert seen["bytes"] == payload
+    assert not os.path.exists(seen["path"]), "the temp file must be cleaned up"
+
+
+def test_video_download_honours_the_size_cap(monkeypatch, public_dns):
+    monkeypatch.setenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", "0.0001")
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(b"x" * 4096),
+    )
+    monkeypatch.setattr(
+        vision_utils, "get_video_reader_backend",
+        lambda: pytest.fail("not reached"),
+    )
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": "https://example.com/big.mp4"})
+
+
+def test_failed_video_download_leaves_no_temp_file(monkeypatch, public_dns, tmp_path):
+    import glob
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path), raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(b"", status=500),
+    )
+    monkeypatch.setattr(
+        vision_utils, "get_video_reader_backend",
+        lambda: pytest.fail("not reached"),
+    )
+    with pytest.raises(Exception):
+        vision_utils.fetch_video({"video": "https://example.com/broken.mp4"})
+    assert glob.glob(str(tmp_path / "unsloth_media_*")) == []
 
 
 def test_fetch_video_does_not_mutate_the_caller_dict(monkeypatch, public_dns):
