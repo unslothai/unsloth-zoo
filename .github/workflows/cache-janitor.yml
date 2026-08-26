@@ -31,30 +31,26 @@ name: Cache janitor
 #        v0-rust-*                       Swatinem/rust-cache
 #
 #   3. Superseded generations of setup-python-*-pip-*, keyed by a hash over the
-#      dependency files. This family resolves by restore-key too: setup-python
-#      v7.0.0 returns exactly one, the primary key minus the trailing hash
-#      (cache-distributions/pip-cache.ts computeKeys), which is the same prefix
-#      this workflow groups by. So the newest generation still answers a changed
-#      hash, and keeping 1 costs nothing routine. These were previously left
-#      alone on the reasoning that
-#      one generation is live at a time and a superseded one expires by itself
-#      after 7 days unused. Both halves are true and the conclusion still does
-#      not hold: 7 days of overlap, times four interpreters, times every ref
-#      that ran, is larger than the whole budget. A dependency bump on 2026-08-23
-#      left 6.6 GiB of the previous generation resident behind the new one.
+#      dependency files, beyond the same keep. This family resolves by
+#      restore-key too: setup-python v7.0.0 returns exactly one, the primary key
+#      minus the trailing hash (cache-distributions/pip-cache.ts computeKeys),
+#      which is the same prefix this workflow groups by. So generation N-1 never
+#      answers a CHANGED hash -- the newest prefix match wins -- and generation
+#      N-2 and older answer nothing at all. These were previously left alone on
+#      the reasoning that one generation is live at a time and a superseded one
+#      expires by itself after 7 days unused. Both halves are true and the
+#      conclusion still does not hold: 7 days of overlap, times four
+#      interpreters, times every ref that ran, is larger than the whole budget.
+#      A dependency bump on 2026-08-23 left 6.6 GiB of the previous generation
+#      resident behind the new one.
 #
 # "Older" is not the same as unreachable. rust-cache passes its full key to
 # restoreCache, which tries an exact match first, so a build returning to an
 # earlier dependency state (a re-run of an old commit, a lockfile revert) can
-# still hit an older generation exactly. setup-python is the same shape. Pruning
-# trades those rare exact hits for headroom, which is the point; keep is the dial.
-#
-# setup-python keeps 1 generation rather than keep, deliberately. The usual
-# reason to hold a second -- an in-flight run losing the cache it just resolved
-# -- does not apply: restore happens at the top of a job, so a job that resolved
-# the old generation already holds the files on disk, and its own save writes a
-# new key. Holding a second generation of a family whose entries are ~2 GiB each
-# is what put this repo on the ceiling.
+# still hit an older generation exactly. setup-python is the same shape. keep is
+# the dial, and it is set for hit rate, not for headroom: the budget exists to be
+# spent, so a generation that can still answer something stays. What goes is what
+# can answer nothing -- unreachable refs, and generations past keep.
 #
 # Everything else is left alone. The hf-* / *-gguf-* model caches use exact keys,
 # so an entry that looks superseded is the only one its key will ever match and
@@ -71,7 +67,7 @@ on:
         options: [report, delete]
         default: report
       keep:
-        description: 'Generations kept per prefix. 2 so an in-flight run cannot lose the cache it just resolved. setup-python always keeps 1.'
+        description: 'Generations kept per prefix. 2 so an in-flight run cannot lose the cache it just resolved, and so a reverted dependency bump still hits.'
         type: string
         default: '2'
 
@@ -176,7 +172,6 @@ jobs:
           : > "$grouped"
           while IFS=$'\t' read -r id created size ref ver key; do
             [ -z "${id:-}" ] && continue
-            fam=other
             case "$key" in
               codeql-overlay-base-database-*)
                 pre=$(printf '%s' "$key" | sed -E 's/-[0-9a-f]{40}-[0-9]+-[0-9]+$//') ;;
@@ -187,7 +182,6 @@ jobs:
                 # stays in the prefix on purpose: 3.10 and 3.13 entries are separate
                 # keys that never substitute for one another, and folding them into
                 # one group would rank four live caches as four generations of one.
-                fam=setup-python
                 pre=$(printf '%s' "$key" | sed -E 's/-[0-9a-f]{64}$//') ;;
               *) continue ;;
             esac
@@ -199,17 +193,16 @@ jobs:
             # compression change mints a new version that is restored
             # independently. Ranking them together lets two entries from one
             # scope evict every usable entry of another.
-            printf '%s\t%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" "$fam" >> "$grouped"
+            printf '%s\t%s\t%s\t%s\n' "$ref|$ver|$pre" "$created" "$id" "$size" >> "$grouped"
           done < "$live"
 
           sort -t"$(printf '\t')" -k1,1 -k2,2r -o "$grouped" "$grouped"
 
           prev=""; n=0; superseded=0
-          while IFS=$'\t' read -r pre created id size fam; do
+          while IFS=$'\t' read -r pre created id size; do
             [ -z "${pre:-}" ] && continue
             if [ "$pre" != "$prev" ]; then prev="$pre"; n=1; else n=$(( n + 1 )); fi
-            lim="$KEEP"; [ "$fam" = "setup-python" ] && lim=1
-            [ "$n" -le "$lim" ] && continue
+            [ "$n" -le "$KEEP" ] && continue
             superseded=$(( superseded + 1 ))
             if [ "$DELETE" != "yes" ]; then
               freed=$(( freed + size )); deleted=$(( deleted + 1 )); continue
@@ -229,7 +222,7 @@ jobs:
             echo "| metric | value |"
             echo "| --- | --- |"
             echo "| mode | $([ "$DELETE" = yes ] && echo delete || echo 'report only') |"
-            echo "| kept per prefix | $KEEP (setup-python: 1) |"
+            echo "| kept per prefix | $KEEP |"
             echo "| caches total | $count |"
             echo "| closed-PR candidates | $stale_pr |"
             echo "| superseded candidates | $superseded |"
