@@ -652,6 +652,117 @@ def _generation_cache_hygiene():
                 pass
 
 
+_ARRAYS_CACHE_ADVANCE_LOCK = threading.Lock()
+_ARRAYS_CACHE_ADVANCE_RESOLVED = False
+
+
+def _adopt_deferred_metadata(cache):
+    """Move a cache built before the patch onto the deferred slots."""
+
+    state = cache.__dict__
+    for name in ("lengths", "left_padding"):
+        if name in state:
+            state["_" + name] = state.pop(name)
+            state["_" + name + "_pending"] = 0
+
+
+def _deferred_metadata(name):
+    stored = "_" + name
+    pending = stored + "_pending"
+
+    def read(self):
+        _adopt_deferred_metadata(self)
+        value = getattr(self, stored)
+        outstanding = getattr(self, pending)
+        if outstanding and value is not None:
+            value = value - outstanding
+            setattr(self, stored, value)
+            setattr(self, pending, 0)
+        return value
+
+    def write(self, value):
+        _adopt_deferred_metadata(self)
+        setattr(self, stored, value)
+        setattr(self, pending, 0)
+
+    return property(read, write)
+
+
+def _deferred_advance(self, N):
+    _adopt_deferred_metadata(self)
+    if self._lengths is not None:
+        self._lengths_pending += N
+    if self._left_padding is not None:
+        self._left_padding_pending += N
+
+
+# Compared against the installed mlx-lm, never installed, never called. Comparing the
+# compiled body and signature identifies the implementation this patch reproduces
+# without depending on source files or formatting, and separates it from one whose
+# `advance` means something else.
+def _stock_advance(self, N):
+    if self.lengths is not None:
+        self.lengths -= N
+    if self.left_padding is not None:
+        self.left_padding -= N
+
+
+def _advance_identity(function):
+    code = function.__code__
+    return (
+        inspect.signature(function),
+        code.co_code,
+        code.co_consts,
+        code.co_names,
+        code.co_varnames,
+    )
+
+
+def _has_replaceable_advance(arrays_cache):
+    """Identify the exact ``advance`` this patch reproduces."""
+
+    if any(
+        hasattr(type(inspect.getattr_static(arrays_cache, name, None)), "__set__")
+        for name in ("lengths", "left_padding")
+    ):
+        return False
+    return _advance_identity(arrays_cache.advance) == _advance_identity(_stock_advance)
+
+
+def _install_arrays_cache_advance_fix():
+    """Keep mlx-lm's ``ArraysCache.advance`` from stranding a Metal buffer per call.
+
+    ``advance`` rebinds ``lengths``/``left_padding`` with ``-=``, building an
+    unevaluated subtract whose integer operand is materialised as a scalar array that
+    owns a live buffer. The metadata is absent from ``ArraysCache.state``, and during
+    batched decoding only the cache owning the shared mask has its chain forced each
+    step, so every other linear-attention layer strands one buffer per token until
+    Metal refuses to allocate. Deferring the subtraction into a Python counter keeps
+    the arithmetic and allocates nothing until the value is read.
+    """
+
+    global _ARRAYS_CACHE_ADVANCE_RESOLVED
+    with _ARRAYS_CACHE_ADVANCE_LOCK:
+        if _ARRAYS_CACHE_ADVANCE_RESOLVED:
+            return
+        try:
+            arrays_cache = importlib.import_module("mlx_lm.models.cache").ArraysCache
+            replaceable = _has_replaceable_advance(arrays_cache)
+        except Exception:
+            # A failed attempt is not a decision: retry on the next call.
+            return
+        # Any other body keeps stock.
+        if replaceable:
+            arrays_cache._lengths = None
+            arrays_cache._lengths_pending = 0
+            arrays_cache._left_padding = None
+            arrays_cache._left_padding_pending = 0
+            arrays_cache.lengths = _deferred_metadata("lengths")
+            arrays_cache.left_padding = _deferred_metadata("left_padding")
+            arrays_cache.advance = _deferred_advance
+        _ARRAYS_CACHE_ADVANCE_RESOLVED = True
+
+
 class _StopStringScanner:
     """Incrementally search new detokenized text with longest-stop lookback."""
 
@@ -1699,6 +1810,7 @@ def generate_batch(
             if is_vlm
             else "Text batched generation requires a tokenizer."
         )
+    _install_arrays_cache_advance_fix()
     with generation_mode(model):
         with _generation_cache_hygiene():
             adapter = (
