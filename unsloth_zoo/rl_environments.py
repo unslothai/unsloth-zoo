@@ -628,14 +628,18 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     exposed_builtins = (
         _py_builtins.__dict__ if builtins_policy == "full" else _allowlist_builtins()
     )
-    f = types.FunctionType(
+    locked = types.FunctionType(
         f.__code__,
         {"__builtins__": exposed_builtins},
         f.__name__,
         f.__defaults__,
         f.__closure__,
     )
-    return f
+    # Assigned rather than passed: the constructor only grew a kwdefaults
+    # parameter recently, but the attribute is writable on every version we
+    # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
+    locked.__kwdefaults__ = f.__kwdefaults__
+    return locked
 pass
 
 
