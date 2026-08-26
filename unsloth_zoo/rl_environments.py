@@ -485,16 +485,14 @@ pass
 
 
 # Importable by generated code. Excludes anything reaching the filesystem,
-# network or another process (os, subprocess, socket, ctypes, ...).
-#
-# Excludes `string`, whose Formatter.get_field resolves a dotted RUNTIME STRING
-# and returns the object, walking straight back to the real builtins with
-# nothing in the source for the AST check to match. str.format resolves
-# attributes the same way but only ever returns formatted text, never the
-# object, so it is not an execution path and stays.
-#
-# dataclasses is excluded for a different reason: it resolves annotations via
-# sys.modules[cls.__module__], which cannot work for synthetic globals.
+# network or another process (os, subprocess, socket, ctypes, ...), plus two
+# whose whole module has to go:
+#   string -- Formatter.get_field resolves a dotted runtime string and returns
+#     the object, reaching the real builtins with nothing in the source to
+#     match. str.format resolves the same way but only returns text, never the
+#     object, so it is not an execution path and stays.
+#   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
+#     cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -502,28 +500,18 @@ _SAFE_IMPORT_MODULES = frozenset({
     "typing", "unicodedata",
 })
 
-# Public members that turn a runtime string into an object, or evaluate one.
-# Same AST blind spot as `string` above, but these sit in modules worth
-# keeping, so deny the member instead of the whole module:
-#   operator.attrgetter("__class__.__bases__")(x) walks dunders from a string,
-#     while itemgetter, the one generated sorting code actually reaches for,
-#     takes an index and is fine.
-#   typing.get_type_hints evaluates string annotations, and since this module
-#     compiles annotations to strings, a class annotated with
-#     "__import__('os').system(...)" executes on the call. The notebooks' own
-#     samples do `from typing import Callable`, so typing itself stays.
-#   typing.ForwardRef.evaluate and typing.evaluate_forward_ref are the same
-#     evaluator, made public in 3.14. They do not exist on 3.13, where the
-#     entry point is the private _evaluate and the private-attribute rule
-#     already covers it, but this package supports up to 3.14, so deny the
-#     names outright rather than have the hole open on the newer runtime.
-#   functools.update_wrapper and wraps copy attributes named by their
-#     `assigned` argument, so assigned=("__globals__",) plus a class with a
-#     custom __setattr__ captures a real module globals dict, and indexing
-#     "__builtins__" out of it recovers the unrestricted __import__.
-#   time.clock_settime and clock_settime_ns mutate the host clock. They need
-#     privilege, which a container running as root has, and no generated
-#     strategy needs to set the time. The read-only clocks stay.
+# Members denied individually, where the module itself is worth keeping.
+# Three reasons, all of them invisible to the AST check:
+#   string-to-object resolvers -- operator.attrgetter walks dunders from a
+#     dotted string (itemgetter takes an index and stays); functools
+#     update_wrapper/wraps copy whatever `assigned` names, so ("__globals__",)
+#     plus a custom __setattr__ yields a real globals dict to index.
+#   evaluators -- typing.get_type_hints runs string annotations, and
+#     ForwardRef/evaluate_forward_ref are the same evaluator made public in
+#     3.14. Denied on every version; 3.13 reaches it only via private
+#     _evaluate, which the private-attribute rule already covers.
+#   mutators -- time.clock_settime(_ns) sets the host clock given the
+#     privilege a root container has. Read-only clocks stay.
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
