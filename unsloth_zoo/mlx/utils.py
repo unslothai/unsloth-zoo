@@ -14658,9 +14658,49 @@ def save_pretrained_merged(
             )
 
 
-def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
+def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
+    """Whether we may `pip install` a package out of this llama.cpp checkout.
+
+    Installing a local directory runs its build backend, so only a checkout we
+    manage (~/.unsloth) or one the operator named via UNSLOTH_LLAMA_CPP_PATH
+    qualifies. A CWD-relative ./llama.cpp does not: the working directory is not
+    always the operator's, and gguf is on the package index anyway.
+    """
+    from unsloth_zoo.llama_cpp import UNSLOTH_HOME
+
+    def _canonical(path):
+        # realpath so a symlinked home (or macOS' /tmp -> /private/tmp) compares
+        # equal; normcase so Windows' case-insensitive paths do too.
+        return os.path.normcase(os.path.realpath(path))
+
+    def _contains(parent, child):
+        parent = _canonical(parent)
+        # Trailing separator: "~/.unsloth-evil" is not inside "~/.unsloth".
+        # join(parent, "") keeps a root parent as "/" rather than "//".
+        return child == parent or child.startswith(os.path.join(parent, ""))
+
+    try:
+        real_folder = _canonical(llama_cpp_folder)
+        if _contains(UNSLOTH_HOME, real_folder): return True
+        # Raw and stripped: LLAMA_CPP_DEFAULT_DIR uses the variable verbatim
+        # while Studio strips it, so both spellings must read as trusted.
+        raw = os.environ.get("UNSLOTH_LLAMA_CPP_PATH") or ""
+        for operator_path in (raw, raw.strip()):
+            if operator_path and _contains(operator_path, real_folder): return True
+    except Exception:
+        # Untrusted on any error; the index fallback still installs gguf.
+        pass
+    return False
+
+
+def _install_llama_cpp_macos(llama_cpp_folder=None):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
+    if llama_cpp_folder is None:
+        # The managed checkout, not a CWD-relative "llama.cpp", so we never build
+        # or install out of whatever sits in the working directory.
+        from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
     def _clone():
         print("Unsloth: Cloning llama.cpp...")
@@ -14698,9 +14738,11 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
-    # Install deps; prefer gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync, but only
+    # from a trusted checkout. Otherwise take the index copy, which keeps the
+    # export working without building an unvetted local package.
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-    if os.path.exists(gguf_py_dir):
+    if os.path.exists(gguf_py_dir) and _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
         subprocess.run(
             [sys.executable, "-m", "pip", "install", gguf_py_dir,
              "protobuf", "sentencepiece"],

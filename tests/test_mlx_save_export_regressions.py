@@ -2155,3 +2155,263 @@ def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
 
     assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
     assert (folder / "CMakeLists.txt").is_file()
+
+
+def _run_macos_helper_capturing_pip(monkeypatch, folder):
+    """Run the macOS helper against a ready source tree, returning the pip argv."""
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    return [c for c in cmds if "pip" in c and "install" in c]
+
+
+def _make_source_tree_with_gguf_py(folder):
+    (folder / "gguf-py").mkdir(parents=True)
+    (folder / "CMakeLists.txt").write_text("# source tree")
+
+
+def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
+    # `pip install <dir>` runs that directory's build backend, so a checkout we
+    # neither manage nor were pointed at must never be installed from. gguf comes
+    # from the package index instead; conversion itself is unaffected either way,
+    # since the converter loads its own sibling gguf-py.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = tmp_path / "untrusted" / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    installed = pip_cmds[0]
+    assert not any(str(folder) in arg for arg in installed), \
+        f"must not pip install from an untrusted checkout: {installed}"
+    assert "gguf" in installed
+
+
+def test_macos_helper_installs_gguf_py_from_managed_checkout(monkeypatch, tmp_path):
+    # The normal path is unchanged: the managed ~/.unsloth checkout still gets its
+    # in-tree gguf-py installed so gguf stays in sync with llama.cpp.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    home = tmp_path / "unsloth_home"
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(home), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = home / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
+
+
+def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch, tmp_path):
+    # An operator who explicitly points UNSLOTH_LLAMA_CPP_PATH at their own
+    # checkout has vouched for it, so the in-tree gguf-py is still used.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+
+    folder = tmp_path / "my_llama_cpp"
+    _make_source_tree_with_gguf_py(folder)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(folder))
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
+
+
+# --- _is_trusted_local_llama_cpp_dir path semantics -------------------------
+# `pip install <dir>` runs that directory's build backend, so the containment
+# check that guards it has to be exact. These cover the ways a naive prefix
+# comparison goes wrong.
+
+def _trusted(monkeypatch, folder, home, env_value=None):
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(home), raising=False)
+    if env_value is None:
+        monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(env_value))
+    return mutils._is_trusted_local_llama_cpp_dir(str(folder))
+
+
+def test_trusted_dir_accepts_managed_checkout(monkeypatch, tmp_path):
+    home = tmp_path / ".unsloth"
+    assert _trusted(monkeypatch, home / "llama.cpp", home) is True
+    assert _trusted(monkeypatch, home, home) is True
+
+
+def test_trusted_dir_rejects_prefix_sibling(monkeypatch, tmp_path):
+    # "~/.unsloth-evil" shares a string prefix with "~/.unsloth" but is not inside
+    # it. A startswith() without the separator would trust it.
+    home = tmp_path / ".unsloth"
+    evil = tmp_path / ".unsloth-evil"
+    evil.mkdir(parents=True)
+    assert _trusted(monkeypatch, evil, home) is False
+    assert _trusted(monkeypatch, evil / "llama.cpp", home) is False
+
+
+def test_trusted_dir_rejects_symlink_escaping_the_managed_root(monkeypatch, tmp_path):
+    # A symlink sitting inside ~/.unsloth that points out of it must not launder
+    # an untrusted directory into the trusted set.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = home / "llama.cpp"
+    link.symlink_to(outside)
+    assert _trusted(monkeypatch, link, home) is False
+
+
+def test_trusted_dir_rejects_cwd_relative_checkout(monkeypatch, tmp_path):
+    # The case the whole guard exists for: a llama.cpp that just happens to be in
+    # the working directory is not something anyone vouched for.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    cwd = tmp_path / "cwd"
+    (cwd / "llama.cpp").mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    assert _trusted(monkeypatch, "llama.cpp", home) is False
+    assert _trusted(monkeypatch, os.path.join(".", "llama.cpp"), home) is False
+    # An operator who names that same directory does get the local install.
+    assert _trusted(monkeypatch, "llama.cpp", home, env_value=cwd / "llama.cpp") is True
+
+
+def test_trusted_dir_accepts_operator_named_checkout(monkeypatch, tmp_path):
+    # How Unsloth Studio configures this: it exports UNSLOTH_LLAMA_CPP_PATH.
+    home = tmp_path / ".unsloth"
+    studio = tmp_path / "StudioHome" / "llama.cpp"
+    studio.mkdir(parents=True)
+    assert _trusted(monkeypatch, studio, home, env_value=studio) is True
+    assert _trusted(monkeypatch, studio / "gguf-py", home, env_value=studio) is True
+    # Whitespace is stripped, matching how Studio itself reads the variable.
+    assert _trusted(monkeypatch, studio, home, env_value=f"  {studio}  ") is True
+    # An empty or blank value must not trust anything.
+    assert _trusted(monkeypatch, tmp_path / "other", home, env_value="") is False
+    assert _trusted(monkeypatch, tmp_path / "other", home, env_value="   ") is False
+
+
+def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
+    # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
+    # a bare parent + os.sep would produce and never match.
+    home = tmp_path / ".unsloth"
+    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+
+
+def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
+    # Only reached on macOS today, but the comparison should not quietly depend on
+    # that. Drive letter and directory case must not change the verdict.
+    import ntpath
+    import types
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    fake_os = types.SimpleNamespace(
+        path=types.SimpleNamespace(
+            realpath=ntpath.normpath,
+            normcase=ntpath.normcase,
+            join=ntpath.join,
+        ),
+        sep="\\",
+        environ={},
+    )
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", r"C:\Users\Dan\.unsloth", raising=False)
+    monkeypatch.setattr(mutils, "os", fake_os)
+
+    assert mutils._is_trusted_local_llama_cpp_dir(r"c:\users\dan\.UNSLOTH\llama.cpp") is True
+    assert mutils._is_trusted_local_llama_cpp_dir("C:/Users/Dan/.unsloth/llama.cpp") is True
+    assert mutils._is_trusted_local_llama_cpp_dir(r"C:\Users\Dan\.unsloth-evil") is False
+    assert mutils._is_trusted_local_llama_cpp_dir(r"D:\Users\Dan\.unsloth\llama.cpp") is False
+
+
+def test_trusted_dir_never_raises_on_bad_input(monkeypatch, tmp_path):
+    # A bad path must degrade to "untrusted" (which still installs gguf from the
+    # index), never take down an export with an unexpected exception.
+    home = tmp_path / ".unsloth"
+    for bad in ("", None, "/tmp/a\x00b"):
+        assert _trusted(monkeypatch, bad, home) is False
+
+
+def test_macos_helper_defaults_to_the_managed_checkout(monkeypatch, tmp_path):
+    # The default used to be a CWD-relative "llama.cpp", so a no-arg call built and
+    # pip installed out of the process working directory.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    managed = tmp_path / ".unsloth" / "llama.cpp"
+    managed.mkdir(parents=True)
+    (managed / "CMakeLists.txt").write_text("# source tree")
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / ".unsloth"), raising=False)
+    monkeypatch.setattr(lcpp, "LLAMA_CPP_DEFAULT_DIR", str(managed), raising=False)
+
+    cwd = tmp_path / "cwd"
+    (cwd / "llama.cpp").mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos()
+
+    assert cmds, "expected the helper to run build commands"
+    assert any(str(managed) in " ".join(str(p) for p in c) for c in cmds), \
+        f"no-arg call should target the managed checkout: {cmds}"
+    assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), \
+        "the managed source tree already exists, so nothing should be cloned"
+
+
+def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, tmp_path):
+    # Why nothing changes for real users: save_pretrained_gguf only ever passes
+    # LLAMA_CPP_DEFAULT_DIR, so every spelling of that variable must read as
+    # trusted, or an export quietly stops using the user's own gguf-py.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    custom = tmp_path / "custom" / "llama.cpp"
+    custom.mkdir(parents=True)
+
+    spellings = [
+        None,                                   # unset
+        str(custom),
+        str(custom) + os.sep,
+        f"  {custom}  ",                        # LLAMA_CPP_DEFAULT_DIR does not strip
+        f"\t{custom}\n",
+        os.path.join(str(tmp_path), "custom", ".", "llama.cpp"),
+        os.path.join(str(tmp_path), "custom", "..", "custom", "llama.cpp"),
+        str(tmp_path / "not_created_yet" / "llama.cpp"),
+    ]
+    for value in spellings:
+        if value is None:
+            monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+            folder = str(home / "llama.cpp")
+        else:
+            monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", value)
+            folder = value  # exactly what LLAMA_CPP_DEFAULT_DIR would hold
+        assert _trusted(monkeypatch, folder, home, env_value=value) is True, \
+            f"UNSLOTH_LLAMA_CPP_PATH={value!r} should stay trusted"
