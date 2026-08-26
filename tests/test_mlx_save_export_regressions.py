@@ -3846,3 +3846,122 @@ def test_moe_gguf_export_restores_an_axis_a_sanitizer_moved(tmp_path):
     moved = _staged_tensors(path)["model.layers.0.self_attn.conv.weight"]
     assert moved.tolist() == mutils.mx.moveaxis(
         model.expected["model.layers.0.self_attn.conv.weight"], 1, 2).tolist()
+
+
+def _make_composed_moe_model():
+    """A model whose expert tensors only the two sanitizers together reproduce.
+
+    The outer sanitizer relocates the MoE block and splits its fused expert tensor
+    while the inner renames what is left inside it, so neither reproduces a saved name
+    alone. The inner reads the whole leaf, so of the three fragments between the saved
+    name and the checkpoint's the last two prove together or not at all. The tensors
+    outside the block, reproduced by both, hold the floor.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Language:
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                parent, found, leaf = name.rpartition(".experts.")
+                if found and "." not in leaf:
+                    name = f"{parent}.switch_mlp.{leaf}.weight"
+                out[name] = tensor
+            return out
+
+    class Model:
+        def __init__(self):
+            self.language_model = Language()
+            self.checkpoint = {
+                "outer.inner.layers.0.mlp.experts.gate_up_proj":
+                    mx.arange(24, dtype=mx.float32).reshape(2, 3, 4),
+                # Untouched by both sanitizers: without them a fragment every name carries reads
+                # as the checkpoint's own shape, which the search will not substitute.
+                "vision.blocks.0.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
+                "vision.blocks.1.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
+            }
+            self.expected = self.language_model.sanitize(
+                self.sanitize(dict(self.checkpoint))
+            )
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                # Both under the checkpoint's namespace: the split is how the relocated block is
+                # stored, not something that happens to any tensor with the name.
+                if "outer.inner" in name:
+                    name = name.replace("outer.inner", "inner.outer")
+                    if "gate_up_proj" in name:
+                        middle = tensor.shape[-1] // 2
+                        for leaf, half in (("gate_proj", tensor[..., :middle]),
+                                           ("up_proj", tensor[..., middle:])):
+                            out[name.replace("gate_up_proj", leaf)] = mx.moveaxis(
+                                half, 1, 2)
+                        continue
+                out[name] = tensor
+            return out
+
+    return Model()
+
+
+def test_moe_gguf_export_replays_the_sanitizers_a_model_composes(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_composed_moe_model()
+    assert sorted(model.expected)[0].endswith("switch_mlp.gate_proj.weight")
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    for name, tensor in model.checkpoint.items():
+        assert rewritten[name].tolist() == tensor.tolist()
+
+
+def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it(
+        tmp_path):
+    """The export must not change the model it planned against.
+
+    Gemma 3 ties its output head and drops `lm_head` when handed weights without
+    `lm_head.weight`, and the search hands it every spelling of that name. What
+    is exported is one thing; the model the caller goes on to run is another.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Language(dict):
+        def __init__(self):
+            super().__init__(lm_head="the head this model was trained with")
+            self.tied = False
+
+        def sanitize(self, weights):
+            if "lm_head.weight" not in weights:
+                self.tied = True
+                self.pop("lm_head", None)
+            return weights
+
+    class Model:
+        def __init__(self):
+            self.language_model = Language()
+            self.expected = {
+                "lm_head.weight": mx.array([[1.0, 2.0]]),
+                "model.layers.0.mlp.switch_mlp.gate_proj.weight":
+                    mx.array([[3.0, 4.0]]),
+            }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            return self.language_model.sanitize(weights)
+
+    model = Model()
+    path = _stage_moe_directory(tmp_path, model)
+    mutils._prepare_moe_gguf_export_directory(path, model=model)
+    assert model.language_model.tied is False
+    assert model.language_model["lm_head"] == "the head this model was trained with"

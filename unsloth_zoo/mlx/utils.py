@@ -14893,16 +14893,58 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
     return stacked
 
 
+class _MlxReplayedSanitizers:
+    """Sanitizers replayed in order, leaving no module of the model changed.
+
+    A vision-language model's saved names are the composition's image, so no
+    single sanitizer reproduces them. And some write to their module: Gemma 3 ties
+    its output head and drops `lm_head` when what arrives carries no
+    `lm_head.weight`, which is exactly what a search renaming that tensor hands it.
+    """
+
+    def __init__(self, owners, held):
+        self.owners = tuple(owners)
+        self.held = tuple(held)
+
+    def sanitize(self, weights):
+        # An mlx `Module` is a dict of its parameters and children with
+        # everything else an ordinary attribute, and Gemma 3 writes one of each.
+        state = [(module, dict(module) if isinstance(module, dict) else None,
+                  dict(vars(module))) for module in self.held]
+        try:
+            for owner in self.owners:
+                weights = owner.sanitize(weights)
+            return weights
+        finally:
+            for module, items, attributes in state:
+                if items is not None:
+                    # Through `dict`: a `Module` reads `update` as replacing its parameters from a
+                    # nested tree rather than as putting its own items back.
+                    dict.clear(module)
+                    dict.update(module, items)
+                vars(module).clear()
+                vars(module).update(attributes)
+
+
 def _mlx_moe_sanitizers(model):
-    """Sanitizers that may own an MoE block's expert stacking."""
-    sanitizers = []
-    for owner in (model, getattr(model, "language_model", None),
+    """Sanitizers that may own an MoE block's expert stacking.
+
+    The composition first, since a VLM's saved names are only its image; the parts
+    after, since a sub-model owning a whole block is still reproduced by one of them.
+    """
+    owners = []
+    for owner in (model, getattr(model, "vision_tower", None),
+                  getattr(model, "language_model", None),
                   getattr(model, "text_model", None)):
         if owner is None or getattr(owner, "sanitize", None) is None:
             continue
-        if all(existing is not owner for existing in sanitizers):
-            sanitizers.append(owner)
-    return sanitizers
+        if all(existing is not owner for existing in owners):
+            owners.append(owner)
+    if len(owners) < 2:
+        return [_MlxReplayedSanitizers(owners, owners)]
+    return [_MlxReplayedSanitizers(owners, owners)] + [
+        _MlxReplayedSanitizers([owner], owners) for owner in owners
+    ]
 
 
 def _mlx_moe_expert_names(name, num_experts, group, leaf_alias, parent=("", "")):
@@ -15016,8 +15058,9 @@ def _mlx_sanitizer_vocabulary(sanitizers):
                 collect(item, depth + 1)
 
     for sanitizer in sanitizers:
-        sanitize = getattr(type(sanitizer), "sanitize", None)
-        collect(getattr(sanitize, "__code__", None), 0)
+        for owner in getattr(sanitizer, "owners", (sanitizer,)):
+            sanitize = getattr(type(owner), "sanitize", None)
+            collect(getattr(sanitize, "__code__", None), 0)
     return sorted(f for f in found if len(f) > 1 and not f.isspace())
 
 
@@ -15036,6 +15079,10 @@ def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQU
         for replacement in vocabulary:
             if replacement != replaced:
                 yield replaced, replacement
+        # A checkpoint can spell a tensor with one fragment fewer rather than a
+        # different one -- mlx-lm appends `.weight` to a name carried bare -- and no
+        # fragment stands for its absence.
+        yield replaced, ""
 
 
 def _mlx_moe_renamed(names, replaced, replacement):
@@ -15273,13 +15320,15 @@ def _mlx_moe_merge_groups(staged, substitutions):
     """
     groups = {}
     for name in staged:
-        target, rank = name, len(substitutions)
-        for position, (replaced, replacement) in enumerate(substitutions):
-            if replaced in target:
-                target = target.replace(replaced, replacement)
-                rank = min(rank, position)
-        if target != name:
-            groups.setdefault(target, []).append((rank, name))
+        for rank, (replaced, replacement) in enumerate(substitutions):
+            # The first match only: one part's fragment can be a fragment of the fused name
+            # the other restores to -- `up_proj` inside `gate_up_proj` -- so applying the
+            # rest in turn would land the two parts of one split in two groups.
+            if replaced in name:
+                target = name.replace(replaced, replacement)
+                if target != name:
+                    groups.setdefault(target, []).append((rank, name))
+                break
     return {
         target: [name for _, name in sorted(parts)] for target, parts in groups.items()
     }
@@ -15441,7 +15490,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
     return None
 
 
-def _build_mlx_moe_merge_plan(model, staged):
+def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
     """Recover checkpoint tensors a sanitizer split into several staged ones.
 
     GraniteMoE stores a layer's gate and up projections as one tensor, so no rename
@@ -15449,10 +15498,13 @@ def _build_mlx_moe_merge_plan(model, staged):
     concatenation with the name makes the pair provable, and a marker with no two
     elements alike proves the arrangement, not just the shape.
     """
-    sanitizers = _mlx_moe_sanitizers(model)
-    vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
+    owned = _mlx_moe_sanitizers(model)
+    vocabulary = _mlx_sanitizer_vocabulary(owned)
     if not vocabulary:
         return {}
+    # The vocabulary is the model's own either way: a sanitizer wrapped to
+    # spell its output differently carries no name fragments of its own.
+    sanitizers = sanitizers or owned
     arrivals = _mlx_moe_merge_arrivals(staged, vocabulary)
     collected = {}
     for name, targets in arrivals.items():
@@ -15475,6 +15527,51 @@ def _build_mlx_moe_merge_plan(model, staged):
             if plan:
                 return plan
     return {}
+
+
+class _MlxRelabelledSanitizer:
+    """A sanitizer whose output is spelled the way a proved rename spells it."""
+
+    def __init__(self, inner, renames):
+        self.inner, self.renames = inner, renames
+        self.owners = getattr(inner, "owners", (inner,))
+
+    def sanitize(self, weights):
+        return {self.renames.get(name, name): tensor
+                for name, tensor in self.inner.sanitize(weights).items()}
+
+
+def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
+    """Merges the checkpoint still needs once the renames have been proved.
+
+    A sanitizer that splits as well as relocates leaves no staged name one substitution
+    from the checkpoint's: Qwen3-VL-MoE saves `switch_mlp.gate_proj.weight` for a
+    checkpoint holding `experts.gate_up_proj`. From the proved name it is one, so the
+    search runs again there with both sides relabelled to checkpoint names.
+    """
+    if not renames:
+        return {}
+    renamed = {renames.get(name, name): tensor for name, tensor in staged.items()}
+    # A rename can land on a name the search never saw, since names a merge claimed
+    # are held out of it, and two staged tensors under one name is not a checkpoint.
+    if len(renamed) != len(staged):
+        return {}
+    merges = _build_mlx_moe_merge_plan(
+        model, renamed,
+        [_MlxRelabelledSanitizer(sanitizer, renames)
+         for sanitizer in _mlx_moe_sanitizers(model)],
+    )
+    staged_names = {proved: name for name, proved in renames.items()}
+    restored = {}
+    for target, (parts, *recipe) in merges.items():
+        parts = [staged_names.get(part, part) for part in parts]
+        # A group no rename touched is one the first search saw under these very names
+        # and reaches the same recipe; dropping it keeps this search to what the renames
+        # made reachable.
+        if all(part not in renames for part in parts):
+            continue
+        restored[target] = (parts, *recipe)
+    return restored
 
 
 def _mlx_moe_merge_placement(files, merges):
@@ -15769,12 +15866,12 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             for name, proposed in proposal.items()
         }
         recovered = {name for name, p in candidate.items() if p != name}
-        # A substitution that maps a recovered name back onto the one already
-        # saved has nothing left to prove and would pass by vacancy, undoing an
-        # earlier one. Recovered names may be refined, never dropped.
+        # A substitution mapping a recovered name back onto the saved one would pass by
+        # vacancy, undoing an earlier one. Recovered names may be refined, never dropped,
+        # so equalling the last candidate is enough and losing one is not.
         if len(set(candidate.values())) != len(candidate):
             continue
-        if not recovered > {name for name, p in proposal.items() if p != name}:
+        if not recovered >= {name for name, p in proposal.items() if p != name}:
             continue
         # Names this candidate leaves alone must keep coming back and the ones it renamed
         # must not: falling short on exactly those is what the completion reads.
@@ -15866,6 +15963,17 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
     renames, offsets, layouts = _build_mlx_moe_rename_plan(
         model, staged, split, exclude=consumed
     )
+    # A sanitizer that splits a tensor as well as relocating it is out of the
+    # first search's reach, and in the second's once the relocation is proved.
+    late = _build_mlx_moe_renamed_merge_plan(model, staged, renames)
+    # A part goes into its merge as the checkpoint holds it, so whatever the
+    # renames proved for one the merge consumes goes with it.
+    for parts, *_ in late.values():
+        for part in parts:
+            renames.pop(part, None)
+            offsets.pop(part, None)
+            layouts.pop(part, None)
+    merges.update(late)
     plan = dict(split or {})
     # A rename is a one-name split, so the rewrite below needs no second path.
     plan.update((name, [renamed]) for name, renamed in renames.items())
