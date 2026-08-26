@@ -14658,9 +14658,43 @@ def save_pretrained_merged(
             )
 
 
-def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
+def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
+    """Whether we may `pip install` a package out of this llama.cpp checkout.
+
+    Installing a local directory runs that directory's own build backend, so we
+    only ever do it for a checkout Unsloth itself manages (under ~/.unsloth) or
+    one the operator explicitly pointed us at via UNSLOTH_LLAMA_CPP_PATH. A
+    CWD-relative ./llama.cpp is deliberately not trusted: the process working
+    directory is not always under the operator's control, and the same package
+    is available from the configured package index anyway.
+    """
+    from unsloth_zoo.llama_cpp import UNSLOTH_HOME
+
+    def _contains(parent, child):
+        parent = os.path.realpath(parent)
+        return child == parent or child.startswith(parent + os.sep)
+
+    try:
+        real_folder = os.path.realpath(llama_cpp_folder)
+        if _contains(UNSLOTH_HOME, real_folder): return True
+        operator_path = os.environ.get("UNSLOTH_LLAMA_CPP_PATH")
+        if operator_path and _contains(operator_path, real_folder): return True
+    except Exception:
+        # On any unexpected error treat the checkout as untrusted -- the index
+        # fallback still produces a working gguf install.
+        pass
+    return False
+
+
+def _install_llama_cpp_macos(llama_cpp_folder=None):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
+    if llama_cpp_folder is None:
+        # Default to the managed checkout (~/.unsloth/llama.cpp) rather than a
+        # CWD-relative "llama.cpp", so we never build or install out of whatever
+        # happens to sit in the process working directory.
+        from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
     def _clone():
         print("Unsloth: Cloning llama.cpp...")
@@ -14698,9 +14732,12 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
-    # Install deps; prefer gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync, but only
+    # when that checkout is one we manage or the operator named -- see
+    # _is_trusted_local_llama_cpp_dir. Otherwise fall back to the package index,
+    # which keeps the export working without building an unvetted local package.
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-    if os.path.exists(gguf_py_dir):
+    if os.path.exists(gguf_py_dir) and _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
         subprocess.run(
             [sys.executable, "-m", "pip", "install", gguf_py_dir,
              "protobuf", "sentencepiece"],

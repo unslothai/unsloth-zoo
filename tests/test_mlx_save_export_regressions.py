@@ -2155,3 +2155,84 @@ def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
 
     assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
     assert (folder / "CMakeLists.txt").is_file()
+
+
+def _run_macos_helper_capturing_pip(monkeypatch, folder):
+    """Run the macOS helper against a ready source tree, returning the pip argv."""
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    return [c for c in cmds if "pip" in c and "install" in c]
+
+
+def _make_source_tree_with_gguf_py(folder):
+    (folder / "gguf-py").mkdir(parents=True)
+    (folder / "CMakeLists.txt").write_text("# source tree")
+
+
+def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
+    # `pip install <dir>` executes that directory's build backend, so a llama.cpp
+    # checkout we neither manage nor were pointed at (eg a ./llama.cpp that just
+    # happens to sit in the working directory) must never be installed from. The
+    # export still works: gguf comes from the package index instead.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = tmp_path / "untrusted" / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    installed = pip_cmds[0]
+    assert not any(str(folder) in arg for arg in installed), \
+        f"must not pip install from an untrusted checkout: {installed}"
+    assert "gguf" in installed
+
+
+def test_macos_helper_installs_gguf_py_from_managed_checkout(monkeypatch, tmp_path):
+    # The normal path is unchanged: the managed ~/.unsloth checkout still gets its
+    # in-tree gguf-py installed so gguf stays in sync with llama.cpp.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    home = tmp_path / "unsloth_home"
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(home), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = home / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
+
+
+def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch, tmp_path):
+    # An operator who explicitly points UNSLOTH_LLAMA_CPP_PATH at their own
+    # checkout has vouched for it, so the in-tree gguf-py is still used.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+
+    folder = tmp_path / "my_llama_cpp"
+    _make_source_tree_with_gguf_py(folder)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(folder))
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
