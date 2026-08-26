@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVa
 from collections import OrderedDict
 import re
 from .log import logger
+from .empty_model import _get_module_attribute
 
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
@@ -412,7 +413,7 @@ def requires_grad_for_gradient_checkpointing(model):
                 name_pre  = "model." + ".".join(name_components[:j])
                 # Disable [\d] since it fails in gradient checkpointing
                 if re.search(r"\[[\d]{1,}\]", name_pre): continue
-                module = eval(name_pre, globals(), {"model" : model})
+                module = _get_module_attribute(model, ".".join(name_components[:j]))
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
@@ -444,7 +445,7 @@ def requires_grad_for_gradient_checkpointing(model):
             pass
 
             module_name = "model." + ".".join(name_components[:final_where])
-            module = eval(module_name, globals(), {"model" : model})
+            module = _get_module_attribute(model, ".".join(name_components[:final_where]))
             hook_targets[module_name] = module
         pass
         return hook_targets, fallback_targets

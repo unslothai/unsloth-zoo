@@ -30,6 +30,7 @@ __all__ = [
 import torch
 import re
 import os
+import functools
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
@@ -490,7 +491,17 @@ def create_empty_vision_model(config, dtype = torch.float16):
         SiglipVisionModel._init_weights = _init_weights
 
     import transformers
-    model_cls = getattr(transformers, config.architectures[0])
+    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
+    # on the transformers namespace followed by a call is an unbounded gadget: nothing
+    # here requires it to name a model class. Restrict it to the architectures the auto
+    # mappings actually register, which is the same gate the vllm_utils.py twin applies.
+    architecture = config.architectures[0]
+    if not _is_known_architecture(architecture):
+        raise ValueError(
+            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
+            f"a model architecture transformers registers."
+        )
+    model_cls = getattr(transformers, architecture)
 
     try:
         # accelerate's init_empty_weights, not transformers.modeling_utils.
@@ -571,6 +582,71 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     layer_names = sum(layer_templates.values(), [])
 
     return new_model, original_meta_model, num_layers, layer_names
+
+
+@functools.lru_cache(maxsize = 1)
+def _registered_architectures():
+    """Every model class name the transformers auto mappings register.
+
+    `MODEL_*_MAPPING_NAMES` maps a model_type to a *model* class name, which is what
+    `config.architectures` holds. `CONFIG_MAPPING_NAMES` lives in the same module and
+    maps to config classes, so it is excluded by the `MODEL_` prefix.
+    """
+    from transformers.models.auto import modeling_auto
+
+    names = set()
+    for attribute in dir(modeling_auto):
+        if not (attribute.startswith("MODEL_") and attribute.endswith("_MAPPING_NAMES")):
+            continue
+        mapping = getattr(modeling_auto, attribute, None)
+        if not isinstance(mapping, dict): continue
+        for value in mapping.values():
+            if isinstance(value, str): names.add(value)
+            elif isinstance(value, (list, tuple)):
+                names.update(v for v in value if isinstance(v, str))
+    return frozenset(names)
+pass
+
+
+def _is_known_architecture(architecture):
+    """Is `architecture` a name we are willing to resolve on the transformers namespace?
+
+    `config.architectures[0]` is a raw string off a downloaded config.json, and
+    `getattr(transformers, name)` followed by a call is an unbounded gadget - nothing
+    otherwise requires it to name a model. Two ways to qualify:
+
+      - the auto mappings register it. This is the primary check and it deliberately
+        admits the lazy `Placeholder` transformers substitutes when a model's optional
+        dependency is missing, so transformers' own "install X" error still surfaces
+        instead of being masked by ours.
+      - it is a PreTrainedModel subclass. Covers a class that exists but is not in the
+        mappings on this version.
+    """
+    import transformers
+
+    if not isinstance(architecture, str) or not architecture.isidentifier():
+        return False
+    if architecture in _registered_architectures():
+        return True
+    candidate = getattr(transformers, architecture, None)
+    return isinstance(candidate, type) and issubclass(candidate, transformers.PreTrainedModel)
+pass
+
+
+def _get_module_attribute(root, path):
+    """ Reads a dotted module path, e.g. `visual.blocks.0.norm.weight`
+
+    The read counterpart of `_set_module_attribute`. Replaces `eval(f"model.{path}")`:
+    same result for every path an attribute expression could express, plus numeric
+    segments, and no way for a path component to be Python rather than a name.
+    An empty `path` returns `root`, matching what `eval("model")` used to give.
+    """
+    if path == "": return root
+    obj = root
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
+pass
 
 
 def _set_module_attribute(root, path, value):

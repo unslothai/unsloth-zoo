@@ -60,6 +60,16 @@ jobs:
         run: |
           ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts
 
+      - name: Dynamic-execution lint self-test
+        run: python scripts/lint_dynamic_exec.py --self-test
+
+      - name: No exec/eval/compile of an interpolated string
+        # PR #1083: a model_type off a downloaded config.json was interpolated into an
+        # exec'd import. Bare exec(inspect.getsource(...)) is normal here and is not
+        # flagged; a built string is, unless it carries a written justification in
+        # scripts/dynamic_exec_allowlist.json.
+        run: python scripts/lint_dynamic_exec.py
+
       - name: No leftover debugger / pdb / breakpoint calls
         # Catches `import pdb`, `pdb.set_trace()`, `breakpoint()`, `import ipdb`.
         # continue-on-error during bootstrap: rl_replacements.py has a
