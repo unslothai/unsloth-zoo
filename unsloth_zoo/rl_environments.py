@@ -487,31 +487,34 @@ pass
 # Importable by generated code. Excludes anything reaching the filesystem,
 # network or another process (os, subprocess, socket, ctypes, ...).
 #
-# Also excludes every module that resolves attributes from a RUNTIME STRING and
-# hands back the object, because _reject_dunder_access works on the AST and
-# there is nothing in the source for it to match:
-#   operator.attrgetter("__class__.__bases__")(x)
-#   string.Formatter().get_field("0.get_field.__globals__[...]", (x,), {})
-# Both walk straight back to the real builtins. str.format resolves attributes
-# the same way but only ever returns the formatted text, never the object, so
-# it is not an execution path.
+# Excludes `string`, whose Formatter.get_field resolves a dotted RUNTIME STRING
+# and returns the object, walking straight back to the real builtins with
+# nothing in the source for the AST check to match. str.format resolves
+# attributes the same way but only ever returns formatted text, never the
+# object, so it is not an execution path and stays.
 #
 # dataclasses is excluded for a different reason: it resolves annotations via
 # sys.modules[cls.__module__], which cannot work for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
-    "numbers", "random", "re", "statistics", "textwrap", "typing",
-    "unicodedata",
+    "numbers", "operator", "random", "re", "statistics", "textwrap", "time",
+    "typing", "unicodedata",
 })
 
-# Public members of otherwise-safe modules that turn a runtime string into an
-# object, or evaluate one. Same blind spot as the excluded modules above, but
-# these live in modules worth keeping: typing.get_type_hints evaluates string
-# annotations, and since this module compiles annotations to strings, a class
-# annotated with "__import__('os').system(...)" executes on the call.
-# typing itself stays, because the notebooks' own samples import from it.
+# Public members that turn a runtime string into an object, or evaluate one.
+# Same AST blind spot as `string` above, but these sit in modules worth
+# keeping, so deny the member instead of the whole module:
+#   operator.attrgetter("__class__.__bases__")(x) walks dunders from a string,
+#     while itemgetter, the one generated sorting code actually reaches for,
+#     takes an index and is fine.
+#   typing.get_type_hints evaluates string annotations, and since this module
+#     compiles annotations to strings, a class annotated with
+#     "__import__('os').system(...)" executes on the call. The notebooks' own
+#     samples do `from typing import Callable`, so typing itself stays.
 _DENIED_MODULE_ATTRS = frozenset({
+    "operator.attrgetter",
+    "operator.methodcaller",
     "typing.get_type_hints",
 })
 
@@ -591,6 +594,12 @@ def _allowlist_builtins():
         "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
         "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
         "str", "sum", "tuple", "type", "zip",
+        # Class machinery: generated helpers are occasionally written as a
+        # small class. hasattr only ever answers yes or no, and object/super
+        # hand back nothing that is not already reachable, since getting
+        # anywhere from them needs a dunder the AST check rejects.
+        "bytearray", "classmethod", "hasattr", "object", "property",
+        "staticmethod", "super",
         # Generated code routinely uses try/except.
         "ArithmeticError", "AssertionError", "AttributeError", "BaseException",
         "Exception", "FloatingPointError", "IndexError", "KeyError",

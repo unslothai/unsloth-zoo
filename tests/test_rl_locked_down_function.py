@@ -36,8 +36,9 @@ BLOCKED = [
     ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', RuntimeError),
     ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
     # attrgetter takes a dotted string, so it walks dunders without the AST
-    # check ever seeing them. operator is therefore not allowlisted.
-    ("operator", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__")(1)\n', ImportError),
+    # check ever seeing them. The member is denied; operator itself stays.
+    ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
+    ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
     # Formatter.get_field resolves a dotted string and returns the object, so
     # it recovers the real __import__. str.format walks attributes the same way
     # but only returns text, which is why only this one matters.
@@ -130,6 +131,43 @@ def test_public_members_of_allowlisted_modules_still_work():
         "    return math.floor(2.7) + random.choice([0])\n"
     )
     assert create_locked_down_function(source)([[0]]) == 2
+
+
+def test_operator_itemgetter_still_works():
+    # itemgetter is what generated sorting code actually reaches for, and it
+    # takes an index rather than an attribute path, so only attrgetter and
+    # methodcaller are denied.
+    source = (
+        "def strategy(board):\n"
+        "    import operator\n"
+        '    return sorted([(2, "b"), (1, "a")], key = operator.itemgetter(0))[0][0]\n'
+    )
+    assert create_locked_down_function(source)([[0]]) == 1
+
+
+def test_class_helpers_still_work():
+    # Generated helpers are occasionally written as a small class.
+    source = (
+        "def matmul(A, B):\n"
+        "    class Base:\n"
+        "        def go(self):\n"
+        "            return 1\n"
+        "    class C(Base):\n"
+        "        def go(self):\n"
+        "            return super().go() + 1\n"
+        "    return C().go()\n"
+    )
+    assert create_locked_down_function(source)([], []) == 2
+
+
+def test_hasattr_and_time_are_available():
+    source = (
+        "def matmul(A, B):\n"
+        "    import time\n"
+        "    t = time.monotonic()\n"
+        '    return hasattr(A, "shape") is False and t > 0\n'
+    )
+    assert create_locked_down_function(source)([], []) is True
 
 
 def test_generated_matmul_still_runs():
