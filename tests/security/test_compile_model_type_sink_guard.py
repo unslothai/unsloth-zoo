@@ -42,9 +42,43 @@ PAYLOADS = [
 
 
 @pytest.mark.parametrize("model_type", PAYLOADS)
-def test_compile_rejects_unnormalised_model_type(model_type):
-    with pytest.raises(ValueError, match = "Invalid model_type"):
-        unsloth_compile_transformers(model_type)
+def test_compile_stops_on_an_unnormalised_model_type(model_type):
+    """Stops short of the compiled-cache filename, and does so by returning.
+
+    Returning rather than raising is deliberate. The import below the guard raises
+    ModuleNotFoundError for any name that is not a plain module name, and that happens
+    before the filename is built, so a non-canonical model_type has always been a silent
+    skip here. 38 of the model_type values transformers ships are hyphenated, and this
+    function is exported, so raising would turn a skip into a hard failure for a caller
+    passing a raw `config.model_type`.
+    """
+    assert unsloth_compile_transformers(model_type) is None
+
+
+def _shipped_non_canonical_model_types():
+    """Literal `model_type` values the INSTALLED transformers ships that fail the regex.
+
+    Derived rather than hardcoded: the set differs between transformers versions, and a
+    hardcoded name that a version has not got yet would fail for the wrong reason.
+    """
+    import re as _re
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+    return sorted(
+        m for m in CONFIG_MAPPING_NAMES if not _re.fullmatch(r"[a-z0-9_]+", m)
+    )
+
+
+def test_real_hyphenated_model_types_are_skipped_not_raised():
+    """The compatibility property: a direct call must not turn a skip into a failure.
+
+    The producer rewrites `-` to `_` before the canonical path ever reaches here, so
+    this covers a direct call to the exported function, which is the case that regressed.
+    """
+    shipped = _shipped_non_canonical_model_types()
+    assert len(shipped) > 10, f"expected many hyphenated model types, got {shipped}"
+    for model_type in shipped:
+        assert unsloth_compile_transformers(model_type) is None, model_type
 
 
 @pytest.mark.parametrize("model_type", [p for p in PAYLOADS if p != ""])

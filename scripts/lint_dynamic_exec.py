@@ -167,14 +167,28 @@ def _call_hash(node: ast.Call) -> str:
 
 
 def scan_file(path: Path) -> list[dict]:
-    source = path.read_text(encoding = "utf-8", errors = "replace")
+    # A hard CI gate must not fall over on something that is not a readable file. A
+    # dangling symlink, a directory named `*.py`, or a symlink to one all reach here
+    # through rglob and raise out of read_text, failing the build for a reason that has
+    # nothing to do with dynamic execution.
+    try:
+        source = path.read_text(encoding = "utf-8", errors = "replace")
+    except OSError:
+        return []
     try:
         tree = ast.parse(source, filename = str(path))
-    except SyntaxError:
-        # compileall in the same lint job is what reports unparseable files.
+    except (SyntaxError, ValueError):
+        # compileall in the same lint job is what reports unparseable files. ValueError
+        # covers a source containing a NUL byte, which ast.parse rejects separately.
         return []
     visitor = _Visitor(path)
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except RecursionError:
+        # A deeply nested literal can exhaust the stack during the walk, after parse
+        # succeeded. Report nothing rather than taking the gate down; compileall still
+        # sees the file.
+        return []
     return visitor.findings
 
 
@@ -192,8 +206,11 @@ def collect_paths(targets: list[str]) -> list[Path]:
         if root.is_file() and root.suffix == ".py":
             paths.append(root)
         elif root.is_dir():
+            # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
+            # points at one are skipped rather than read.
             paths.extend(
-                p for p in root.rglob("*.py") if "tests" not in p.relative_to(REPO_ROOT).parts
+                p for p in root.rglob("*.py")
+                if p.is_file() and "tests" not in p.relative_to(REPO_ROOT).parts
             )
     return paths
 

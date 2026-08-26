@@ -4312,11 +4312,20 @@ def unsloth_compile_transformers(
     # `get_transformers_model_type` in hf_utils.py already validates this, but that is
     # the producer and this is the sink: `model_type` is a plain parameter here, and it
     # reaches both an import path (below) and the compiled-cache filename
-    # `f"{COMBINED_UNSLOTH_NAME}_{model_type}"`, which is os.path.join'd - so a `/` or
-    # `..` would be a path-traversal write. Re-check it so the sink defends itself
-    # rather than trusting every caller to have gone through the choke point.
+    # `f"{COMBINED_UNSLOTH_NAME}_{model_type}"`, which is os.path.join'd. Re-check it so
+    # the sink defends itself rather than trusting every caller to have gone through the
+    # choke point.
+    #
+    # `return`, not `raise`. This function is exported, and 38 of the model_type values
+    # transformers itself ships are hyphenated (`lfm2-vl`,
+    # `audio-spectrogram-transformer`, ...). A direct caller passing a raw
+    # `config.model_type` used to get a silent skip here, because the import below
+    # raises ModuleNotFoundError for any name that is not a plain module name, and that
+    # happens before the filename is ever built. Raising would turn that skip into a
+    # hard failure for real model types. Returning keeps the old behaviour exactly and
+    # still stops the value short of the os.path.join.
     if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
-        raise ValueError(f"Unsloth: Invalid model_type {model_type!r}.")
+        return
 
     model_location = f"transformers.models.{model_type}.modeling_{model_type}"
     try:

@@ -650,8 +650,13 @@ def _is_known_architecture(architecture):
 pass
 
 
-# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts.
-_INDEXED_COMPONENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[\d+\])+)")
+# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts. The name part
+# is "anything without brackets" rather than an ASCII identifier, because Python
+# identifiers are not ASCII-only and PyTorch registers a submodule under a Unicode name
+# without complaint. Only the subscripts are constrained, which is what keeps this a
+# name-and-index walk; the name itself is handed straight to getattr, exactly as the
+# eval this replaces did.
+_INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
 _INDEX = re.compile(r"\[(\d+)\]")
 
 

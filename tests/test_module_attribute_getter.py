@@ -170,3 +170,38 @@ def test_bracket_components_stay_a_name_and_index_walk():
         except Exception:
             continue
         raise AssertionError(f"{hostile!r} resolved, so a component is being evaluated")
+
+
+def test_a_unicode_named_submodule_resolves():
+    """Python identifiers are not ASCII-only and PyTorch registers them without complaint.
+
+    An ASCII-only pattern for the name part of `name[0]` would fall through to a bare
+    getattr on the whole `层[0]` string and fail, where the removed eval indexed it.
+    """
+    import torch
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    class Unicode(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.层 = torch.nn.ModuleList([Block(), Block()])
+
+    from unsloth_zoo.empty_model import _get_module_attribute
+
+    model = Unicode()
+    for path in ("层[0]", "层[1]", "层[0].weight"):
+        oracle = eval("model." + path, {}, {"model": model})
+        assert _get_module_attribute(model, path) is oracle, path
+    # The dotted-index spelling too, which eval could never parse at all.
+    assert _get_module_attribute(model, "层.0") is model.层[0]
+    # And the subscript is still digits only.
+    for hostile in ("层[x]", "层[0+0]", "层[-1]", "层['a']"):
+        try:
+            _get_module_attribute(model, hostile)
+        except Exception:
+            continue
+        raise AssertionError(f"{hostile!r} resolved")
