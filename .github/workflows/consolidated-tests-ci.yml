@@ -64,8 +64,8 @@ jobs:
       # interpreters share one `~/.cache/pip` on the runner, so four cache-enabled
       # steps do not cache four things: they save the identical directory four times
       # under four python-version keys. Observed on main 2026-08-23, where the 3.10
-      # and 3.13 entries were byte-identical at 2011216266 and 3.11 differed by 1524
-      # bytes -- 3.8 GiB of exact duplicates, against a 20 GiB repo ceiling. (3.12
+      # and 3.11 entries were byte-identical at 2011216266 and 3.13 differed by 1524
+      # bytes -- 3.7 GiB of exact duplicates, against a 20 GiB repo ceiling. (3.12
       # looked small only because repo-tests-cpu had already written that key four
       # minutes earlier and the duplicate save was skipped; same-key saves are
       # first-writer-wins.)

@@ -4,9 +4,10 @@
 name: Cache janitor
 
 # Keeps Actions cache usage clear of the 20 GiB ceiling. At the ceiling GitHub
-# evicts by LRU regardless of reachability, and a partially evicted cache still
-# restores, then misses on the evicted objects: the hit rate collapses with
-# nothing failing.
+# deletes whole entries by last-access date, regardless of reachability, so the
+# live entry of a family can go between the run that wrote it and the run that
+# needs it. The documented result is cache thrashing: entries created and deleted
+# at a high frequency, the hit rate collapsing with nothing failing.
 #
 # The ceiling is 20 GiB, not the 50 GB this workflow assumed until 2026-08-26.
 # That was not a harmless off-by-a-constant: the warning fired at 40 GiB, so it
@@ -23,14 +24,19 @@ name: Cache janitor
 #      open PR's caches are live no matter how old, and a lookup that errors
 #      keeps the cache.
 #
-#   2. Superseded generations of families that resolve via restore-keys, where
-#      GitHub returns the most recent prefix match so older generations serve no
-#      routine build:
+#   2. Superseded generations of the non-Python families that resolve via
+#      restore-keys, where GitHub returns the most recent prefix match so older
+#      generations serve no routine build:
 #        codeql-overlay-base-database-*  keys embed commit SHA + run id
 #        v0-rust-*                       Swatinem/rust-cache
 #
 #   3. Superseded generations of setup-python-*-pip-*, keyed by a hash over the
-#      dependency files. These were previously left alone on the reasoning that
+#      dependency files. This family resolves by restore-key too: setup-python
+#      v7.0.0 returns exactly one, the primary key minus the trailing hash
+#      (cache-distributions/pip-cache.ts computeKeys), which is the same prefix
+#      this workflow groups by. So the newest generation still answers a changed
+#      hash, and keeping 1 costs nothing routine. These were previously left
+#      alone on the reasoning that
 #      one generation is live at a time and a superseded one expires by itself
 #      after 7 days unused. Both halves are true and the conclusion still does
 #      not hold: 7 days of overlap, times four interpreters, times every ref
