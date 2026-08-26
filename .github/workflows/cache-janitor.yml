@@ -44,6 +44,24 @@ name: Cache janitor
 #      A dependency bump on 2026-08-23 left 6.6 GiB of the previous generation
 #      resident behind the new one.
 #
+#   4. Superseded generations of pip-*, the caches written by
+#      .github/actions/pip-cache-save. `name` is inside the prefix, so each
+#      installing job is its own family and its generations rank against each
+#      other and nothing else.
+#
+#      This family is why family 3 is on its way out. Once every job uses the
+#      restore/save pair, nothing writes a setup-python-*-pip-* key again and
+#      the last of them expires within 7 days; the arm stays only to sweep what
+#      is already there. Leaving pip-* unmatched in the meantime would have been
+#      the whole bug back: every pyproject.toml edit would strand the previous
+#      multi-GB entry on main with nothing able to rank it.
+#
+#      Bare pip-*, not a versioned prefix, because this repo has never written a
+#      pip-* key by any other scheme -- checked against the live cache list.
+#      unslothai/unsloth needs pip-v2-* for exactly the opposite reason: it has
+#      pre-existing pip-<os>-... keys, `Linux` is a valid name, and nothing else
+#      tells the two shapes apart.
+#
 # "Older" is not the same as unreachable. rust-cache passes its full key to
 # restoreCache, which tries an exact match first, so a build returning to an
 # earlier dependency state (a re-run of an old commit, a lockfile revert) can
@@ -177,11 +195,15 @@ jobs:
                 pre=$(printf '%s' "$key" | sed -E 's/-[0-9a-f]{40}-[0-9]+-[0-9]+$//') ;;
               v0-rust-*)
                 pre=$(printf '%s' "$key" | sed -E 's/-[0-9a-f]{8,}$//') ;;
-              setup-python-*-pip-*)
-                # Strip only the trailing dependency hash. The interpreter version
-                # stays in the prefix on purpose: 3.10 and 3.13 entries are separate
-                # keys that never substitute for one another, and folding them into
-                # one group would rank four live caches as four generations of one.
+              setup-python-*-pip-*|pip-*)
+                # Strip only the trailing dependency hash. Everything ahead of it
+                # stays in the prefix on purpose: the interpreter version for
+                # setup-python, the job name for pip-*. Those are separate keys
+                # that never substitute for one another, and folding them into one
+                # group would rank several live caches as generations of one.
+                #
+                # The two arms cannot collide: a setup-python key never begins
+                # `pip-`, and a pip-cache key always does.
                 pre=$(printf '%s' "$key" | sed -E 's/-[0-9a-f]{64}$//') ;;
               *) continue ;;
             esac

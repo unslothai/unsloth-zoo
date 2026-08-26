@@ -33,6 +33,7 @@ documented way to do this -- which is why it is asserted here instead.
 """
 
 import re
+import fnmatch
 import pathlib
 
 import pytest
@@ -144,6 +145,39 @@ def test_cache_names_are_unique_across_all_jobs():
                 )
                 seen[name] = where
     assert seen, "no pip-cache-restore call sites found; this test is stale"
+
+
+def test_the_janitor_ranks_the_pip_family():
+    # The keys this action mints are `pip-<name>-...`, which matched none of the
+    # janitor's original arms and so fell through to `*) continue`. Left that way,
+    # every pyproject.toml edit strands the previous multi-GB entry on main with
+    # nothing able to rank it -- and once every job here uses the restore/save
+    # pair, nothing writes a setup-python-* key again, so the janitor would prune
+    # no pip cache at all. Caught in review on #1109.
+    #
+    # Asserted by MATCHING a representative key against the arms, not by looking
+    # for the text `pip-*)`. That substring is already inside
+    # `setup-python-*-pip-*)`, so a textual check passes on the broken version and
+    # proves nothing.
+    janitor = (REPO / ".github/workflows/cache-janitor.yml").read_text()
+    block = re.search(r'case "\$key" in(.+?)\n\s*esac', janitor, re.S)
+    assert block, "the janitor's key dispatch moved; this assertion is stale"
+
+    patterns = []
+    for line in block.group(1).splitlines():
+        line = line.strip()
+        if not line.endswith(")") or line.startswith("#") or line.startswith("pre="):
+            continue
+        patterns.extend(line[:-1].split("|"))
+
+    for key in (
+        "pip-repo-tests-Linux-X64-py3.12-" + "a" * 64,
+        "pip-lint-Linux-X64-py3.12-" + "b" * 64,
+    ):
+        assert any(fnmatch.fnmatchcase(key, p) for p in patterns if p != "*"), (
+            f"cache-janitor.yml does not rank {key!r}. Its superseded generations "
+            f"would accumulate untouched, which is the pressure this PR removes."
+        )
 
 
 def test_save_runs_on_the_default_branch_only():
