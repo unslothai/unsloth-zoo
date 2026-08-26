@@ -484,12 +484,11 @@ def validate_single_function_source(
 pass
 
 
-# Importable by generated code. Excludes any stdlib module that reaches the
-# filesystem, network or another process (os, subprocess, socket, ctypes, ...).
-# Also excludes two that look harmless but are not: `operator`, whose attrgetter
-# takes a dotted string and so walks dunders without the AST check ever seeing
-# them, and `dataclasses`, which resolves annotations through
-# sys.modules[cls.__module__] and cannot work for synthetic globals.
+# Importable by generated code. Excludes anything reaching the filesystem,
+# network or another process (os, subprocess, socket, ctypes, ...), plus two
+# that only look harmless: `operator`, whose attrgetter takes a dotted string
+# and so walks dunders unseen by the AST check, and `dataclasses`, which
+# resolves annotations via sys.modules[cls.__module__] and cannot work here.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -502,11 +501,10 @@ class _SafeModule:
     """
     Facade over an allowlisted module.
 
-    Handing back the real module object is not enough, because modules
-    re-export other modules: `random._os` and `typing.sys` both lead straight
-    back to the process and filesystem capabilities the allowlist removes. So
-    deny private names, and deny nested modules unless their dotted name is
-    itself allowlisted.
+    Returning the real module is not enough: modules re-export other modules,
+    and `random._os` / `typing.sys` lead straight back to the capabilities the
+    allowlist removes. Denies private names, and nested modules unless their
+    dotted name is allowlisted too.
     """
     __slots__ = ("_module", "_name")
 
@@ -594,15 +592,14 @@ def _reject_dunder_access(tree):
     dunders, so refuse them outright.
     """
     for node in ast.walk(tree):
-        # Attributes are checked on a single underscore, not two: private
-        # attributes reach modules and internals just as well (random._os,
-        # ABCMeta._abc_impl), and generated code never needs them.
+        # One underscore for attributes: private ones reach modules and
+        # internals just as well (random._os, ABCMeta._abc_impl).
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
-        # Names stay at two, because a bare `_` or `_total` local is ordinary
-        # in generated code and reaches nothing on its own.
+        # Two for names: a bare `_` or `_total` local is ordinary and reaches
+        # nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
