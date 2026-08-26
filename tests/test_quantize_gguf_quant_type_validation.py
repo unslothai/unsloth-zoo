@@ -1,0 +1,146 @@
+"""quant_type reaches a shell=True command line, so it must be a bare token.
+
+`quantization_method` is a user facing argument all the way from
+`save_pretrained_gguf(..., quantization_method=...)` down to
+`quantize_gguf(quant_type=...)`, and the command is assembled as a string.
+Every legitimate value (unsloth's ALLOWED_QUANTS / IMATRIX_QUANTS, and the MLX
+quant_map) is `[a-z0-9_]+`, so anything carrying shell metacharacters is
+rejected outright instead of being interpolated.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+def _load_llama_cpp_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    module_path = repo_root / "unsloth_zoo" / "llama_cpp.py"
+    spec = importlib.util.spec_from_file_location("llama_cpp_under_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _install_fake_subprocess_run(monkeypatch, llama_cpp):
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(stdout="ok", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(llama_cpp.subprocess, "run", fake_run)
+    return captured
+
+
+def _stub_output_exists(monkeypatch):
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+    monkeypatch.setattr(Path, "stat", lambda self: SimpleNamespace(st_size=4096))
+
+
+MALICIOUS = [
+    "q4_k_m; touch pwned; #",
+    "q4_k_m && curl http://127.0.0.1/x",
+    "q4_k_m`id`",
+    "q4_k_m $(id)",
+    "q4_k_m | sh",
+    "",
+    "q4 k m",
+]
+
+
+@pytest.mark.parametrize("quant_type", MALICIOUS)
+def test_shell_metacharacters_are_rejected(monkeypatch, quant_type):
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    with pytest.raises(ValueError):
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type=quant_type,
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+        )
+    assert "cmd" not in captured, "subprocess must not run for a rejected quant_type"
+
+
+def test_non_string_quant_type_is_rejected(monkeypatch):
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    with pytest.raises(ValueError):
+        llama_cpp.quantize_gguf(
+            input_gguf="/tmp/in.gguf",
+            output_gguf="/tmp/out.gguf",
+            quant_type=None,
+            quantizer_location="/usr/bin/llama-quantize",
+            n_threads=4,
+            print_output=False,
+        )
+    assert "cmd" not in captured
+
+
+@pytest.mark.parametrize(
+    "quant_type",
+    ["q4_k_m", "q8_0", "bf16", "f16", "f32", "iq4_xs", "iq1_m", "q6_k", "Q4_K_M"],
+)
+def test_legitimate_quant_types_still_run(monkeypatch, quant_type):
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type=quant_type,
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=False,
+    )
+
+    cmd = captured["cmd"]
+    assert cmd == f"/usr/bin/llama-quantize /tmp/in.gguf /tmp/out.gguf {quant_type} 4"
+
+
+def test_surrounding_whitespace_is_trimmed_not_rejected(monkeypatch):
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="  q4_k_m  ",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads=4,
+        print_output=False,
+    )
+    assert captured["cmd"].endswith("q4_k_m 4")
+
+
+def test_n_threads_is_coerced_to_int(monkeypatch):
+    llama_cpp = _load_llama_cpp_module()
+    captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
+    _stub_output_exists(monkeypatch)
+
+    llama_cpp.quantize_gguf(
+        input_gguf="/tmp/in.gguf",
+        output_gguf="/tmp/out.gguf",
+        quant_type="q4_k_m",
+        quantizer_location="/usr/bin/llama-quantize",
+        n_threads="8",
+        print_output=False,
+    )
+    assert captured["cmd"].endswith(" 8")

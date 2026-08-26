@@ -1501,26 +1501,82 @@ def install_llama_cpp(
 pass
 
 
-def _load_module_from_path(filepath, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, filepath)
-    if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
-    module = importlib.util.module_from_spec(spec)
-    script_dir = os.path.dirname(os.path.abspath(filepath))
-    original_path = sys.path[:]
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    # Register module before execution to handle circular imports within the script if any
-    sys.modules[module_name] = module
+def _extract_archs_from_monolith_source(source_bytes):
+    """AST-parse a monolithic convert_hf_to_gguf.py for its registered
+    architectures, returning (text_archs, vision_archs).
+
+    Reads the `@ModelBase.register("Arch", ...)` / `@Model.register(...)`
+    decorators statically. Parsing rather than importing matters: the file is
+    downloaded from llama.cpp's master branch at runtime, and importing it
+    would execute whatever that download happens to contain inside this
+    process. Mirrors _extract_dict_keys_from_conversion_init, which already
+    does the same for the newer conversion/ package layout.
+    """
     try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        # Clean up registry if exec fails
-        del sys.modules[module_name]
-        raise ImportError(f"Failed to execute module {module_name} from {filepath}") from e
-    finally:
-        sys.path[:] = original_path
-    return module
+        tree = ast.parse(source_bytes)
+    except Exception:
+        return set(), set()
+
+    text_archs   = set()
+    vision_archs = set()
+
+    def _is_register_call(node):
+        # Matches ModelBase.register(...) / Model.register(...) / <X>.register(...)
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register"
+            and isinstance(node.func.value, ast.Name)
+        )
+
+    def _base_names(class_node):
+        names = []
+        for base in class_node.bases:
+            if   isinstance(base, ast.Attribute): names.append(base.attr)
+            elif isinstance(base, ast.Name):      names.append(base.id)
+        return names
+
+    # class name -> base names, so `class X(WhisperEncoderModel)` is still
+    # recognised as an mmproj model two hops away from MmprojModel.
+    class_bases = {
+        node.name : _base_names(node)
+        for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    }
+
+    def _inherits_mmproj(class_name, _seen = None):
+        if _seen is None: _seen = set()
+        if class_name in _seen: return False
+        _seen.add(class_name)
+        for base in class_bases.get(class_name, []):
+            if base.lower() in ("mmprojmodel", "visionmodel"): return True
+            if _inherits_mmproj(base, _seen): return True
+        return False
+
+    def _is_mmproj(class_node, call_node):
+        for keyword in call_node.keywords:
+            if keyword.arg != "model_type": continue
+            value = keyword.value
+            # model_type=ModelType.MMPROJ, or a bare MMPROJ / "mmproj"
+            name = None
+            if isinstance(value, ast.Attribute): name = value.attr
+            elif isinstance(value, ast.Name): name = value.id
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = value.value
+            if name is not None and "mmproj" in name.lower(): return True
+        return _inherits_mmproj(class_node.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef): continue
+        for decorator in node.decorator_list:
+            if not _is_register_call(decorator): continue
+            names = [
+                arg.value for arg in decorator.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            ]
+            if not names: continue
+            if _is_mmproj(node, decorator): vision_archs.update(names)
+            else: text_archs.update(names)
+    return text_archs, vision_archs
 pass
 
 
@@ -1696,8 +1752,6 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     supported_types = set()
     text_archs = set()
     vision_archs = set()
-    temp_original_file_path = None # for the finally block
-    original_module_name = None    # Only set on the monolith branch
     # Default to 'monolith' so a failed introspection still drives the legacy
     # patches; set by introspection and read by Patch 2 + Patch 3 below.
     _layout = "monolith"
@@ -1759,63 +1813,18 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     "allowlist will be empty; conversion will still attempt to run."
                 )
         else:
-            # Monolith layout: original behaviour. Write the entrypoint to a
-            # temp file under LLAMA_CPP_DEFAULT_DIR and import it to read
-            # ModelBase._model_classes.
-            with tempfile.NamedTemporaryFile(
-                mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
-            ) as temp_file:
-                temp_original_file_path = temp_file.name
-                temp_file.write(original_content)
-                temp_file.flush()
-
-            logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
-            original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
-
-            # Set NO_LOCAL_GGUF to prevent the script from adding path again
-            old_env = os.environ.get('NO_LOCAL_GGUF')
-            os.environ['NO_LOCAL_GGUF'] = '1'
-
-            try:
-                module = _load_module_from_path(temp_original_file_path, original_module_name)
-            finally:
-                if old_env is None:
-                    os.environ.pop('NO_LOCAL_GGUF', None)
-                else:
-                    os.environ['NO_LOCAL_GGUF'] = old_env
-            ModelBase = getattr(module, 'ModelBase', None)
-            ModelType = getattr(module, 'ModelType', None)
-
-            if ModelBase is None or ModelType is None:
-                logger.warning(
-                    f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
-                    f"Structure might have changed. Cannot determine supported architectures."
-                )
-            elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
-                 logger.warning(
-                    f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
-                     " Cannot determine supported architectures."
-                )
-            else:
-                # Check for TEXT models
-                if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
-                        text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
-                        supported_types.update(text_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
-                else:
-                    logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
-
-                # Check for VISION models
-                if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
-                        vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
-                        supported_types.update(vision_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
-                else:
-                     logger.info("Unsloth: No VISION model architectures found registered in the original script.")
+            # Monolith layout: archs come from AST-parsing the
+            # @ModelBase.register(...) decorators in the entrypoint itself.
+            # This file is downloaded from llama.cpp master at runtime, so it
+            # is read, never imported - importing it would execute whatever
+            # the download contained inside this process.
+            text_archs, vision_archs = _extract_archs_from_monolith_source(original_content)
+            supported_types.update(text_archs)
+            supported_types.update(vision_archs)
+            if not text_archs:
+                logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+            if not vision_archs:
+                logger.info("Unsloth: No VISION model architectures found registered in the original script.")
         # --- End Architecture Extraction ---
 
         # Convert final set to frozenset for immutability (good practice for cache keys/return values)
@@ -1828,23 +1837,9 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
-        # Cleanup module reference (only set on the monolith branch)
-        if original_module_name is not None and original_module_name in sys.modules:
-             del sys.modules[original_module_name]
-
     except Exception as e:
          logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
-         if temp_original_file_path and os.path.exists(temp_original_file_path):
-             try: os.remove(temp_original_file_path)
-             except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
          raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
-    finally:
-        if temp_original_file_path and os.path.exists(temp_original_file_path):
-            try:
-                os.remove(temp_original_file_path)
-                logger.debug(f"Cleaned up temporary file: {temp_original_file_path}")
-            except OSError as remove_error:
-                logger.warning(f"Could not remove temporary file {temp_original_file_path}: {remove_error}")
 
 
     # --- Proceed with patching and saving ---
@@ -2603,7 +2598,9 @@ def convert_to_gguf(
             )
     pass
 
-    if is_vlm and supported_vision_archs is not None:
+    # An empty set means "we could not determine the allowlist", not "nothing is
+    # supported" - matching the text-arch check above, don't gate on it.
+    if is_vlm and supported_vision_archs:
         if "architectures" in config_file:
             arch = config_file["architectures"][0]
         else:
@@ -2947,6 +2944,18 @@ def quantize_gguf(
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
 
+    # quant_type lands in a shell command below, and callers pass it straight
+    # through from user facing arguments (`quantization_method=...`). Every
+    # legitimate value is a bare token like q4_k_m / iq3_xxs / bf16, so reject
+    # anything else rather than letting shell metacharacters through.
+    if not isinstance(quant_type, str) or \
+        re.fullmatch(r"[A-Za-z0-9_.\-]+", quant_type.strip()) is None:
+        raise ValueError(
+            f"Unsloth: Invalid quantization type `{quant_type}`. Quantization types are "
+            f"single tokens like `q4_k_m`, `q8_0`, `iq4_xs`, `bf16`."
+        )
+    quant_type = quant_type.strip()
+
     # Fix default path on Windows: binaries are in build/bin/Release/
     default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
     # H3: Use normpath for reliable path comparison on Windows (/ vs \)
@@ -2960,6 +2969,7 @@ def quantize_gguf(
         if n_threads is None:
             n_threads = 1
         n_threads *= 2
+    n_threads = int(n_threads)
 
     def _quote(s):
         """Quote a path for shell usage (the command runs under shell=True)."""
@@ -2999,7 +3009,7 @@ def quantize_gguf(
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
-        f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
+        f"{_quote(input_gguf)} {_quote(output_gguf)} {_quote(quant_type)} {n_threads}"
     )
 
     if print_output:

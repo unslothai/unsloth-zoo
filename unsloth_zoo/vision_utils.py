@@ -119,6 +119,117 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
+# Dataset rows can carry arbitrary http(s) URLs (`{"type": "image_url", ...}`),
+# and the collators fetch them server side. Without a destination check that is
+# an SSRF primitive: a dataset can make the training worker hit 127.0.0.1, a
+# LAN host, or the cloud metadata endpoint. Public URLs and every local-file
+# form keep working exactly as before; users who really do serve training media
+# from localhost or a private host set UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
+UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
+UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
+_MAX_MEDIA_REDIRECTS = 5
+
+
+def _allow_private_url_fetch() -> bool:
+    # Read at call time, not import time: notebooks routinely set the env var
+    # after `import unsloth`.
+    return os.environ.get(UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR, "0") == "1"
+
+
+def _max_media_download_bytes() -> int:
+    try:
+        megabytes = float(os.environ.get(UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR, 256))
+    except ValueError:
+        megabytes = 256.0
+    if megabytes <= 0: return 0  # 0 disables the cap
+    return int(megabytes * 1024 * 1024)
+
+
+def _is_blocked_address(host: str) -> bool:
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        # Unresolvable: let the HTTP client produce its own error.
+        return False
+    for info in infos:
+        address = info[4][0]
+        try:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
+            return True
+        # IPv4-mapped/6to4 wrappers around a private v4 address
+        mapped = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None)
+        if mapped is not None and (
+            mapped.is_loopback or mapped.is_private or mapped.is_link_local
+            or mapped.is_reserved or mapped.is_multicast or mapped.is_unspecified
+        ):
+            return True
+    return False
+
+
+def assert_fetchable_url(url: str) -> str:
+    """Reject non-http(s) URLs and URLs pointing at loopback/private hosts."""
+    if _allow_private_url_fetch(): return url
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
+            f"Only http and https URLs are fetched; use a local path for local files."
+        )
+    host = parsed.hostname
+    if host is None:
+        raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
+    if _is_blocked_address(host):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
+            f"loopback, private, link-local or otherwise internal address. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
+        )
+    return url
+
+
+def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
+    """Fetch an http(s) URL into memory, checking every redirect hop."""
+    from urllib.parse import urljoin
+
+    max_bytes = _max_media_download_bytes()
+    current = url
+    for _ in range(_MAX_MEDIA_REDIRECTS + 1):
+        assert_fetchable_url(current)
+        response = requests.get(current, stream = True, timeout = timeout, allow_redirects = False)
+        if response.is_redirect or response.is_permanent_redirect:
+            location = response.headers.get("location")
+            response.close()
+            if not location:
+                raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
+            current = urljoin(current, location)
+            continue
+        response.raise_for_status()
+        data = BytesIO()
+        for chunk in response.iter_content(chunk_size = 1024 * 1024):
+            if not chunk: continue
+            data.write(chunk)
+            if max_bytes and data.tell() > max_bytes:
+                response.close()
+                raise ValueError(
+                    f"Unsloth: Media at `{url}` exceeds {max_bytes // (1024 * 1024)}MB. "
+                    f"Raise {UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
+                )
+        data.seek(0)
+        return data
+    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
+
+
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -175,7 +286,7 @@ def fetch_image(
         image_obj = image
     elif isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image_obj = Image.open(requests.get(image, stream=True, timeout=30).raw)
+            image_obj = Image.open(fetch_remote_media_bytes(image))
         elif image.startswith("file://"):
             image_obj = Image.open(resolve_file_uri_to_path(image))
         elif image.startswith("data:image"):
@@ -193,7 +304,7 @@ def fetch_image(
         elif "path" in image and image["path"]:
             image_obj = Image.open(image["path"])
         elif "url" in image and image["url"]:
-            image_obj = Image.open(requests.get(image["url"], stream=True, timeout=30).raw)
+            image_obj = Image.open(fetch_remote_media_bytes(image["url"]))
 
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
@@ -446,6 +557,10 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
+        # The backends (torchvision / decord / torchcodec+ffmpeg) fetch remote
+        # URLs themselves, so vet the destination before handing it over.
+        if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
+            assert_fetchable_url(ele["video"])
         video_reader_backend = get_video_reader_backend()
         try:
             video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

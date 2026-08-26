@@ -1,0 +1,208 @@
+"""Dataset supplied image/video URLs must not reach internal addresses.
+
+A VLM dataset row can carry `{"type": "image_url", "image_url": "http://..."}`,
+and the collators resolve it server side through fetch_image()/fetch_video().
+Without a destination check that lets a dataset drive requests from the
+training worker to localhost, the LAN, or the cloud metadata endpoint. Public
+URLs and every local-file form must keep working unchanged.
+"""
+
+from __future__ import annotations
+
+import io
+
+import pytest
+
+PIL = pytest.importorskip("PIL")
+from PIL import Image  # noqa: E402
+
+from unsloth_zoo import vision_utils  # noqa: E402
+
+
+BLOCKED_URLS = [
+    "http://127.0.0.1:9/x.png",
+    "http://localhost:8080/x.png",
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "http://10.0.0.5/x.png",
+    "http://192.168.1.10/x.png",
+    "http://172.16.3.4/x.png",
+    "http://[::1]:8000/x.png",
+    "http://0.0.0.0/x.png",
+]
+
+
+@pytest.fixture(autouse=True)
+def _default_policy(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", raising=False)
+    monkeypatch.delenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", raising=False)
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    """Fail loudly if anything actually issues a request."""
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError(f"network call escaped the guard: {args} {kwargs}")
+
+    monkeypatch.setattr(vision_utils.requests, "get", boom)
+    return calls
+
+
+def _png_bytes(size=(32, 32), color=(1, 2, 3)):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _FakeResponse:
+    is_redirect = False
+    is_permanent_redirect = False
+
+    def __init__(self, content=b"", status=200, headers=None, redirect_to=None):
+        self._content = content
+        self.status_code = status
+        self.headers = headers or {}
+        if redirect_to is not None:
+            self.is_redirect = True
+            self.headers["location"] = redirect_to
+
+    def iter_content(self, chunk_size=1):
+        for i in range(0, len(self._content), chunk_size):
+            yield self._content[i : i + chunk_size]
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"HTTP {self.status_code}")
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    """Resolve every host to a public address unless it is a literal IP."""
+    import ipaddress
+    import socket
+
+    real = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.mark.parametrize("url", BLOCKED_URLS)
+def test_fetch_image_blocks_internal_urls(url, no_network):
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": url})
+    assert no_network == []
+
+
+@pytest.mark.parametrize("url", BLOCKED_URLS)
+def test_fetch_image_blocks_internal_urls_via_image_url_dict(url, no_network):
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image_url": {"url": url}})
+    assert no_network == []
+
+
+def test_fetch_image_blocks_non_http_scheme_in_url_dict(no_network):
+    # The dict {"url": ...} branch previously had no scheme check at all.
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": {"url": "file:///etc/passwd"}})
+    assert no_network == []
+
+
+def test_process_vision_info_blocks_internal_urls(no_network):
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": "http://169.254.169.254/metadata"},
+        ],
+    }]
+    with pytest.raises(ValueError):
+        vision_utils.process_vision_info(messages)
+    assert no_network == []
+
+
+def test_public_url_is_still_fetched(monkeypatch, public_dns):
+    seen = []
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        return _FakeResponse(_png_bytes())
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+
+    image = vision_utils.fetch_image({"image": "https://example.com/cat.png"})
+    assert seen == ["https://example.com/cat.png"]
+    assert image.size[0] > 0 and image.size[1] > 0
+
+
+def test_redirect_to_internal_address_is_blocked(monkeypatch, public_dns):
+    seen = []
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        return _FakeResponse(redirect_to="http://127.0.0.1:9/secret.png")
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": "https://example.com/redir.png"})
+    assert seen == ["https://example.com/redir.png"], "the internal hop must not be requested"
+
+
+def test_size_cap_is_enforced(monkeypatch, public_dns):
+    monkeypatch.setenv("UNSLOTH_MAX_MEDIA_DOWNLOAD_MB", "0.0001")  # ~100 bytes
+    monkeypatch.setattr(
+        vision_utils.requests, "get",
+        lambda url, **kwargs: _FakeResponse(_png_bytes((256, 256), (7, 8, 9))),
+    )
+    with pytest.raises(ValueError):
+        vision_utils.fetch_image({"image": "https://example.com/big.png"})
+
+
+def test_opt_out_env_var_allows_private_urls(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
+    seen = []
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        return _FakeResponse(_png_bytes())
+
+    monkeypatch.setattr(vision_utils.requests, "get", fake_get)
+
+    image = vision_utils.fetch_image({"image": "http://127.0.0.1:8000/local.png"})
+    assert seen == ["http://127.0.0.1:8000/local.png"]
+    assert image.size[0] > 0
+
+
+def test_local_paths_and_data_uris_are_untouched(tmp_path, no_network):
+    path = tmp_path / "img.png"
+    path.write_bytes(_png_bytes(color=(9, 9, 9)))
+
+    assert vision_utils.fetch_image({"image": str(path)}).size[0] > 0
+    assert vision_utils.fetch_image({"image": path.as_uri()}).size[0] > 0
+    assert vision_utils.fetch_image({"image": {"path": str(path)}}).size[0] > 0
+    assert vision_utils.fetch_image({"image": {"bytes": _png_bytes()}}).size[0] > 0
+
+    import base64
+    encoded = base64.b64encode(_png_bytes()).decode()
+    assert vision_utils.fetch_image({"image": f"data:image/png;base64,{encoded}"}).size[0] > 0
+
+
+def test_fetch_video_rejects_internal_url_before_touching_a_backend(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("video backend must not be reached")
+
+    monkeypatch.setattr(vision_utils, "get_video_reader_backend", boom)
+    with pytest.raises(ValueError):
+        vision_utils.fetch_video({"video": "http://127.0.0.1:9/clip.mp4"})
