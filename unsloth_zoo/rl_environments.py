@@ -512,9 +512,16 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     compiles annotations to strings, a class annotated with
 #     "__import__('os').system(...)" executes on the call. The notebooks' own
 #     samples do `from typing import Callable`, so typing itself stays.
+#   typing.ForwardRef.evaluate and typing.evaluate_forward_ref are the same
+#     evaluator, made public in 3.14. They do not exist on 3.13, where the
+#     entry point is the private _evaluate and the private-attribute rule
+#     already covers it, but this package supports up to 3.14, so deny the
+#     names outright rather than have the hole open on the newer runtime.
 _DENIED_MODULE_ATTRS = frozenset({
     "operator.attrgetter",
     "operator.methodcaller",
+    "typing.ForwardRef",
+    "typing.evaluate_forward_ref",
     "typing.get_type_hints",
 })
 

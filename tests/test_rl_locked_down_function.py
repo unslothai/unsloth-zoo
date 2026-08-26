@@ -60,6 +60,19 @@ def test_typing_get_type_hints_is_denied():
         create_locked_down_function(source)([], [])
 
 
+def test_typing_forward_ref_evaluators_are_denied():
+    # ForwardRef.evaluate and evaluate_forward_ref are the same evaluator, made
+    # public in 3.14. On 3.13 the entry point is the private _evaluate, which
+    # the private-attribute rule already covers, but this package supports 3.14
+    # so the names are denied on every version.
+    for source in (
+        'def matmul(A, B):\n    import typing\n    return typing.ForwardRef("1+1")\n',
+        'def matmul(A, B):\n    import typing\n    return typing.evaluate_forward_ref\n',
+    ):
+        with pytest.raises(AttributeError):
+            create_locked_down_function(source)([], [])
+
+
 def test_rest_of_typing_still_works():
     # typing stays allowlisted because the notebooks' own samples import it.
     source = (
