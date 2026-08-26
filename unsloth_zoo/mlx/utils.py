@@ -14670,15 +14670,30 @@ def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
     """
     from unsloth_zoo.llama_cpp import UNSLOTH_HOME
 
+    def _canonical(path):
+        # realpath both sides so a symlinked home, or macOS' /tmp -> /private/tmp,
+        # compares equal. normcase so Windows' case-insensitive, backslash paths
+        # do too (this helper is only reached on macOS today, but the comparison
+        # should not silently depend on that).
+        return os.path.normcase(os.path.realpath(path))
+
     def _contains(parent, child):
-        parent = os.path.realpath(parent)
-        return child == parent or child.startswith(parent + os.sep)
+        parent = _canonical(parent)
+        # The trailing separator matters: "/home/me/.unsloth-evil" must not read
+        # as being inside "/home/me/.unsloth". os.path.join(parent, "") rather
+        # than parent + os.sep so a root parent stays "/" and not "//".
+        return child == parent or child.startswith(os.path.join(parent, ""))
 
     try:
-        real_folder = os.path.realpath(llama_cpp_folder)
+        real_folder = _canonical(llama_cpp_folder)
         if _contains(UNSLOTH_HOME, real_folder): return True
-        operator_path = os.environ.get("UNSLOTH_LLAMA_CPP_PATH")
-        if operator_path and _contains(operator_path, real_folder): return True
+        # Both the raw and the stripped value: LLAMA_CPP_DEFAULT_DIR uses the
+        # variable verbatim, while Studio .strip()s it, so a value with stray
+        # whitespace must read as trusted either way rather than falling through
+        # to the index because the two spellings did not compare equal.
+        raw = os.environ.get("UNSLOTH_LLAMA_CPP_PATH") or ""
+        for operator_path in (raw, raw.strip()):
+            if operator_path and _contains(operator_path, real_folder): return True
     except Exception:
         # On any unexpected error treat the checkout as untrusted -- the index
         # fallback still produces a working gguf install.
