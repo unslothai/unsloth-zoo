@@ -123,3 +123,50 @@ def test_round_trip_with_the_setter(path):
     value = nn.Parameter(torch.randn(8), requires_grad = False)
     _set_module_attribute(model, path, value)
     assert _get_module_attribute(model, path) is value
+
+
+# --- bracket components, from the parallel review of PR #1108 -----------------
+
+def test_bracket_components_resolve_like_eval():
+    """`peft_utils` rewrites `.0.` to `[0].`, and one of its two call sites can hand
+    back a path whose component still carries the brackets.
+
+    `eval("model.blocks[0]")` indexed that happily; a bare getattr cannot, so the
+    replacement has to understand the same syntax or gradient checkpointing breaks for
+    any model whose forward calls `self.blocks[0](...)` directly.
+    """
+    import torch
+    from unsloth_zoo.empty_model import _get_module_attribute
+
+    class Inner(torch.nn.Module):
+        def __init__(self): 
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    class Outer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([Inner(), Inner()])
+
+    model = Outer()
+    for path in ("blocks[0]", "blocks[1]", "blocks[0].weight"):
+        oracle = eval("model." + path, {}, {"model": model})
+        assert _get_module_attribute(model, path) is oracle, path
+
+    # The dotted-index spelling still works, and both spellings agree.
+    assert _get_module_attribute(model, "blocks.0") is _get_module_attribute(model, "blocks[0]")
+
+
+def test_bracket_components_stay_a_name_and_index_walk():
+    """Only digits are accepted inside the brackets, so this is not an expression."""
+    import torch
+    from unsloth_zoo.empty_model import _get_module_attribute
+
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+    for hostile in ("blocks[0+0]", "blocks[x]", "blocks[-1]", "blocks['a']", "blocks[()]"):
+        try:
+            _get_module_attribute(model, hostile)
+        except Exception:
+            continue
+        raise AssertionError(f"{hostile!r} resolved, so a component is being evaluated")

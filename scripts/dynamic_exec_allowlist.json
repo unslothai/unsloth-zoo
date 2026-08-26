@@ -266,6 +266,22 @@
       "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
     },
     {
+      "path": "unsloth_zoo/llama_cpp.py",
+      "qualname": "_assert_correct_gguf",
+      "sink": "exec",
+      "kind": "f-string via `source`",
+      "hash": "3725bba562bb6fff",
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+    },
+    {
+      "path": "unsloth_zoo/llama_cpp.py",
+      "qualname": "_assert_correct_gguf",
+      "sink": "exec",
+      "kind": "f-string via `functions`",
+      "hash": "7330700d494b9249",
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+    },
+    {
       "path": "unsloth_zoo/patching_utils.py",
       "qualname": "<module>",
       "sink": "exec",
@@ -296,6 +312,14 @@
       "kind": "f-string",
       "hash": "45bbd24d7d803e73",
       "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "get_lora_layer_modules",
+      "sink": "eval",
+      "kind": "f-string via `item`",
+      "hash": "81cdac2f6f8a2c32",
+      "reason": "`item` is `peft.tuners.lora.<file>` where <file> is a .py filename listed from the INSTALLED peft package directory, and `modules` is dir() of that module filtered to Linear* names. Both are properties of the installed dependency."
     },
     {
       "path": "unsloth_zoo/peft_utils.py",
@@ -344,6 +368,14 @@
       "kind": "string concatenation",
       "hash": "13fce184fe981cb2",
       "reason": "Imports names selected by `x in source` from dir(transformers.quantizers.auto)."
+    },
+    {
+      "path": "unsloth_zoo/temporary_patches/misc.py",
+      "qualname": "patch_merge_quantization_configs",
+      "sink": "exec",
+      "kind": "string concatenation via `source`",
+      "hash": "7a5e305efb369e7f",
+      "reason": "`source` is inspect.getsource of the installed transformers quantizer method, reindented and with the classmethod `cls` parameter stripped. Self-generated source, same category as the compiler sites."
     },
     {
       "path": "unsloth_zoo/vllm_utils.py",

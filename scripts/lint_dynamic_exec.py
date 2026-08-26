@@ -79,37 +79,80 @@ def _is_interpolated(node: ast.AST) -> str | None:
     return None
 
 
+def _sink_name(function: ast.AST) -> str | None:
+    """The sink this call target names, if any.
+
+    Both `exec(...)` and `builtins.exec(...)` execute. Matching only `ast.Name` meant
+    the second form passed the lint with zero findings.
+    """
+    if isinstance(function, ast.Name) and function.id in SINKS:
+        return function.id
+    if isinstance(function, ast.Attribute) and function.attr in SINKS:
+        if isinstance(function.value, ast.Name) and function.value.id == "builtins":
+            return f"builtins.{function.attr}"
+    return None
+
+
 class _Visitor(ast.NodeVisitor):
     def __init__(self, path: Path):
         self.path = path
         self.scope: list[str] = []
         self.findings: list[dict] = []
+        # name -> reason, for locals bound to a built string in the current scope.
+        self.tainted: list[dict[str, str]] = [{}]
 
     def _qualname(self) -> str:
         return ".".join(self.scope) if self.scope else "<module>"
 
     def _enter(self, node):
         self.scope.append(node.name)
+        # A fresh scope: a name built in one function says nothing about the same name
+        # in another.
+        self.tainted.append({})
         self.generic_visit(node)
+        self.tainted.pop()
         self.scope.pop()
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
     visit_ClassDef = _enter
 
+    def visit_Assign(self, node: ast.Assign):
+        """Tracks `payload = f"...{x}..."` so `exec(payload)` is still caught.
+
+        One level of local indirection, which is all it took to defeat the previous
+        version: moving the interpolation onto the line above is a two-line refactor
+        that leaves the vulnerability shape exactly as it was. Rebinding a tracked name
+        to something that is not a built string clears it, so this does not accumulate
+        false positives.
+        """
+        reason = _is_interpolated(node.value)
+        for target in node.targets:
+            if not isinstance(target, ast.Name): continue
+            if reason is None:
+                self.tainted[-1].pop(target.id, None)
+            else:
+                self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call):
-        function = node.func
-        if isinstance(function, ast.Name) and function.id in SINKS and node.args:
-            reason = _is_interpolated(node.args[0])
+        sink = _sink_name(node.func)
+        if sink is not None and node.args:
+            argument = node.args[0]
+            reason = _is_interpolated(argument)
+            if reason is None and isinstance(argument, ast.Name):
+                reason = self.tainted[-1].get(argument.id)
             if reason is not None:
-                self.findings.append({
-                    "path": _relative(self.path),
-                    "qualname": self._qualname(),
-                    "sink": function.id,
-                    "reason": reason,
-                    "line": node.lineno,
-                    "hash": _call_hash(node),
-                })
+                self.findings.append(
+                    {
+                        "path": _relative(self.path),
+                        "qualname": self._qualname(),
+                        "sink": sink,
+                        "reason": reason,
+                        "line": node.lineno,
+                        "hash": _call_hash(node),
+                    }
+                )
         self.generic_visit(node)
 
 
@@ -150,8 +193,7 @@ def collect_paths(targets: list[str]) -> list[Path]:
             paths.append(root)
         elif root.is_dir():
             paths.extend(
-                p for p in root.rglob("*.py")
-                if "tests" not in p.relative_to(REPO_ROOT).parts
+                p for p in root.rglob("*.py") if "tests" not in p.relative_to(REPO_ROOT).parts
             )
     return paths
 
@@ -160,11 +202,19 @@ def load_allowlist() -> dict[str, dict]:
     if not ALLOWLIST_PATH.exists():
         return {}
     data = json.loads(ALLOWLIST_PATH.read_text())
-    return {entry["hash"]: entry for entry in data.get("allowed", [])}
+    return {key_of(entry): entry for entry in data.get("allowed", [])}
 
 
 def key_of(finding: dict) -> str:
-    return finding["hash"]
+    """Identity of a reviewed call: where it is, and what it is.
+
+    The hash alone is not an identity. Two different call sites with byte-identical
+    source share a hash, so approving one approved the other, and copying an
+    allowlisted call into a function with attacker-controlled inputs inherited its
+    justification without review. The location is half of what was reviewed, so it is
+    half of the key.
+    """
+    return f"{finding['path']}::{finding['qualname']}::{finding['hash']}"
 
 
 def write_allowlist(findings: list[dict], reason: str) -> None:
@@ -172,14 +222,16 @@ def write_allowlist(findings: list[dict], reason: str) -> None:
     allowed = []
     for finding in findings:
         previous = existing.get(key_of(finding), {})
-        allowed.append({
-            "path": finding["path"],
-            "qualname": finding["qualname"],
-            "sink": finding["sink"],
-            "kind": finding["reason"],
-            "hash": finding["hash"],
-            "reason": previous.get("reason", reason),
-        })
+        allowed.append(
+            {
+                "path": finding["path"],
+                "qualname": finding["qualname"],
+                "sink": finding["sink"],
+                "kind": finding["reason"],
+                "hash": finding["hash"],
+                "reason": previous.get("reason", reason),
+            }
+        )
     allowed.sort(key = lambda e: (e["path"], e["qualname"], e["hash"]))
     ALLOWLIST_PATH.write_text(
         json.dumps(
@@ -194,21 +246,22 @@ def write_allowlist(findings: list[dict], reason: str) -> None:
                 "allowed": allowed,
             },
             indent = 2,
-        ) + "\n"
+        )
+        + "\n"
     )
 
 
 # --- self test ---------------------------------------------------------------
 
-_BAD = '''
+_BAD = """
 def f(model_type):
     exec(f"import transformers.models.{model_type}")
     eval("torch." + name)
     compile("x = %s" % value, "<x>", "exec")
     exec("a.{}.b".format(name))
-'''
+"""
 
-_GOOD = '''
+_GOOD = """
 import inspect
 
 def f(cls):
@@ -218,7 +271,7 @@ def f(cls):
     exec(f"plain f-string with no placeholders")
     module.exec(f"{name}")          # not the builtin
     exec()                          # no arguments
-'''
+"""
 
 
 def self_test() -> int:
@@ -268,10 +321,15 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description = __doc__)
     parser.add_argument("--self-test", action = "store_true")
-    parser.add_argument("--update", action = "store_true",
-                        help = "rewrite the allowlist from the current tree")
-    parser.add_argument("--paths", nargs = "*", default = None,
-                        help = "files or directories to scan (default: the package)")
+    parser.add_argument(
+        "--update", action = "store_true", help = "rewrite the allowlist from the current tree"
+    )
+    parser.add_argument(
+        "--paths",
+        nargs = "*",
+        default = None,
+        help = "files or directories to scan (default: the package)",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -288,16 +346,14 @@ def main() -> int:
     allowlist = load_allowlist()
     unreviewed = [f for f in findings if key_of(f) not in allowlist]
     pending = [
-        entry for entry in allowlist.values()
+        entry
+        for entry in allowlist.values()
         if entry.get("reason", "").strip().upper() in ("", "REVIEW ME")
     ]
     # Staleness is only meaningful over the whole tree: with --paths the scan is a
     # subset, so every entry outside it would look stale.
     seen = {key_of(f) for f in findings}
-    stale = (
-        [] if args.paths
-        else [entry for key, entry in allowlist.items() if key not in seen]
-    )
+    stale = [] if args.paths else [entry for key, entry in allowlist.items() if key not in seen]
 
     for finding in unreviewed:
         print(

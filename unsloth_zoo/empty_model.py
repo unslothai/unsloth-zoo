@@ -481,6 +481,24 @@ def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = get_model_type(config)
 
+    import transformers
+    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
+    # on the transformers namespace followed by a call is an unbounded gadget: nothing
+    # here requires it to name a model class. Restrict it to the architectures the auto
+    # mappings actually register.
+    #
+    # Checked BEFORE the SiglipVisionModel patch below, not after. That patch replaces
+    # `_init_weights` on a class shared by the whole process and undoes it at the end of
+    # this function, so raising in between would leave every later SigLIP model skipping
+    # weight init. Validate first, then touch global state.
+    architecture = config.architectures[0]
+    if not _is_known_architecture(architecture):
+        raise ValueError(
+            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
+            f"a model architecture transformers registers."
+        )
+    model_cls = getattr(transformers, architecture)
+
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
     # Patch SiglipVisionModel to skip weight init on meta device.
@@ -489,19 +507,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
         def _init_weights(self, module):
             return
         SiglipVisionModel._init_weights = _init_weights
-
-    import transformers
-    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
-    # on the transformers namespace followed by a call is an unbounded gadget: nothing
-    # here requires it to name a model class. Restrict it to the architectures the auto
-    # mappings actually register, which is the same gate the vllm_utils.py twin applies.
-    architecture = config.architectures[0]
-    if not _is_known_architecture(architecture):
-        raise ValueError(
-            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
-            f"a model architecture transformers registers."
-        )
-    model_cls = getattr(transformers, architecture)
 
     try:
         # accelerate's init_empty_weights, not transformers.modeling_utils.
@@ -633,6 +638,11 @@ def _is_known_architecture(architecture):
 pass
 
 
+# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts.
+_INDEXED_COMPONENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)((?:\[\d+\])+)")
+_INDEX = re.compile(r"\[(\d+)\]")
+
+
 def _get_module_attribute(root, path):
     """ Reads a dotted module path, e.g. `visual.blocks.0.norm.weight`
 
@@ -640,11 +650,26 @@ def _get_module_attribute(root, path):
     same result for every path an attribute expression could express, plus numeric
     segments, and no way for a path component to be Python rather than a name.
     An empty `path` returns `root`, matching what `eval("model")` used to give.
+
+    Bracket components (`blocks[0]`) are resolved as well. `peft_utils` rewrites
+    `.0.` to `[0].` before splitting, and one of its two call sites can hand back a
+    path whose last component still carries the brackets, which `eval` indexed happily
+    and a bare `getattr` cannot. Indices are digits only, so this stays a name-and-index
+    walk rather than an expression.
     """
     if path == "": return root
     obj = root
     for part in path.split("."):
-        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+        if part.isdigit():
+            obj = obj[int(part)]
+            continue
+        match = _INDEXED_COMPONENT.fullmatch(part)
+        if match is None:
+            obj = getattr(obj, part)
+            continue
+        obj = getattr(obj, match.group(1))
+        for index in _INDEX.findall(match.group(2)):
+            obj = obj[int(index)]
     return obj
 pass
 
