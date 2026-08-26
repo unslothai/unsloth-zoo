@@ -66,7 +66,16 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # pyproject.toml only. The mlx-vlm pin comes from the matrix, and a changed
+      # pin simply misses on that one wheel: a pip HTTP cache cannot serve the
+      # wrong content, so it does not need to be in the key.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: gemma4-audio
+          key-files: |
+            pyproject.toml
 
       - name: Install zoo with the pinned mlx-vlm
         # One resolution, so pip honours this package's transformers cap. torch
@@ -81,6 +90,12 @@ jobs:
           print('mlx-vlm', mlx_vlm.__version__, 'transformers', transformers.__version__)
           assert mlx_vlm.__version__ == '${{ matrix.mlx_vlm }}', mlx_vlm.__version__
           "
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: Cache the checkpoint
         # 3.4 GB, and every job wants the same one. Shared key on purpose: the
