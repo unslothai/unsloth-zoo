@@ -502,29 +502,41 @@ def create_empty_vision_model(config, dtype = torch.float16):
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
     # Patch SiglipVisionModel to skip weight init on meta device.
-    if not hasattr(SiglipVisionModel, "_original_initialize_weights"):
+    #
+    # `_init_weights` lives on a class shared by the whole process, so the restore has to
+    # be in a `finally`. `except Exception` does not cover KeyboardInterrupt, and
+    # cancelling a cell mid-load is an ordinary thing to do in a notebook: without this,
+    # one cancel leaves weight init disabled for every SigLIP model built afterwards,
+    # silently and far from the cause.
+    #
+    # `patched_here` rather than the sentinel alone, so a nested or re-entrant call that
+    # found the patch already installed does not restore it out from under the outer call
+    # that owns it.
+    patched_here = not hasattr(SiglipVisionModel, "_original_initialize_weights")
+    if patched_here:
         SiglipVisionModel._original_initialize_weights = SiglipVisionModel._init_weights
         def _init_weights(self, module):
             return
         SiglipVisionModel._init_weights = _init_weights
 
     try:
-        # accelerate's init_empty_weights, not transformers.modeling_utils.
-        # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
-        # as real tensors so inference-time attribute access works.
-        from accelerate import init_empty_weights
-        with init_empty_weights():
-            original_meta_model = model_cls(config)
-    except Exception as e:
-        print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
-        import traceback
-        traceback.print_exc()
-        original_meta_model = None
-
-    # Restore original SiglipVisionModel weight init
-    if hasattr(SiglipVisionModel, "_original_initialize_weights"):
-        SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
-        del SiglipVisionModel._original_initialize_weights
+        try:
+            # accelerate's init_empty_weights, not transformers.modeling_utils.
+            # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
+            # as real tensors so inference-time attribute access works.
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                original_meta_model = model_cls(config)
+        except Exception as e:
+            print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
+            import traceback
+            traceback.print_exc()
+            original_meta_model = None
+    finally:
+        # Restore original SiglipVisionModel weight init
+        if patched_here and hasattr(SiglipVisionModel, "_original_initialize_weights"):
+            SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
+            del SiglipVisionModel._original_initialize_weights
 
 
     new_config = deepcopy(config)
