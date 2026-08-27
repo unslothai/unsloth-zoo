@@ -349,9 +349,8 @@ class _ModelingLoader(importlib.abc.Loader):
     def __init__(self, inner):
         self._inner = inner
 
-    # Forward the inspection half of the loader API. Defined rather than routed
-    # through __getattr__ so the class itself carries them: hasattr and
-    # mock.patch.object look them up on the type, which skips __getattr__.
+    # Defined, not routed through __getattr__: hasattr and mock.patch.object
+    # look these up on the type, which skips __getattr__.
     def get_source(self, name):
         return self._inner.get_source(name)
 
