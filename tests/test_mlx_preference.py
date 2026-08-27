@@ -150,11 +150,6 @@ def policy(kind="dpo", **kwargs):
     )
     options.update(kwargs)
     options.setdefault("max_seq_length", options["max_length"])
-    if kind == "orpo" and options["max_prompt_length"] is None:
-        # ORPO cannot leave the prompt bound open. Every ORPO case that does not
-        # name one has a row that fits, where the bound is never consulted, so
-        # the whole budget stands in for it.
-        options["max_prompt_length"] = options["max_length"]
     return PreferenceLengthPolicy(kind=kind, **options)
 
 
@@ -494,14 +489,23 @@ def test_an_inherited_max_length_says_it_narrowed_the_budget():
     assert resolve(1024, explicit=False) == []
 
 
-def test_an_orpo_policy_cannot_leave_the_prompt_bound_open():
-    from unsloth_zoo.mlx.preference import PreferenceLengthPolicy
+def test_orpo_says_what_an_open_prompt_bound_costs_only_when_it_matters():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
 
-    with pytest.raises(ValueError, match="cannot be left open"):
-        PreferenceLengthPolicy("orpo", 64, None, None, "keep_end", 64)
-    assert PreferenceLengthPolicy(
-        "dpo", 64, None, None, "keep_end", 64,
-    ).max_prompt_length is None
+    # A row that fits never consults the bound, so leaving it open still works.
+    open_bound = policy("orpo", max_length=64, max_prompt_length=None)
+    assert open_bound.max_prompt_length is None
+    assert tokenize_preference_row(
+        Tokenizer(), {"prompt": "ab", "chosen": "cd", "rejected": "ef"},
+        length_policy=open_bound,
+    )
+    # One that overruns used to negate the None inside a slice.
+    with pytest.raises(ValueError, match="cannot be left open here"):
+        tokenize_preference_row(
+            Tokenizer(),
+            {"prompt": PROMPT, "chosen": CHOSEN, "rejected": CHOSEN[::-1]},
+            length_policy=policy("orpo", max_length=8, max_prompt_length=None),
+        )
 
 
 @pytest.mark.parametrize(

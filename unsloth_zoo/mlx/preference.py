@@ -61,17 +61,6 @@ class PreferenceLengthPolicy:
     # The width every row must fit; max_length is the budget spent inside it.
     max_seq_length: int
 
-    def __post_init__(self):
-        # ORPO spends max_length minus max_prompt_length on the answer, so an
-        # open prompt bound has nothing to subtract and the first overflowing
-        # row dies inside a slice instead. resolve_preference_length_policy
-        # back-fills it, but the dataclass is constructed directly too.
-        if self.kind == "orpo" and self.max_prompt_length is None:
-            raise ValueError(
-                "Unsloth MLX ORPO: max_prompt_length is the room reserved for "
-                "the prompt inside max_length, so it cannot be left open."
-            )
-
 
 def _token_budget(value, name):
     if value is None:
@@ -214,6 +203,16 @@ def _truncate_orpo(
 
     def fits(prompt_ids):
         return len(prompt_ids) + longer <= policy.max_length
+
+    if keep is None and not (fits(chosen_prompt) and fits(rejected_prompt)):
+        # Only an overflowing row consults the bound, so a policy that leaves it
+        # open still serves every row that fits. Say what is missing rather than
+        # letting the slices below negate a None.
+        raise ValueError(
+            "Unsloth MLX ORPO: this row overruns max_length="
+            f"{policy.max_length}, and max_prompt_length is the room reserved "
+            "for the prompt inside it, so it cannot be left open here."
+        )
 
     def cap_prompt(prompt_ids):
         if fits(prompt_ids):
