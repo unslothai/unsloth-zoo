@@ -14772,6 +14772,21 @@ def save_pretrained_gguf(
         )
         imatrix_file = None
 
+    # An imatrix named like a file this export writes would be silently destroyed: convert_to_gguf
+    # and llama-quantize overwrite by name, and the intermediate is deleted afterwards. Resolution
+    # copies it out first, so the export would succeed while eating the caller's input. Refuse
+    # rather than relocate -- the file is theirs, and only they know where it belongs. Checked even
+    # when the drop guard cleared imatrix_file, since the collision destroys it either way.
+    if imatrix_source is not None:
+        base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
+        for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):
+            if _is_same_file(imatrix_source, out):
+                raise RuntimeError(
+                    f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
+                    f"'{os.path.basename(out)}', so the export would overwrite it.\n"
+                    "Move the imatrix outside save_directory, or rename it."
+                )
+
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
         import torch  # noqa: F401

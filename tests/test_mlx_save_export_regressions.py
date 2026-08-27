@@ -2267,6 +2267,26 @@ def test_an_imatrix_inside_the_export_directory_is_not_reported_or_uploaded(monk
     assert source.exists(), "the caller's file must never be deleted"
 
 
+# An imatrix named like a file the export writes is destroyed by it: convert_to_gguf and
+# llama-quantize overwrite by name, and the intermediate is deleted afterwards. Resolution copies
+# it out first, so without this guard the export SUCCEEDS while eating the caller's input.
+@pytest.mark.parametrize("source_name", ["TestModel.IQ2_XXS.gguf", "TestModel.BF16.gguf"])
+def test_an_imatrix_named_like_an_output_is_refused_before_anything_is_written(
+    monkeypatch, tmp_path, source_name
+):
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    source = out / source_name
+    source.write_bytes(b"MY_IMATRIX")
+
+    with pytest.raises(RuntimeError, match="would overwrite it"):
+        _export(out, quantization_method="iq2_xxs", imatrix_file=str(source))
+
+    assert source.read_bytes() == b"MY_IMATRIX", "the caller's imatrix must survive"
+    assert "merged" not in calls, "must refuse before paying for the merge"
+
+
 def test_exported_gguf_files_without_an_imatrix_lists_everything(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
