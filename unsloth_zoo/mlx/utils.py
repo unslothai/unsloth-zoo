@@ -14772,11 +14772,10 @@ def save_pretrained_gguf(
         )
         imatrix_file = None
 
-    # An imatrix named like a file this export writes would be silently destroyed: convert_to_gguf
-    # and llama-quantize overwrite by name, and the intermediate is deleted afterwards. Resolution
-    # copies it out first, so the export would succeed while eating the caller's input. Refuse
-    # rather than relocate -- the file is theirs, and only they know where it belongs. Checked even
-    # when the drop guard cleared imatrix_file, since the collision destroys it either way.
+    # An imatrix named like a file this export writes is destroyed by it: the outputs overwrite by
+    # name and the intermediate is then deleted, while resolution has already copied it out, so the
+    # export succeeds having eaten the caller's input. Refuse rather than relocate; where their
+    # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
     if imatrix_source is not None:
         base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
         for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):

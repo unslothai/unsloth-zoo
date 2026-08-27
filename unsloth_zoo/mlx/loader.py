@@ -5757,7 +5757,7 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
 
 
 def _mlx_supported_kwargs(kwargs, supported, context=None):
-    """Keep CUDA-only kwargs out of MLX save/export APIs, naming the caller via `context` in a
+    """Keep CUDA-only kwargs out of MLX save/export APIs; `context` names the caller in the
     warning, since a silently dropped save option misexports."""
     kept = {key: kwargs[key] for key in supported if key in kwargs}
     if context is not None:
