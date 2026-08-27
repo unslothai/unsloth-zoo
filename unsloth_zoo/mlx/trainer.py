@@ -942,12 +942,9 @@ def _build_generation_defaults(args):
 def _escape_terminal_controls(text):
     """Show control characters instead of executing them.
 
-    Prompts come from the dataset and completions from the model, and
-    str.split() strips only whitespace: ESC/BEL survive, so an OSC sequence
-    reaches the clipboard and a CSI one rewrites the log above. Only Cc/Cf are
-    escaped, so CJK and backslashes stay as they are. Emoji do too unless they
-    join with U+200D, which is Cf: escaping the whole class also catches the
-    Unicode tag block, the carrier for invisible-text smuggling.
+    Dataset prompts and model completions are untrusted: str.split() leaves
+    ESC/BEL intact. Escaping all of Cc/Cf also covers U+200D joiners and the
+    Unicode tag block, while leaving CJK and backslashes alone.
     """
     return "".join(
         (
@@ -5895,9 +5892,9 @@ class MLXTrainer:
                 _generation_budget[split_name] = [
                     0, int(args.num_generation_prompts),
                 ]
-            # The plan builder iterates to exhaustion, so the length checked at
-            # configuration time bounds nothing. Hold the split to it: a longer
-            # one scores rows the validation never saw, an endless one hangs.
+            # The plan builder iterates to exhaustion, so hold the split to the
+            # length it declares: a longer one scores unvalidated rows, an
+            # endless one hangs.
             try:
                 expected = len(split)
             except (TypeError, AttributeError):
@@ -6435,9 +6432,8 @@ class MLXTrainer:
                     """Decode on every rank, or on none of them.
 
                     A rank that unwinds never reaches the
-                    _distributed_should_stop() collective below, stranding
-                    peers there. Join a consensus first and skip together, as
-                    _evaluate_batch_totals does.
+                    _distributed_should_stop() collective below and strands its
+                    peers, so join a consensus first and skip together.
                     """
                     result = None
                     local_error = None
@@ -6482,9 +6478,8 @@ class MLXTrainer:
                         for module, scale in zip(modules, scales):
                             module.scale = scale
                     if reference is None:
-                        # _decode already said it is skipping this evaluation.
-                        # Publishing the policy half is what an unreferenced
-                        # objective publishes, so the failure would be invisible.
+                        # The policy half alone is indistinguishable from what an
+                        # unreferenced objective publishes, hiding the failure.
                         self.last_generation_samples = []
                         return
             elapsed = time.perf_counter() - started
@@ -7877,10 +7872,8 @@ class MLXTrainer:
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
-            # Read eval_strategy the way the loop's trigger does: it gates the
-            # step cadence on _static_eval_cadence_enabled(), so eval_steps > 0
-            # under "no" evaluates never, and "epoch" is a cadence without
-            # eval_steps at all.
+            # Match the loop's trigger: eval_steps > 0 under eval_strategy "no"
+            # evaluates never, and "epoch" is a cadence without eval_steps.
             _eval_cadence = (
                 (
                     _resolve_interval_steps(args.eval_steps, 1) > 0
@@ -7958,10 +7951,8 @@ class MLXTrainer:
                         "cadence is set; sampling runs only when a callback "
                         "requests an evaluation."
                     )
-            # Without a cadence nothing raises an evaluation, so _best_step
-            # stays None and the restore is skipped: best-model loading was
-            # asked for and silently not done. A callback may own the cadence,
-            # so notice rather than refuse.
+            # Without a cadence _best_step stays None and the restore is
+            # silently skipped. A callback may own the cadence, so only notice.
             if (
                 self.eval_dataset is not None
                 and not _eval_cadence

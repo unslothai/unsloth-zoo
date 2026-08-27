@@ -976,8 +976,8 @@ def _generation_common(tmp_path, **overrides):
 def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
     """Drive one training step whose evaluation samples, recording engine calls.
 
-    ``generate_batch`` replaces the recording stub, for tests that need the
-    engine to fail or to return text of their own choosing.
+    ``generate_batch`` replaces the recording stub, for tests needing the engine
+    to fail or to return text of their own choosing.
     """
     import mlx.core as mx
     import mlx.nn as nn
@@ -1507,13 +1507,10 @@ def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
 
 
 def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
-    """Prompts come from the dataset and completions from the model, so both are
-    untrusted text on its way to a terminal.
-
-    str.split() collapses whitespace and leaves ESC/BEL untouched, so an OSC
-    sequence reached the terminal intact and a CSI erase could rewrite the log
-    above it. Falsified against the whitespace-only version: the raw escapes
-    appear in the captured output.
+    """Dataset prompts and model completions are untrusted text bound for a
+    terminal, and str.split() leaves ESC/BEL untouched, so an OSC sequence
+    arrived intact and a CSI erase could rewrite the log above it. Falsified
+    against the whitespace-only version: the raw escapes appear in the output.
     """
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
@@ -1545,13 +1542,10 @@ def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
 
 
 def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
-    """A rank that unwinds is a rank that never reaches the collective.
-
-    The caller keeps a raise off the run, but _sample_generations still calls
-    _distributed_should_stop() between the two decodes. A rank that left early
-    would strand a healthy peer waiting there, so the failing rank has to join a
-    consensus first. Falsified against an unguarded decode: no consensus is
-    joined at all.
+    """A rank that unwinds never reaches the _distributed_should_stop() call
+    between the two decodes, stranding a healthy peer there, so the failing rank
+    must join a consensus first. Falsified against an unguarded decode: no
+    consensus is joined at all.
     """
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
@@ -1583,13 +1577,11 @@ def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
 def test_a_failed_reference_decode_publishes_no_samples(
     tmp_path, monkeypatch, capsys,
 ):
-    """A referenced run that loses its reference half skips the whole set.
-
-    reference=None is what ORPO and reference-free DPO publish, so keeping the
-    policy half would make a failed reference pass read as a legitimate
-    policy-only sample set -- and _decode has already printed that it is
-    skipping this evaluation's samples. Falsified against the unguarded
-    publish: two rows arrive, each with reference None.
+    """A referenced run that loses its reference half skips the whole set:
+    reference=None is what ORPO and reference-free DPO publish, so the policy
+    half would read as a legitimate policy-only set, after _decode already said
+    it was skipping. Falsified against the unguarded publish: two rows arrive,
+    each with reference None.
     """
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
@@ -1633,10 +1625,9 @@ def test_a_failed_reference_decode_publishes_no_samples(
 
 
 def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
-    """Asking for best-model selection and silently getting none is the worst of
-    the available outcomes: _run_best_tracking never runs, _best_step stays None
-    and the restore is skipped. A callback owning the cadence is legitimate, so
-    this is a notice, not a refusal."""
+    """Asking for best-model selection and silently getting none is the worst
+    outcome: _best_step stays None and the restore is skipped. A callback owning
+    the cadence is legitimate, so this is a notice, not a refusal."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     def _notice(eval_strategy=None, **overrides):
@@ -1646,8 +1637,7 @@ def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
                 tmp_path, reference_free=True, generate_during_eval=False,
                 load_best_model_at_end=True, **overrides)),
         )
-        # eval_strategy is not a config field; _ensure_callback_args_compat
-        # attaches it, so an epoch run carries it on the args object.
+        # Not a config field; _ensure_callback_args_compat attaches it to args.
         if eval_strategy is not None:
             trainer.args.eval_strategy = eval_strategy
         trainer._prepare_data(False)
@@ -1661,9 +1651,9 @@ def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
 def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
     tmp_path, capsys,
 ):
-    """eval_strategy="epoch" evaluates every epoch without setting eval_steps,
-    so testing eval_steps alone called a real cadence "no cadence". Falsified
-    against the eval_steps-only test: the notice prints for the epoch run."""
+    """eval_strategy="epoch" is a cadence without eval_steps, so reading
+    eval_steps alone called a real cadence "no cadence". Falsified against the
+    eval_steps-only test: the notice prints for the epoch run."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -1677,11 +1667,10 @@ def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
 
 
 def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
-    """len() is checked at configuration time, but the plan builder iterates to
-    exhaustion, so the declared length bounded nothing: a split claiming 2 rows
-    and yielding 3 had all 3 scored, and an endless sized iterable would hang
-    rather than raise. Falsified against the unbounded loop: 3 rows are scored
-    and nothing is raised."""
+    """len() is checked at configuration time but the plan builder iterates to
+    exhaustion, so a split claiming 2 rows and yielding 3 had all 3 scored, and
+    an endless sized iterable would hang. Falsified against the unbounded loop:
+    3 rows are scored and nothing is raised."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     class LyingSplit:
@@ -1708,10 +1697,9 @@ def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
 
 
 def test_a_step_cadence_under_eval_strategy_no_is_no_cadence(tmp_path, capsys):
-    """The loop gates its step cadence on _static_eval_cadence_enabled(), so
-    eval_steps > 0 under eval_strategy="no" evaluates never. Reading eval_steps
-    alone called that a cadence and suppressed the notice for the one case it
-    exists to report. Falsified against the eval_steps-only test: nothing prints.
+    """eval_steps > 0 under eval_strategy="no" evaluates never, so reading
+    eval_steps alone suppressed the notice for the one case it exists to report.
+    Falsified against the eval_steps-only test: nothing prints.
     """
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
