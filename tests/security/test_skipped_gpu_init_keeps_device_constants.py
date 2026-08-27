@@ -86,6 +86,7 @@ def test_the_constant_survives_a_skipped_init(name):
     assert result.stdout.strip(), f"{name} is bound but empty"
 
 
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "the MLX install ships no torch to import")
 def test_a_module_that_reads_them_still_imports():
     """`compiler.py` is the one CI actually tripped over."""
     result = _child("import unsloth_zoo.compiler")
@@ -130,6 +131,7 @@ def test_both_import_paths_publish_the_same_constant(name):
 
 
 @pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "the MLX install ships no torch to import")
 def test_the_compiler_binds_its_old_arch_flag_on_the_skip_path():
     """`fuse_lm_head = True` reads `OLD_CUDA_ARCH_VERSION`, which only the CUDA, HIP
     and XPU branches used to bind, so the "cpu" value raised NameError."""
