@@ -120,3 +120,10 @@ jobs:
         # 8-bit first-moment numerics on Metal: the affine quantizer rounds
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      - name: tests/test_mlx_neftune_quant_map.py
+        # NEFTune: quantization-map survival across the __class__ swap, VLM
+        # embedding identification, and the transformers-matched noise scale.
+        # The metal_only half needs real quantized models and a compiled step;
+        # the mlx_only half also runs on the Linux mlx-cpu job.
+        run: python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs

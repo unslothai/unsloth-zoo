@@ -664,8 +664,19 @@ _MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
 })
 # Architectures transformers has always scaled inside the embedding, used when
 # the installed transformers cannot be asked because it predates them.
+#
+# minicpm3 is deliberately absent. transformers ships no built-in minicpm3
+# anywhere in the range this package supports, so the question is never askable
+# for it and this set would be its permanent answer -- but in that range the only
+# transformers path is trust_remote_code, and openbmb/MiniCPM3-4B's
+# modeling_minicpm.py applies `* config.scale_emb` in the model forward, outside
+# the module the NEFTune hook attaches to. Its noise is scaled there exactly as
+# mlx-lm scales it (minicpm3.py: `h = self.embed_tokens(inputs) * scale_emb`), so
+# correcting would make MLX scale_emb times weaker, not closer. A later
+# transformers does add a built-in MiniCPM3ScaledWordEmbedding; once such a
+# version is in range the gate reads it directly and needs no entry here.
 _SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
-    "gemma3", "gemma3n", "gemma4", "gemma4_unified", "minicpm3",
+    "gemma3", "gemma3n", "gemma4", "gemma4_unified",
 })
 
 
@@ -738,27 +749,62 @@ def _neftune_embed_scale(model):
                 return value
         return None
 
+    def _usable(value):
+        """The value as a positive float, or None if it is not one.
+
+        Truthiness alone is not enough here: `embed_scale` can be a 0-d or
+        length-1 mx.array (fine), a multi-element array or a string (neither of
+        which converts), and dividing by a non-positive scale would flip or blow
+        up the noise. Anything that does not reduce to a usable number is treated
+        as absent, so the next candidate is tried and the caller trains
+        un-corrected rather than crashing.
+        """
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number <= 0.0:
+            return None
+        return number
+
     model_type = str(_first("model_type") or "")
     base = _model_type_base(model_type)
-    scale = getattr(backbone, "embed_scale", None)      # gemma4, gemma4_unified
-    if not scale:
-        scale = _first("scale_emb")                     # minicpm3, and not a sqrt
-    if not scale and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
-        hidden_size = _first("hidden_size")
-        scale = float(hidden_size) ** 0.5 if hidden_size else None
-    if not scale:
+    scale = _usable(getattr(backbone, "embed_scale", None))  # gemma4, gemma4_unified
+    if scale is None:
+        scale = _usable(_first("scale_emb"))                 # a config value, not a sqrt
+    if scale is None and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+        hidden_size = _usable(_first("hidden_size"))
+        scale = hidden_size ** 0.5 if hidden_size else None
+    if scale is None:
         return None
     inside = _transformers_scales_inside_embedding(model_type)
     if inside is None:
         inside = base in _SCALED_INSIDE_WHEN_UNASKABLE
-    return float(scale) if inside else None
+    return scale if inside else None
 
 
 def _vlm_compares_embedding_values(model):
     """Whether the forward finds merged positions by comparing embedding
     values, which noise redrawn per call invalidates. Read off the scale
-    families so the two cannot drift apart."""
-    return _vlm_embed_scale(model) is not None
+    families so the two cannot drift apart.
+
+    Matched on the normalized model type as well as the raw one. `_vlm_embed_scale`
+    compares the raw spelling, so a tower exposing the bare family name rather than
+    the `_text` one answers False there -- and refusing is the conservative side of
+    that difference: a missed refusal injects noise into a forward that locates
+    merged positions by comparing embedding values, while a spurious one only
+    trains un-noised.
+    """
+    if _vlm_embed_scale(model) is not None:
+        return True
+    config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
+    base = _model_type_base(_config_get(config, "model_type"))
+    if not base:
+        return False
+    return any(base == _model_type_base(family)
+               for family in _VLM_EMBED_SCALE_FAMILIES)
 
 
 def _identify_vlm_embedding_module(model):
@@ -835,10 +881,14 @@ def _probe_vlm_embedding_module(model):
     Training mode is deliberately untouched: a quantized-activation layer
     requantizes its weights on every flip, and shapes do not depend on the mode.
     """
-    # mx.random.state is the live list every draw rewrites, so holding it
-    # snapshots nothing and rebinding it restores nothing. A stub backend may
-    # not present it as a list at all; identification still runs there, and any
-    # draw it makes stays on the caller's stream rather than raising.
+    # Up to mlx 0.31 mx.random.state is the live list every draw rewrites, so
+    # holding it snapshots nothing and only element assignment puts it back.
+    # mlx 0.32 replaced it with a read-only `_RandomState` sentinel (so that
+    # mx.compile captures it thread-independently) which exposes no write API at
+    # all; identification still runs there, and any draw it makes stays on the
+    # caller's stream rather than raising. Do NOT "fix" that by rebinding
+    # mx.random.state to a list: that shadows the sentinel and stops a compiled
+    # step from redrawing, which turns NEFTune into a fixed offset.
     rng_state = None
     try:
         live = mx.random.state

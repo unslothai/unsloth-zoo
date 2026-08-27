@@ -4072,13 +4072,24 @@ class MLXTrainer:
         _alpha = alpha
         # These families multiply the embedding after this module returns, so
         # undivided noise would be scaled with it; transformers adds its noise
-        # after that multiply.
-        _embed_scale = _neftune_embed_scale(self.model) or 1.0
+        # after that multiply. A config that cannot be read degrades to
+        # uncorrected noise, which is what every other lookup here does -- it
+        # must not abort train().
+        try:
+            _embed_scale = _neftune_embed_scale(self.model) or 1.0
+        except Exception as e:
+            print(f"Unsloth: NEFTune could not resolve the embedding scale ({e}); "
+                  f"injecting uncorrected noise.")
+            _embed_scale = 1.0
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
-            def __call__(self, x):
-                out = _Base.__call__(self, x)
+            # *args/**kwargs, not (self, x): on the text path the target is always
+            # a 1-arg embed_tokens, but the VLM probe returns whichever module
+            # produced the embedding shape, which may be an adapter or wrapper that
+            # takes extra arguments on the image path the probe never exercises.
+            def __call__(self, *args, **kwargs):
+                out = _Base.__call__(self, *args, **kwargs)
                 if getattr(self, "training", False):
                     dim = out.shape[-1] * out.shape[-2]
                     scale = _alpha / (dim ** 0.5) / _embed_scale
@@ -4101,7 +4112,14 @@ class MLXTrainer:
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
-        print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
+        # Report the divisor: on gemma3/gemma3n/gemma4 the same alpha now perturbs
+        # sqrt(hidden_size) times less than it did before this correction, and an
+        # unchanged message would be the only signal a user got.
+        if _embed_scale != 1.0:
+            print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}, noise divided by "
+                  f"the post-embedding scale {_embed_scale:.4f} to match transformers).")
+        else:
+            print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
 
     def _remove_neftune(self):
         emb = getattr(self, "_neftune_emb", None)
@@ -6379,7 +6397,12 @@ class MLXTrainer:
             compile_error = None
             result = None
             rng_state_before = None
-            if _ddp_compile_local_grad:
+            if _ddp_compile_local_grad and isinstance(mx.random.state, list) \
+                    and mx.random.state:
+                # Only snapshot where it can be put back. mlx 0.32 made
+                # mx.random.state a read-only sentinel, so the restore below
+                # would raise TypeError and turn a graceful downgrade to eager
+                # into a hard failure. Mirrors the non-DDP path.
                 rng_state_before = mx.array(
                     mx.random.state[0].tolist(),
                     dtype=mx.uint32,

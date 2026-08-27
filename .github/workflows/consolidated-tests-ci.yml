@@ -194,6 +194,19 @@ jobs:
             echo "real mlx is installed but the numeric tests skipped"; exit 1
           fi
 
+      - name: pytest tests/test_mlx_neftune_quant_map.py (mlx_only half)
+        # Embedding identification, embed-scale resolution and probe cleanup are
+        # pure logic over a synthetic module tree: real mlx, no Metal, no
+        # downloads. The metal_only half skips here and runs on the mlx job.
+        run: python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+
+      - name: Fail if the NEFTune logic tests all skipped
+        run: |
+          python -m pytest tests/test_mlx_neftune_quant_map.py -q -rs | tee neftune.txt
+          if ! grep -qiE '[1-9][0-9]* passed' neftune.txt; then
+            echo "real mlx is installed but no NEFTune logic test ran"; exit 1
+          fi
+
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults. fail-fast=false; drift in one cell shouldn't cancel others.
   core-upstream-matrix:

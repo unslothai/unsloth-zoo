@@ -18,11 +18,32 @@ import pytest
 
 try:
     import mlx.core as mx
+    _MLX = True
     _METAL = mx.metal.is_available()
 except Exception:
-    _METAL = False
+    _MLX = _METAL = False
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+# Identification, scale resolution and cleanup are pure logic over a synthetic
+# module tree: they need a real mlx runtime but no Metal and no downloads, so they
+# also gate the Linux mlx-cpu job rather than only the opt-in Apple Silicon one.
+mlx_only = pytest.mark.skipif(not _MLX, reason="requires the mlx runtime")
+
+# mlx 0.32 replaced the mutable `mx.random.state` list with a read-only
+# `_RandomState` sentinel. Tests that put the stream back have to ask first.
+_RNG_STATE_WRITABLE = _MLX and isinstance(mx.random.state, list)
+rng_restorable_only = pytest.mark.skipif(
+    not _RNG_STATE_WRITABLE,
+    reason="mx.random.state is read-only on this mlx (>=0.32)",
+)
+
+
+def _restore_rng(keys):
+    """Put the stream back where the backend allows it. Returns whether it did."""
+    if not _RNG_STATE_WRITABLE:
+        return False
+    mx.random.state[:] = keys
+    return True
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
@@ -306,7 +327,7 @@ def test_vlm_neftune_lands_on_the_module_the_embed_path_uses(vlm):
     assert distinct > 64, f"a real draw is not {distinct} repeated values"
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("opts,expected", [
     ({"per_layer": True}, "embed_tokens"),  # gemma4: on the path, other width
     ({"decoy": True}, "embed_tokens"),      # completes first: order cannot decide
@@ -327,7 +348,7 @@ def test_probe_picks_the_embedding_or_declines(opts, expected):
         assert found is getattr(model.language_model.model, expected)
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("opts,resolves", [
     ({}, True), ({"sibling": True}, False), ({"raises": True}, False),
     # florence2 hands one embedding to encoder and decoder alike
@@ -362,17 +383,21 @@ def test_probe_leaves_no_trace(opts, resolves):
     keys = [mx.array(k) for k in mx.random.state]
     want = mx.random.uniform(shape=(3,))
     mx.eval(want)
-    mx.random.state[:] = keys
+    stream_rewound = _restore_rng(keys)
     assert (_probe_vlm_embedding_module(model) is not None) is resolves
     assert {p: m.training for p, m in model.named_modules()} == flags
     assert {p: type(m) for p, m in model.named_modules()} == classes
-    got = mx.random.uniform(shape=(3,))
-    mx.eval(got)
-    assert mx.array_equal(want, got), "probe consumed the caller's stream"
+    if stream_rewound:
+        # Only assertable where the backend lets the stream be put back; mlx 0.32
+        # exposes mx.random.state read-only, and the probe leaves the draw it made
+        # on the caller's stream there rather than raising.
+        got = mx.random.uniform(shape=(3,))
+        mx.eval(got)
+        assert mx.array_equal(want, got), "probe consumed the caller's stream"
     assert bb.embed_tokens.flips == 0, "a mode flip requantizes real layers"
 
 
-@metal_only
+@mlx_only
 def test_neftune_declines_for_value_comparing_families():
     """gemma3n finds merged positions by comparing embeddings; noise breaks it."""
     from types import SimpleNamespace
@@ -389,7 +414,7 @@ def test_neftune_declines_for_value_comparing_families():
 GEMMA3_TEXT = "mlx-community/gemma-3-270m-it-4bit"
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("model_type,inside,scaled", [
     # transformers moved gemma and gemma2's multiply inside the embedding
     # partway through the supported version range, so the answer follows the
@@ -416,7 +441,7 @@ def test_embed_scale_follows_the_installed_transformers(monkeypatch, model_type,
     assert found == (pytest.approx(H ** 0.5) if scaled else None)
 
 
-@metal_only
+@mlx_only
 def test_embed_scale_probe_reads_the_installed_transformers():
     """The probe must answer from the installed package, not a table."""
     import importlib.util
@@ -457,14 +482,19 @@ def test_embed_scale_probe_reads_the_installed_transformers():
     probe.cache_clear()
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("model_type,scaled", [
     # transformers 4.x predates these, so the probe cannot answer; they have
     # scaled inside the embedding in every transformers that has them.
     ("gemma4_text", True),
     ("gemma4_unified_text", True),
-    ("minicpm3", True),
-    ("gemma", False),   # genuinely version-dependent, so not assumed
+    ("gemma", False),      # genuinely version-dependent, so not assumed
+    # minicpm3 is unaskable for a different reason: transformers ships no
+    # built-in arch for it in the supported range, so the reference there is the
+    # trust_remote_code modeling file, which scales OUTSIDE the embedding just as
+    # mlx-lm does. Assuming "inside" would divide the noise by scale_emb twice
+    # over. Covered in full by test_minicpm3_keeps_the_scale_transformers_actually_applies.
+    ("minicpm3", False),
 ])
 def test_embed_scale_falls_back_when_transformers_cannot_be_asked(
         monkeypatch, model_type, scaled):
@@ -481,7 +511,7 @@ def test_embed_scale_falls_back_when_transformers_cannot_be_asked(
     assert found == (pytest.approx(H ** 0.5) if scaled else None)
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("key,value,expected", [
     ("scale_emb", 12.0, 12.0),      # minicpm3 scales by a config value, not a sqrt
     (None, None, H ** 0.5),
@@ -500,7 +530,7 @@ def test_embed_scale_reads_a_non_sqrt_factor(monkeypatch, key, value, expected):
     assert mlx_utils._neftune_embed_scale(model) == pytest.approx(expected)
 
 
-@metal_only
+@mlx_only
 def test_embed_scale_prefers_the_backbone_attribute():
     """gemma4 exposes the multiply it uses; a derived value could disagree."""
     from types import SimpleNamespace
@@ -578,7 +608,7 @@ def test_compiled_step_carries_the_rng_so_noise_is_redrawn():
         "the random state is not compiled in; every step would replay one draw"
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("state", [(), None])
 def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state):
     """A stub backend need not present the random state as a mutable list.
@@ -593,7 +623,7 @@ def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state
     assert found is model.language_model.model.embed_tokens
 
 
-@metal_only
+@mlx_only
 @pytest.mark.parametrize("family,embed_scale,expected", [
     ("gemma3", None, H ** 0.5),           # sqrt(hidden_size), computed inline
     ("gemma3n", None, H ** 0.5),
@@ -619,3 +649,171 @@ def test_embed_scale_reads_both_spellings_of_a_family(
             backbone.embed_scale = embed_scale
         found.append(mlx_utils._neftune_embed_scale(model))
     assert found[0] == found[1] == pytest.approx(expected), found
+
+
+@mlx_only
+def test_probe_survives_the_backends_own_random_state():
+    """The shapes above are hypothetical; this is the one that actually ships.
+
+    mlx 0.32 replaced the mutable ``mx.random.state`` list with a read-only
+    ``_RandomState`` sentinel, so on a current install the probe takes the
+    no-snapshot path by default rather than as an exotic fallback. Nothing is
+    monkeypatched here: identification has to work against whatever this mlx
+    really exposes, and the probe must not raise trying to put it back.
+    """
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
+
+    model = _tree()
+    found = _probe_vlm_embedding_module(model)
+    assert found is model.language_model.model.embed_tokens
+    # And the sentinel must survive: rebinding it to a list shadows the object
+    # mx.compile captured, which stops a compiled step redrawing.
+    assert isinstance(mx.random.state, list) is _RNG_STATE_WRITABLE
+
+
+@mlx_only
+def test_minicpm3_keeps_the_scale_transformers_actually_applies():
+    """minicpm3 must not be corrected while transformers ships no built-in arch.
+
+    In that state the only transformers path is trust_remote_code, whose
+    ``modeling_minicpm.py`` multiplies by ``scale_emb`` in the model forward --
+    outside the module its NEFTune hook attaches to. mlx-lm multiplies outside
+    too, so both sides already agree and dividing would make MLX ``scale_emb``
+    times weaker. Once a transformers with ``MiniCPM3ScaledWordEmbedding`` is in
+    range the gate answers directly and this flips on its own, which is why the
+    expectation is derived rather than hardcoded.
+    """
+    import importlib.util
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    builtin = None
+    try:
+        builtin = importlib.util.find_spec(
+            "transformers.models.minicpm3.modeling_minicpm3")
+    except Exception:
+        builtin = None
+
+    model = _tree()
+    model.language_model.model.config = SimpleNamespace(
+        model_type="minicpm3", hidden_size=H, scale_emb=12.0)
+    got = mlx_utils._neftune_embed_scale(model)
+
+    if builtin is None:
+        assert got is None, (
+            f"minicpm3 corrected by {got} with no built-in transformers arch; "
+            f"that makes MLX {got}x weaker than the trust_remote_code reference")
+    else:
+        assert got == pytest.approx(12.0)
+
+
+@mlx_only
+def test_neftune_forwards_extra_call_arguments():
+    """The probe returns whichever module produced the embedding shape, and that
+    need not be a one-argument embedding. A wrapper called with pixel_values on
+    the image path must not blow up on the swapped __call__."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from types import SimpleNamespace
+
+    class MultiArg(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.embedding = inner
+        def __call__(self, x, pixel_values=None, mask=None):
+            return self.embedding(x) + mx.zeros((1, 3, H))
+
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.config = SimpleNamespace(model_type="llama", hidden_size=H)
+    backbone.embed_tokens = MultiArg(backbone.embed_tokens)
+
+    _install(model, alpha=5.0, is_vlm=True)
+    emb = backbone.embed_tokens
+    assert getattr(emb, "_unsloth_neftune_active", False), "probe declined"
+    emb.train()
+    out = emb(mx.array([[0, 1, 2]]), pixel_values=None, mask=None)
+    mx.eval(out)
+    assert out.shape == (1, 3, H)
+
+
+@mlx_only
+@pytest.mark.parametrize("model_type", ["gemma3n_text", "gemma3n"])
+def test_refusal_covers_both_spellings_of_a_value_comparing_family(model_type):
+    """The refusal must not depend on which spelling the wrapper exposes.
+
+    `_vlm_embed_scale` compares the raw model type, so the bare family name slips
+    past it. Missing the refusal injects noise into a forward that locates merged
+    positions by comparing embedding values; a spurious refusal only trains
+    un-noised, so the gate has to be conservative across both.
+    """
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _vlm_compares_embedding_values
+
+    model = _tree()
+    model.language_model.model.config = SimpleNamespace(
+        model_type=model_type, hidden_size=H)
+    assert _vlm_compares_embedding_values(model) is True
+
+
+@mlx_only
+def test_neftune_noise_is_zero_mean():
+    """RMS and max both survive a sign change, so neither pins the distribution.
+
+    transformers draws Uniform(-m, m); Uniform(0, m) has an identical RMS and an
+    identical max magnitude while adding a constant positive shift to every
+    embedding dimension. Only the mean separates them.
+    """
+    import mlx.core as mx
+    from types import SimpleNamespace
+
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.config = SimpleNamespace(model_type="llama", hidden_size=H)
+    _install(model, alpha=15.0, is_vlm=False)
+    emb = backbone.embed_tokens
+    emb.train()
+
+    ids = mx.array([[0, 1, 2]])
+    base_call = type(emb).__mro__[1].__call__
+    total = 0.0
+    draws = 400
+    for _ in range(draws):
+        noise = emb(ids) - base_call(emb, ids)
+        mx.eval(noise)
+        total += float(mx.mean(noise).item())
+    mean = total / draws
+    # sd of the mean over draws*3*H samples of U(-m, m); 6 sigma is still tiny
+    # next to the m/2 offset a one-sided draw would produce.
+    m = 15.0 / ((3 * H) ** 0.5)
+    tolerance = 6.0 * m / (3.0 ** 0.5) / ((draws * 3 * H) ** 0.5)
+    assert abs(mean) < tolerance, (
+        f"noise mean {mean} exceeds {tolerance}; a one-sided draw would sit "
+        f"near {m / 2}")
+
+
+@mlx_only
+def test_embed_scale_failure_does_not_abort_training():
+    """A config that cannot be reduced to a number degrades to uncorrected noise.
+
+    Every other lookup in _install_neftune prints and continues; resolving the
+    scale must not be the one that takes train() down with it.
+    """
+    import mlx.core as mx
+    from types import SimpleNamespace
+
+    class Hostile:
+        @property
+        def model_type(self):
+            raise RuntimeError("this config does not want to be read")
+
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.config = Hostile()
+    _install(model, alpha=5.0, is_vlm=False)
+    emb = backbone.embed_tokens
+    assert getattr(emb, "_unsloth_neftune_active", False), \
+        "a hostile config must not prevent NEFTune from installing un-corrected"
+    emb.train()
+    mx.eval(emb(mx.array([[0, 1, 2]])))
