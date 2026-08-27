@@ -4422,10 +4422,20 @@ class _MLXPromptCompletionTokens:
     prompt_length: int
 
 
-def _mlx_prompt_completion_boundary(prompt_ids, input_ids, *, strict=True):
+def _mlx_prompt_completion_boundary(
+    prompt_ids, input_ids, *, strict=True, step_back=False,
+):
     """Locate the completion after tolerating one boundary-merged token.
 
     Without ``strict`` it may fall wherever the two tokenizations stop agreeing.
+
+    ``step_back`` drops the verification rather than raising on it. That is what
+    ORPOTrainer.build_tokenized_answer does in trl/trainer/orpo_trainer.py: when
+    the prompt is not a token prefix it steps back exactly one token and never
+    checks what precedes it. Reproducing that is deliberate parity, not an
+    oversight, and only the preference path asks for it: a recovered prompt is a
+    character prefix and so lands mid-token routinely, where SFT's prompt is
+    tokenized from the same text it re-tokenizes and a mismatch is a real error.
     """
     prompt_ids = tuple(prompt_ids)
     input_ids = tuple(input_ids)
@@ -4439,7 +4449,7 @@ def _mlx_prompt_completion_boundary(prompt_ids, input_ids, *, strict=True):
             shared += 1
         return shared
     prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
-    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+    if not step_back and input_ids[:prompt_length] != prompt_ids[:prompt_length]:
         raise ValueError(
             "Unsloth MLX: tokenized prompt and prompt+completion differ before "
             "the final prompt token; only a boundary merge is supported."
@@ -4449,6 +4459,7 @@ def _mlx_prompt_completion_boundary(prompt_ids, input_ids, *, strict=True):
 
 def _encode_mlx_prompt_completion(
     tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+    step_back=False,
 ):
     """Encode a prompt and its full text with one EOS policy."""
     prompt_ids = tuple(int(x) for x in encode_mlx_text(
@@ -4470,6 +4481,7 @@ def _encode_mlx_prompt_completion(
         # follows it, leaving the prompt no longer even a text prefix.
         _mlx_prompt_completion_boundary(
             prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
+            step_back=step_back,
         ),
     )
 

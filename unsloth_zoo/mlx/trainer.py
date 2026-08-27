@@ -1264,6 +1264,11 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+        # The preference configs default max_length to TRL's 1024, which is below
+        # the usual max_seq_length, so a run that predates those fields would be
+        # budgeted more tightly than before without ever saying so. Record whether
+        # the caller chose the value so the resolver can tell the two apart.
+        self._unsloth_mlx_max_length_explicit = "max_length" in provided
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
 

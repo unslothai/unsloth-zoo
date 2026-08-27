@@ -61,6 +61,17 @@ class PreferenceLengthPolicy:
     # The width every row must fit; max_length is the budget spent inside it.
     max_seq_length: int
 
+    def __post_init__(self):
+        # ORPO spends max_length minus max_prompt_length on the answer, so an
+        # open prompt bound has nothing to subtract and the first overflowing
+        # row dies inside a slice instead. resolve_preference_length_policy
+        # back-fills it, but the dataclass is constructed directly too.
+        if self.kind == "orpo" and self.max_prompt_length is None:
+            raise ValueError(
+                "Unsloth MLX ORPO: max_prompt_length is the room reserved for "
+                "the prompt inside max_length, so it cannot be left open."
+            )
+
 
 def _token_budget(value, name):
     if value is None:
@@ -144,6 +155,21 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
                 f"{max_prompt_length}.",
                 RuntimeWarning, stacklevel=2,
             )
+    # A config that predates max_length carries its default rather than a choice,
+    # and that default sits below the batch width, so the run would train on a
+    # smaller budget than the same call used to. Say so once, and say how to get
+    # the old budget back. An args object without the marker is duck-typed rather
+    # than copied from a config, so take its value as meant.
+    max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
+    if max_seq_length > max_length and not max_length_explicit:
+        warnings.warn(
+            f"Unsloth MLX preference: max_length defaults to {max_length}, below "
+            f"max_seq_length={max_seq_length}, so rows are budgeted more tightly "
+            "than they were before this option existed. Pass "
+            "max_length=max_seq_length, max_prompt_length=None to keep the "
+            "previous budget.",
+            RuntimeWarning, stacklevel=2,
+        )
     # For DPO the prompt bound is a cap rather than reserved room, so it may
     # stand above max_length.
     return PreferenceLengthPolicy(
@@ -383,7 +409,18 @@ def _encode_dpo_branches(
     prompt ending mid-token simply splits there.
     """
     prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
-    prompt_ids = [int(x) for x in encode_mlx_text(tokenizer, prompt_text)]
+    # The completions below are encoded without automatic special tokens, so say
+    # the same for the prompt rather than leaning on the shared default: a
+    # tokenizer that closes with its own EOS would otherwise land one between
+    # the prompt and a completion encoded apart from it. Re-adding a missing BOS
+    # keeps MLX's existing policy, and is what TRL's own ORPO does through
+    # add_bos_token_if_needed.
+    prompt_ids = [int(x) for x in encode_mlx_text(
+        tokenizer, prompt_text, add_special_tokens=False,
+    )]
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != int(bos_id)):
+        prompt_ids.insert(0, int(bos_id))
     eos_id = getattr(tokenizer, "eos_token_id", None)
 
     def response(text):
@@ -416,11 +453,17 @@ def tokenize_preference_row(
         )
         rejected_prompt = list(chosen_prompt)
     else:
+        # A prompt the row left implicit is recovered as a character prefix, so
+        # it lands mid-token often enough that verifying the tokens before the
+        # boundary would refuse rows ORPOTrainer trains on. It steps back one
+        # token and asks no more, so ask no more here either.
         chosen = _encode_mlx_prompt_completion(
             tokenizer, prompt_text, chosen_text, append_eos=append_eos,
+            step_back=True,
         )
         rejected = _encode_mlx_prompt_completion(
             tokenizer, prompt_text, rejected_text, append_eos=append_eos,
+            step_back=True,
         )
         boundaries = [chosen.prompt_length, rejected.prompt_length]
         if not all(
@@ -630,15 +673,23 @@ def create_preference_batch_plan(
 ):
     """Build the finite preference plan consumed by both objectives."""
     rows = []
-    for raw in dataset:
+    for index, raw in enumerate(dataset):
         row = formatting_func(raw) if formatting_func is not None else raw
         if not isinstance(row, Mapping):
             raise ValueError(
                 "Unsloth MLX preference: formatting_func must return a mapping."
             )
-        rows.append(tokenize_preference_row(
-            tokenizer, row, length_policy=length_policy, append_eos=append_eos,
-        ))
+        try:
+            rows.append(tokenize_preference_row(
+                tokenizer, row, length_policy=length_policy, append_eos=append_eos,
+            ))
+        except ValueError as exc:
+            # Every row is tokenized up front, so without the index one bad row
+            # in a large dataset aborts the run with nothing to look at.
+            raise ValueError(
+                f"Unsloth MLX preference: dataset row {index} could not be "
+                f"tokenized. {exc}"
+            ) from exc
     if not rows:
         raise ValueError("Unsloth MLX preference: the training dataset is empty.")
     order_mode = "sequential" if preserve_dataset_order else dataset_order
