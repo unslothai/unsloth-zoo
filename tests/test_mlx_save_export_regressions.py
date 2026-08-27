@@ -4079,3 +4079,46 @@ def test_moe_gguf_export_relocates_a_namespace_every_tensor_carries(tmp_path):
     assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
     assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
 
+
+def test_moe_gguf_export_splits_a_tensor_a_sanitizer_fused_from_a_named_group(tmp_path):
+    """Parts fused into one staged tensor, named and ordered by the sanitizer's tuple."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"model.layers.{layer}.attn.{part}":
+                    mx.arange(6, dtype=mx.float32).reshape(3, 2) + 10 * layer + index
+                for layer in range(2) for index, part in enumerate(
+                    ("q_conv.weight", "k_conv.weight", "v_conv.weight"))}
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out, held = {}, {}
+            for name, tensor in weights.items():
+                for part in ("q_conv.weight", "k_conv.weight", "v_conv.weight"):
+                    if name.endswith(part):
+                        held.setdefault(name[: -len(part)], {})[part] = tensor
+                        break
+                else:
+                    out[name] = tensor
+            for head, found in held.items():
+                if len(found) == 3:
+                    out[head + "conv.weight"] = mx.concatenate(
+                        [found["q_conv.weight"], found["k_conv.weight"],
+                         found["v_conv.weight"]], axis=0)
+                else:
+                    out.update((head + part, value) for part, value in found.items())
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(model.checkpoint))
+    assert sorted(model.expected) == ["model.layers.0.attn.conv.weight",
+                                      "model.layers.1.attn.conv.weight"]
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    assert all(rewritten[n].tolist() == v.tolist() for n, v in model.checkpoint.items())

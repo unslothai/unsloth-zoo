@@ -15117,6 +15117,32 @@ def _mlx_sanitizer_vocabulary(sanitizers):
     return sorted({f for f in found if len(f) > 1 and not f.isspace()})
 
 
+def _mlx_sanitizer_fusion_groups(sanitizers):
+    """Each tuple of names a sanitizer holds, with the fragments beside it.
+
+    Which names belong to one split would otherwise cost the vocabulary to the
+    power of the part count. A sanitizer that fuses several tensors names them in
+    one tuple, so the tuple is the group, in the order they were concatenated, and
+    only the fragments from the same function are worth substituting into.
+    """
+    def named(obj):
+        return (isinstance(obj, tuple) and 1 < len(obj) <= _MOE_SPLIT_PARTS
+                and len(set(obj)) == len(obj)
+                and all(isinstance(item, str) and len(item) > 1 for item in obj))
+
+    found = {}
+    for code in _mlx_sanitizer_code(sanitizers):
+        groups = _mlx_sanitizer_constants([code], named)
+        if not groups:
+            continue
+        fragments = {f for f in _mlx_sanitizer_constants(
+            [code], lambda obj: isinstance(obj, str))
+            if len(f) > 1 and not f.isspace()}
+        for group in groups:
+            found.setdefault(tuple(group), set()).update(fragments)
+    return [(group, sorted(fragments)) for group, fragments in sorted(found.items())]
+
+
 def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
     """Substitutions worth trying, as (replaced, replacement) pairs.
 
@@ -15330,8 +15356,12 @@ def _mlx_moe_group_recipe(parts, recipe):
 
 
 def _mlx_moe_merged(parts, recipe):
-    """Rebuild the checkpoint tensor a sanitizer split into `parts`."""
-    _, layouts, axis, flattened = recipe
+    """Rebuild the checkpoint tensor a sanitizer split into `parts`.
+
+    A share says the sanitizer went the other way and fused several checkpoint
+    tensors into the one part read here, so what comes back is one slice of it.
+    """
+    _, layouts, axis, flattened, *share = recipe
     merged = mx.concatenate(
         [
             part if layout is None else mx.moveaxis(part, layout[1], layout[0])
@@ -15345,6 +15375,9 @@ def _mlx_moe_merged(parts, recipe):
         for dim in shape[: axis + 1]:
             leading *= dim
         merged = mx.reshape(merged, (leading,) + shape[axis + 1 :])
+    if share and share[0] is not None:
+        index, count = share[0]
+        merged = mx.split(merged, count, axis=axis)[index]
     return merged
 
 
@@ -15752,6 +15785,121 @@ def _build_mlx_moe_expert_stack_plan(model, staged):
     return plan
 
 
+# How many tensors one staged tensor is split back into. Three covers the KDA
+# convolutions glm5_next fuses; a group longer than this is a table of names
+# rather than the parts of one tensor.
+_MOE_SPLIT_PARTS = 4
+
+
+def _mlx_moe_split_recipes(rank, count):
+    """Every way one staged tensor could be the concatenation of `count` parts.
+
+    Both directions of every axis move, unlike a merge's: a merge undoes what the
+    sanitizer did to a part it was given, a split does it to one it hands over.
+    """
+    moves = [layout for layout in _MOE_TENSOR_LAYOUTS if max(layout) < rank]
+    # Moved layouts first, identity last: a sanitizer only moves an axis because
+    # some checkpoint stores it the other way, so where both replay -- as they do
+    # for glm5_next's convolutions -- the moved one is what llama.cpp reads.
+    for layout in moves + [(after, before) for before, after in moves] + [None]:
+        for axis in range(rank):
+            yield (layout,), axis
+
+
+def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
+    """The naming and recipe under which the sanitizer fuses parts into `source`.
+
+    A merge's proof reads markers back under the names it gave; here the names are
+    new, so what has to come back is the one tensor they were built into. The floor
+    is replayed once for the source: what it holds does not depend on the naming.
+    """
+    others = {name: mx.full(tuple(tensor.shape), float(position), dtype=mx.float32)
+              for position, (name, tensor) in enumerate(staged.items())
+              if name != source}
+    try:
+        floor = sanitizer.sanitize(dict(others))
+    except Exception:
+        return None
+    # The floor, as the merge proof reads it, against the source arriving as parts.
+    kept = {name: floor[name] for name in others if name in floor}
+
+    shape = tuple(staged[source].shape)
+    for layouts, axis in recipes:
+        for targets in proposals:
+            if shape[axis] % len(targets):
+                continue
+            part = shape[:axis] + (shape[axis] // len(targets),) + shape[axis + 1:]
+            size, seed, markers = 1, 0, []
+            for dim in part:
+                size *= dim
+            for _ in targets:
+                markers.append(mx.reshape(
+                    mx.arange(seed, seed + size, dtype=mx.float32), part))
+                seed += size
+            try:
+                expected = mx.concatenate(markers, axis=axis)
+                layout = layouts[0]
+                probe = dict(others)
+                for name, marker in zip(targets, markers):
+                    probe[name] = (marker if layout is None
+                                   else mx.moveaxis(marker, layout[0], layout[1]))
+                sanitized = sanitizer.sanitize(probe)
+            except Exception:
+                continue
+            if not _mlx_arrays_match(sanitized.get(source), expected):
+                continue
+            if any(not _mlx_arrays_match(sanitized.get(name), value)
+                   for name, value in kept.items()):
+                continue
+            return targets, layouts, axis
+    return None
+
+
+def _build_mlx_moe_name_split_plan(model, staged, claimed):
+    """Recover checkpoint tensors a sanitizer fused into one staged tensor.
+
+    glm5_next concatenates a layer's three KDA convolutions and moves an axis, so
+    neither a rename nor a merge reaches them: the checkpoint holds the parts and
+    the staged form the whole. Each part is a share of the tensor it came from.
+    """
+    sanitizers = _mlx_moe_sanitizers(model)
+    groups = _mlx_sanitizer_fusion_groups(sanitizers)
+    if not groups:
+        return {}
+
+    plan = {}
+    for source in sorted(staged):
+        if source in claimed or _kept_for_the_gguf_converter(source):
+            continue
+        rank = len(staged[source].shape)
+        # The names first, since they are string work and a replay is not.
+        proposals = []
+        for group, fragments in groups:
+            for replaced in fragments:
+                if replaced not in source or replaced in group:
+                    continue
+                targets = [source.replace(replaced, name) for name in group]
+                if len(set(targets)) != len(targets) or any(
+                    name == source or name in staged for name in targets
+                ):
+                    continue
+                if targets not in proposals:
+                    proposals.append(targets)
+        if not proposals:
+            continue
+        recipes = list(_mlx_moe_split_recipes(rank, len(proposals[0])))
+        for sanitizer in sanitizers:
+            proved = _proved_mlx_moe_name_split(
+                sanitizer, staged, source, proposals, recipes)
+            if proved is None:
+                continue
+            targets, layouts, axis = proved
+            for index, name in enumerate(targets):
+                plan[name] = ([source], layouts, axis, False, (index, len(targets)))
+            break
+    return plan
+
+
 def _mlx_moe_merge_placement(files, merges):
     """Which shard receives each merged tensor, and which shard holds each part.
 
@@ -16153,6 +16301,19 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
             offsets.pop(part, None)
             layouts.pop(part, None)
     merges.update(late)
+    # A fused tensor has no staged counterpart, so the split runs over what nothing
+    # else claimed, and its own rename is dropped: the parts carry the name now, and
+    # two reconstructions of one tensor is not a checkpoint.
+    fused = _build_mlx_moe_name_split_plan(
+        model, staged,
+        set(merges) | {part for parts, *_ in merges.values() for part in parts}
+        | set(split or {}))
+    for parts, *_ in fused.values():
+        for part in parts:
+            renames.pop(part, None)
+            offsets.pop(part, None)
+            layouts.pop(part, None)
+    merges.update(fused)
     plan = dict(split or {})
     # A rename is a one-name split, so the rewrite below needs no second path.
     plan.update((name, [renamed]) for name, renamed in renames.items())
@@ -16201,10 +16362,13 @@ def _prepare_moe_gguf_export_directory(
     # rather than the checkpoint.
     name_map = {}
     consumed = {part: target for target, (parts, *_) in merges.items() for part in parts}
-    for target, anchor in anchors.items():
-        name_map[anchor] = (target,)
+    # A split's targets all read one tensor, so its anchor collects them rather
+    # than the last one winning and the index losing the rest.
+    for target, anchor in sorted(anchors.items()):
+        name_map[anchor] = name_map.get(anchor, ()) + (target,)
+    for target, anchor in sorted(anchors.items()):
         for part in merges[target][0]:
-            if part != anchor:
+            if part != anchor and part not in name_map:
                 name_map[part] = ()
 
     for file in files:
