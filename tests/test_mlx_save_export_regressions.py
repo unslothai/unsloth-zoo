@@ -2248,6 +2248,59 @@ def test_the_imatrix_copy_lands_outside_the_export_directory(monkeypatch, tmp_pa
     assert sorted(p.name for p in out.rglob("*.gguf")) == sorted(["TestModel.IQ2_XXS.gguf"] + left_behind)
 
 
+# The caller's own imatrix may sit in save_directory; we must not delete it, but both the
+# completion summary and push_to_hub_gguf glob save_directory/*.gguf, so it must not be
+# reported or uploaded as though this export had produced it.
+def test_an_imatrix_inside_the_export_directory_is_not_reported_or_uploaded(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    _stub_gguf_export(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    source = out / "imatrix_unsloth.gguf"
+    source.write_bytes(b"IMAT")
+
+    _export(out, quantization_method="iq2_xxs", imatrix_file=str(source))
+
+    reported = [f.name for f in mutils._exported_gguf_files(out, str(source))]
+    assert reported == ["TestModel.IQ2_XXS.gguf"]
+    assert source.exists(), "the caller's file must never be deleted"
+
+
+def test_exported_gguf_files_without_an_imatrix_lists_everything(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    (tmp_path / "a.gguf").write_bytes(b"A")
+    (tmp_path / "b.gguf").write_bytes(b"B")
+
+    assert [f.name for f in mutils._exported_gguf_files(tmp_path)] == ["a.gguf", "b.gguf"]
+    # A path that no longer exists must not crash the listing -- samefile raises on a dead path.
+    assert [f.name for f in mutils._exported_gguf_files(tmp_path, str(tmp_path / "gone.gguf"))] == \
+        ["a.gguf", "b.gguf"]
+
+
+def test_is_same_file_asks_the_filesystem_then_falls_back(tmp_path):
+    """The identity test must survive a path the filesystem spells differently, or one now gone."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    real = tmp_path / "imatrix.gguf"
+    real.write_bytes(b"IMAT")
+    other = tmp_path / "quant.gguf"
+    other.write_bytes(b"Q")
+
+    assert mutils._is_same_file(real, str(real))
+    # One file, two names: only the filesystem knows. Comparing the strings would miss it, and
+    # the imatrix would be uploaded as a model.
+    link = tmp_path / "linked.gguf"
+    link.symlink_to(real)
+    assert mutils._is_same_file(link, str(real))
+    assert not mutils._is_same_file(real, other)
+    # Both gone: samefile raises OSError, so the normcase/NFC fallback decides.
+    gone = tmp_path / "gone.gguf"
+    assert mutils._is_same_file(gone, str(gone))
+    assert not mutils._is_same_file(gone, tmp_path / "also-gone.gguf")
+
+
 # "BF16" is spelled either way: the converter lowercases, so these checks have to as well.
 @pytest.mark.parametrize("quantization_method", ["not_quantized", "bf16", "BF16"])
 def test_a_direct_conversion_drops_the_imatrix_instead_of_resolving_it(

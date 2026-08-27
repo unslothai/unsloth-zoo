@@ -47,6 +47,7 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import unicodedata
 import warnings
 import weakref
 import zlib
@@ -14613,6 +14614,34 @@ _REPACKAGED_MODEL_SUFFIX = re.compile(
 )
 
 
+def _exported_gguf_files(save_directory, imatrix_source=None):
+    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
+
+    An imatrix_file path may point inside save_directory. It is copied out before use, but the
+    original stays put, and both the completion summary and the Hub upload glob save_directory,
+    so it would otherwise be reported and published as if it were an exported model.
+    """
+    files = sorted(Path(save_directory).glob("*.gguf"))
+    if imatrix_source is None:
+        return files
+    return [f for f in files if not _is_same_file(f, imatrix_source)]
+
+
+def _is_same_file(a, b):
+    """True when two paths name one file, asking the filesystem rather than comparing strings.
+
+    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case and
+    APFS stores NFD, so a path we derived need not match the one rglob returns byte for byte.
+    samefile answers that, and the normcase/NFC comparison covers a path already gone at cleanup.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        a, b = os.path.abspath(str(a)), os.path.abspath(str(b))
+        norm = lambda p: unicodedata.normalize("NFC", os.path.normcase(p))
+        return norm(a) == norm(b)
+
+
 def _gguf_imatrix_repo_candidates(model):
     """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
     repos = []
@@ -14705,6 +14734,12 @@ def save_pretrained_gguf(
     # the one gating llama-quantize further down used to compare differently-normalized values, so
     # a caller passing "Q4_K_M" had the imatrix discarded from a run that then went ahead without it.
     quant_type = str(quant_type).strip().lower()
+
+    # Kept before the drop guard below can clear imatrix_file: a caller-supplied path may sit
+    # inside save_directory, and the export must not report or upload it as one of its own files.
+    imatrix_source = None
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
 
     # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
     if quant_requires_imatrix(quant_type) and not imatrix_file:
@@ -14918,7 +14953,7 @@ def save_pretrained_gguf(
                 print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
 
     # List produced files
-    gguf_files = sorted(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
@@ -15117,7 +15152,11 @@ def push_to_hub_gguf(
     # private=True request never silently leaks GGUF shards public.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
-    gguf_files = list(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(
+        save_directory,
+        os.path.expanduser(os.fspath(imatrix_file))
+        if isinstance(imatrix_file, (str, os.PathLike)) else None,
+    )
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),
