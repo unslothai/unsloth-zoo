@@ -670,11 +670,9 @@ def _masked_logit_sum(logits, mask):
 def _orpo_logit_sum(logits):
     """Logit sum over every position, and the count it divides by.
 
-    Cast before reducing, not after: mx.sum accumulates in the input dtype, and
-    a bf16 model emits millions of logits per batch, far past the point an
-    8-bit mantissa stops registering the next addend. Casting the result would
-    be too late -- the sum has already saturated. The masked path above avoids
-    this only because its float32 mask promotes the multiply first.
+    Cast before reducing: mx.sum accumulates in the input dtype, and a bf16
+    batch holds millions of logits, far past where an 8-bit mantissa stops
+    registering the next addend. Casting the result would already be too late.
     """
     return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
 
