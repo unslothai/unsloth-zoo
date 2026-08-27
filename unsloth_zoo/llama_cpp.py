@@ -2863,6 +2863,10 @@ def _materialize_imatrix(path, dest_dir):
     if base.endswith(".gguf_file"):
         base = base[: -len(".gguf_file")] + ".gguf"
     local = os.path.join(dest_dir, base)
+    # resolve_imatrix_file is public API, so dest_dir can be the file's own directory (the MLX
+    # exporter always passes a fresh temp dir, but Studio and callers need not). Nothing to copy.
+    if os.path.exists(local) and os.path.samefile(path, local):
+        return local
     shutil.copyfile(path, local)
     return local
 

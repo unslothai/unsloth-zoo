@@ -2463,6 +2463,20 @@ def test_missing_imatrix_path_is_rejected(tmp_path):
         llama_cpp.resolve_imatrix_file(str(tmp_path / "absent.dat"), dest_dir=str(tmp_path))
 
 
+# resolve_imatrix_file is exported, so a caller may hand it a dest_dir that already holds the file
+# -- Studio does. shutil.copyfile raises SameFileError on that; there is simply nothing to copy.
+def test_an_imatrix_already_in_dest_dir_is_used_in_place(tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    source = tmp_path / "imatrix_unsloth.dat"
+    source.write_bytes(b"IMAT")
+
+    resolved = llama_cpp.resolve_imatrix_file(str(source), dest_dir=str(tmp_path))
+
+    assert Path(resolved).samefile(source)
+    assert source.read_bytes() == b"IMAT"
+
+
 @pytest.mark.parametrize(
     "repo, expected",
     [
