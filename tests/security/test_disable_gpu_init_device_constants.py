@@ -44,6 +44,18 @@ def _mlx_branch_is_live() -> bool:
     )
 
 
+def _load_real_predicate():
+    """`is_mlx_available` loaded by file path, so the package (and torch) stays out of it.
+
+    `unsloth_zoo/mlx/runtime.py` imports stdlib only, so this is safe.
+    """
+    path = REPO_ROOT / "unsloth_zoo" / "mlx" / "runtime.py"
+    spec = importlib.util.spec_from_file_location("_zoo_mlx_runtime_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.is_mlx_available
+
+
 # MLX binds the constants eagerly, so PEP 562 __getattr__ never runs and "does not
 # pull torch" would pass for the wrong reason. Skip the pair together, not vacuously green.
 _needs_lazy_path = pytest.mark.skipif(
@@ -253,7 +265,12 @@ def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
 def test_the_mlx_guard_agrees_with_is_mlx_available(
     monkeypatch, system, machine, has_mlx, force_gpu, expected,
 ):
-    """The guard copies `unsloth_zoo/mlx/runtime.py::is_mlx_available`, so pin every arm against drift."""
+    """The guard copies `is_mlx_available`, so check it against the real one, not just a table.
+
+    A table alone would stay green if the production predicate gained a condition,
+    while `_needs_lazy_path` silently skipped the wrong environments. Asserting both
+    against `expected` catches drift on either side.
+    """
     monkeypatch.setattr(platform, "system", lambda: system)
     monkeypatch.setattr(platform, "machine", lambda: machine)
     real_find_spec = importlib.util.find_spec
@@ -268,7 +285,14 @@ def test_the_mlx_guard_agrees_with_is_mlx_available(
         monkeypatch.delenv("UNSLOTH_FORCE_GPU_PATH", raising = False)
     else:
         monkeypatch.setenv("UNSLOTH_FORCE_GPU_PATH", force_gpu)
+    real = _load_real_predicate()
+    real.cache_clear() # functools.cache: one stale answer would fix every arm below
     assert _mlx_branch_is_live() is expected
+    assert real() is expected, (
+        f"unsloth_zoo/mlx/runtime.py::is_mlx_available returned {real()!r} where the "
+        f"copy in this file returned {expected!r}. The two have diverged, so "
+        f"_needs_lazy_path now skips the wrong environments; update the copy."
+    )
 
 
 def test_every_contract_name_actually_resolves_under_the_skip():
