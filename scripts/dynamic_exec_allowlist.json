@@ -301,6 +301,22 @@
       "path": "unsloth_zoo/patching_utils.py",
       "qualname": "patch_compiled_autograd",
       "sink": "exec",
+      "kind": ".join() via `source` via `source` via `source`",
+      "hash": "7a5e305efb369e7f",
+      "reason": "Self-generated source: `source` is `inspect.getsource` of the INSTALLED torch._dynamo.compiled_autograd function, with literal replacements applied, and the import list is built from `dir()` of that same installed module. No value from a config, a download or the environment reaches either string."
+    },
+    {
+      "path": "unsloth_zoo/patching_utils.py",
+      "qualname": "patch_compiled_autograd",
+      "sink": "exec",
+      "kind": ".join() via `source` via `source` via `source`",
+      "hash": "7a5e305efb369e7f",
+      "reason": "Self-generated source: `source` is `inspect.getsource` of the INSTALLED torch._dynamo.compiled_autograd function, with literal replacements applied, and the import list is built from `dir()` of that same installed module. No value from a config, a download or the environment reaches either string."
+    },
+    {
+      "path": "unsloth_zoo/patching_utils.py",
+      "qualname": "patch_compiled_autograd",
+      "sink": "exec",
       "kind": "string concatenation",
       "hash": "d5c91cdf1f94e789",
       "reason": "Imports names selected by `x in source` from dir() of the installed torch._dynamo modules being patched."
@@ -360,6 +376,14 @@
       "kind": "f-string",
       "hash": "691766359b82b093",
       "reason": "Imports names from dir(transformers.modeling_utils); the generated save_pretrained interpolates only output_dtype (checked against four torch dtypes above) and two ints."
+    },
+    {
+      "path": "unsloth_zoo/saving_utils.py",
+      "qualname": "merge_and_dequantize_lora",
+      "sink": "exec",
+      "kind": "string concatenation via `save_pretrained` via `save_pretrained` via `save_pretrained`",
+      "hash": "b9fff86a8c82eb0d",
+      "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. Nothing external is spliced in."
     },
     {
       "path": "unsloth_zoo/temporary_patches/misc.py",
