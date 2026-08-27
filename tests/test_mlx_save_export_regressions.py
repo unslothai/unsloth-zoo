@@ -1512,6 +1512,81 @@ def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_na
     assert mutils._mlx_arrays_match(recovered, source), recovered
 
 
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+def test_norm_offsets_reject_a_non_finite_constant(tmp_path, bad):
+    # The probe hands zeros to a third-party sanitizer, so a division by a
+    # weight it zeroed comes back inf or NaN. NaN fails every comparison, so an
+    # unguarded spread check reads it as a constant and the export writes it
+    # into the real tensor.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class DividingSanitizer:
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+
+        def sanitize(self, weights):
+            out = dict(weights)
+            out["model.layers.0.normed"] = (
+                weights["model.layers.0.normed"] / weights["model.layers.0.scale"]
+            )
+            return out
+
+    numerator = 0.0 if bad == "nan" else 4.0
+    weights = {
+        "model.layers.0.scale": mx.array([2.0, 2.0]),
+        "model.layers.0.normed": mx.array([numerator, numerator]),
+    }
+    src = tmp_path / "src"
+    _write_weights(mx, src, weights)
+    model = DividingSanitizer(src)
+
+    assert mutils._mlx_sanitizer_norm_offsets(model) == {}
+
+    export = tmp_path / "export"
+    _write_weights(mx, export, weights)
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    assert mutils._prepare_mlx_gguf_export_directory(
+        export, model=model, replay_sanitizers=False
+    ) == 0
+    exported = mx.load(str(export / "model.safetensors"))
+    for key, expected in weights.items():
+        assert mutils._mlx_arrays_match(exported[key], expected), key
+
+
+def test_norm_offsets_fail_closed_when_the_model_cannot_be_copied(tmp_path):
+    # Falling back to the live instance would sanitize the model this exists to
+    # protect. Unmeasurable is the safe answer: it is what the export did before
+    # any of this landed.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Uncopyable:
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+            self.cached_weights = {"trained": "weights"}
+
+        def __copy__(self):
+            raise TypeError("this model cannot be shallow-copied")
+
+        def sanitize(self, weights):
+            self.cached_weights = dict(weights)
+            return {
+                key: (value + 1.0 if value.ndim == 1 else value)
+                for key, value in weights.items()
+            }
+
+    src = tmp_path / "src"
+    _write_weights(mx, src, {"model.norm.weight": mx.array([0.5, 0.25])})
+    model = Uncopyable(src)
+
+    assert mutils._mlx_sanitizer_norm_offsets(model) is None
+    assert model.cached_weights == {"trained": "weights"}
+
+
 def test_norm_offsets_survive_a_zero_length_tensor(tmp_path):
     # mx.min refuses a zero-size reduce. Letting that raise would discard every
     # offset measured alongside it and silently drop the whole correction.

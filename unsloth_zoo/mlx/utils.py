@@ -14135,7 +14135,13 @@ def _mlx_constant_1d_value(value):
     if value.shape[0] == 0:
         return None
     low = mx.min(value).item()
-    if abs(low - mx.max(value).item()) > _MLX_NORM_OFFSET_TOLERANCE:
+    high = mx.max(value).item()
+    # The probe feeds zeros to a third-party sanitizer, so a division can hand
+    # back inf or NaN. NaN fails every comparison, so an unguarded spread check
+    # reads it as constant and the export subtracts it into the real weight.
+    if not math.isfinite(low) or not math.isfinite(high):
+        return None
+    if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
         return None
     return low
 
@@ -14149,12 +14155,12 @@ def _mlx_sanitize_probe(model, weights):
     measuring on the model itself would rebuild the live model out of the probe
     values, halfway through an export. A shallow copy keeps every read the
     sanitizer does and sends those writes to a throwaway.
+
+    A model that cannot be copied is not measured. Falling back to the live
+    instance would do the exact thing this exists to prevent, and the caller
+    treats the failure as unmeasurable, which is the pre-existing behaviour.
     """
-    try:
-        model = copy.copy(model)
-    except Exception:
-        pass
-    return model.sanitize(weights)
+    return copy.copy(model).sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
