@@ -1355,8 +1355,12 @@ def test_mxfp4_dequantize_signature():
 # with the replacement defined in temporary_patches/mxfp4.py: patch_function refuses
 # a replacement whose parameters do not match the original exactly, so a shape that
 # is not listed here is a shape zoo cannot patch.
+# 5.0.0 alone takes target_device; 5.1.0 and newer leave placement to the caller.
+# If the 5.0.0 arm in mxfp4.py is ever dropped, drop the 3-tuple here too, or this
+# test will pass on a version zoo can no longer patch.
 _CONVERTOPS_HANDLED_SIGNATURES = (
     ("blocks", "scales"),
+    ("blocks", "scales", "target_device"),
 )
 
 

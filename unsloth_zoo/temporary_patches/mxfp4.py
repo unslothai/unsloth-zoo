@@ -161,20 +161,49 @@ def patch_convert_moe_packed_tensors():
     # that convention), so the live loader hook must restore GPT-OSS's [E, G*B*2, D].
     # Which hook is live:
     #   4.x             -> module level mxfp4.dequantize, called by quantizer_mxfp4
-    #   5.1.0 and newer -> Mxfp4Dequantize (a ConversionOps) -> dequantize_convertops
-    # (5.0.0's dequantize_convertops is 3-arg and excluded by pyproject.) mxfp4.dequantize
-    # survives unreferenced until 5.16.0 (upstream PR #47579, the DTensor TP rewrite)
-    # deletes it, so patching only dequantize dropped the transpose from 5.1.0 on and
-    # loaded GPT-OSS with dims 1 and 2 silently swapped.
+    #   5.0.0 and newer -> Mxfp4Dequantize (a ConversionOps) -> dequantize_convertops
+    # mxfp4.dequantize survives unreferenced from 5.0.0 until 5.16.0 (upstream PR
+    # #47579, the DTensor TP rewrite) deletes it, so patching only dequantize dropped
+    # the transpose from 5.0.0 on and loaded GPT-OSS with dims 1 and 2 silently
+    # swapped.
+    #
+    # 5.0.0 alone declares dequantize_convertops(blocks, scales, target_device); every
+    # release from 5.1.0 on declares (blocks, scales). A 2-arg replacement against the
+    # 3-arg original is refused by can_safely_patch ("Parameter count mismatch: 3 vs
+    # 2"), which left 5.0.0 with the un-transposed convert_moe_packed_tensors above and
+    # nothing restoring the transpose. So pick the arm that matches what is actually
+    # installed.
+    #
+    # Dispatch on the observed parameter names rather than on transformers_version:
+    # arity is the exact property can_safely_patch enforces, so reading it directly
+    # cannot disagree with it, whereas a version gate is a proxy that a backport or a
+    # fork can falsify. An unrecognised signature falls through to the 2-arg arm and is
+    # rejected loudly by can_safely_patch, which is the correct failure mode.
+    _convertops = getattr(transformers.integrations.mxfp4, "dequantize_convertops", None)
+    if _convertops is not None:
+        # 5.x path, called only by Mxfp4Dequantize.convert. Both arms close over the
+        # local un-transposed convert_moe_packed_tensors rather than re-reading the
+        # module attribute, so the transpose stays correct even if patch_function above
+        # did not take and upstream's self-transposing version is still installed.
+        try:
+            _convertops_params = tuple(inspect.signature(_convertops).parameters)
+        except (TypeError, ValueError):
+            _convertops_params = ()
 
-    if hasattr(transformers.integrations.mxfp4, "dequantize_convertops"):
-        # 5.x path, called only by Mxfp4Dequantize.convert. Closes over the local
-        # un-transposed convert_moe_packed_tensors rather than re-reading the module
-        # attribute, so the transpose stays correct even if patch_function above did
-        # not take and upstream's self-transposing version is still installed.
-        def dequantize_convertops(blocks, scales):
-            dequantized = convert_moe_packed_tensors(blocks, scales)
-            return torch.nn.Parameter(dequantized.transpose(1, 2).contiguous())
+        if _convertops_params == ("blocks", "scales", "target_device"):
+            # 5.0.0. Mirrors upstream's own body (empty_cache before the move, and the
+            # result placed on target_device) with the transpose added back.
+            def dequantize_convertops(blocks, scales, target_device):
+                dequantized = convert_moe_packed_tensors(blocks, scales)
+                dequantized = dequantized.transpose(1, 2).contiguous()
+                if target_device == "cpu" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return torch.nn.Parameter(dequantized.to(target_device))
+        else:
+            # 5.1.0 and newer. Upstream leaves placement to its caller here.
+            def dequantize_convertops(blocks, scales):
+                dequantized = convert_moe_packed_tensors(blocks, scales)
+                return torch.nn.Parameter(dequantized.transpose(1, 2).contiguous())
         patch_function(transformers.integrations.mxfp4, "dequantize_convertops", dequantize_convertops)
 
     if transformers_version < Version("5.0.0"):
