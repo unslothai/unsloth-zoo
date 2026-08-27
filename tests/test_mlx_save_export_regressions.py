@@ -2383,6 +2383,9 @@ def _fake_hub(monkeypatch, tmp_path, upstream_name, hosted_by="unsloth/TestModel
     [
         ("imatrix_unsloth.dat", "imatrix_unsloth.dat"),
         ("imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf"),
+        # Some repos publish the GGUF imatrix under its plain name, without the .gguf_file guard
+        # (unsloth/Qwen3.8-27B-GGUF does). llama-quantize --imatrix reads it just the same.
+        ("imatrix_unsloth.gguf", "imatrix_unsloth.gguf"),
     ],
 )
 def test_imatrix_file_true_resolves_the_upstream_gguf_repo(monkeypatch, tmp_path, upstream_name,
@@ -2501,6 +2504,13 @@ def test_an_imatrix_already_in_dest_dir_is_used_in_place(tmp_path):
         ("unsloth/Qwen3-8B-unsloth-bnb-4bit",
          ["unsloth/Qwen3-8B-unsloth-bnb-4bit-GGUF", "unsloth/Qwen3-8B-unsloth-bnb-GGUF",
           "unsloth/Qwen3-8B-unsloth-GGUF", "unsloth/Qwen3-8B-GGUF"]),
+        # mlx-community publishes the bit width both ways; -4-bit is as common as -4bit and is
+        # what this exporter sees most (e.g. mlx-community/Mistral-7B-Instruct-v0.2-4-bit).
+        ("mlx-community/Mistral-7B-Instruct-v0.2-4-bit",
+         ["unsloth/Mistral-7B-Instruct-v0.2-4-bit-GGUF", "unsloth/Mistral-7B-Instruct-v0.2-GGUF"]),
+        ("mlx-community/Llama-3.2-3B-Instruct-8-bit",
+         ["unsloth/Llama-3.2-3B-Instruct-8-bit-GGUF", "unsloth/Llama-3.2-3B-Instruct-GGUF"]),
+        ("some-org/Model-float16", ["unsloth/Model-float16-GGUF", "unsloth/Model-GGUF"]),
     ],
 )
 def test_imatrix_repo_candidates_map_onto_the_unsloth_gguf_namespace(repo, expected):

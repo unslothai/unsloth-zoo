@@ -14605,8 +14605,11 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
 # Markers naming a repackaging rather than a different model; the imatrix is published against
 # the base, so they are stripped after the verbatim name has been tried. One per match, applied
 # repeatedly, so compounds like -unsloth-bnb-4bit peel all the way down.
+# \d+-?bit covers both spellings: mlx-community publishes -4bit and -4-bit (e.g.
+# mlx-community/Mistral-7B-Instruct-v0.2-4-bit), and only the hyphenless one used to peel.
 _REPACKAGED_MODEL_SUFFIX = re.compile(
-    r"-(?:\d+bit|int\d+|bf16|fp16|f16|fp8|mxfp4|mlx|awq|gptq|hqq|bnb|unsloth)$", re.IGNORECASE
+    r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
+    re.IGNORECASE,
 )
 
 

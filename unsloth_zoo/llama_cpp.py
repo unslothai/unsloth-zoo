@@ -2848,8 +2848,13 @@ IMATRIX_REQUIRED_QUANTS = frozenset((
     "q2_k_s",
 ))
 
-# Upstream imatrix filenames; .gguf_file stops the Hub listing it as a model GGUF.
-IMATRIX_UPSTREAM_NAMES = ("imatrix_unsloth.dat", "imatrix_unsloth.gguf_file")
+# Upstream imatrix filenames, all three in live use across the unsloth/*-GGUF repos:
+# .dat is the legacy format, .gguf_file is a GGUF imatrix named so the Hub does not list it as a
+# model GGUF, and plain .gguf is the same thing without that guard (e.g. unsloth/Qwen3.8-27B-GGUF).
+# llama-quantize --imatrix reads any of them.
+IMATRIX_UPSTREAM_NAMES = (
+    "imatrix_unsloth.dat", "imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf",
+)
 
 
 def quant_requires_imatrix(quant_type):
