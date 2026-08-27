@@ -696,7 +696,7 @@ PREFERENCE_EVAL_STATS_WIDTH = {
 def _preference_forward(model, batch, lengths):
     """Logits, per-token cross entropy, and the response mask for one batch."""
     targets = batch[:, 1:]
-    logits = model(batch[:, :-1])
+    logits = _model_logits(model(batch[:, :-1]))
     ce = nn.losses.cross_entropy(
         logits, targets, reduction="none",
     ).reshape(targets.shape)

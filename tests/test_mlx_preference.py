@@ -1498,3 +1498,35 @@ def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
             tmp_path, reference_free=True, generate_during_eval=False,
             metric_for_best_model="eval_rewards/accuracies")))
     assert trainer.args.greater_is_better is True
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+def test_evaluation_accepts_a_wrapped_model_output(objective):
+    """A text-only VLM load takes the preference path, and mlx-vlm wrappers return
+    a LanguageModelOutput where mlx_lm models return the array. Evaluation reads
+    the same forward the training loss does, so it has to accept both."""
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, make_preference_eval_fn,
+    )
+
+    class Wrapped(TinyModel):
+        def __call__(self, tokens):
+            class LanguageModelOutput:
+                def __init__(self, logits):
+                    self.logits = logits
+            return LanguageModelOutput(super().__call__(tokens))
+
+    plan = create_preference_batch_plan(
+        rows(2), Tokenizer(), batch_size=2, max_seq_length=64,
+        num_epochs=1, grad_accum=1, preserve_dataset_order=True)
+    eval_fn = make_preference_eval_fn(objective, beta=0.1, reference_free=True)
+
+    bare = TinyModel()
+    wrapped = Wrapped()
+    wrapped.embedding, wrapped.output = bare.embedding, bare.output
+
+    from_bare = eval_fn(bare, *plan[0])
+    from_wrapped = eval_fn(wrapped, *plan[0])
+    assert math.isclose(float(from_bare[0]), float(from_wrapped[0]),
+                        rel_tol=1e-6, abs_tol=1e-6)
+    assert int(from_bare[1]) == int(from_wrapped[1])
