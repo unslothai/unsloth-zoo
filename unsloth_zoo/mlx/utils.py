@@ -512,13 +512,11 @@ def pause_mlx_training_patches() -> bool:
 def resume_mlx_training_patches(paused: bool) -> None:
     """Give back exactly what `pause_mlx_training_patches` took.
 
-    The physical reference is restored by INCREMENT, never by assignment: another
-    trainer may have acquired during the pause, and setting the depth to 1 there
-    would drop this run's reference, so that trainer's release would unpatch
-    `mlx.core` while this one is still differentiating.
-
-    The logical depth is restored from this context's own pause stack, so it does
-    not count a second run the way `acquire()` would.
+    By increment, never assignment: another trainer may have acquired during the
+    pause, and assigning 1 there would drop this run's reference, so that
+    trainer's release would unpatch `mlx.core` mid-differentiation. The logical
+    depth comes off this context's own stack, so it does not count a second run
+    the way `acquire()` would.
     """
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:

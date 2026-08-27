@@ -495,9 +495,8 @@ def test_one_trainers_evaluation_leaves_another_threads_flag_alone():
 
 
 def test_resume_keeps_its_reference_when_another_run_acquired_mid_pause():
-    """A pauses as the sole holder, B acquires during the pause, A resumes. If the
-    resume assigns the depth instead of incrementing it, A's reference is lost and
-    B's release unpatches mlx.core while A is still differentiating."""
+    """If resume assigns the depth instead of incrementing it, A's reference is
+    lost and B's release unpatches mlx.core while A is still differentiating."""
     acquire_mlx_training_patches()                      # A trains
     try:
         paused = pause_mlx_training_patches()           # A evaluates, sole holder
