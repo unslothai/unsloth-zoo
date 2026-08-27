@@ -1470,6 +1470,48 @@ def test_norm_offsets_do_not_mutate_the_model(tmp_path):
     assert model["lm_head"] == "the real lm_head module"
 
 
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16", "float32"])
+def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_name):
+    # The recovery offers ``tensor - 1.0`` and accepts it only if replaying the
+    # sanitizer reproduces the stored tensor EXACTLY. That looks fragile --
+    # ``(t - c) + c == t`` is not a floating-point identity in general -- but
+    # the stored tensor is itself ``source + c`` computed in this same dtype,
+    # and over every finite bfloat16 and float16 value the only sources that
+    # fail are |source| = 258 and 2050 respectively. So the exact check is
+    # right and must not be loosened into a tolerance, which would let a
+    # near-miss candidate through.
+    #
+    # Values here span the range the shifting families actually occupy: the
+    # published Qwen3-Next input_layernorm runs -0.154 to 0.781. A |source|
+    # above 1 is a different matter -- 1.8984375 + 1 does not fit bfloat16 and
+    # the low bit is gone before Unsloth sees the checkpoint at all -- so the
+    # recovery returns what mlx-lm's load left, which is what upstream
+    # inference runs on too.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    dtype = getattr(mx, dtype_name)
+    source = mx.array([-0.953125, -0.7, 0.046875, 0.25, 0.5, 0.78125], dtype=dtype)
+    hf_weights = {"model.language_model.norm.weight": source}
+
+    src = tmp_path / "src"
+    # An mlx-community style checkpoint: already sanitized on disk, so the
+    # measurement is empty and only the replay can recover the shift.
+    _write_weights(mx, src, _KeyGatedNormSanitizer(src).sanitize(dict(hf_weights)))
+    model = _KeyGatedNormSanitizer(src)
+    assert mutils._mlx_sanitizer_norm_offsets(model) == {}
+
+    export = tmp_path / "export"
+    _write_weights(mx, export, model.sanitize(dict(hf_weights)))
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    assert mutils._prepare_mlx_gguf_export_directory(export, model=model) == 1
+
+    exported = mx.load(str(export / "model.safetensors"))
+    recovered = exported["model.language_model.norm.weight"]
+    assert mutils._mlx_arrays_match(recovered, source), recovered
+
+
 def test_norm_offsets_survive_a_zero_length_tensor(tmp_path):
     # mx.min refuses a zero-size reduce. Letting that raise would discard every
     # offset measured alongside it and silently drop the whole correction.
