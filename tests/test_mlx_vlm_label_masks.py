@@ -995,6 +995,16 @@ def test_vlm_only_architecture_routes_text_only_loads_to_mlx_vlm(monkeypatch):
     ) is True
 
 
+@pytest.mark.parametrize("model_type", ["muse_glimmer", "qwen4_exp", "glm5_next"])
+def test_verified_vlm_text_paths_stay_verified(model_type):
+    """Dropping one silently restores the mlx_lm "not supported" load error."""
+    from unsloth_zoo.mlx import loader
+
+    assert loader._mlx_vlm_text_path_is_verified(model_type) is True
+    assert loader._mlx_vlm_text_path_is_verified("qwen3_5") is False
+    assert loader._mlx_vlm_text_path_is_verified("") is False
+
+
 def test_architecture_neither_backend_ships_is_not_routed_to_mlx_vlm(monkeypatch):
     assert _route_text_only(
         monkeypatch, mlx_lm_class=None, vlm_text_path_verified=False

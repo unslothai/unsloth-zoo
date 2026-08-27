@@ -2631,6 +2631,11 @@ def _get_mlx_lm_model_class(model_type: str):
 
 _VLM_TEXT_PATH_MODEL_TYPES = frozenset({
     "muse_glimmer",
+    # Hybrid linear-attention decoders mlx_lm has no class for. Both reproduce a
+    # fresh model bitwise across a width or batch change, so the position tensor
+    # qwen4_exp caches between calls never leaks into the next text batch.
+    "qwen4_exp",
+    "glm5_next",
 })
 
 
