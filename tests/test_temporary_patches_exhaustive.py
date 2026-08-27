@@ -36,6 +36,11 @@ from packaging.version import Version  # noqa: E402
 
 _TX_VERSION = getattr(transformers, "__version__", "0.0.0")
 _TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
+# 5.16.0 (upstream PR #47579, the DTensor tensor parallel rewrite) deleted
+# transformers.integrations.mxfp4.dequantize and reduced
+# transformers.integrations.tensor_parallel.shard_and_distribute_module to a
+# tombstone that raises RuntimeError when called.
+_TX_GE_5_16 = Version(_TX_VERSION) >= Version("5.16.0")
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
@@ -1241,8 +1246,22 @@ def test_mxfp4_convert_moe_packed_tensors_signature():
 
 
 def test_mxfp4_dequantize_signature():
-    """mxfp4.py:220 patches ``mxfp4.dequantize`` (module, param_name,
-    param_value, target_device, dq_param_name, **kwargs)."""
+    """mxfp4.py patches ``mxfp4.dequantize`` (module, param_name, param_value,
+    target_device, dq_param_name, **kwargs) on transformers 4.x ONLY.
+
+    ``dequantize`` is the live per-parameter loader hook only on 4.x, where
+    quantizer_mxfp4 calls it. From 5.0 the live path is
+    ``Mxfp4Dequantize`` (a ConversionOps) -> ``dequantize_convertops``, leaving
+    ``dequantize`` defined but unreferenced, and 5.16.0 deleted it outright. Zoo
+    gates its patch to < 5.0.0 to match, so pinning the symbol above that range
+    would report drift against something zoo no longer touches. The 5.x
+    replacement is pinned by test_mxfp4_dequantize_convertops_signature below."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: mxfp4.dequantize is not the live "
+            "loader hook on 5.x and zoo gates its patch to < 5.0.0; the "
+            "ConversionOps replacement is pinned separately"
+        )
     mod_name = "transformers.integrations.mxfp4"
     try:
         mod = importlib.import_module(mod_name)
@@ -1251,7 +1270,7 @@ def test_mxfp4_dequantize_signature():
     fn = getattr(mod, "dequantize", None)
     if fn is None:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:220 expects "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
             "transformers.integrations.mxfp4.dequantize but it is missing on "
             f"transformers {_TX_VERSION}"
         )
@@ -1266,11 +1285,56 @@ def test_mxfp4_dequantize_signature():
     )
     if not _has_var_keyword(fn):
         pytest.fail(
-            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py:185 forwards "
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py forwards "
             f"by name (model=..., empty_param=..., casting_dtype=..., "
             f"to_contiguous=..., rank=..., device_mesh=...) via **kwargs but "
             f"upstream transformers.integrations.mxfp4.dequantize lost its "
             f"**kwargs catch-all on {_TX_VERSION}: {inspect.signature(fn)}"
+        )
+
+
+def test_mxfp4_dequantize_convertops_signature():
+    """mxfp4.py patches ``mxfp4.dequantize_convertops`` (blocks, scales) on
+    transformers 5.x.
+
+    This is the 5.x replacement for the deleted module-level ``dequantize``:
+    ``Mxfp4Dequantize.convert`` is its only caller, and zoo rebinds it to
+    re-apply the ``transpose(1, 2)`` that its own un-transposed
+    ``convert_moe_packed_tensors`` leaves off. Absent on 4.x, where the legacy
+    ``dequantize`` hook carries the transpose instead."""
+    try:
+        mod = importlib.import_module("transformers.integrations.mxfp4")
+    except Exception as exc:
+        pytest.skip(f"mxfp4 integrations unavailable: {exc}")
+    fn = getattr(mod, "dequantize_convertops", None)
+    if not _TX_IS_5X:
+        if fn is None:
+            pytest.skip(
+                f"transformers {_TX_VERSION} predates the ConversionOps mxfp4 "
+                "loading path; zoo patches mxfp4.dequantize instead"
+            )
+        return
+    if fn is None:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
+            "transformers.integrations.mxfp4.dequantize_convertops but it is "
+            f"missing on transformers {_TX_VERSION}. Without it the loader "
+            "keeps zoo's un-transposed [E, D, G*B*2] layout and GPT-OSS loads "
+            "with dims 1 and 2 swapped."
+        )
+    _assert_params_superset(
+        fn,
+        required=["blocks", "scales"],
+        zoo_file="mxfp4.py",
+        label="dequantize_convertops",
+    )
+    # Zoo's replacement is what Mxfp4Dequantize.convert calls, so the class and
+    # its call site must both still be there for the patch to reach the loader.
+    if getattr(mod, "Mxfp4Dequantize", None) is None:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py relies on "
+            "transformers.integrations.mxfp4.Mxfp4Dequantize calling "
+            f"dequantize_convertops, but the class is missing on {_TX_VERSION}"
         )
 
 
@@ -1288,23 +1352,35 @@ def test_mxfp4_fp4_values_constant_present():
 
 
 def test_mxfp4_shard_and_distribute_module_present():
-    """mxfp4.py:181 imports
-    ``transformers.integrations.tensor_parallel.shard_and_distribute_module``;
-    patched dequantize delegates when device_mesh != None. Positional
-    arity must be 8 for zoo's call to land."""
+    """mxfp4.py (4.x gate) and gpt_oss.py (< 5.16.0 gate) import
+    ``transformers.integrations.tensor_parallel.shard_and_distribute_module``
+    and delegate to it when device_mesh != None. Positional arity must be 8
+    for zoo's call to land.
+
+    5.16.0 replaced the function with a ``(*args, **kwargs)`` tombstone that
+    raises RuntimeError, so there is nothing left to pin above that version --
+    zoo gates both call sites off instead. Note the tombstone is a genuine
+    upstream stub, NOT a decorator wrapper: it has no ``__wrapped__``, so
+    ``follow_wrapped`` would not recover a real signature."""
     try:
         mod = importlib.import_module("transformers.integrations.tensor_parallel")
     except Exception as exc:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:181 imports "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py imports "
             f"transformers.integrations.tensor_parallel but it is missing: {exc}"
         )
     fn = getattr(mod, "shard_and_distribute_module", None)
     if fn is None:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:181 expects "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
             "shard_and_distribute_module but it is missing on transformers "
             f"{_TX_VERSION}"
+        )
+    if _TX_GE_5_16:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: shard_and_distribute_module is a "
+            "deprecation tombstone that raises RuntimeError; zoo gates both "
+            "call sites to < 5.16.0 and uses tp_plan= above it"
         )
     # 8 positionals: model, param_value, empty_param, dq_param_name,
     # casting_dtype, to_contiguous, rank, device_mesh.
@@ -1314,28 +1390,30 @@ def test_mxfp4_shard_and_distribute_module_present():
                       inspect.Parameter.POSITIONAL_ONLY)
     ]
     if len(params) < 8:
+        sig = inspect.signature(fn)
+        # A bare (*args, **kwargs) is not a function that stopped taking
+        # arguments, it is a passthrough: upstream's 5.16.0 tombstone accepts
+        # any call and unconditionally raises RuntimeError. Reporting that as
+        # "accepts only 0 positionals" sends the reader looking for a signature
+        # change that never happened, so name what it actually is. Worth
+        # stating explicitly that it is NOT a decorator wrapper either: it has
+        # no __wrapped__, so follow_wrapped recovers nothing.
+        if _has_var_keyword(fn) and any(
+            p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+        ):
+            detail = (
+                f"accepts any call and forwards nothing: {sig}. That is a "
+                "deprecation tombstone or passthrough, not a narrowed "
+                "signature, so the call site cannot be repaired by dropping "
+                "arguments and must be gated off or ported"
+            )
+        else:
+            detail = f"accepts only {len(params)}: {sig}"
         pytest.fail(
-            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py:196 calls "
-            f"shard_and_distribute_module with 8 positionals but installed "
-            f"signature on transformers {_TX_VERSION} accepts only "
-            f"{len(params)}: {inspect.signature(fn)}"
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py calls "
+            f"shard_and_distribute_module with 8 positionals but the installed "
+            f"signature on transformers {_TX_VERSION} {detail}"
         )
-
-
-def test_mxfp4_shard_and_distribute_set_param_kwarg_or_4x_compat():
-    """mxfp4.py:196 passes ``set_param=False`` (5.x kwarg). 4.x without
-    **kwargs catch-all TypeErrors on the TP path; surface as skip."""
-    mod = importlib.import_module("transformers.integrations.tensor_parallel")
-    fn = mod.shard_and_distribute_module
-    if "set_param" in _param_names(fn):
-        return  # 5.x
-    if _has_var_keyword(fn):
-        return  # **kwargs swallows set_param
-    pytest.skip(
-        f"transformers {_TX_VERSION} predates set_param kwarg on "
-        "shard_and_distribute_module; zoo's TP path (device_mesh != None) "
-        "requires 5.x. Non-TP users unaffected."
-    )
 
 
 def test_mxfp4_mxfp4_config_top_level_class():
