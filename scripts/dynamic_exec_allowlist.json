@@ -127,7 +127,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "002343bd43161592",
-      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f"
     },
     {
       "path": "unsloth_zoo/compiler.py",
@@ -135,7 +136,8 @@
       "sink": "eval",
       "kind": "f-string",
       "hash": "03e6d133b778a53e",
-      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f"
     },
     {
       "path": "unsloth_zoo/compiler.py",
@@ -143,7 +145,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "07325163fcae29ba",
-      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f"
     },
     {
       "path": "unsloth_zoo/compiler.py",
@@ -152,6 +155,7 @@
       "kind": "f-string",
       "hash": "41335056252b5222",
       "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f",
       "count": 9
     },
     {
@@ -169,7 +173,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "aec8dc650544d15a",
-      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f"
     },
     {
       "path": "unsloth_zoo/compiler.py",
@@ -177,7 +182,8 @@
       "sink": "eval",
       "kind": "f-string",
       "hash": "b4ffe1845a490edc",
-      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint.",
+      "origin": "3eadeb9f"
     },
     {
       "path": "unsloth_zoo/compiler.py",
@@ -193,7 +199,8 @@
       "sink": "exec",
       "kind": "f-string via `source`",
       "hash": "3725bba562bb6fff",
-      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either.",
+      "origin": "6cab0fdc"
     },
     {
       "path": "unsloth_zoo/llama_cpp.py",
@@ -201,7 +208,8 @@
       "sink": "exec",
       "kind": "f-string via `functions`",
       "hash": "7330700d494b9249",
-      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either.",
+      "origin": "8cd5eb16"
     },
     {
       "path": "unsloth_zoo/patching_utils.py",
@@ -209,7 +217,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "70146d03d161750a",
-      "reason": "Imports names selected by `x in source` from dir(transformers.integrations.bitsandbytes), i.e. attributes of the installed transformers."
+      "reason": "Imports names selected by `x in source` from dir(transformers.integrations.bitsandbytes), i.e. attributes of the installed transformers.",
+      "origin": "0f013019"
     },
     {
       "path": "unsloth_zoo/patching_utils.py",
@@ -226,6 +235,7 @@
       "kind": ".join() via `source` via `source` via `source`",
       "hash": "7a5e305efb369e7f",
       "reason": "Self-generated source: `source` is `inspect.getsource` of the INSTALLED torch._dynamo.compiled_autograd function, with literal replacements applied, and the import list is built from `dir()` of that same installed module. No value from a config, a download or the environment reaches either string.",
+      "origin": "5b0eb651+addd479f",
       "count": 2
     },
     {
@@ -242,7 +252,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "45bbd24d7d803e73",
-      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names."
+      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names.",
+      "origin": "a43c9531"
     },
     {
       "path": "unsloth_zoo/peft_utils.py",
@@ -250,7 +261,8 @@
       "sink": "eval",
       "kind": "f-string via `item`",
       "hash": "81cdac2f6f8a2c32",
-      "reason": "`item` is `peft.tuners.lora.<file>` where <file> is a .py filename listed from the INSTALLED peft package directory, and `modules` is dir() of that module filtered to Linear* names. Both are properties of the installed dependency."
+      "reason": "`item` is `peft.tuners.lora.<file>` where <file> is a .py filename listed from the INSTALLED peft package directory, and `modules` is dir() of that module filtered to Linear* names. Both are properties of the installed dependency.",
+      "origin": "a43c9531"
     },
     {
       "path": "unsloth_zoo/peft_utils.py",
@@ -258,7 +270,8 @@
       "sink": "exec",
       "kind": "f-string",
       "hash": "d467bcd0b437db95",
-      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names."
+      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names.",
+      "origin": "a43c9531"
     },
     {
       "path": "unsloth_zoo/peft_utils.py",
@@ -298,7 +311,8 @@
       "sink": "exec",
       "kind": "string concatenation via `save_pretrained` via `save_pretrained` via `save_pretrained`",
       "hash": "b9fff86a8c82eb0d",
-      "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. The one external pair, `repo_id` and `revision` in `incremental_save_pretrained`, goes through `repr` before it is formatted in."
+      "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. The one external pair, `repo_id` and `revision` in `incremental_save_pretrained`, goes through `repr` before it is formatted in.",
+      "origin": "94841545"
     },
     {
       "path": "unsloth_zoo/temporary_patches/misc.py",
@@ -314,7 +328,8 @@
       "sink": "exec",
       "kind": "string concatenation via `source`",
       "hash": "7a5e305efb369e7f",
-      "reason": "`source` is inspect.getsource of the installed transformers quantizer method, reindented and with the classmethod `cls` parameter stripped. Self-generated source, same category as the compiler sites."
+      "reason": "`source` is inspect.getsource of the installed transformers quantizer method, reindented and with the classmethod `cls` parameter stripped. Self-generated source, same category as the compiler sites.",
+      "origin": "d383e04a"
     },
     {
       "path": "unsloth_zoo/vllm_utils.py",
