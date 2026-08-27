@@ -226,18 +226,29 @@ def _resolve_interval_steps(value, total_steps):
     return int(value)
 
 
+# Metrics this trainer reports that improve DOWNWARD but do not end in "loss".
+# HF's rule is a bare "loss" suffix because HF never emits any of these; this
+# trainer emits perplexity for every token objective, and has since before the
+# metric direction was inferred at all.
+_LOWER_IS_BETTER_SUFFIXES = ("loss", "perplexity")
+
+
 def _resolve_greater_is_better(args):
     """Whether metric_for_best_model improves upward, mirroring HF Trainer.
 
     HF infers the direction from the metric name when it is not set. Defaulting
     to False instead would keep the worst checkpoint for every metric that is
     not a loss, which is what preference runs select on.
+
+    Perplexity is exempt from the suffix rule. It is a token objective's only
+    other reported metric, so reading it as upward would silently invert
+    best-checkpoint selection for runs that predate any of this.
     """
     explicit = getattr(args, "greater_is_better", None)
     if explicit is not None:
         return bool(explicit)
     metric = getattr(args, "metric_for_best_model", None) or "eval_loss"
-    return not str(metric).endswith("loss")
+    return not str(metric).endswith(_LOWER_IS_BETTER_SUFFIXES)
 
 
 class _MLXCallbackHandler:
@@ -1963,12 +1974,17 @@ class MLXTrainer:
             raise TypeError(
                 f"{type(self).__name__} requires {self.config_class.__name__}."
             )
-        if self.preference_kind and args is not None:
-            self.args = copy.copy(self.args)
         # HF resolves this in TrainingArguments.__post_init__. EarlyStoppingCallback
         # and friends read args.greater_is_better straight off the arguments, so it
         # has to be a real boolean before any callback runs, not only at the
         # comparisons this trainer makes itself.
+        #
+        # Copy first, for every objective and not just the preference ones. This
+        # is a write, and `args` is the object the caller still holds: without
+        # the copy a plain SFT or VLM run reaches back into their config and
+        # rewrites a field they never set.
+        if args is not None:
+            self.args = copy.copy(self.args)
         self.args.greater_is_better = _resolve_greater_is_better(self.args)
 
         # Auto-detect VLM
@@ -6449,7 +6465,21 @@ class MLXTrainer:
                     f"Perplexity: {ppl:.2f}"
                 )
             if preference_kind and bool(getattr(args, "generate_during_eval", False)):
-                _sample_generations(current_step)
+                # Sample in eval mode, like the scoring pass above and like TRL,
+                # which generates inside its evaluation_loop. model.train() has
+                # already run by here, so without this the sampler decodes under
+                # NEFTune embedding noise and active dropout -- it would print
+                # text the policy does not actually produce.
+                self.model.eval()
+                try:
+                    _sample_generations(current_step)
+                except Exception as e:
+                    # A diagnostic must not take the run down, nor discard the
+                    # evaluation that already succeeded but has not been logged
+                    # yet by the block below.
+                    _main_print(f"Unsloth: generate_during_eval failed: {e}")
+                finally:
+                    self.model.train()
             if is_main_process:
                 for cb in self._eval_callbacks:
                     try:

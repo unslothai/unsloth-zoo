@@ -1256,6 +1256,65 @@ def test_a_reused_trainer_does_not_report_the_previous_run_samples(
     assert trainer.last_generation_samples == []
 
 
+def test_sampling_runs_in_eval_mode_and_restores_training_mode(
+    tmp_path, monkeypatch,
+):
+    """_evaluate restores training mode before sampling starts, so the sampler
+    has to enter eval mode itself or it decodes under NEFTune noise and
+    dropout -- printing text the policy does not actually produce. TRL samples
+    inside its evaluation_loop, in eval mode."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+    # The shim's Module.eval() is a no-op with no `training` attribute, so the
+    # observable here is the call order, not the flag. The flag itself is
+    # covered on the Metal lane.
+    order = []
+    _eval, _train = trainer.model.eval, trainer.model.train
+    trainer.model.eval = lambda: (order.append("eval"), _eval())[1]
+    trainer.model.train = lambda: (order.append("train"), _train())[1]
+
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+
+    assert calls, "the sampler never ran"
+    assert order[-1] == "train", f"run did not end in training mode: {order}"
+    # Scoring's own eval/train pair, then a second pair around the sampler.
+    assert order.count("eval") >= 2, (
+        f"sampling did not enter eval mode of its own: {order}"
+    )
+
+
+def test_a_failing_sampler_does_not_take_the_run_down(tmp_path, monkeypatch):
+    """Sampling is a diagnostic. A raise here used to abort training and drop
+    the evaluation that had already succeeded but was not yet logged."""
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    class Exploding:
+        # Not generate_batch: _run_generation_trainer substitutes its own, so a
+        # failure injected there is overwritten before the sampler ever sees it.
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("engine out of memory")
+
+    monkeypatch.setattr(generate_module, "GenerationRequest", Exploding)
+    result = _run_generation_trainer(trainer, monkeypatch, [])
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert trainer._last_eval_metrics, "the evaluation was discarded"
+    assert any(
+        "eval_loss" in entry for entry in trainer.state.log_history
+    ), "the completed evaluation never reached the log"
+
+
 def test_prompt_preparation_runs_inside_the_rng_guard(tmp_path, monkeypatch):
     """Building the eval batches draws from the shared RNG, so it has to run
     inside the preservation. Falsified against a run that builds none."""
@@ -1347,6 +1406,29 @@ def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
     assert weight == 3, "every pair is weighted once"
     assert math.isclose(total / weight, float(eval_fn(model, *whole[0])[0]),
                         rel_tol=2e-5, abs_tol=2e-5)
+
+
+def test_the_orpo_logit_sum_is_accumulated_in_float32():
+    """ORPO reduces raw logits, so the accumulator dtype is the model's own.
+
+    mx.sum does not promote, and a batch holds millions of logits: in bf16 the
+    running sum stops registering addends long before the end, and the cast in
+    mx.stack lands after the damage. DPO is safe by construction -- its float32
+    response mask promotes the multiply before the reduction.
+
+    This shim runs in float32, so the assertion is on the dtype rather than on
+    the value; only a real-mlx run reproduces the drift itself.
+    """
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference as pref
+
+    logits = mx.random.uniform(shape=(2, 16, 64)) * 2.0
+    for dtype in (mx.bfloat16, mx.float16):
+        summed, count = pref._orpo_logit_sum(logits.astype(dtype))
+        assert summed.dtype == mx.float32
+        assert float(count) == 2 * 16 * 64
+        assert float(summed) == pytest.approx(
+            float(logits.astype(dtype).astype(mx.float32).sum()), rel=1e-3)
 
 
 def test_a_token_mean_is_taken_over_every_token_not_every_batch():

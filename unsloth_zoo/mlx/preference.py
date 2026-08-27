@@ -663,7 +663,20 @@ def _masked_logit_sum(logits, mask):
     Separate so the eval set's mean is taken over all of its positions at once.
     """
     kept = mask.sum() * logits.shape[-1]
+    # The float32 mask promotes the product, so this reduction is already exact.
     return (logits * mask[..., None]).sum(), kept
+
+
+def _orpo_logit_sum(logits):
+    """Logit sum over every position, and the count it divides by.
+
+    Cast before reducing, not after: mx.sum accumulates in the input dtype, and
+    a bf16 model emits millions of logits per batch, far past the point an
+    8-bit mantissa stops registering the next addend. Casting the result would
+    be too late -- the sum has already saturated. The masked path above avoids
+    this only because its float32 mask promotes the multiply first.
+    """
+    return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
 
 
 # Metric index -> index of the stats entry it is divided by. Anything absent is
@@ -714,10 +727,8 @@ def make_preference_eval_fn(
         # logit metric over the completion positions only, ORPOTrainer over the
         # whole sequence. Follow each, so either compares against its own run.
         if kind == "orpo":
-            chosen_logits = logits[:pairs].sum()
-            rejected_logits = logits[pairs:].sum()
-            chosen_logit_count = mx.array(float(math.prod(logits[:pairs].shape)))
-            rejected_logit_count = mx.array(float(math.prod(logits[pairs:].shape)))
+            chosen_logits, chosen_logit_count = _orpo_logit_sum(logits[:pairs])
+            rejected_logits, rejected_logit_count = _orpo_logit_sum(logits[pairs:])
         else:
             chosen_logits, chosen_logit_count = _masked_logit_sum(
                 logits[:pairs], mask[:pairs])
