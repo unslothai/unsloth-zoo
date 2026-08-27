@@ -313,6 +313,16 @@ def _knobbed(_where="args", **attrs):
         (dict(mup_width_multiplier=2.0), "untied", "cannot reproduce"),  # phi3small masked tail
         (dict(logit_scale=None), "tied", "present but None"),  # malformed -> fail closed
         (dict(logit_scale=0.0625, logits_scaling=4.0), "tied", "multiple output-transform knobs"),
+        # Muse Glimmer multiplies before the softcap, on either head status.
+        (dict(output_multiplier=0.19611613513818404), "untied",
+         (0.19611613513818404, None)),
+        (dict(output_multiplier=0.19611613513818404), "tied",
+         (0.19611613513818404, None)),
+        (dict(output_multiplier=1.0), "untied", (None, None)),  # identity -> no-op
+        (dict(output_multiplier=None), "untied", "present but None"),
+        (dict(output_multiplier=0.001), "untied", "outside the supported range"),
+        (dict(output_multiplier=0.5, logits_scaling=4.0), "untied",
+         "multiple output-transform knobs"),
     ],
 )
 def test_detect_head_transform_rows(attrs, status, expected):
@@ -323,6 +333,32 @@ def test_detect_head_transform_rows(attrs, status, expected):
         assert problem is not None and expected in problem
     else:
         assert (scale, problem) == expected
+
+
+def test_output_multiplier_is_read_from_the_module_attribute():
+    """Muse Glimmer's forward reads the constructor copy, so `attr` counts."""
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    class _LanguageModel:
+        output_multiplier = 0.19611613513818404
+
+    assert _detect_head_transform(_LanguageModel(), "untied") == (
+        0.19611613513818404, None,
+    )
+
+
+def test_output_multiplier_drift_between_copy_and_config_fails_closed():
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    class _LanguageModel:
+        output_multiplier = 0.25
+
+        class args:
+            output_multiplier = 0.5
+
+    scale, problem = _detect_head_transform(_LanguageModel(), "untied")
+    assert scale is None
+    assert problem is not None and "inconsistent" in problem
 
 
 @pytest.mark.parametrize(

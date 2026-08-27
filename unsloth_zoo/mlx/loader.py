@@ -2608,6 +2608,27 @@ def _get_mlx_lm_model_class(model_type: str):
     return getattr(module, "Model", None)
 
 
+_VLM_TEXT_PATH_MODEL_TYPES = frozenset({
+    "muse_glimmer",
+})
+
+
+def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
+    """Whether mlx-vlm's text path for this architecture is known to train.
+
+    Listed rather than inferred, because nothing readable before loading proves
+    it: mlx-vlm's encoder-decoder and masked-diffusion families declare the same
+    token-logit output as the causal ones, and the Qwen, GLM and Paddle towers
+    holding `_position_ids` across calls declare nothing about it. An unlisted
+    architecture keeps the mlx_lm "Model type ... not supported" it had before.
+    """
+    if not model_type:
+        return False
+    # Shared with utils' vision-grid family set so the two cannot disagree on spelling.
+    from .utils import _mlx_vlm_canonical_model_type
+    return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
+
+
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     """Whether a multimodal wrapper should stay on the VLM load path.
 
@@ -2615,6 +2636,11 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     stripping modality towers in `sanitize()`, meaning it reconstructs a
     different object graph than the checkpoint. Keeping the VLM path is more
     robust than a per-family sanitizer workaround.
+
+    Multimodal architectures also land in mlx-vlm before mlx_lm has them, or
+    without mlx_lm ever gaining them. mlx_lm cannot construct those at all, so
+    a text-only request loads the wrapper and trains its text tower rather than
+    failing with "Model type ... not supported".
     """
 
     if not _is_vlm(config):
@@ -2622,7 +2648,7 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 
     cls = _get_mlx_lm_model_class(model_type)
     if cls is None:
-        return False
+        return _mlx_vlm_text_path_is_verified(model_type)
 
     return _has_multimodal_strip_sanitize(cls)
 
@@ -5764,13 +5790,23 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
             "repo_id", "commit_message", "commit_description",
             "create_pr", "revision",
         ),
+        context="save_pretrained_merged",
     )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
-def _mlx_supported_kwargs(kwargs, supported):
-    """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
-    return {key: kwargs[key] for key in supported if key in kwargs}
+def _mlx_supported_kwargs(kwargs, supported, context=None):
+    """Keep CUDA-only kwargs out of MLX save/export APIs; `context` names the caller in the
+    warning, since a silently dropped save option misexports."""
+    kept = {key: kwargs[key] for key in supported if key in kwargs}
+    if context is not None:
+        dropped = sorted(set(kwargs) - set(kept))
+        if dropped:
+            warnings.warn(
+                f"Unsloth: {context} ignored unsupported argument(s) "
+                f"{', '.join(dropped)} on the MLX path."
+            )
+    return kept
 
 
 def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
@@ -5784,6 +5820,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
             "token", "private", "tags", "commit_message",
             "commit_description", "create_pr", "revision",
         ),
+        context="push_to_hub",
     )
     if save_directory is not None:
         _mlx_save_pretrained_merged(
@@ -5810,7 +5847,11 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion",))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "imatrix_file"),
+        context="save_pretrained_gguf",
+    )
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method, **kwargs)
 
@@ -5828,7 +5869,11 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion", "token", "private"))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "private", "imatrix_file"),
+        context="push_to_hub_gguf",
+    )
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 
@@ -5998,9 +6043,16 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
-    processor = getattr(self, "_tokenizer", None)
+    # A text-only multimodal load publishes an inner tokenizer that cannot drive
+    # mlx-vlm preprocessing. By presence, so a falsy processor is not replaced by it.
+    processor = getattr(self, "_processor", None)
     if processor is None:
-        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+        processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError(
+            "Unsloth MLX: VLM generate() requires model._processor or "
+            "model._tokenizer."
+        )
 
     inputs = {}
     if args:

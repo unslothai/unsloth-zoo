@@ -883,3 +883,225 @@ def test_force_rebinds_already_loaded_real_fla_subprocess():
     )
     assert "FORCE_REBIND_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr}"
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Kernel-hub closures frozen by an import that happened before fla was live
+# ---------------------------------------------------------------------------
+
+def _has_kernel_hub_fallback() -> bool:
+    # use_kernel_func_from_hub_with_fallback arrived with huggingface/transformers#47630.
+    # On anything older the repair correctly returns () and there is nothing to patch.
+    try:
+        from transformers.integrations.hub_kernels import (  # noqa: F401
+            use_kernel_func_from_hub_with_fallback,
+        )
+        return True
+    except Exception:
+        return False
+
+
+requires_kernel_hub = pytest.mark.skipif(
+    not _has_kernel_hub_fallback(),
+    reason="transformers predates use_kernel_func_from_hub_with_fallback",
+)
+
+
+def _fake_wrapper(implementation, original, params=("q", "k")):
+    """A stand-in for what use_kernel_func_from_hub_with_fallback builds: a closure
+    over (applicable_params, implementation) with __wrapped__ set to the original."""
+    def wrapped(*args, **kwargs):
+        return implementation(*args, **kwargs)
+    wrapped.__wrapped__ = original
+    # Force a closure with the same shape the real decorator produces.
+    def outer(applicable_params, impl):
+        def inner(*args, **kwargs):
+            return impl(*args, **kwargs)
+        return inner
+    inner = outer(params, implementation)
+    inner.__wrapped__ = original
+    return inner
+
+
+def _fake_modeling(monkeypatch, package, wrapper, attribute="torch_chunk_gated_delta_rule"):
+    import types
+    module = types.ModuleType(f"transformers.models.{package}.modeling_{package}")
+    setattr(module, attribute, wrapper)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return module
+
+
+def test_resolved_implementation_reads_the_closure():
+    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+
+    def kernel(): return "kernel"
+    def original(): return "torch"
+
+    assert _resolved_implementation(_fake_wrapper(kernel, original)) is kernel
+    assert _resolved_implementation(lambda: None) is None
+    assert _resolved_implementation(object()) is None
+
+
+@requires_kernel_hub
+def test_late_import_repair_rebinds_the_frozen_fallback(monkeypatch):
+    """The whole point: a wrapper still closed over its own torch fallback is rebuilt."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def kernel(): return "fla"
+
+    module = _fake_modeling(monkeypatch, "qwen3_5", _fake_wrapper(original, original))
+
+    import transformers.integrations.hub_kernels as hub
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback",
+        lambda name, package, internal_path=None: (
+            lambda fn: _fake_wrapper(kernel, fn, params=("q", "k", "v", "g"))
+        ),
+    )
+    repaired = fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",))
+
+    assert repaired == ("qwen3_5.torch_chunk_gated_delta_rule",), repaired
+    assert fla_vendor._resolved_implementation(module.torch_chunk_gated_delta_rule) is kernel
+
+
+@requires_kernel_hub
+def test_late_import_repair_leaves_the_live_kernel_alone(monkeypatch):
+    """A module imported in the right order already dispatches to the live fla."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def kernel(): return "fla"
+
+    wrapper = _fake_wrapper(kernel, original)
+    module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
+    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: kernel)
+
+    import transformers.integrations.hub_kernels as hub
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not rebuild")),
+    )
+    assert fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",)) == ()
+    assert module.torch_chunk_gated_delta_rule is wrapper
+
+
+@requires_kernel_hub
+def test_late_import_repair_replaces_a_purged_install_kernel(monkeypatch):
+    """The case UNSLOTH_FORCE_VENDORED_FLA and the Hopper #640 switch create: the
+    wrapper closed over a real install's kernel that has since been purged. That is
+    not "already dispatching to a real kernel", it is the miscompiled backward we
+    replaced the install to avoid, so it must be rebound onto the live fla."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def purged(): return "the install we just deleted"
+    def vendored(): return "fla"
+
+    wrapper = _fake_wrapper(purged, original)
+    module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
+    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: vendored)
+
+    import transformers.integrations.hub_kernels as hub
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback",
+        lambda *a, **k: (lambda fn: _fake_wrapper(vendored, fn)),
+    )
+    repaired = fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",))
+
+    assert repaired == ("qwen3_5.torch_chunk_gated_delta_rule",), repaired
+    assert fla_vendor._resolved_implementation(
+        module.torch_chunk_gated_delta_rule) is vendored
+
+
+@requires_kernel_hub
+def test_late_import_repair_prefers_torch_over_a_purged_kernel(monkeypatch):
+    """Stale kernel, and nothing live to swap in. Pure torch beats calling into an
+    install that is no longer on sys.modules."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def purged(): return "gone"
+
+    module = _fake_modeling(monkeypatch, "qwen3_5", _fake_wrapper(purged, original))
+    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: None)
+
+    import transformers.integrations.hub_kernels as hub
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback",
+        lambda *a, **k: (lambda fn: _fake_wrapper(fn, fn)),
+    )
+    repaired = fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",))
+
+    assert repaired == ("qwen3_5.torch_chunk_gated_delta_rule",), repaired
+    assert fla_vendor._resolved_implementation(
+        module.torch_chunk_gated_delta_rule) is original
+
+
+@requires_kernel_hub
+def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
+    """If the rebuild still resolves to the fallback, fla genuinely has no kernel:
+    keep what was there rather than swapping in an identical object."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    wrapper = _fake_wrapper(original, original)
+    module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
+    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: None)
+
+    import transformers.integrations.hub_kernels as hub
+    monkeypatch.setattr(
+        hub, "use_kernel_func_from_hub_with_fallback",
+        lambda *a, **k: (lambda fn: _fake_wrapper(fn, fn)),
+    )
+    assert fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",)) == ()
+    assert module.torch_chunk_gated_delta_rule is wrapper
+
+
+def test_late_import_repair_skips_undecorated_attributes(monkeypatch):
+    """On a transformers that predates #47630 there is no __wrapped__ to rebuild from."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def plain(): return "plain"
+    module = _fake_modeling(monkeypatch, "qwen3_5", plain)
+    assert fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",)) == ()
+    assert module.torch_chunk_gated_delta_rule is plain
+
+
+def test_late_import_repair_is_scoped_to_vendor_covered_models():
+    """olmo_hybrid imports ShortConvolution, which is not vendored, so its probe must
+    stay False; rebinding vendored kernels into it would contradict that."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+    import inspect
+
+    default = inspect.signature(
+        fla_vendor._repair_kernel_hub_closures
+    ).parameters["packages"].default
+    assert "olmo_hybrid" not in default
+    assert default is fla_vendor._REPAIR_MODELING
+
+
+def test_late_import_repair_survives_missing_hub_kernels(monkeypatch):
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    real_import = __import__
+
+    def fail(name, *args, **kwargs):
+        if name == "transformers.integrations.hub_kernels":
+            raise ImportError("too old")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail)
+    assert fla_vendor._repair_kernel_hub_closures(packages=("qwen3_5",)) == ()
+
+
+def test_patch_vendor_fla_survives_a_broken_repair(monkeypatch):
+    """The repair runs in the exit path; it must never take patch_vendor_fla down."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(
+        fla_vendor, "_repair_kernel_hub_closures",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(fla_vendor, "_patch_vendor_fla", lambda phase=None: "sentinel")
+    assert fla_vendor.patch_vendor_fla() == "sentinel"

@@ -649,23 +649,6 @@ def test_preference_trainer_runs_through_shared_training_loop(
         MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
     )
 
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = nn.Embedding(64, 4)
-            self.proj = nn.Linear(4, 64, bias=False)
-            self._config = {"model_type": "tiny"}
-
-        def __call__(self, tokens):
-            return self.proj(self.embed(tokens))
-
-        def train(self, mode=True):
-            return self
-
-        @property
-        def state(self):
-            return []
-
     def value_and_grad_with_aux(model, fn):
         def wrapped(*args):
             return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
@@ -687,11 +670,11 @@ def test_preference_trainer_runs_through_shared_training_loop(
     )
     if objective == "orpo":
         trainer = MLXORPOTrainer(
-            Model(), Tokenizer(), rows(3), args=MLXORPOConfig(**common),
+            _tiny_model(), Tokenizer(), rows(3), args=MLXORPOConfig(**common),
         )
     else:
         trainer = MLXDPOTrainer(
-            Model(), Tokenizer(), rows(3),
+            _tiny_model(), Tokenizer(), rows(3),
             args=MLXDPOConfig(reference_free=True, **common),
         )
     trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
@@ -808,23 +791,6 @@ def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
     from unsloth_zoo.mlx.preference import make_orpo_loss_fn
     from unsloth_zoo.mlx.trainer import MLXORPOConfig, MLXORPOTrainer
 
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = nn.Embedding(64, 4)
-            self.proj = nn.Linear(4, 64, bias=False)
-            self._config = {"model_type": "tiny"}
-
-        def __call__(self, tokens):
-            return self.proj(self.embed(tokens))
-
-        def train(self, mode=True):
-            return self
-
-        @property
-        def state(self):
-            return []
-
     def value_and_grad_with_aux(model, fn):
         def wrapped(*args):
             return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
@@ -839,7 +805,7 @@ def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
         max_grad_norm=0.0, max_grad_leaf_norm=0.0, logging_steps=10,
         output_dir=str(tmp_path),
     )
-    model = Model()
+    model = _tiny_model()
     trainer = MLXORPOTrainer(model, Tokenizer(), rows(5), args=config)
     plan, _ = trainer._prepare_data(False)
     objective = make_orpo_loss_fn(config.beta)
@@ -852,23 +818,6 @@ def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
     result = trainer.train()
     assert result["train_steps"] == 2
     assert result["train_loss"] == pytest.approx(expected, rel=1e-6)
-
-
-def test_preference_capabilities_fail_before_model_setup():
-    import mlx.nn as nn
-    from unsloth_zoo.mlx.trainer import MLXORPOConfig, MLXORPOTrainer
-
-    class CapabilityModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self._config = {"model_type": "tiny"}
-
-    trainer = MLXORPOTrainer(
-        CapabilityModel(), Tokenizer(), rows(1), eval_dataset=rows(1),
-        args=MLXORPOConfig(eval_steps=1),
-    )
-    with pytest.raises(ValueError, match="evaluation, best-model loading"):
-        trainer._prepare_data(False)
 
 
 def test_trainer_applies_preference_formatter_once_per_row():
@@ -892,7 +841,7 @@ def test_trainer_applies_preference_formatter_once_per_row():
 
     dataset = [dict(row, id=index) for index, row in enumerate(rows(3))]
     trainer = MLXORPOTrainer(
-        Model(), Tokenizer(), dataset, formatting_func=formatter,
+        _tiny_model(), Tokenizer(), dataset, formatting_func=formatter,
         args=MLXORPOConfig(max_steps=1, gradient_accumulation_steps=1),
     )
     trainer._prepare_data(False)
@@ -963,3 +912,621 @@ def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path)
         trainer.train(resume_from_checkpoint=str(checkpoint))
     assert model.loaded is False
     assert model.adapter.lora_b.tolist() == [[0.0]]
+
+
+def _tiny_model(lora=False):
+    """lora=True adds one adapter at zero delta, as referenced DPO requires."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    class Adapter:
+        def __init__(self):
+            self.lora_a = mx.array([[1.0]])
+            self.lora_b = mx.array([[0.0]])
+            self.scale = 1.0
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(64, 4)
+            self.proj = nn.Linear(4, 64, bias=False)
+            self._config = {"model_type": "tiny"}
+            if lora:
+                self.q_proj = Adapter()
+
+        def __call__(self, tokens):
+            return self.proj(self.embed(tokens))
+
+        def train(self, mode=True):
+            return self
+
+        @property
+        def state(self):
+            return []
+
+        if lora:
+            def named_modules(self):
+                return [("", self), ("q_proj", self.q_proj)]
+
+            def parameters(self):
+                return {"q_proj": {
+                    "lora_a": self.q_proj.lora_a, "lora_b": self.q_proj.lora_b,
+                }}
+
+            def trainable_parameters(self):
+                return self.parameters()
+
+    return Model()
+
+
+def _generation_common(tmp_path, **overrides):
+    common = dict(
+        max_steps=1, gradient_accumulation_steps=2, per_device_train_batch_size=2,
+        compile=True, gradient_checkpointing=False, disable_memory_limits=True,
+        cast_norm_output_to_input_dtype=False,
+        max_grad_norm=0.0, max_grad_leaf_norm=0.0, logging_steps=1,
+        output_dir=str(tmp_path), max_seq_length=64, generate_during_eval=True,
+        num_generation_prompts=2, generation_max_tokens=8, eval_steps=1,
+        generation_temperature=0.25,
+    )
+    common.update(overrides)
+    return common
+
+
+def _run_generation_trainer(trainer, monkeypatch, calls):
+    """Drive one training step whose evaluation samples, recording engine calls."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    def fake_generate_batch(model, tokenizer, requests, *, defaults=None):
+        call = len(calls) + 1
+        calls.append({
+            "requests": list(requests),
+            "defaults": defaults,
+            "scales": [module.scale for _, module in iter_mlx_lora_modules(model)],
+        })
+        # Distinct per call and per row, so a mis-mapped sample reads wrong.
+        return [
+            types.SimpleNamespace(
+                token_ids=[1, 2], text=f"c{call}r{index}", logprobs=[0.0, 0.0],
+                finish_reason="length", stop_match=None,
+            )
+            for index, _ in enumerate(requests)
+        ]
+
+    monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+
+    def value_and_grad_with_aux(model, fn):
+        def wrapped(*args):
+            return fn(*args), tree_map(mx.zeros_like, model.trainable_parameters())
+        return wrapped
+
+    monkeypatch.setattr(nn, "value_and_grad", value_and_grad_with_aux)
+    trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5), state={}, update=lambda _model, _grad: None,
+    )
+    trainer.save_model = lambda *_args, **_kwargs: None
+    return trainer.train()
+
+
+def test_generation_fields_stay_appended_for_a_wholesale_config_copy():
+    """A config round-tripped without the generation fields is still a copy.
+
+    An unregistered field flips the copy detection, letting a copied default
+    warmup_steps override an explicit warmup_ratio.
+    """
+    import dataclasses
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig
+
+    generation_fields = {
+        "generate_during_eval", "num_generation_prompts",
+        "generation_max_tokens", "generation_temperature",
+    }
+    baseline = MLXDPOConfig()
+    provided = {
+        field.name: getattr(baseline, field.name)
+        for field in dataclasses.fields(MLXDPOConfig)
+        if field.name not in generation_fields
+    }
+    provided["warmup_ratio"] = 0.25
+    config = MLXDPOConfig(**provided)
+    assert config._unsloth_mlx_warmup_steps_explicit is False
+
+
+def test_callback_requested_eval_samples_without_a_step_cadence(
+    tmp_path, monkeypatch,
+):
+    """A callback raising should_evaluate reaches the sampling pass."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(
+            **_generation_common(tmp_path, reference_free=True, eval_steps=0)
+        ),
+    )
+
+    class RequestEval:
+        def on_step_end(self, args, state, control, **kwargs):
+            control.should_evaluate = True
+
+    assert trainer.last_generation_samples == [], "readable before the first eval"
+    trainer.add_callback(RequestEval())
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("overrides,with_eval,error,message", [
+    ({}, False, ValueError, "needs an eval_dataset"),
+    ({"generation_max_tokens": 64}, True, ValueError,
+     "smaller than max_seq_length"),
+    ({"num_generation_prompts": 0}, True, ValueError,
+     "num_generation_prompts must be at least 1"),
+    # The engine validates these itself, and both of its rejections must land at
+    # configuration time rather than at the first evaluation.
+    ({"generation_max_tokens": 0}, True, ValueError,
+     "generation_max_tokens is invalid"),
+    ({"generation_max_tokens": 8.5}, True, TypeError,
+     "generation_max_tokens is invalid"),
+    ({"generation_temperature": -1.0}, True, ValueError,
+     "generation_temperature is invalid"),
+])
+def test_generate_during_eval_rejects_a_configuration_it_cannot_honour(
+    tmp_path, overrides, with_eval, error, message,
+):
+    """What a sampling pass cannot honour fails while the config is checked."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3),
+        eval_dataset=rows(2) if with_eval else None,
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, **overrides)),
+    )
+    with pytest.raises(error, match=message):
+        trainer._prepare_data(False)
+
+
+def test_generation_prompt_is_the_standalone_encoding_not_the_training_boundary():
+    """A merged seam is prompt when there is no completion to merge with.
+
+    tokenize_preference_row gives that token to the response span so supervision
+    starts after the merge; generation must not inherit that boundary.
+    """
+    from unsloth_zoo.mlx.preference import (
+        encode_generation_prompt, tokenize_preference_row,
+    )
+
+    tokenizer = MappingTokenizer({"ab": [1, 2], "abc": [1, 3, 4], "abd": [1, 5, 6]})
+    row = {"prompt": "ab", "chosen": "c", "rejected": "d"}
+    trained = tokenize_preference_row(tokenizer, row, max_seq_length=16)
+    assert trained.chosen_prompt_ids == (1,)
+
+    _text, prompt_ids = encode_generation_prompt(
+        tokenizer, row, max_seq_length=16, max_new_tokens=4,
+    )
+    assert prompt_ids == (1, 2)
+
+
+def test_generation_prompt_reserves_room_for_the_sample():
+    """The prompt keeps its end and leaves max_new_tokens of context free."""
+    from unsloth_zoo.mlx.preference import encode_generation_prompt
+
+    tokenizer = MappingTokenizer({"p": [1, 2, 3, 4, 5, 6, 7, 8]})
+    row = {"prompt": "p", "chosen": "", "rejected": ""}
+    _text, prompt_ids = encode_generation_prompt(
+        tokenizer, row, max_seq_length=10, max_new_tokens=6,
+    )
+    assert prompt_ids == (5, 6, 7, 8)
+
+
+def test_referenced_dpo_samples_the_reference_with_scales_zeroed(
+    tmp_path, monkeypatch,
+):
+    """The reference sample is the base policy, and the scales come back."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    model = _tiny_model(lora=True)
+    trainer = MLXDPOTrainer(
+        model, Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path)),
+    )
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+
+    assert len(calls) == 2, "policy and reference"
+    assert all(scale != 0.0 for scale in calls[0]["scales"])
+    assert all(scale == 0.0 for scale in calls[1]["scales"])
+    assert all(
+        module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
+    ), "scales restored after sampling"
+    samples = trainer.last_generation_samples
+    assert [row["policy"] for row in samples] == ["c1r0", "c1r1"]
+    assert [row["reference"] for row in samples] == ["c2r0", "c2r1"], (
+        "each row reports its own reference, from the reference call"
+    )
+    # The reference must decode under the budget the prompt was truncated for.
+    for call in calls:
+        assert call["defaults"].max_tokens == 8
+        assert call["defaults"].sampling.temperature == 0.25
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+def test_unreferenced_objectives_sample_the_policy_only(
+    tmp_path, monkeypatch, objective,
+):
+    """ORPO has no reference and reference-free DPO has none either."""
+    from unsloth_zoo.mlx.trainer import (
+        MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
+    )
+
+    common = _generation_common(tmp_path, generation_max_tokens=56)
+    if objective == "orpo":
+        cls, args = MLXORPOTrainer, MLXORPOConfig(**common)
+    else:
+        cls, args = MLXDPOTrainer, MLXDPOConfig(reference_free=True, **common)
+    trainer = cls(
+        _tiny_model(lora=True), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=args,
+    )
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    assert len(calls) == 1
+    assert trainer.last_generation_samples[0]["reference"] is None
+
+    from unsloth_zoo.mlx.preference import encode_generation_prompt
+    samples = trainer.last_generation_samples
+    for index, row in enumerate(rows(2)):
+        request = calls[0]["requests"][index]
+        text, expected = encode_generation_prompt(
+            Tokenizer(), row, max_seq_length=64, max_new_tokens=56,
+        )
+        # Token ids, not text: the engine encodes without special tokens, so
+        # text would drop what training adds. The budget bites at this length.
+        assert request.prompt is None
+        assert tuple(request.prompt_token_ids) == expected
+        assert len(request.prompt_token_ids) == 64 - 56
+        assert samples[index]["prompt"] == text
+    assert calls[0]["defaults"].max_tokens == 56
+    assert calls[0]["defaults"].sampling.temperature == 0.25
+
+
+def test_generation_samples_every_split_of_a_dict_eval_dataset(
+    tmp_path, monkeypatch,
+):
+    """A dict of splits is resolved, not iterated as prompts named by key.
+
+    Each split holds more rows than num_generation_prompts, so the per-split cap
+    has to bite for the count to come out right.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3),
+        eval_dataset={"a": rows(3), "b": rows(3)},
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    assert len(calls) == 1
+    assert len(calls[0]["requests"]) == 4, "two prompts from each split"
+    assert [row["split"] for row in trainer.last_generation_samples] == [
+        "a", "a", "b", "b",
+    ]
+
+
+@pytest.mark.parametrize("eval_steps,expected", [(0, True), (0.5, False), (2, False)])
+def test_sampling_without_a_cadence_says_so(tmp_path, capsys, eval_steps, expected):
+    """No cadence samples nothing, which is worth a word rather than silence.
+
+    eval_steps is an HF interval, so a ratio in (0, 1) is a real cadence.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, eval_steps=eval_steps)),
+    )
+    trainer._prepare_data(False)
+    said = "no evaluation cadence" in capsys.readouterr().out
+    assert said is expected
+
+
+def test_a_reused_trainer_does_not_report_the_previous_run_samples(
+    tmp_path, monkeypatch,
+):
+    """Same contract the eval metrics get: a run reports only its own."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert trainer.last_generation_samples
+
+    trainer.args.eval_steps = 0
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert trainer.last_generation_samples == []
+
+
+def test_sampling_runs_in_eval_mode_and_restores_training_mode(
+    tmp_path, monkeypatch,
+):
+    """_evaluate restores training mode before sampling starts, so the sampler
+    has to enter eval mode itself or it decodes under NEFTune noise and
+    dropout -- printing text the policy does not actually produce. TRL samples
+    inside its evaluation_loop, in eval mode."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+    # The shim's Module.eval() is a no-op with no `training` attribute, so the
+    # observable here is the call order, not the flag. The flag itself is
+    # covered on the Metal lane.
+    order = []
+    _eval, _train = trainer.model.eval, trainer.model.train
+    trainer.model.eval = lambda: (order.append("eval"), _eval())[1]
+    trainer.model.train = lambda: (order.append("train"), _train())[1]
+
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls)
+
+    assert calls, "the sampler never ran"
+    assert order[-1] == "train", f"run did not end in training mode: {order}"
+    # Scoring's own eval/train pair, then a second pair around the sampler.
+    assert order.count("eval") >= 2, (
+        f"sampling did not enter eval mode of its own: {order}"
+    )
+
+
+def test_a_failing_sampler_does_not_take_the_run_down(tmp_path, monkeypatch):
+    """Sampling is a diagnostic. A raise here used to abort training and drop
+    the evaluation that had already succeeded but was not yet logged."""
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    class Exploding:
+        # Not generate_batch: _run_generation_trainer substitutes its own, so a
+        # failure injected there is overwritten before the sampler ever sees it.
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("engine out of memory")
+
+    monkeypatch.setattr(generate_module, "GenerationRequest", Exploding)
+    result = _run_generation_trainer(trainer, monkeypatch, [])
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert trainer._last_eval_metrics, "the evaluation was discarded"
+    assert any(
+        "eval_loss" in entry for entry in trainer.state.log_history
+    ), "the completed evaluation never reached the log"
+
+
+def test_prompt_preparation_runs_inside_the_rng_guard(tmp_path, monkeypatch):
+    """Building the eval batches draws from the shared RNG, so it has to run
+    inside the preservation. Falsified against a run that builds none."""
+    import random
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    held_out = [{"prompt": f"eval {index}: ", "chosen": "yes", "rejected": "no"}
+                for index in range(4)]
+
+    def training_draws(evaluating):
+        drawn, calls = [], []
+        random.seed(11)
+        trainer = MLXDPOTrainer(
+            _tiny_model(), Tokenizer(), rows(4),
+            eval_dataset=held_out if evaluating else None,
+            formatting_func=lambda row: (random.random(), row)[1],
+            args=MLXDPOConfig(**_generation_common(
+                tmp_path, reference_free=True, max_steps=2, eval_steps=1,
+                generate_during_eval=evaluating)))
+        # After each step, so the second lands past the first evaluation.
+        trainer.add_step_callback(lambda *_a, **_k: drawn.append(random.random()))
+        _run_generation_trainer(trainer, monkeypatch, calls)
+        return drawn, calls
+
+    evaluated, calls = training_draws(True)
+    control, no_calls = training_draws(False)
+    assert calls and not no_calls, "one run evaluated and the other did not"
+    assert len(evaluated) == len(control) == 2
+    assert evaluated == control, "building eval batches moved the training draws"
+
+
+def test_generation_prompt_rejects_a_budget_with_no_room():
+    """A non-positive budget would slice the wrong end, or the whole prompt."""
+    from unsloth_zoo.mlx.preference import encode_generation_prompt
+
+    with pytest.raises(ValueError, match="at least one"):
+        encode_generation_prompt(
+            MappingTokenizer({"p": [1, 2]}),
+            {"prompt": "p", "chosen": "", "rejected": ""},
+            max_seq_length=8, max_new_tokens=8,
+        )
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch):
+    """No perplexity: a preference loss is not a per-token likelihood."""
+    from unsloth_zoo.mlx.preference import PREFERENCE_EVAL_METRICS
+    from unsloth_zoo.mlx.trainer import (
+        MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
+    )
+
+    cls, config = ((MLXORPOTrainer, MLXORPOConfig) if objective == "orpo"
+                   else (MLXDPOTrainer, MLXDPOConfig))
+    common = _generation_common(
+        tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False)
+    if objective == "dpo":
+        common["reference_free"] = True
+    trainer = cls(_tiny_model(), Tokenizer(), rows(4), eval_dataset=rows(3),
+                  args=config(**common))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    metrics = trainer._last_eval_metrics
+    assert not [name for name in PREFERENCE_EVAL_METRICS[objective]
+                if f"eval_{name}" not in metrics]
+    assert "eval_loss" in metrics and "eval_perplexity" not in metrics
+    assert any("eval_loss" in entry for entry in trainer.state.log_history)
+
+
+def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
+    """Three rows at batch_size 2 leave a one-pair tail. Weighting each batch
+    equally would give that tail the same say as the two pairs before it."""
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, make_preference_eval_fn,
+    )
+
+    options = dict(max_seq_length=64, num_epochs=1, grad_accum=1,
+                   preserve_dataset_order=True)
+    split = create_preference_batch_plan(
+        rows(3), Tokenizer(), batch_size=2, **options)
+    whole = create_preference_batch_plan(
+        rows(3), Tokenizer(), batch_size=3, **options)
+    assert len(split) == 2 and len(whole) == 1
+    model = TinyModel()
+    eval_fn = make_preference_eval_fn("dpo", beta=0.1, reference_free=True)
+    total, weight = 0.0, 0
+    for index in range(len(split)):
+        loss, pairs, _stats = eval_fn(model, *split[index])
+        total += float(loss) * int(pairs)
+        weight += int(pairs)
+    assert weight == 3, "every pair is weighted once"
+    assert math.isclose(total / weight, float(eval_fn(model, *whole[0])[0]),
+                        rel_tol=2e-5, abs_tol=2e-5)
+
+
+def test_the_orpo_logit_sum_is_accumulated_in_float32():
+    """ORPO reduces raw logits, so the accumulator dtype is the model's own.
+
+    mx.sum does not promote, and a batch holds millions of logits: in bf16 the
+    running sum stops registering addends long before the end, and the cast in
+    mx.stack lands after the damage. DPO is safe by construction -- its float32
+    response mask promotes the multiply before the reduction.
+
+    This shim runs in float32, so the assertion is on the dtype rather than on
+    the value; only a real-mlx run reproduces the drift itself.
+    """
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference as pref
+
+    logits = mx.random.uniform(shape=(2, 16, 64)) * 2.0
+    for dtype in (mx.bfloat16, mx.float16):
+        summed, count = pref._orpo_logit_sum(logits.astype(dtype))
+        assert summed.dtype == mx.float32
+        assert float(count) == 2 * 16 * 64
+        assert float(summed) == pytest.approx(
+            float(logits.astype(dtype).astype(mx.float32).sum()), rel=1e-3)
+
+
+def test_a_token_mean_is_taken_over_every_token_not_every_batch():
+    """Two pairs averaging 1 over two tokens then a one-pair tail averaging 10
+    over four is a mean of 7; by-pair weighting gives 4, equal weighting 5.5."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference as pref
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    names = pref.PREFERENCE_EVAL_METRICS["dpo"]
+    at = names.index("logits/chosen")
+    over = pref.PREFERENCE_EVAL_DENOMINATORS["dpo"][at]
+
+    def scored(logit_sum, tokens, pairs):
+        values = [0.0] * pref.PREFERENCE_EVAL_STATS_WIDTH["dpo"]
+        values[at], values[over] = logit_sum, tokens
+        return mx.array(0.0), mx.array(pairs), mx.array(values)
+
+    batches = {"full": scored(2.0, 2.0, 2), "tail": scored(40.0, 4.0, 1)}
+    loss_fn = lambda _m, name, _l, _labels=None: batches[name]
+    loss_fn._unsloth_preference_metrics = names
+    loss_fn._unsloth_preference_denominators = pref.PREFERENCE_EVAL_DENOMINATORS["dpo"]
+    loss_fn._unsloth_preference_stats_width = pref.PREFERENCE_EVAL_STATS_WIDTH["dpo"]
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model, trainer.stop_requested = _tiny_model(), False
+    trainer._evaluate(
+        [("full", None, None), ("tail", None, None)], loss_fn, is_vlm=False)
+    assert trainer._last_eval_metrics["eval_logits/chosen"] == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize("eval_dataset,overrides,message", [
+    pytest.param(None, {"load_best_model_at_end": True},
+                 "need an eval_dataset", id="nothing-to-select-on"),
+    pytest.param({}, {"load_best_model_at_end": True},
+                 "at least one eval split", id="empty-mapping"),
+    pytest.param([], {}, "eval dataset is empty", id="empty-split"),
+    pytest.param({"a": rows(1), "b": []}, {}, "eval dataset is empty",
+                 id="one-empty-split"),
+    pytest.param(iter(rows(2)), {}, "requires a finite", id="unsized"),
+    pytest.param(rows(2), {"max_eval_batches": 1}, "max_eval_batches",
+                 id="capped-by-batch-count"),
+])
+def test_an_evaluation_that_cannot_be_trusted_is_rejected_before_the_run(
+    eval_dataset, overrides, message, tmp_path,
+):
+    """Each would otherwise report a number that reads like a real evaluation."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(4), eval_dataset=eval_dataset,
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, generate_during_eval=False,
+            **overrides)))
+    with pytest.raises(ValueError, match=message):
+        trainer._prepare_data(False)
+
+
+def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
+    """HF's EarlyStoppingCallback reads args.greater_is_better itself, so an
+    unresolved direction stops a run whose reward accuracy is still climbing."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(4), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, generate_during_eval=False,
+            metric_for_best_model="eval_rewards/accuracies")))
+    assert trainer.args.greater_is_better is True
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+def test_evaluation_accepts_a_wrapped_model_output(objective):
+    """A text-only VLM load takes the preference path, and mlx-vlm wrappers return
+    a LanguageModelOutput where mlx_lm models return the array. Evaluation reads
+    the same forward the training loss does, so it has to accept both."""
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, make_preference_eval_fn,
+    )
+
+    class Wrapped(TinyModel):
+        def __call__(self, tokens):
+            class LanguageModelOutput:
+                def __init__(self, logits):
+                    self.logits = logits
+            return LanguageModelOutput(super().__call__(tokens))
+
+    plan = create_preference_batch_plan(
+        rows(2), Tokenizer(), batch_size=2, max_seq_length=64,
+        num_epochs=1, grad_accum=1, preserve_dataset_order=True)
+    eval_fn = make_preference_eval_fn(objective, beta=0.1, reference_free=True)
+
+    bare = TinyModel()
+    wrapped = Wrapped()
+    wrapped.embedding, wrapped.output = bare.embedding, bare.output
+
+    from_bare = eval_fn(bare, *plan[0])
+    from_wrapped = eval_fn(wrapped, *plan[0])
+    assert math.isclose(float(from_bare[0]), float(from_wrapped[0]),
+                        rel_tol=1e-6, abs_tol=1e-6)
+    assert int(from_bare[1]) == int(from_wrapped[1])

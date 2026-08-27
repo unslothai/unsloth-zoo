@@ -1,5 +1,6 @@
 """MLX text preference tokenization, finite batching, and objectives."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -15,10 +16,12 @@ from .utils import (
     _finite_row_schedule,
     _finite_text_pad_width,
     _get_mlx_dropout_probability,
+    _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
     _torch_randperm_order,
     collect_mlx_lora_adapter_tensors,
+    encode_mlx_text,
     iter_mlx_lora_modules,
 )
 
@@ -133,10 +136,7 @@ def _render_preference_row(tokenizer, row):
     )
 
 
-def tokenize_preference_row(
-    tokenizer, row, *, max_seq_length, append_eos=True,
-):
-    """Tokenize one row and preserve a shared prompt boundary."""
+def _require_preference_fields(row):
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
     missing = {"prompt", "chosen", "rejected"} - set(row)
@@ -145,7 +145,21 @@ def tokenize_preference_row(
             "Unsloth MLX preference: every row requires explicit prompt, chosen, "
             f"and rejected fields; missing {sorted(missing)!r}."
         )
-    prompt_text, chosen_text, rejected_text = _render_preference_row(tokenizer, row)
+
+
+def tokenize_preference_row(
+    tokenizer, row, *, max_seq_length, append_eos=True, rendered=None,
+):
+    """Tokenize one row and preserve a shared prompt boundary.
+
+    ``rendered`` passes back a ``_render_preference_row`` result the caller
+    already has: a chat template may carry state, so rendering twice is not
+    guaranteed to give the same text.
+    """
+    _require_preference_fields(row)
+    prompt_text, chosen_text, rejected_text = (
+        _render_preference_row(tokenizer, row) if rendered is None else rendered
+    )
     chosen = _encode_mlx_prompt_completion(
         tokenizer, prompt_text, chosen_text, append_eos=append_eos,
     )
@@ -185,6 +199,41 @@ def tokenize_preference_row(
         tuple(chosen_prompt), tuple(chosen_response),
         tuple(rejected_prompt), tuple(rejected_response),
     )
+
+
+def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
+    """Encode one row's prompt for generation, reserving room for the sample.
+
+    ``max_new_tokens`` comes out of ``max_seq_length`` and the prompt keeps its
+    end. Not ``tokenize_preference_row``'s prompt: that boundary hands a merged
+    prompt/completion token to the response span, and generation has no
+    completion to merge with. Not the generation engine's own encoder either,
+    which omits the special tokens training adds.
+    """
+    _require_preference_fields(row)
+    prompt_text, _, _ = _render_preference_row(tokenizer, row)
+    return encode_generation_prompt_text(
+        tokenizer, prompt_text,
+        max_seq_length=max_seq_length, max_new_tokens=max_new_tokens,
+    )
+
+
+def encode_generation_prompt_text(
+    tokenizer, prompt_text, *, max_seq_length, max_new_tokens,
+):
+    """Encode an already-rendered prompt, reserving room for the sample."""
+    budget = int(max_seq_length) - int(max_new_tokens)
+    if budget < 1:
+        raise ValueError(
+            "Unsloth MLX preference: max_new_tokens must leave at least one "
+            "prompt token within max_seq_length."
+        )
+    prompt_ids = [int(token) for token in encode_mlx_text(tokenizer, prompt_text)]
+    if not prompt_ids:
+        raise ValueError(
+            "Unsloth MLX preference: a row rendered an empty prompt."
+        )
+    return prompt_text, tuple(prompt_ids[-budget:])
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
@@ -320,8 +369,13 @@ def create_preference_batch_plan(
     seed=None,
     append_eos=True,
     formatting_func=None,
+    prompt_sink=None,
 ):
-    """Build the finite preference plan consumed by both objectives."""
+    """Build the finite preference plan consumed by both objectives.
+
+    ``prompt_sink`` receives each row's rendered prompt text as the plan is
+    built, so a caller wanting it does not render the row a second time.
+    """
     rows = []
     for raw in dataset:
         row = formatting_func(raw) if formatting_func is not None else raw
@@ -329,8 +383,14 @@ def create_preference_batch_plan(
             raise ValueError(
                 "Unsloth MLX preference: formatting_func must return a mapping."
             )
+        rendered = None
+        if prompt_sink is not None:
+            _require_preference_fields(row)
+            rendered = _render_preference_row(tokenizer, row)
+            prompt_sink(rendered[0])
         rows.append(tokenize_preference_row(
             tokenizer, row, max_seq_length=max_seq_length, append_eos=append_eos,
+            rendered=rendered,
         ))
     if not rows:
         raise ValueError("Unsloth MLX preference: the training dataset is empty.")
@@ -405,13 +465,17 @@ def _log_sigmoid(value):
     return -mx.logaddexp(mx.array(0.0, dtype=value.dtype), -value)
 
 
-def _orpo_terms(chosen, rejected):
+def _orpo_log_odds(chosen, rejected):
     chosen = chosen.astype(mx.float32)
     rejected = rejected.astype(mx.float32)
     floor = mx.array(1e-12, dtype=mx.float32)
     chosen_odds = chosen - mx.log(mx.maximum(-mx.expm1(chosen), floor))
     rejected_odds = rejected - mx.log(mx.maximum(-mx.expm1(rejected), floor))
-    return -_log_sigmoid(chosen_odds - rejected_odds)
+    return chosen_odds - rejected_odds
+
+
+def _orpo_terms(chosen, rejected):
+    return -_log_sigmoid(_orpo_log_odds(chosen, rejected))
 
 
 def make_orpo_loss_fn(beta=0.1):
@@ -421,7 +485,7 @@ def make_orpo_loss_fn(beta=0.1):
     def loss_fn(model, batch, lengths, normalizers):
         targets = batch[:, 1:]
         ce = nn.losses.cross_entropy(
-            model(batch[:, :-1]), targets, reduction="none",
+            _model_logits(model(batch[:, :-1])), targets, reduction="none",
         ).reshape(targets.shape)
         mask = _response_mask(targets, lengths)
         response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
@@ -536,7 +600,7 @@ class LoRAReferencePolicy:
 def _response_logps(model, batch, lengths):
     targets = batch[:, 1:]
     ce = nn.losses.cross_entropy(
-        model(batch[:, :-1]), targets, reduction="none",
+        _model_logits(model(batch[:, :-1])), targets, reduction="none",
     ).reshape(targets.shape)
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
@@ -571,6 +635,159 @@ def make_dpo_loss_fn(
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
     return loss_fn
+
+
+_SHARED_EVAL_METRICS = (
+    "rewards/chosen",
+    "rewards/rejected",
+    "rewards/accuracies",
+    "rewards/margins",
+    "logps/chosen",
+    "logps/rejected",
+    "logits/chosen",
+    "logits/rejected",
+)
+
+# The names TRL logs for these objectives, so a run reads the same on
+# either backend. ORPO adds the three terms its loss decomposes into.
+PREFERENCE_EVAL_METRICS = {
+    "dpo": _SHARED_EVAL_METRICS,
+    "orpo": _SHARED_EVAL_METRICS + (
+        "nll_loss", "log_odds_ratio", "log_odds_chosen",
+    ),
+}
+
+
+def _masked_logit_sum(logits, mask):
+    """Logit sum over the response positions, and the count it divides by.
+
+    Separate so the eval set's mean is taken over all of its positions at once.
+    """
+    kept = mask.sum() * logits.shape[-1]
+    # The float32 mask promotes the product, so this reduction is already exact.
+    return (logits * mask[..., None]).sum(), kept
+
+
+def _orpo_logit_sum(logits):
+    """Logit sum over every position, and the count it divides by.
+
+    Cast before reducing: mx.sum accumulates in the input dtype, and a bf16
+    batch holds millions of logits, far past where an 8-bit mantissa stops
+    registering the next addend. Casting the result would already be too late.
+    """
+    return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
+
+
+# Metric index -> index of the stats entry it is divided by. Anything absent is
+# a per-pair sum over the pair count. These are means over tokens, which no pair
+# count recovers once batches hold different numbers of them.
+PREFERENCE_EVAL_DENOMINATORS = {
+    "dpo": {6: 8, 7: 9},
+    "orpo": {6: 11, 7: 12, 8: 13},
+}
+
+# Reported metrics, then the denominators the trainer sums alongside them.
+PREFERENCE_EVAL_STATS_WIDTH = {
+    kind: len(names) + len(PREFERENCE_EVAL_DENOMINATORS[kind])
+    for kind, names in PREFERENCE_EVAL_METRICS.items()
+}
+
+
+def _preference_forward(model, batch, lengths):
+    """Logits, per-token cross entropy, and the response mask for one batch."""
+    targets = batch[:, 1:]
+    logits = _model_logits(model(batch[:, :-1]))
+    ce = nn.losses.cross_entropy(
+        logits, targets, reduction="none",
+    ).reshape(targets.shape)
+    return logits, ce, _response_mask(targets, lengths)
+
+
+def make_preference_eval_fn(
+    kind, *, beta=0.1, label_smoothing=0.0,
+    reference_policy=None, reference_free=False,
+):
+    """Score one preference batch as ``(loss, pairs, stats)``.
+
+    ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
+    order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
+    Nothing is a per-batch mean: summing the vector across batches and dividing
+    each numerator by its own total averages the eval set exactly, however
+    unlike the batches are.
+    """
+    beta = float(beta)
+    epsilon = float(label_smoothing)
+
+    def eval_fn(model, batch, lengths, _normalizers=None):
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+        pairs = batch.shape[0] // 2
+        logps = -(ce * mask).sum(axis=1)
+        # TRL is not consistent between its trainers: DPOTrainer averages its
+        # logit metric over the completion positions only, ORPOTrainer over the
+        # whole sequence. Follow each, so either compares against its own run.
+        if kind == "orpo":
+            chosen_logits, chosen_logit_count = _orpo_logit_sum(logits[:pairs])
+            rejected_logits, rejected_logit_count = _orpo_logit_sum(logits[pairs:])
+        else:
+            chosen_logits, chosen_logit_count = _masked_logit_sum(
+                logits[:pairs], mask[:pairs])
+            rejected_logits, rejected_logit_count = _masked_logit_sum(
+                logits[pairs:], mask[pairs:])
+        if kind == "orpo":
+            logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
+        chosen, rejected = logps[:pairs], logps[pairs:]
+        if kind == "orpo":
+            nll_mask = (
+                mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+            ).astype(mx.float32)
+            nll_tokens = nll_mask.sum()
+            nll_sum = (ce[:pairs] * nll_mask).sum()
+            nll = nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
+            log_odds = _orpo_log_odds(chosen, rejected)
+            ratio = _log_sigmoid(log_odds)
+            loss = nll - beta * ratio.mean()
+            chosen_rewards = beta * chosen
+            rejected_rewards = beta * rejected
+            extra = [nll_sum, ratio.sum(), log_odds.sum()]
+            denominators = [
+                chosen_logit_count, rejected_logit_count, nll_tokens,
+            ]
+        else:
+            if reference_free:
+                reference = mx.zeros(logps.shape, dtype=logps.dtype)
+            else:
+                reference = reference_policy.forward(model, batch, lengths)
+            margin = beta * (
+                (chosen - rejected) - (reference[:pairs] - reference[pairs:])
+            )
+            loss = -(
+                (1.0 - epsilon) * _log_sigmoid(margin)
+                + epsilon * _log_sigmoid(-margin)
+            ).mean()
+            chosen_rewards = beta * (chosen - reference[:pairs])
+            rejected_rewards = beta * (rejected - reference[pairs:])
+            extra = []
+            denominators = [chosen_logit_count, rejected_logit_count]
+        stats = [
+            chosen_rewards.sum(),
+            rejected_rewards.sum(),
+            (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
+            (chosen_rewards - rejected_rewards).sum(),
+            chosen.sum(),
+            rejected.sum(),
+            chosen_logits,
+            rejected_logits,
+        ] + extra + denominators
+        return (
+            loss,
+            mx.array(pairs, dtype=mx.int32),
+            mx.stack([value.astype(mx.float32) for value in stats]),
+        )
+
+    eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
+    eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
+    eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
+    return eval_fn
 
 
 def lora_modules_have_nonzero_delta(modules):

@@ -226,6 +226,25 @@ def _resolve_interval_steps(value, total_steps):
     return int(value)
 
 
+# HF's rule is a bare "loss" suffix, which it can afford because it never emits
+# perplexity; this trainer emits it for every token objective.
+_LOWER_IS_BETTER_SUFFIXES = ("loss", "perplexity")
+
+
+def _resolve_greater_is_better(args):
+    """Whether metric_for_best_model improves upward, mirroring HF Trainer.
+
+    HF infers the direction from the metric name when it is not set. Defaulting
+    to False instead would keep the worst checkpoint for every metric that is
+    not a loss, which is what preference runs select on.
+    """
+    explicit = getattr(args, "greater_is_better", None)
+    if explicit is not None:
+        return bool(explicit)
+    metric = getattr(args, "metric_for_best_model", None) or "eval_loss"
+    return not str(metric).endswith(_LOWER_IS_BETTER_SUFFIXES)
+
+
 class _MLXCallbackHandler:
     """Small HF-compatible callback dispatcher that keeps MLX imports Torch-free."""
 
@@ -577,6 +596,9 @@ from .utils import (
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
     _get_text_model,
+    _neftune_embed_scale,
+    _probe_vlm_embedding_module,
+    _vlm_compares_embedding_values,
     _distributed_rank_size,
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
@@ -586,8 +608,10 @@ from .preference import (
     PreferenceRunContext,
     build_reference_policy,
     create_preference_batch_plan,
+    encode_generation_prompt_text,
     make_dpo_loss_fn,
     make_orpo_loss_fn,
+    make_preference_eval_fn,
 )
 from .compile import (
     build_compile_policy,
@@ -888,6 +912,37 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
     return tree_map(_clip_leaf_norm, grad)
 
 
+def _build_generation_defaults(args):
+    """Build the engine's sampling parameters, validating them as a side effect.
+
+    The engine validates in its own frozen dataclasses, so building them at
+    configuration time turns a crash at the first evaluation into a
+    configuration error. Values stay uncoerced: coercing would hide the type
+    checks this exists to run. Its messages name its own fields, so they are
+    restated against the config field the user set.
+    """
+    from .generate import GenerationDefaults, SamplingParams
+
+    try:
+        sampling = SamplingParams(temperature=args.generation_temperature)
+    except (TypeError, ValueError) as error:
+        raise type(error)(
+            f"Unsloth MLX preference: generation_temperature is invalid: {error}"
+        ) from error
+    try:
+        return GenerationDefaults(max_tokens=args.generation_max_tokens,
+                                  sampling=sampling)
+    except (TypeError, ValueError) as error:
+        raise type(error)(
+            f"Unsloth MLX preference: generation_max_tokens is invalid: {error}"
+        ) from error
+
+
+def _one_line(text, width):
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= width else flat[: width - 1] + "\u2026"
+
+
 def _global_grad_norm_fp32(grad):
     """Fp32 L2 norm of a gradient tree (one cross-tree reduction)."""
     norm_squared = tree_reduce(
@@ -1122,9 +1177,9 @@ class MLXTrainingConfig:
     eval_steps: int = 0  # 0 = disabled
     load_best_model_at_end: bool = False
     metric_for_best_model: str = "eval_loss"
-    greater_is_better: bool = False
+    greater_is_better: bool | None = None  # None infers from the metric name
     early_stopping_patience: int = 0  # 0 = disabled
-    neftune_noise_alpha: float = 0.0  # 0 = disabled (text models only)
+    neftune_noise_alpha: float = 0.0  # 0 = disabled
 
     # SFT-specific (from SFTConfig, for API compat)
     dataset_text_field: str = "text"
@@ -1248,6 +1303,10 @@ class MLXTrainingConfig:
             "disable_dropout",
             "reference_free",
             "label_smoothing",
+            "generate_during_eval",
+            "num_generation_prompts",
+            "generation_max_tokens",
+            "generation_temperature",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1307,6 +1366,12 @@ class MLXORPOConfig(MLXTrainingConfig):
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    # Batched decoding is not batch-invariant, so a prompt can decode
+    # differently depending on what shares its batch.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
 
 
 @dataclass(init=False)
@@ -1317,6 +1382,11 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    # As MLXORPOConfig; a referenced run also samples the frozen base policy.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
 
 
 def _shape_guard_report(
@@ -1901,8 +1971,13 @@ class MLXTrainer:
             raise TypeError(
                 f"{type(self).__name__} requires {self.config_class.__name__}."
             )
-        if self.preference_kind and args is not None:
+        # EarlyStoppingCallback and friends read args.greater_is_better straight
+        # off the arguments, so it has to be a real boolean before any callback
+        # runs. Copy first, for every objective: this is a write, and `args` is
+        # the object the caller still holds.
+        if args is not None:
             self.args = copy.copy(self.args)
+        self.args.greater_is_better = _resolve_greater_is_better(self.args)
 
         # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
@@ -2087,6 +2162,7 @@ class MLXTrainer:
         # eval (eval_steps=0 or no eval dataset) does not report a prior run's
         # eval_loss/perplexity in its result. Repopulated by _evaluate.
         self._last_eval_metrics = {}
+        self.last_generation_samples = []
         self._early_stopped = False
         self._best_metric = None
         self._best_step = None
@@ -2639,7 +2715,8 @@ class MLXTrainer:
     def add_eval_callback(self, fn):
         """Register a callback called after each evaluation.
 
-        fn(step, eval_loss, perplexity)
+        fn(step, eval_loss, perplexity); perplexity is None for a preference
+        objective, which reports no token-level likelihood to exponentiate.
         """
         self._eval_callbacks.append(fn)
 
@@ -3247,7 +3324,7 @@ class MLXTrainer:
         value = metrics[metric_name]
         if value != value:
             return False
-        greater = bool(getattr(self.args, "greater_is_better", False))
+        greater = _resolve_greater_is_better(self.args)
         improved = (
             self.state.best_metric is None
             or (value > self.state.best_metric if greater else value < self.state.best_metric)
@@ -3707,16 +3784,24 @@ class MLXTrainer:
                 pass  # read-only attribute; the close above already ended it
 
     def _evaluate_batch_totals(self, eval_batches, loss_fn, is_vlm=False):
-        """Accumulate weighted loss totals for one flat eval batch stream."""
+        """Accumulate weighted loss totals for one flat eval batch stream.
+
+        Returns ``(all_losses, ntokens, stats)``; ``stats`` is None unless the
+        loss function also reports per-batch metric sums.
+        """
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
+        metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
+        stats = None if not metric_names else mx.zeros((getattr(
+            loss_fn, "_unsloth_preference_stats_width", len(metric_names),
+        ),))
         # A stop requested before evaluation must abort before the first pull:
         # an unsized source's next row can block, so cancellation could
         # otherwise never take effect. Rank-synchronized so peers return
         # together instead of diverging at the in-loop status collective.
         should_stop, _ = self._distributed_eval_status()
         if should_stop:
-            return all_losses, ntokens
+            return all_losses, ntokens, stats
         iterator = iter(eval_batches)
 
         while True:
@@ -3735,16 +3820,21 @@ class MLXTrainer:
             if not failed and not self.stop_requested:
                 try:
                     if is_vlm:
-                        loss, ntoks = loss_fn(self.model, batch_data)
+                        scored = loss_fn(self.model, batch_data)
                     else:
                         batch, lengths, labels = batch_data
-                        loss, ntoks = loss_fn(self.model, batch, lengths, labels)
+                        scored = loss_fn(self.model, batch, lengths, labels)
+                    loss, ntoks = scored[0], scored[1]
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
                     # distributed all-sum. mx.where never selects the NaN branch.
                     all_losses += mx.where(ntoks > 0, loss * ntoks, 0.0)
                     ntokens += ntoks
-                    mx.eval(all_losses, ntokens)
+                    if stats is None:
+                        mx.eval(all_losses, ntokens)
+                    else:
+                        stats = stats + scored[2]
+                        mx.eval(all_losses, ntokens, stats)
                     # HF dispatches on_prediction_step after each evaluation
                     # batch is folded into the running totals. Raised inside
                     # this try on purpose: a callback that fails on one rank
@@ -3765,7 +3855,7 @@ class MLXTrainer:
             if should_stop:
                 break
 
-        return all_losses, ntokens
+        return all_losses, ntokens, stats
 
     def _create_text_eval_batches(
         self,
@@ -3841,62 +3931,101 @@ class MLXTrainer:
         """Run evaluation loop.
 
         Returns:
-            (avg_loss, perplexity) tuple.
+            ``(avg_loss, perplexity)``. Perplexity is None for a preference
+            objective, whose loss is not a per-token likelihood.
+
+        The weight each batch contributes is whatever its loss function returns
+        second: supervised tokens for a token objective, scored pairs for a
+        preference one.
         """
         self.model.eval()
-        metrics = {}
-        if isinstance(eval_batches, dict):
-            all_losses = mx.array(0.0)
-            ntokens = mx.array(0)
-            # HF evaluates one split at a time and rebuilds its eval_dataloader
-            # per split, so on_prediction_step reports the split being consumed
-            # rather than the dict of splits (whose len is the split count, and
-            # would give ProgressCallback a nonsense bar total).
-            handler = getattr(self, "callback_handler", None)
-            outer_dataloader = getattr(handler, "eval_dataloader", None)
-            try:
-                for split_index, (split_name, split_batches) in enumerate(
-                    eval_batches.items()
-                ):
-                    if handler is not None:
-                        if split_index:
-                            self._close_split_prediction_bars()
-                        handler.eval_dataloader = split_batches
-                    split_losses, split_tokens = self._evaluate_batch_totals(
-                        split_batches, loss_fn, is_vlm=is_vlm,
-                    )
-                    split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
-                    split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
-                    all_losses += split_losses
-                    ntokens += split_tokens
-                    mx.eval(all_losses, ntokens)
-                    split_loss = (
-                        (split_losses / split_tokens).item()
-                        if split_tokens.item() > 0 else 0.0
-                    )
-                    split_ppl = math.exp(min(split_loss, 100))
-                    split_prefix = f"eval_{split_name}"
-                    metrics[f"{split_prefix}_loss"] = split_loss
-                    metrics[f"{split_prefix}_perplexity"] = split_ppl
-                    if self._distributed_should_stop():
-                        break
-            finally:
-                if handler is not None:
-                    handler.eval_dataloader = outer_dataloader
-        else:
-            all_losses, ntokens = self._evaluate_batch_totals(
-                eval_batches, loss_fn, is_vlm=is_vlm,
-            )
-            all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
-            ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
+        # Restored on every path: a raise here would otherwise leave the model
+        # in eval mode for the rest of training, silently disabling dropout and
+        # NEFTune noise.
+        try:
+            metrics = {}
+            # Set by the preference scorer, which has no perplexity to report.
+            metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
+            # Means over tokens carry their own denominator in the same vector.
+            metric_denominators = getattr(
+                loss_fn, "_unsloth_preference_denominators", None,
+            ) or {}
 
-        self.model.train()
-        avg_loss = (all_losses / ntokens).item() if ntokens.item() > 0 else 0.0
-        perplexity = math.exp(min(avg_loss, 100))
-        metrics["eval_loss"] = avg_loss
-        metrics["eval_perplexity"] = perplexity
+            def _record(prefix, losses, weights, stats):
+                """Write one scope's metrics and return its mean loss."""
+                total = weights.item()
+                value = (losses / weights).item() if total > 0 else 0.0
+                metrics[f"{prefix}loss"] = value
+                if metric_names is None:
+                    metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
+                elif total > 0:
+                    summed = stats.tolist()
+                    for index, name in enumerate(metric_names):
+                        over = metric_denominators.get(index)
+                        divisor = total if over is None else summed[over]
+                        metrics[f"{prefix}{name}"] = (
+                            summed[index] / divisor if divisor > 0 else 0.0
+                        )
+                return value
+
+            if isinstance(eval_batches, dict):
+                all_losses = mx.array(0.0)
+                ntokens = mx.array(0)
+                all_stats = None
+                # HF evaluates one split at a time and rebuilds its eval_dataloader
+                # per split, so on_prediction_step reports the split being consumed
+                # rather than the dict of splits (whose len is the split count, and
+                # would give ProgressCallback a nonsense bar total).
+                handler = getattr(self, "callback_handler", None)
+                outer_dataloader = getattr(handler, "eval_dataloader", None)
+                try:
+                    for split_index, (split_name, split_batches) in enumerate(
+                        eval_batches.items()
+                    ):
+                        if handler is not None:
+                            if split_index:
+                                self._close_split_prediction_bars()
+                            handler.eval_dataloader = split_batches
+                        split_losses, split_tokens, split_stats = (
+                            self._evaluate_batch_totals(
+                                split_batches, loss_fn, is_vlm=is_vlm,
+                            )
+                        )
+                        split_losses = self._distributed_all_sum(split_losses, stream=mx.cpu)
+                        split_tokens = self._distributed_all_sum(split_tokens, stream=mx.cpu)
+                        all_losses += split_losses
+                        ntokens += split_tokens
+                        if split_stats is not None:
+                            split_stats = self._distributed_all_sum(
+                                split_stats, stream=mx.cpu,
+                            )
+                            all_stats = (
+                                split_stats if all_stats is None
+                                else all_stats + split_stats
+                            )
+                            mx.eval(all_stats)
+                        mx.eval(all_losses, ntokens)
+                        _record(f"eval_{split_name}_", split_losses, split_tokens,
+                                split_stats)
+                        if self._distributed_should_stop():
+                            break
+                finally:
+                    if handler is not None:
+                        handler.eval_dataloader = outer_dataloader
+            else:
+                all_losses, ntokens, all_stats = self._evaluate_batch_totals(
+                    eval_batches, loss_fn, is_vlm=is_vlm,
+                )
+                all_losses = self._distributed_all_sum(all_losses, stream=mx.cpu)
+                ntokens = self._distributed_all_sum(ntokens, stream=mx.cpu)
+                if all_stats is not None:
+                    all_stats = self._distributed_all_sum(all_stats, stream=mx.cpu)
+
+        finally:
+            self.model.train()
+        avg_loss = _record("eval_", all_losses, ntokens, all_stats)
         self._last_eval_metrics = metrics
-        return avg_loss, perplexity
+        return avg_loss, metrics.get("eval_perplexity")
 
     @staticmethod
     def _bytes_to_gb(value):
@@ -4064,16 +4193,28 @@ class MLXTrainer:
                     pass
 
         def _on_eval(step, eval_loss, perplexity):
+            # Everything the evaluation reported, not just the two values this
+            # callback is handed: "eval_rewards/chosen" charts as
+            # "eval/rewards/chosen", matching the existing "eval/loss".
+            reported = {
+                f"eval/{name[len('eval_'):]}": value
+                for name, value in (self._last_eval_metrics or {}).items()
+                # These two come from the arguments, so each value has one source.
+                if name not in ("eval_loss", "eval_perplexity")
+                and name.startswith("eval_") and isinstance(value, (int, float))
+            }
+            reported["eval/loss"] = eval_loss
+            if perplexity is not None:
+                reported["eval/perplexity"] = perplexity
             if wandb_run is not None:
                 try:
-                    wandb_run.log({"eval/loss": eval_loss,
-                                   "eval/perplexity": perplexity}, step=step)
+                    wandb_run.log(reported, step=step)
                 except Exception:
                     pass
             if tb_writer is not None:
                 try:
-                    tb_writer.add_scalar("eval/loss", eval_loss, step)
-                    tb_writer.add_scalar("eval/perplexity", perplexity, step)
+                    for name, value in reported.items():
+                        tb_writer.add_scalar(name, value, step)
                 except Exception:
                     pass
 
@@ -4084,43 +4225,66 @@ class MLXTrainer:
 
     def _install_neftune(self):
         """NEFTune: add scaled uniform noise to input embeddings during training.
-        Text models only; no-op in eval. Uses __class__ reassignment (a real
-        subclass) rather than a module swap, so the embedding object is
-        unchanged -- .weight stays readable for tied LM-head models, and
-        __call__ resolves on the subtype so interception actually fires."""
+        No-op in eval. Text models read the embedding off the backbone; VLM
+        wrappers agree on too little for that, so theirs is identified by running
+        the text-only embed path. Uses __class__ reassignment rather than a
+        module swap, so .weight stays readable for tied LM-head models and
+        __call__ resolves on the subtype so interception fires."""
         alpha = float(getattr(self.args, "neftune_noise_alpha", 0.0) or 0.0)
         # Reject non-finite alpha: nan slips past `alpha <= 0` and would poison
         # every embedding with nan/inf noise from step 0.
         if not math.isfinite(alpha) or alpha <= 0:
             return
         if self._is_vlm:
-            print("Unsloth: NEFTune (neftune_noise_alpha) is not yet supported "
-                  "for VLM models on MLX; ignoring.")
-            return
-        try:
-            tm = _get_text_model(self.model)
-            backbone = getattr(tm, "model", tm)
-            emb = backbone.embed_tokens
-        except Exception as e:
-            print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
-            return
+            if _vlm_compares_embedding_values(self.model):
+                print("Unsloth: NEFTune (neftune_noise_alpha) is not supported "
+                      "for this VLM on MLX: its forward identifies merged "
+                      "positions by comparing embedding values, which noise "
+                      "redrawn per call would defeat; ignoring.")
+                return
+            emb = _probe_vlm_embedding_module(self.model)
+            if emb is None:
+                print("Unsloth: NEFTune could not identify this VLM's token "
+                      "embedding; ignoring.")
+                return
+        else:
+            try:
+                tm = _get_text_model(self.model)
+                backbone = getattr(tm, "model", tm)
+                emb = backbone.embed_tokens
+            except Exception as e:
+                print(f"Unsloth: NEFTune could not locate embed_tokens ({e}); ignoring.")
+                return
         if getattr(emb, "_unsloth_neftune_active", False):
             return
 
         _Base = type(emb)
         _alpha = alpha
+        # These families multiply the embedding after this module returns, so
+        # undivided noise would ride through it; transformers adds its noise
+        # after that multiply. An unreadable config degrades to uncorrected
+        # noise, as every other lookup here does, rather than aborting train().
+        try:
+            _embed_scale = _neftune_embed_scale(self.model) or 1.0
+        except Exception as e:
+            print(f"Unsloth: NEFTune could not resolve the embedding scale ({e}); "
+                  f"injecting uncorrected noise.")
+            _embed_scale = 1.0
 
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
             _neftune_noise_enabled = True
-            def __call__(self, x):
-                out = _Base.__call__(self, x)
+            # *args/**kwargs, not (self, x): the VLM probe returns whichever
+            # module produced the embedding shape, which may take more arguments
+            # on the image path the probe never exercises.
+            def __call__(self, *args, **kwargs):
+                out = _Base.__call__(self, *args, **kwargs)
                 if (
                     getattr(self, "training", False)
                     and getattr(self, "_neftune_noise_enabled", True)
                 ):
                     dim = out.shape[-1] * out.shape[-2]
-                    scale = _alpha / (dim ** 0.5)
+                    scale = _alpha / (dim ** 0.5) / _embed_scale
                     noise = mx.random.uniform(
                         low=-1.0, high=1.0, shape=out.shape
                     ).astype(out.dtype) * scale
@@ -4140,7 +4304,13 @@ class MLXTrainer:
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
-        print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
+        # Report the divisor: on gemma3/gemma3n/gemma4 the same alpha perturbs
+        # sqrt(hidden_size) times less than before this correction.
+        if _embed_scale != 1.0:
+            print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}, noise divided by "
+                  f"the post-embedding scale {_embed_scale:.4f} to match transformers).")
+        else:
+            print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}).")
 
     def _remove_neftune(self):
         emb = getattr(self, "_neftune_emb", None)
@@ -5128,6 +5298,8 @@ class MLXTrainer:
                     f"silently restart from step 0."
                 ) from e
 
+        _sampling_reference = None
+        preference_eval_fn = None
         if preference_kind:
             if preference_kind == "orpo":
                 loss_fn = make_orpo_loss_fn(beta=args.beta)
@@ -5146,6 +5318,9 @@ class MLXTrainer:
                     ),
                 )
                 self._preference_reference_provenance = provenance
+                # Sampling borrows this policy's adapter modules so it zeroes
+                # the same ones the loss does. NEFTune is already off in eval.
+                _sampling_reference = reference_policy
                 loss_fn = make_dpo_loss_fn(
                     beta=args.beta,
                     label_smoothing=args.label_smoothing,
@@ -5155,6 +5330,15 @@ class MLXTrainer:
                 _main_print(f"Unsloth: Using DPO loss (beta={args.beta}).")
             self._preference_run_context = PreferenceRunContext(
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
+            )
+            # Not the training loss: that one normalizes across an accumulation
+            # window, and reports none of these metrics.
+            preference_eval_fn = make_preference_eval_fn(
+                preference_kind,
+                beta=args.beta,
+                label_smoothing=getattr(args, "label_smoothing", 0.0),
+                reference_policy=_sampling_reference,
+                reference_free=bool(getattr(args, "reference_free", False)),
             )
 
         self.callback_handler.optimizer = optimizer
@@ -5664,6 +5848,53 @@ class MLXTrainer:
 
         # Prepare eval batches
         eval_batches = None
+        # (split_name, prompt_text, prompt_token_ids), filled by the plan
+        # builder's own pass so the eval dataset is never read twice.
+        _generation_source = []
+
+        _samples_prompts = bool(getattr(args, "generate_during_eval", False))
+        _generation_budget = {}
+
+        def _format_preference_split(split_name, split):
+            """Format a preference split's rows here, so the plan is told not to.
+
+            One call per row, whatever else reads the split: a formatting_func
+            that varies between calls, or consumes what it is given, would
+            otherwise have one example sampled and a different one scored. Only
+            the preference plan hands its formatting over; every other eval path
+            formats inside its own builder, so this wraps nothing they see --
+            it would format their rows a second time and hide a sized dataset
+            behind a generator.
+            """
+            if _samples_prompts:
+                _generation_budget[split_name] = [
+                    0, int(args.num_generation_prompts),
+                ]
+            for raw in split:
+                yield (
+                    self.formatting_func(raw)
+                    if self.formatting_func is not None else raw
+                )
+
+        def _capture_generation_prompt(split_name, prompt_text):
+            """Keep a sampler prompt from the rendering the scorer already did.
+
+            Rendering is not required to be a pure function of the row -- a chat
+            template may carry state -- so the prompt that is sampled is the one
+            the scorer rendered, not a second rendering of the same row. Keeping
+            text and token ids rather than the row is what makes that safe: an
+            iterable is free to yield one row object it rewrites every time, and
+            sampling reads these only once the pass has finished.
+            """
+            budget = _generation_budget.get(split_name)
+            if budget is None or budget[0] >= budget[1]:
+                return
+            budget[0] += 1
+            _generation_source.append((split_name,) + encode_generation_prompt_text(
+                self.tokenizer, prompt_text,
+                max_seq_length=args.max_seq_length,
+                max_new_tokens=args.generation_max_tokens,
+            ))
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
@@ -5687,8 +5918,29 @@ class MLXTrainer:
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
             else:
-                def _create_eval_batches(eval_dataset):
+                def _create_eval_batches(eval_dataset, _split_name=None):
                     """Build evaluation batches for one dataset split."""
+                    if self.preference_kind:
+                        # Sequential, so every evaluation scores the same
+                        # batches in the declared order. grad_accum=1 leaves each
+                        # batch's normalizers describing only itself.
+                        return create_preference_batch_plan(
+                            _format_preference_split(_split_name, eval_dataset),
+                            self.tokenizer,
+                            batch_size=eval_batch_size,
+                            max_seq_length=args.max_seq_length,
+                            num_epochs=1,
+                            grad_accum=1,
+                            preserve_dataset_order=True,
+                            seed=args.seed,
+                            append_eos=bool(args.append_eos),
+                            formatting_func=None,
+                            prompt_sink=(
+                                (lambda text, _n=_split_name:
+                                 _capture_generation_prompt(_n, text))
+                                if _samples_prompts else None
+                            ),
+                        )
                     if is_vlm:
                         if not _vlm_has_sized_index_space(eval_dataset):
                             raise ValueError(
@@ -5725,26 +5977,20 @@ class MLXTrainer:
                     """Build every eval split, in the order the user declared."""
                     if isinstance(self.eval_dataset, dict):
                         return {
-                            key: _create_eval_batches(value)
-                            for key, value in self.eval_dataset.items()
+                            key: _create_eval_batches(self.eval_dataset[key], key)
+                            for key in self.eval_dataset
                         }
-                    return _create_eval_batches(self.eval_dataset)
+                    return _create_eval_batches(self.eval_dataset, None)
 
-                if is_vlm:
-                    # Eager VLM training batches used to be built before this
-                    # point, so eval preprocessing could never reach the
-                    # training augmentation stream. A lazy training plan builds
-                    # nothing yet, so these eval builds would otherwise consume
-                    # the draws the first training batch is owed; keep them out
-                    # of that stream. ONE preservation spans every split: one
-                    # per split would restore the same snapshot before each of
-                    # them and replay a single draw sequence for all, where
-                    # sequential construction advanced from split to split.
-                    # It spans the process-global RNGs only, so state owned
-                    # privately -- by the processor, or by a user's
-                    # response_mask_fn, which the plan also calls per batch at
-                    # materialize -- does still advance here. No snapshot of an
-                    # arbitrary object's own counter exists to take.
+                if is_vlm or self.preference_kind:
+                    # A preference plan is built at the first evaluation, with
+                    # training already running, so these builds would otherwise
+                    # consume draws a training batch is owed. One preservation
+                    # spans every split: one per split would restore the same
+                    # snapshot before each and replay one draw sequence for all.
+                    # Only the process-global RNGs are spanned, so state held
+                    # privately -- by the processor, or a user's
+                    # response_mask_fn -- still advances here.
                     with _preserved_preprocessing_rng():
                         eval_batches = _create_every_eval_split()
                 else:
@@ -6118,6 +6364,73 @@ class MLXTrainer:
             steps = 0
             train_time = 0
 
+        def _sample_generations(current_step):
+            from .generate import GenerationRequest, generate_batch
+
+            # A temperature > 0 burst advances the global stream by a
+            # token-count-dependent amount, which would move the NEFTune noise
+            # the next steps draw. Rendering is not in here: the prompts were
+            # built during the plan's pass, under the preservation that takes.
+            with _preserved_preprocessing_rng():
+                labels = [name for name, _text, _ids in _generation_source]
+                prompts = [text for _name, text, _ids in _generation_source]
+                requests = [
+                    GenerationRequest(prompt_token_ids=ids)
+                    for _name, _text, ids in _generation_source
+                ]
+                if not requests:
+                    _main_print(
+                        "  Gen   eval dataset has no rows to sample; skipping."
+                    )
+                    self.last_generation_samples = []
+                    return
+
+                defaults = self._generation_defaults
+                started = time.perf_counter()
+                policy = generate_batch(
+                    model, self.tokenizer, requests, defaults=defaults,
+                )
+                reference = None
+                modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
+                if modules and not self._distributed_should_stop():
+                    scales = [module.scale for module in modules]
+                    try:
+                        for module in modules:
+                            module.scale = 0.0
+                        reference = generate_batch(
+                            model, self.tokenizer, requests, defaults=defaults,
+                        )
+                    finally:
+                        for module, scale in zip(modules, scales):
+                            module.scale = scale
+            elapsed = time.perf_counter() - started
+
+            samples = [
+                {
+                    "split": labels[index],
+                    "prompt": prompts[index],
+                    "policy": item.text,
+                    "reference": None if reference is None else reference[index].text,
+                }
+                for index, item in enumerate(policy)
+            ]
+            self.last_generation_samples = samples
+            sampled = sum(len(item.token_ids) for item in policy)
+            if reference is not None:
+                sampled += sum(len(item.token_ids) for item in reference)
+            _main_print(
+                f"  Gen   {current_step}/{total_steps} | {len(policy)} prompts | "
+                f"{sampled} tokens | {elapsed:.1f}s"
+            )
+            for index, sample in enumerate(samples):
+                tag = "" if sample["split"] is None else f" [{sample['split']}]"
+                _main_print(f"    {index + 1}{tag} {_one_line(sample['prompt'], 96)}")
+                _main_print(f"        policy    {_one_line(sample['policy'], 96)}")
+                if sample["reference"] is not None:
+                    _main_print(
+                        f"        reference {_one_line(sample['reference'], 96)}"
+                    )
+
         def _run_eval(current_step):
             """Run eval and dispatch MLX/HF eval callbacks in DDP lockstep."""
             current_eval_batches = _prepare_eval_batches()
@@ -6135,7 +6448,9 @@ class MLXTrainer:
             _metrics_before_eval = self._last_eval_metrics
             try:
                 val_loss, ppl = self._evaluate(
-                    current_eval_batches, loss_fn, is_vlm=is_vlm)
+                    current_eval_batches, preference_eval_fn or loss_fn,
+                    is_vlm=is_vlm,
+                )
             finally:
                 if _pf is not None:
                     _pf.resume()
@@ -6153,11 +6468,36 @@ class MLXTrainer:
                 self._last_eval_metrics = _metrics_before_eval
                 self.control.should_evaluate = False
                 return False
-            _main_print(
-                f"  Eval  {current_step}/{total_steps} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Perplexity: {ppl:.2f}"
-            )
+            if ppl is None:
+                # No per-token likelihood to exponentiate.
+                _scores = self._last_eval_metrics or {}
+                _accuracy = _scores.get("eval_rewards/accuracies", float("nan"))
+                _margin = _scores.get("eval_rewards/margins", float("nan"))
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss: {val_loss:.4f} | "
+                    f"Rewards Acc: {_accuracy:.4f} | "
+                    f"Margin: {_margin:.4f}"
+                )
+            else:
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss: {val_loss:.4f} | "
+                    f"Perplexity: {ppl:.2f}"
+                )
+            if preference_kind and bool(getattr(args, "generate_during_eval", False)):
+                # model.train() has already run by here, so without this the
+                # sampler decodes under NEFTune noise and dropout, printing text
+                # the policy does not produce. TRL samples in its evaluation_loop.
+                self.model.eval()
+                try:
+                    _sample_generations(current_step)
+                except Exception as e:
+                    # A diagnostic must not take the run down, nor discard the
+                    # evaluation that succeeded but is logged only below.
+                    _main_print(f"Unsloth: generate_during_eval failed: {e}")
+                finally:
+                    self.model.train()
             if is_main_process:
                 for cb in self._eval_callbacks:
                     try:
@@ -6225,7 +6565,7 @@ class MLXTrainer:
                     f"metrics; available: {sorted(_em)}"
                 )
             _cur = _em[_metric_name]
-            _greater = bool(getattr(args, "greater_is_better", False))
+            _greater = _resolve_greater_is_better(args)
             _improved = (
                 _cur == _cur  # reject NaN: a diverged eval must never be "best"
                 and (
@@ -7445,17 +7785,83 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
-            if (
-                self.eval_dataset is not None
-                or args.eval_steps > 0
-                or args.load_best_model_at_end
-                or args.early_stopping_patience > 0
+            # A cadence is optional -- a callback can raise should_evaluate --
+            # but selecting a best model reads a metric only an evaluation makes.
+            _sampling_eval = bool(getattr(args, "generate_during_eval", False))
+            if self.eval_dataset is None and (
+                args.load_best_model_at_end or args.early_stopping_patience > 0
             ):
                 raise ValueError(
-                    "Unsloth MLX preference: evaluation, best-model loading, "
-                    "and early stopping are not supported yet."
+                    "Unsloth MLX preference: best-model loading and early "
+                    "stopping select on an evaluation metric, so they need an "
+                    "eval_dataset."
                 )
-            if self._batches is not None:
+            _splits = (
+                list(self.eval_dataset.values())
+                if isinstance(self.eval_dataset, dict)
+                else [] if self.eval_dataset is None else [self.eval_dataset]
+            )
+            # Scoring nothing still reports eval_loss 0.0: a best watermark no
+            # real evaluation can beat, and a reset of early stopping's patience.
+            if self.eval_dataset is not None and not _splits:
+                raise ValueError(
+                    "Unsloth MLX preference: evaluation requires at least one "
+                    "eval split to score."
+                )
+            # Read exactly once, by the plan builder, and never indexed. The
+            # declared length stands in for a guarantee the pass ends, which
+            # nothing can establish for an arbitrary iterable. That refuses a
+            # bare generator one traversal would have served; hanging on an
+            # endless one is the worse trade.
+            for _split in _splits:
+                try:
+                    _size = len(_split)
+                except (TypeError, AttributeError) as exc:
+                    raise ValueError(
+                        "Unsloth MLX preference: evaluation requires a finite "
+                        "eval dataset, one that reports its own length."
+                    ) from exc
+                if _size == 0:
+                    raise ValueError(
+                        "Unsloth MLX preference: the eval dataset is empty."
+                    )
+            if (
+                self.eval_dataset is not None
+                and getattr(args, "max_eval_batches", None) is not None
+            ):
+                raise ValueError(
+                    "Unsloth MLX preference: max_eval_batches bounds an "
+                    "unbounded lazy eval stream by batch count, and preference "
+                    "evaluation scores a finite plan instead. Shorten the "
+                    "eval_dataset instead."
+                )
+            if _sampling_eval:
+                if self.eval_dataset is None:
+                    raise ValueError(
+                        "Unsloth MLX preference: generate_during_eval needs an "
+                        "eval_dataset to sample prompts from."
+                    )
+                if int(args.generation_max_tokens) >= int(args.max_seq_length):
+                    raise ValueError(
+                        "Unsloth MLX preference: generation_max_tokens must be "
+                        "smaller than max_seq_length, or no prompt tokens remain."
+                    )
+                if int(args.num_generation_prompts) < 1:
+                    raise ValueError(
+                        "Unsloth MLX preference: num_generation_prompts must be "
+                        "at least 1."
+                    )
+                self._generation_defaults = _build_generation_defaults(args)
+                if _resolve_interval_steps(args.eval_steps, 1) <= 0:
+                    print(
+                        "Unsloth: generate_during_eval is on but no evaluation "
+                        "cadence is set; sampling runs only when a callback "
+                        "requests an evaluation."
+                    )
+            if (
+                self._batches is not None
+                or getattr(self, "_eval_batches_labeled", None) is not None
+            ):
                 raise ValueError(
                     "Unsloth MLX preference: prebuilt SFT or response-masked "
                     "batches are not compatible with preference objectives."
