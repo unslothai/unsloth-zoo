@@ -15123,15 +15123,29 @@ def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQU
     ``ubiquity`` of 1 offers every fragment, which is right once the names have
     been narrowed to the few a candidate could not account for.
     """
-    # A fragment carried by most tensors names the checkpoint's shape, not one
-    # block's layout, so substituting it can only produce nonsense to replay.
     limit = max(1, int(len(names) * ubiquity))
     for replaced in vocabulary:
-        if sum(replaced in name for name in names) not in range(1, limit + 1):
+        carried = [name for name in names if replaced in name]
+        if not carried:
             continue
+        # A fragment carried by most tensors names the checkpoint's shape, not one block's
+        # layout -- unless every name carrying it starts with it, which is a namespace, and
+        # a relocated namespace is what qwen4_exp's 86 of 88 names differ by.
+        relocation = len(carried) > limit
+        if relocation and not all(name.startswith(replaced) for name in carried):
+            continue
+        # A relocation moves a namespace and does not invent one, so it is only
+        # offered fragments spelling the same components in another order: pairing
+        # one with the whole vocabulary costs a replay per name in the checkpoint.
+        components = sorted(part for part in replaced.split(".") if part)
         for replacement in vocabulary:
-            if replacement != replaced:
-                yield replaced, replacement
+            if replacement == replaced:
+                continue
+            if relocation and sorted(
+                part for part in replacement.split(".") if part
+            ) != components:
+                continue
+            yield replaced, replacement
         # A checkpoint can spell a tensor with one fragment fewer rather than a
         # different one -- mlx-lm appends `.weight` to a name carried bare -- and no
         # fragment stands for its absence.

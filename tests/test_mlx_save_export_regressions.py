@@ -4025,6 +4025,11 @@ def _relocate_outside(self, weights):
     return {_relocated(name): tensor for name, tensor in weights.items()}
 
 
+def _relocate_inside(self, weights):
+    return {name.replace("outer.inner.", "inner.outer."): tensor
+            for name, tensor in weights.items()}
+
+
 def _relocating_model(mx, sanitize, others):
     """A checkpoint one namespace move restores, with `others` names outside it."""
     class Model:
@@ -4057,6 +4062,18 @@ def test_moe_gguf_export_reads_the_names_a_sanitizer_spells_in_what_it_calls(tmp
     assert "outer.inner." in mutils._mlx_sanitizer_vocabulary(
         mutils._mlx_moe_sanitizers(model))
     assert sum("outer.inner." in name for name in model.expected) <= int(
+        len(model.expected) * mutils._MOE_VOCABULARY_UBIQUITY)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
+    assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
+
+
+def test_moe_gguf_export_relocates_a_namespace_every_tensor_carries(tmp_path):
+    """A fragment past the ubiquity limit, admitted because every name starts with it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    model = _relocating_model(mx, _relocate_inside, others=0)
+    assert sum("inner.outer." in name for name in model.expected) > int(
         len(model.expected) * mutils._MOE_VOCABULARY_UBIQUITY)
     path = _stage_moe_directory(tmp_path, model)
     assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
