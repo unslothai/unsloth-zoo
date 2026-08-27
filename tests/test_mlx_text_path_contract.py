@@ -176,6 +176,7 @@ def test_generate_keeps_a_falsy_processor(monkeypatch):
     """
     import types
     import unsloth_zoo.mlx.loader as loader
+    import unsloth_zoo.mlx.utils as mutils
 
     picked = []
 
@@ -196,9 +197,10 @@ def test_generate_keeps_a_falsy_processor(monkeypatch):
     def _fake_to_mx_vlm_batch(inputs):
         raise _Stop
 
-    monkeypatch.setattr(
-        "unsloth_zoo.mlx.utils._to_mx_vlm_batch", _fake_to_mx_vlm_batch,
-    )
+    # The module object, not a dotted string: a string target is resolved by walking
+    # attributes, which fails on a real MLX runtime where the submodule is not bound
+    # on its parent package yet.
+    monkeypatch.setattr(mutils, "_to_mx_vlm_batch", _fake_to_mx_vlm_batch)
     with pytest.raises(_Stop):
         loader._mlx_generate_vlm(model, "hello")
     assert picked == ["processor"]
