@@ -192,6 +192,13 @@ jobs:
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
 
+      - name: tests/test_mlx_neftune_quant_map.py
+        # NEFTune: quantization-map survival across the __class__ swap, VLM
+        # embedding identification, and the transformers-matched noise scale.
+        # The metal_only half needs real quantized models and a compiled step;
+        # the mlx_only half also runs on the Linux mlx-cpu job.
+        run: python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+
       # The three VLM/shape/batching suites, also run on Linux CPU MLX by
       # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm
       # version an Apple Silicon user resolves, which the audio gate is keyed on.
