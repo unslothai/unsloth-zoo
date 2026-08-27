@@ -35,12 +35,7 @@ _NAMES = ("DEVICE_TYPE", "DEVICE_TYPE_TORCH", "DEVICE_COUNT", "ALLOW_PREQUANTIZE
 
 
 def _mlx_branch_is_live() -> bool:
-    """Mirror `is_mlx_available()` without importing unsloth_zoo (which needs torch).
-
-    Kept in step with `unsloth_zoo/mlx/runtime.py` deliberately: importing the real
-    predicate would drag in the package under test, and these tests exist precisely
-    to characterise how that import behaves.
-    """
+    """Mirror `is_mlx_available()`: importing the real predicate would drag in the package under test."""
     return (
         os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
         and platform.system() == "Darwin"
@@ -49,18 +44,14 @@ def _mlx_branch_is_live() -> bool:
     )
 
 
-# On the MLX branch all four constants are eager module globals, so PEP 562
-# __getattr__ is never consulted and there is nothing lazy to assert. The pair
-# below would not just fail, it would be meaningless: the "does not pull torch"
-# half would pass for the wrong reason. Skip both together so neither can go
-# vacuously green.
+# MLX binds the constants eagerly, so PEP 562 __getattr__ never runs and "does not
+# pull torch" would pass for the wrong reason. Skip the pair together, not vacuously green.
 _needs_lazy_path = pytest.mark.skipif(
     _mlx_branch_is_live(),
     reason = "MLX branch defines the device constants eagerly; the lazy path is not taken",
 )
 
-# `unsloth_zoo.compiler` imports torch at module scope. Apple Silicon installs
-# routinely have no torch at all, and that is a supported configuration.
+# `unsloth_zoo.compiler` imports torch at module scope; a torch-less Apple Silicon install is supported.
 _needs_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None,
     reason = "torch is not installed; unsloth_zoo.compiler cannot import by design",
@@ -250,23 +241,19 @@ def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
 @pytest.mark.parametrize(
     "system, machine, has_mlx, force_gpu, expected",
     (
-        ("Darwin", "arm64", True,  None,  True),   # the branch this guard exists for
-        ("Darwin", "arm64", False, None,  False),  # Apple Silicon without mlx installed
-        ("Darwin", "x86_64", True, None,  False),  # Intel Mac
-        ("Linux",  "x86_64", True, None,  False),  # every CI runner we gate on
+        ("Darwin", "arm64", True,  None,  True),   # the guarded branch
+        ("Darwin", "arm64", False, None,  False),
+        ("Darwin", "x86_64", True, None,  False),
+        ("Linux",  "x86_64", True, None,  False),
         ("Windows", "AMD64", True, None,  False),
         ("Darwin", "arm64", True,  "1",   False),  # escape hatch wins
-        ("Darwin", "arm64", True,  "0",   True),   # and only when set to exactly "1"
+        ("Darwin", "arm64", True,  "0",   True),   # only when exactly "1"
     ),
 )
 def test_the_mlx_guard_agrees_with_is_mlx_available(
     monkeypatch, system, machine, has_mlx, force_gpu, expected,
 ):
-    """A skip guard that never fires, or always fires, is worse than none.
-
-    This mirrors `unsloth_zoo/mlx/runtime.py::is_mlx_available`, so it can drift
-    from it. Pin every arm of the predicate rather than trusting the copy.
-    """
+    """The guard copies `unsloth_zoo/mlx/runtime.py::is_mlx_available`, so pin every arm against drift."""
     monkeypatch.setattr(platform, "system", lambda: system)
     monkeypatch.setattr(platform, "machine", lambda: machine)
     real_find_spec = importlib.util.find_spec
