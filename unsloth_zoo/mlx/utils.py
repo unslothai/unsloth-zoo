@@ -14103,15 +14103,67 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps, norm_offset=1
 
 
 _MLX_NORM_OFFSET_TOLERANCE = 1e-6
+_MLX_NORM_OFFSET_PROBE = 1.0
+
+
+def _mlx_norm_offset_probe(weights, fill):
+    """Replace every 1-D float weight with ``fill``, passing the rest through.
+
+    Keys, shapes and dtypes survive, and those are what the real sanitizer gates
+    read -- key names, the presence of a key elsewhere in the checkpoint, shape
+    and dtype -- so the replay reproduces the gate while carrying a value we
+    chose.
+    """
+    return {
+        key: (
+            mx.zeros(value.shape, dtype=value.dtype) + fill
+            if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating)
+            else value
+        )
+        for key, value in weights.items()
+    }
+
+
+def _mlx_constant_1d_value(value):
+    """Return the single value a 1-D float array holds, or None if it varies."""
+    if getattr(value, "ndim", None) != 1:
+        return None
+    if not mx.issubdtype(value.dtype, mx.floating):
+        return None
+    low = mx.min(value).item()
+    if abs(low - mx.max(value).item()) > _MLX_NORM_OFFSET_TOLERANCE:
+        return None
+    return low
+
+
+def _mlx_sanitize_probe(model, weights):
+    """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
+
+    Sanitizers are not pure. mlx-vlm's phi4mm caches its split LoRA weights on
+    the instance (``self._base_weights`` and friends) and mlx-lm's gemma3_text
+    pops the ``lm_head`` submodule when the checkpoint ties embeddings, so
+    measuring on the model itself would rebuild the live model out of the probe
+    values, halfway through an export. A shallow copy keeps every read the
+    sanitizer does and sends those writes to a throwaway.
+    """
+    try:
+        model = copy.copy(model)
+    except Exception:
+        pass
+    return model.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
-    """Measure the constants a model's sanitizer adds to its 1-D float weights.
+    """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
 
     The MTP families shift RMSNorm weights by +1 when loading an HF checkpoint,
     gated on the source checkpoint's contents rather than on the model class, so
-    zero the 1-D floats and replay the real sanitizer: each 1-D output is then
-    the constant it added. None means unmeasurable, not unshifted.
+    replay the real sanitizer over two probes -- 1-D floats all zero, then all
+    one -- and keep a key only where the output rose by the difference between
+    the probes. Rising is what makes the constant an ADDED one: a sanitizer that
+    invents a 1-D tensor the source never held, as mlx-vlm's Inkling does for
+    its expert scales, or that transforms one non-additively, does not track its
+    input and is rejected. None means unmeasurable, not unshifted.
     """
     src_path = _get_src_path(model)
     sanitize = getattr(model, "sanitize", None)
@@ -14125,26 +14177,25 @@ def _mlx_sanitizer_norm_offsets(model):
         if not weights:
             return None
 
-        probe = {
-            key: (
-                mx.zeros(value.shape, dtype=value.dtype)
-                if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating)
-                else value
-            )
-            for key, value in weights.items()
-        }
+        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
+        raised = _mlx_sanitize_probe(
+            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        )
 
         offsets = {}
-        for key, value in sanitize(probe).items():
-            if getattr(value, "ndim", None) != 1:
+        for key, value in zeroed.items():
+            offset = _mlx_constant_1d_value(value)
+            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
                 continue
-            if not mx.issubdtype(value.dtype, mx.floating):
+            raised_value = raised.get(key)
+            if getattr(raised_value, "shape", None) != value.shape:
                 continue
-            low = mx.min(value).item()
-            if abs(low - mx.max(value).item()) > _MLX_NORM_OFFSET_TOLERANCE:
+            delta = _mlx_constant_1d_value(raised_value - value)
+            if delta is None:
                 continue
-            if abs(low) > _MLX_NORM_OFFSET_TOLERANCE:
-                offsets[key] = low
+            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            offsets[key] = offset
     except Exception as exc:
         print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
         return None

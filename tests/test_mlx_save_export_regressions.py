@@ -1253,10 +1253,15 @@ def test_gguf_export_does_not_subtract_a_replayed_offset_twice(tmp_path):
 
 class _KeyGatedNormSanitizer:
     """Shaped like the Qwen3.5 family's: the RMSNorm shift is decided by the
-    pre-sanitize key, so it survives a checkpoint that was already converted."""
+    pre-sanitize key, so it survives a checkpoint that was already converted.
 
-    def __init__(self, src_path):
+    ``shift`` is parametrized rather than fixed at 1.0 so the tests can tell a
+    measured offset apart from the 1.0 the export falls back to.
+    """
+
+    def __init__(self, src_path, shift=1.0):
         self._src_path = str(src_path)
+        self._shift = shift
 
     def sanitize(self, weights):
         sanitized = {}
@@ -1269,7 +1274,7 @@ class _KeyGatedNormSanitizer:
                 and key.endswith(_MTP_NORM_SUFFIXES)
                 and not original_key.startswith("language_model.")
             ):
-                value = value + 1.0
+                value = value + self._shift
             sanitized[key] = value
         return sanitized
 
@@ -1308,6 +1313,161 @@ def test_gguf_export_unshifts_an_already_converted_source(tmp_path, source_conve
     for key, expected in hf_weights.items():
         assert key in exported, key
         assert mutils._mlx_arrays_match(exported[key], expected), key
+
+
+def test_gguf_export_removes_a_measured_offset_that_is_not_one(tmp_path):
+    # The export threads the MEASURED offset into the replay candidates. A
+    # hardcoded ``- 1`` reproduces every 1.0 case, so pin a shift that is not
+    # 1.0: there the wrong constant makes no candidate round-trip, and the
+    # tensor keeps its MLX name and never reaches the export at all.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    hf_weights = {
+        "model.language_model.layers.0.input_layernorm.weight": mx.array([0.5, 0.25]),
+        "model.language_model.norm.weight": mx.array([0.125, 0.75]),
+    }
+    src = tmp_path / "src"
+    _write_weights(mx, src, hf_weights)
+    model = _KeyGatedNormSanitizer(src, shift=0.5)
+
+    assert mutils._mlx_sanitizer_norm_offsets(model) == {
+        "language_model.model.layers.0.input_layernorm.weight": 0.5,
+        "language_model.model.norm.weight": 0.5,
+    }
+
+    export = tmp_path / "export"
+    _write_weights(mx, export, model.sanitize(dict(hf_weights)))
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    mutils._prepare_mlx_gguf_export_directory(export, model=model)
+
+    exported = mx.load(str(export / "model.safetensors"))
+    for key, expected in hf_weights.items():
+        assert key in exported, key
+        assert mutils._mlx_arrays_match(exported[key], expected), key
+
+
+class _SynthesizedScaleSanitizer:
+    """Shaped like mlx-vlm's Inkling: the sanitizer CREATES 1-D scale vectors
+    that the source checkpoint never held, filled with ones, under names that
+    are real model parameters. They are constant and non-zero, so a measurement
+    that only looks at its own output reads them as an added offset."""
+
+    def __init__(self, src_path):
+        self._src_path = str(src_path)
+
+    def sanitize(self, weights):
+        import unsloth_zoo.mlx.utils as mutils
+
+        out = dict(weights)
+        for key in [k for k in out if k.endswith("switch_mlp.gate_proj.weight")]:
+            prefix = key[: -len("gate_proj.weight")]
+            ones = mutils.mx.ones((out[key].shape[0],))
+            out.setdefault(prefix + "gate_scale", ones)
+            out.setdefault(prefix + "out_scale", ones)
+        return out
+
+
+_SWITCH_MLP = "language_model.model.layers.0.mlp.switch_mlp."
+
+
+def test_norm_offsets_ignore_a_sanitizer_created_constant(tmp_path):
+    # A created tensor is not an offset: nothing in the source was shifted to
+    # produce it, so subtracting it annihilates a real parameter.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    src = tmp_path / "src"
+    _write_weights(mx, src, {_SWITCH_MLP + "gate_proj.weight": mx.zeros((2, 3))})
+
+    assert mutils._mlx_sanitizer_norm_offsets(_SynthesizedScaleSanitizer(src)) == {}
+
+
+@pytest.mark.parametrize("replay_sanitizers", [True, False])
+def test_gguf_export_keeps_sanitizer_created_scales(tmp_path, replay_sanitizers):
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    src = tmp_path / "src"
+    _write_weights(mx, src, {_SWITCH_MLP + "gate_proj.weight": mx.zeros((2, 3))})
+    model = _SynthesizedScaleSanitizer(src)
+
+    export = tmp_path / "export"
+    merged = {
+        _SWITCH_MLP + "gate_proj.weight": mx.zeros((2, 3)),
+        _SWITCH_MLP + "gate_scale": mx.array([1.0, 1.0]),
+        _SWITCH_MLP + "out_scale": mx.array([1.0, 1.0]),
+    }
+    _write_weights(mx, export, merged)
+    (export / "config.json").write_text(json.dumps({"model_type": "stub"}))
+
+    mutils._prepare_mlx_gguf_export_directory(
+        export, model=model, replay_sanitizers=replay_sanitizers
+    )
+
+    exported = mx.load(str(export / "model.safetensors"))
+    for key, expected in merged.items():
+        assert mutils._mlx_arrays_match(exported[key], expected), key
+
+
+def test_norm_offsets_ignore_a_non_additive_transform(tmp_path):
+    # ``A_log = -exp(A_log)`` maps a zeroed probe to a constant -1.0. Reading
+    # that as an offset would shift a real state-space parameter by +1.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class NegExpSanitizer:
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+
+        def sanitize(self, weights):
+            return {
+                key: (-mx.exp(value) if key.endswith("A_log") else value)
+                for key, value in weights.items()
+            }
+
+    src = tmp_path / "src"
+    _write_weights(mx, src, {
+        "model.layers.0.mixer.A_log": mx.array([0.5, 0.25]),
+        "model.layers.0.input_layernorm.weight": mx.array([0.5, 0.25]),
+    })
+
+    assert mutils._mlx_sanitizer_norm_offsets(NegExpSanitizer(src)) == {}
+
+
+def test_norm_offsets_do_not_mutate_the_model(tmp_path):
+    # Real sanitizers write to ``self``: mlx-vlm's phi4mm caches its LoRA
+    # weights, and mlx-lm's gemma3_text drops the lm_head submodule for a tied
+    # checkpoint. Measuring must not leave the caller holding a model rebuilt
+    # from the all-zero probe.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class SelfMutatingSanitizer(dict):
+        def __init__(self, src_path):
+            super().__init__({"lm_head": "the real lm_head module"})
+            self._src_path = str(src_path)
+            self.cached_weights = {"trained": "weights"}
+
+        def sanitize(self, weights):
+            self.cached_weights = dict(weights)
+            self.pop("lm_head", None)
+            return {
+                key: (value + 1.0 if value.ndim == 1 else value)
+                for key, value in weights.items()
+            }
+
+    src = tmp_path / "src"
+    _write_weights(mx, src, {"model.norm.weight": mx.array([0.5, 0.25])})
+    model = SelfMutatingSanitizer(src)
+
+    assert mutils._mlx_sanitizer_norm_offsets(model) == {"model.norm.weight": 1.0}
+
+    assert model.cached_weights == {"trained": "weights"}
+    assert model["lm_head"] == "the real lm_head module"
 
 
 class _StopAfterExportPrep(Exception):
