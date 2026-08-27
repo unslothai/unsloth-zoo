@@ -131,7 +131,7 @@ jobs:
           }
 
           # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
-          # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+          # satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
           lane() {
             version="$1"; interpreter="$2"
             venv=".lanes/venv-$version"
@@ -234,7 +234,7 @@ jobs:
             pyproject.toml
 
       - name: Install runtime + test deps
-        # --no-deps unsloth satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
@@ -566,7 +566,7 @@ jobs:
       # Pure-Python protobuf parser; transformers' bundled *_pb2.py is rejected by C++ protobuf 4+/5+.
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
       UNSLOTH_COMPILE_DISABLE: '1'
-      # Secondary handshake after find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+      # Secondary handshake after the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
       UNSLOTH_IS_PRESENT: '1'
     steps:
       - name: Harden runner (audit)
