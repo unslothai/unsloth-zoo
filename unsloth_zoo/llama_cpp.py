@@ -2836,11 +2836,10 @@ def convert_to_gguf(
 pass
 
 
-# Quants that tensor_requires_imatrix rejects for any transformer (llama.cpp src/llama-quant.cpp),
-# measured with `llama-quantize --dry-run` against a real Llama-3.2-1B rather than read off the
-# ftype defaults. iq3_xs belongs here even though its ftype default (IQ3_S) needs no imatrix: the
-# attention Q/K overrides promote to IQ3_XXS unconditionally, so it fails on blk.0.attn_k.weight.
-# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s, tq1_0 and tq2_0 quantize fine without one.
+# Quants tensor_requires_imatrix rejects for any transformer, measured with
+# `llama-quantize --dry-run`, not read off the ftype defaults. iq3_xs is here despite defaulting
+# to IQ3_S: the attention Q/K overrides promote to IQ3_XXS unconditionally, failing on blk.0.
+# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s and tq*_0 all quantize fine without one.
 IMATRIX_REQUIRED_QUANTS = frozenset((
     "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
     "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
@@ -2848,10 +2847,8 @@ IMATRIX_REQUIRED_QUANTS = frozenset((
     "q2_k_s",
 ))
 
-# Upstream imatrix filenames, all three in live use across the unsloth/*-GGUF repos:
-# .dat is the legacy format, .gguf_file is a GGUF imatrix named so the Hub does not list it as a
-# model GGUF, and plain .gguf is the same thing without that guard (e.g. unsloth/Qwen3.8-27B-GGUF).
-# llama-quantize --imatrix reads any of them.
+# All three are in live use across unsloth/*-GGUF, and --imatrix reads any of them. .gguf_file is
+# a GGUF imatrix named so the Hub does not list it as a model; plain .gguf skips that guard.
 IMATRIX_UPSTREAM_NAMES = (
     "imatrix_unsloth.dat", "imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf",
 )
@@ -2868,8 +2865,7 @@ def _materialize_imatrix(path, dest_dir):
     if base.endswith(".gguf_file"):
         base = base[: -len(".gguf_file")] + ".gguf"
     local = os.path.join(dest_dir, base)
-    # resolve_imatrix_file is public API, so dest_dir can be the file's own directory (the MLX
-    # exporter always passes a fresh temp dir, but Studio and callers need not). Nothing to copy.
+    # dest_dir can be the file's own directory: the helper is public and Studio calls it directly.
     if os.path.exists(local) and os.path.samefile(path, local):
         return local
     shutil.copyfile(path, local)

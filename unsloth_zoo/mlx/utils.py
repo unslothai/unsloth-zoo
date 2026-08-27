@@ -14603,11 +14603,9 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: llama.cpp installed successfully.")
 
 
-# Markers naming a repackaging rather than a different model; the imatrix is published against
-# the base, so they are stripped after the verbatim name has been tried. One per match, applied
-# repeatedly, so compounds like -unsloth-bnb-4bit peel all the way down.
-# \d+-?bit covers both spellings: mlx-community publishes -4bit and -4-bit (e.g.
-# mlx-community/Mistral-7B-Instruct-v0.2-4-bit), and only the hyphenless one used to peel.
+# Markers naming a repackaging, not a different model. The imatrix is published against the base,
+# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
+# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
 _REPACKAGED_MODEL_SUFFIX = re.compile(
     r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
     re.IGNORECASE,
@@ -14617,9 +14615,9 @@ _REPACKAGED_MODEL_SUFFIX = re.compile(
 def _exported_gguf_files(save_directory, imatrix_source=None):
     """The *.gguf files this export produced, excluding a caller-supplied imatrix.
 
-    An imatrix_file path may point inside save_directory. It is copied out before use, but the
-    original stays put, and both the completion summary and the Hub upload glob save_directory,
-    so it would otherwise be reported and published as if it were an exported model.
+    imatrix_file may point inside save_directory. It is copied out before use, but the original
+    stays put, and both the summary and the Hub upload glob save_directory, so without this it
+    would be published as though it were an exported model.
     """
     files = sorted(Path(save_directory).glob("*.gguf"))
     if imatrix_source is None:
@@ -14628,11 +14626,10 @@ def _exported_gguf_files(save_directory, imatrix_source=None):
 
 
 def _is_same_file(a, b):
-    """True when two paths name one file, asking the filesystem rather than comparing strings.
+    """True when two paths name one file, asked of the filesystem rather than of the strings.
 
-    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case and
-    APFS stores NFD, so a path we derived need not match the one rglob returns byte for byte.
-    samefile answers that, and the normcase/NFC comparison covers a path already gone at cleanup.
+    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
+    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
     """
     try:
         return os.path.samefile(a, b)
@@ -14729,14 +14726,13 @@ def save_pretrained_gguf(
         None: "q8_0",
     }
     quant_type = quant_map.get(quantization_method, quantization_method)
-    # Normalize once, here, so every later comparison against quant_type / first_conversion agrees.
-    # llama-quantize accepts either spelling, but the "is this a direct conversion" test below and
-    # the one gating llama-quantize further down used to compare differently-normalized values, so
-    # a caller passing "Q4_K_M" had the imatrix discarded from a run that then went ahead without it.
+    # Normalize once so every later comparison agrees. The direct-conversion test below and the
+    # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
+    # that then went ahead without it.
     quant_type = str(quant_type).strip().lower()
 
-    # Kept before the drop guard below can clear imatrix_file: a caller-supplied path may sit
-    # inside save_directory, and the export must not report or upload it as one of its own files.
+    # Captured before the drop guard can clear imatrix_file: the path may sit inside
+    # save_directory, and must not be reported or uploaded as a file this export produced.
     imatrix_source = None
     if isinstance(imatrix_file, (str, os.PathLike)):
         imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
@@ -14765,9 +14761,8 @@ def save_pretrained_gguf(
     else:
         first_conversion = str(first_conversion).strip().lower()
 
-    # llama-quantize below runs only when the target differs from the direct conversion; without
-    # it an imatrix has nothing to weight, so drop it rather than resolve an unusable one. The
-    # comparison is case-insensitive because the converter accepts either spelling.
+    # llama-quantize runs only when the target differs from the direct conversion. Without it an
+    # imatrix has nothing to weight, so drop it rather than resolve an unusable one.
     if imatrix_file and (
         quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
     ):
