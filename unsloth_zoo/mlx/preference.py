@@ -268,7 +268,16 @@ def _extract_prompt(chosen, rejected):
         )
     for index in range(limit):
         if chosen[index] != rejected[index]:
-            if chosen[index - 1] == " ":
+            # TRL drops a space sitting immediately before the divergence, and
+            # reads chosen[index - 1] to find it. At index 0 that subscript
+            # wraps to the LAST character of chosen, so a row whose completions
+            # differ from the first character and whose chosen ends in a space
+            # takes index to -1: the prompt becomes everything but chosen's
+            # last character, and the rejected completion loses everything but
+            # its own. Deliberate divergence from TRL, recorded as one: there
+            # is nothing before the first character to strip, and reproducing
+            # it would silently train the row on invented text.
+            if index > 0 and chosen[index - 1] == " ":
                 index -= 1
             break
     return chosen[:index], chosen[index:], rejected[index:]
