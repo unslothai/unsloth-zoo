@@ -1142,11 +1142,10 @@ _HEAD_TRANSFORM_KNOBS = {
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
-# The table records where a knob is read and what values are usable, not where
-# it sits in the forward. Fused CCE pre-scales the hidden states and softcaps
-# after its own matmul, so listing a knob here asserts the model scales before
-# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does; one that
-# capped first would need its own handling rather than a row here.
+# The table records where a knob is read and what values are usable, not where it
+# sits in the forward. Fused CCE pre-scales the hidden states and caps after its
+# own matmul, so a row here asserts the model scales before it caps. Every
+# softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -3188,8 +3187,8 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: the loader routes an aliased config to the canonical
-    # family's tower, so the grid form has to follow it there.
+    # Resolved, not raw: an aliased config is routed to the canonical family's
+    # tower, so the grid form has to follow it there.
     grid_as_array = (
         _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
     )
@@ -3483,9 +3482,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
-    # Every decision above prints when it declines. Print when it accepts too:
-    # a head transform that is silently ignored is the failure this resolution
-    # exists to prevent, and a VLM only ever reaches this factory.
+    # Every decision above prints when it declines; print when it accepts too. A
+    # silently ignored head transform is the failure this resolution prevents, and
+    # a VLM reaches no other factory.
     if softcap > 0:
         print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
