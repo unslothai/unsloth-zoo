@@ -408,7 +408,16 @@ _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
 _MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
 _MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
 _MLX_INDEX_GRADIENT_LOCK = threading.RLock()
+# Two counters, because the two questions have different answers. The patch depth
+# is physical -- how many runs still need `mlx.core` wrapped -- and unpatching is
+# process-wide, so an inner run must not unpatch an outer one. The active depth is
+# logical: is THIS thread of control inside a training step. Evaluation can always
+# drop the logical flag (it takes no gradients) even when it cannot drop the
+# physical patches, and without that separation an evaluation nested under a
+# second run still looks like training to `_is_training_call`.
 _MLX_TRAINING_PATCH_DEPTH = 0
+_MLX_TRAINING_ACTIVE_DEPTH = 0
+_MLX_TRAINING_PAUSE_STACK = []
 # MLX differentiates integer arrays, so only real index positions are detached.
 _MLX_INTEGER_DTYPES = frozenset((mx.int8, mx.int16, mx.int32, mx.int64,
                                  mx.uint8, mx.uint16, mx.uint32, mx.uint64))
@@ -453,29 +462,41 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
-    global _MLX_TRAINING_PATCH_DEPTH
+    global _MLX_TRAINING_PATCH_DEPTH, _MLX_TRAINING_ACTIVE_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
+        _MLX_TRAINING_ACTIVE_DEPTH += 1
 
 
 def release_mlx_training_patches() -> None:
-    global _MLX_TRAINING_PATCH_DEPTH
+    global _MLX_TRAINING_PATCH_DEPTH, _MLX_TRAINING_ACTIVE_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             return
         _MLX_TRAINING_PATCH_DEPTH -= 1
+        if _MLX_TRAINING_ACTIVE_DEPTH > 0:
+            _MLX_TRAINING_ACTIVE_DEPTH -= 1
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
 
 
 def pause_mlx_training_patches() -> bool:
     """Evaluation runs under `model.eval()` but inside the trainer's window, which
-    would otherwise route it down the training paths. Refused while another run
-    holds the window, since unpatching is process-wide."""
-    global _MLX_TRAINING_PATCH_DEPTH
+    would otherwise route it down the training paths.
+
+    The logical "inside a training step" flag is ALWAYS cleared, so an uncached
+    evaluation never reads as training. Removing the process-wide `mlx.core`
+    patches is refused while another run holds the window, and the return value
+    reports only that: True when they came off, False when another run still
+    needs them. Leaving them on costs nothing here, because they only stop
+    gradients flowing into gather indices and evaluation takes no gradients.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH, _MLX_TRAINING_ACTIVE_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
+        _MLX_TRAINING_PAUSE_STACK.append(_MLX_TRAINING_ACTIVE_DEPTH)
+        _MLX_TRAINING_ACTIVE_DEPTH = 0
         if _MLX_TRAINING_PATCH_DEPTH != 1:
             return False
         _MLX_TRAINING_PATCH_DEPTH = 0
@@ -484,12 +505,22 @@ def pause_mlx_training_patches() -> bool:
 
 
 def resume_mlx_training_patches(paused: bool) -> None:
-    if paused:
-        acquire_mlx_training_patches()
+    """Reopen at the depth `pause_mlx_training_patches` closed from.
+
+    Deliberately not `acquire()`: that would count a second run, and the pause
+    never released one.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH, _MLX_TRAINING_ACTIVE_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if paused and _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+            _MLX_TRAINING_PATCH_DEPTH = 1
+        if _MLX_TRAINING_PAUSE_STACK:
+            _MLX_TRAINING_ACTIVE_DEPTH = _MLX_TRAINING_PAUSE_STACK.pop()
 
 
 def mlx_training_patches_active() -> bool:
-    return _MLX_TRAINING_PATCH_DEPTH > 0
+    return _MLX_TRAINING_ACTIVE_DEPTH > 0
 
 
 def _get_transformer_layers(model):
@@ -534,7 +565,12 @@ def _detach_integer_arrays(value):
     if isinstance(value, list):
         return [_detach_integer_arrays(v) for v in value]
     if isinstance(value, tuple):
-        return tuple(_detach_integer_arrays(v) for v in value)
+        detached = tuple(_detach_integer_arrays(v) for v in value)
+        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would
+        # turn a layer's `payload.ids` into an AttributeError.
+        return type(value)(*detached) if hasattr(value, "_fields") else detached
+    if isinstance(value, dict):
+        return {k: _detach_integer_arrays(v) for k, v in value.items()}
     return _detach_if_index(value)
 
 

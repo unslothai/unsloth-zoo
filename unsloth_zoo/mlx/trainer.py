@@ -4908,12 +4908,23 @@ class MLXTrainer:
                 restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
             except Exception:
                 pass
-            if _training_patches_held:
-                release_mlx_training_patches()
+            # Each guarded like its neighbours above: a failure restoring an
+            # optional fast path must not replace the exception that ended the run.
+            try:
+                if _training_patches_held:
+                    release_mlx_training_patches()
+            except Exception:
+                pass
             for _module in _unfused_projection_modules:
-                _module.fuse_in = True
+                try:
+                    _module.fuse_in = True
+                except Exception:
+                    pass
             for _module in _unfused_mrope_modules:
-                _module.fused_apply = True
+                try:
+                    _module.fused_apply = True
+                except Exception:
+                    pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile

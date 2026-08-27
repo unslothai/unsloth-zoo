@@ -44,9 +44,9 @@ import mlx.nn as nn  # noqa: E402
 from unsloth_zoo.mlx.loader import (  # noqa: E402
     _disable_fused_input_projections, _disable_fused_mrope)
 from unsloth_zoo.mlx.utils import (  # noqa: E402
-    _MLX_INDEX_OP_NAMES, acquire_mlx_training_patches, mlx_training_patches_active,
-    pause_mlx_training_patches, release_mlx_training_patches,
-    resume_mlx_training_patches)
+    _MLX_INDEX_OP_NAMES, _detach_integer_arrays, acquire_mlx_training_patches,
+    mlx_training_patches_active, pause_mlx_training_patches,
+    release_mlx_training_patches, resume_mlx_training_patches)
 
 _HAS_METAL = _HAS_REAL_MLX and mx.metal.is_available()
 requires_metal = pytest.mark.skipif(
@@ -416,9 +416,14 @@ def test_window_depth_accounting():
     assert not mlx_training_patches_active()
     acquire_mlx_training_patches()
     acquire_mlx_training_patches()
-    # The outer run still needs the window, so this pause must be refused.
+    # The outer run still needs the patches, so removing them is refused -- but
+    # the evaluation doing the pausing must still stop reading as training,
+    # otherwise nesting silently routes it down the training paths.
     assert pause_mlx_training_patches() is False
-    assert mlx_training_patches_active() and mx.take_along_axis._unsloth_index_stop_gradient
+    assert not mlx_training_patches_active()
+    assert mx.take_along_axis._unsloth_index_stop_gradient
+    resume_mlx_training_patches(False)
+    assert mlx_training_patches_active()
     release_mlx_training_patches()
     assert pause_mlx_training_patches() is True
     assert not mlx_training_patches_active()
@@ -431,6 +436,65 @@ def test_window_depth_accounting():
     # Outside a run there is nothing to close, and nothing to reopen.
     resume_mlx_training_patches(pause_mlx_training_patches())
     assert not mlx_training_patches_active()
+
+
+def test_pause_stops_evaluation_reading_as_training_at_any_depth():
+    """`_is_training_call` consults the window, so an evaluation that cannot
+    remove the process-wide patches must still stop being counted as training."""
+    for depth in (1, 2, 3):
+        for _ in range(depth):
+            acquire_mlx_training_patches()
+        assert mlx_training_patches_active()
+        paused = pause_mlx_training_patches()
+        assert paused is (depth == 1), "only a lone run may unpatch mlx.core"
+        assert not mlx_training_patches_active(), (
+            f"evaluation still reads as training at depth {depth}")
+        resume_mlx_training_patches(paused)
+        assert mlx_training_patches_active()
+        for _ in range(depth):
+            release_mlx_training_patches()
+        assert not mlx_training_patches_active()
+
+
+def test_detaching_preserves_container_types():
+    """`mx.checkpoint` hands the layer its own arguments back, so rebuilding a
+    NamedTuple as a plain tuple turns `payload.ids` into an AttributeError."""
+    import collections
+
+    Payload = collections.namedtuple("Payload", "ids hidden")
+    ids = mx.array([1, 2, 3])
+    payload = Payload(ids=ids, hidden=mx.zeros((2, 2)))
+
+    out = _detach_integer_arrays(payload)
+    assert isinstance(out, Payload) and out.ids.tolist() == [1, 2, 3]
+
+    nested = _detach_integer_arrays({"mask": [payload], "axis": 1})
+    assert isinstance(nested, dict) and isinstance(nested["mask"][0], Payload)
+    assert nested["axis"] == 1
+
+    plain = _detach_integer_arrays((ids, [ids]))
+    assert type(plain) is tuple and isinstance(plain[1], list)
+    assert plain[0].tolist() == plain[1][0].tolist() == [1, 2, 3]
+
+
+def test_patch_gated_delta_survives_an_mlx_lm_without_the_module(monkeypatch):
+    """Layers are matched structurally now, so an mlx-vlm-defined gated-delta
+    mixer routes here even where mlx_lm ships no `models/gated_delta`."""
+    from unsloth_zoo import gated_delta_vjp
+
+    class _Block:
+        def find_spec(self, name, path=None, target=None):
+            if name == "mlx_lm.models.gated_delta":
+                raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+            return None
+
+    monkeypatch.delitem(sys.modules, "mlx_lm.models.gated_delta", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_Block()] + sys.meta_path)
+    mlx_lm_models = sys.modules.get("mlx_lm.models")
+    if mlx_lm_models is not None:
+        monkeypatch.delattr(mlx_lm_models, "gated_delta", raising=False)
+
+    gated_delta_vjp.patch_gated_delta()          # must not raise
 
 
 @requires_real_mlx

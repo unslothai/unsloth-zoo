@@ -259,8 +259,15 @@ def _is_training_call(state, use_kernel):
     """An empty cache does not mark a training call -- prefill has one too. Call
     sites say so with `use_kernel=not self.training`; GLM-5.x's passes neither, so
     an open training window speaks for it."""
+    if state is not None:
+        return False
+    if not use_kernel:
+        return True
+    # Imported lazily and only on the path that needs it: this runs once per
+    # layer per decode step, and `unsloth_zoo.mlx.utils` is large enough that a
+    # pure-inference process should not pay for it until a caller is ambiguous.
     from .mlx.utils import mlx_training_patches_active
-    return state is None and (not use_kernel or mlx_training_patches_active())
+    return mlx_training_patches_active()
 
 
 def patch_gated_delta():
@@ -273,7 +280,13 @@ def patch_gated_delta():
     rebind any stale reference to the original function.
     """
     import sys
-    from mlx_lm.models import gated_delta
+    try:
+        from mlx_lm.models import gated_delta
+    except ImportError:
+        # Reachable now that layers are matched structurally: a gated-delta mixer
+        # defined by mlx-vlm routes here even on an mlx_lm that has no copy of the
+        # module. mlx-vlm's own copies are patched by the two functions below.
+        return
 
     if not getattr(gated_delta, "_unsloth_gated_delta_patched", False):
         original_gated_delta_update = gated_delta.gated_delta_update
@@ -368,7 +381,10 @@ def patch_gated_delta_vlm():
         except ImportError:
             return
         patch_gated_delta()
-        from mlx_lm.models import gated_delta
+        try:
+            from mlx_lm.models import gated_delta
+        except ImportError:
+            return
         if (
             getattr(vlm_language, "gated_delta_update", None)
             is not gated_delta.gated_delta_update
@@ -383,7 +399,12 @@ def patch_gated_delta_vlm():
         from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
         vlm_language = None
-    from mlx_lm.models import gated_delta
+    try:
+        from mlx_lm.models import gated_delta
+    except ImportError:
+        # mlx-vlm ships its own copy from 0.6 on, but `compute_g` below is still
+        # taken from mlx_lm; without it there is nothing to patch with.
+        return
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
         return
