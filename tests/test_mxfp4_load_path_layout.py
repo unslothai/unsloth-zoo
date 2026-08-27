@@ -21,9 +21,9 @@ Zoo's `convert_moe_packed_tensors` replacement returns the UN-transposed
 [E, G*B*2, D]:
 
   * 4.x             -> module level `mxfp4.dequantize`, called by quantizer_mxfp4
-  * 5.1.0 and newer -> `Mxfp4Dequantize` (a ConversionOps) -> `dequantize_convertops`
+  * 5.0.0 and newer -> `Mxfp4Dequantize` (a ConversionOps) -> `dequantize_convertops`
 
-Zoo only ever patched `dequantize`, so from 5.1.0 the transpose was dropped and
+Zoo only ever patched `dequantize`, so from 5.0.0 the transpose was dropped and
 GPT-OSS loaded with dims 1 and 2 swapped; 5.16.0 deleting the function is what
 finally turned the drift detector red. The existing mxfp4 tests missed it because
 they only exercise the SAVE path, which stayed self-consistent. So assert the
@@ -45,6 +45,7 @@ import pytest
 # against the installed transformers rather than a hardcoded, version-gated shape.
 _PROBE = textwrap.dedent(
     """
+    import inspect
     import torch
     import transformers
     import transformers.integrations.mxfp4 as m
@@ -53,17 +54,33 @@ _PROBE = textwrap.dedent(
         print("SKIP no dequantize_convertops (pre-5.0 ConversionOps path)")
         raise SystemExit(0)
 
+    # Arity-agnostic. transformers 5.0.0 declares
+    # (blocks, scales, target_device); 5.1.0 and newer declare (blocks, scales).
+    # Hardcoding two positionals made this probe die on 5.0.0 with "missing 1
+    # required positional argument: 'target_device'" while capturing the golden,
+    # i.e. it went red before it could measure the corruption it exists to detect.
+    # Mirror Mxfp4Dequantize.convert, which passes the blocks' own device.
+    _N_POS = len([
+        p for p in inspect.signature(m.dequantize_convertops).parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ])
+
+    def _call(fn, blocks, scales):
+        if _N_POS >= 3:
+            return fn(blocks, scales, blocks.device)
+        return fn(blocks, scales)
+
     E, D, G, B = 2, 4, 3, 16
     torch.manual_seed(0)
     blocks = torch.randint(0, 255, (E, D, G, B), dtype=torch.uint8)
     scales = torch.full((E, D, G), 127, dtype=torch.uint8)
 
-    golden = m.dequantize_convertops(blocks.clone(), scales.clone()).clone()
+    golden = _call(m.dequantize_convertops, blocks.clone(), scales.clone()).clone()
 
     from unsloth_zoo.temporary_patches.mxfp4 import patch_convert_moe_packed_tensors
     patch_convert_moe_packed_tensors()
 
-    after = m.dequantize_convertops(blocks.clone(), scales.clone())
+    after = _call(m.dequantize_convertops, blocks.clone(), scales.clone())
 
     # .cpu(): zoo's convert_moe_packed_tensors moves inputs to the accelerator when
     # one is present, which is intended and irrelevant to the layout being checked.
