@@ -188,6 +188,14 @@
     {
       "path": "unsloth_zoo/compiler.py",
       "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string via `model_location` through create_new_function()",
+      "hash": "c946cc38b4163e28",
+      "reason": "`model_location` is built one screen above as f\"transformers.models.{model_type}.modeling_{model_type}\", and `model_type` is rejected here unless it matches [a-z0-9_]+ before that line runs; the eval inside create_new_function only resolves that module name."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
       "sink": "exec",
       "kind": "string concatenation",
       "hash": "ffa18102ffbe15dd",
@@ -235,7 +243,7 @@
       "kind": ".join() via `source` via `source` via `source`",
       "hash": "7a5e305efb369e7f",
       "reason": "Self-generated source: `source` is `inspect.getsource` of the INSTALLED torch._dynamo.compiled_autograd function, with literal replacements applied, and the import list is built from `dir()` of that same installed module. No value from a config, a download or the environment reaches either string.",
-      "origin": "5b0eb651+addd479f",
+      "origin": "7a303ade",
       "count": 2
     },
     {
@@ -312,7 +320,7 @@
       "kind": "string concatenation via `save_pretrained` via `save_pretrained` via `save_pretrained`",
       "hash": "b9fff86a8c82eb0d",
       "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. The one external pair, `repo_id` and `revision` in `incremental_save_pretrained`, goes through `repr` before it is formatted in.",
-      "origin": "94841545"
+      "origin": "a658f03b"
     },
     {
       "path": "unsloth_zoo/temporary_patches/misc.py",
