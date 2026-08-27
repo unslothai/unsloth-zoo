@@ -697,6 +697,14 @@ jobs:
 
               if [ "$rc" -eq 0 ]; then
                 trc=0
+                # test_mxfp4_load_path_layout runs here, not in repo-tests-cpu, for
+                # two reasons. It is version-aware by construction -- red on 5.5.0
+                # and 5.16.x, skipped on 4.57.6 -- so it only means anything across
+                # more than one pin, and these lanes are the only ones that provide
+                # them. And its probe runs in a subprocess, which conftest does not
+                # reach: importing unsloth_zoo there needs UNSLOTH_IS_PRESENT, which
+                # this job sets in `env` rather than leaving to whether conftest's
+                # best-effort `import unsloth` happened to succeed.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -711,6 +719,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_temporary_patches_exhaustive.py \
+                  tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \

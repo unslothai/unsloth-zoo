@@ -18,6 +18,7 @@ in zoo; an upstream rename/drop makes that patch silently no-op via
 
 from __future__ import annotations
 
+import dis
 import importlib
 import importlib.util
 import types
@@ -239,13 +240,30 @@ def _assert_params_superset(
         )
 
 
+# Opcodes whose name operand is a module-level binding (a global or an import),
+# i.e. exactly the bindings a ``setattr(module, name, ...)`` patch can reach.
+# ``LOAD_ATTR``/``STORE_ATTR`` are deliberately NOT here: co_names is documented
+# as "names other than arguments and function locals", so it mixes attribute
+# names in with globals, and matching on it would let an unrelated
+# ``self.quantization_config.dequantize`` masquerade as a call to the
+# module-level ``dequantize``.
+_GLOBAL_NAME_OPS = frozenset((
+    "LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL",
+    "LOAD_NAME", "STORE_NAME", "DELETE_NAME",
+    "IMPORT_NAME", "IMPORT_FROM",
+))
+
+
 def _referenced_global_names(obj) -> set[str]:
     """Every global name reachable from ``obj``'s code, nested code included.
 
-    ``co_names`` on the top-level code object alone is not enough: a call made
-    inside a comprehension, a nested def or a lambda lives in a child code
-    object hanging off ``co_consts``, so the name would be invisible. Walk the
-    whole tree."""
+    Scanning the top-level code object alone is not enough: a call made inside a
+    comprehension, a nested def or a lambda lives in a child code object hanging
+    off ``co_consts``, so the name would be invisible. Walk the whole tree.
+
+    Filter on the opcode rather than reading ``co_names`` wholesale, otherwise
+    attribute accesses land in the result and the drift check passes
+    vacuously."""
     code = getattr(obj, "__code__", None) or getattr(obj, "__func__", None)
     code = getattr(code, "__code__", code)
     if code is None or not hasattr(code, "co_names"):
@@ -254,7 +272,9 @@ def _referenced_global_names(obj) -> set[str]:
     stack = [code]
     while stack:
         current = stack.pop()
-        found |= set(current.co_names)
+        for instruction in dis.get_instructions(current):
+            if instruction.opname in _GLOBAL_NAME_OPS and isinstance(instruction.argval, str):
+                found.add(instruction.argval)
         stack += [c for c in current.co_consts if hasattr(c, "co_names")]
     return found
 
@@ -1437,6 +1457,32 @@ def test_mxfp4_legacy_dequantize_is_on_the_live_path_on_4x():
             f"Mxfp4HfQuantizer calls it on transformers {_TX_VERSION}. The "
             "patch would apply cleanly and reach nothing."
         )
+
+
+def test_referenced_global_names_ignores_attribute_accesses():
+    """The live-path detector must not be satisfied by a same-named ATTRIBUTE.
+
+    ``co_names`` is "names other than arguments and function locals", so it
+    carries ``LOAD_ATTR``/``STORE_ATTR`` operands alongside globals. Reading it
+    wholesale made the 4.x gate vacuous: ``Mxfp4HfQuantizer`` reads
+    ``self.quantization_config.dequantize`` in half a dozen methods, so the
+    name is present whether or not anything still calls the module-level
+    ``dequantize`` that zoo patches. Real transformers 5.x is the proof - the
+    call site is gone there while every config read remains."""
+    def attribute_only(cfg):
+        cfg.dequantize = True
+        return cfg.dequantize
+
+    def real_global_call(x):
+        return dequantize(x)  # noqa: F821
+
+    def real_import_from(x):
+        from transformers.integrations.mxfp4 import dequantize
+        return dequantize(x)
+
+    assert "dequantize" not in _referenced_global_names(attribute_only)
+    assert "dequantize" in _referenced_global_names(real_global_call)
+    assert "dequantize" in _referenced_global_names(real_import_from)
 
 
 def test_mxfp4_fp4_values_constant_present():
