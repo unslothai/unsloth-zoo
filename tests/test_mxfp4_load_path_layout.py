@@ -92,6 +92,16 @@ def test_mxfp4_load_path_layout_matches_stock_transformers():
     # conftest's GPU-free harness does not reach a subprocess, and importing
     # unsloth_zoo calls get_device_type() at import time.
     env["UNSLOTH_ALLOW_CPU"] = "1"
+    # The core-upstream lane installs unsloth with `|| true`, so the checkout is
+    # allowed to fail, and unsloth_zoo/__init__.py raises
+    # ImportError("Please install Unsloth") when find_spec("unsloth") is None.
+    # UNSLOTH_IS_PRESENT does NOT cover that: it guards a separate, later check
+    # that this import never reaches. Without the line below, one transient git
+    # failure turns every 5.x lane red and blames unsloth rather than the layout
+    # this test exists to police. Both variables are needed and neither implies
+    # the other: this one skips the unsloth requirement, UNSLOTH_ALLOW_CPU keeps
+    # get_device_type() from raising on a driverless runner.
+    env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     r = subprocess.run(
         [sys.executable, "-c", _PROBE], capture_output=True, text=True, env=env,
     )
