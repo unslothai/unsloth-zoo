@@ -43,6 +43,19 @@ except Exception:
 # `find_spec("unsloth") is None -> ImportError`. Only the tests that deliberately turn
 # the skip flag OFF reach that, so they are the only ones guarded.
 _HAS_UNSLOTH = importlib.util.find_spec("unsloth") is not None
+
+# `UNSLOTH_ALLOW_CPU=1` is a fallback for a host with NO accelerator, so it is only
+# reached where none is visible. Clearing `CUDA_VISIBLE_DEVICES` does that for CUDA
+# and not for XPU, which stays available and is answered before the hatch.
+def _has_non_cuda_accelerator():
+    try:
+        import torch
+    except Exception:
+        return False
+    return bool(getattr(getattr(torch, "xpu", None), "is_available", bool)())
+
+
+_HAS_NON_CUDA_ACCELERATOR = _has_non_cuda_accelerator()
 _INIT = _ROOT / "unsloth_zoo" / "__init__.py"
 
 # Bound by the MLX branch and by the skip branch alike, and by the real init below
@@ -130,6 +143,11 @@ def test_the_compiler_binds_its_old_arch_flag_on_the_skip_path():
 @pytest.mark.skipif(
     not _HAS_UNSLOTH,
     reason = "this one turns the skip flag off, so the init needs `unsloth` installed",
+)
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX answers before the CPU hatch is read")
+@pytest.mark.skipif(
+    _HAS_NON_CUDA_ACCELERATOR,
+    reason = "clearing CUDA_VISIBLE_DEVICES leaves another accelerator visible",
 )
 def test_the_legacy_cpu_hatch_still_answers_cuda(monkeypatch):
     """`UNSLOTH_ALLOW_CPU=1` keeps its own meaning, unchanged by the skip flag."""

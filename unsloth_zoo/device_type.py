@@ -431,6 +431,11 @@ elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():
+    if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+        # Answered HERE, not only on the constant below: a caller using the getter was
+        # being handed 1 while `DEVICE_COUNT` said 0 in the same process. No device
+        # was looked for at all on this path, which is what 0 says.
+        return 0
     if DEVICE_TYPE in ("cuda", "hip"):
         return torch.cuda.device_count()
     elif DEVICE_TYPE == "xpu":
@@ -440,12 +445,6 @@ def get_device_count():
 pass
 
 DEVICE_COUNT : int = get_device_count()
-if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
-    # `get_device_count` answers 1 for anything that is not CUDA/HIP/XPU, which is the
-    # right answer for a real CPU run and the wrong one here: no device was looked for
-    # at all. `__init__.py` publishes 0 on this path, and a reader cannot tell which of
-    # the two spellings it got.
-    DEVICE_COUNT = 0
 
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(
