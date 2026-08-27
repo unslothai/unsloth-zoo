@@ -25,10 +25,11 @@ The transport also changes on a transient fault, a crash and an incomplete snaps
 stall, and on Xet an UNRECOGNIZED error counts as transient: hf_xet reports a CAS fault as a bare
 ``RuntimeError`` whose Rust error chain this package does not own, and treating that as deterministic
 skipped the HTTP rung entirely. HTTP is the last rung and gets ``UNSLOTH_HTTP_ATTEMPTS`` children
-(default 2) of its own, because the Xet bridge CDN serves Xet-backed blobs over plain HTTP too and one
-degraded CDN therefore fails both rungs. Exhausting them raises ``DownloadTransportError``, a
-``DownloadStallError``, so a caller's guard around the supervised download cannot be bypassed by a
-retryable CDN error and fall through to the unguarded in-process load.
+(default 2, ``UNSLOTH_HTTP_RETRY_BACKOFF`` seconds apart) of its own, because the Xet bridge CDN serves
+Xet-backed blobs over plain HTTP too and one degraded CDN therefore fails both rungs. Exhausting them
+raises ``DownloadTransportError``, a ``DownloadStallError``, so a caller's guard around the
+supervised download cannot be bypassed by a retryable CDN error and fall through to the unguarded
+in-process load.
 
 A DATA-phase stall spends one more Xet child (``UNSLOTH_XET_ATTEMPTS``, default 2) before the
 transport changes, since that hang is usually a wedged CAS stream that clears on a fresh process.
@@ -110,6 +111,7 @@ __all__ = [
     "DEFAULT_HTTP_STALL_TIMEOUT",
     "DEFAULT_XET_ATTEMPTS",
     "DEFAULT_HTTP_ATTEMPTS",
+    "DEFAULT_HTTP_RETRY_BACKOFF",
 ]
 
 _CTX = mp.get_context("spawn")
@@ -139,6 +141,7 @@ _MAX_XET_ATTEMPTS = 8
 DEFAULT_HTTP_ATTEMPTS = 2
 _MAX_HTTP_ATTEMPTS = 8
 # Wait between HTTP children so a CDN shedding load is not hit again in the same instant.
+# ``UNSLOTH_HTTP_RETRY_BACKOFF`` overrides it, and 0 means "retry at once" rather than "junk".
 DEFAULT_HTTP_RETRY_BACKOFF = 5.0
 
 # A child buffering from the network grows RSS at roughly the wire rate. Well above allocator noise
@@ -222,6 +225,28 @@ def http_attempts() -> int:
         logger.warning("Ignoring non-positive UNSLOTH_HTTP_ATTEMPTS=%r", raw)
         return DEFAULT_HTTP_ATTEMPTS
     return min(value, _MAX_HTTP_ATTEMPTS)
+
+
+def _http_retry_backoff() -> float:
+    """Seconds to wait between HTTP children, from ``UNSLOTH_HTTP_RETRY_BACKOFF``.
+
+    Not ``_env_seconds``: that treats non-positive as junk, which is right for a timeout but wrong
+    here, where 0 is the meaningful "retry at once" a test harness or a CI run actually reaches for
+    and silently restoring the full default would be a surprise. Only negative / unparseable falls
+    back.
+    """
+    raw = os.environ.get("UNSLOTH_HTTP_RETRY_BACKOFF")
+    if not raw:
+        return DEFAULT_HTTP_RETRY_BACKOFF
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Ignoring non-numeric UNSLOTH_HTTP_RETRY_BACKOFF=%r", raw)
+        return DEFAULT_HTTP_RETRY_BACKOFF
+    if value < 0:
+        logger.warning("Ignoring negative UNSLOTH_HTTP_RETRY_BACKOFF=%r", raw)
+        return DEFAULT_HTTP_RETRY_BACKOFF
+    return value
 
 
 def is_data_phase_stall(message: str) -> bool:
@@ -1045,6 +1070,10 @@ _DETERMINISTIC_ERROR_NAMES = frozenset({
     "LocalTokenNotFoundError",  # a missing required token fails identically either way
     "BadRequestError",
     "HFValidationError",        # a malformed repo id / revision never reaches the network
+    # Subclasses builtin ConnectionError, so it is an OSError with no errno and no builtin of its own
+    # name: nothing below catches it, and the rung default would spend an HTTP child AND the
+    # destructive pre-HTTP purge on a repo the user has switched offline.
+    "OfflineModeIsEnabled",
 })
 # TYPE reconstructed across the spawn but NOT retry-deterministic: ``HfHubHTTPError`` bases both
 # deterministic 4xx and transient 5xx / 429, so its retry stays status-code driven while the parent
@@ -1055,8 +1084,7 @@ _TYPE_PRESERVE_ONLY_NAMES = frozenset({
 # Substrings marking a transient transport failure (hf_xet / CAS error, timeout, reset, 5xx / 429)
 # that an HTTP retry may recover.
 _TRANSIENT_ERROR_HINTS = (
-    "xet", "casclient", "cas_", "cas client", "file reconstruction",
-    "timeout", "timed out", "connection", "reset by peer",
+    "xet", "casclient", "cas_", "timeout", "timed out", "connection", "reset by peer",
     "temporarily", "try again", "incompleteread", "protocolerror", "remotedisconnected",
     "broken pipe", "ssl", "eof occurred", "502", "503", "504", "500 server", "429",
     "too many requests", "service unavailable", "bad gateway", "gateway time",
@@ -1165,12 +1193,13 @@ def _is_retryable_download_error(exc: BaseException, *, on_xet: bool) -> bool:
     not-found, gated, disk-full).
 
     An UNRECOGNIZED error is decided by the rung it happened on. hf_xet reports a CAS fault as a bare
-    ``RuntimeError`` carrying a Rust error chain whose wording this package does not own and cannot
-    keep an allow-list complete for -- "Task error: File reconstruction error: CAS Client Error: Format
-    error: I/O error: error decoding response body" matches none of the hints below -- so on Xet an
-    unknown error is treated as transport-attributable. That costs one HTTP attempt to disprove, against
-    surrendering the supervised path to an unguarded in-process load, which is the worse trade by far.
-    HTTP is the last rung, where an unknown error is surfaced rather than looped.
+    ``RuntimeError`` carrying a Rust error chain -- "Task error: File reconstruction error: CAS Client
+    Error: Format error: I/O error: error decoding response body" -- which matches none of the hints
+    below and is worded by xet-core rather than by this package, so the list cannot be kept complete
+    from here. On Xet an unknown error is therefore treated as transport-attributable: that costs one
+    HTTP attempt to disprove, against surrendering the supervised path to an unguarded in-process
+    load, which is the worse trade by far. HTTP is the last rung, where an unknown error is surfaced
+    rather than looped.
     """
     name = type(exc).__name__
     # LocalEntryNotFoundError wraps BOTH a genuine offline / uncached miss (deterministic) AND a
@@ -2328,7 +2357,7 @@ def _wait_before_http_retry(cancel_event: Optional[threading.Event]) -> None:
     Interruptible: a cancel arriving during the wait raises immediately rather than spending another
     child on a download the caller has already abandoned.
     """
-    delay = _env_seconds("UNSLOTH_HTTP_RETRY_BACKOFF", DEFAULT_HTTP_RETRY_BACKOFF)
+    delay = _http_retry_backoff()
     if cancel_event is None:
         time.sleep(delay)
         return
@@ -2388,6 +2417,10 @@ def _download_with_xet_fallback(
     # HTTP children this download may spend, and how many it has spent.
     http_budget = http_attempts()
     http_used = 0
+    # force_download as the CALLER asked for it, so a clean re-download forced by an uncleared partial
+    # can be handed back after the first HTTP child has done it.
+    caller_force_download = params.get("force_download", False)
+    forced_clean_redownload = False
     # The Xet -> HTTP purge runs at the TRANSITION only. Repeating it per HTTP child would spare the
     # partial the failed HTTP child just wrote (it is younger than active_grace), leaving
     # has_active_incomplete_blobs true and forcing force_download, so every HTTP retry would restart
@@ -2397,6 +2430,11 @@ def _download_with_xet_fallback(
     # for 24h after two CONSECUTIVE failures, so charging both attempts would let one bad download
     # pin it, against the "one is noise, two is a pattern" rule the tracker is built on.
     pending_xet_failure: Optional[str] = None
+    # Whether that held reason still needs proof. A STALL stands on its own, so it is charged even if
+    # the ladder later leaves by another door. A transport fault or a crash does not: a degraded CDN
+    # fails both rungs identically, so only HTTP finishing what Xet could not shows the Xet path alone
+    # was the broken one.
+    pending_needs_http_success = False
 
     def _flush_pending_failure() -> None:
         """Report a deferred Xet failure on the way out of the ladder (exactly once)."""
@@ -2439,6 +2477,13 @@ def _download_with_xet_fallback(
                     "HTTP re-download instead of an unsafe resume.", label
                 )
                 params = {**params, "force_download": True}
+                forced_clean_redownload = True
+        elif disable_xet and forced_clean_redownload:
+            # The clean re-download has already happened, so the partial on disk is now HTTP-written
+            # and resumable. Leaving force_download latched would make every retry in the new budget
+            # discard it and start again from zero -- on a large repo, the whole file per attempt.
+            forced_clean_redownload = False
+            params = {**params, "force_download": caller_force_download}
 
         kind_result, payload = _run_download_attempt(
             repo_id,
@@ -2497,8 +2542,13 @@ def _download_with_xet_fallback(
             raise RuntimeError("Cancelled")
         if kind_result == "error":
             # Deterministic failure (auth / not-found / gated / disk-full): the other transport fails
-            # identically. _raise_child_error preserves the original type across the spawn. An
-            # earlier stall was still evidence, so report it before the raise leaves the ladder.
+            # identically. _raise_child_error preserves the original type across the spawn. An earlier
+            # STALL was still evidence, so report it before the raise leaves the ladder -- but a held
+            # transport fault is not, and this is easy to reach now that every unrecognized Xet error
+            # holds one: a Xet CAS fault followed by an HTTP child that fills the disk would otherwise
+            # charge the machine for a download that never succeeded on either rung.
+            if pending_needs_http_success:
+                pending_xet_failure = None
             _flush_pending_failure()
             _raise_child_error(payload)
         if kind_result == "retryable_error":
@@ -2514,6 +2564,7 @@ def _download_with_xet_fallback(
                 # HTTP then succeeds. A degraded CDN fails both rungs, and charging it here demoted a
                 # perfectly good machine to HTTP for 24h after two such downloads.
                 pending_xet_failure = _xet_failure_reason("transient Xet transport error")
+                pending_needs_http_success = True
                 disable_xet = True
                 continue
             # A cancel landing in the failure window ends the ladder as a cancel, not as a transport
@@ -2546,6 +2597,7 @@ def _download_with_xet_fallback(
                 _safe_status(on_status, f"{label}: download crashed, retrying over HTTP")
                 # Held for the same reason as a transient error: only an HTTP rescue proves it was Xet.
                 pending_xet_failure = _xet_failure_reason("Xet download process crashed")
+                pending_needs_http_success = True
                 disable_xet = True
                 continue
             if cancel_event is not None and cancel_event.is_set():
@@ -2587,6 +2639,7 @@ def _download_with_xet_fallback(
                 )
                 # Held, not recorded: if the next attempt succeeds this stall was noise.
                 pending_xet_failure = _xet_failure_reason("Xet download stalled")
+                pending_needs_http_success = False
                 _purge_owned_partials_for_xet_retry(
                     repo_type, repo_id, cache_dir = cache_dir,
                     owned_incomplete_blobs = params.pop("_owned_incomplete_blobs", None),

@@ -702,9 +702,9 @@ def _no_real_cache_hit(monkeypatch):
     monkeypatch.delenv("HF_HUB_DISABLE_XET", raising = False)
     monkeypatch.delenv("UNSLOTH_XET_ATTEMPTS", raising = False)
     monkeypatch.delenv("UNSLOTH_HTTP_ATTEMPTS", raising = False)
-    monkeypatch.delenv("UNSLOTH_HTTP_RETRY_BACKOFF", raising = False)
     # The HTTP retry backoff is real seconds in production; tests assert the ladder, not the wait.
-    monkeypatch.setattr(xf, "DEFAULT_HTTP_RETRY_BACKOFF", 0.0)
+    # Set through the knob rather than the module attribute, which also pins that 0 is honoured.
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
 
 
 class _FakeAttempt:
@@ -918,7 +918,12 @@ def test_is_retryable_download_error_classification():
         "Task error: File reconstruction error: CAS Client Error: Format error: "
         "I/O error: error decoding response body"
     )
+    # It must reach the RUNG DEFAULT, not a hint: the wording belongs to xet-core, and a hint list
+    # that happened to cover this one chain would leave the next one deterministic again.
+    text = f"{type(cas).__name__}: {cas}".lower()
+    assert not any(h in text for h in xf._TRANSIENT_ERROR_HINTS), "must not be hint-matched"
     assert f(cas, True) is True
+    assert f(cas, False) is False
     assert f(ValueError("unexpected response payload"), True) is True
     assert f(ValueError("unexpected response payload"), False) is False
 
@@ -1156,7 +1161,7 @@ def test_cancel_in_the_http_failure_window_reports_cancelled(monkeypatch):
 def test_wait_before_http_retry_is_interruptible(monkeypatch):
     """A cancel arriving during the backoff raises rather than spending another child on a download
     the caller has abandoned; without one the wait is a plain sleep."""
-    monkeypatch.setattr(xf, "DEFAULT_HTTP_RETRY_BACKOFF", 30.0)
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "30")
     cancel = threading.Event()
     cancel.set()
     started = time.monotonic()
@@ -1164,10 +1169,7 @@ def test_wait_before_http_retry_is_interruptible(monkeypatch):
         xf._wait_before_http_retry(cancel)
     assert time.monotonic() - started < 5.0, "must not sit out the whole backoff"
     # No cancel event: the wait is honoured, so keep it short here.
-    monkeypatch.setattr(xf, "DEFAULT_HTTP_RETRY_BACKOFF", 0.01)
-    xf._wait_before_http_retry(None)
-    # Junk in the env override falls back to the default rather than failing a download.
-    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "abc")
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0.01")
     xf._wait_before_http_retry(None)
 
 
@@ -1201,6 +1203,102 @@ def test_crash_on_xet_is_charged_only_when_http_rescues_it(monkeypatch):
     _install(monkeypatch, [("crashed", "boom"), ("ok", "/cache/x")])
     xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert outcomes == [False]
+
+
+def test_offline_mode_is_deterministic_on_both_rungs(monkeypatch):
+    """OfflineModeIsEnabled subclasses builtin ConnectionError, so it is an OSError with no errno and
+    no builtin of its own name -- nothing else in the predicate catches it. Without an entry in the
+    name set the rung default would spend an HTTP child AND the destructive pre-HTTP purge on a repo
+    the user has deliberately switched offline."""
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    assert "OfflineModeIsEnabled" in xf._DETERMINISTIC_ERROR_NAMES
+    exc = OfflineModeIsEnabled(
+        "Offline mode is enabled. To disable it, please unset the HF_HUB_OFFLINE environment variable."
+    )
+    assert isinstance(exc, OSError) and getattr(exc, "errno", None) is None
+    for on_xet in (True, False):
+        assert xf._is_retryable_download_error(exc, on_xet = on_xet) is False, on_xet
+
+
+def test_deterministic_http_error_does_not_charge_a_held_transport_fault(monkeypatch):
+    """A Xet fault held for proof, then an unrelated deterministic failure on HTTP (disk full): the
+    download succeeded on neither rung, so nothing ever showed the Xet path alone was broken. Two of
+    these would demote the machine to HTTP for 24h."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(
+        monkeypatch,
+        [("retryable_error", "503 Service Unavailable"),
+         ("error", "OSError: [Errno 28] No space left on device")],
+    )
+    with pytest.raises(OSError, match = "No space left"):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [], "neither rung finished: not a Xet verdict"
+
+
+def test_a_stall_is_still_charged_when_a_later_error_ends_the_ladder(monkeypatch):
+    """The counterpart to the test above, and the invariant it must not break: a STALL stands on its
+    own as evidence, so a deterministic error afterwards still reports it."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(
+        monkeypatch,
+        [("stall", None), ("error", "RepositoryNotFoundError: gone")],
+    )
+    with pytest.raises(Exception):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [False]
+
+
+def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeypatch):
+    """An unsafe partial that could not be cleared forces a clean re-download on the FIRST HTTP
+    child. Leaving force_download latched would make every retry in the new budget discard the
+    partial that child wrote and start again from zero -- the whole file per attempt on a large
+    repo, which is a cost the budget must not introduce."""
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.force_download for c in fake.calls] == [False, True, False], (
+        "Xet as asked, one clean HTTP re-download, then resumable retries"
+    )
+
+
+def test_http_retry_keeps_a_caller_requested_force_download(monkeypatch):
+    """Handing force_download back means handing back what the CALLER asked for, not False."""
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(
+        DL_REPO, FILE, None, force_download = True) == "/cache/x"
+    assert [c.force_download for c in fake.calls] == [True, True, True]
+
+
+def test_http_retry_backoff_honours_zero(monkeypatch):
+    """0 is the value a CI run or a test harness actually reaches for. _env_seconds would read it as
+    junk and silently restore the full default, so this knob does not use it."""
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+    assert xf._http_retry_backoff() == 0.0
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "1.5")
+    assert xf._http_retry_backoff() == 1.5
+    # Negative and unparseable are junk and fall back; unset falls back too.
+    for bad in ("abc", "-1", "  "):
+        monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", bad)
+        assert xf._http_retry_backoff() == xf.DEFAULT_HTTP_RETRY_BACKOFF, bad
+    monkeypatch.delenv("UNSLOTH_HTTP_RETRY_BACKOFF")
+    assert xf._http_retry_backoff() == xf.DEFAULT_HTTP_RETRY_BACKOFF
+    # A zero backoff really does return at once, with no cancel event in play.
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+    started = time.monotonic()
+    xf._wait_before_http_retry(None)
+    assert time.monotonic() - started < 1.0
 
 
 def test_recovered_stall_is_not_charged_to_the_machine(monkeypatch):
