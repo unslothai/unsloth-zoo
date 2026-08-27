@@ -442,6 +442,33 @@ def _encode_dpo_branches(
     return prompt_ids, response(chosen_text), response(rejected_text)
 
 
+def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
+    """Refuse an ORPO row whose two prompt encodings disagree beyond a merge.
+
+    ORPOTrainer.tokenize_row allows the last prompt token to move, because a
+    tokenizer can merge it with the first token of the answer, and nothing
+    beyond that. It compares over the pair and separately bounds the length
+    gap; comparing over the overlap and bounding the gap here accepts exactly
+    the same rows, without depending on zip's strict= raising for us.
+    """
+    overlap = min(len(chosen_prompt_ids), len(rejected_prompt_ids))
+    different = sum(
+        int(a != b) for a, b in zip(
+            chosen_prompt_ids[:overlap], rejected_prompt_ids[:overlap],
+        )
+    )
+    length_gap = abs(len(chosen_prompt_ids) - len(rejected_prompt_ids))
+    if different > 1 or length_gap > 1:
+        raise ValueError(
+            "Unsloth MLX ORPO: the chosen and rejected branches tokenized the "
+            "same prompt differently in "
+            f"{different} position(s) with a length gap of {length_gap}, and "
+            "only the last prompt token may move that way through a tokenizer "
+            "merge. Training the row would compare two responses written "
+            "against different contexts."
+        )
+
+
 def tokenize_preference_row(
     tokenizer, row, *, length_policy, append_eos=True,
 ):
@@ -482,6 +509,16 @@ def tokenize_preference_row(
         rejected_prompt = list(rejected.input_ids[:boundaries[1]])
         chosen_response = list(chosen.input_ids[boundaries[0]:])
         rejected_response = list(rejected.input_ids[boundaries[1]:])
+        # Stepping back one token mirrors build_tokenized_answer, but that is
+        # only half of what ORPOTrainer does: it then refuses a row whose two
+        # prompt encodings differ by more than the single token a merge can
+        # move. Without this, two materially different prefixes reach the loss
+        # and ORPO compares the responses as though they shared one context.
+        # This runs on the boundaries as finally resolved, not the raw pair: a
+        # branch that leaves the prompt early is clipped to the shared minimum
+        # just above, and judging it before that would refuse rows whose two
+        # prompts end up identical.
+        _reject_diverging_orpo_prompts(chosen_prompt, rejected_prompt)
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "

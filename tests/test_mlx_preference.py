@@ -345,6 +345,29 @@ def test_orpo_steps_back_one_token_the_way_trl_does():
     assert (tokenized.rejected_prompt_ids, tokenized.rejected_ids) == ((8, 2), (6, 7))
 
 
+def test_orpo_refuses_two_prompts_that_disagree_beyond_a_merge():
+    from unsloth_zoo.mlx.preference import tokenize_preference_row
+
+    # One differing prompt token is a tokenizer merge, which the test above
+    # keeps trainable. Two is not reachable that way: the branches would be
+    # answering different contexts, and ORPOTrainer.tokenize_row refuses the
+    # row rather than averaging across them.
+    tokenizer = MappingTokenizer(
+        {
+            "abc": [1, 2, 3],
+            "abcd": [9, 7, 4, 5],
+            "abce": [8, 6, 6, 7],
+        }
+    )
+
+    with pytest.raises(ValueError, match="only the last prompt token may move"):
+        tokenize_preference_row(
+            tokenizer,
+            {"prompt": "abc", "chosen": "d", "rejected": "e"},
+            length_policy=policy("orpo", max_length=8),
+        )
+
+
 # Distinct characters, so a head slice can never pass for a tail slice.
 PROMPT, CHOSEN, REJECTED = "abcdefghijklmnopqrst", "uvwxyzABCD", "EFGH"
 LONG_ROW = {"prompt": PROMPT, "chosen": CHOSEN, "rejected": REJECTED}
