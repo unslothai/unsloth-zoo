@@ -510,16 +510,22 @@ def pause_mlx_training_patches() -> bool:
 
 
 def resume_mlx_training_patches(paused: bool) -> None:
-    """Reopen at the depth `pause_mlx_training_patches` closed from.
+    """Give back exactly what `pause_mlx_training_patches` took.
 
-    Deliberately not `acquire()`: that would count a second run, and the pause
-    never released one.
+    The physical reference is restored by INCREMENT, never by assignment: another
+    trainer may have acquired during the pause, and setting the depth to 1 there
+    would drop this run's reference, so that trainer's release would unpatch
+    `mlx.core` while this one is still differentiating.
+
+    The logical depth is restored from this context's own pause stack, so it does
+    not count a second run the way `acquire()` would.
     """
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
-        if paused and _MLX_TRAINING_PATCH_DEPTH == 0:
-            _set_mlx_index_gradient_stop(True)
-            _MLX_TRAINING_PATCH_DEPTH = 1
+        if paused:
+            if _MLX_TRAINING_PATCH_DEPTH == 0:
+                _set_mlx_index_gradient_stop(True)
+            _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
         _MLX_TRAINING_ACTIVE_DEPTH.set(stack[-1])

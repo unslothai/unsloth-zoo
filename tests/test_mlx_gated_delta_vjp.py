@@ -494,6 +494,26 @@ def test_one_trainers_evaluation_leaves_another_threads_flag_alone():
     assert not mlx_training_patches_active()
 
 
+def test_resume_keeps_its_reference_when_another_run_acquired_mid_pause():
+    """A pauses as the sole holder, B acquires during the pause, A resumes. If the
+    resume assigns the depth instead of incrementing it, A's reference is lost and
+    B's release unpatches mlx.core while A is still differentiating."""
+    acquire_mlx_training_patches()                      # A trains
+    try:
+        paused = pause_mlx_training_patches()           # A evaluates, sole holder
+        assert paused is True
+        acquire_mlx_training_patches()                  # B trains during A's eval
+        try:
+            resume_mlx_training_patches(paused)         # A back to training
+        finally:
+            release_mlx_training_patches()              # B finishes first
+        assert mx.take_along_axis._unsloth_index_stop_gradient, (
+            "B's release unpatched mlx.core while A was still training")
+    finally:
+        release_mlx_training_patches()
+    assert not hasattr(mx.take_along_axis, "_unsloth_index_stop_gradient")
+
+
 def test_detaching_preserves_container_types():
     """`mx.checkpoint` hands the layer its own arguments back, so rebuilding a
     NamedTuple as a plain tuple turns `payload.ids` into an AttributeError."""
