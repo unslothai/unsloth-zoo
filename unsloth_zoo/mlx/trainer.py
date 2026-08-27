@@ -5893,10 +5893,29 @@ class MLXTrainer:
                 _generation_budget[split_name] = [
                     0, int(args.num_generation_prompts),
                 ]
+            # The plan builder iterates to exhaustion, so the length checked at
+            # configuration time bounds nothing. Hold the split to it: a longer
+            # one scores rows the validation never saw, an endless one hangs.
+            try:
+                expected = len(split)
+            except (TypeError, AttributeError):
+                expected = None
+            seen = 0
             for raw in split:
+                if expected is not None and seen >= expected:
+                    raise ValueError(
+                        "Unsloth MLX preference: the eval dataset yielded more "
+                        f"rows than the {expected} it declares."
+                    )
+                seen += 1
                 yield (
                     self.formatting_func(raw)
                     if self.formatting_func is not None else raw
+                )
+            if expected is not None and seen != expected:
+                raise ValueError(
+                    f"Unsloth MLX preference: the eval dataset yielded {seen} "
+                    f"rows but declares {expected}."
                 )
 
         def _capture_generation_prompt(split_name, prompt_text):

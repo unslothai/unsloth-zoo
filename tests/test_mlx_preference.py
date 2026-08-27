@@ -1622,3 +1622,34 @@ def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
     trainer.args.eval_strategy = "epoch"
     trainer._prepare_data(False)
     assert "no evaluation cadence" not in capsys.readouterr().out
+
+
+def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
+    """len() is checked at configuration time, but the plan builder iterates to
+    exhaustion, so the declared length bounded nothing: a split claiming 2 rows
+    and yielding 3 had all 3 scored, and an endless sized iterable would hang
+    rather than raise. Falsified against the unbounded loop: 3 rows are scored
+    and nothing is raised."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    class LyingSplit:
+        """Declares two rows, yields three."""
+
+        def __init__(self, rows_):
+            self._rows = rows_
+
+        def __len__(self):
+            return len(self._rows) - 1
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=LyingSplit(rows(3)),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, max_steps=1, eval_steps=1,
+            generate_during_eval=False)),
+    )
+    # The plan is built at the first evaluation, not at _prepare_data.
+    with pytest.raises(ValueError, match="more rows than the 2 it declares"):
+        _run_generation_trainer(trainer, monkeypatch, [])
