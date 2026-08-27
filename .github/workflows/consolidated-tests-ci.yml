@@ -131,7 +131,7 @@ jobs:
           }
 
           # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
-          # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+          # satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
           lane() {
             version="$1"; interpreter="$2"
             venv=".lanes/venv-$version"
@@ -234,7 +234,7 @@ jobs:
             pyproject.toml
 
       - name: Install runtime + test deps
-        # --no-deps unsloth satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
@@ -324,6 +324,7 @@ jobs:
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
+            tests/test_mlx_trainer_internals.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -566,7 +567,7 @@ jobs:
       # Pure-Python protobuf parser; transformers' bundled *_pb2.py is rejected by C++ protobuf 4+/5+.
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
       UNSLOTH_COMPILE_DISABLE: '1'
-      # Secondary handshake after find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+      # Secondary handshake after the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
       UNSLOTH_IS_PRESENT: '1'
     steps:
       - name: Harden runner (audit)
@@ -697,6 +698,18 @@ jobs:
 
               if [ "$rc" -eq 0 ]; then
                 trc=0
+                # test_mxfp4_load_path_layout runs here, not in repo-tests-cpu, for
+                # two reasons. It is version-aware by construction -- red on 5.5.0
+                # and 5.16.x, skipped on 4.57.6 -- so it only means anything across
+                # more than one pin, and these lanes are the only ones that provide
+                # them. And its probe runs in a subprocess, which conftest does not
+                # reach, so it sets its own environment rather than relying on this
+                # job's `env`. The binding constraint there is find_spec("unsloth"),
+                # not the UNSLOTH_IS_PRESENT set below: unsloth is installed with
+                # `|| true` above, and unsloth_zoo raises on the missing spec before
+                # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
+                # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
+                # cannot turn these lanes red.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -711,6 +724,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_temporary_patches_exhaustive.py \
+                  tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \
