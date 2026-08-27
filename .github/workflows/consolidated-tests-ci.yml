@@ -520,6 +520,39 @@ jobs:
             echo "real mlx is installed but the numeric tests skipped"; exit 1
           fi
 
+      - name: int8 prefill suites (HARD GATE)
+        # The Apple Silicon lane is opt-in behind an `mlx` label, so on a normal pull
+        # request this is the only place the int8 prefill code is exercised at all.
+        # Everything here is backend-independent: dispatch, eligibility, the W8A8
+        # arithmetic via the portable backend, mx.compile safety and the LoRA vjp. The
+        # Metal kernels and the M5 capability probe are not reachable from Linux and are
+        # not claimed to be.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tests
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest -v -rs \
+            tests/test_mlx_int8_prefill_dispatch.py \
+            tests/test_mlx_int8_prefill_numerics.py \
+            tests/test_mlx_int8_prefill_safety.py
+
+      - name: Fail if the int8 prefill suites collapsed to skips
+        # One skip is expected and understood: mx.quantized_matmul at group_size 128
+        # cannot be evaluated on some backends, so the comparison against it is skipped
+        # on the reference rather than on a backend guess. Anything beyond that means
+        # the suites stopped testing and quietly passed.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tests
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest -q -rs \
+            tests/test_mlx_int8_prefill_dispatch.py \
+            tests/test_mlx_int8_prefill_numerics.py \
+            tests/test_mlx_int8_prefill_safety.py | tee int8.txt
+          SKIPPED=$(grep -oE '[0-9]+ skipped' int8.txt | grep -oE '[0-9]+' || echo 0)
+          if [ "${SKIPPED:-0}" -gt 1 ]; then
+            echo "int8 prefill suites skipped ${SKIPPED} tests, expected at most 1"
+            exit 1
+          fi
+
       - name: tests/test_mlx_rng_rewind.py (HARD GATE)
         # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
         # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
