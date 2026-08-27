@@ -26,6 +26,7 @@ Everything runs in a subprocess: both properties are about what happens during
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -35,8 +36,59 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+INIT_PY = REPO_ROOT / "unsloth_zoo" / "__init__.py"
 
 _NAMES = ("DEVICE_TYPE", "DEVICE_TYPE_TORCH", "DEVICE_COUNT", "ALLOW_PREQUANTIZED_MODELS")
+
+
+def _public_upper_names(body) -> set:
+    """Module-level UPPER_CASE names bound by a branch of `__init__.py`.
+
+    Descends into nested `if`s, because those still bind at module level when
+    the branch is taken, but not into `def`/`class`, whose locals do not.
+    """
+    found = set()
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    found.add(target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name.isupper():
+                    found.add(name)
+        stack.extend(ast.iter_child_nodes(node))
+    return {name for name in found if not name.startswith("_")}
+
+
+def _cross_path_contract() -> set:
+    """Names that BOTH the MLX branch and the normal path bind at module level.
+
+    A name bound on only one path is that path's private business:
+    `UNSLOTH_ZOO_IS_PRESENT` is MLX-only (the normal path sets just the
+    environment variable), `IS_HIP_RUNTIME` and the torch-version flags are
+    normal-only. Neither kind is read off the package root anywhere. The
+    intersection is the set every path genuinely promises, and it is therefore
+    the set the skip path has to keep reachable.
+    """
+    tree = ast.parse(INIT_PY.read_text(encoding = "utf-8"))
+    mlx, normal = set(), set()
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.unparse(node.test)
+        if "_is_mlx_only" in test:
+            mlx |= _public_upper_names(node.body)
+        elif test == "not _SKIP_GPU_INIT":
+            normal |= _public_upper_names(node.body)
+    assert mlx, "could not find the MLX branch in __init__.py; this test needs rewriting"
+    assert normal, "could not find the normal branch in __init__.py; this test needs rewriting"
+    return mlx & normal
 
 
 def _run(code: str) -> subprocess.CompletedProcess:
@@ -120,3 +172,42 @@ def test_an_unknown_attribute_still_raises_attribute_error():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("raised"), result.stdout
+
+
+def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
+    """The contract is DERIVED from `__init__.py`, not restated here.
+
+    The bug this file exists for was a hardcoded assumption about which names
+    the skip path needs, made in a workflow comment in #1089 and falsified
+    three days later by an ordinary new test in #1108. Hardcoding the same
+    assumption in the resolver would leave the identical trap: add a fifth
+    constant to the MLX branch and the normal path, and the skip path silently
+    lacks it again with nothing to notice.
+
+    So this reads the three branches out of the source. If the cross-path
+    contract grows, this fails until the resolver is extended to match.
+    """
+    contract = _cross_path_contract()
+    assert contract == set(_NAMES), (
+        f"the set of names bound by BOTH the MLX branch and the normal path is "
+        f"{sorted(contract)}, but this suite checks {sorted(_NAMES)}. Extend the "
+        f"lazy resolver in unsloth_zoo/__init__.py and _NAMES here to match, or "
+        f"the skip path is short a name that every other path defines."
+    )
+
+
+def test_every_contract_name_actually_resolves_under_the_skip():
+    """Derivation is worth nothing if nothing checks it against a live import."""
+    names = sorted(_cross_path_contract())
+    code = (
+        "import unsloth_zoo\n"
+        f"for name in {names!r}:\n"
+        "    getattr(unsloth_zoo, name)\n"
+        "print('all resolved')\n"
+    )
+    result = _run(code)
+    assert result.returncode == 0, (
+        f"one of {names} did not resolve under UNSLOTH_ZOO_DISABLE_GPU_INIT=1:\n"
+        f"{result.stderr}"
+    )
+    assert result.stdout.strip().endswith("all resolved"), result.stdout
