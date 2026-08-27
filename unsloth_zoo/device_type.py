@@ -372,10 +372,25 @@ def _cpu_fallback():
     return None
 
 
+# Read once, at module scope, so every reader below agrees. `get_device_type` is
+# `@functools.cache`d, so it would read the environment once per process anyway.
+_GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
+
+
 @functools.cache
 def get_device_type():
     if _IS_MLX:
+        # MLX keeps its precedence: a macOS/arm64 host answers "mlx" whatever the
+        # skip flag says, which is what `__init__.py` publishes there too.
         return "mlx"
+    if _GPU_INIT_SKIPPED:
+        # BEFORE the hardware probes, not after. `__init__.py` publishes
+        # `DEVICE_TYPE = "cpu"` on this path unconditionally, so consulting the flag
+        # only in the no-accelerator fallback left a CUDA or XPU host holding both
+        # answers at once: the package said "cpu" and a direct
+        # `import unsloth_zoo.device_type` said "cuda". It also ran the very
+        # detection the flag promises to skip.
+        return "cpu"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
@@ -425,10 +440,20 @@ def get_device_count():
 pass
 
 DEVICE_COUNT : int = get_device_count()
+if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+    # `get_device_count` answers 1 for anything that is not CUDA/HIP/XPU, which is the
+    # right answer for a real CPU run and the wrong one here: no device was looked for
+    # at all. `__init__.py` publishes 0 on this path, and a reader cannot tell which of
+    # the two spellings it got.
+    DEVICE_COUNT = 0
 
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(
 ALLOW_PREQUANTIZED_MODELS : bool = True
+if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+    # Same argument as `DEVICE_COUNT` above: `__init__.py` publishes False here, and
+    # the two import paths must not disagree about what the process can load.
+    ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True
 if DEVICE_TYPE == "hip":

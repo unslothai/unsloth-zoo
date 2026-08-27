@@ -19,6 +19,7 @@ CPU-only and network-free: this reads source and runs a subprocess with the flag
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import pathlib
 import subprocess
@@ -28,6 +29,20 @@ import pytest
 
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# The MLX branch of `__init__.py` runs BEFORE the skip flag is consulted and answers
+# "mlx", deliberately, so the CPU expectations below are not the right ones there.
+# Read without importing torch: `is_mlx_available` is import-light.
+try:
+    from unsloth_zoo.mlx.runtime import is_mlx_available as _is_mlx_available
+    _IS_MLX_HOST = bool(_is_mlx_available())
+except Exception:
+    _IS_MLX_HOST = False
+
+# The security lane installs `.[core]` and NOT `unsloth`, and the full init ends in
+# `find_spec("unsloth") is None -> ImportError`. Only the tests that deliberately turn
+# the skip flag OFF reach that, so they are the only ones guarded.
+_HAS_UNSLOTH = importlib.util.find_spec("unsloth") is not None
 _INIT = _ROOT / "unsloth_zoo" / "__init__.py"
 
 # Bound by the MLX branch and by the skip branch alike, and by the real init below
@@ -64,6 +79,7 @@ def test_a_module_that_reads_them_still_imports():
     assert result.returncode == 0, result.stderr[-2000:]
 
 
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
 def test_the_two_device_type_spellings_agree_on_the_skip_path():
     """One process must not hold two different answers for the same question.
 
@@ -82,6 +98,39 @@ def test_the_two_device_type_spellings_agree_on_the_skip_path():
     assert package == direct == torch_name == "cpu", (package, direct, torch_name)
 
 
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
+@pytest.mark.parametrize("name", _CONSTANTS)
+def test_both_import_paths_publish_the_same_constant(name):
+    """Not just the device NAME: a reader cannot tell which spelling it got.
+
+    `DEVICE_COUNT` and `ALLOW_PREQUANTIZED_MODELS` disagreed - the package published
+    0 and False, and `device_type` computed 1 and left True - so two modules in one
+    process could hold contradictory device capabilities.
+    """
+    result = _child(
+        "import unsloth_zoo, unsloth_zoo.device_type as d;"
+        f"print(unsloth_zoo.{name}, d.{name})"
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    package, direct = result.stdout.strip().splitlines()[-1].split()
+    assert package == direct, (name, package, direct)
+
+
+@pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
+def test_the_compiler_binds_its_old_arch_flag_on_the_skip_path():
+    """`fuse_lm_head = True` reads `OLD_CUDA_ARCH_VERSION`, which only the CUDA, HIP
+    and XPU branches used to bind, so the "cpu" value raised NameError."""
+    result = _child(
+        "import unsloth_zoo.compiler as c; print(c.OLD_CUDA_ARCH_VERSION)"
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == "False"
+
+
+@pytest.mark.skipif(
+    not _HAS_UNSLOTH,
+    reason = "this one turns the skip flag off, so the init needs `unsloth` installed",
+)
 def test_the_legacy_cpu_hatch_still_answers_cuda(monkeypatch):
     """`UNSLOTH_ALLOW_CPU=1` keeps its own meaning, unchanged by the skip flag."""
     environment = dict(os.environ)
