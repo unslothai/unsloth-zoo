@@ -41,6 +41,13 @@ _TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
 # mxfp4.dequantize and reduced tensor_parallel.shard_and_distribute_module to a
 # tombstone that still imports but raises RuntimeError when called.
 _TX_GE_5_16 = Version(_TX_VERSION) >= Version("5.16.0")
+# transformers 5.10.0 was published from a stale branch, yanked on PyPI ~14 minutes
+# later ("We pushed from a week old main branch ... missing a bunch of fixes") and
+# superseded by 5.10.1. Its tree carries an in-progress refactor in which
+# integrations/tensor_parallel.py had been moved to distributed/tensor_parallel.py
+# and shard_and_distribute_module did not exist anywhere; 5.10.1 restored the
+# integrations layout. It is a retracted artifact, not an upstream API decision.
+_TX_IS_YANKED_5_10_0 = Version(_TX_VERSION) == Version("5.10.0")
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
@@ -1344,14 +1351,31 @@ def test_mxfp4_dequantize_signature():
         )
 
 
+# Every upstream shape zoo's mxfp4.py knows how to replace. MUST be kept in sync
+# with the replacement defined in temporary_patches/mxfp4.py: patch_function refuses
+# a replacement whose parameters do not match the original exactly, so a shape that
+# is not listed here is a shape zoo cannot patch.
+_CONVERTOPS_HANDLED_SIGNATURES = (
+    ("blocks", "scales"),
+)
+
+
 def test_mxfp4_dequantize_convertops_signature():
-    """mxfp4.py patches ``mxfp4.dequantize_convertops`` (blocks, scales) on
-    transformers 5.x.
+    """mxfp4.py patches ``mxfp4.dequantize_convertops`` on transformers 5.x.
 
     The 5.x replacement for module-level ``dequantize``: ``Mxfp4Dequantize.convert``
     is its only caller, and zoo rebinds it to re-apply the ``transpose(1, 2)`` its
     own un-transposed ``convert_moe_packed_tensors`` leaves off. Absent on 4.x, where
-    the legacy ``dequantize`` hook carries the transpose instead."""
+    the legacy ``dequantize`` hook carries the transpose instead.
+
+    EXACT parameter tuple, not a superset. ``can_safely_patch`` refuses any arity
+    the replacement does not match exactly, so a superset check is the wrong
+    predicate here: 5.0.0's 3-arg ``(blocks, scales, target_device)`` IS a superset
+    of ``["blocks", "scales"]`` and sailed through this test while the patch it was
+    meant to police was being rejected at runtime with "Parameter count mismatch:
+    3 vs 2", leaving GPT-OSS loading with dims 1 and 2 swapped. Assert instead that
+    the installed signature is one zoo actually dispatches on; anything else is
+    drift, because anything else is a patch that will not apply."""
     try:
         mod = importlib.import_module("transformers.integrations.mxfp4")
     except Exception as exc:
@@ -1372,12 +1396,18 @@ def test_mxfp4_dequantize_convertops_signature():
             "keeps zoo's un-transposed [E, D, G*B*2] layout and GPT-OSS loads "
             "with dims 1 and 2 swapped."
         )
-    _assert_params_superset(
-        fn,
-        required=["blocks", "scales"],
-        zoo_file="mxfp4.py",
-        label="dequantize_convertops",
-    )
+    got = tuple(_param_names(fn))
+    if got not in _CONVERTOPS_HANDLED_SIGNATURES:
+        pytest.fail(
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py replaces "
+            f"transformers.integrations.mxfp4.dequantize_convertops and has arms "
+            f"for {list(_CONVERTOPS_HANDLED_SIGNATURES)}, but transformers "
+            f"{_TX_VERSION} declares {inspect.signature(fn)}. patch_function will "
+            f"refuse a replacement whose parameters do not match exactly, so the "
+            f"transpose(1, 2) that zoo's un-transposed convert_moe_packed_tensors "
+            f"leaves off would never be restored and GPT-OSS would load with dims "
+            f"1 and 2 swapped."
+        )
     # The class and its call site must both still exist for the patch to reach
     # the loader.
     cls = getattr(mod, "Mxfp4Dequantize", None)
@@ -1493,12 +1523,37 @@ def test_mxfp4_shard_and_distribute_module_present():
     5.16.0 replaced the function with a ``(*args, **kwargs)`` tombstone that raises
     RuntimeError, so there is nothing left to pin above that version and zoo gates
     both call sites off instead. It is a genuine upstream stub, NOT a decorator
-    wrapper: no ``__wrapped__``, so ``follow_wrapped`` recovers nothing."""
+    wrapper: no ``__wrapped__``, so ``follow_wrapped`` recovers nothing.
+
+    An unimportable module is a hard failure on every release EXCEPT the yanked
+    5.10.0, where it is xfail. Not a skip: the consequence is real. gpt_oss.py's
+    import sits under a ``< 5.16.0`` gate inside ``patch_gpt_oss``, so on 5.10.0 it
+    raises and ``return raise_error(...)`` abandons the remainder of that function,
+    losing both ``load_and_swizzle_mxfp4`` and ``replace_with_mxfp4_linear`` --
+    silently, because ``raise_error`` only speaks under UNSLOTH_ENABLE_LOGGING.
+    (Reached only when triton_kernels is installed; without it ``patch_gpt_oss``
+    returns earlier and 5.10.0 costs nothing extra.) xfail keeps that written down
+    and reported, and turns into XPASS if the module ever comes back, whereas a
+    skip would read as "not applicable" and a hard fail would redden a lane no
+    change to zoo can ever green: 5.10.0 is yanked, so the fix is 5.10.1.
+
+    Note that widening the gate to match gpt_oss.py's ``< 5.16.0`` would NOT help:
+    5.10.0 is inside that range, so the test would still fail."""
     try:
         mod = importlib.import_module("transformers.integrations.tensor_parallel")
     except Exception as exc:
+        if _TX_IS_YANKED_5_10_0:
+            pytest.xfail(
+                "transformers 5.10.0 is YANKED upstream (published from a stale "
+                "branch, replaced by 5.10.1 minutes later). It moved "
+                "integrations/tensor_parallel.py to distributed/tensor_parallel.py "
+                "and shipped no shard_and_distribute_module at all, so "
+                "patch_gpt_oss aborts at its gated import and silently drops "
+                "load_and_swizzle_mxfp4 and replace_with_mxfp4_linear on installs "
+                f"that have triton_kernels. Upgrade to 5.10.1 or newer. ({exc})"
+            )
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py imports "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py and gpt_oss.py import "
             f"transformers.integrations.tensor_parallel but it is missing: {exc}"
         )
     fn = getattr(mod, "shard_and_distribute_module", None)
