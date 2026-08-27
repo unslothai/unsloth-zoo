@@ -64,6 +64,38 @@ def test_a_module_that_reads_them_still_imports():
     assert result.returncode == 0, result.stderr[-2000:]
 
 
+def test_the_two_device_type_spellings_agree_on_the_skip_path():
+    """One process must not hold two different answers for the same question.
+
+    `__init__.py` publishes `DEVICE_TYPE = "cpu"` on the skip path, and
+    `device_type.get_device_type()` has to say the same, or a module reading one and a
+    module reading the other take different device branches in the same run. The older
+    `UNSLOTH_ALLOW_CPU=1` hatch deliberately answers `"cuda"`; that is a different
+    question and is checked separately below.
+    """
+    result = _child(
+        "import unsloth_zoo, unsloth_zoo.device_type as d;"
+        "print(unsloth_zoo.DEVICE_TYPE, d.DEVICE_TYPE, d.DEVICE_TYPE_TORCH)"
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    package, direct, torch_name = result.stdout.strip().splitlines()[-1].split()
+    assert package == direct == torch_name == "cpu", (package, direct, torch_name)
+
+
+def test_the_legacy_cpu_hatch_still_answers_cuda(monkeypatch):
+    """`UNSLOTH_ALLOW_CPU=1` keeps its own meaning, unchanged by the skip flag."""
+    environment = dict(os.environ)
+    environment.pop("UNSLOTH_ZOO_DISABLE_GPU_INIT", None)
+    environment["UNSLOTH_ALLOW_CPU"] = "1"
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    result = subprocess.run(
+        [sys.executable, "-c", "import unsloth_zoo.device_type as d; print(d.DEVICE_TYPE)"],
+        cwd = _ROOT, env = environment, capture_output = True, text = True, timeout = 300,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == "cuda"
+
+
 def test_the_skip_branch_binds_every_constant_the_mlx_branch_does():
     """Read off the source, so a constant added to one branch cannot be forgotten.
 
