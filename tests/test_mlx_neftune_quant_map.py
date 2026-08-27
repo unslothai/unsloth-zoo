@@ -25,13 +25,11 @@ except Exception:
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 # Identification, scale resolution and cleanup are pure logic over a synthetic
-# module tree: they need a real mlx runtime but no Metal and no downloads, so they
-# also gate the Linux mlx-cpu job rather than only the opt-in Apple Silicon one.
+# tree: real mlx, no Metal, no downloads, so they gate the Linux job too.
 mlx_only = pytest.mark.skipif(not _MLX, reason="requires the mlx runtime")
 
-# mlx 0.32 replaced the mutable `mx.random.state` list with a sentinel that
-# refuses item assignment, so tests rewind through the same reseed pair the
-# production code uses rather than writing the state back.
+# mlx 0.32 made mx.random.state a sentinel refusing item assignment, so tests
+# rewind through the same reseed pair the production code uses.
 _RNG_STATE_WRITABLE = _MLX and isinstance(mx.random.state, list)
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
@@ -476,11 +474,9 @@ def test_embed_scale_probe_reads_the_installed_transformers():
     ("gemma4_text", True),
     ("gemma4_unified_text", True),
     ("gemma", False),      # genuinely version-dependent, so not assumed
-    # minicpm3 is unaskable for a different reason: transformers ships no
-    # built-in arch for it in the supported range, so the reference there is the
-    # trust_remote_code modeling file, which scales OUTSIDE the embedding just as
-    # mlx-lm does. Assuming "inside" would divide the noise by scale_emb twice
-    # over. Covered in full by test_minicpm3_keeps_the_scale_transformers_actually_applies.
+    # minicpm3 is unaskable for a different reason: no built-in arch in the
+    # supported range, so the reference is trust_remote_code, which scales
+    # OUTSIDE the embedding as mlx-lm does. See the dedicated test below.
     ("minicpm3", False),
 ])
 def test_embed_scale_falls_back_when_transformers_cannot_be_asked(
@@ -642,11 +638,8 @@ def test_embed_scale_reads_both_spellings_of_a_family(
 def test_probe_survives_the_backends_own_random_state():
     """The shapes above are hypothetical; this is the one that actually ships.
 
-    mlx 0.32 replaced the mutable ``mx.random.state`` list with a read-only
-    ``_RandomState`` sentinel, so on a current install the probe takes the
-    no-snapshot path by default rather than as an exotic fallback. Nothing is
-    monkeypatched here: identification has to work against whatever this mlx
-    really exposes, and the probe must not raise trying to put it back.
+    Nothing is monkeypatched: identification and the rewind have to work against
+    whatever random state this mlx really exposes.
     """
     import mlx.core as mx
     from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
@@ -658,8 +651,8 @@ def test_probe_survives_the_backends_own_random_state():
     # mx.compile captured, which stops a compiled step redrawing.
     assert isinstance(mx.random.state, list) is _RNG_STATE_WRITABLE
 
-    # The rewind has to work on whatever this mlx exposes, not only on the
-    # pre-0.32 list form, so the stream is genuinely restored either way.
+    # The rewind must work on whatever this mlx exposes, not just the pre-0.32
+    # list form.
     import mlx.nn as nn
     from unsloth_zoo.mlx.utils import _mlx_rng_key, _restore_mlx_rng_key
 
@@ -689,13 +682,10 @@ def test_probe_survives_the_backends_own_random_state():
 def test_minicpm3_keeps_the_scale_transformers_actually_applies():
     """minicpm3 must not be corrected while transformers ships no built-in arch.
 
-    In that state the only transformers path is trust_remote_code, whose
-    ``modeling_minicpm.py`` multiplies by ``scale_emb`` in the model forward --
-    outside the module its NEFTune hook attaches to. mlx-lm multiplies outside
-    too, so both sides already agree and dividing would make MLX ``scale_emb``
-    times weaker. Once a transformers with ``MiniCPM3ScaledWordEmbedding`` is in
-    range the gate answers directly and this flips on its own, which is why the
-    expectation is derived rather than hardcoded.
+    Then the only reference is trust_remote_code, which multiplies by scale_emb
+    outside the embedding just as mlx-lm does, so both sides already agree.
+    Derived rather than hardcoded: a transformers carrying the scaled class
+    flips this on its own.
     """
     import importlib.util
     from types import SimpleNamespace
@@ -723,9 +713,8 @@ def test_minicpm3_keeps_the_scale_transformers_actually_applies():
 
 @mlx_only
 def test_neftune_forwards_extra_call_arguments():
-    """The probe returns whichever module produced the embedding shape, and that
-    need not be a one-argument embedding. A wrapper called with pixel_values on
-    the image path must not blow up on the swapped __call__."""
+    """The probe can return a wrapper taking more than one argument; the swapped
+    __call__ must forward them."""
     import mlx.core as mx
     import mlx.nn as nn
     from types import SimpleNamespace
@@ -756,10 +745,9 @@ def test_neftune_forwards_extra_call_arguments():
 def test_refusal_covers_both_spellings_of_a_value_comparing_family(model_type):
     """The refusal must not depend on which spelling the wrapper exposes.
 
-    `_vlm_embed_scale` compares the raw model type, so the bare family name slips
-    past it. Missing the refusal injects noise into a forward that locates merged
-    positions by comparing embedding values; a spurious refusal only trains
-    un-noised, so the gate has to be conservative across both.
+    `_vlm_embed_scale` compares the raw model type, so the bare name slips past
+    it. A missed refusal injects noise into that comparison; a spurious one only
+    trains un-noised, so the gate is conservative across both.
     """
     from types import SimpleNamespace
     from unsloth_zoo.mlx.utils import _vlm_compares_embedding_values
@@ -774,9 +762,8 @@ def test_refusal_covers_both_spellings_of_a_value_comparing_family(model_type):
 def test_neftune_noise_is_zero_mean():
     """RMS and max both survive a sign change, so neither pins the distribution.
 
-    transformers draws Uniform(-m, m); Uniform(0, m) has an identical RMS and an
-    identical max magnitude while adding a constant positive shift to every
-    embedding dimension. Only the mean separates them.
+    transformers draws U(-m, m); U(0, m) matches on both while shifting every
+    dimension positively. Only the mean separates them.
     """
     import mlx.core as mx
     from types import SimpleNamespace
@@ -808,11 +795,8 @@ def test_neftune_noise_is_zero_mean():
 
 @mlx_only
 def test_embed_scale_failure_does_not_abort_training():
-    """A config that cannot be reduced to a number degrades to uncorrected noise.
-
-    Every other lookup in _install_neftune prints and continues; resolving the
-    scale must not be the one that takes train() down with it.
-    """
+    """A config that cannot be reduced to a number degrades to uncorrected noise,
+    like every other lookup in _install_neftune, rather than taking train() down."""
     import mlx.core as mx
     from types import SimpleNamespace
 

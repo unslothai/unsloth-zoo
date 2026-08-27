@@ -666,17 +666,11 @@ _MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
 })
 # Architectures transformers has always scaled inside the embedding, used when
 # the installed transformers cannot be asked because it predates them.
-#
-# minicpm3 is deliberately absent. transformers ships no built-in minicpm3
-# anywhere in the range this package supports, so the question is never askable
-# for it and this set would be its permanent answer -- but in that range the only
-# transformers path is trust_remote_code, and openbmb/MiniCPM3-4B's
-# modeling_minicpm.py applies `* config.scale_emb` in the model forward, outside
-# the module the NEFTune hook attaches to. Its noise is scaled there exactly as
-# mlx-lm scales it (minicpm3.py: `h = self.embed_tokens(inputs) * scale_emb`), so
-# correcting would make MLX scale_emb times weaker, not closer. A later
-# transformers does add a built-in MiniCPM3ScaledWordEmbedding; once such a
-# version is in range the gate reads it directly and needs no entry here.
+# minicpm3 is deliberately absent: no transformers in the supported range has a
+# built-in one, so the reference is trust_remote_code, which multiplies by
+# scale_emb outside the embedding just as mlx-lm does. Correcting would make MLX
+# scale_emb times weaker. A later transformers adds the scaled class, and the
+# gate then reads it directly.
 _SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
     "gemma3", "gemma3n", "gemma4", "gemma4_unified",
 })
@@ -692,16 +686,13 @@ def _transformers_scales_inside_embedding(model_type):
     """Whether the installed transformers applies this architecture's embedding
     multiply inside the embedding module, so its NEFTune hook fires after it.
 
-    Asked rather than assumed: transformers moved gemma and gemma2's multiply
-    into the module partway through the version range this package supports, so
-    a fixed answer would be wrong for one end of it. None when the question
-    cannot be put -- in practice, an installed transformers with no such
-    architecture, since it ships its modeling modules as Python.
+    Asked, not assumed: transformers moved gemma and gemma2's multiply into the
+    module partway through the supported range, so a fixed answer would be wrong
+    at one end. None when it cannot be asked (no such architecture installed).
 
-    Read through the loader rather than imported: a modeling module needs torch,
-    which this package deliberately does not install on macOS arm64, so
-    importing would fail on a working MLX setup. Source first, then the compiled
-    code, so the answer survives a package shipped without its source.
+    Read through the loader, never imported: a modeling module needs torch, which
+    is deliberately absent on macOS arm64. Source first, then compiled code, so
+    the answer survives a package shipped without its source.
     """
     base = _model_type_base(model_type)
     if not base:
@@ -754,12 +745,10 @@ def _neftune_embed_scale(model):
     def _usable(value):
         """The value as a positive float, or None if it is not one.
 
-        Truthiness alone is not enough here: `embed_scale` can be a 0-d or
-        length-1 mx.array (fine), a multi-element array or a string (neither of
-        which converts), and dividing by a non-positive scale would flip or blow
-        up the noise. Anything that does not reduce to a usable number is treated
-        as absent, so the next candidate is tried and the caller trains
-        un-corrected rather than crashing.
+        Truthiness is not enough: embed_scale can be a 0-d array (fine), a
+        multi-element array or a string (neither converts), and a non-positive
+        scale would flip or blow up the noise. Anything unusable counts as
+        absent, so the next candidate is tried instead of crashing.
         """
         if value is None:
             return None
@@ -792,12 +781,10 @@ def _vlm_compares_embedding_values(model):
     values, which noise redrawn per call invalidates. Read off the scale
     families so the two cannot drift apart.
 
-    Matched on the normalized model type as well as the raw one. `_vlm_embed_scale`
-    compares the raw spelling, so a tower exposing the bare family name rather than
-    the `_text` one answers False there -- and refusing is the conservative side of
-    that difference: a missed refusal injects noise into a forward that locates
-    merged positions by comparing embedding values, while a spurious one only
-    trains un-noised.
+    Matched on the normalized model type too, since `_vlm_embed_scale` compares
+    the raw spelling and would miss a tower exposing the bare family name.
+    Refusing is the conservative side: a missed refusal injects noise into that
+    comparison, a spurious one only trains un-noised.
     """
     if _vlm_embed_scale(model) is not None:
         return True
@@ -883,15 +870,12 @@ def _probe_vlm_embedding_module(model):
     Training mode is deliberately untouched: a quantized-activation layer
     requantizes its weights on every flip, and shapes do not depend on the mode.
     """
-    # Captured and rewound through the same pair the compile fallbacks use, so
-    # this keeps working across the mlx 0.32 change that made `mx.random.state` a
-    # sentinel refusing item assignment: the rewind reseeds from the key's own
-    # words rather than writing the state back. `_mlx_rng_key` returns None only
-    # when the key is unreadable or not the two-word form, and then the probe's
-    # draws stay on the caller's stream rather than raising. Do NOT "restore" by
-    # rebinding mx.random.state to a list: that shadows the sentinel mx.compile
-    # captured and stops a compiled step redrawing, which silently turns NEFTune
-    # into a fixed offset.
+    # Rewound through the same pair the compile fallbacks use: it reseeds from
+    # the key's own words, so it survives mlx 0.32 making mx.random.state a
+    # sentinel that refuses item assignment. None (unreadable key) leaves the
+    # probe's draws on the caller's stream rather than raising. Never restore by
+    # rebinding mx.random.state -- that shadows the sentinel mx.compile captured
+    # and stops a compiled step redrawing, turning NEFTune into a fixed offset.
     rng_key = _mlx_rng_key()
     try:
         return _identify_vlm_embedding_module(model)

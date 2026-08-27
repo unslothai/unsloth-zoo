@@ -4123,10 +4123,9 @@ class MLXTrainer:
         _Base = type(emb)
         _alpha = alpha
         # These families multiply the embedding after this module returns, so
-        # undivided noise would be scaled with it; transformers adds its noise
-        # after that multiply. A config that cannot be read degrades to
-        # uncorrected noise, which is what every other lookup here does -- it
-        # must not abort train().
+        # undivided noise would ride through it; transformers adds its noise
+        # after that multiply. An unreadable config degrades to uncorrected
+        # noise, as every other lookup here does, rather than aborting train().
         try:
             _embed_scale = _neftune_embed_scale(self.model) or 1.0
         except Exception as e:
@@ -4137,10 +4136,9 @@ class MLXTrainer:
         class _NEFTuneEmbed(_Base):
             _unsloth_neftune_active = True
             _neftune_noise_enabled = True
-            # *args/**kwargs, not (self, x): on the text path the target is always
-            # a 1-arg embed_tokens, but the VLM probe returns whichever module
-            # produced the embedding shape, which may be an adapter or wrapper that
-            # takes extra arguments on the image path the probe never exercises.
+            # *args/**kwargs, not (self, x): the VLM probe returns whichever
+            # module produced the embedding shape, which may take more arguments
+            # on the image path the probe never exercises.
             def __call__(self, *args, **kwargs):
                 out = _Base.__call__(self, *args, **kwargs)
                 if (
@@ -4168,9 +4166,8 @@ class MLXTrainer:
         self._neftune_emb = emb
         self._neftune_base_cls = _Base
         emb.__class__ = _NEFTuneEmbed
-        # Report the divisor: on gemma3/gemma3n/gemma4 the same alpha now perturbs
-        # sqrt(hidden_size) times less than it did before this correction, and an
-        # unchanged message would be the only signal a user got.
+        # Report the divisor: on gemma3/gemma3n/gemma4 the same alpha perturbs
+        # sqrt(hidden_size) times less than before this correction.
         if _embed_scale != 1.0:
             print(f"Unsloth: NEFTune enabled (noise_alpha={alpha}, noise divided by "
                   f"the post-embedding scale {_embed_scale:.4f} to match transformers).")
