@@ -239,6 +239,47 @@ def _assert_params_superset(
         )
 
 
+def _referenced_global_names(obj) -> set[str]:
+    """Every global name reachable from ``obj``'s code, nested code included.
+
+    ``co_names`` on the top-level code object alone is not enough: a call made
+    inside a comprehension, a nested def or a lambda lives in a child code
+    object hanging off ``co_consts``, so the name would be invisible. Walk the
+    whole tree."""
+    code = getattr(obj, "__code__", None) or getattr(obj, "__func__", None)
+    code = getattr(code, "__code__", code)
+    if code is None or not hasattr(code, "co_names"):
+        return set()
+    found: set[str] = set()
+    stack = [code]
+    while stack:
+        current = stack.pop()
+        found |= set(current.co_names)
+        stack += [c for c in current.co_consts if hasattr(c, "co_names")]
+    return found
+
+
+def _assert_on_live_path(callee_name: str, caller, caller_label: str, zoo_file: str):
+    """DRIFT-fail when ``caller`` no longer references ``callee_name``.
+
+    Existence-and-signature pinning is not sufficient on its own, and this suite
+    has the scar to prove it: zoo patched ``mxfp4.dequantize`` while every
+    transformers 5.x actually loaded through ``Mxfp4Dequantize`` ->
+    ``dequantize_convertops``. The symbol existed with the right signature all
+    the way to 5.15, so every detector stayed green while the patch reached
+    nothing and GPT-OSS loaded with dims 1 and 2 swapped. Asking "is the thing
+    we patch still CALLED by the thing that loads" is what closes that class of
+    gap, cheaply and statically."""
+    if callee_name not in _referenced_global_names(caller):
+        pytest.fail(
+            f"DRIFT DETECTED: zoo temporary_patches/{zoo_file} patches "
+            f"{callee_name}, but {caller_label} no longer references it on "
+            f"transformers {_TX_VERSION}. The patch would still apply cleanly "
+            f"and silently reach nothing, which is exactly how the un-transposed "
+            f"MXFP4 layout survived from 5.0.0 to 5.16.0."
+        )
+
+
 def _has_var_keyword(func) -> bool:
     try:
         sig = inspect.signature(func)
@@ -1330,11 +1371,71 @@ def test_mxfp4_dequantize_convertops_signature():
     )
     # Zoo's replacement is what Mxfp4Dequantize.convert calls, so the class and
     # its call site must both still be there for the patch to reach the loader.
-    if getattr(mod, "Mxfp4Dequantize", None) is None:
+    cls = getattr(mod, "Mxfp4Dequantize", None)
+    if cls is None:
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/mxfp4.py relies on "
             "transformers.integrations.mxfp4.Mxfp4Dequantize calling "
             f"dequantize_convertops, but the class is missing on {_TX_VERSION}"
+        )
+    convert = getattr(cls, "convert", None)
+    if convert is None:
+        pytest.fail(
+            "DRIFT DETECTED: transformers.integrations.mxfp4.Mxfp4Dequantize "
+            f"lost its .convert method on {_TX_VERSION}; zoo's "
+            "dequantize_convertops patch has no live caller"
+        )
+    _assert_on_live_path(
+        "dequantize_convertops", convert, "Mxfp4Dequantize.convert", "mxfp4.py",
+    )
+
+
+def test_mxfp4_legacy_dequantize_is_on_the_live_path_on_4x():
+    """On 4.x, ``mxfp4.dequantize`` must still be CALLED by quantizer_mxfp4.
+
+    Zoo patches it there, and a patch on a function nothing calls is a silent
+    no-op. That is precisely what happened on 5.x, where the symbol survived
+    until 5.16.0 with an unchanged signature while the loader had already moved
+    to the ConversionOps path.
+
+    Best effort: transformers.quantizers pulls in optional heavy backends
+    (torchao and friends), and a broken one of those says nothing about drift,
+    so an unimportable caller module skips rather than fails."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: the legacy dequantize hook is not on "
+            "the live path on 5.x; test_mxfp4_dequantize_convertops_signature "
+            "pins the ConversionOps replacement instead"
+        )
+    try:
+        mod = importlib.import_module("transformers.integrations.mxfp4")
+        quantizer = importlib.import_module(
+            "transformers.quantizers.quantizer_mxfp4"
+        )
+    except Exception as exc:
+        pytest.skip(_unimportable("transformers.quantizers.quantizer_mxfp4", exc))
+    if getattr(mod, "dequantize", None) is None:
+        pytest.skip(
+            f"transformers {_TX_VERSION} has no mxfp4.dequantize; covered by "
+            "test_mxfp4_dequantize_signature"
+        )
+    cls = getattr(quantizer, "Mxfp4HfQuantizer", None)
+    if cls is None:
+        pytest.fail(
+            "DRIFT DETECTED: transformers.quantizers.quantizer_mxfp4."
+            f"Mxfp4HfQuantizer is missing on {_TX_VERSION}"
+        )
+    callers = [
+        name for name, fn in vars(cls).items()
+        if isinstance(fn, types.FunctionType)
+        and "dequantize" in _referenced_global_names(fn)
+    ]
+    if not callers:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py patches "
+            "transformers.integrations.mxfp4.dequantize, but no method on "
+            f"Mxfp4HfQuantizer calls it on transformers {_TX_VERSION}. The "
+            "patch would apply cleanly and reach nothing."
         )
 
 
