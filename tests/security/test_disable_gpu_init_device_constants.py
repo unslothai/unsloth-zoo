@@ -46,6 +46,13 @@ def _public_upper_names(body) -> set:
 
     Descends into nested `if`s, because those still bind at module level when
     the branch is taken, but not into `def`/`class`, whose locals do not.
+
+    Annotated assignment counts. `device_type.py` declares these very constants
+    as `DEVICE_TYPE : str = get_device_type()`, so a fifth one arriving in the
+    MLX branch in that style is the likely shape, and reading only `ast.Assign`
+    would miss it, shrink the intersection back to four and let this file pass
+    while the skip path is short a name. Unpacked targets count for the same
+    reason. A bare `X: int` with no value only annotates and binds nothing.
     """
     found = set()
     stack = list(body)
@@ -53,11 +60,16 @@ def _public_upper_names(body) -> set:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+        targets = ()
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id.isupper():
-                    found.add(target.id)
-        elif isinstance(node, ast.ImportFrom):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = (node.target,)
+        for target in targets:
+            for leaf in ast.walk(target):
+                if isinstance(leaf, ast.Name) and leaf.id.isupper():
+                    found.add(leaf.id)
+        if isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 name = alias.asname or alias.name
                 if name.isupper():
@@ -194,6 +206,26 @@ def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
         f"lazy resolver in unsloth_zoo/__init__.py and _NAMES here to match, or "
         f"the skip path is short a name that every other path defines."
     )
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    (
+        "NEW_CONST = 1",                      # plain assignment
+        "NEW_CONST : bool = True",            # the device_type.py idiom
+        "NEW_CONST, OTHER = 1, 2",            # unpacked
+        "if True:\n    NEW_CONST = 1",        # nested branch
+        "from .device_type import NEW_CONST", # the normal path's shape
+    ),
+)
+def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
+    """The derivation is only as good as the binding forms it recognises.
+
+    A form it cannot see shrinks the intersection instead of growing it, so the
+    contract test passes while the skip path is missing a name -- the exact
+    failure mode this file was written to close.
+    """
+    assert "NEW_CONST" in _public_upper_names(ast.parse(snippet).body), snippet
 
 
 def test_every_contract_name_actually_resolves_under_the_skip():
