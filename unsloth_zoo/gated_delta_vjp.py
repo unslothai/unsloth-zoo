@@ -263,10 +263,15 @@ def _is_training_call(state, use_kernel):
         return False
     if not use_kernel:
         return True
-    # Imported lazily and only on the path that needs it: this runs once per
-    # layer per decode step, and `unsloth_zoo.mlx.utils` is large enough that a
-    # pure-inference process should not pay for it until a caller is ambiguous.
-    from .mlx.utils import mlx_training_patches_active
+    # Absolute, not `from .mlx.utils import ...`: transformers' custom_object_save
+    # copies this file next to a checkpoint and resolves every relative import
+    # against that directory, where `mlx.utils.py` does not exist.
+    # tests/test_relative_imports_resolve.py enforces it.
+    #
+    # Lazy, and only on the path that needs it: this runs once per layer per
+    # decode step, and unsloth_zoo.mlx.utils is large enough that a pure-inference
+    # process should not pay for it until a call site is genuinely ambiguous.
+    from unsloth_zoo.mlx.utils import mlx_training_patches_active
     return mlx_training_patches_active()
 
 
