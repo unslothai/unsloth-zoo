@@ -383,7 +383,7 @@
       "sink": "exec",
       "kind": "string concatenation via `save_pretrained` via `save_pretrained` via `save_pretrained`",
       "hash": "b9fff86a8c82eb0d",
-      "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. Nothing external is spliced in."
+      "reason": "Self-generated source: `save_pretrained` is `inspect.getsource` of the installed transformers method with two literal renames applied. The one external pair, `repo_id` and `revision` in `incremental_save_pretrained`, goes through `repr` before it is formatted in."
     },
     {
       "path": "unsloth_zoo/temporary_patches/misc.py",

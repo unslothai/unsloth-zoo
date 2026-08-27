@@ -3860,7 +3860,7 @@ _PUSHING_CODE = \
 PushToHubMixin._upload_modified_files(
     PushToHubMixin,
     working_dir = save_directory,
-    repo_id = '{repo_id}',
+    repo_id = {repo_id},
     files_timestamps = files_timestamps,
     commit_message = "Upload Unsloth finetuned model",
     token = token,
@@ -3920,8 +3920,10 @@ def incremental_save_pretrained(
             " "*spaces + \
             re.sub(r"[ ]{8,}", "",
                    _PUSHING_CODE.format(
-                       repo_id = repo_id,
-                       revision = revision,
+                       # `repr` so a repo id or revision carrying a quote is a string
+                       # literal in the generated source rather than more source.
+                       repo_id = repr(repo_id),
+                       revision = repr(revision),
                        use_temp_file = use_temp_file,
                     ).rstrip()
             ).replace("\n", "\n" + " "*spaces)
@@ -3946,7 +3948,7 @@ def incremental_save_pretrained(
             " "*(spaces) + \
             "save_directory = temp_file.name\n" + \
             " "*(spaces) + \
-            f"repo_id = '{repo_id}'\n"
+            f"repo_id = {repo_id!r}\n"
     pass
     save_pretrained = save_pretrained.replace(for_loop, new_for_loop)
 
