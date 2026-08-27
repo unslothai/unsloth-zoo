@@ -85,6 +85,11 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 # device capability
 major = None
 minor = None
+# Bound before the branches, so no DEVICE_TYPE can leave it undefined. "cpu" is one:
+# `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` publishes that value, and `fuse_lm_head = True`
+# then read this global and raised NameError. There is no arch to read without a GPU,
+# and the old-arch workarounds only ever run on a real one, so False changes nothing.
+OLD_CUDA_ARCH_VERSION = False
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
