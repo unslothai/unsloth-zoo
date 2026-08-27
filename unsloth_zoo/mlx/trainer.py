@@ -47,6 +47,7 @@ from pathlib import Path
 import random
 import socket
 import time
+import unicodedata
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -938,8 +939,30 @@ def _build_generation_defaults(args):
         ) from error
 
 
+def _escape_terminal_controls(text):
+    """Show control characters instead of executing them.
+
+    Prompts come from the dataset and completions from the model, and
+    str.split() strips only whitespace: ESC/BEL survive, so an OSC sequence
+    reaches the clipboard and a CSI one rewrites the log above. Only Cc/Cf are
+    escaped, so CJK, emoji and backslashes stay as they are.
+    """
+    return "".join(
+        (
+            character
+            if unicodedata.category(character) not in ("Cc", "Cf")
+            else (
+                f"\\x{ord(character):02x}"
+                if ord(character) <= 0xFF
+                else f"\\u{ord(character):04x}"
+            )
+        )
+        for character in str(text)
+    )
+
+
 def _one_line(text, width):
-    flat = " ".join(str(text).split())
+    flat = _escape_terminal_controls(" ".join(str(text).split()))
     return flat if len(flat) <= width else flat[: width - 1] + "\u2026"
 
 
@@ -6387,9 +6410,45 @@ class MLXTrainer:
 
                 defaults = self._generation_defaults
                 started = time.perf_counter()
-                policy = generate_batch(
-                    model, self.tokenizer, requests, defaults=defaults,
-                )
+                def _decode(label):
+                    """Decode on every rank, or on none of them.
+
+                    A rank that unwinds never reaches the
+                    _distributed_should_stop() collective below, stranding
+                    peers there. Join a consensus first and skip together, as
+                    _evaluate_batch_totals does.
+                    """
+                    result = None
+                    local_error = None
+                    try:
+                        result = generate_batch(
+                            model, self.tokenizer, requests, defaults=defaults,
+                        )
+                    except BaseException as error:
+                        local_error = error
+                    failed_any = self._distributed_any_flag(local_error is not None)
+                    if local_error is not None and not isinstance(
+                        local_error, Exception
+                    ):
+                        # Captured only to join the consensus.
+                        raise local_error
+                    if failed_any:
+                        detail = (
+                            f"{local_error}" if local_error is not None
+                            else "a peer rank failed"
+                        )
+                        _main_print(
+                            f"  Gen   {label} generation failed ({detail}); "
+                            "skipping samples for this evaluation."
+                        )
+                        return None
+                    return result
+
+                policy = _decode("policy")
+                if policy is None:
+                    self.last_generation_samples = []
+                    return
+
                 reference = None
                 modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
                 if modules and not self._distributed_should_stop():
@@ -6397,9 +6456,7 @@ class MLXTrainer:
                     try:
                         for module in modules:
                             module.scale = 0.0
-                        reference = generate_batch(
-                            model, self.tokenizer, requests, defaults=defaults,
-                        )
+                        reference = _decode("reference")
                     finally:
                         for module, scale in zip(modules, scales):
                             module.scale = scale
@@ -6423,7 +6480,12 @@ class MLXTrainer:
                 f"{sampled} tokens | {elapsed:.1f}s"
             )
             for index, sample in enumerate(samples):
-                tag = "" if sample["split"] is None else f" [{sample['split']}]"
+                # A caller-supplied dict key, no more trusted than the prompt.
+                tag = (
+                    ""
+                    if sample["split"] is None
+                    else f" [{_one_line(sample['split'], 32)}]"
+                )
                 _main_print(f"    {index + 1}{tag} {_one_line(sample['prompt'], 96)}")
                 _main_print(f"        policy    {_one_line(sample['policy'], 96)}")
                 if sample["reference"] is not None:
@@ -7788,6 +7850,12 @@ class MLXTrainer:
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
+            # An epoch strategy is a cadence too, and is resolved separately
+            # from eval_steps, so testing eval_steps alone misreports it.
+            _eval_cadence = (
+                _resolve_interval_steps(args.eval_steps, 1) > 0
+                or self._epoch_cadence_enabled("eval_strategy")
+            )
             if self.eval_dataset is None and (
                 args.load_best_model_at_end or args.early_stopping_patience > 0
             ):
@@ -7852,12 +7920,31 @@ class MLXTrainer:
                         "at least 1."
                     )
                 self._generation_defaults = _build_generation_defaults(args)
-                if _resolve_interval_steps(args.eval_steps, 1) <= 0:
+                if not _eval_cadence:
                     print(
                         "Unsloth: generate_during_eval is on but no evaluation "
                         "cadence is set; sampling runs only when a callback "
                         "requests an evaluation."
                     )
+            # Without a cadence nothing raises an evaluation, so _best_step
+            # stays None and the restore is skipped: best-model loading was
+            # asked for and silently not done. A callback may own the cadence,
+            # so notice rather than refuse.
+            if (
+                self.eval_dataset is not None
+                and not _eval_cadence
+                and (
+                    args.load_best_model_at_end
+                    or args.early_stopping_patience > 0
+                )
+            ):
+                print(
+                    "Unsloth: load_best_model_at_end/early_stopping_patience "
+                    "need evaluations to select between, but no evaluation "
+                    "cadence is set. Set eval_steps > 0 or "
+                    "eval_strategy='epoch', or have a callback request "
+                    "evaluations; otherwise no best model is tracked."
+                )
             if (
                 self._batches is not None
                 or getattr(self, "_eval_batches_labeled", None) is not None

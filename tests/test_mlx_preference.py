@@ -973,8 +973,12 @@ def _generation_common(tmp_path, **overrides):
     return common
 
 
-def _run_generation_trainer(trainer, monkeypatch, calls):
-    """Drive one training step whose evaluation samples, recording engine calls."""
+def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
+    """Drive one training step whose evaluation samples, recording engine calls.
+
+    ``generate_batch`` replaces the recording stub, for tests that need the
+    engine to fail or to return text of their own choosing.
+    """
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map
@@ -997,7 +1001,9 @@ def _run_generation_trainer(trainer, monkeypatch, calls):
             for index, _ in enumerate(requests)
         ]
 
-    monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+    monkeypatch.setattr(
+        generate_module, "generate_batch", generate_batch or fake_generate_batch,
+    )
 
     def value_and_grad_with_aux(model, fn):
         def wrapped(*args):
@@ -1498,3 +1504,121 @@ def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
             tmp_path, reference_free=True, generate_during_eval=False,
             metric_for_best_model="eval_rewards/accuracies")))
     assert trainer.args.greater_is_better is True
+
+
+def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
+    """Prompts come from the dataset and completions from the model, so both are
+    untrusted text on its way to a terminal.
+
+    str.split() collapses whitespace and leaves ESC/BEL untouched, so an OSC
+    sequence reached the terminal intact and a CSI erase could rewrite the log
+    above it. Falsified against the whitespace-only version: the raw escapes
+    appear in the captured output.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3),
+        eval_dataset={"ev\x1b[2Kil": rows(2)},
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    def hostile_generate_batch(model, tokenizer, requests, *, defaults=None):
+        return [
+            types.SimpleNamespace(
+                token_ids=[1, 2],
+                text="ok\x1b]52;c;U0VDUkVU\x07forged‮desrever",
+                logprobs=[0.0, 0.0], finish_reason="length", stop_match=None,
+            )
+            for _ in requests
+        ]
+
+    _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=hostile_generate_batch,
+    )
+
+    printed = capsys.readouterr().out
+    assert "forged" in printed, "the text itself still shows"
+    for raw in ("\x1b]52", "\x07", "‮", "\x1b[2K"):
+        assert raw not in printed, f"{raw!r} reached the terminal"
+    assert "\\x1b" in printed, "the escape is shown, not executed"
+
+
+def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
+    """A rank that unwinds is a rank that never reaches the collective.
+
+    The caller keeps a raise off the run, but _sample_generations still calls
+    _distributed_should_stop() between the two decodes. A rank that left early
+    would strand a healthy peer waiting there, so the failing rank has to join a
+    consensus first. Falsified against an unguarded decode: no consensus is
+    joined at all.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    joined = []
+    original = trainer._distributed_any_flag
+    monkeypatch.setattr(
+        trainer, "_distributed_any_flag",
+        lambda flag: (joined.append(bool(flag)), original(flag))[1],
+    )
+
+    def exploding_generate_batch(model, tokenizer, requests, *, defaults=None):
+        raise RuntimeError("engine out of memory")
+
+    result = _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=exploding_generate_batch,
+    )
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert True in joined, "the failing rank never joined the consensus"
+    assert trainer.last_generation_samples == []
+    assert trainer._last_eval_metrics, "the evaluation was discarded"
+
+
+def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
+    """Asking for best-model selection and silently getting none is the worst of
+    the available outcomes: _run_best_tracking never runs, _best_step stays None
+    and the restore is skipped. A callback owning the cadence is legitimate, so
+    this is a notice, not a refusal."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    def _notice(eval_strategy=None, **overrides):
+        trainer = MLXDPOTrainer(
+            _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+            args=MLXDPOConfig(**_generation_common(
+                tmp_path, reference_free=True, generate_during_eval=False,
+                load_best_model_at_end=True, **overrides)),
+        )
+        # eval_strategy is not a config field; _ensure_callback_args_compat
+        # attaches it, so an epoch run carries it on the args object.
+        if eval_strategy is not None:
+            trainer.args.eval_strategy = eval_strategy
+        trainer._prepare_data(False)
+        return "no evaluation cadence is set" in capsys.readouterr().out
+
+    assert _notice(eval_steps=0) is True
+    assert _notice(eval_steps=1) is False
+    assert _notice(eval_steps=0, eval_strategy="epoch") is False
+
+
+def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
+    tmp_path, capsys,
+):
+    """eval_strategy="epoch" evaluates every epoch without setting eval_steps,
+    so testing eval_steps alone called a real cadence "no cadence". Falsified
+    against the eval_steps-only test: the notice prints for the epoch run."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, eval_steps=0)),
+    )
+    trainer.args.eval_strategy = "epoch"
+    trainer._prepare_data(False)
+    assert "no evaluation cadence" not in capsys.readouterr().out
