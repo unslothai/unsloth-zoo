@@ -456,6 +456,44 @@ def test_pause_stops_evaluation_reading_as_training_at_any_depth():
         assert not mlx_training_patches_active()
 
 
+def test_one_trainers_evaluation_leaves_another_threads_flag_alone():
+    """The flag is what routes a backward pass, so clearing it globally is a crash,
+    not a slowdown: a call site like GLM-5.x's passes no `use_kernel`, and reading
+    as inference sends its backward to the fused kernel, which has no VJP."""
+    import threading
+
+    b_holds, a_paused = threading.Event(), threading.Event()
+    seen = {}
+
+    def second_trainer():
+        acquire_mlx_training_patches()
+        try:
+            b_holds.set()
+            a_paused.wait(10)
+            seen["active"] = mlx_training_patches_active()
+        finally:
+            release_mlx_training_patches()
+
+    acquire_mlx_training_patches()
+    thread = threading.Thread(target=second_trainer)
+    thread.start()
+    try:
+        assert b_holds.wait(10)
+        paused = pause_mlx_training_patches()
+        assert paused is False, "the other trainer still needs mlx.core patched"
+        assert not mlx_training_patches_active(), "our own evaluation reads as training"
+    finally:
+        a_paused.set()
+        thread.join(30)
+        resume_mlx_training_patches(False)
+        release_mlx_training_patches()
+
+    assert seen["active"] is True, (
+        "one trainer's evaluation cleared the training flag out from under another "
+        "thread that was still differentiating")
+    assert not mlx_training_patches_active()
+
+
 def test_detaching_preserves_container_types():
     """`mx.checkpoint` hands the layer its own arguments back, so rebuilding a
     NamedTuple as a plain tuple turns `payload.ids` into an AttributeError."""
