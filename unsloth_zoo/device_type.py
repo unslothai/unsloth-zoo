@@ -347,21 +347,29 @@ def get_amd_flash_attn_func():
     return None
 
 
-def _cpu_fallback_requested():
-    """True when this process has declared it has no accelerator and wants none.
+def _cpu_fallback():
+    """The device name to fall back to on a host with no accelerator, or None.
 
-    `UNSLOTH_ALLOW_CPU=1` is the long standing test-only escape hatch.
+    Two flags reach here and they do NOT mean the same thing, so they do not give the
+    same answer.
+
+    `UNSLOTH_ALLOW_CPU=1` is the long standing test-only escape hatch, and it answers
+    `"cuda"` deliberately: callers keep taking their CUDA branches against a CPU torch.
+    That is unchanged.
+
     `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` is the newer flag a download-only child (and the
-    CPU security job) sets to skip the heavy GPU init entirely; `__init__.py` already
-    binds the package level device constants for it. Importing a module that reads
-    `device_type` directly - `temporary_patches.gpt_oss` does - then still ran this
-    detection and raised, so the flag only half kept its promise. Both flags mean the
-    same thing here, so both are honoured.
+    CPU security job) sets to skip the heavy GPU init entirely. Importing a module that
+    reads `device_type` directly - `temporary_patches.gpt_oss` does - still ran this
+    detection and raised, so the flag only half kept its promise. It answers `"cpu"`,
+    which is what `__init__.py` already publishes as the package level `DEVICE_TYPE` on
+    that path. Answering `"cuda"` here instead left one process holding both values at
+    once, so two modules picked different device branches.
     """
-    return (
-        os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1" or
-        os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
-    )
+    if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+        return "cuda"
+    if os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1":
+        return "cpu"
+    return None
 
 
 @functools.cache
@@ -378,8 +386,9 @@ def get_device_type():
         if not torch.accelerator.is_available():
             # Test-only CPU fallback. The env vars are read exactly once per
             # process because get_device_type is @functools.cache'd.
-            if _cpu_fallback_requested():
-                return "cuda"
+            fallback = _cpu_fallback()
+            if fallback is not None:
+                return fallback
             amd_hint = _amd_installation_hint()
             if amd_hint is not None:
                 raise NotImplementedError(amd_hint)
@@ -391,8 +400,9 @@ def get_device_type():
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
-    if _cpu_fallback_requested():
-        return "cuda"
+    fallback = _cpu_fallback()
+    if fallback is not None:
+        return fallback
     amd_hint = _amd_installation_hint()
     if amd_hint is not None:
         raise NotImplementedError(amd_hint)
