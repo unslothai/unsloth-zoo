@@ -409,27 +409,19 @@ _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
 _MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
 _MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
 _MLX_INDEX_GRADIENT_LOCK = threading.RLock()
-# Two counters, because the two questions have different answers, and they have
-# different SCOPES for the same reason.
-#
-# The patch depth is physical -- how many runs still need `mlx.core` wrapped --
-# and `mlx.core` is process-wide, so this one is global under the lock and an
-# inner run must never unpatch an outer one.
-#
-# The active depth is logical: is THIS execution context inside a training step.
-# Evaluation can always drop it (it takes no gradients) even when it cannot drop
-# the physical patches. It is context-local because a global one is wrong in both
-# directions: global-and-never-cleared makes a nested evaluation read as training,
-# while global-and-always-cleared lets one trainer's evaluation clear the flag out
-# from under a second trainer that is still differentiating -- and that one is a
-# crash, since a call site like GLM-5.x's, which passes no `use_kernel`, would then
-# route its backward to the fused kernel that has no VJP. ContextVar isolates per
-# thread AND per asyncio Task, where `threading.local` would only cover the first.
+# Two depths, with different scopes. Physical: how many runs still need `mlx.core`
+# wrapped. Global under the lock, since unpatching is process-wide.
 _MLX_TRAINING_PATCH_DEPTH = 0
+# Logical: is THIS context inside a training step. Context-local because a global
+# one is wrong both ways -- never cleared, a nested evaluation reads as training;
+# always cleared, one trainer's evaluation clears the flag under another that is
+# still differentiating, and a call site passing no `use_kernel` (GLM-5.x) then
+# routes its backward to the fused kernel, which has no VJP. ContextVar covers
+# threads and asyncio Tasks; `threading.local` would cover only the first.
 _MLX_TRAINING_ACTIVE_DEPTH = contextvars.ContextVar(
     "unsloth_mlx_training_active_depth", default=0)
-# Immutable tuple, never a list: a mutable ContextVar default is shared by every
-# context that never set one, which would put the stack straight back in global scope.
+# Tuple, not list: a mutable ContextVar default is shared by every context that
+# never set one, putting the stack straight back in global scope.
 _MLX_TRAINING_PAUSE_STACK = contextvars.ContextVar(
     "unsloth_mlx_training_pause_stack", default=())
 # MLX differentiates integer arrays, so only real index positions are detached.
@@ -499,13 +491,11 @@ def pause_mlx_training_patches() -> bool:
     """Evaluation runs under `model.eval()` but inside the trainer's window, which
     would otherwise route it down the training paths.
 
-    The logical "inside a training step" flag is ALWAYS cleared, but only for THIS
-    context, so an uncached evaluation never reads as training and a second trainer
-    differentiating on another thread keeps its own flag. Removing the process-wide
-    `mlx.core` patches is refused while another run holds the window, and the return
-    value reports only that: True when they came off, False when another run still
-    needs them. Leaving them on costs nothing here, because they only stop gradients
-    flowing into gather indices and evaluation takes no gradients.
+    Always clears the logical flag, but only for THIS context, so a second trainer
+    on another thread keeps its own. The return value reports only whether the
+    process-wide patches came off: they stay while another run needs them, which
+    costs nothing, since they stop gradients into gather indices and evaluation
+    takes none.
     """
     global _MLX_TRAINING_PATCH_DEPTH
     _MLX_TRAINING_PAUSE_STACK.set(

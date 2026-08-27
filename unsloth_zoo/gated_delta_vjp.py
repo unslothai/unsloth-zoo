@@ -263,14 +263,10 @@ def _is_training_call(state, use_kernel):
         return False
     if not use_kernel:
         return True
-    # Absolute, not `from .mlx.utils import ...`: transformers' custom_object_save
-    # copies this file next to a checkpoint and resolves every relative import
-    # against that directory, where `mlx.utils.py` does not exist.
-    # tests/test_relative_imports_resolve.py enforces it.
-    #
-    # Lazy, and only on the path that needs it: this runs once per layer per
-    # decode step, and unsloth_zoo.mlx.utils is large enough that a pure-inference
-    # process should not pay for it until a call site is genuinely ambiguous.
+    # Absolute (test_relative_imports_resolve.py enforces it): custom_object_save
+    # copies this file beside a checkpoint, where `mlx.utils.py` does not exist.
+    # Lazy: this runs once per layer per decode step, so a pure-inference process
+    # should not import `unsloth_zoo.mlx.utils` until a call site is ambiguous.
     from unsloth_zoo.mlx.utils import mlx_training_patches_active
     return mlx_training_patches_active()
 
@@ -288,9 +284,8 @@ def patch_gated_delta():
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
-        # Reachable now that layers are matched structurally: a gated-delta mixer
-        # defined by mlx-vlm routes here even on an mlx_lm that has no copy of the
-        # module. mlx-vlm's own copies are patched by the two functions below.
+        # Reachable since layers are matched structurally: an mlx-vlm-defined
+        # gated-delta mixer routes here even where mlx_lm has no such module.
         return
 
     if not getattr(gated_delta, "_unsloth_gated_delta_patched", False):
@@ -407,8 +402,8 @@ def patch_gated_delta_vlm():
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
-        # mlx-vlm ships its own copy from 0.6 on, but `compute_g` below is still
-        # taken from mlx_lm; without it there is nothing to patch with.
+        # `compute_g` below still comes from mlx_lm even on 0.6+, which ships its
+        # own copy of the update; without it there is nothing to patch with.
         return
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):
