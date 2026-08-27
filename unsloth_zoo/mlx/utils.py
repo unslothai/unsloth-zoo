@@ -1372,10 +1372,9 @@ _HEAD_TRANSFORM_KNOBS = {
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
-# The table records where a knob is read and what values are usable, not where it
-# sits in the forward. Fused CCE pre-scales the hidden states and caps after its
-# own matmul, so a row here asserts the model scales before it caps. Every
-# softcapping architecture in mlx-lm and mlx-vlm does.
+# Where a knob is read and what values are usable, not where it sits in the forward.
+# Fused CCE pre-scales and caps after, so a row here asserts the model scales before
+# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -1757,8 +1756,8 @@ def _model_logits(output):
     if logits is not None:
         return logits
     if hasattr(output, "logits"):
-        # Say which side is empty here: unwrapping to None instead leaves an
-        # `'NoneType' object has no attribute 'ndim'` inside cross-entropy.
+        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
+        # inside cross-entropy.
         raise ValueError(
             "Unsloth: the model returned an output wrapper whose `logits` is "
             "None, so there is nothing to compute a loss from."
@@ -2700,15 +2699,13 @@ def _normalize_grid_thw(grid_thw):
 def _mlx_vlm_canonical_model_type(model_type):
     """The name mlx-vlm resolves this config's `model_type` to.
 
-    mlx-vlm lower-cases the config value and sends it through MODEL_REMAPPING to
-    pick the module, and never writes the resolved name back to the config, so a
-    family set keyed on the canonical spelling has to resolve the same way or an
-    aliased checkpoint silently misses it. Hyphens are folded too: MODEL_REMAPPING
-    carries the aliases it knows (`phi4-siglip`, `granite-vision`, `lfm2-vl`) and
-    not the ones it has not met.
+    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
+    module, never writing the result back, so a family set keyed on the canonical
+    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
+    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
 
-    Any failure leaves the name alone. An mlx-vlm too old to have MODEL_REMAPPING
-    is exactly the case where the raw spelling is the only spelling.
+    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
+    exactly the case where the raw spelling is the only spelling.
     """
     if not model_type:
         return ""
@@ -2721,15 +2718,13 @@ def _mlx_vlm_canonical_model_type(model_type):
     return name.replace("-", "_")
 
 
-# Families reaching mlx-vlm code that indexes the vision grid as an array
-# (`.tolist()`, `.prod()`, `[:, 1:]`). Everything else keeps the Python tuple
-# form, which is what the Qwen/Paddle compile patches trace: an array turns
-# into a tracer under mx.compile and its `.tolist()` raises.
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
+# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
+# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
-    # Muse Glimmer's vision tower is not compile-patched and opens with
-    # `grid_thw.tolist()`.
+    # Not compile-patched, and opens with `grid_thw.tolist()`.
     "muse_glimmer",
 })
 
@@ -3417,8 +3412,8 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's
-    # tower, so the grid form has to follow it there.
+    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
+    # so the grid form has to follow it there.
     grid_as_array = (
         _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
     )
@@ -3712,9 +3707,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
-    # Every decision above prints when it declines; print when it accepts too. A
-    # silently ignored head transform is the failure this resolution prevents, and
-    # a VLM reaches no other factory.
+    # Every decision above prints when it declines; print when it accepts too, since
+    # a silently ignored head transform is the failure this prevents.
     if softcap > 0:
         print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -14276,10 +14270,9 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
-    # A multimodal encoder MLX keeps at the top level sits under "model." in the HF
-    # layout these converters read. The projector counts: llama.cpp drops a tensor whose
-    # name it does not recognize, so a missed prefix here costs the mmproj its projector
-    # and the file only fails later, when something tries to load it.
+    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
+    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
+    # missed prefix costs the mmproj its projector and only fails at load time.
     if name.startswith(
         (
             "audio_tower.",
@@ -15344,11 +15337,9 @@ _GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 def _gguf_shard_family(first_file, produced_files):
     """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
 
-    A conversion can also emit a vision projector, which is a separate `--outfile`
-    and so carries a different stem. Grouping by stem keeps it out without asking
-    what any filename looks like: a model may legitimately be named
-    `example-mmproj-model`, or `example-mmproj.gguf`, which the converter uses
-    verbatim.
+    A vision projector is a separate `--outfile` and so carries a different stem.
+    Grouping by stem keeps it out without pattern-matching filenames, which would
+    misfire on a model legitimately named `example-mmproj-model`.
     """
     def shard_stem(path):
         name = os.path.basename(path)
@@ -15639,10 +15630,9 @@ def save_pretrained_gguf(
                 raise RuntimeError(
                     "Unsloth: the GGUF converter reported no output file to quantize."
                 )
-            # Take what the converter reported first, never the requested --outfile
-            # name: past --split-max-size it writes shards under that name instead,
-            # and llama.cpp finds the rest from shard 1's split.count. The model is
-            # always converted before any vision projector, so it comes first.
+            # What the converter reported, never the requested --outfile name: past
+            # --split-max-size it writes shards instead, and llama.cpp finds the rest
+            # from shard 1's split.count. The model always converts before any projector.
             base_gguf = produced_files[0]
             base_files = _gguf_shard_family(base_gguf, produced_files)
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"

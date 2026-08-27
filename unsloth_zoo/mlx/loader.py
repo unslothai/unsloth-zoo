@@ -2624,8 +2624,7 @@ def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
     """
     if not model_type:
         return False
-    # Shared with the vision-grid family set in utils, so routing a checkpoint and
-    # preparing its batches cannot disagree about how it is spelled.
+    # Shared with utils' vision-grid family set so the two cannot disagree on spelling.
     from .utils import _mlx_vlm_canonical_model_type
     return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
 
@@ -6044,9 +6043,8 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
-    # A text-only multimodal load stays on the vision path but publishes its inner
-    # tokenizer, which cannot drive mlx-vlm preprocessing. Selected by presence,
-    # not truthiness, so a falsy processor is not replaced by that tokenizer.
+    # A text-only multimodal load publishes an inner tokenizer that cannot drive
+    # mlx-vlm preprocessing. By presence, so a falsy processor is not replaced by it.
     processor = getattr(self, "_processor", None)
     if processor is None:
         processor = getattr(self, "_tokenizer", None)
