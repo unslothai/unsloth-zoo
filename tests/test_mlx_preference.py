@@ -1580,6 +1580,58 @@ def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
     assert trainer._last_eval_metrics, "the evaluation was discarded"
 
 
+def test_a_failed_reference_decode_publishes_no_samples(
+    tmp_path, monkeypatch, capsys,
+):
+    """A referenced run that loses its reference half skips the whole set.
+
+    reference=None is what ORPO and reference-free DPO publish, so keeping the
+    policy half would make a failed reference pass read as a legitimate
+    policy-only sample set -- and _decode has already printed that it is
+    skipping this evaluation's samples. Falsified against the unguarded
+    publish: two rows arrive, each with reference None.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    model = _tiny_model(lora=True)
+    trainer = MLXDPOTrainer(
+        model, Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path)),
+    )
+
+    seen = []
+
+    def failing_reference(model, tokenizer, requests, *, defaults=None):
+        seen.append(1)
+        if len(seen) > 1:
+            raise RuntimeError("engine out of memory")
+        return [
+            types.SimpleNamespace(
+                token_ids=[1, 2], text=f"policy{index}", logprobs=[0.0, 0.0],
+                finish_reason="length", stop_match=None,
+            )
+            for index, _ in enumerate(requests)
+        ]
+
+    result = _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=failing_reference,
+    )
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert len(seen) == 2, "the policy decode ran, then the reference one failed"
+    assert trainer.last_generation_samples == [], (
+        "a policy-only set was published for a failed reference pass"
+    )
+    printed = capsys.readouterr().out
+    assert "reference generation failed" in printed
+    assert "policy0" not in printed, "samples printed after saying they are skipped"
+    assert all(
+        module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
+    ), "scales restored after the failure"
+    assert trainer._last_eval_metrics, "the evaluation itself still stands"
+
+
 def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
     """Asking for best-model selection and silently getting none is the worst of
     the available outcomes: _run_best_tracking never runs, _best_step stays None
@@ -1653,3 +1705,22 @@ def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
     # The plan is built at the first evaluation, not at _prepare_data.
     with pytest.raises(ValueError, match="more rows than the 2 it declares"):
         _run_generation_trainer(trainer, monkeypatch, [])
+
+
+def test_a_step_cadence_under_eval_strategy_no_is_no_cadence(tmp_path, capsys):
+    """The loop gates its step cadence on _static_eval_cadence_enabled(), so
+    eval_steps > 0 under eval_strategy="no" evaluates never. Reading eval_steps
+    alone called that a cadence and suppressed the notice for the one case it
+    exists to report. Falsified against the eval_steps-only test: nothing prints.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, generate_during_eval=False,
+            load_best_model_at_end=True, eval_steps=1)),
+    )
+    trainer.args.eval_strategy = "no"
+    trainer._prepare_data(False)
+    assert "no evaluation cadence is set" in capsys.readouterr().out

@@ -945,7 +945,9 @@ def _escape_terminal_controls(text):
     Prompts come from the dataset and completions from the model, and
     str.split() strips only whitespace: ESC/BEL survive, so an OSC sequence
     reaches the clipboard and a CSI one rewrites the log above. Only Cc/Cf are
-    escaped, so CJK, emoji and backslashes stay as they are.
+    escaped, so CJK and backslashes stay as they are. Emoji do too unless they
+    join with U+200D, which is Cf: escaping the whole class also catches the
+    Unicode tag block, the carrier for invisible-text smuggling.
     """
     return "".join(
         (
@@ -6479,6 +6481,12 @@ class MLXTrainer:
                     finally:
                         for module, scale in zip(modules, scales):
                             module.scale = scale
+                    if reference is None:
+                        # _decode already said it is skipping this evaluation.
+                        # Publishing the policy half is what an unreferenced
+                        # objective publishes, so the failure would be invisible.
+                        self.last_generation_samples = []
+                        return
             elapsed = time.perf_counter() - started
 
             samples = [
@@ -7869,10 +7877,15 @@ class MLXTrainer:
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
-            # An epoch strategy is a cadence too, and is resolved separately
-            # from eval_steps, so testing eval_steps alone misreports it.
+            # Read eval_strategy the way the loop's trigger does: it gates the
+            # step cadence on _static_eval_cadence_enabled(), so eval_steps > 0
+            # under "no" evaluates never, and "epoch" is a cadence without
+            # eval_steps at all.
             _eval_cadence = (
-                _resolve_interval_steps(args.eval_steps, 1) > 0
+                (
+                    _resolve_interval_steps(args.eval_steps, 1) > 0
+                    and self._static_eval_cadence_enabled()
+                )
                 or self._epoch_cadence_enabled("eval_strategy")
             )
             if self.eval_dataset is None and (
