@@ -40,6 +40,7 @@ import textwrap
 import numpy as np
 import os
 import random
+import re
 import sys
 import shutil
 import struct
@@ -47,6 +48,7 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import unicodedata
 import warnings
 import weakref
 import zlib
@@ -1332,6 +1334,11 @@ def _get_logit_scale(model):
         scale = getattr(tm.args, "logit_scale", None)
     if scale is None and hasattr(tm, "config"):
         scale = getattr(tm.config, "logit_scale", None)
+    return _validated_head_multiplier(scale)
+
+
+def _validated_head_multiplier(scale):
+    """Returns ``(scale, invalid)``, scale None when absent or a no-op 1.0."""
     if scale is None:
         return None, False
     if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
@@ -1359,11 +1366,15 @@ _KNOB_MISSING = object()
 # config drift must fail closed); others read args (config for VLM wrappers).
 _HEAD_TRANSFORM_KNOBS = {
     "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "output_multiplier": ("attr", "args", "config"),  # Muse Glimmer: pre-softcap multiply
     "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
     "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
+# Where a knob is read and what values are usable, not where it sits in the forward.
+# Fused CCE pre-scales and caps after, so a row here asserts the model scales before
+# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -1476,14 +1487,20 @@ def _detect_head_transform(model, head_status):
         # value-guarded divide: presence alone makes the tail non-scalar.
         return None, ("mup_width_multiplier models mask logits after the "
                       "output head, which fused CCE cannot reproduce")
-    if knob == "logit_scale":
+    if knob in ("logit_scale", "output_multiplier"):
         # A present-None value is malformed live state (the forward would
         # multiply logits by None); fail closed rather than run unscaled.
         if raw is None:
-            return None, "logit_scale is present but None"
-        scale, invalid = _get_logit_scale(model)
+            return None, f"{knob} is present but None"
+        # logit_scale re-reads its own consumer sites; output_multiplier is
+        # read straight off the resolved knob, whose sites already agreed.
+        scale, invalid = (
+            _get_logit_scale(model)
+            if knob == "logit_scale"
+            else _validated_head_multiplier(raw)
+        )
         if invalid:
-            return None, ("logit_scale cannot be applied by fused CCE "
+            return None, (f"{knob} cannot be applied by fused CCE "
                           "(non-finite, non-scalar, or outside the "
                           "supported range)")
         return scale, None
@@ -1733,6 +1750,21 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     return loss_fn
 
 
+def _model_logits(output):
+    """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
+    logits = getattr(output, "logits", None)
+    if logits is not None:
+        return logits
+    if hasattr(output, "logits"):
+        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
+        # inside cross-entropy.
+        raise ValueError(
+            "Unsloth: the model returned an output wrapper whose `logits` is "
+            "None, so there is nothing to compute a loss from."
+        )
+    return output
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -1762,7 +1794,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
-            logits = model(inputs)
+            logits = _model_logits(model(inputs))
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = _token_ce(logits, targets) * mask
@@ -1776,7 +1808,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         # Widen unsigned dtypes so mx.where(..., -100, ...) and the
         # `targets != -100` compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
-        logits = model(inputs)
+        logits = _model_logits(model(inputs))
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
@@ -2353,7 +2385,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = output.logits if hasattr(output, "logits") else output
+        logits = _model_logits(output)
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]
@@ -2662,6 +2694,39 @@ def _normalize_grid_thw(grid_thw):
             item = item.tolist()
         normalized.append(tuple(int(x) for x in item))
     return tuple(normalized)
+
+
+def _mlx_vlm_canonical_model_type(model_type):
+    """The name mlx-vlm resolves this config's `model_type` to.
+
+    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
+    module, never writing the result back, so a family set keyed on the canonical
+    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
+    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
+
+    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
+    exactly the case where the raw spelling is the only spelling.
+    """
+    if not model_type:
+        return ""
+    name = str(model_type).lower()
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        name = MODEL_REMAPPING.get(name, name)
+    except Exception:
+        pass
+    return name.replace("-", "_")
+
+
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
+# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
+# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
+_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
+    "glm4v",
+    "glm_ocr",
+    # Not compile-patched, and opens with `grid_thw.tolist()`.
+    "muse_glimmer",
+})
 
 
 def _grid_thw_to_mx_array(grid_thw):
@@ -3347,10 +3412,12 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    grid_as_array = model_type in {"glm4v", "glm_ocr"}
+    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
+    # so the grid form has to follow it there.
+    grid_as_array = (
+        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
+    )
     if image_grid_thw is not None:
-        # GLM native mlx-vlm paths call .tolist(), .prod(), and slicing on
-        # grids; Qwen/Paddle compile patches expect Python tuples.
         batch_dict["image_grid_thw"] = (
             _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
         )
@@ -3640,6 +3707,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
+    # Every decision above prints when it declines; print when it accepts too, since
+    # a silently ignored head transform is the failure this prevents.
+    if softcap > 0:
+        print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
@@ -14197,8 +14270,18 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
+    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
+    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
+    # missed prefix costs the mmproj its projector and only fails at load time.
     if name.startswith(
-        ("audio_tower.", "vision_tower.", "embed_audio.", "embed_vision.")
+        (
+            "audio_tower.",
+            "vision_tower.",
+            "vision_adapter.",
+            "vision_projection.",
+            "embed_audio.",
+            "embed_vision.",
+        )
     ):
         add(f"model.{name}")
 
@@ -14215,11 +14298,20 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
+    # Pre-fold text-tower names. Key-gated sanitizers (Qwen3.5) shift only under
+    # these, so they are what lets the replay recover the shift from an
+    # already-converted MLX checkpoint, where the measurement comes back bare.
+    if name.startswith("language_model.model."):
+        suffix = name[len("language_model.model."):]
+        add(f"model.language_model.{suffix}")
+    if name.startswith("language_model.lm_head"):
+        add(name[len("language_model."):])
+
     add(name)
     return candidates
 
 
-def _vlm_gguf_tensor_candidates(name, tensor):
+def _vlm_gguf_tensor_candidates(name, tensor, norm_offset=1.0):
     """Yield HF-layout tensor candidates for an MLX VLM tensor."""
     candidates = []
     shape = getattr(tensor, "shape", ())
@@ -14231,8 +14323,8 @@ def _vlm_gguf_tensor_candidates(name, tensor):
     elif len(shape) == 3 and "depthwise_conv1d.weight" in name:
         candidates.append(mx.transpose(tensor, (0, 2, 1)))
 
-    if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
-        candidates.append(tensor - 1)
+    if norm_offset and len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
+        candidates.append(tensor - norm_offset)
 
     candidates.append(tensor)
     return candidates
@@ -14289,13 +14381,15 @@ def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
     return sanitize_steps
 
 
-def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
+def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps, norm_offset=1.0):
     """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
     if not _has_vlm_gguf_rewrite_candidate(name, tensor):
         return name, tensor, False
 
     for candidate_name in _vlm_gguf_name_candidates(name):
-        for candidate_tensor in _vlm_gguf_tensor_candidates(name, tensor):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(
+            name, tensor, norm_offset
+        ):
             for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
                 sanitized = _apply_mlx_vlm_sanitizers(
                     pipeline,
@@ -14317,6 +14411,118 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
                 return candidate_name, candidate_tensor, True
 
     return name, tensor, False
+
+
+_MLX_NORM_OFFSET_TOLERANCE = 1e-6
+_MLX_NORM_OFFSET_PROBE = 1.0
+
+
+def _mlx_norm_offset_probe(weights, fill):
+    """Replace every 1-D float weight with ``fill``, passing the rest through.
+
+    Keys, shapes and dtypes survive, and every real sanitizer gate reads only
+    those, so the replay reproduces the gate while carrying a value we chose.
+    """
+    return {
+        key: (
+            mx.zeros(value.shape, dtype=value.dtype) + fill
+            if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating)
+            else value
+        )
+        for key, value in weights.items()
+    }
+
+
+def _mlx_constant_1d_value(value):
+    """Return the single value a 1-D float array holds, or None if it varies."""
+    if getattr(value, "ndim", None) != 1:
+        return None
+    if not mx.issubdtype(value.dtype, mx.floating):
+        return None
+    # mx.min refuses a zero-size reduce, and the raise would discard every
+    # offset measured alongside this one.
+    if value.shape[0] == 0:
+        return None
+    low = mx.min(value).item()
+    high = mx.max(value).item()
+    # A sanitizer dividing by a weight the probe zeroed returns inf or NaN, and
+    # NaN fails every comparison, so the spread check below would read it as
+    # constant and the export would subtract it into a real weight.
+    if not math.isfinite(low) or not math.isfinite(high):
+        return None
+    if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
+        return None
+    return low
+
+
+def _mlx_sanitize_probe(model, weights):
+    """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
+
+    Sanitizers are not pure: phi4mm caches its split LoRA weights on the
+    instance and gemma3_text pops the ``lm_head`` submodule for a tied
+    checkpoint, so measuring on the model itself would rebuild it out of the
+    probe halfway through an export. A model that cannot be copied is left
+    unmeasured; the caller treats that as unmeasurable, which is what the export
+    did before this existed.
+    """
+    return copy.copy(model).sanitize(weights)
+
+
+def _mlx_sanitizer_norm_offsets(model):
+    """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
+
+    The MTP families shift RMSNorm weights by +1 on load, gated on the source
+    checkpoint's contents rather than the model class, so replay the real
+    sanitizer over two probes -- 1-D floats all zero, then all one -- and keep a
+    key only where the output rose by the difference. Rising is what makes the
+    constant an ADDED one, so a sanitizer that invents a 1-D tensor the source
+    never held (Inkling's expert scales) or transforms one non-additively is
+    rejected. None means unmeasurable, not unshifted.
+    """
+    src_path = _get_src_path(model)
+    sanitize = getattr(model, "sanitize", None)
+    if src_path is None or not callable(sanitize):
+        return None
+
+    try:
+        weights = {}
+        for weight_file in sorted(Path(src_path).glob("*.safetensors")):
+            weights.update(mx.load(str(weight_file)))
+        if not weights:
+            return None
+
+        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
+        candidates = {}
+        for key, value in zeroed.items():
+            offset = _mlx_constant_1d_value(value)
+            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            candidates[key] = (value, offset)
+        if not candidates:
+            # Nothing to confirm. Shifting nothing is the common case, so skip
+            # the second replay rather than pay for it on every model.
+            return {}
+
+        raised = _mlx_sanitize_probe(
+            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        )
+
+        offsets = {}
+        for key, (value, offset) in candidates.items():
+            raised_value = raised.get(key)
+            if getattr(raised_value, "shape", None) != value.shape:
+                continue
+            delta = _mlx_constant_1d_value(raised_value - value)
+            if delta is None:
+                continue
+            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            offsets[key] = offset
+    except Exception as exc:
+        print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
+        return None
+
+    return offsets
 
 
 def _sync_gguf_nextn_layer_config(config, model):
@@ -14372,8 +14578,12 @@ def _sync_gguf_nextn_layer_config(config, model):
     return changed
 
 
-def _prepare_vlm_gguf_export_directory(path, model=None):
-    """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
+def _prepare_mlx_gguf_export_directory(path, model=None, replay_sanitizers=True):
+    """Restore HF tensor names, layouts and norm convention in the export dir.
+
+    ``replay_sanitizers`` gates the mlx-vlm name/layout inversion, VLM-only; the
+    norm correction runs for every model.
+    """
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -14381,8 +14591,13 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
     with open(config_path, "r") as f:
         config = json.load(f)
     config_changed = _sync_gguf_nextn_layer_config(config, model)
-    sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
-    if not sanitize_steps:
+    sanitize_steps = (
+        _build_mlx_vlm_sanitize_pipelines(config, model=model)
+        if replay_sanitizers
+        else []
+    )
+    norm_offsets = _mlx_sanitizer_norm_offsets(model)
+    if not sanitize_steps and not norm_offsets:
         if config_changed:
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=4)
@@ -14395,12 +14610,25 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
         updated = {}
         file_rewritten = 0
         for name, tensor in tensors.items():
+            original_tensor = tensor
+            # An empty measurement is ambiguous: an already-converted MLX
+            # source shifts nothing at load yet still holds shifted norms.
+            offset = 1.0 if not norm_offsets else norm_offsets.get(name, 0.0)
             new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
-                name, tensor, sanitize_steps
+                name, tensor, sanitize_steps, offset
             )
+            # The replay cannot observe a gate that spans the whole checkpoint,
+            # so a value it left alone is one the measurement has to recover.
+            if (
+                norm_offsets
+                and offset
+                and _mlx_arrays_match(tensor, original_tensor)
+            ):
+                tensor = tensor - offset
+                changed = True
             if new_name in updated:
                 raise RuntimeError(
-                    f"Unsloth: duplicate tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
             updated[new_name] = tensor
             name_map[name] = new_name
@@ -14423,7 +14651,7 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
             new_name = name_map.get(name, name)
             if new_name in weight_map:
                 raise RuntimeError(
-                    f"Unsloth: duplicate index tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate index tensor name after GGUF rewrite: {new_name}"
                 )
             weight_map[new_name] = shard
         index_data["weight_map"] = dict(sorted(weight_map.items()))
@@ -15037,12 +15265,99 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+# Markers naming a repackaging, not a different model. The imatrix is published against the base,
+# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
+# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
+_REPACKAGED_MODEL_SUFFIX = re.compile(
+    r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
+    re.IGNORECASE,
+)
+
+
+def _exported_gguf_files(save_directory, imatrix_source=None):
+    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
+
+    imatrix_file may point inside save_directory. It is copied out before use, but the original
+    stays put, and both the summary and the Hub upload glob save_directory, so without this it
+    would be published as though it were an exported model.
+    """
+    files = sorted(Path(save_directory).glob("*.gguf"))
+    if imatrix_source is None:
+        return files
+    return [f for f in files if not _is_same_file(f, imatrix_source)]
+
+
+def _is_same_file(a, b):
+    """True when two paths name one file, asked of the filesystem rather than of the strings.
+
+    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
+    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        a, b = os.path.abspath(str(a)), os.path.abspath(str(b))
+        norm = lambda p: unicodedata.normalize("NFC", os.path.normcase(p))
+        return norm(a) == norm(b)
+
+
+def _gguf_imatrix_repo_candidates(model):
+    """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
+    repos = []
+    sources = (
+        getattr(model, "_hf_repo", None),
+        # Text models keep their config as a dict in _config; VLMs expose an object as .config.
+        _config_get(getattr(model, "_config", None), "_name_or_path"),
+        _config_get(getattr(model, "config", None), "_name_or_path"),
+    )
+    for raw in sources:
+        name = str(raw or "").strip()
+        if not name or os.path.isdir(name):
+            continue
+        if name.endswith("-GGUF"):
+            stems = [name]
+        else:
+            stem = name.split("/")[-1]
+            stems = [stem]
+            while True:
+                stripped = _REPACKAGED_MODEL_SUFFIX.sub("", stems[-1])
+                if stripped == stems[-1] or not stripped:
+                    break
+                stems.append(stripped)
+            stems = [f"unsloth/{s}-GGUF" for s in stems]
+        for repo in stems:
+            if repo not in repos:
+                repos.append(repo)
+    return repos
+
+
+_GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+
+def _gguf_shard_family(first_file, produced_files):
+    """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
+
+    A vision projector is a separate `--outfile` and so carries a different stem.
+    Grouping by stem keeps it out without pattern-matching filenames, which would
+    misfire on a model legitimately named `example-mmproj-model`.
+    """
+    def shard_stem(path):
+        name = os.path.basename(path)
+        match = _GGUF_SHARD_SUFFIX.search(name)
+        return name[: match.start()] if match else None
+
+    stem = shard_stem(first_file)
+    if stem is None:
+        return [first_file]
+    return [f for f in produced_files if shard_stem(f) == stem]
 def save_pretrained_gguf(
     model,
     tokenizer,
     save_directory,
     quantization_method="fast_quantized",
     first_conversion=None,
+    token=None,
+    imatrix_file=None,
 ):
     """Save LoRA-fused model in GGUF format for llama.cpp inference.
 
@@ -15067,18 +15382,22 @@ def save_pretrained_gguf(
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
+        token: HuggingFace token for reading the upstream imatrix.
+        imatrix_file: None = off; a path = that file; True = download the
+            upstream unsloth/<base>-GGUF imatrix. Quants that need one
+            whatever the model are refused up front (IMATRIX_REQUIRED_QUANTS);
+            the rest are left to llama.cpp.
     """
     from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
+        quant_requires_imatrix,
+        resolve_imatrix_file,
         check_llama_cpp,
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
-
-    save_directory = Path(save_directory)
-    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Map friendly names to llama.cpp quant types
     quant_map = {
@@ -15088,6 +15407,27 @@ def save_pretrained_gguf(
         None: "q8_0",
     }
     quant_type = quant_map.get(quantization_method, quantization_method)
+    # Normalize once so every later comparison agrees. The direct-conversion test below and the
+    # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
+    # that then went ahead without it.
+    quant_type = str(quant_type).strip().lower()
+
+    # Captured before the drop guard can clear imatrix_file: the path may sit inside
+    # save_directory, and must not be reported or uploaded as a file this export produced.
+    imatrix_source = None
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
+
+    # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
+    if quant_requires_imatrix(quant_type) and not imatrix_file:
+        raise RuntimeError(
+            f"Unsloth: '{quant_type}' cannot be quantized without an importance matrix. "
+            "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
+            "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+        )
+
+    save_directory = Path(save_directory)
+    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
@@ -15099,6 +15439,33 @@ def save_pretrained_gguf(
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
+    else:
+        first_conversion = str(first_conversion).strip().lower()
+
+    # llama-quantize runs only when the target differs from the direct conversion. Without it an
+    # imatrix has nothing to weight, so drop it rather than resolve an unusable one.
+    if imatrix_file and (
+        quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
+    ):
+        warnings.warn(
+            f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "
+            "so llama-quantize never runs."
+        )
+        imatrix_file = None
+
+    # An imatrix named like a file this export writes is destroyed by it: the outputs overwrite by
+    # name and the intermediate is then deleted, while resolution has already copied it out, so the
+    # export succeeds having eaten the caller's input. Refuse rather than relocate; where their
+    # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
+    if imatrix_source is not None:
+        base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
+        for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):
+            if _is_same_file(imatrix_source, out):
+                raise RuntimeError(
+                    f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
+                    f"'{os.path.basename(out)}', so the export would overwrite it.\n"
+                    "Move the imatrix outside save_directory, or rename it."
+                )
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
@@ -15112,17 +15479,27 @@ def save_pretrained_gguf(
 
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Before the merge so a bad path fails in seconds, and outside save_directory so the
+        # result is never mistaken for an exported model.
+        imatrix = resolve_imatrix_file(
+            imatrix_file,
+            dest_dir=os.path.join(tmp_dir, "imatrix"),
+            repo_candidates=_gguf_imatrix_repo_candidates(model),
+            token=token,
+        )
+
         tmp_path = Path(tmp_dir) / "merged"
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
-        if is_vlm_model:
-            rewritten = _prepare_vlm_gguf_export_directory(tmp_path, model=model)
-            if rewritten:
-                print(
-                    "Unsloth: Rewrote "
-                    f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
-                )
+        rewritten = _prepare_mlx_gguf_export_directory(
+            tmp_path, model=model, replay_sanitizers=is_vlm_model
+        )
+        if rewritten:
+            print(
+                f"Unsloth: Rewrote {rewritten} MLX tensors "
+                "for llama.cpp GGUF export."
+            )
 
         # Restore architectures from the original HF config since mlx-vlm's
         # save_config strips that key. convert_to_gguf reconciles MTP metadata
@@ -15238,7 +15615,7 @@ def save_pretrained_gguf(
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
         try:
-            convert_to_gguf(**kwargs)
+            produced_files, _ = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
@@ -15249,7 +15626,15 @@ def save_pretrained_gguf(
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
             quantizer = quantizer_location
-            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+            if not produced_files:
+                raise RuntimeError(
+                    "Unsloth: the GGUF converter reported no output file to quantize."
+                )
+            # What the converter reported, never the requested --outfile name: past
+            # --split-max-size it writes shards instead, and llama.cpp finds the rest
+            # from shard 1's split.count. The model always converts before any projector.
+            base_gguf = produced_files[0]
+            base_files = _gguf_shard_family(base_gguf, produced_files)
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
             print(f"Unsloth: Quantizing to {quant_type}...")
@@ -15259,14 +15644,17 @@ def save_pretrained_gguf(
                 quant_type=quant_type,
                 quantizer_location=quantizer,
                 print_output=True,
+                imatrix=imatrix,
             )
-            # Remove intermediate bf16 gguf to save space
-            if os.path.exists(base_gguf) and base_gguf != final_gguf:
-                os.remove(base_gguf)
-                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
+            # Remove the intermediate, every shard of it, to save space
+            for stale in base_files:
+                if stale == final_gguf or not os.path.exists(stale):
+                    continue
+                os.remove(stale)
+                print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
     # List produced files
-    gguf_files = sorted(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
@@ -15427,6 +15815,7 @@ def push_to_hub_gguf(
     token=None,
     private=None,
     first_conversion=None,
+    imatrix_file=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -15441,6 +15830,7 @@ def push_to_hub_gguf(
         first_conversion: Optional intermediate GGUF dtype passed through to
             save_pretrained_gguf. Placed after the pre-existing arguments so
             positional callers keep their meaning.
+        imatrix_file: Importance matrix passed through to save_pretrained_gguf.
     """
     from huggingface_hub import HfApi
 
@@ -15453,6 +15843,8 @@ def push_to_hub_gguf(
         save_directory,
         quantization_method=quantization_method,
         first_conversion=first_conversion,
+        token=token,
+        imatrix_file=imatrix_file,
     )
 
     # Upload GGUF files
@@ -15461,7 +15853,11 @@ def push_to_hub_gguf(
     # private=True request never silently leaks GGUF shards public.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
-    gguf_files = list(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(
+        save_directory,
+        os.path.expanduser(os.fspath(imatrix_file))
+        if isinstance(imatrix_file, (str, os.PathLike)) else None,
+    )
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),

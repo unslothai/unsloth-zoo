@@ -17,6 +17,9 @@
 __all__ = [
     "convert_to_gguf",
     "quantize_gguf",
+    "resolve_imatrix_file",
+    "quant_requires_imatrix",
+    "IMATRIX_REQUIRED_QUANTS",
     "use_local_gguf",
     "install_llama_cpp",
     "check_llama_cpp",
@@ -2949,6 +2952,95 @@ def convert_to_gguf(
 
     return all_output_files, is_vlm
 pass
+
+
+# Quants tensor_requires_imatrix rejects for any transformer, measured with
+# `llama-quantize --dry-run`, not read off the ftype defaults. iq3_xs is here despite defaulting
+# to IQ3_S: the attention Q/K overrides promote to IQ3_XXS unconditionally, failing on blk.0.
+# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s and tq*_0 all quantize fine without one.
+IMATRIX_REQUIRED_QUANTS = frozenset((
+    "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+    "iq3_xxs", "iq3_xs",
+    "q2_k_s",
+))
+
+# All three are in live use across unsloth/*-GGUF, and --imatrix reads any of them. .gguf_file is
+# a GGUF imatrix named so the Hub does not list it as a model; plain .gguf skips that guard.
+IMATRIX_UPSTREAM_NAMES = (
+    "imatrix_unsloth.dat", "imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf",
+)
+
+
+def quant_requires_imatrix(quant_type):
+    return str(quant_type).strip().lower() in IMATRIX_REQUIRED_QUANTS
+
+
+def _materialize_imatrix(path, dest_dir):
+    """Copy into dest_dir (never mutate the HF cache), renaming *.gguf_file -> *.gguf."""
+    os.makedirs(dest_dir, exist_ok = True)
+    base = os.path.basename(path)
+    if base.endswith(".gguf_file"):
+        base = base[: -len(".gguf_file")] + ".gguf"
+    local = os.path.join(dest_dir, base)
+    # dest_dir can be the file's own directory: the helper is public and Studio calls it directly.
+    if os.path.exists(local) and os.path.samefile(path, local):
+        return local
+    shutil.copyfile(path, local)
+    return local
+
+
+def resolve_imatrix_file(imatrix_file, dest_dir, repo_candidates = (), token = None):
+    """Resolve imatrix_file to a local path, or None.
+
+    None/False -> None; a path -> a copy in dest_dir (*.gguf_file renamed to .gguf); True -> the
+    first upstream imatrix across repo_candidates, or a RuntimeError naming what was searched.
+    """
+    if imatrix_file is None or imatrix_file is False:
+        return None
+
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        path = os.path.expanduser(os.fspath(imatrix_file))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Unsloth: imatrix_file '{path}' does not exist.")
+        # Copy even when it is already local: an imatrix under save_directory would be uploaded
+        # and reported as an exported model, since both paths glob save_directory/*.gguf.
+        return _materialize_imatrix(path, dest_dir)
+
+    if imatrix_file is not True:
+        raise TypeError(
+            "Unsloth: imatrix_file must be None, a path string, or True "
+            f"(got {type(imatrix_file).__name__})."
+        )
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repos = []
+    for repo in repo_candidates:
+        if repo and repo not in repos: repos.append(repo)
+    api = HfApi(token = token)
+    lookup_error = None
+    for repo in repos:
+        try:
+            files = set(api.list_repo_files(repo))
+        except Exception as error:
+            # Keep the first cause, reported only if no candidate hits: otherwise a bad token
+            # or an outage reads as "no imatrix exists".
+            if lookup_error is None: lookup_error = f"{repo}: {type(error).__name__}: {error}"
+            continue
+        for name in IMATRIX_UPSTREAM_NAMES:
+            if name not in files: continue
+            downloaded = hf_hub_download(repo_id = repo, filename = name, token = token)
+            local = _materialize_imatrix(downloaded, dest_dir)
+            print(f"Unsloth: Using imatrix '{name}' from '{repo}' -> '{local}'")
+            return local
+    raise RuntimeError(
+        "Unsloth: imatrix_file=True but no upstream Unsloth imatrix was found.\n"
+        f"  Searched repos: {repos or '(none derived from the base model)'}\n"
+        f"  Searched files: {list(IMATRIX_UPSTREAM_NAMES)}\n"
+        + (f"  First lookup failure: {lookup_error}\n" if lookup_error else "")
+        + "Pass imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+    )
 
 
 def quantize_gguf(

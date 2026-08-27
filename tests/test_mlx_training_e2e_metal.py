@@ -1215,3 +1215,110 @@ def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
     assert in_eval, "evaluation never reached the embedding"
     assert not any(in_eval), "NEFTune noise leaked into the eval forward"
     assert restored == [True], "_evaluate left the model in eval mode"
+
+
+@metal_only
+def test_every_text_loss_accepts_a_wrapped_model_output():
+    """Text-only VLM loads take the text losses, but mlx-vlm wrappers return a
+    LanguageModelOutput where mlx_lm models return the array. Every loss that
+    feeds a model call to cross-entropy has to accept both."""
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.preference import make_dpo_loss_fn, make_orpo_loss_fn
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    vocab = 8
+    ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+    labels = mx.array([[-100, 2, 3, 4]], dtype=mx.int32)
+    logits = mx.random.normal((1, ids.shape[1] - 1, vocab))
+
+    class _LanguageModelOutput:
+        def __init__(self, logits):
+            self.logits = logits
+
+    def bare(_inputs):
+        return logits
+
+    def wrapped(_inputs):
+        return _LanguageModelOutput(logits)
+
+    baseline = make_baseline_loss_fn()
+    orpo = make_orpo_loss_fn(beta=0.1)
+    dpo = make_dpo_loss_fn(beta=0.1, reference_free=True)
+    # Chosen and rejected rows differ, so an unwrap that reordered the batch
+    # axis would reverse the preference signal instead of comparing equal.
+    rejected_ids = mx.array([[1, 5, 6, 7]], dtype=mx.int32)
+    pair = mx.concatenate([ids, rejected_ids], axis=0)
+    pair_lengths = mx.concatenate([lengths, lengths], axis=0)
+    pair_logits = mx.concatenate([logits, mx.random.normal(logits.shape)], axis=0)
+    # (supervised tokens, pairs, microbatches) for the window normalizers.
+    norms = (mx.array(3), mx.array(1), mx.array(1))
+
+    def pair_bare(_inputs):
+        return pair_logits
+
+    def pair_wrapped(_inputs):
+        return _LanguageModelOutput(pair_logits)
+
+    for name, call, models in (
+        ("sft", lambda m: baseline(m, ids, lengths), (bare, wrapped)),
+        ("sft-labels", lambda m: baseline(m, ids, lengths, labels), (bare, wrapped)),
+        ("orpo", lambda m: orpo(m, pair, pair_lengths, norms), (pair_bare, pair_wrapped)),
+        ("dpo", lambda m: dpo(m, pair, pair_lengths, norms), (pair_bare, pair_wrapped)),
+    ):
+        from_bare = call(models[0])[0]
+        from_wrapped = call(models[1])[0]
+        assert mx.allclose(from_bare, from_wrapped), name
+
+    # The comparisons above only pin the two forms to each other. This pins the
+    # supervised one to a value computed outside the loss.
+    expected = nn.losses.cross_entropy(logits, ids[:, 1:]).mean()
+    assert mx.allclose(baseline(wrapped, ids, lengths)[0], expected)
+
+
+@metal_only
+@pytest.mark.parametrize("softcap", (0.0, 20.0), ids=("no-softcap", "softcap"))
+def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
+    """A model whose forward scales logits after the head must have that scale
+    reproduced by fused CCE, which rebuilds the logits itself.
+
+    Guards the silent failure mode: without the multiply, CCE softcaps logits
+    that are far too large, so the loss stays plausible while the gradients it
+    produces come from a saturated tanh. The softcap case is the composition
+    that failure needs, so it is exercised too.
+    """
+    from unsloth_zoo.mlx.utils import _get_text_model, make_cce_loss_fn
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    ids = mx.array([tokenizer.encode("the capital of France is Paris")])
+    # (start, end) per row: covers every shifted target position.
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+
+    # The knob is read off the resolved text model, which is not `model.model`.
+    text_model = _get_text_model(model)
+    multiplier = 0.5
+    if softcap:
+        text_model.final_logit_softcapping = softcap
+
+    try:
+        unscaled, _ = make_cce_loss_fn(model)(model, ids, lengths)
+        text_model.output_multiplier = multiplier
+        try:
+            scaled, _ = make_cce_loss_fn(model)(model, ids, lengths)
+        finally:
+            del text_model.output_multiplier
+    finally:
+        if softcap:
+            del text_model.final_logit_softcapping
+
+    # Reference: cross-entropy over the logits the model's own tail would emit.
+    logits = model(ids[:, :-1]).astype(mx.float32) * multiplier
+    if softcap:
+        logits = mx.tanh(logits / softcap) * softcap
+    reference = float(
+        nn.losses.cross_entropy(logits, ids[:, 1:], reduction="mean")
+    )
+
+    assert float(scaled) == pytest.approx(reference, rel=2e-2)
+    assert abs(float(scaled) - float(unscaled)) > 1e-3
