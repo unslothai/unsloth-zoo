@@ -39,6 +39,7 @@ if not _HAS_REAL_MLX:
     simulate_mlx_on_torch()
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
+import mlx.nn as nn  # noqa: E402
 
 from unsloth_zoo.mlx.loader import (  # noqa: E402
     _disable_fused_input_projections, _disable_fused_mrope)
@@ -430,6 +431,32 @@ def test_window_depth_accounting():
     # Outside a run there is nothing to close, and nothing to reopen.
     resume_mlx_training_patches(pause_mlx_training_patches())
     assert not mlx_training_patches_active()
+
+
+@requires_real_mlx
+def test_checkpointed_layer_detaches_integer_arguments():
+    """A layer that embeds the token ids it was handed derives a gather index,
+    and `mx.checkpoint` makes every argument a primal MLX wants a gradient for."""
+    from unsloth_zoo.mlx.utils import _patch_layer_class_for_gc, _unpatch_layer_class_gc
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed, self.proj = nn.Embedding(8, 4), nn.Linear(4, 4)
+
+        def __call__(self, h, ids):
+            return self.proj(h) + self.embed(ids)
+
+    layer, ids, h = _Layer(), mx.array([0, 1, 2]), mx.zeros((3, 4))
+    plain = nn.value_and_grad(layer, lambda m: m(h, ids).sum())(layer)
+    _patch_layer_class_for_gc(_Layer)
+    try:
+        checkpointed = nn.value_and_grad(layer, lambda m: m(h, ids).sum())(layer)
+        mx.eval(plain, checkpointed)
+    finally:
+        _unpatch_layer_class_gc(_Layer)
+    assert checkpointed[0].item() == plain[0].item()
+    assert mx.allclose(checkpointed[1]["proj"]["weight"], plain[1]["proj"]["weight"]).item()
 
 
 @requires_real_mlx

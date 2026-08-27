@@ -178,13 +178,15 @@ def _keep_norm_parameters_float32(model) -> None:
     if not needs_cast:
         return
 
-    model.update(tree_map_with_path(
+    casted = tree_map_with_path(
         lambda k, v: v.astype(mx.float32)
         if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
         parameters,
-    ))
-    mx.eval(model.parameters())
+    )
+    model.update(casted)
+    # Evaluating the whole tree would page every weight into one command buffer.
+    mx.eval([v for k, v in tree_flatten(casted) if is_mlx_norm_parameter_path(k)])
 
 
 def _seed_mlx_random_state(random_state):

@@ -528,6 +528,16 @@ def _get_vision_encoder_layers(model):
     return None
 
 
+def _detach_integer_arrays(value):
+    """`mx.checkpoint` makes every argument a primal of the recomputed function,
+    so a layer that embeds the token ids it was handed derives a gather index."""
+    if isinstance(value, list):
+        return [_detach_integer_arrays(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_integer_arrays(v) for v in value)
+    return _detach_if_index(value)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -539,6 +549,8 @@ def _patch_layer_class_for_gc(layer_cls):
         if slot is None:
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                args = tuple(_detach_integer_arrays(a) for a in args)
+                kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
             return mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
@@ -548,6 +560,8 @@ def _patch_layer_class_for_gc(layer_cls):
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            args = tuple(_detach_integer_arrays(a) for a in args)
+            kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
