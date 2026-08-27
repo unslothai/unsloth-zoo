@@ -1142,6 +1142,11 @@ _HEAD_TRANSFORM_KNOBS = {
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
+# The table records where a knob is read and what values are usable, not where
+# it sits in the forward. Fused CCE pre-scales the hidden states and softcaps
+# after its own matmul, so listing a knob here asserts the model scales before
+# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does; one that
+# capped first would need its own handling rather than a row here.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -1519,7 +1524,17 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
 
 def _model_logits(output):
     """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
-    return output.logits if hasattr(output, "logits") else output
+    logits = getattr(output, "logits", None)
+    if logits is not None:
+        return logits
+    if hasattr(output, "logits"):
+        # Say which side is empty here: unwrapping to None instead leaves an
+        # `'NoneType' object has no attribute 'ndim'` inside cross-entropy.
+        raise ValueError(
+            "Unsloth: the model returned an output wrapper whose `logits` is "
+            "None, so there is nothing to compute a loss from."
+        )
+    return output
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -2453,6 +2468,30 @@ def _normalize_grid_thw(grid_thw):
     return tuple(normalized)
 
 
+def _mlx_vlm_canonical_model_type(model_type):
+    """The name mlx-vlm resolves this config's `model_type` to.
+
+    mlx-vlm lower-cases the config value and sends it through MODEL_REMAPPING to
+    pick the module, and never writes the resolved name back to the config, so a
+    family set keyed on the canonical spelling has to resolve the same way or an
+    aliased checkpoint silently misses it. Hyphens are folded too: MODEL_REMAPPING
+    carries the aliases it knows (`phi4-siglip`, `granite-vision`, `lfm2-vl`) and
+    not the ones it has not met.
+
+    Any failure leaves the name alone. An mlx-vlm too old to have MODEL_REMAPPING
+    is exactly the case where the raw spelling is the only spelling.
+    """
+    if not model_type:
+        return ""
+    name = str(model_type).lower()
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        name = MODEL_REMAPPING.get(name, name)
+    except Exception:
+        pass
+    return name.replace("-", "_")
+
+
 # Families reaching mlx-vlm code that indexes the vision grid as an array
 # (`.tolist()`, `.prod()`, `[:, 1:]`). Everything else keeps the Python tuple
 # form, which is what the Qwen/Paddle compile patches trace: an array turns
@@ -3149,7 +3188,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    grid_as_array = model_type in _VLM_ARRAY_GRID_MODEL_TYPES
+    # Resolved, not raw: the loader routes an aliased config to the canonical
+    # family's tower, so the grid form has to follow it there.
+    grid_as_array = (
+        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
+    )
     if image_grid_thw is not None:
         batch_dict["image_grid_thw"] = (
             _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
@@ -3440,6 +3483,13 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
+    # Every decision above prints when it declines. Print when it accepts too:
+    # a head transform that is silently ignored is the failure this resolution
+    # exists to prevent, and a VLM only ever reaches this factory.
+    if softcap > 0:
+        print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path

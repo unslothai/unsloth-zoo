@@ -2624,11 +2624,10 @@ def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
     """
     if not model_type:
         return False
-    try:
-        from mlx_vlm.utils import MODEL_REMAPPING
-    except Exception:
-        MODEL_REMAPPING = {}
-    return MODEL_REMAPPING.get(model_type, model_type) in _VLM_TEXT_PATH_MODEL_TYPES
+    # Shared with the vision-grid family set in utils, so routing a checkpoint
+    # here and preparing its batches cannot disagree about how it is spelled.
+    from .utils import _mlx_vlm_canonical_model_type
+    return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
 
 
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
@@ -6028,9 +6027,16 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     # A text-only multimodal load stays on the vision path but publishes its
     # inner tokenizer, which cannot drive mlx-vlm preprocessing.
-    processor = getattr(self, "_processor", None) or getattr(self, "_tokenizer", None)
+    # Presence, not truthiness: falling back on a falsy processor would hand
+    # preprocessing the very object this prefers the processor over.
+    processor = getattr(self, "_processor", None)
     if processor is None:
-        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+        processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError(
+            "Unsloth MLX: VLM generate() requires model._processor or "
+            "model._tokenizer."
+        )
 
     inputs = {}
     if args:
