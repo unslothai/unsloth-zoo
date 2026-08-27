@@ -4012,3 +4012,53 @@ def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_pat
     assert sorted(rewritten) == sorted(model.checkpoint)
     for name, tensor in model.checkpoint.items():
         assert rewritten[name].tolist() == tensor.tolist()
+
+
+def _relocated(name):
+    """A rename spelled outside the sanitizer, as mlx-vlm's qwen4_exp spells its own."""
+    if name.startswith("outer.inner."):
+        return "inner.outer." + name[len("outer.inner."):]
+    return name
+
+
+def _relocate_outside(self, weights):
+    return {_relocated(name): tensor for name, tensor in weights.items()}
+
+
+def _relocating_model(mx, sanitize, others):
+    """A checkpoint one namespace move restores, with `others` names outside it."""
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"outer.inner.layers.{layer}.{leaf}":
+                    mx.arange(8, dtype=mx.float32).reshape(2, 4) + 10 * layer + index
+                for layer in range(2) for index, leaf in enumerate(("mlp.w", "attn.w"))}
+            self.checkpoint.update(
+                (f"vision.layers.{n}.w",
+                 mx.arange(8, dtype=mx.float32).reshape(2, 4) + 100 + n)
+                for n in range(others))
+
+        def named_modules(self):
+            yield "", self
+
+    Model.sanitize = sanitize
+    model = Model()
+    model.expected = model.sanitize(dict(model.checkpoint))
+    return model
+
+
+def test_moe_gguf_export_reads_the_names_a_sanitizer_spells_in_what_it_calls(tmp_path):
+    """A relocation only the helper reaches, kept under the limit to isolate it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    model = _relocating_model(mx, _relocate_outside, others=6)
+    assert not any("outer" in const for const in
+                   type(model).sanitize.__code__.co_consts if isinstance(const, str))
+    assert "outer.inner." in mutils._mlx_sanitizer_vocabulary(
+        mutils._mlx_moe_sanitizers(model))
+    assert sum("outer.inner." in name for name in model.expected) <= int(
+        len(model.expected) * mutils._MOE_VOCABULARY_UBIQUITY)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
+    assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
+

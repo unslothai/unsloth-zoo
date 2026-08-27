@@ -15039,29 +15039,82 @@ def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", "")
 # architectures no static table anticipated; the replay decides whether one applies.
 _MOE_VOCABULARY_DEPTH = 5
 _MOE_VOCABULARY_UBIQUITY = 0.5
+# How far a sanitizer's calls are followed. Every installed architecture spells its names
+# one call away, so two is measured margin for one that delegates twice.
+_MOE_VOCABULARY_CALLS = 2
 
 
-def _mlx_sanitizer_vocabulary(sanitizers):
-    """Name fragments a sanitizer mentions, read from its constant pool."""
-    found = set()
+def _mlx_sanitizer_own_functions(found, package, mentioned):
+    """The package's own functions one global name reaches.
+
+    Only the attributes named beside a class, since following every method would cost a
+    vocabulary the sanitizer never mentions.
+    """
+    def owned(value):
+        return (inspect.isfunction(value)
+                and (getattr(value, "__module__", "") or "").split(".")[0] == package)
+
+    if isinstance(found, type):
+        return [value for name, value in vars(found).items()
+                if name in mentioned and owned(value)]
+    return [found] if owned(found) else []
+
+
+def _mlx_sanitizer_code(sanitizers):
+    """Every code object a sanitizer reaches inside the model's own package.
+
+    Only the model's own package is followed: a walk into mlx or numpy would cost
+    a vocabulary of everything and prove nothing.
+    """
+    reached, walked = [], set()
+
+    def walk(function, calls):
+        code = getattr(function, "__code__", None)
+        if code is None or code in walked:
+            return
+        walked.add(code)
+        reached.append(code)
+        if calls >= _MOE_VOCABULARY_CALLS:
+            return
+        package = (getattr(function, "__module__", "") or "").split(".")[0]
+        namespace = getattr(function, "__globals__", None) or {}
+        mentioned = set(code.co_names)
+        for name in code.co_names:
+            for called in _mlx_sanitizer_own_functions(
+                namespace.get(name), package, mentioned
+            ):
+                walk(called, calls + 1)
+
+    for sanitizer in sanitizers:
+        for owner in getattr(sanitizer, "owners", (sanitizer,)):
+            walk(getattr(type(owner), "sanitize", None), 0)
+    return reached
+
+
+def _mlx_sanitizer_constants(codes, keep):
+    found = []
 
     def collect(obj, depth):
         if depth > _MOE_VOCABULARY_DEPTH:
             return
-        if isinstance(obj, str):
-            found.add(obj)
-        elif isinstance(obj, (tuple, list, frozenset)):
+        if keep(obj):
+            found.append(obj)
+        if isinstance(obj, (tuple, list, frozenset)):
             for item in obj:
                 collect(item, depth + 1)
         elif hasattr(obj, "co_consts"):
             for item in obj.co_consts:
                 collect(item, depth + 1)
 
-    for sanitizer in sanitizers:
-        for owner in getattr(sanitizer, "owners", (sanitizer,)):
-            sanitize = getattr(type(owner), "sanitize", None)
-            collect(getattr(sanitize, "__code__", None), 0)
-    return sorted(f for f in found if len(f) > 1 and not f.isspace())
+    for code in codes:
+        collect(code, 0)
+    return found
+
+
+def _mlx_sanitizer_vocabulary(sanitizers):
+    found = _mlx_sanitizer_constants(
+        _mlx_sanitizer_code(sanitizers), lambda obj: isinstance(obj, str))
+    return sorted({f for f in found if len(f) > 1 and not f.isspace()})
 
 
 def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
