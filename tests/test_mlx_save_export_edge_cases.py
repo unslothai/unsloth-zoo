@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import sys
 import threading
 import types
@@ -1022,7 +1023,15 @@ def test_merged_save_keeps_quantization_when_not_dequantizing(
 # --- Group 11: save_pretrained_gguf first_conversion derivation + quantize step ---
 
 
-def _gguf_export_scaffold(monkeypatch, tmp_path):
+def _gguf_export_scaffold(
+    monkeypatch, tmp_path, shards=1, mmproj=False, mmproj_shards=1
+):
+    """Fake out the GGUF toolchain around the real ``save_pretrained_gguf``.
+
+    ``shards`` > 1 makes the converter write llama.cpp's shard names instead of
+    the requested ``--outfile``, which is what it does past ``--split-max-size``.
+    ``mmproj_shards`` does the same for the vision projector's own ``--outfile``.
+    """
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -1046,17 +1055,65 @@ def _gguf_export_scaffold(monkeypatch, tmp_path):
 
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
-        output = Path(
-            f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
-        )
-        output.write_bytes(b"GGUF-intermediate")
+        # Mirror convert_to_gguf's own naming: a model_name that already ends in
+        # .gguf is the --outfile verbatim, and the projector hangs off the name
+        # with that suffix stripped.
+        name = kwargs["model_name"]
+        if name.endswith(".gguf"):
+            stem = name[: -len(".gguf")]
+            mmproj_stem = f"{stem}.{kwargs['model_dtype'].upper()}"
+        else:
+            stem = f"{name}.{kwargs['quantization_type'].upper()}"
+            mmproj_stem = f"{name}.{kwargs['model_dtype'].upper()}"
+        if shards > 1:
+            produced = [
+                Path(f"{stem}-{i:05d}-of-{shards:05d}.gguf")
+                for i in range(1, shards + 1)
+            ]
+        else:
+            produced = [Path(f"{stem}.gguf")]
+        for part in produced:
+            part.write_bytes(b"GGUF-intermediate")
+        if mmproj:
+            # The projector is a second --outfile, so it shards on its own stem.
+            for i in range(1, mmproj_shards + 1):
+                part = Path(
+                    f"{mmproj_stem}-mmproj.gguf" if mmproj_shards == 1
+                    else f"{mmproj_stem}-mmproj-{i:05d}-of-{mmproj_shards:05d}.gguf"
+                )
+                part.write_bytes(b"GGUF-mmproj")
+                produced.append(part)
+        return [str(p) for p in produced], bool(mmproj)
 
     def fake_quantize_gguf(**kwargs):
         calls["quantize_kwargs"] = kwargs
+        # llama-quantize reads shard 1 and then every sibling its split.count names,
+        # so a missing sibling is as fatal as a missing input.
+        source = Path(kwargs["input_gguf"])
+        needed = [source]
+        split = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", source.name)
+        if split:
+            total = int(split.group(2))
+            needed = [
+                source.with_name(
+                    f"{source.name[:split.start()]}-{i:05d}-of-{total:05d}.gguf"
+                )
+                for i in range(1, total + 1)
+            ]
+        for part in needed:
+            if not part.exists():
+                raise RuntimeError(
+                    f"gguf_init_from_file: failed to open GGUF file '{part}'"
+                )
         Path(kwargs["output_gguf"]).write_bytes(b"GGUF-final")
 
     monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
-    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: mmproj)
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_mlx_gguf_export_directory",
+        lambda path, model=None, replay_sanitizers=True: 0,
+    )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(
         llama_cpp,
@@ -1110,6 +1167,140 @@ def test_gguf_default_first_conversion_not_quantized_skips_quantizer(
     )
     assert calls["convert_kwargs"]["quantization_type"] == "bf16"
     assert (out / "EdgeModel.BF16.gguf").exists()
+
+
+def test_gguf_quantizes_split_intermediate_from_first_shard(monkeypatch, tmp_path):
+    """A split intermediate has no --outfile-named file; quantize shard 1 instead."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=3, mmproj=True)
+    out = tmp_path / "out"
+    model = types.SimpleNamespace(_hf_repo="mlx-community/EdgeModel-30B-4bit")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert calls["quantize_kwargs"]["input_gguf"] == str(
+        out / "EdgeModel-30B-4bit.BF16-00001-of-00003.gguf"
+    )
+    # Every base shard is an intermediate; the projector and the quant are outputs.
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel-30B-4bit.BF16-mmproj.gguf",
+        "EdgeModel-30B-4bit.Q4_K_M.gguf",
+    ]
+
+
+def test_gguf_keeps_the_vision_projector_out_of_the_intermediates(
+    monkeypatch, tmp_path
+):
+    """The projector is an output of the export, not an intermediate to consume."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, mmproj=True)
+    out = tmp_path / "out"
+    model = types.SimpleNamespace(_hf_repo="org/EdgeModel")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert calls["quantize_kwargs"]["input_gguf"] == str(out / "EdgeModel.BF16.gguf")
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-mmproj.gguf",
+        "EdgeModel.Q4_K_M.gguf",
+    ]
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+@pytest.mark.parametrize(
+    "repo, stem",
+    [
+        # The converter appends ".BF16.gguf" to these, so the model's own name is
+        # free to look like a projector's.
+        ("org/example-mmproj-model", "example-mmproj-model.BF16"),
+        # A name already ending in .gguf is used verbatim as the --outfile, so the
+        # model file itself is literally named like a projector.
+        ("org/example-mmproj.gguf", "example-mmproj"),
+    ],
+)
+def test_gguf_exports_a_model_whose_own_name_looks_like_a_projector(
+    monkeypatch, tmp_path, repo, stem, shards
+):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=shards)
+    out = tmp_path / "out"
+    mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo=repo),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    expected = f"{stem}.gguf" if shards == 1 else f"{stem}-00001-of-{shards:05d}.gguf"
+    assert calls["quantize_kwargs"]["input_gguf"] == str(out / expected)
+    assert [p.name for p in out.glob("*.gguf")] == [
+        f"{Path(repo).name}.Q4_K_M.gguf"
+    ]
+
+
+def test_gguf_keeps_a_projector_that_llama_cpp_sharded(monkeypatch, tmp_path):
+    """The projector shards on its own stem, so it is not part of the model."""
+    mutils, calls = _gguf_export_scaffold(
+        monkeypatch, tmp_path, shards=2, mmproj=True, mmproj_shards=2
+    )
+    out = tmp_path / "out"
+    mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-mmproj-00001-of-00002.gguf",
+        "EdgeModel.BF16-mmproj-00002-of-00002.gguf",
+        "EdgeModel.Q4_K_M.gguf",
+    ]
+
+
+def test_gguf_reports_a_conversion_that_reported_no_output(monkeypatch, tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, _calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", lambda **kwargs: ([], False))
+    monkeypatch.setattr(
+        llama_cpp,
+        "quantize_gguf",
+        lambda **kwargs: pytest.fail("nothing was produced to quantize"),
+    )
+    with pytest.raises(RuntimeError, match="no output file to quantize"):
+        mutils.save_pretrained_gguf(
+            types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+            tokenizer=object(),
+            save_directory=tmp_path / "out",
+            quantization_method="q4_k_m",
+        )
+
+
+def test_gguf_keeps_the_intermediates_when_quantization_fails(monkeypatch, tmp_path):
+    """A failed quantize must leave the shards it would have to be retried from."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, _calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=3)
+    out = tmp_path / "out"
+    monkeypatch.setattr(
+        llama_cpp,
+        "quantize_gguf",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("llama-quantize failed")),
+    )
+    with pytest.raises(RuntimeError, match="llama-quantize failed"):
+        mutils.save_pretrained_gguf(
+            types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+            tokenizer=object(),
+            save_directory=out,
+            quantization_method="q4_k_m",
+        )
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-00001-of-00003.gguf",
+        "EdgeModel.BF16-00002-of-00003.gguf",
+        "EdgeModel.BF16-00003-of-00003.gguf",
+    ]
 
 
 # --- Group 12: concurrency over the patcher env mutation ---

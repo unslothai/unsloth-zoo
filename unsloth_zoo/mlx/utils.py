@@ -1334,6 +1334,11 @@ def _get_logit_scale(model):
         scale = getattr(tm.args, "logit_scale", None)
     if scale is None and hasattr(tm, "config"):
         scale = getattr(tm.config, "logit_scale", None)
+    return _validated_head_multiplier(scale)
+
+
+def _validated_head_multiplier(scale):
+    """Returns ``(scale, invalid)``, scale None when absent or a no-op 1.0."""
     if scale is None:
         return None, False
     if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
@@ -1361,11 +1366,15 @@ _KNOB_MISSING = object()
 # config drift must fail closed); others read args (config for VLM wrappers).
 _HEAD_TRANSFORM_KNOBS = {
     "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "output_multiplier": ("attr", "args", "config"),  # Muse Glimmer: pre-softcap multiply
     "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
     "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
+# Where a knob is read and what values are usable, not where it sits in the forward.
+# Fused CCE pre-scales and caps after, so a row here asserts the model scales before
+# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -1478,14 +1487,20 @@ def _detect_head_transform(model, head_status):
         # value-guarded divide: presence alone makes the tail non-scalar.
         return None, ("mup_width_multiplier models mask logits after the "
                       "output head, which fused CCE cannot reproduce")
-    if knob == "logit_scale":
+    if knob in ("logit_scale", "output_multiplier"):
         # A present-None value is malformed live state (the forward would
         # multiply logits by None); fail closed rather than run unscaled.
         if raw is None:
-            return None, "logit_scale is present but None"
-        scale, invalid = _get_logit_scale(model)
+            return None, f"{knob} is present but None"
+        # logit_scale re-reads its own consumer sites; output_multiplier is
+        # read straight off the resolved knob, whose sites already agreed.
+        scale, invalid = (
+            _get_logit_scale(model)
+            if knob == "logit_scale"
+            else _validated_head_multiplier(raw)
+        )
         if invalid:
-            return None, ("logit_scale cannot be applied by fused CCE "
+            return None, (f"{knob} cannot be applied by fused CCE "
                           "(non-finite, non-scalar, or outside the "
                           "supported range)")
         return scale, None
@@ -1735,6 +1750,21 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
     return loss_fn
 
 
+def _model_logits(output):
+    """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
+    logits = getattr(output, "logits", None)
+    if logits is not None:
+        return logits
+    if hasattr(output, "logits"):
+        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
+        # inside cross-entropy.
+        raise ValueError(
+            "Unsloth: the model returned an output wrapper whose `logits` is "
+            "None, so there is nothing to compute a loss from."
+        )
+    return output
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -1764,7 +1794,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
-            logits = model(inputs)
+            logits = _model_logits(model(inputs))
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = _token_ce(logits, targets) * mask
@@ -1778,7 +1808,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         # Widen unsigned dtypes so mx.where(..., -100, ...) and the
         # `targets != -100` compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
-        logits = model(inputs)
+        logits = _model_logits(model(inputs))
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
@@ -2355,7 +2385,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = output.logits if hasattr(output, "logits") else output
+        logits = _model_logits(output)
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]
@@ -2664,6 +2694,39 @@ def _normalize_grid_thw(grid_thw):
             item = item.tolist()
         normalized.append(tuple(int(x) for x in item))
     return tuple(normalized)
+
+
+def _mlx_vlm_canonical_model_type(model_type):
+    """The name mlx-vlm resolves this config's `model_type` to.
+
+    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
+    module, never writing the result back, so a family set keyed on the canonical
+    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
+    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
+
+    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
+    exactly the case where the raw spelling is the only spelling.
+    """
+    if not model_type:
+        return ""
+    name = str(model_type).lower()
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        name = MODEL_REMAPPING.get(name, name)
+    except Exception:
+        pass
+    return name.replace("-", "_")
+
+
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
+# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
+# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
+_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
+    "glm4v",
+    "glm_ocr",
+    # Not compile-patched, and opens with `grid_thw.tolist()`.
+    "muse_glimmer",
+})
 
 
 def _grid_thw_to_mx_array(grid_thw):
@@ -3349,10 +3412,12 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    grid_as_array = model_type in {"glm4v", "glm_ocr"}
+    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
+    # so the grid form has to follow it there.
+    grid_as_array = (
+        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
+    )
     if image_grid_thw is not None:
-        # GLM native mlx-vlm paths call .tolist(), .prod(), and slicing on
-        # grids; Qwen/Paddle compile patches expect Python tuples.
         batch_dict["image_grid_thw"] = (
             _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
         )
@@ -3642,6 +3707,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
+    # Every decision above prints when it declines; print when it accepts too, since
+    # a silently ignored head transform is the failure this prevents.
+    if softcap > 0:
+        print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
@@ -14199,8 +14270,18 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
+    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
+    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
+    # missed prefix costs the mmproj its projector and only fails at load time.
     if name.startswith(
-        ("audio_tower.", "vision_tower.", "embed_audio.", "embed_vision.")
+        (
+            "audio_tower.",
+            "vision_tower.",
+            "vision_adapter.",
+            "vision_projection.",
+            "embed_audio.",
+            "embed_vision.",
+        )
     ):
         add(f"model.{name}")
 
@@ -15250,6 +15331,25 @@ def _gguf_imatrix_repo_candidates(model):
     return repos
 
 
+_GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+
+def _gguf_shard_family(first_file, produced_files):
+    """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
+
+    A vision projector is a separate `--outfile` and so carries a different stem.
+    Grouping by stem keeps it out without pattern-matching filenames, which would
+    misfire on a model legitimately named `example-mmproj-model`.
+    """
+    def shard_stem(path):
+        name = os.path.basename(path)
+        match = _GGUF_SHARD_SUFFIX.search(name)
+        return name[: match.start()] if match else None
+
+    stem = shard_stem(first_file)
+    if stem is None:
+        return [first_file]
+    return [f for f in produced_files if shard_stem(f) == stem]
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -15515,7 +15615,7 @@ def save_pretrained_gguf(
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
         try:
-            convert_to_gguf(**kwargs)
+            produced_files, _ = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
@@ -15526,7 +15626,15 @@ def save_pretrained_gguf(
         # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
             quantizer = quantizer_location
-            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
+            if not produced_files:
+                raise RuntimeError(
+                    "Unsloth: the GGUF converter reported no output file to quantize."
+                )
+            # What the converter reported, never the requested --outfile name: past
+            # --split-max-size it writes shards instead, and llama.cpp finds the rest
+            # from shard 1's split.count. The model always converts before any projector.
+            base_gguf = produced_files[0]
+            base_files = _gguf_shard_family(base_gguf, produced_files)
             final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
 
             print(f"Unsloth: Quantizing to {quant_type}...")
@@ -15538,10 +15646,12 @@ def save_pretrained_gguf(
                 print_output=True,
                 imatrix=imatrix,
             )
-            # Remove intermediate bf16 gguf to save space
-            if os.path.exists(base_gguf) and base_gguf != final_gguf:
-                os.remove(base_gguf)
-                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
+            # Remove the intermediate, every shard of it, to save space
+            for stale in base_files:
+                if stale == final_gguf or not os.path.exists(stale):
+                    continue
+                os.remove(stale)
+                print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
     # List produced files
     gguf_files = _exported_gguf_files(save_directory, imatrix_source)
