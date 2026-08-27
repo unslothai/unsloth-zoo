@@ -42,6 +42,7 @@ import textwrap
 import tokenize
 from .utils import (
     Version,
+    _get_dtype,
     is_main_process,
     is_distributed,
     distributed_function,
@@ -55,7 +56,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from unsloth_zoo.temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -85,8 +86,15 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 major = None
 minor = None
 if DEVICE_TYPE == "cuda":
-    major, minor = torch.cuda.get_device_capability()
-    OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        OLD_CUDA_ARCH_VERSION = (major <= 7) and (minor < 5)
+    else:
+        # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so
+        # ask whether a device is present before asking what it can do. There is
+        # no arch to read, and the old-arch compile workarounds only ever run on
+        # a real GPU, so False is the answer that changes nothing.
+        OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "hip":
     OLD_CUDA_ARCH_VERSION = False
 elif DEVICE_TYPE == "xpu":
@@ -136,6 +144,11 @@ DISABLE_COMPILE_FUNCTIONS = [
     "torch_recurrent_gated_delta_rule",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
+    # The decode-kernel name fla_vendor.py aliases onto fla. Modeling sources reach
+    # it through the kernel-hub decorator rather than spelling it, so this matches
+    # nothing today; it is here so one that goes back to importing it by name, the
+    # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
+    "recurrent_gated_delta_rule",
 ]
 
 # Re-exported from .model_lists so callers can keep using
@@ -799,8 +812,12 @@ def fix_rotary_embedding_dtype(source):
                 checker == "float16" or checker == "torch.float16"
             ) and (os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1")
             if allow_all_runs or allow_float16_runs:
-                if eval(_dtype) is not None:
-                    dtype = eval(_dtype)
+                # A lookup, not eval: the field names a dtype (`torch.float16`,
+                # `None`, ...), it is not an expression to evaluate. `_get_dtype`
+                # returns None for anything it does not recognise, which is the same
+                # "no override" branch the `None` field already takes.
+                dtype = _get_dtype(_dtype.strip().removeprefix("torch."))
+                if dtype is not None:
                     if dtype == torch.float32:
                         source = source.replace(
                             "cos.to(dtype=x.dtype)",
@@ -1102,6 +1119,13 @@ def create_new_function(
     add_torch_compile=False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
+    # `name` becomes both a module name and, via os.path.join(compile_folder, ...), a
+    # file path. Callers build it from `model_type` and from class names scraped out of
+    # the modeling file, so pin it to a Python identifier here: a separator or `..`
+    # would write outside the compiled cache.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
+        raise ValueError(f"Unsloth: Invalid generated module name {name!r}.")
+
     old_new_source = new_source
     do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
@@ -4285,12 +4309,31 @@ def unsloth_compile_transformers(
         )
     pass
 
+    # `get_transformers_model_type` in hf_utils.py already validates this, but that is
+    # the producer and this is the sink: `model_type` is a plain parameter here, and it
+    # reaches both an import path (below) and the compiled-cache filename
+    # `f"{COMBINED_UNSLOTH_NAME}_{model_type}"`, which is os.path.join'd. Re-check it so
+    # the sink defends itself rather than trusting every caller to have gone through the
+    # choke point.
+    #
+    # `return`, not `raise`. This function is exported, and 38 of the model_type values
+    # transformers itself ships are hyphenated (`lfm2-vl`,
+    # `audio-spectrogram-transformer`, ...). A direct caller passing a raw
+    # `config.model_type` used to get a silent skip here, because the import below
+    # raises ModuleNotFoundError for any name that is not a plain module name, and that
+    # happens before the filename is ever built. Raising would turn that skip into a
+    # hard failure for real model types. Returning keeps the old behaviour exactly and
+    # still stops the value short of the os.path.join.
+    if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
+        return
+
     model_location = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
-        exec(f"import {model_location}", globals())
+        modeling_file = importlib.import_module(model_location)
     except ModuleNotFoundError:
         return
-    modeling_file = eval(model_location)
+    # Later `eval(model_location)` calls need `transformers` bound in globals
+    exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):

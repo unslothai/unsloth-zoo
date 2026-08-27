@@ -38,7 +38,7 @@ from .utils import (
     Cache,
     process_return,
 )
-from ..hf_utils import dtype_from_config
+from unsloth_zoo.hf_utils import dtype_from_config
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,

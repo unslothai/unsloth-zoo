@@ -95,7 +95,7 @@ def aiter_attention_forward(
     # Registration is AMD gated, but this is exported, directly callable, and the
     # gate behind it is cached at import. Re-check per call: `is_hip` is uncached
     # and cheap, and ROCm tensors report device.type "cuda", so both are needed.
-    from ..device_type import is_hip
+    from unsloth_zoo.device_type import is_hip
     if not is_hip() or not query.is_cuda:
         return _fallback()
 
@@ -115,7 +115,7 @@ def aiter_attention_forward(
                 and kwarg_value is not None and kwarg_value is not False):
             return _fallback()
 
-    from ..device_type import get_amd_flash_attn_func
+    from unsloth_zoo.device_type import get_amd_flash_attn_func
     flash_attn_func = get_amd_flash_attn_func()
     if flash_attn_func is None:
         return _fallback()
@@ -166,7 +166,7 @@ def aiter_attention_forward(
 def patch_amd_aiter_attention():
     """Register `aiter` as an attention backend when the hardware supports it."""
     try:
-        from ..device_type import get_amd_attention_implementation
+        from unsloth_zoo.device_type import get_amd_attention_implementation
         if get_amd_attention_implementation() != "amd_aiter":
             return  # NVIDIA, Intel, CPU, MLX, ROCm < 7, or an unsupported arch
         from transformers.modeling_utils import AttentionInterface

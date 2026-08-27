@@ -31,6 +31,7 @@ import contextlib
 import copy
 import inspect
 import importlib
+import importlib.util
 import json
 import math
 import numbers
@@ -60,8 +61,8 @@ from typing import NamedTuple
 from packaging.version import Version as _Version
 
 
-from .cce import _get_runtime_cce
-from .cce.runtime_cce import _normalize_label_smoothing
+from unsloth_zoo.mlx.cce import _get_runtime_cce
+from unsloth_zoo.mlx.cce.runtime_cce import _normalize_label_smoothing
 
 
 _LLAMA_CPP_PATCHER_ENV_LOCK = threading.Lock()
@@ -656,6 +657,234 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
     # In the embedding dtype, as the ids path does: an fp32 product rounded back
     # lands on different bf16 values.
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
+
+
+# Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
+# the module returns, without exposing the factor as an attribute. Named by the
+# base the model type normalizes to, since a tower is reachable as either
+# `gemma3` or `gemma3_text` depending on how the wrapper exposes it.
+_MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
+    "gemma", "gemma2", "gemma3", "gemma3n",
+})
+# Architectures transformers has always scaled inside the embedding, used when
+# the installed transformers cannot be asked because it predates them.
+# minicpm3 is deliberately absent: no transformers in the supported range has a
+# built-in one, so the reference is trust_remote_code, which multiplies by
+# scale_emb outside the embedding just as mlx-lm does. Correcting would make MLX
+# scale_emb times weaker. A later transformers adds the scaled class, and the
+# gate then reads it directly.
+_SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
+    "gemma3", "gemma3n", "gemma4", "gemma4_unified",
+})
+
+
+def _model_type_base(model_type):
+    """The spelling both the family sets and the transformers lookup use."""
+    return str(model_type or "").removesuffix("_text")
+
+
+@lru_cache(maxsize=None)
+def _transformers_scales_inside_embedding(model_type):
+    """Whether the installed transformers applies this architecture's embedding
+    multiply inside the embedding module, so its NEFTune hook fires after it.
+
+    Asked, not assumed: transformers moved gemma and gemma2's multiply into the
+    module partway through the supported range, so a fixed answer would be wrong
+    at one end. None when it cannot be asked (no such architecture installed).
+
+    Read through the loader, never imported: a modeling module needs torch, which
+    is deliberately absent on macOS arm64. Source first, then compiled code, so
+    the answer survives a package shipped without its source.
+    """
+    base = _model_type_base(model_type)
+    if not base:
+        return None
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{base}.modeling_{base}")
+    except Exception:
+        return None
+    if spec is None or spec.loader is None:
+        return None
+    marker = "ScaledWordEmbedding"
+    try:
+        source = spec.loader.get_source(spec.name)
+    except Exception:
+        source = None
+    if source is not None:
+        return marker in source
+    try:
+        code = spec.loader.get_code(spec.name)
+    except Exception:
+        code = None
+    if code is None:
+        return None
+    # A module-level class binds its name, so the flat scan is enough.
+    return any(marker in name for name in code.co_names)
+
+
+def _neftune_embed_scale(model):
+    """The multiply applied after the embedding returns that NEFTune noise has
+    to be divided by, or None when nothing needs correcting.
+
+    MLX multiplies once the embedding module has returned, so noise injected
+    there rides through it; transformers adds its noise after the same multiply
+    wherever it keeps it inside the embedding.
+    """
+    text_model = _get_text_model(model)
+    backbone = getattr(text_model, "model", None)
+    # mlx-lm keeps this on `args`, mlx-vlm on `config`, at either level.
+    holders = (backbone, text_model, getattr(backbone, "args", None),
+               getattr(backbone, "config", None), getattr(text_model, "args", None),
+               getattr(text_model, "config", None))
+
+    def _first(key):
+        for holder in holders:
+            value = None if holder is None else _config_get(holder, key)
+            if value is not None:
+                return value
+        return None
+
+    def _usable(value):
+        """The value as a positive float, or None if it is not one.
+
+        Truthiness is not enough: embed_scale can be a 0-d array (fine), a
+        multi-element array or a string (neither converts), and a non-positive
+        scale would flip or blow up the noise. Anything unusable counts as
+        absent, so the next candidate is tried instead of crashing.
+        """
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number <= 0.0:
+            return None
+        return number
+
+    model_type = str(_first("model_type") or "")
+    base = _model_type_base(model_type)
+    scale = _usable(getattr(backbone, "embed_scale", None))  # gemma4, gemma4_unified
+    if scale is None:
+        scale = _usable(_first("scale_emb"))                 # a config value, not a sqrt
+    if scale is None and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+        hidden_size = _usable(_first("hidden_size"))
+        scale = hidden_size ** 0.5 if hidden_size else None
+    if scale is None:
+        return None
+    inside = _transformers_scales_inside_embedding(model_type)
+    if inside is None:
+        inside = base in _SCALED_INSIDE_WHEN_UNASKABLE
+    return scale if inside else None
+
+
+def _vlm_compares_embedding_values(model):
+    """Whether the forward finds merged positions by comparing embedding
+    values, which noise redrawn per call invalidates. Read off the scale
+    families so the two cannot drift apart.
+
+    Matched on the normalized model type too, since `_vlm_embed_scale` compares
+    the raw spelling and would miss a tower exposing the bare family name.
+    Refusing is the conservative side: a missed refusal injects noise into that
+    comparison, a spurious one only trains un-noised.
+    """
+    if _vlm_embed_scale(model) is not None:
+        return True
+    config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
+    base = _model_type_base(_config_get(config, "model_type"))
+    if not base:
+        return False
+    return any(base == _model_type_base(family)
+               for family in _VLM_EMBED_SCALE_FAMILIES)
+
+
+def _identify_vlm_embedding_module(model):
+    """The module a text-only embedding forward uses to build ``inputs_embeds``.
+
+    Observed, not looked up: wrappers disagree on attribute name and container,
+    some expose none, and an untied ``lm_head`` carries the same weight shape --
+    a quantized embedding carries no such shape at all. Of the modules producing
+    the returned shape, drop those another encloses, which picks an adapter over
+    the embedding it wraps. None means decline, never guess.
+    """
+    calls, stack, swapped, recorders = [], [], [], {}
+    def _recorder(base):
+        cls = recorders.get(base)
+        if cls is None:
+            class _Probe(base):
+                def __call__(self, *args, **kwargs):
+                    stack.append(id(self))
+                    enclosing = frozenset(stack[:-1])
+                    try:
+                        out = base.__call__(self, *args, **kwargs)
+                    finally:
+                        stack.pop()
+                    calls.append((self, getattr(out, "shape", None), enclosing))
+                    return out
+            # The save-window DoRA check reads the class name.
+            _Probe.__name__ = base.__name__
+            _Probe.__qualname__ = getattr(base, "__qualname__", base.__name__)
+            cls = recorders[base] = _Probe
+        return cls
+
+    try:
+        seen = set()
+        for _, module in model.named_modules():
+            # One module can appear under several names; wrapping it per name
+            # stacks recorders and leaves one installed.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            base = type(module)
+            try:
+                module.__class__ = _recorder(base)
+            except TypeError:
+                continue
+            swapped.append((module, base))
+        ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+        try:
+            embed_result = model.get_input_embeddings(ids, None)
+        except TypeError:
+            embed_result = model.get_input_embeddings(ids)
+        merged, _ = _unpack_embed_result(embed_result, model)
+    except Exception:
+        return None
+    finally:
+        for module, base in swapped:
+            module.__class__ = base
+
+    shape = getattr(merged, "shape", None)
+    if shape is None:
+        return None
+    matching = [(m, enclosing) for m, s, enclosing in calls if s == shape]
+    matching_ids = {id(m) for m, _ in matching}
+    outermost = {id(m): m for m, enclosing in matching
+                 if not (enclosing & matching_ids)}
+    if len(outermost) != 1:
+        return None
+    return next(iter(outermost.values()))
+
+
+def _probe_vlm_embedding_module(model):
+    """``_identify_vlm_embedding_module`` with the random stream it consumed put
+    back.
+
+    Training mode is deliberately untouched: a quantized-activation layer
+    requantizes its weights on every flip, and shapes do not depend on the mode.
+    """
+    # Rewound through the same pair the compile fallbacks use: it reseeds from
+    # the key's own words, so it survives mlx 0.32 making mx.random.state a
+    # sentinel that refuses item assignment. None (unreadable key) leaves the
+    # probe's draws on the caller's stream rather than raising. Never restore by
+    # rebinding mx.random.state -- that shadows the sentinel mx.compile captured
+    # and stops a compiled step redrawing, turning NEFTune into a fixed offset.
+    rng_key = _mlx_rng_key()
+    try:
+        return _identify_vlm_embedding_module(model)
+    except Exception:
+        return None
+    finally:
+        _restore_mlx_rng_key(rng_key)
 
 
 def _shared_kv_slot_count(model):
@@ -1576,7 +1805,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
 # so the two backends cannot drift apart.
-from ..vlm_tokens import VLM_PLACEHOLDER_TOKENS
+from unsloth_zoo.vlm_tokens import VLM_PLACEHOLDER_TOKENS
 _IMAGE_TOKEN_STRINGS = tuple(VLM_PLACEHOLDER_TOKENS)
 
 
@@ -5568,7 +5797,7 @@ def _extract_vlm_images(
 
     if not images and isinstance(messages, list):
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             extracted = process_vision_info(messages, return_video_kwargs=True)
             if isinstance(extracted, tuple) and extracted:
@@ -5598,7 +5827,7 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
 
     if isinstance(item, dict) and "images" in item:
         try:
-            from ..vision_utils import process_vision_info
+            from unsloth_zoo.vision_utils import process_vision_info
 
             raw_images = item["images"]
             vision_infos = [{"image": raw_images[i]} for i in range(len(raw_images))]
@@ -8970,6 +9199,122 @@ def _vlm_family_divergence(expected, observed, path="batch"):
     return f"{path}: surveyed {expected!r} vs runtime {observed!r}"
 
 
+# Problem kinds already reported, so an unsupported key layout costs one message
+# per process rather than one per training step. Both trainer captures sit inside
+# the per-batch loop, so without this a run that is otherwise fine emits a warning
+# per batch. Keyed on the kind and not the rendered text: the message interpolates
+# the offending word, so a value that changes between draws would defeat both the
+# `warnings` registry and the stderr fallback below, which has no registry at all.
+# A plain set is enough here; two threads racing costs a duplicate message, never
+# a lost one.
+_reported_unrewindable_keys = set()
+
+
+def _warn_unrewindable_key(kind, message):
+    """Report a key we cannot rewind, at most once per kind, without ever raising.
+
+    Every caller reads the key *before* entering the `try` that a raise here
+    would land in: both trainer captures sit above their compile-fallback
+    `try`, and `_preserved_preprocessing_rng` captures before it yields. This
+    path is documented as declining rather than failing, so under
+    `PYTHONWARNINGS=error` (or any filter promoting RuntimeWarning) the
+    diagnostic must not become the abort it is warning about.
+
+    Not `catch_warnings` + `simplefilter`: that mutates a process-global filter
+    list, and MLX training runs these paths from more than one thread, where it
+    would briefly disarm another thread's warnings-as-errors. Falling back to
+    stderr keeps the message instead of swallowing it.
+    """
+    if kind in _reported_unrewindable_keys:
+        return
+    _reported_unrewindable_keys.add(kind)
+    try:
+        warnings.warn(message, RuntimeWarning, stacklevel = 3)
+    except Exception:
+        # A filter promoted the warning, so say it on stderr rather than lose it.
+        # Guarded too, though: stderr can be closed (a daemonised Studio backend,
+        # or a test runner tearing down its capture) or a stream whose write
+        # raises, and this helper is called ABOVE the `try` that would contain
+        # such a raise. An unreportable diagnostic must not become the abort.
+        try:
+            print(message, file = sys.stderr)
+        except Exception:
+            pass
+
+
+def _mlx_rng_key():
+    """The current MLX PRNG key as its two 32-bit words, or None if unreadable.
+
+    Unreadable covers the torch simulation shim, whose state is a callable;
+    deciding that here is what lets the restore below stay unconditional. A
+    readable key that is not two words is different: the rewind no longer works
+    on the installed mlx, and a bare None would leave every compile fallback
+    silently not restoring, so it warns once and declines.
+    """
+    try:
+        words = mx.random.state[0].tolist()
+    except Exception:
+        return None
+    if len(words) != 2:
+        _warn_unrewindable_key(
+            "word-count",
+            f"Unsloth: MLX now exposes a {len(words)}-word random key. Unsloth "
+            "can only rewind the two-word form, so a run that falls back from "
+            "mx.compile to eager will not have its RNG restored and may diverge "
+            "from an eager run of the same seed."
+        )
+        return None
+    return _as_uint32_pair(int(words[0]), int(words[1]))
+
+
+def _as_uint32_pair(high, low):
+    """Both words as uint32, or None if either is not a 32-bit word at all.
+
+    mx.random.seed takes a uint64 and raises outside [0, 2**64), and that raise
+    would land in a `finally` or a compile-failure handler. Range-checking here
+    is what lets the restore below stay unguarded.
+
+    Range-checked rather than masked, though. A negative reads as the two's
+    complement of the uint32 mlx stores, so reinterpreting it loses nothing. A
+    value at or above 2**32 is not a 32-bit word under any reading, and masking
+    it would turn a key we cannot represent into a plausible wrong one:
+    (2**32, 0) would restore as (0, 0), so the fallback would look like it had
+    rewound the RNG while actually diverging. Declining says so instead, and is
+    the outcome every caller already handles.
+    """
+    converted = []
+    for word in (high, low):
+        if not -(2**31) <= word < 2**32:
+            _warn_unrewindable_key(
+                "word-range",
+                f"Unsloth: MLX exposed a random key word of {word}, which is not "
+                "a 32-bit word. Unsloth cannot rewind this key, so a run that "
+                "falls back from mx.compile to eager will not have its RNG "
+                "restored and may diverge from an eager run of the same seed."
+            )
+            return None
+        converted.append(word & 0xFFFFFFFF)
+    return (converted[0], converted[1])
+
+
+def _restore_mlx_rng_key(words):
+    """Rewind the PRNG to a key captured by ``_mlx_rng_key``.
+
+    mlx 0.32.1 made ``mx.random.state`` a sentinel that refuses item assignment.
+    Upstream builds a key as ``{seed >> 32, (uint32) seed}``, so reseeding with a
+    key's own words restores it exactly over the whole unsigned 64-bit range.
+    Unguarded on purpose: the range check in ``_as_uint32_pair`` removes the only
+    way this can raise, and a blanket ``except`` would be a failure
+    indistinguishable from an intentional no-op, which is the defect this fixes.
+    """
+    if words is None:
+        return
+    pair = _as_uint32_pair(int(words[0]), int(words[1]))
+    if pair is None:
+        return
+    mx.random.seed((pair[0] << 32) | pair[1])
+
+
 @contextlib.contextmanager
 def _preserved_preprocessing_rng():
     """Run a block without leaving the shared preprocessing RNGs advanced.
@@ -8999,15 +9344,7 @@ def _preserved_preprocessing_rng():
             ))
         except Exception:
             pass
-    mx_state = None
-    try:
-        mx_random_state = mx.random.state
-        if isinstance(mx_random_state, list) and mx_random_state:
-            mx_state = mx.array(
-                mx_random_state[0].tolist(), dtype=mx.uint32,
-            )
-    except Exception:
-        mx_state = None
+    mx_state = _mlx_rng_key()
     try:
         yield
     finally:
@@ -9016,11 +9353,7 @@ def _preserved_preprocessing_rng():
                 restore(snapshot)
             except Exception:
                 pass
-        if mx_state is not None:
-            try:
-                mx.random.state[0] = mx_state
-            except Exception:
-                pass
+        _restore_mlx_rng_key(mx_state)
 
 
 def _vlm_file_identity(path):
@@ -12742,6 +13075,38 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     )
 
 
+def _inherit_target_permissions(tmp_file, target):
+    """Carry an existing target's access bits onto the temp file replacing it.
+
+    os.replace() installs the temp file's inode, so the destination's mode and
+    group would otherwise be dropped for whatever the temp file was created with.
+    An in-place write kept both, so without this a re-save widens a deliberately
+    restricted adapter (0600 -> 0644 under the usual umask), and in a directory
+    that is not setgid it also moves the file to the writer's primary group,
+    which is how collaborators lose access to a group-shared checkpoint.
+
+    First save has no target to inherit from; the umask default is then correct.
+
+    Only mode and group are carried. Restoring a different owner needs privileges
+    we do not have, and POSIX ACLs have no interface in the standard library, so
+    a checkpoint relying on either is outside what this can preserve.
+    """
+    try:
+        info = os.stat(str(target))
+    except OSError:
+        return  # First save, or an unreadable target; the umask default stands.
+    try:
+        # Group before mode: chown clears the setgid bit on some systems, so
+        # applying the mode afterwards is what keeps it. Owner is left alone.
+        os.chown(str(tmp_file), -1, info.st_gid)
+    except OSError:
+        pass  # Not a member of that group, or a filesystem without ownership.
+    try:
+        os.chmod(str(tmp_file), info.st_mode & 0o7777)
+    except OSError:
+        pass  # Filesystem that will not take a chmod.
+
+
 def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     # Refuse to write adapter_config.json without adapters.safetensors next
     # to it; mlx-lm reload chokes on the missing weights file.
@@ -12754,7 +13119,19 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
-    mx.save_safetensors(str(path / "adapters.safetensors"), tensors)
+    # mx.load() arrays stay file-backed, so saving over the source truncates them
+    # mid-read (mlx 0.32.1: "[read] Unable to read from file"). Re-saving into the
+    # directory an adapter came from is the ordinary switch/merge path.
+    target = path / "adapters.safetensors"
+    mx.eval(*tensors.values())
+    tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
+    try:
+        mx.save_safetensors(str(tmp_file), tensors)
+        _inherit_target_permissions(tmp_file, target)
+        os.replace(tmp_file, target)
+    except BaseException:
+        tmp_file.unlink(missing_ok=True)
+        raise
 
     adapter_config = _enrich_mlx_adapter_config(model, adapter_config or {})
     if adapter_config:
@@ -12914,17 +13291,34 @@ def save_optimizer_state(optimizer, path):
     os.makedirs(path, exist_ok=True)
     flat = dict(mlx.utils.tree_flatten(optimizer.state))
     target = f"{path}/optimizer_state.safetensors"
-    if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
-        metadata = {
-            "quantized_moment_group_size" : str(optimizer.group_size),
-            "quantized_moment_bits"       : str(optimizer.bits),
-        }
+    # load_optimizer_state() hands back mx.load()'s file-backed arrays, so checkpointing
+    # where a resume came from truncates the source under them. Write beside, replace.
+    if flat:
+        mx.eval(*flat.values())
+    # ".tmp.safetensors", not ".safetensors.tmp": mx.save_safetensors appends
+    # ".safetensors" to any path lacking it, silently writing a third file.
+    tmp_target = f"{path}/optimizer_state.tmp.safetensors"
+    try:
+        if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
+            metadata = {
+                "quantized_moment_group_size" : str(optimizer.group_size),
+                "quantized_moment_bits"       : str(optimizer.bits),
+            }
+            try:
+                mx.save_safetensors(tmp_target, flat, metadata = metadata)
+            except TypeError:
+                # backend without metadata support; fall through
+                mx.save_safetensors(tmp_target, flat)
+        else:
+            mx.save_safetensors(tmp_target, flat)
+        _inherit_target_permissions(tmp_target, target)
+        os.replace(tmp_target, target)
+    except BaseException:
         try:
-            mx.save_safetensors(target, flat, metadata = metadata)
-            return
-        except TypeError:
-            pass  # backend without metadata support; fall through
-    mx.save_safetensors(target, flat)
+            os.remove(tmp_target)
+        except OSError:
+            pass
+        raise
 
 
 def load_optimizer_state(optimizer, path):
@@ -14495,9 +14889,49 @@ def save_pretrained_merged(
             )
 
 
-def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
+def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
+    """Whether we may `pip install` a package out of this llama.cpp checkout.
+
+    Installing a local directory runs its build backend, so only a checkout we
+    manage (~/.unsloth) or one the operator named via UNSLOTH_LLAMA_CPP_PATH
+    qualifies. A CWD-relative ./llama.cpp does not: the working directory is not
+    always the operator's, and gguf is on the package index anyway.
+    """
+    from unsloth_zoo.llama_cpp import UNSLOTH_HOME
+
+    def _canonical(path):
+        # realpath so a symlinked home (or macOS' /tmp -> /private/tmp) compares
+        # equal; normcase so Windows' case-insensitive paths do too.
+        return os.path.normcase(os.path.realpath(path))
+
+    def _contains(parent, child):
+        parent = _canonical(parent)
+        # Trailing separator: "~/.unsloth-evil" is not inside "~/.unsloth".
+        # join(parent, "") keeps a root parent as "/" rather than "//".
+        return child == parent or child.startswith(os.path.join(parent, ""))
+
+    try:
+        real_folder = _canonical(llama_cpp_folder)
+        if _contains(UNSLOTH_HOME, real_folder): return True
+        # Raw and stripped: LLAMA_CPP_DEFAULT_DIR uses the variable verbatim
+        # while Studio strips it, so both spellings must read as trusted.
+        raw = os.environ.get("UNSLOTH_LLAMA_CPP_PATH") or ""
+        for operator_path in (raw, raw.strip()):
+            if operator_path and _contains(operator_path, real_folder): return True
+    except Exception:
+        # Untrusted on any error; the index fallback still installs gguf.
+        pass
+    return False
+
+
+def _install_llama_cpp_macos(llama_cpp_folder=None):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
+    if llama_cpp_folder is None:
+        # The managed checkout, not a CWD-relative "llama.cpp", so we never build
+        # or install out of whatever sits in the working directory.
+        from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
     def _clone():
         print("Unsloth: Cloning llama.cpp...")
@@ -14520,7 +14954,7 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         # Reuse the same guards the generic installer uses so a user-pointed
         # UNSLOTH_LLAMA_CPP_PATH that happens to be a non-source directory is
         # never wiped out from under the caller.
-        from ..llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
+        from unsloth_zoo.llama_cpp import _is_safe_to_delete, UNSLOTH_PREBUILT_INFO_FILENAME
         is_prebuilt_install = os.path.isfile(
             os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
         )
@@ -14535,9 +14969,11 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
-    # Install deps; prefer gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync, but only
+    # from a trusted checkout. Otherwise take the index copy, which keeps the
+    # export working without building an unvetted local package.
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-    if os.path.exists(gguf_py_dir):
+    if os.path.exists(gguf_py_dir) and _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
         subprocess.run(
             [sys.executable, "-m", "pip", "install", gguf_py_dir,
              "protobuf", "sentencepiece"],
@@ -14707,7 +15143,7 @@ def save_pretrained_gguf(
             whatever the model are refused up front (IMATRIX_REQUIRED_QUANTS);
             the rest are left to llama.cpp.
     """
-    from ..llama_cpp import (
+    from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
         quant_requires_imatrix,

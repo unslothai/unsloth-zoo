@@ -245,15 +245,40 @@ def test_the_compiled_callable_stays_reachable():
     assert hasattr(w, "get_compiler_config")
 
 
-def test_it_degrades_to_the_compiled_function_when_torch_offers_neither():
+def test_it_degrades_to_the_compiled_function_when_torch_offers_none_of_them():
     """On a torch with no such exceptions at all, wrapping buys nothing and
-    must not add a layer."""
+    must not add a layer.
+
+    All THREE families have to be absent. The wrapper now also catches Inductor
+    codegen refusals, and `_backend_compile_errors()` is non-empty on every
+    supported torch, so mocking only the two recompile families left the third
+    live and the wrapper rightly kept its layer -- this asserted "no exceptions
+    at all" while one family was still there.
+    """
     import unittest.mock as mock
+    with mock.patch.object(U, "_recompile_limit_errors", lambda: ()), \
+         mock.patch.object(U, "_disabled_hook_graph_break_error", lambda: ()), \
+         mock.patch.object(U, "_backend_compile_errors", lambda: ()):
+        sentinel = object()
+        assert U._fall_back_to_eager_on_recompile_limit(
+            sentinel, lambda: None, "x") is sentinel
+
+
+def test_backend_errors_alone_are_enough_to_keep_the_wrapper():
+    """The other half of the contract, and the reason the test above changed.
+
+    A torch that reports no recompile-limit exception and no graph-break
+    exception can still refuse to generate code, so the layer has to stay --
+    otherwise the codegen fallback would silently not exist there.
+    """
+    import unittest.mock as mock
+    if not U._backend_compile_errors():
+        pytest.skip("this torch exposes no backend compile exception")
     with mock.patch.object(U, "_recompile_limit_errors", lambda: ()), \
          mock.patch.object(U, "_disabled_hook_graph_break_error", lambda: ()):
         sentinel = object()
         assert U._fall_back_to_eager_on_recompile_limit(
-            sentinel, lambda: None, "x") is sentinel
+            sentinel, lambda: None, "x") is not sentinel
 
 
 if __name__ == "__main__":

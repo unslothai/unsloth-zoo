@@ -54,7 +54,7 @@ try:
 except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
-from ..utils import Version
+from unsloth_zoo.utils import Version
 from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger, unwrap_already_compiled
 
 EMPTY = inspect._empty
@@ -872,6 +872,16 @@ def _in_non_reentrant_checkpoint():
     `saved_tensors_hooks`/`save_on_cpu` entered inside the region sits above
     ours, so an unrecognised hook is "cannot tell from here", not "no region":
     ask the frames instead.
+
+    The walk is deliberately NOT put on `_probe_walk`'s miss budget, even though
+    `_note_compiled_ok` calls this on every successful compiled call. Budgeting
+    it means a spent budget has to answer something, and both answers are wrong
+    somewhere: False loses a compiled pack that really was under a checkpoint,
+    and None gets recorded as a possible pack, which on a generation-heavy GRPO
+    step marks uncheckpointed inference calls as packed and re-raises on the
+    first codegen refusal -- the exact failure this module exists to prevent.
+    A definite answer per call is worth the walk; the cost is instead removed by
+    not asking, see `_note_compiled_ok`.
     """
     top = _saved_tensor_hook_accessor()
     if top is not None:
@@ -1009,6 +1019,131 @@ def _disabled_hook_graph_break_error():
     if isinstance(_e, type) and issubclass(_e, BaseException):
         return (_e,)
     return ()
+
+
+def _wants_hard_backend_failure():
+    """Did the caller ask for a backend codegen failure to be fatal?
+
+    Its own switch rather than a reuse of `_wants_hard_recompile_failure`:
+    that one reads a Dynamo config flag about the recompile budget, which says
+    nothing about codegen. Off by default, so the shipped behaviour is the
+    fallback; on, so this repo's tests can assert the exception still escapes
+    and a user chasing a backend bug can see it.
+
+    `os` is imported inside the function: this module has no module-level
+    `import os`, and the read has to be live anyway, since a test that sets the
+    variable after import must still be seen.
+    """
+    import os
+    return os.environ.get("UNSLOTH_HARD_BACKEND_FAILURE", "0") == "1"
+
+
+def _is_inductor_codegen_failure(e):
+    """True only when Inductor itself refused to generate code.
+
+    `_backend_compile_errors` has to include `BackendCompilerFailed` to catch
+    the refusal on torch versions that wrap it, but that class wraps ANY
+    backend. `torch_compile_with_fallback(..., backend = custom)` is supported,
+    and swallowing a custom backend's exception would turn a configuration or
+    programming error into a silent permanent switch to eager -- the user would
+    lose both the speed and the diagnosis.
+
+    So a wrapper is only accepted when what it wraps is an Inductor error.
+    `InductorError` raised directly is accepted as itself.
+    """
+    try:
+        from torch._inductor.exc import InductorError as _inductor_error
+    except Exception:
+        _inductor_error = None
+    if _inductor_error is not None and isinstance(e, _inductor_error):
+        return True
+    # `BackendCompilerFailed` keeps the original under one of these, depending on
+    # the version; `__cause__` is the one that survives `raise ... from`.
+    for attribute in ("inner_exception", "__cause__", "__context__"):
+        inner = getattr(e, attribute, None)
+        if inner is None: continue
+        if _inductor_error is not None and isinstance(inner, _inductor_error):
+            return True
+        # 2.6-era builds raise a bare RuntimeError out of the scheduler rather
+        # than an `InductorError`, so fall back to where it was raised from.
+        module = type(inner).__module__ or ""
+        if module.startswith("torch._inductor"):
+            return True
+    # Last resort, the backend name the wrapper records. `backend_name`, not
+    # `backend`: `BackendCompilerFailed.__init__` has stored
+    # `getattr(backend_fn, "__name__", "?")` under `backend_name` on every
+    # supported version (checked in torch 2.4.0, 2.6.0, 2.9.1 and main), and
+    # `InductorError` carries `backend_name = "inductor"` as a class attribute.
+    # No torch has ever set `backend`, so reading it answered "" for every
+    # exception and this branch could never fire -- which is exactly the branch
+    # the 2.6-era bare `RuntimeError` above depends on, since its module is
+    # `builtins` and the module test cannot see Inductor in it. Verified by
+    # making `compile_fx` raise a bare `RuntimeError` under
+    # `torch.compile(backend = "inductor")` on 2.9.1: torch raises
+    # `BackendCompilerFailed` with `backend_name == "inductor"`, no `backend`
+    # attribute, and `inner_exception` a plain `builtins.RuntimeError`.
+    backend = getattr(e, "backend_name", None)
+    if backend is None: backend = getattr(e, "backend", None)
+    name = getattr(backend, "__name__", None) or (backend if isinstance(backend, str) else "")
+    return name == "inductor"
+
+
+def _backend_compile_errors():
+    """Inductor's own codegen failures, if this torch exposes them.
+
+    Categorically different from a graph break. The frame traced fine and the
+    backend then refused to generate code for the graph it was handed, so the
+    eager result is the same result and only speed is lost. A graph break means
+    Dynamo could not represent the code at all, which is a bug worth raising.
+
+    The live example is torch 2.12 refusing the ragged tail of
+    `torch.chunk(x, chunks = N)` under dynamic shapes:
+
+        InductorError: CantSplit: 202048*s47*s87 - 3434816*(((s47*s87 + 17)//18))
+        not divisible by s47*s87 - 17*(((s47*s87 + 17)//18))
+
+    which is arithmetic that is true by inspection: `202048*tail` over `tail`
+    is `202048`. A backend that cannot see that should cost speed, not end the
+    run.
+
+    Deliberately NOT claiming which torch versions answer the underlying
+    divisibility question correctly. A standalone `statically_known_multiple_of`
+    probe does not reproduce the refusal: driving it with an unbacked symint
+    answers False on 2.6 through 2.10 and on 2.12, and True only on 2.11, which
+    tracks neither the versions nor the hardware where the compile actually
+    fails. What IS measured: the same expression compiles cleanly under torch
+    2.12.1 on CPU Inductor and on an sm_100 B200, and refuses on an sm_75 T4,
+    where the reduction has to be split in the first place. So the trigger is a
+    tiling decision, not a version constant, and this net is written to catch
+    the refusal wherever it appears rather than to encode a version range.
+
+    Looked up by name, like the recompile-limit and graph-break tuples above.
+    Measured across CPU builds 2.6.0, 2.7.1, 2.8.0, 2.10.0, 2.11.0, 2.12.1 and
+    2.9.1+cu128: `InductorError` is absent on 2.6 and present from 2.7, while
+    `BackendCompilerFailed` is present on all of them, so the tuple is non-empty
+    everywhere in the supported range and the import must not be able to stop it
+    from being built.
+    """
+    found = []
+    try:
+        from torch._inductor.exc import InductorError as _inductor_error
+    except Exception:
+        pass
+    else:
+        if isinstance(_inductor_error, type) and issubclass(_inductor_error, BaseException):
+            found.append(_inductor_error)
+    try:
+        import torch._dynamo.exc as _exc
+    except Exception:
+        pass
+    else:
+        # What Dynamo wraps a backend failure in when it does not surface the
+        # Inductor class directly. Not a superset: on some versions only one of
+        # the two ever reaches the caller, so both are needed.
+        _e = getattr(_exc, "BackendCompilerFailed", None)
+        if isinstance(_e, type) and issubclass(_e, BaseException):
+            found.append(_e)
+    return tuple(found)
 
 
 def _is_recompile_limit_unsupported(exc):
@@ -1170,6 +1305,13 @@ def _restore_recompile_limits():
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0
+    # `_COMPILED_OK_LABELS` is deliberately NOT cleared here. This runs whenever
+    # the last borrowed bump is handed back, which `_release_borrowed_budget`
+    # does mid-step after a caught exception, not only at a step boundary. One
+    # wrapper releasing budget would then erase another wrapper's record of
+    # having packed compiled under a still-open checkpoint, and that wrapper's
+    # next refusal would latch eager and let its pack be recomputed eagerly.
+    # The genuine step boundary, `apply_pending_eager_fallbacks`, clears it.
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1280,6 +1422,30 @@ _PENDING_EAGER_LABELS: set = set()
 # one says "in this step", which is the question being asked.
 _RECENT_EAGER_LABELS: set = set()
 
+# Labels whose compiled callable returned at least once UNDER A CHECKPOINT,
+# SINCE THE LAST SETTLE. Both qualifiers earn their place: see `_note_compiled_ok`
+# for why an uncheckpointed compiled call must not go in here.
+# `_give_up_on_backend` reads this to decide whether going eager could
+# desynchronise a pack from its recompute, and that question is only ever about
+# the step being executed: last step's activations are long since freed. Holding
+# it per wrapper instead would answer for a step that is over, which is exactly
+# backwards -- it would re-raise on a first refusal in a later step, where
+# nothing compiled has been packed and the fallback is safe.
+_COMPILED_OK_LABELS: set = set()
+
+
+class _EagerFallbackTaken:
+    """Carries the eager result back out of the budget retry.
+
+    The retry has three outcomes, not two: it compiled and returned, it ran out
+    of road (`_NO_RESULT`), or the compiler REFUSED and the backend fallback
+    already ran the call eagerly. The third has to be distinguishable from the
+    first, because a value that came back eager must not be recorded as a
+    compiled pack, and `None` is a valid return value so no sentinel VALUE
+    works. A one-field box does."""
+    __slots__ = ("value",)
+    def __init__(self, value): self.value = value
+
 
 def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """Run eager instead of dying when the recompile cache is exhausted.
@@ -1307,7 +1473,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
-    if not errors and not graph_break_errors:
+    backend_errors = _backend_compile_errors()
+    if not errors and not graph_break_errors and not backend_errors:
         return compiled_func
 
     # Warn once. The condition repeats every call, and the log should not.
@@ -1316,6 +1483,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # it cannot be hoisted) dies with that forward and the registry holds it
     # weakly, so latching it bought nothing -- the next step compiled a fresh
     # one, borrowed again, and the bounded transition to eager never happened.
+    # Whether the compiled callable has returned is deliberately NOT held here:
+    # it lives in the module-level `_COMPILED_OK_LABELS`, which is cleared at
+    # every step boundary. See that set for why the answer has to be per step
+    # rather than per wrapper.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
              "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
 
@@ -1489,18 +1660,216 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             raise e
         return eager_func(*args, **kwargs)
 
+    def _give_up_on_backend(e, args, kwargs, marker_before):
+        """Inductor refused to generate code. Run eager, and stay there.
+
+        No budget retry: cache exhaustion is a resource problem that more
+        budget can genuinely fix, but a codegen refusal is deterministic. The
+        same graph regenerates the same failure, so retrying only pays the
+        compile twice before landing here anyway.
+
+        Only THIS label latches, unlike `_give_up`. Exhaustion is process-wide
+        and takes the other borrowers with it; a codegen refusal is a property
+        of one region's graph, so knocking unrelated regions eager would cost
+        their compilation for nothing.
+
+        The checkpoint rule from `_give_up` applies, but only when THIS wrapper
+        has actually run compiled at some point in this step. That extra
+        condition is the difference between recovering and not.
+
+        `_give_up` has to assume the worst because it latches every borrower,
+        including regions that did pack activations compiled. This path latches
+        one label, so the only pack/recompute pair that can desynchronise is
+        this function's own. Inductor refuses at compile time, so a first-call
+        refusal means this region has packed nothing compiled: the eager call
+        below packs eagerly and the backward recomputes eagerly, which agree.
+
+        The case that does need the raise is a later compile for a new dynamic
+        shape, after an earlier shape already compiled and packed. Then the pack
+        was compiled and the recompute would be eager, which either aborts or
+        returns wrong gradients, so end the step instead.
+        """
+        global _PACKED_COMPILED_IN_CHECKPOINT
+        packed = (
+            (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
+            and label in _COMPILED_OK_LABELS
+        )
+        # `_note_packed_under_checkpoint` ran before the compiled call and set
+        # the process-wide marker, but the call refused at compile time so no
+        # compiled code ran and nothing compiled was packed. Leaving the marker
+        # set would make an unrelated wrapper's `_give_up` believe this
+        # checkpoint holds a compiled pack and end the step for no reason.
+        _PACKED_COMPILED_IN_CHECKPOINT = marker_before
+        state["eager"] = True
+        _LATCHED_EAGER_LABELS.add(label)
+        # And as current-step EVIDENCE, which is a different question from the
+        # permanent latch and the reason `_latch_all_to_eager` writes both.
+        # `force_eager_fallback` deliberately refuses to read
+        # `_LATCHED_EAGER_LABELS` -- it is permanent, so a previous model's
+        # labels would answer for this one -- and falls back to asking the live
+        # wrappers. The wrapper that fails here need not be one: GRPO builds
+        # `accumulate_chunk` inside the forward, so it is collected before the
+        # backward that calls `force_eager_fallback`. With no live wrapper and
+        # no recent label the call returns 0, the caller reads that as "no
+        # compile-mode flip happened" and re-raises the very failure it was
+        # asked to retry past.
+        _RECENT_EAGER_LABELS.add(label)
+        _warn(
+            f"Unsloth: torch.compile could not generate code for {label}; "
+            f"running it eagerly from here. Training is unaffected apart from "
+            f"speed. ({type(e).__name__})"
+        )
+        if packed:
+            global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise e
+        return eager_func(*args, **kwargs)
+
+    def _is_backend_refusal_we_handle(e):
+        """The gate the wrapper's own backend arm applies, in one place."""
+        if _wants_hard_backend_failure():
+            return False
+        return _is_inductor_codegen_failure(e)
+
+    def _retry_catching_backend_refusal(args, kwargs, marker_before):
+        """`_retry_with_more_budget`, with a codegen refusal FROM THE RETRY caught.
+
+        The wrapper's `except backend_errors` arm only ever sees the first
+        `compiled_func` call. `_retry_with_more_budget` calls `compiled_func`
+        again inside its own `try`, and Python does not route an exception
+        raised inside one `except` block to a sibling `except` on the same
+        `try` -- so a refusal there escaped the wrapper entirely and ended the
+        run, which is the one outcome this whole function exists to prevent.
+        Reachable whenever a dynamic graph exhausts the recompile cache first
+        and only then exposes the refusal, once the bumped budget lets the
+        compile get as far as codegen.
+
+        The retry's own `except BaseException` has already handed the borrowed
+        bump back by the time this sees the exception, so there is nothing to
+        release here.
+        """
+        try:
+            return _retry_with_more_budget(args, kwargs)
+        except backend_errors as e:
+            if not _is_backend_refusal_we_handle(e):
+                raise
+            return _EagerFallbackTaken(
+                _give_up_on_backend(e, args, kwargs, marker_before))
+
+    def _note_compiled_ok():
+        """Record that this label packed something COMPILED in this step.
+
+        Only calls made under a non-reentrant checkpoint count. The question
+        `_give_up_on_backend` asks of this set is whether going eager now could
+        leave a compiled pack to be RECOMPUTED eagerly, and a compiled call
+        outside a checkpoint region packs nothing that is ever recomputed --
+        generation, inference, or an uncheckpointed stretch of the step. GRPO
+        is exactly that shape: it generates with the same patched kernels it
+        then trains with, so recording the generation pass made the first
+        refusal of the training pass end the step for no reason.
+
+        `None` means torch could not say -- no hook accessor before 2.8, or a
+        user's own `saved_tensors_hooks` sitting above ours -- and that has to
+        count as yes. The asymmetry is the whole point: over-recording ends a
+        step that `force_eager_fallback` retries, while under-recording
+        recomputes a compiled pack eagerly and returns wrong gradients. Same
+        conservative test `_retry_with_more_budget` uses to decide whether
+        anything is half-packed, and for the same reason.
+        """
+        global _PACKED_COMPILED_IN_CHECKPOINT
+        # The marker FIRST, because it is a plain global read and everything
+        # below it can cost a full stack walk. Written as one `and` it read
+        # `_in_non_reentrant_checkpoint() is False and not marker`, and Python
+        # evaluates the left operand first, so the probe was paid on every
+        # successful compiled call even once the marker had latched and the
+        # answer was a foregone conclusion -- on 2.4-2.7, where there is no hook
+        # accessor, that is an uncapped ~15us frame walk per compiled kernel
+        # invocation for the rest of the run.
+        if _PACKED_COMPILED_IN_CHECKPOINT:
+            _COMPILED_OK_LABELS.add(label)
+            return
+        if _dynamo_is_tracing():
+            # The accessor the probe reaches for is a pybind builtin Dynamo
+            # refuses to enter, and under `fullgraph = True` that is fatal
+            # rather than a graph break -- the failure
+            # `_note_packed_under_checkpoint` documents, which killed
+            # Gemma4_(E2B)-Vision at cell 15. This runs in the wrapper body, so
+            # a nested compiled region traces it. Nothing is lost: the answer is
+            # meaningless mid-trace, and the same wrapper is entered from eager
+            # on the call that actually packs. The marker was the only thing
+            # worth reading here and it is already known False above.
+            return
+        if torch.is_inference_mode_enabled():
+            # Inference mode saves nothing for backward, so this call cannot
+            # have packed anything that is ever recomputed and the answer is
+            # known without asking. Inference mode, NOT `is_grad_enabled()`:
+            # `autograd.Function.forward` runs with grad off and Unsloth's
+            # gradient checkpointing IS one, so grad-off is true in the exact
+            # place the record has to be made -- the same trap
+            # `_note_packed_under_checkpoint` documents.
+            return
+        if label in _COMPILED_OK_LABELS:
+            # Already recorded this step, so the probe cannot change anything.
+            # Together with the marker branch above this is what bounds the
+            # cost: a label is probed until its answer is known, not forever.
+            return
+        answer = _in_non_reentrant_checkpoint()
+        if answer is False:
+            return
+        if answer:
+            # Latch the process-wide marker too, not just this label. The
+            # pre-call probe can miss a region the post-call one then finds --
+            # on 2.4-2.7 its budget may already be spent -- and leaving the
+            # marker False lets a later refusal by this same wrapper OUTSIDE the
+            # region read `packed` as false, latch eager, and leave the compiled
+            # activations this call just packed to be recomputed eagerly, which
+            # aborts the backward or returns wrong gradients.
+            #
+            # It also makes this probe self-limiting, which is the other half of
+            # the cost fix above: once the marker is set the branch at the top
+            # short-circuits and no further call walks anything.
+            _PACKED_COMPILED_IN_CHECKPOINT = True
+        # `answer is None` falls through to here deliberately: torch could not
+        # say, and an unknown has to count as packed (see the docstring), but it
+        # must NOT latch the process-wide marker on a guess.
+        _COMPILED_OK_LABELS.add(label)
+
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
-            return compiled_func(*args, **kwargs)
+            result = compiled_func(*args, **kwargs)
+        except backend_errors as e:
+            # Before the recompile-limit clause: these are disjoint classes, but
+            # the ordering states the intent, which is that a backend refusal is
+            # never a budget problem and must not consume budget.
+            if not _is_backend_refusal_we_handle(e):
+                # Either the caller asked for a hard failure, or some other
+                # backend refused. Only Inductor's simplifier gaps are
+                # known-benign enough to run through eagerly; a custom backend
+                # raising is a configuration or programming error and hiding it
+                # would cost the user their diagnosis.
+                raise
+            return _give_up_on_backend(e, args, kwargs, marker_before)
         except errors as e:
             if _wants_hard_recompile_failure():
                 raise
-            result = _retry_with_more_budget(args, kwargs)
+            result = _retry_catching_backend_refusal(args, kwargs, marker_before)
+            if type(result) is _EagerFallbackTaken:
+                # The retry hit a codegen refusal and already ran eager. Hand
+                # that value straight back: recording it as compiled would be a
+                # lie in the direction that recomputes a pack in the wrong mode.
+                return result.value
             if result is not _NO_RESULT:
+                # The retry COMPILED and returned, so this region may now have
+                # packed compiled activations. Without this the `else:` below is
+                # never reached on the retry path and a later backend refusal in
+                # the same step would fall back to eager against a compiled pack.
+                _note_compiled_ok()
                 return result
             return _give_up(e, args, kwargs)
         except graph_break_errors as e:
@@ -1508,8 +1877,18 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # (2.4), then our own `torch.compiler.disable` hook. Anything else
             # is a real graph break and must keep raising.
             if _is_recompile_limit_unsupported(e):
-                result = _retry_with_more_budget(args, kwargs)
+                # The 2.4 route to the same place as the typed arm above, so it
+                # needs the same two things: a refusal from the retry must reach
+                # the backend fallback, and a retry that COMPILED must be
+                # recorded as having packed compiled. Neither happened here, so
+                # cache exhaustion on 2.4 followed by a codegen refusal in the
+                # same step took the opposite decision from 2.7+.
+                result = _retry_catching_backend_refusal(
+                    args, kwargs, marker_before)
+                if type(result) is _EagerFallbackTaken:
+                    return result.value
                 if result is not _NO_RESULT:
+                    _note_compiled_ok()
                     return result
                 return _give_up(e, args, kwargs)
             if not _is_our_own_disabled_hook(e):
@@ -1522,6 +1901,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 f"unaffected apart from speed."
             )
             return eager_func(*args, **kwargs)
+        else:
+            # The compiled callable returned, so anything it packed under a
+            # checkpoint is packed compiled. Only `_give_up_on_backend` reads
+            # this, to decide whether switching to eager could desynchronise a
+            # pack from its recompute.
+            _note_compiled_ok()
+            return result
 
     # Keep the compiled callable reachable for anything that unwraps it, and
     # keep `get_compiler_config` present so the unwrap check below still sees
@@ -1682,6 +2068,7 @@ def apply_pending_eager_fallbacks() -> int:
     global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
+    _COMPILED_OK_LABELS.clear()              # and a new compiled-pack history
     _settled = _settle_abandoned_checkpoint_generator()
     if _RAISED_INSIDE_CHECKPOINT and not _settled:
         # Still rooted, so its saved-tensor hooks are still on the stack and the
@@ -1727,6 +2114,11 @@ def apply_pending_eager_fallbacks() -> int:
     _LATCHED_EAGER_LABELS.update(_PENDING_EAGER_LABELS)
     _PENDING_EAGER_LABELS.clear()
     _RECENT_EAGER_LABELS.clear()
+    # A genuine settlement: everything is eager now, so the step is being
+    # abandoned and the compiled-pack history answers for nobody.
+    # `_restore_recompile_limits` deliberately does NOT do this, because it also
+    # runs mid-step when a borrower hands its bump back.
+    _COMPILED_OK_LABELS.clear()
     # Everything that borrowed headroom is eager now, so hand the budget back
     # rather than leaving the process permanently raised.
     _restore_recompile_limits()

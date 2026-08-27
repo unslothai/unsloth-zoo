@@ -689,7 +689,7 @@ def train_on_responses_only(
     # All Unsloth Zoo code licensed under LGPLv3
     if trainer is not None:
         try:
-            from .mlx.trainer import (
+            from unsloth_zoo.mlx.trainer import (
                 MLXTrainer,
                 train_on_responses_only as _mlx_train_on_responses_only,
             )

@@ -31,7 +31,7 @@ __all__ = [
 
 import functools
 from .utils import Version
-from .mlx.runtime import is_mlx_available
+from unsloth_zoo.mlx.runtime import is_mlx_available
 import inspect
 import os
 import re
