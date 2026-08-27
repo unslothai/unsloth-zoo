@@ -1470,6 +1470,58 @@ def test_norm_offsets_do_not_mutate_the_model(tmp_path):
     assert model["lm_head"] == "the real lm_head module"
 
 
+def test_norm_offsets_survive_a_zero_length_tensor(tmp_path):
+    # mx.min refuses a zero-size reduce. Letting that raise would discard every
+    # offset measured alongside it and silently drop the whole correction.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class ShiftEveryNorm:
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+
+        def sanitize(self, weights):
+            return {
+                key: (value + 1.0 if key.endswith("norm.weight") else value)
+                for key, value in weights.items()
+            }
+
+    src = tmp_path / "src"
+    _write_weights(mx, src, {
+        "model.norm.weight": mx.array([0.5, 0.25]),
+        "model.layers.0.empty_bias": mx.zeros((0,)),
+    })
+
+    assert mutils._mlx_sanitizer_norm_offsets(ShiftEveryNorm(src)) == {
+        "model.norm.weight": 1.0,
+    }
+
+
+def test_norm_offsets_replay_once_when_nothing_is_shifted(tmp_path):
+    # The confirming replay only runs when the first one found something to
+    # confirm. Sanitizers that shift nothing are the common case, and some of
+    # them dequantize the whole checkpoint on the way through.
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    calls = []
+
+    class CountingPassthrough:
+        def __init__(self, src_path):
+            self._src_path = str(src_path)
+
+        def sanitize(self, weights):
+            calls.append(len(weights))
+            return dict(weights)
+
+    src = tmp_path / "src"
+    _write_weights(mx, src, {"model.norm.weight": mx.array([0.5, 0.25])})
+
+    assert mutils._mlx_sanitizer_norm_offsets(CountingPassthrough(src)) == {}
+    assert len(calls) == 1
+
+
 class _StopAfterExportPrep(Exception):
     """Ends save_pretrained_gguf once the export prep has been observed."""
 

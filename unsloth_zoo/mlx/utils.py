@@ -14130,6 +14130,10 @@ def _mlx_constant_1d_value(value):
         return None
     if not mx.issubdtype(value.dtype, mx.floating):
         return None
+    # mx.min refuses a zero-size reduce, and one such tensor anywhere in the
+    # checkpoint would otherwise discard every offset measured alongside it.
+    if value.shape[0] == 0:
+        return None
     low = mx.min(value).item()
     if abs(low - mx.max(value).item()) > _MLX_NORM_OFFSET_TOLERANCE:
         return None
@@ -14178,15 +14182,24 @@ def _mlx_sanitizer_norm_offsets(model):
             return None
 
         zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
+        candidates = {}
+        for key, value in zeroed.items():
+            offset = _mlx_constant_1d_value(value)
+            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            candidates[key] = (value, offset)
+        if not candidates:
+            # Nothing to confirm, so skip the second replay: the sanitizers that
+            # shift nothing are the common case and some of them dequantize the
+            # whole checkpoint on the way through.
+            return {}
+
         raised = _mlx_sanitize_probe(
             model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
         )
 
         offsets = {}
-        for key, value in zeroed.items():
-            offset = _mlx_constant_1d_value(value)
-            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
-                continue
+        for key, (value, offset) in candidates.items():
             raised_value = raised.get(key)
             if getattr(raised_value, "shape", None) != value.shape:
                 continue
