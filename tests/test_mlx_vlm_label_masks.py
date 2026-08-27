@@ -3623,7 +3623,7 @@ def _prepared_grid(model_type):
 
 def test_array_grid_families_keep_an_indexable_grid():
     """These vision towers open with `grid_thw.tolist()`; tuples raise there."""
-    for model_type in ("glm4v", "glm_ocr", "muse_glimmer"):
+    for model_type in ("glm4v", "glm_ocr", "muse_glimmer", "glm5_next"):
         grid = _prepared_grid(model_type)["image_grid_thw"]
         assert isinstance(grid, mx.array), model_type
         assert grid.tolist() == [[1, 16, 16]], model_type
@@ -3634,6 +3634,29 @@ def test_compile_patched_families_keep_the_traceable_tuple_grid():
     for model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "paddleocr_vl"):
         grid = _prepared_grid(model_type)["image_grid_thw"]
         assert grid == ((1, 16, 16),), model_type
+
+
+def _prepared_positions(model_type):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    return _prepare_vlm_batch_for_compile({
+        "input_ids": mx.array([[1, 5, 5, 5, 5, 2]], dtype=mx.int32),
+        "attention_mask": mx.array([[1] * 6], dtype=mx.int32),
+        "image_grid_thw": mx.array([[1, 4, 4]], dtype=mx.int32),
+    }, {"model_type": model_type, "image_token_id": 5, "video_token_id": 6,
+        "vision_config": {"spatial_merge_size": 2}})
+
+
+def test_qwen_mrope_families_get_pipeline_built_position_ids():
+    """Without them the decoder falls back to mlx-vlm's `get_rope_index`, which
+    calls `.item()` on grid entries the pipeline hands it as plain ints."""
+    for model_type in ("qwen2_vl", "qwen3_vl", "qwen3_5", "qwen4_exp"):
+        prepared = _prepared_positions(model_type)
+        assert prepared["_unsloth_collated_position_ids"] is True, model_type
+        assert np.asarray(prepared["position_ids"]).shape == (3, 1, 6), model_type
+
+    # GLM-5.x reaches its vision grid directly instead, so it must not be here.
+    assert "position_ids" not in _prepared_positions("glm5_next")
 
 
 # --- audio alignment from stated spans, for families whose run carries no id ---
