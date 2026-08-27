@@ -14217,11 +14217,20 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
+    # Pre-fold text-tower names. Key-gated sanitizers (Qwen3.5) shift only under
+    # these, so they are what lets the replay recover the shift from an
+    # already-converted MLX checkpoint, where the measurement comes back bare.
+    if name.startswith("language_model.model."):
+        suffix = name[len("language_model.model."):]
+        add(f"model.language_model.{suffix}")
+    if name.startswith("language_model.lm_head"):
+        add(name[len("language_model."):])
+
     add(name)
     return candidates
 
 
-def _vlm_gguf_tensor_candidates(name, tensor):
+def _vlm_gguf_tensor_candidates(name, tensor, norm_offset=1.0):
     """Yield HF-layout tensor candidates for an MLX VLM tensor."""
     candidates = []
     shape = getattr(tensor, "shape", ())
@@ -14233,8 +14242,8 @@ def _vlm_gguf_tensor_candidates(name, tensor):
     elif len(shape) == 3 and "depthwise_conv1d.weight" in name:
         candidates.append(mx.transpose(tensor, (0, 2, 1)))
 
-    if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
-        candidates.append(tensor - 1)
+    if norm_offset and len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
+        candidates.append(tensor - norm_offset)
 
     candidates.append(tensor)
     return candidates
@@ -14291,13 +14300,15 @@ def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
     return sanitize_steps
 
 
-def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
+def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps, norm_offset=1.0):
     """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
     if not _has_vlm_gguf_rewrite_candidate(name, tensor):
         return name, tensor, False
 
     for candidate_name in _vlm_gguf_name_candidates(name):
-        for candidate_tensor in _vlm_gguf_tensor_candidates(name, tensor):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(
+            name, tensor, norm_offset
+        ):
             for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
                 sanitized = _apply_mlx_vlm_sanitizers(
                     pipeline,
@@ -14319,6 +14330,118 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
                 return candidate_name, candidate_tensor, True
 
     return name, tensor, False
+
+
+_MLX_NORM_OFFSET_TOLERANCE = 1e-6
+_MLX_NORM_OFFSET_PROBE = 1.0
+
+
+def _mlx_norm_offset_probe(weights, fill):
+    """Replace every 1-D float weight with ``fill``, passing the rest through.
+
+    Keys, shapes and dtypes survive, and every real sanitizer gate reads only
+    those, so the replay reproduces the gate while carrying a value we chose.
+    """
+    return {
+        key: (
+            mx.zeros(value.shape, dtype=value.dtype) + fill
+            if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating)
+            else value
+        )
+        for key, value in weights.items()
+    }
+
+
+def _mlx_constant_1d_value(value):
+    """Return the single value a 1-D float array holds, or None if it varies."""
+    if getattr(value, "ndim", None) != 1:
+        return None
+    if not mx.issubdtype(value.dtype, mx.floating):
+        return None
+    # mx.min refuses a zero-size reduce, and the raise would discard every
+    # offset measured alongside this one.
+    if value.shape[0] == 0:
+        return None
+    low = mx.min(value).item()
+    high = mx.max(value).item()
+    # A sanitizer dividing by a weight the probe zeroed returns inf or NaN, and
+    # NaN fails every comparison, so the spread check below would read it as
+    # constant and the export would subtract it into a real weight.
+    if not math.isfinite(low) or not math.isfinite(high):
+        return None
+    if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
+        return None
+    return low
+
+
+def _mlx_sanitize_probe(model, weights):
+    """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
+
+    Sanitizers are not pure: phi4mm caches its split LoRA weights on the
+    instance and gemma3_text pops the ``lm_head`` submodule for a tied
+    checkpoint, so measuring on the model itself would rebuild it out of the
+    probe halfway through an export. A model that cannot be copied is left
+    unmeasured; the caller treats that as unmeasurable, which is what the export
+    did before this existed.
+    """
+    return copy.copy(model).sanitize(weights)
+
+
+def _mlx_sanitizer_norm_offsets(model):
+    """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
+
+    The MTP families shift RMSNorm weights by +1 on load, gated on the source
+    checkpoint's contents rather than the model class, so replay the real
+    sanitizer over two probes -- 1-D floats all zero, then all one -- and keep a
+    key only where the output rose by the difference. Rising is what makes the
+    constant an ADDED one, so a sanitizer that invents a 1-D tensor the source
+    never held (Inkling's expert scales) or transforms one non-additively is
+    rejected. None means unmeasurable, not unshifted.
+    """
+    src_path = _get_src_path(model)
+    sanitize = getattr(model, "sanitize", None)
+    if src_path is None or not callable(sanitize):
+        return None
+
+    try:
+        weights = {}
+        for weight_file in sorted(Path(src_path).glob("*.safetensors")):
+            weights.update(mx.load(str(weight_file)))
+        if not weights:
+            return None
+
+        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
+        candidates = {}
+        for key, value in zeroed.items():
+            offset = _mlx_constant_1d_value(value)
+            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            candidates[key] = (value, offset)
+        if not candidates:
+            # Nothing to confirm. Shifting nothing is the common case, so skip
+            # the second replay rather than pay for it on every model.
+            return {}
+
+        raised = _mlx_sanitize_probe(
+            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        )
+
+        offsets = {}
+        for key, (value, offset) in candidates.items():
+            raised_value = raised.get(key)
+            if getattr(raised_value, "shape", None) != value.shape:
+                continue
+            delta = _mlx_constant_1d_value(raised_value - value)
+            if delta is None:
+                continue
+            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+                continue
+            offsets[key] = offset
+    except Exception as exc:
+        print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
+        return None
+
+    return offsets
 
 
 def _sync_gguf_nextn_layer_config(config, model):
@@ -14374,8 +14497,12 @@ def _sync_gguf_nextn_layer_config(config, model):
     return changed
 
 
-def _prepare_vlm_gguf_export_directory(path, model=None):
-    """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
+def _prepare_mlx_gguf_export_directory(path, model=None, replay_sanitizers=True):
+    """Restore HF tensor names, layouts and norm convention in the export dir.
+
+    ``replay_sanitizers`` gates the mlx-vlm name/layout inversion, VLM-only; the
+    norm correction runs for every model.
+    """
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -14383,8 +14510,13 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
     with open(config_path, "r") as f:
         config = json.load(f)
     config_changed = _sync_gguf_nextn_layer_config(config, model)
-    sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
-    if not sanitize_steps:
+    sanitize_steps = (
+        _build_mlx_vlm_sanitize_pipelines(config, model=model)
+        if replay_sanitizers
+        else []
+    )
+    norm_offsets = _mlx_sanitizer_norm_offsets(model)
+    if not sanitize_steps and not norm_offsets:
         if config_changed:
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=4)
@@ -14397,12 +14529,25 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
         updated = {}
         file_rewritten = 0
         for name, tensor in tensors.items():
+            original_tensor = tensor
+            # An empty measurement is ambiguous: an already-converted MLX
+            # source shifts nothing at load yet still holds shifted norms.
+            offset = 1.0 if not norm_offsets else norm_offsets.get(name, 0.0)
             new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
-                name, tensor, sanitize_steps
+                name, tensor, sanitize_steps, offset
             )
+            # The replay cannot observe a gate that spans the whole checkpoint,
+            # so a value it left alone is one the measurement has to recover.
+            if (
+                norm_offsets
+                and offset
+                and _mlx_arrays_match(tensor, original_tensor)
+            ):
+                tensor = tensor - offset
+                changed = True
             if new_name in updated:
                 raise RuntimeError(
-                    f"Unsloth: duplicate tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
             updated[new_name] = tensor
             name_map[name] = new_name
@@ -14425,7 +14570,7 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
             new_name = name_map.get(name, name)
             if new_name in weight_map:
                 raise RuntimeError(
-                    f"Unsloth: duplicate index tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate index tensor name after GGUF rewrite: {new_name}"
                 )
             weight_map[new_name] = shard
         index_data["weight_map"] = dict(sorted(weight_map.items()))
@@ -15247,13 +15392,14 @@ def save_pretrained_gguf(
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
-        if is_vlm_model:
-            rewritten = _prepare_vlm_gguf_export_directory(tmp_path, model=model)
-            if rewritten:
-                print(
-                    "Unsloth: Rewrote "
-                    f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
-                )
+        rewritten = _prepare_mlx_gguf_export_directory(
+            tmp_path, model=model, replay_sanitizers=is_vlm_model
+        )
+        if rewritten:
+            print(
+                f"Unsloth: Rewrote {rewritten} MLX tensors "
+                "for llama.cpp GGUF export."
+            )
 
         # Restore architectures from the original HF config since mlx-vlm's
         # save_config strips that key. convert_to_gguf reconciles MTP metadata

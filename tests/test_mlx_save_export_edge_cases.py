@@ -297,7 +297,7 @@ def test_sanitize_missing_method_returns_weights_unchanged():
     assert mutils._call_mlx_vlm_sanitize(NoSanitize, {}, weights) is weights
 
 
-# --- Group 4: _prepare_vlm_gguf_export_directory end-to-end (real shards) ---
+# --- Group 4: _prepare_mlx_gguf_export_directory end-to-end (real shards) ---
 
 
 class _ConvAndRenameSanitizer:
@@ -379,7 +379,7 @@ def test_prepare_export_rewrites_real_shards_and_index(monkeypatch, tmp_path):
         },
     )
 
-    rewritten = mutils._prepare_vlm_gguf_export_directory(out)
+    rewritten = mutils._prepare_mlx_gguf_export_directory(out)
     assert rewritten == 1
 
     shard1 = _read_shard(out / "model-00001-of-00002.safetensors")
@@ -435,7 +435,7 @@ def test_prepare_export_restores_stripped_multimodal_namespaces_and_index(
         index={"metadata": {"total_size": 123}, "weight_map": weight_map},
     )
 
-    assert mutils._prepare_vlm_gguf_export_directory(out) == len(tensors)
+    assert mutils._prepare_mlx_gguf_export_directory(out) == len(tensors)
 
     shard = _read_shard(out / shard_name)
     expected_names = {f"model.{name}" for name in tensors}
@@ -476,7 +476,7 @@ def test_prepare_export_duplicate_rewrite_name_raises(monkeypatch, tmp_path):
         },
     )
     with pytest.raises(RuntimeError, match="duplicate tensor name"):
-        mutils._prepare_vlm_gguf_export_directory(out)
+        mutils._prepare_mlx_gguf_export_directory(out)
 
 
 def test_prepare_export_missing_index_is_fine(monkeypatch, tmp_path):
@@ -497,7 +497,7 @@ def test_prepare_export_missing_index_is_fine(monkeypatch, tmp_path):
             },
         },
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 1
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 1
     assert not (out / "model.safetensors.index.json").exists()
 
 
@@ -511,7 +511,7 @@ def test_prepare_export_no_shards_returns_zero(monkeypatch, tmp_path):
     out = _export_dir_with_shards(
         tmp_path, config={"model_type": "fake_vlm"}, shards={}
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 0
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 0
 
 
 def test_prepare_export_unicode_shard_filename(monkeypatch, tmp_path):
@@ -532,7 +532,7 @@ def test_prepare_export_unicode_shard_filename(monkeypatch, tmp_path):
             },
         },
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 1
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 1
     assert list(_read_shard(out / "模型-shard.safetensors")) == [
         "visual.embed.weight"
     ]
@@ -1398,7 +1398,7 @@ def test_prepare_export_accepts_string_path(monkeypatch, tmp_path):
         lambda config, model=None: [],
     )
     out = _export_dir_with_shards(tmp_path, config={"model_type": "t"}, shards={})
-    assert mutils._prepare_vlm_gguf_export_directory(str(out)) == 0
+    assert mutils._prepare_mlx_gguf_export_directory(str(out)) == 0
 
 
 def test_repair_with_backslash_path_string_returns_processor_unchanged():
