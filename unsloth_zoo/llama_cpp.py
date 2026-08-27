@@ -2836,13 +2836,15 @@ def convert_to_gguf(
 pass
 
 
-# Quants whose ftype default type tensor_requires_imatrix rejects (llama.cpp src/llama-quant.cpp).
-# iq3_xs is excluded deliberately: it defaults to IQ3_S and reaches IQ3_XXS only through the
-# attention and FFN overrides, so refusing it would reject models lacking those tensors.
+# Quants that tensor_requires_imatrix rejects for any transformer (llama.cpp src/llama-quant.cpp),
+# measured with `llama-quantize --dry-run` against a real Llama-3.2-1B rather than read off the
+# ftype defaults. iq3_xs belongs here even though its ftype default (IQ3_S) needs no imatrix: the
+# attention Q/K overrides promote to IQ3_XXS unconditionally, so it fails on blk.0.attn_k.weight.
+# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s, tq1_0 and tq2_0 quantize fine without one.
 IMATRIX_REQUIRED_QUANTS = frozenset((
     "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
     "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
-    "iq3_xxs",
+    "iq3_xxs", "iq3_xs",
     "q2_k_s",
 ))
 

@@ -14697,6 +14697,11 @@ def save_pretrained_gguf(
         None: "q8_0",
     }
     quant_type = quant_map.get(quantization_method, quantization_method)
+    # Normalize once, here, so every later comparison against quant_type / first_conversion agrees.
+    # llama-quantize accepts either spelling, but the "is this a direct conversion" test below and
+    # the one gating llama-quantize further down used to compare differently-normalized values, so
+    # a caller passing "Q4_K_M" had the imatrix discarded from a run that then went ahead without it.
+    quant_type = str(quant_type).strip().lower()
 
     # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
     if quant_requires_imatrix(quant_type) and not imatrix_file:
@@ -14719,13 +14724,14 @@ def save_pretrained_gguf(
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
+    else:
+        first_conversion = str(first_conversion).strip().lower()
 
     # llama-quantize below runs only when the target differs from the direct conversion; without
     # it an imatrix has nothing to weight, so drop it rather than resolve an unusable one. The
     # comparison is case-insensitive because the converter accepts either spelling.
-    target = str(quant_type).strip().lower()
     if imatrix_file and (
-        target in ("bf16", "f16", "f32") or str(first_conversion).strip().lower() == target
+        quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
     ):
         warnings.warn(
             f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "

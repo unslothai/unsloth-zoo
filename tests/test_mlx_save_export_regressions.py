@@ -2265,22 +2265,56 @@ def test_a_direct_conversion_drops_the_imatrix_instead_of_resolving_it(
     with pytest.warns(UserWarning, match="ignoring imatrix_file"):
         _export(tmp_path / "out", quantization_method=quantization_method, imatrix_file=True)
 
-    # Resolution was reached with None, so no repo lookup happened, and llama-quantize -- which
-    # only the uppercase spelling still reaches -- is handed no imatrix either way.
+    # Resolution was reached with None, so no repo lookup happened. quant_type is normalized before
+    # either comparison, so "BF16" is a direct conversion like the others and llama-quantize is not
+    # reached at all -- it no longer degenerates into a BF16 -> BF16 requantize.
     assert seen["arg"] is None
+    assert "quantize" not in calls
     assert calls.get("quantize", {}).get("imatrix") is None
 
 
-# Left: needs an imatrix for every model. Right: some model can produce it without one, so
-# refusing up front would reject an export that works -- iq3_xs is on the right for that reason.
+# The drop guard predicts whether llama-quantize will run. It has to agree with the condition that
+# actually gates it, or the imatrix is discarded from a run that then goes ahead without one. These
+# spellings differ only in case/whitespace from the intermediate, which llama-quantize accepts.
+@pytest.mark.parametrize("first_conversion", ["Q4_K_M", " q4_k_m ", "q4_k_m"])
+def test_a_case_variant_intermediate_does_not_silently_discard_the_imatrix(
+    monkeypatch, tmp_path, first_conversion
+):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    calls = _stub_gguf_export(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        llama_cpp, "resolve_imatrix_file",
+        lambda imatrix_file, **k: None if imatrix_file is None else "/tmp/imatrix.gguf",
+    )
+
+    with pytest.warns(UserWarning, match="ignoring imatrix_file"):
+        _export(
+            tmp_path / "out", quantization_method="q4_k_m",
+            first_conversion=first_conversion, imatrix_file=True,
+        )
+
+    # Target and intermediate are the same quant however it is spelled, so the warning is honest:
+    # llama-quantize really is skipped. It must not be reached with the imatrix thrown away.
+    assert "quantize" not in calls
+
+
+# Left: needs an imatrix. Right: quantizes without one. Measured, not read off the ftype defaults:
+# `llama-quantize --dry-run <bf16.gguf> /dev/null <quant>` on a real Llama-3.2-1B prints
+# "will require an imatrix!" for exactly the left column.
+#
+# iq3_xs is on the LEFT despite its ftype defaulting to IQ3_S, because the attention Q/K overrides
+# in llama_tensor_get_type_impl promote to IQ3_XXS with no has_imatrix check. A real export fails on
+# blk.0.attn_k.weight -- the first block -- so leaving it off the list buys nothing and costs the
+# user the whole merge and BF16 conversion first, which is the failure this guard exists to prevent.
 @pytest.mark.parametrize(
     "quant, required",
     [(q, True) for q in (
         "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
-        "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m", "iq3_xxs", "q2_k_s",
+        "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m", "iq3_xxs", "iq3_xs", "q2_k_s",
     )] + [(q, False) for q in (
-        "iq3_xs", "iq3_s", "iq3_m", "iq4_nl", "iq4_xs",
-        "q2_k", "q4_k_m", "q8_0", "bf16", "f16",
+        "iq3_s", "iq3_m", "iq4_nl", "iq4_xs",
+        "q2_k", "q3_k_s", "tq1_0", "tq2_0", "q4_k_m", "q8_0", "bf16", "f16",
     )],
 )
 def test_quant_requires_imatrix_matches_llama_cpp(quant, required):
@@ -2291,7 +2325,7 @@ def test_quant_requires_imatrix_matches_llama_cpp(quant, required):
 
 
 # llama.cpp's tensor_requires_imatrix rejects every one of these outright (src/llama-quant.cpp).
-@pytest.mark.parametrize("quant", ["iq1_s", "iq2_xxs", "iq2_m", "iq3_xxs", "q2_k_s"])
+@pytest.mark.parametrize("quant", ["iq1_s", "iq2_xxs", "iq2_m", "iq3_xxs", "iq3_xs", "q2_k_s"])
 def test_imatrix_only_quants_are_refused_before_the_merge(monkeypatch, tmp_path, quant):
     calls = _stub_gguf_export(monkeypatch, tmp_path)
 
@@ -2302,9 +2336,9 @@ def test_imatrix_only_quants_are_refused_before_the_merge(monkeypatch, tmp_path,
     assert not (tmp_path / "out").exists(), "a refused export must not leave a directory behind"
 
 
-# The counterpart: each of these is reachable without an imatrix for some model, so the export
-# must run rather than be refused.
-@pytest.mark.parametrize("quant", ["iq3_xs", "iq4_xs", "iq4_nl", "iq3_s", "iq3_m", "q4_k_m"])
+# The counterpart: each of these quantizes without an imatrix, so the export must run rather than
+# be refused. llama.cpp may still warn that quality suffers -- that is its call to make, not ours.
+@pytest.mark.parametrize("quant", ["iq4_xs", "iq4_nl", "iq3_s", "iq3_m", "q2_k", "q4_k_m"])
 def test_quants_not_refused_up_front(monkeypatch, tmp_path, quant):
     calls = _stub_gguf_export(monkeypatch, tmp_path)
 
