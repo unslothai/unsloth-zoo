@@ -545,30 +545,19 @@ if not _SKIP_GPU_INIT:
     del os, warnings, re
 
 
-# Device constants under UNSLOTH_ZOO_DISABLE_GPU_INIT.
+# Device constants under UNSLOTH_ZOO_DISABLE_GPU_INIT. The MLX branch sets these
+# four eagerly and the normal path imports them from `.device_type`; the skip
+# branch did neither, so `from . import DEVICE_TYPE` (compiler.py) raised.
 #
-# The MLX branch near the top sets these four eagerly, and the normal path
-# imports them from `.device_type`. The opt-in skip branch did neither, so
-# `from unsloth_zoo import DEVICE_TYPE` raised ImportError there -- and
-# `unsloth_zoo/compiler.py` does exactly that on line 58, which is how the
-# security-audit lane lost `tests/security/test_compile_model_type_sink_guard.py`
-# at collection. The skip was only ever meant to defer work, not to leave the
-# package half-defined.
+# Lazy, not a top-level import: `.device_type` costs ~1.4s and pulls in torch,
+# and the download-only child the flag exists for never reads a constant.
 #
-# Resolved lazily rather than eagerly on purpose: importing `.device_type`
-# costs ~1.4s and pulls torch into the process, and the download-only child
-# (hf_xet_fallback) that the flag exists for never reads one of these. Import
-# stays at ~20ms for that child and the constants are still there for anything
-# that actually asks.
+# PEP 562: __getattr__ runs only when normal lookup fails, so the MLX and normal
+# paths, where all four are real globals, are unaffected.
 #
-# PEP 562 semantics: consulted only when normal attribute lookup fails, so on
-# the MLX and normal paths -- where all four are real globals -- this never
-# runs, and `from . import DEVICE_TYPE` goes through it unchanged.
-#
-# No CPU fallback here. A driverless host is expected to opt in with
-# UNSLOTH_ALLOW_CPU=1, which `get_device_type` already honours by returning the
-# "cuda" sentinel; inventing a "cpu" value instead would fall through every
-# branch in compiler.py, none of which has a cpu arm.
+# No "cpu" fallback: compiler.py has cuda/hip/xpu arms only, so "cpu" would fall
+# through all three. Driverless hosts opt in with UNSLOTH_ALLOW_CPU=1, which
+# `get_device_type` honours by returning the "cuda" sentinel.
 _LAZY_DEVICE_CONSTANTS = frozenset((
     "DEVICE_TYPE",
     "DEVICE_TYPE_TORCH",

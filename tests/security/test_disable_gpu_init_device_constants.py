@@ -3,25 +3,16 @@
 
 """`UNSLOTH_ZOO_DISABLE_GPU_INIT=1` must leave the package fully defined.
 
-This lane sets that flag (see `.github/workflows/security-audit.yml`) so
-`import unsloth_zoo` skips the device init that would otherwise demand
-`unsloth` be installed in a supply-chain-hygiene job. The skip branch used to
-define none of the four device constants that the MLX branch defines eagerly
-and the normal path imports from `.device_type`, so `from unsloth_zoo import
-DEVICE_TYPE` raised ImportError -- which `unsloth_zoo/compiler.py` does at
-import time, taking `test_compile_model_type_sink_guard.py` out at COLLECTION.
-A whole security test module stopped running and the lane reported it as one
-red rather than as missing coverage.
+The security-audit lane sets that flag, and the skip branch used to define none
+of the four device constants, so `from . import DEVICE_TYPE` in compiler.py
+raised at import time and took a whole security module out at COLLECTION.
 
-Two properties, and the second is the one that rots quietly. The constants have
-to be reachable, and reaching them has to stay lazy: resolving `.device_type`
-costs ~1.4s and pulls torch into the process, and the download-only child that
-this flag exists for never reads one. Someone "simplifying" the resolver into a
-top-level import would satisfy the first test and silently undo the reason the
-flag is there at all, so the torch check below is not decoration.
+Two properties: the constants must be reachable, and reaching them must stay
+lazy (`.device_type` costs ~1.4s and pulls in torch, and the download-only child
+this flag exists for never reads one). Hence the torch checks below.
 
-Everything runs in a subprocess: both properties are about what happens during
-`import unsloth_zoo`, and this process has already imported it.
+Everything runs in a subprocess, since both properties are about what happens
+during `import unsloth_zoo` and this process already imported it.
 """
 
 from __future__ import annotations
@@ -44,15 +35,12 @@ _NAMES = ("DEVICE_TYPE", "DEVICE_TYPE_TORCH", "DEVICE_COUNT", "ALLOW_PREQUANTIZE
 def _public_upper_names(body) -> set:
     """Module-level UPPER_CASE names bound by a branch of `__init__.py`.
 
-    Descends into nested `if`s, because those still bind at module level when
-    the branch is taken, but not into `def`/`class`, whose locals do not.
+    Descends into nested `if`s (still module-level bindings) but not `def`/`class`.
 
-    Annotated assignment counts. `device_type.py` declares these very constants
-    as `DEVICE_TYPE : str = get_device_type()`, so a fifth one arriving in the
-    MLX branch in that style is the likely shape, and reading only `ast.Assign`
-    would miss it, shrink the intersection back to four and let this file pass
-    while the skip path is short a name. Unpacked targets count for the same
-    reason. A bare `X: int` with no value only annotates and binds nothing.
+    Annotated assignment and unpacked targets count: `device_type.py` uses
+    `DEVICE_TYPE : str = ...`, and a binding form we miss shrinks the
+    intersection, letting the contract test pass while the skip path is short a
+    name. A bare `X: int` with no value binds nothing.
     """
     found = set()
     stack = list(body)
@@ -81,12 +69,10 @@ def _public_upper_names(body) -> set:
 def _cross_path_contract() -> set:
     """Names that BOTH the MLX branch and the normal path bind at module level.
 
-    A name bound on only one path is that path's private business:
-    `UNSLOTH_ZOO_IS_PRESENT` is MLX-only (the normal path sets just the
-    environment variable), `IS_HIP_RUNTIME` and the torch-version flags are
-    normal-only. Neither kind is read off the package root anywhere. The
-    intersection is the set every path genuinely promises, and it is therefore
-    the set the skip path has to keep reachable.
+    A name bound on only one path (`UNSLOTH_ZOO_IS_PRESENT` is MLX-only,
+    `IS_HIP_RUNTIME` normal-only) is that path's private business and is not read
+    off the package root. The intersection is what every path promises, so it is
+    what the skip path has to keep reachable.
     """
     tree = ast.parse(INIT_PY.read_text(encoding = "utf-8"))
     mlx, normal = set(), set()
@@ -106,8 +92,8 @@ def _cross_path_contract() -> set:
 def _run(code: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
-    # A CI runner has no accelerator; this is the sentinel `get_device_type`
-    # already honours, and is what `tests/conftest.py` sets for the same reason.
+    # CI runners have no accelerator; `get_device_type` honours this sentinel,
+    # and `tests/conftest.py` sets it for the same reason.
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
@@ -142,8 +128,8 @@ def test_the_module_that_actually_broke_imports():
 def test_importing_the_package_does_not_pull_in_torch():
     """The skip stays a skip: torch is not imported until a constant is read.
 
-    Fails if the lazy resolver is ever replaced by a top-level
-    `from .device_type import ...`, which would pass every test above.
+    Fails if the lazy resolver becomes a top-level `from .device_type import
+    ...`, which would pass every test above.
     """
     result = _run(
         "import sys\n"
@@ -189,15 +175,9 @@ def test_an_unknown_attribute_still_raises_attribute_error():
 def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
     """The contract is DERIVED from `__init__.py`, not restated here.
 
-    The bug this file exists for was a hardcoded assumption about which names
-    the skip path needs, made in a workflow comment in #1089 and falsified
-    three days later by an ordinary new test in #1108. Hardcoding the same
-    assumption in the resolver would leave the identical trap: add a fifth
-    constant to the MLX branch and the normal path, and the skip path silently
-    lacks it again with nothing to notice.
-
-    So this reads the three branches out of the source. If the cross-path
-    contract grows, this fails until the resolver is extended to match.
+    A hardcoded list of names is the trap that caused the original bug: add a
+    fifth constant to the MLX branch and the normal path, and the skip path
+    silently lacks it. Reading the branches from source fails loudly instead.
     """
     contract = _cross_path_contract()
     assert contract == set(_NAMES), (
@@ -221,9 +201,8 @@ def test_the_skip_path_covers_every_name_the_other_two_paths_promise():
 def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
     """The derivation is only as good as the binding forms it recognises.
 
-    A form it cannot see shrinks the intersection instead of growing it, so the
-    contract test passes while the skip path is missing a name -- the exact
-    failure mode this file was written to close.
+    A missed form shrinks the intersection rather than growing it, so the
+    contract test passes while the skip path is missing a name.
     """
     assert "NEW_CONST" in _public_upper_names(ast.parse(snippet).body), snippet
 
