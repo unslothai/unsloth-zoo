@@ -205,15 +205,12 @@ H, V = 4, 32
 
 @pytest.fixture(scope="module")
 def vlm():
-    """The one test here that needs a real 4-bit VLM, or a skip saying why not.
+    """The one test needing a real 4-bit VLM, or a skip saying why not.
 
-    Building it is a third-party download plus a transformers processor lookup,
-    both outside anything NEFTune touches, and both able to fail on a runner for
-    reasons this branch cannot fix: conftest redirects HF_HOME to a fresh tmp dir
-    per session, and the mlx-community repo's processor has to be resolvable by
-    the installed transformers. A skip names that; an error would report it as a
-    NEFTune failure. Scoped to construction only, so a real regression in the
-    probe still fails loudly below.
+    Building it is a cold download plus a transformers processor lookup, both
+    outside anything NEFTune touches and both able to fail on a runner this
+    branch cannot fix. Scoped to construction, so a real probe regression still
+    fails loudly.
     """
     from unsloth_zoo.mlx.loader import FastMLXModel
     try:
