@@ -1316,10 +1316,10 @@ def test_gguf_export_unshifts_an_already_converted_source(tmp_path, source_conve
 
 
 def test_gguf_export_removes_a_measured_offset_that_is_not_one(tmp_path):
-    # The export threads the MEASURED offset into the replay candidates. A
-    # hardcoded ``- 1`` reproduces every 1.0 case, so pin a shift that is not
-    # 1.0: there the wrong constant makes no candidate round-trip, and the
-    # tensor keeps its MLX name and never reaches the export at all.
+    # The export threads the MEASURED offset into the replay candidates, and a
+    # hardcoded ``- 1`` reproduces every 1.0 case. Pin a shift that is not 1.0:
+    # there the wrong constant makes no candidate round-trip, so the tensor
+    # keeps its MLX name and never reaches the export.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -1472,21 +1472,17 @@ def test_norm_offsets_do_not_mutate_the_model(tmp_path):
 
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16", "float32"])
 def test_already_converted_recovery_is_exact_in_low_precision(tmp_path, dtype_name):
-    # The recovery offers ``tensor - 1.0`` and accepts it only if replaying the
-    # sanitizer reproduces the stored tensor EXACTLY. That looks fragile --
-    # ``(t - c) + c == t`` is not a floating-point identity in general -- but
-    # the stored tensor is itself ``source + c`` computed in this same dtype,
-    # and over every finite bfloat16 and float16 value the only sources that
-    # fail are |source| = 258 and 2050 respectively. So the exact check is
-    # right and must not be loosened into a tolerance, which would let a
-    # near-miss candidate through.
+    # The recovery accepts ``tensor - 1.0`` only if replaying the sanitizer
+    # reproduces the stored tensor EXACTLY. ``(t - c) + c == t`` is not a
+    # floating-point identity, but the stored tensor is itself ``source + c`` in
+    # this dtype, and across every finite bfloat16 and float16 value the only
+    # sources that fail are |source| = 258 and 2050. So the exact check is right
+    # and must not be loosened into a tolerance.
     #
-    # Values here span the range the shifting families actually occupy: the
-    # published Qwen3-Next input_layernorm runs -0.154 to 0.781. A |source|
-    # above 1 is a different matter -- 1.8984375 + 1 does not fit bfloat16 and
-    # the low bit is gone before Unsloth sees the checkpoint at all -- so the
-    # recovery returns what mlx-lm's load left, which is what upstream
-    # inference runs on too.
+    # These values span the range the shifting families occupy (the published
+    # Qwen3-Next input_layernorm runs -0.154 to 0.781). Above |source| = 1 the
+    # low bit is gone before Unsloth sees the checkpoint, so the recovery
+    # returns what mlx-lm's load left, which is what inference runs on too.
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx

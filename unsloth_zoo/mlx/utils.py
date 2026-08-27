@@ -13986,10 +13986,9 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
-    # Pre-fold text-tower names. Sanitizers that decide the RMSNorm shift from
-    # the key, as the Qwen3.5 family does, only apply it under these, so they
-    # are what lets the replay recover the shift from an already-converted MLX
-    # checkpoint, where nothing was shifted at load and the measurement is bare.
+    # Pre-fold text-tower names. Key-gated sanitizers (Qwen3.5) shift only under
+    # these, so they are what lets the replay recover the shift from an
+    # already-converted MLX checkpoint, where the measurement comes back bare.
     if name.startswith("language_model.model."):
         suffix = name[len("language_model.model."):]
         add(f"model.language_model.{suffix}")
@@ -14109,10 +14108,8 @@ _MLX_NORM_OFFSET_PROBE = 1.0
 def _mlx_norm_offset_probe(weights, fill):
     """Replace every 1-D float weight with ``fill``, passing the rest through.
 
-    Keys, shapes and dtypes survive, and those are what the real sanitizer gates
-    read -- key names, the presence of a key elsewhere in the checkpoint, shape
-    and dtype -- so the replay reproduces the gate while carrying a value we
-    chose.
+    Keys, shapes and dtypes survive, and every real sanitizer gate reads only
+    those, so the replay reproduces the gate while carrying a value we chose.
     """
     return {
         key: (
@@ -14130,15 +14127,15 @@ def _mlx_constant_1d_value(value):
         return None
     if not mx.issubdtype(value.dtype, mx.floating):
         return None
-    # mx.min refuses a zero-size reduce, and one such tensor anywhere in the
-    # checkpoint would otherwise discard every offset measured alongside it.
+    # mx.min refuses a zero-size reduce, and the raise would discard every
+    # offset measured alongside this one.
     if value.shape[0] == 0:
         return None
     low = mx.min(value).item()
     high = mx.max(value).item()
-    # The probe feeds zeros to a third-party sanitizer, so a division can hand
-    # back inf or NaN. NaN fails every comparison, so an unguarded spread check
-    # reads it as constant and the export subtracts it into the real weight.
+    # A sanitizer dividing by a weight the probe zeroed returns inf or NaN, and
+    # NaN fails every comparison, so the spread check below would read it as
+    # constant and the export would subtract it into a real weight.
     if not math.isfinite(low) or not math.isfinite(high):
         return None
     if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
@@ -14149,16 +14146,12 @@ def _mlx_constant_1d_value(value):
 def _mlx_sanitize_probe(model, weights):
     """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
 
-    Sanitizers are not pure. mlx-vlm's phi4mm caches its split LoRA weights on
-    the instance (``self._base_weights`` and friends) and mlx-lm's gemma3_text
-    pops the ``lm_head`` submodule when the checkpoint ties embeddings, so
-    measuring on the model itself would rebuild the live model out of the probe
-    values, halfway through an export. A shallow copy keeps every read the
-    sanitizer does and sends those writes to a throwaway.
-
-    A model that cannot be copied is not measured. Falling back to the live
-    instance would do the exact thing this exists to prevent, and the caller
-    treats the failure as unmeasurable, which is the pre-existing behaviour.
+    Sanitizers are not pure: phi4mm caches its split LoRA weights on the
+    instance and gemma3_text pops the ``lm_head`` submodule for a tied
+    checkpoint, so measuring on the model itself would rebuild it out of the
+    probe halfway through an export. A model that cannot be copied is left
+    unmeasured; the caller treats that as unmeasurable, which is what the export
+    did before this existed.
     """
     return copy.copy(model).sanitize(weights)
 
@@ -14166,14 +14159,13 @@ def _mlx_sanitize_probe(model, weights):
 def _mlx_sanitizer_norm_offsets(model):
     """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
 
-    The MTP families shift RMSNorm weights by +1 when loading an HF checkpoint,
-    gated on the source checkpoint's contents rather than on the model class, so
-    replay the real sanitizer over two probes -- 1-D floats all zero, then all
-    one -- and keep a key only where the output rose by the difference between
-    the probes. Rising is what makes the constant an ADDED one: a sanitizer that
-    invents a 1-D tensor the source never held, as mlx-vlm's Inkling does for
-    its expert scales, or that transforms one non-additively, does not track its
-    input and is rejected. None means unmeasurable, not unshifted.
+    The MTP families shift RMSNorm weights by +1 on load, gated on the source
+    checkpoint's contents rather than the model class, so replay the real
+    sanitizer over two probes -- 1-D floats all zero, then all one -- and keep a
+    key only where the output rose by the difference. Rising is what makes the
+    constant an ADDED one, so a sanitizer that invents a 1-D tensor the source
+    never held (Inkling's expert scales) or transforms one non-additively is
+    rejected. None means unmeasurable, not unshifted.
     """
     src_path = _get_src_path(model)
     sanitize = getattr(model, "sanitize", None)
@@ -14195,9 +14187,8 @@ def _mlx_sanitizer_norm_offsets(model):
                 continue
             candidates[key] = (value, offset)
         if not candidates:
-            # Nothing to confirm, so skip the second replay: the sanitizers that
-            # shift nothing are the common case and some of them dequantize the
-            # whole checkpoint on the way through.
+            # Nothing to confirm. Shifting nothing is the common case, so skip
+            # the second replay rather than pay for it on every model.
             return {}
 
         raised = _mlx_sanitize_probe(
