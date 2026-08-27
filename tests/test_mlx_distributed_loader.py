@@ -105,6 +105,19 @@ def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
     assert not loader._is_vlm({"vision_config": {}, "model_type": "text_only"})
 
 
+def test_text_only_vlm_load_stays_on_vlm_path_when_mlx_lm_has_no_model(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _: None)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: object())
+
+    config = {"model_type": "gemma4_unified", "vision_config": {"hidden_size": 32}}
+    assert loader._prefer_vlm_loader_for_text(config, "gemma4_unified")
+
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: None)
+    assert not loader._prefer_vlm_loader_for_text(config, "unsupported_vlm")
+
+
 def test_apply_mlx_distributed_sharding_modes_and_guards():
     from unsloth_zoo.mlx.loader import (
         _apply_mlx_distributed_sharding,

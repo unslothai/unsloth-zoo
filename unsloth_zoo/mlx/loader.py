@@ -2622,7 +2622,7 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 
     cls = _get_mlx_lm_model_class(model_type)
     if cls is None:
-        return False
+        return _resolve_mlx_vlm_model_class(model_type) is not None
 
     return _has_multimodal_strip_sanitize(cls)
 
