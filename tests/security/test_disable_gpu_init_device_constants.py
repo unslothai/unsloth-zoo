@@ -188,8 +188,19 @@ def test_importing_the_package_does_not_pull_in_torch():
     )
 
 
+# Without the flag, `unsloth_zoo/__init__.py` raises `ImportError: Please install
+# Unsloth` when unsloth is absent - which is exactly the case in the security-audit
+# lane, where `.[core]` is installed and the flag is what bypasses that check. The
+# control below is the one test here that drops the flag, so it needs unsloth present.
+_needs_unsloth = pytest.mark.skipif(
+    importlib.util.find_spec("unsloth") is None,
+    reason = "unsloth is not installed; importing unsloth_zoo without the skip flag raises",
+)
+
+
 @_needs_lazy_path
 @_needs_torch
+@_needs_unsloth
 def test_reading_a_constant_is_what_pulls_torch_in():
     """The other half of the pair, so the check above cannot pass vacuously.
 
