@@ -18,7 +18,9 @@ during `import unsloth_zoo` and this process already imported it.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +32,39 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INIT_PY = REPO_ROOT / "unsloth_zoo" / "__init__.py"
 
 _NAMES = ("DEVICE_TYPE", "DEVICE_TYPE_TORCH", "DEVICE_COUNT", "ALLOW_PREQUANTIZED_MODELS")
+
+
+def _mlx_branch_is_live() -> bool:
+    """Mirror `is_mlx_available()` without importing unsloth_zoo (which needs torch).
+
+    Kept in step with `unsloth_zoo/mlx/runtime.py` deliberately: importing the real
+    predicate would drag in the package under test, and these tests exist precisely
+    to characterise how that import behaves.
+    """
+    return (
+        os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
+        and platform.system() == "Darwin"
+        and platform.machine() == "arm64"
+        and importlib.util.find_spec("mlx") is not None
+    )
+
+
+# On the MLX branch all four constants are eager module globals, so PEP 562
+# __getattr__ is never consulted and there is nothing lazy to assert. The pair
+# below would not just fail, it would be meaningless: the "does not pull torch"
+# half would pass for the wrong reason. Skip both together so neither can go
+# vacuously green.
+_needs_lazy_path = pytest.mark.skipif(
+    _mlx_branch_is_live(),
+    reason = "MLX branch defines the device constants eagerly; the lazy path is not taken",
+)
+
+# `unsloth_zoo.compiler` imports torch at module scope. Apple Silicon installs
+# routinely have no torch at all, and that is a supported configuration.
+_needs_torch = pytest.mark.skipif(
+    importlib.util.find_spec("torch") is None,
+    reason = "torch is not installed; unsloth_zoo.compiler cannot import by design",
+)
 
 
 def _public_upper_names(body) -> set:
@@ -116,6 +151,7 @@ def test_device_constant_is_importable_under_the_skip(name):
     )
 
 
+@_needs_torch
 def test_the_module_that_actually_broke_imports():
     """The concrete regression: compiler.py does `from . import DEVICE_TYPE`."""
     result = _run("import unsloth_zoo.compiler\nprint('ok')\n")
@@ -125,6 +161,8 @@ def test_the_module_that_actually_broke_imports():
     )
 
 
+@_needs_lazy_path
+@_needs_torch
 def test_importing_the_package_does_not_pull_in_torch():
     """The skip stays a skip: torch is not imported until a constant is read.
 
@@ -144,6 +182,8 @@ def test_importing_the_package_does_not_pull_in_torch():
     )
 
 
+@_needs_lazy_path
+@_needs_torch
 def test_reading_a_constant_is_what_pulls_torch_in():
     """The other half of the pair, so the check above cannot pass vacuously."""
     result = _run(
@@ -205,6 +245,43 @@ def test_the_contract_parser_sees_every_shape_a_constant_can_arrive_in(snippet):
     contract test passes while the skip path is missing a name.
     """
     assert "NEW_CONST" in _public_upper_names(ast.parse(snippet).body), snippet
+
+
+@pytest.mark.parametrize(
+    "system, machine, has_mlx, force_gpu, expected",
+    (
+        ("Darwin", "arm64", True,  None,  True),   # the branch this guard exists for
+        ("Darwin", "arm64", False, None,  False),  # Apple Silicon without mlx installed
+        ("Darwin", "x86_64", True, None,  False),  # Intel Mac
+        ("Linux",  "x86_64", True, None,  False),  # every CI runner we gate on
+        ("Windows", "AMD64", True, None,  False),
+        ("Darwin", "arm64", True,  "1",   False),  # escape hatch wins
+        ("Darwin", "arm64", True,  "0",   True),   # and only when set to exactly "1"
+    ),
+)
+def test_the_mlx_guard_agrees_with_is_mlx_available(
+    monkeypatch, system, machine, has_mlx, force_gpu, expected,
+):
+    """A skip guard that never fires, or always fires, is worse than none.
+
+    This mirrors `unsloth_zoo/mlx/runtime.py::is_mlx_available`, so it can drift
+    from it. Pin every arm of the predicate rather than trusting the copy.
+    """
+    monkeypatch.setattr(platform, "system", lambda: system)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **k: (
+            object() if has_mlx else None
+        ) if name == "mlx" else real_find_spec(name, *a, **k),
+    )
+    if force_gpu is None:
+        monkeypatch.delenv("UNSLOTH_FORCE_GPU_PATH", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_FORCE_GPU_PATH", force_gpu)
+    assert _mlx_branch_is_live() is expected
 
 
 def test_every_contract_name_actually_resolves_under_the_skip():
