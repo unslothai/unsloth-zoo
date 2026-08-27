@@ -30,6 +30,7 @@ import collections
 import contextlib
 import contextvars
 import copy
+import dis
 import inspect
 import itertools
 import importlib
@@ -14947,6 +14948,47 @@ def _mlx_moe_sanitizers(model):
     ]
 
 
+def _mlx_moe_sanitized_probe(sanitizer, probe):
+    """Replay a probe, copying the tensors a sanitizer writing in place could reach.
+
+    mlx-vlm offsets a norm weight with `+=`, which writes through to the caller's
+    tensor, so an uncopied probe is measured against itself -- and the markers being
+    cached by shape, one written to misreports every later tensor sharing it. Only the
+    1-D tensors an offset is read from are copied; wider ones would cost a
+    synchronization the search is otherwise free of.
+    """
+    if _mlx_sanitizer_writes_in_place(sanitizer):
+        probe = {
+            name: mx.array(tensor) if getattr(tensor, "ndim", 0) == 1 else tensor
+            for name, tensor in probe.items()
+        }
+    return sanitizer.sanitize(dict(probe))
+
+
+def _mlx_augmented_assignment(instruction):
+    """Both spellings: 3.11 replaced `INPLACE_*` with a `BINARY_OP` carrying the operator, and this package supports 3.9."""
+    return (instruction.opname.startswith("INPLACE_")
+            or (instruction.opname == "BINARY_OP"
+                and instruction.argrepr.endswith("=")))
+
+
+def _mlx_sanitizer_writes_in_place(sanitizer):
+    """Whether a sanitizer's code holds an augmented assignment, which may write through.
+
+    Read from the code because measuring costs the synchronization this exists to
+    avoid, and answered for the operator rather than the type it applies to: a store
+    into a tensor is spelled like the store into the dictionary every sanitizer builds.
+    One that writes some other way is left to the confirmation.
+    """
+    if getattr(sanitizer, "_writes_in_place", None) is None:
+        sanitizer._writes_in_place = any(
+            _mlx_augmented_assignment(instruction)
+            for code in _mlx_sanitizer_code([sanitizer])
+            for instruction in dis.get_instructions(code)
+        )
+    return sanitizer._writes_in_place
+
+
 def _mlx_moe_expert_names(name, num_experts, group, leaf_alias, parent=("", "")):
     base, param = name.rsplit(".", 1)
     prefix, _container, leaf = base.rsplit(".", 2)
@@ -15024,7 +15066,7 @@ def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", "")
             continue
         for sanitizer in sanitizers:
             try:
-                sanitized = sanitizer.sanitize(dict(probe))
+                sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
             except Exception:
                 continue
             if all(
@@ -15283,7 +15325,7 @@ def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, re
                     markers[shape, value] = _mlx_moe_replay_marker(shape, value)
                 probe[proposed] = markers[shape, value]
             try:
-                sanitized = sanitizer.sanitize(dict(probe))
+                sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
             except Exception:
                 replays = []
                 break
@@ -15492,7 +15534,7 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
             continue
         probe.update(others)
         try:
-            sanitized = sanitizer.sanitize(dict(probe))
+            sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
         except KeyError as missing:
             yield None, missing.args[0] if missing.args else None
             continue
