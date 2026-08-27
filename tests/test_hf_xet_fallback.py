@@ -913,38 +913,153 @@ def test_immediate_success_uses_xet_only(monkeypatch):
     assert prepared == [], "no cache prep should run when Xet succeeds first try"
 
 
-def test_stall_then_http_fallback_succeeds(monkeypatch):
+def test_stall_then_xet_retry_then_http_fallback_succeeds(monkeypatch):
+    """The full ladder: a data-phase stall buys one more Xet child, then HTTP."""
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda repo_type, repo_id, cache_dir = None, **k: prepared.append((repo_type, repo_id)))
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/model.gguf")])
 
     out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
     assert out == "/cache/model.gguf"
-    assert len(fake.calls) == 2
-    assert fake.calls[0].disable_xet is False  # Xet first
-    assert fake.calls[1].disable_xet is True   # HTTP fallback
-    assert prepared == [("model", DL_REPO)], "must prep cache for HTTP before the retry"
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
+    assert prepared == [("model", DL_REPO)], "HTTP prep runs once, on the transport change only"
 
 
-def test_injected_prepare_for_http_used(monkeypatch):
-    """An injected prepare_for_http_fn is used; the generic default must not run."""
+def test_recovered_xet_retry_never_reaches_http(monkeypatch):
+    """A retry that succeeds ends the ladder: no HTTP attempt, no HTTP cache prep."""
+    monkeypatch.setattr(
+        xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("HTTP prep ran")
+    )
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, False]
+
+
+def test_xet_retry_purges_the_dead_child_partial(monkeypatch):
+    """hf_xet rebuilds from offset zero, so the killed child's partial must go or the watchdog
+    would read a frozen byte count on the retry and trip a false stall."""
+    purged = []
+    monkeypatch.setattr(
+        xf, "_purge_owned_partials_for_xet_retry",
+        lambda rt, rid, cache_dir = None, owned_incomplete_blobs = None: purged.append(rt),
+    )
+    monkeypatch.setattr(
+        xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("HTTP prep ran on a Xet retry")
+    )
+    _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert purged == ["model"]
+
+
+def test_injected_prepare_for_http_not_used_between_xet_attempts(monkeypatch):
+    """The injected (marker-aware) hook belongs to the transport CHANGE only: running it between two
+    Xet attempts would stamp an "http" marker over a partial Xet still owns."""
     monkeypatch.setattr(
         xf, "_default_prepare_for_http", lambda *a, **k: pytest.fail("generic prepare ran")
     )
     injected = []
-    _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/model.gguf")])
     out = xf.hf_hub_download_with_xet_fallback(
         DL_REPO, FILE, None, prepare_for_http_fn = lambda rt, rid: injected.append((rt, rid))
     )
     assert out == "/cache/model.gguf"
-    assert injected == [("model", DL_REPO)]
+    assert injected == [("model", DL_REPO)], "exactly once, on the HTTP rung"
 
 
-def test_second_stall_raises_download_stall_error(monkeypatch):
-    fake = _install(monkeypatch, [("stall", None), ("stall", None)])
+def test_pre_byte_stall_skips_the_xet_retry(monkeypatch):
+    """"did not start" is as likely slow metadata as a broken Xet, and retrying it would buy a
+    second full connect window before HTTP: straight to HTTP instead."""
+    verdict = "Download did not start (xet transport) -- no data after 90s"
+    fake = _install(monkeypatch, [("stall", verdict), ("ok", "/cache/model.gguf")])
+    out = xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert out == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_attempts_knob_of_one_restores_the_old_ladder(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/model.gguf")])
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/model.gguf"
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_attempts_knob_extends_the_xet_budget(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "3")
+    fake = _install(
+        monkeypatch, [("stall", None), ("stall", None), ("stall", None), ("ok", "/cache/x")]
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.disable_xet for c in fake.calls] == [False, False, False, True]
+
+
+def test_attempts_knob_rejects_junk_and_clamps(monkeypatch):
+    for bad in ("", "abc", "0", "-3", "  "):
+        monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", bad)
+        assert xf.xet_attempts() == xf.DEFAULT_XET_ATTEMPTS, bad
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "999")
+    assert xf.xet_attempts() == xf._MAX_XET_ATTEMPTS
+    monkeypatch.delenv("UNSLOTH_XET_ATTEMPTS")
+    assert xf.xet_attempts() == xf.DEFAULT_XET_ATTEMPTS
+
+
+def test_recovered_stall_is_not_charged_to_the_machine(monkeypatch):
+    """Health takes ONE outcome per download: two stalls recorded separately would let a single
+    download hit the two-consecutive-failure demotion threshold on its own."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [True], "a stall the retry recovered from is noise, not evidence"
+
+
+def test_exhausted_xet_records_exactly_one_failure(monkeypatch):
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [False]
+
+
+def test_deferred_stall_is_reported_when_a_later_attempt_errors(monkeypatch):
+    """A deterministic error on the retry ends the ladder without an HTTP rung, but the earlier
+    stall was still real evidence and must not be silently forgiven."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    _install(
+        monkeypatch,
+        [("stall", None), ("error", "RepositoryNotFoundError: gone")],
+    )
+    with pytest.raises(Exception):
+        xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
+    assert outcomes == [False]
+
+
+def test_cancel_between_xet_attempts_spawns_nothing(monkeypatch):
+    """A cancel landing in the stall window must not buy one more child, nor charge the machine."""
+    outcomes = []
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    cancel = threading.Event()
+    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+
+    original = fake.__call__
+
+    def _cancel_after_first(*args, **kwargs):
+        result = original(*args, **kwargs)
+        cancel.set()
+        return result
+
+    monkeypatch.setattr(xf, "_run_download_attempt", _cancel_after_first)
+    # The stall is real, so the ladder still leaves Xet -- but over HTTP, not another Xet child.
+    xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None, cancel_event = cancel)
+    assert [c.disable_xet for c in fake.calls] == [False, True]
+
+
+def test_stall_on_every_rung_raises_download_stall_error(monkeypatch):
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("stall", None)])
     with pytest.raises(xf.DownloadStallError):
         xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None)
-    assert len(fake.calls) == 2
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
 
 
 def test_cancelled_midattempt_raises_no_fallback(monkeypatch):
@@ -955,11 +1070,13 @@ def test_cancelled_midattempt_raises_no_fallback(monkeypatch):
 
 
 def test_per_file_independent_fallback(monkeypatch):
-    """A stalled shard falls back; a sibling shard that succeeds does not."""
-    fake = _install(monkeypatch, [("ok", "/a"), ("stall", None), ("ok", "/b")])
+    """A stalled shard runs its own ladder; a sibling shard that succeeds starts fresh on Xet."""
+    fake = _install(
+        monkeypatch, [("ok", "/a"), ("stall", None), ("stall", None), ("ok", "/b")]
+    )
     assert xf.hf_hub_download_with_xet_fallback(DL_REPO, "shardA.gguf", None) == "/a"
     assert xf.hf_hub_download_with_xet_fallback(DL_REPO, "shardB.gguf", None) == "/b"
-    assert [c.disable_xet for c in fake.calls] == [False, False, True]
+    assert [c.disable_xet for c in fake.calls] == [False, False, False, True]
 
 
 def test_unsloth_disable_xet_forces_http_first(monkeypatch):
@@ -1383,26 +1500,27 @@ def test_unrelated_partial_does_not_block_clean_cached_snapshot(hf_cache, monkey
 
 
 def test_retry_status_failure_does_not_abort_fallback(monkeypatch):
-    """A raising on_status during the Xet->HTTP retry must not abort the fallback."""
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    """A raising on_status during either retry must not abort the ladder."""
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
 
     def boom(_message):
         raise RuntimeError("client gone")
 
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None, on_status = boom)
     assert out == "/cache/x"
-    assert [c.disable_xet for c in fake.calls] == [False, True]
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
 
 
 def test_unclearable_partial_forces_clean_redownload(hf_cache, monkeypatch):
     """When prep cannot clear an unsafe partial, the HTTP attempt forces a clean re-download rather than resume over it."""
     # The autouse fixture makes _default_prepare_for_http a no-op (partial left in place).
     (_blobs_dir(hf_cache, DL_REPO) / "x.incomplete").write_bytes(b"abc")
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/x")])
+    fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/x"
-    assert fake.calls[0].force_download is False   # Xet attempt: not forced
-    assert fake.calls[1].force_download is True    # HTTP attempt: forced clean
+    # Neither Xet attempt is forced: Xet rewrites from zero anyway, and forcing would discard the
+    # finalized blobs the retry is meant to keep.
+    assert [c.force_download for c in fake.calls] == [False, False, True]
 
 
 # Snapshot variant: in-process fast path on a warm cache, else watched download.
@@ -1743,11 +1861,13 @@ def test_prepare_for_http_spares_active_sibling_partial(hf_cache):
 def test_snapshot_stall_then_http(monkeypatch):
     prepared = []
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda rt, rid, cache_dir = None, **k: prepared.append((rt, rid)))
-    fake = _install(monkeypatch, [("stall", None), ("ok", "/cache/snap-dir")])
+    fake = _install(
+        monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/snap-dir")]
+    )
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/snap-dir"
-    assert [c.kind for c in fake.calls] == ["snapshot", "snapshot"]
-    assert [c.disable_xet for c in fake.calls] == [False, True]
+    assert [c.kind for c in fake.calls] == ["snapshot"] * 3
+    assert [c.disable_xet for c in fake.calls] == [False, False, True]
     assert prepared == [("model", DL_REPO)]
 
 

@@ -41,6 +41,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 from unsloth_zoo.mlx.optimizers_quantized import (
     DEFAULT_BITS,
     DEFAULT_GROUP_SIZE,
+    MIN_QUANTIZE_SIZE,
     SUPPORTED_GROUP_SIZES,
     QuantizedMomentAdam,
     QuantizedMomentAdamW,
@@ -71,9 +72,11 @@ def _build_model(width=256):
 
 
 def _build_ineligible_model():
-    """Nothing here is quantization-eligible: 100 is not a multiple of 64."""
+    """Nothing here is quantization-eligible. Eligibility counts elements, not
+    axes, so this needs weights that are both small (under MIN_QUANTIZE_SIZE) and
+    not a whole number of groups: 30*50 = 1500, and 1500 % 64 != 0."""
     mx.random.seed(0)
-    model = nn.Sequential(nn.Linear(96, 100), nn.ReLU(), nn.Linear(100, 100))
+    model = nn.Sequential(nn.Linear(50, 30), nn.ReLU(), nn.Linear(30, 50))
     mx.eval(model.parameters())
     return model
 
@@ -255,7 +258,24 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    assert worst == 0.0, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
+    # Tolerance, not equality. MLX documents compiled and uncompiled output as
+    # "the same up to numerical precision", never bit-identical: mx.compile fuses
+    # elementwise chains, so intermediates stay in registers instead of being
+    # rounded to fp32 on every store, and the fused arithmetic reassociates.
+    #
+    # This asserted `== 0.0` and held on macos-14, where the fused kernel happened
+    # to land on the same bits. On macos-15 it does not: the trajectory differs by
+    # 5.96e-08 at worst, which is 2**-24, half an fp32 ULP on an O(1) loss.
+    #
+    # The point of the test is that compiling does not BREAK the quantized
+    # optimizer, and that still holds at this bar. A compiled path that diverged
+    # for real would grow monotonically across steps as the error fed back through
+    # the moments; this one does not compound (steps 1, 3, 4 and 8 match exactly)
+    # and stays ~1e5 times under the int8-vs-fp32 gap the neighbouring tests
+    # already tolerate. 1e-6 is ~8 fp32 ULP here: loose enough for fusion to pick
+    # a different but equally valid kernel, tight enough that real divergence
+    # still fails loudly.
+    assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 
 # 7 ------------------------------------------------------------------------
@@ -268,8 +288,8 @@ def test_model_with_no_quantizable_parameters_still_trains():
         assert not opt.is_quantizable(param), f"fixture is wrong: {param.shape} is eligible"
 
     mx.random.seed(1)
-    x = mx.random.normal((32, 96))
-    y = mx.random.normal((32, 100))
+    x = mx.random.normal((32, 50))
+    y = mx.random.normal((32, 50))
     losses = _train(opt, model, x, y)
 
     assert all(losses[i] > losses[i + 1] for i in range(len(losses) - 1)), (
@@ -317,11 +337,17 @@ def test_zero_gradient_coordinates_never_move():
     denominator is eps alone and any dequantization residue is amplified ~1e8x.
     Plain Adam moves it by exactly nothing and so must this."""
     steps, lr = 500, 1e-3
-    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+    # MIN_QUANTIZE_SIZE elements, so the moment really is packed: a smaller
+    # parameter is ineligible and the test would never reach the residue at all.
+    width = MIN_QUANTIZE_SIZE
+    grad = mx.array([[1.0] + [0.0] * (width - 1)])
 
     def drive(opt):
-        param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+        param = mx.zeros((1, width))
         opt.init({"w": param})
+        assert isinstance(opt.state["w"]["m"], (tuple, list)), (
+            "fixture is not exercising the quantized path"
+        )
         for _ in range(steps):
             param = opt.apply_gradients({"w": grad}, {"w": param})["w"]
             mx.eval(param, opt.state)
@@ -383,11 +409,15 @@ def test_unpacking_does_not_carry_the_zero_residue_out():
     to a plain optimizer would divide it by eps while v == 0, reintroducing the
     blow-up on the far side of the switch."""
     steps, lr = 200, 1e-3
-    grad = mx.array([[1.0] + [0.0] * (DEFAULT_GROUP_SIZE - 1)])
+    width = MIN_QUANTIZE_SIZE
+    grad = mx.array([[1.0] + [0.0] * (width - 1)])
 
     packed = QuantizedMomentAdam(lr, bias_correction=True)
-    param = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    param = mx.zeros((1, width))
     packed.init({"w": param})
+    assert isinstance(packed.state["w"]["m"], (tuple, list)), (
+        "fixture is not exercising the quantized path"
+    )
     for _ in range(steps):
         param = packed.apply_gradients({"w": grad}, {"w": param})["w"]
         mx.eval(param, packed.state)
@@ -398,13 +428,13 @@ def test_unpacking_does_not_carry_the_zero_residue_out():
     assert residue == 0.0, f"unpacked moment kept a {residue:.3e} residue where v == 0"
 
     plain = optim.Adam(learning_rate=lr, bias_correction=True)
-    resumed = mx.zeros((1, DEFAULT_GROUP_SIZE))
+    resumed = mx.zeros((1, width))
     plain.init({"w": resumed})
     plain.state = unpacked
     for _ in range(steps):
         resumed = plain.apply_gradients({"w": grad}, {"w": resumed})["w"]
         mx.eval(resumed, plain.state)
-    drift = max(abs(float(resumed[0, i])) for i in range(1, DEFAULT_GROUP_SIZE))
+    drift = float(mx.abs(resumed[0, 1:]).max())
     assert drift == 0.0, f"zero-gradient coordinates drifted {drift:.3e} after unpacking"
 
 
@@ -463,3 +493,82 @@ def test_adamw_variant_also_quantizes():
     assert isinstance(_moment(opt, "m"), (tuple, list))
     assert _moment(opt, "v").dtype == mx.float32
     assert (DEFAULT_GROUP_SIZE, DEFAULT_BITS) == (opt.group_size, opt.bits)
+
+
+# 12 -----------------------------------------------------------------------
+# Eligibility counts elements, not axes. The earlier rule was 2-D with a
+# divisible last axis, which excluded the shapes below while packing their
+# partner matrices, so a LoRA run saved half of what it reported.
+@pytest.mark.parametrize(
+    "shape, eligible, why",
+    [
+        ((2048, 16), True, "LoRA_B at rank 16: last axis 16, but 32768 elements"),
+        ((2048, 32), True, "LoRA_B at rank 32"),
+        ((8, 512, 512), True, "3-D MoE expert stack"),
+        ((4096,), True, "1-D, a whole number of groups"),
+        ((100, 100), False, "10000 % 64 != 0"),
+        ((32, 32), False, "1024 elements, under MIN_QUANTIZE_SIZE"),
+    ],
+)
+def test_eligibility_counts_elements_not_axes(shape, eligible, why):
+    opt = QuantizedMomentAdam(1e-3)
+    assert opt.is_quantizable(mx.zeros(shape)) is eligible, why
+
+
+def test_flat_packing_round_trips_every_eligible_shape():
+    """Pack/unpack must return the parameter's own shape, not the flat view."""
+    opt = QuantizedMomentAdam(1e-3)
+    for shape in [(2048, 16), (8, 512, 512), (4096,), (256, 256)]:
+        mx.random.seed(0)
+        moment = mx.random.normal(shape)
+        restored = opt._unpack(opt._pack(moment), shape)
+        assert restored.shape == moment.shape, f"{shape} came back as {restored.shape}"
+        error = float(mx.linalg.norm(restored - moment) / mx.linalg.norm(moment))
+        assert error < 0.02, f"{shape} round-tripped at {error:.4f} relative error"
+
+
+def test_small_parameters_keep_full_width_moments():
+    """Norms and biases sit under the threshold and must not be packed."""
+    opt = QuantizedMomentAdam(1e-3)
+    assert not opt.is_quantizable(mx.zeros((MIN_QUANTIZE_SIZE - 64,)))
+    assert opt.is_quantizable(mx.zeros((MIN_QUANTIZE_SIZE,)))
+
+
+def test_lora_b_at_rank_16_trains_and_is_packed():
+    """The regression this change exists for: previously ineligible, so its
+    moment stayed full width while lora_a next to it was packed."""
+    mx.random.seed(0)
+    model = nn.Sequential(nn.Linear(512, 16, bias=False), nn.Linear(16, 512, bias=False))
+    mx.eval(model.parameters())
+    # (16,512) passed the old rule, (512,16) did not, though both are 8192 elements.
+    shapes = [model.layers[i].weight.shape for i in (0, 1)]
+    assert shapes == [(16, 512), (512, 16)], shapes
+
+    opt = QuantizedMomentAdam(1e-3, bias_correction=True)
+    mx.random.seed(1)
+    x = mx.random.normal((32, 512))
+    y = mx.random.normal((32, 512))
+    losses = _train(opt, model, x, y)
+
+    assert all(losses[i] > losses[i + 1] for i in range(len(losses) - 1)), losses
+    moments = [opt.state["layers"][i]["weight"]["m"] for i in (0, 1)]
+    packed = [m for m in moments if isinstance(m, (tuple, list))]
+    assert len(packed) == 2, (
+        f"both adapter matrices should pack, got {len(packed)} of {len(moments)}"
+    )
+
+
+def test_reads_a_checkpoint_written_in_the_old_per_row_layout():
+    """mx.dequantize is self-describing, so a moment packed per row (the previous
+    layout) still loads: only the packed triple's own shape changes."""
+    mx.random.seed(0)
+    parameter = mx.random.normal((256, 256))
+    moment = mx.random.normal((256, 256)) * 0.01
+
+    old = mx.quantize(moment, group_size=DEFAULT_GROUP_SIZE, bits=DEFAULT_BITS)
+    opt = QuantizedMomentAdam(1e-3)
+    restored = opt._unpack(old, parameter.shape)
+
+    assert restored.shape == parameter.shape
+    error = float(mx.linalg.norm(restored - moment) / mx.linalg.norm(moment))
+    assert error < 0.02, f"old-layout checkpoint dequantized at {error:.4f} error"

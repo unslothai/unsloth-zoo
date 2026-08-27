@@ -528,6 +528,295 @@ def test_vlm_prompt_patch_rebinds_every_loaded_mlx_vlm_alias(monkeypatch):
     assert outsider.apply_chat_template is original
 
 
+def _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader, **overrides):
+    attrs = {
+        "apply_chat_template": lambda *_args, **_kwargs: "count-rendered",
+        "get_message_json": lambda _model, text, role="user", **_kwargs: {
+            "role": role, "content": [{"type": "text", "text": text}],
+        },
+        "_get_role_content": lambda item: (item["role"], item["content"]),
+        "extract_text_from_content": lambda content: content,
+        "MODEL_CONFIG": {"qwen3_omni_moe": object()},
+        **overrides,
+    }
+    for name, value in attrs.items():
+        monkeypatch.setattr(prompt_utils, name, value, raising=False)
+    monkeypatch.setattr(loader, "_vlm_prompt_utils_patched", False)
+    monkeypatch.setattr(loader, "_original_vlm_apply_chat_template", None)
+    loader._ensure_vlm_prompt_utils_patched()
+
+
+def _render_qwen(prompt_utils, prompt, processor=None, **kwargs):
+    processor = object() if processor is None else processor
+    config = {"model_type": "qwen3_omni_moe"}
+    return prompt_utils.apply_chat_template(processor, config, prompt, **kwargs)
+
+
+def test_vlm_prompt_patch_matches_published_model_type_case_insensitively(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    configured = "nemotronh_nano_omni_reasoning_v3"
+    calls = []
+    def original(_processor, config, prompt, **kwargs):
+        model_type = config["model_type"]
+        calls.append((model_type, prompt, kwargs.get("num_audios")))
+        return "configured" if model_type in prompt_utils.MODEL_CONFIG else "text-only"
+    _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader,
+                               apply_chat_template=original,
+                               MODEL_CONFIG={configured: object()})
+    rendered = prompt_utils.apply_chat_template(object(), {
+        "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+    }, "Transcribe this audio.", num_audios=1)
+    assert rendered == "configured"
+    assert calls == [(configured, "Transcribe this audio.", 1)]
+
+
+def test_vlm_prompt_patch_places_counted_qwen3_omni_audio_before_text(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    rendered_messages = []
+    def render(_processor, messages, _add_generation_prompt, **_kwargs):
+        rendered_messages.append(messages)
+        return "structured-rendered"
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader, get_chat_template=render,
+    )
+    result = _render_qwen(prompt_utils, "Transcribe the audio into text.", num_audios=1)
+    assert result == "structured-rendered"
+    assert [x["type"] for x in rendered_messages[0][0]["content"]] == ["audio", "text"]
+
+
+def test_vlm_prompt_patch_preserves_qwen3_omni_video_with_audio(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    def video_message(_model_type, text, **kwargs):
+        video = {"type": "video", "video": kwargs["video"], "fps": kwargs["fps"]}
+        return {"role": "user", "content": [video, {"type": "text", "text": text}]}
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader, get_message_json=video_message,
+    )
+    messages = _render_qwen(prompt_utils, "Describe both inputs.",
+                            return_messages=True, num_audios=1,
+                            video="clip.mp4", fps=2)
+    assert [x["type"] for x in messages[0]["content"]] == ["video", "audio", "text"]
+    assert messages[0]["content"][0] == {"type": "video", "video": "clip.mp4", "fps": 2}
+
+
+def test_vlm_prompt_patch_honors_qwen3_omni_media_suppression(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    _install_qwen_prompt_patch(monkeypatch, prompt_utils, loader)
+    text = "Describe the input."
+    counted = {"role": "user", "content": text}
+    cases = (
+        (text, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (text, {"skip_image_token": True}, "user", ["audio", "text"]),
+        (text, {"role": "assistant"}, "assistant", ["text"]),
+        (counted, {"skip_audio_token": True}, "user", ["image", "text"]),
+        (counted, {"skip_image_token": True}, "user", ["audio", "text"]),
+    )
+    for prompt, options, role, expected_types in cases:
+        message = _render_qwen(prompt_utils, prompt, return_messages=True,
+                               num_images=1, num_audios=1, **options)[0]
+        assert message["role"] == role
+        assert [item["type"] for item in message["content"]] == expected_types
+
+
+def test_vlm_prompt_patch_preserves_structured_qwen3_omni_media_order(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    rendered_messages = []
+
+    def counted_message(_model, text, role="user", **kwargs):
+        videos = [{"type": "video", "video": kwargs["video"]}] if kwargs.get("video") else []
+        return {"role": role, "content": videos + [{"type": "text", "text": text}]}
+
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=(
+            lambda _processor, messages, _add_generation_prompt, **_kwargs:
+                rendered_messages.append(messages) or "structured-rendered"
+        ),
+        get_message_json=counted_message,
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_video", "video": "clip.mp4"},
+                {"type": "video"},
+                {"type": "image", "image": "frame.png"},
+                {"type": "image"},
+                {"type": "input_audio", "audio": "first.wav"},
+                {"audio": "key-only.wav"},
+                {"type": "audio"},
+                {
+                    "type": "group",
+                    "content": [
+                        {"type": "input_audio", "audio": "nested.wav"},
+                    ],
+                },
+                {"type": "text", "text": "Transcribe the audio into text."},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image": "second.png"},
+                {"type": "input_audio", "audio": "second.wav"},
+                {"type": "text", "text": "Continue."},
+            ],
+        },
+    ]
+    result = _render_qwen(prompt_utils, messages, num_images=4, num_audios=5)
+
+    plain_prompt = [
+        {"role": "user", "content": "First."},
+        messages[1],
+    ]
+    plain = _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=2,
+        num_audios=2,
+    )
+    key_only_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"audio": "only.wav", "metadata": {"source": "fixture"}},
+                {"audio_url": "second.wav"},
+                {"type": "text", "text": "Keep me."},
+            ],
+        },
+    ]
+    key_only = _render_qwen(
+        prompt_utils,
+        key_only_prompt,
+        return_messages=True,
+        num_audios=2,
+    )
+    complete_prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe."},
+                {"type": "audio"},
+            ],
+        },
+    ]
+    complete = _render_qwen(
+        prompt_utils,
+        complete_prompt,
+        return_messages=True,
+        num_audios=1,
+    )
+    nested_prompt = [
+        {
+            "role": "user",
+            "content": (
+                messages[0]["content"][4:5]
+                + messages[0]["content"][7:]
+            ),
+        },
+    ]
+    nested = _render_qwen(
+        prompt_utils,
+        nested_prompt,
+        return_messages=True,
+        num_audios=2,
+    )
+
+    assert [item["type"] for item in plain[0]["content"]] == [
+        "image",
+        "audio",
+        "text",
+    ]
+    assert plain[0]["content"][-1]["text"] == "First."
+    assert plain[1] == messages[1]
+    assert key_only == key_only_prompt
+    assert [item["type"] for item in complete[0]["content"]] == [
+        "audio",
+        "text",
+    ]
+    assert [item["type"] for item in nested[0]["content"]] == [
+        "input_audio",
+        "audio",
+        "group",
+        "text",
+    ]
+    assert _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=1,
+        num_audios=1,
+    ) == plain_prompt
+    assert _render_qwen(
+        prompt_utils,
+        plain_prompt,
+        return_messages=True,
+        num_images=2,
+        num_audios=2,
+        skip_image_token=True,
+        skip_audio_token=True,
+    ) == plain_prompt
+
+    counted = {"role": "user", "content": "Transcribe the audio."}
+    for prompt in (counted, [counted]):
+        _render_qwen(prompt_utils, prompt, num_audios=1)
+    conversation = [
+        {"role": "system", "content": "Follow instructions."},
+        {"role": "HuMaN", "content": "Describe all inputs."},
+        {"role": "assistant", "content": "Ready."},
+    ]
+    anchored = _render_qwen(prompt_utils, conversation, return_messages=True,
+                            num_images=1, num_audios=1, video="clip.mp4")
+
+    assert result == "structured-rendered"
+    assert rendered_messages[0][0]["content"] == (
+        messages[0]["content"][:4]
+        + [{"type": "image"}]
+        + messages[0]["content"][4:7]
+        + [{"type": "audio"}]
+        + messages[0]["content"][7:]
+    )
+    assert rendered_messages[0][1] == messages[1]
+    assert len(rendered_messages) == 3
+    for rendered in rendered_messages[1:]:
+        assert [item["type"] for item in rendered[0]["content"]] == ["audio", "text"]
+    assert [[item["type"] for item in turn["content"]] for turn in anchored] == [
+        ["text"], ["video", "image", "audio", "text"], ["text"],
+    ]
+
+
+def test_vlm_prompt_patch_uses_qwen3_omni_native_non_thinking_template(monkeypatch):
+    import mlx_vlm.prompt_utils as prompt_utils
+    import unsloth_zoo.mlx.loader as loader
+    native_calls = []
+    class Processor:
+        def apply_chat_template(
+            self, _messages, *, tokenize, add_generation_prompt, **kwargs,
+        ):
+            native_calls.append((tokenize, kwargs))
+            return "native-rendered"
+    _install_qwen_prompt_patch(
+        monkeypatch, prompt_utils, loader,
+        get_chat_template=lambda *_args, **_kwargs: "generic-rendered",
+    )
+    prompt = "Transcribe the audio into text."
+    result = _render_qwen(prompt_utils, prompt, Processor(), num_audios=1)
+    explicit_result = _render_qwen(prompt_utils, prompt, Processor(),
+                                   num_audios=1, enable_thinking=True)
+    tokenized_result = _render_qwen(prompt_utils, prompt, Processor(),
+                                    num_audios=1, tokenize=True)
+    assert (result, explicit_result, tokenized_result) == ("native-rendered",) * 3
+    assert native_calls == [(False, {}), (False, {"enable_thinking": True}), (True, {})]
+
+
 def test_vlm_generate_hf_kwargs(monkeypatch):
     import torch
     from transformers.tokenization_utils_base import to_py_obj
@@ -1866,3 +2155,263 @@ def test_macos_helper_keeps_existing_source_tree(monkeypatch, tmp_path):
 
     assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), "must not re-clone an existing source tree"
     assert (folder / "CMakeLists.txt").is_file()
+
+
+def _run_macos_helper_capturing_pip(monkeypatch, folder):
+    """Run the macOS helper against a ready source tree, returning the pip argv."""
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos(str(folder))
+
+    return [c for c in cmds if "pip" in c and "install" in c]
+
+
+def _make_source_tree_with_gguf_py(folder):
+    (folder / "gguf-py").mkdir(parents=True)
+    (folder / "CMakeLists.txt").write_text("# source tree")
+
+
+def test_macos_helper_refuses_pip_install_from_untrusted_checkout(monkeypatch, tmp_path):
+    # `pip install <dir>` runs that directory's build backend, so a checkout we
+    # neither manage nor were pointed at must never be installed from. gguf comes
+    # from the package index instead; conversion itself is unaffected either way,
+    # since the converter loads its own sibling gguf-py.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = tmp_path / "untrusted" / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    installed = pip_cmds[0]
+    assert not any(str(folder) in arg for arg in installed), \
+        f"must not pip install from an untrusted checkout: {installed}"
+    assert "gguf" in installed
+
+
+def test_macos_helper_installs_gguf_py_from_managed_checkout(monkeypatch, tmp_path):
+    # The normal path is unchanged: the managed ~/.unsloth checkout still gets its
+    # in-tree gguf-py installed so gguf stays in sync with llama.cpp.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    home = tmp_path / "unsloth_home"
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(home), raising=False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+
+    folder = home / "llama.cpp"
+    _make_source_tree_with_gguf_py(folder)
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
+
+
+def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch, tmp_path):
+    # An operator who explicitly points UNSLOTH_LLAMA_CPP_PATH at their own
+    # checkout has vouched for it, so the in-tree gguf-py is still used.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / "unsloth_home"), raising=False)
+
+    folder = tmp_path / "my_llama_cpp"
+    _make_source_tree_with_gguf_py(folder)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(folder))
+
+    pip_cmds = _run_macos_helper_capturing_pip(monkeypatch, folder)
+
+    assert pip_cmds, "expected the helper to install converter deps"
+    assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
+
+
+# --- _is_trusted_local_llama_cpp_dir path semantics -------------------------
+# `pip install <dir>` runs that directory's build backend, so the containment
+# check that guards it has to be exact. These cover the ways a naive prefix
+# comparison goes wrong.
+
+def _trusted(monkeypatch, folder, home, env_value=None):
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(home), raising=False)
+    if env_value is None:
+        monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(env_value))
+    return mutils._is_trusted_local_llama_cpp_dir(str(folder))
+
+
+def test_trusted_dir_accepts_managed_checkout(monkeypatch, tmp_path):
+    home = tmp_path / ".unsloth"
+    assert _trusted(monkeypatch, home / "llama.cpp", home) is True
+    assert _trusted(monkeypatch, home, home) is True
+
+
+def test_trusted_dir_rejects_prefix_sibling(monkeypatch, tmp_path):
+    # "~/.unsloth-evil" shares a string prefix with "~/.unsloth" but is not inside
+    # it. A startswith() without the separator would trust it.
+    home = tmp_path / ".unsloth"
+    evil = tmp_path / ".unsloth-evil"
+    evil.mkdir(parents=True)
+    assert _trusted(monkeypatch, evil, home) is False
+    assert _trusted(monkeypatch, evil / "llama.cpp", home) is False
+
+
+def test_trusted_dir_rejects_symlink_escaping_the_managed_root(monkeypatch, tmp_path):
+    # A symlink sitting inside ~/.unsloth that points out of it must not launder
+    # an untrusted directory into the trusted set.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = home / "llama.cpp"
+    link.symlink_to(outside)
+    assert _trusted(monkeypatch, link, home) is False
+
+
+def test_trusted_dir_rejects_cwd_relative_checkout(monkeypatch, tmp_path):
+    # The case the whole guard exists for: a llama.cpp that just happens to be in
+    # the working directory is not something anyone vouched for.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    cwd = tmp_path / "cwd"
+    (cwd / "llama.cpp").mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    assert _trusted(monkeypatch, "llama.cpp", home) is False
+    assert _trusted(monkeypatch, os.path.join(".", "llama.cpp"), home) is False
+    # An operator who names that same directory does get the local install.
+    assert _trusted(monkeypatch, "llama.cpp", home, env_value=cwd / "llama.cpp") is True
+
+
+def test_trusted_dir_accepts_operator_named_checkout(monkeypatch, tmp_path):
+    # How Unsloth Studio configures this: it exports UNSLOTH_LLAMA_CPP_PATH.
+    home = tmp_path / ".unsloth"
+    studio = tmp_path / "StudioHome" / "llama.cpp"
+    studio.mkdir(parents=True)
+    assert _trusted(monkeypatch, studio, home, env_value=studio) is True
+    assert _trusted(monkeypatch, studio / "gguf-py", home, env_value=studio) is True
+    # Whitespace is stripped, matching how Studio itself reads the variable.
+    assert _trusted(monkeypatch, studio, home, env_value=f"  {studio}  ") is True
+    # An empty or blank value must not trust anything.
+    assert _trusted(monkeypatch, tmp_path / "other", home, env_value="") is False
+    assert _trusted(monkeypatch, tmp_path / "other", home, env_value="   ") is False
+
+
+def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
+    # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
+    # a bare parent + os.sep would produce and never match.
+    home = tmp_path / ".unsloth"
+    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+
+
+def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
+    # Only reached on macOS today, but the comparison should not quietly depend on
+    # that. Drive letter and directory case must not change the verdict.
+    import ntpath
+    import types
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    fake_os = types.SimpleNamespace(
+        path=types.SimpleNamespace(
+            realpath=ntpath.normpath,
+            normcase=ntpath.normcase,
+            join=ntpath.join,
+        ),
+        sep="\\",
+        environ={},
+    )
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", r"C:\Users\Dan\.unsloth", raising=False)
+    monkeypatch.setattr(mutils, "os", fake_os)
+
+    assert mutils._is_trusted_local_llama_cpp_dir(r"c:\users\dan\.UNSLOTH\llama.cpp") is True
+    assert mutils._is_trusted_local_llama_cpp_dir("C:/Users/Dan/.unsloth/llama.cpp") is True
+    assert mutils._is_trusted_local_llama_cpp_dir(r"C:\Users\Dan\.unsloth-evil") is False
+    assert mutils._is_trusted_local_llama_cpp_dir(r"D:\Users\Dan\.unsloth\llama.cpp") is False
+
+
+def test_trusted_dir_never_raises_on_bad_input(monkeypatch, tmp_path):
+    # A bad path must degrade to "untrusted" (which still installs gguf from the
+    # index), never take down an export with an unexpected exception.
+    home = tmp_path / ".unsloth"
+    for bad in ("", None, "/tmp/a\x00b"):
+        assert _trusted(monkeypatch, bad, home) is False
+
+
+def test_macos_helper_defaults_to_the_managed_checkout(monkeypatch, tmp_path):
+    # The default used to be a CWD-relative "llama.cpp", so a no-arg call built and
+    # pip installed out of the process working directory.
+    import subprocess
+    import unsloth_zoo.mlx.utils as mutils
+    import unsloth_zoo.llama_cpp as lcpp
+
+    managed = tmp_path / ".unsloth" / "llama.cpp"
+    managed.mkdir(parents=True)
+    (managed / "CMakeLists.txt").write_text("# source tree")
+    monkeypatch.setattr(lcpp, "UNSLOTH_HOME", str(tmp_path / ".unsloth"), raising=False)
+    monkeypatch.setattr(lcpp, "LLAMA_CPP_DEFAULT_DIR", str(managed), raising=False)
+
+    cwd = tmp_path / "cwd"
+    (cwd / "llama.cpp").mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+
+    cmds = []
+
+    def fake_run(cmd, *a, **k):
+        cmds.append(list(cmd))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(cpu_count=lambda: 2))
+
+    mutils._install_llama_cpp_macos()
+
+    assert cmds, "expected the helper to run build commands"
+    assert any(str(managed) in " ".join(str(p) for p in c) for c in cmds), \
+        f"no-arg call should target the managed checkout: {cmds}"
+    assert not any(list(c[:2]) == ["git", "clone"] for c in cmds), \
+        "the managed source tree already exists, so nothing should be cloned"
+
+
+def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, tmp_path):
+    # Why nothing changes for real users: save_pretrained_gguf only ever passes
+    # LLAMA_CPP_DEFAULT_DIR, so every spelling of that variable must read as
+    # trusted, or an export quietly stops using the user's own gguf-py.
+    home = tmp_path / ".unsloth"
+    home.mkdir(parents=True)
+    custom = tmp_path / "custom" / "llama.cpp"
+    custom.mkdir(parents=True)
+
+    spellings = [
+        None,                                   # unset
+        str(custom),
+        str(custom) + os.sep,
+        f"  {custom}  ",                        # LLAMA_CPP_DEFAULT_DIR does not strip
+        f"\t{custom}\n",
+        os.path.join(str(tmp_path), "custom", ".", "llama.cpp"),
+        os.path.join(str(tmp_path), "custom", "..", "custom", "llama.cpp"),
+        str(tmp_path / "not_created_yet" / "llama.cpp"),
+    ]
+    for value in spellings:
+        if value is None:
+            monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising=False)
+            folder = str(home / "llama.cpp")
+        else:
+            monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", value)
+            folder = value  # exactly what LLAMA_CPP_DEFAULT_DIR would hold
+        assert _trusted(monkeypatch, folder, home, env_value=value) is True, \
+            f"UNSLOTH_LLAMA_CPP_PATH={value!r} should stay trusted"

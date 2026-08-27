@@ -60,7 +60,7 @@ from .hf_utils import (
     set_dtype_in_config,
 )
 from .patching_utils import patch_model_and_tokenizer
-from .temporary_patches.common import (
+from unsloth_zoo.temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
@@ -417,7 +417,20 @@ else:
 pass
 
 
-if importlib.util.find_spec("bitsandbytes") is not None:
+def _bitsandbytes_is_usable():
+    # find_spec only proves the wheel is on disk. One built against a different torch is
+    # on disk and still fails its own import with AttributeError, so import it and see.
+    if importlib.util.find_spec("bitsandbytes") is None:
+        return False
+    try:
+        import bitsandbytes
+    except Exception:
+        return False
+    return True
+pass
+
+
+if _bitsandbytes_is_usable():
     import bitsandbytes.functional
     from bitsandbytes.utils import pack_dict_to_tensor, unpack_tensor_to_dict
 
@@ -2018,6 +2031,178 @@ def _install_vllm_decompose_size_nodes_fix():
     return True
 
 
+# Where `-L` reaches on Linux. `/usr/local/cuda/compat` is deliberately NOT
+# among them upstream, which is what makes the check below necessary.
+_FLASHINFER_LINK_DIRS = (
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda/lib64/stubs",
+)
+
+# Windows links `cuda.lib` from the toolkit, not a driver stub, and searches
+# LIB rather than LIBRARY_PATH.
+_FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS = (
+    os.path.join("lib", "x64"),
+    os.path.join("lib", "Win32"),
+)
+
+# The only two `-L` dirs FlashInfer emits, verbatim from its generated
+# build.ninja: `-L$cuda_home/lib64 -L$cuda_home/lib64/stubs`.
+_CUDA_ROOT_LIB_SUBDIRS = (
+    "lib64",
+    os.path.join("lib64", "stubs"),
+)
+
+
+def _multiarch_linker_dirs() -> "Tuple[str, ...]":
+    """`<base>/<triplet>` for this machine, e.g. /usr/lib/x86_64-linux-gnu.
+
+    On Debian/Ubuntu the NVIDIA driver's unversioned `libcuda.so` lives in the
+    multiarch directory and nowhere else, and ld's built-in SEARCH_DIRs list
+    it, so `c++ ... -lcuda` links there with no -L at all. The fallback below
+    is what runs when ld cannot be consulted -- no binutils in the image, or an
+    `ld` that is really lld, which has no built-in linker script and so prints
+    no SEARCH_DIR at all -- and omitting the one directory that actually holds
+    the stub would answer False on a machine that links fine. That is the false
+    negative this whole check exists to avoid.
+
+    Both the interpreter's own MULTIARCH triplet (set on Debian/Ubuntu, absent
+    on manylinux and conda builds) and a triplet derived from the machine are
+    tried, so aarch64 hosts -- Jetson, GH200 -- are covered too.
+    """
+    if not sys.platform.startswith("linux"): return ()
+    import platform
+    import sysconfig
+    machine = platform.machine() or ""
+    triplets = []
+    for triplet in (sysconfig.get_config_var("MULTIARCH") or "",
+                    (machine + "-linux-gnu") if machine else ""):
+        if triplet and "/" not in triplet and triplet not in triplets:
+            triplets.append(triplet)
+    return tuple(
+        base + "/" + triplet
+        for base in ("/usr/lib", "/lib", "/usr/local/lib")
+        for triplet in triplets
+    )
+
+
+# Used only when `ld --verbose` cannot be run. Deliberately generous: a
+# directory that does not exist costs nothing, a missing one costs FlashInfer.
+# The multiarch entries come first because on the most common CUDA platform
+# they are the only place the driver's unversioned libcuda.so ever appears.
+_FALLBACK_LINKER_DIRS = _multiarch_linker_dirs() + (
+    "/usr/lib",
+    "/lib",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+)
+
+
+def _cuda_roots_from_nvcc() -> "Tuple[str, ...]":
+    """The CUDA root FlashInfer infers with neither CUDA_HOME nor CUDA_PATH set.
+
+    flashinfer/jit/cpp_ext.py get_cuda_path() resolves CUDA_HOME, CUDA_PATH,
+    `dirname(dirname(which nvcc))`, then /usr/local/cuda. Without that third
+    case a toolkit outside /usr/local/cuda (/opt/cuda, a conda prefix) has its
+    stubs directory missed and FlashInfer is disabled on a machine that links.
+
+    Both the literal and the symlink-resolved grandparent are returned:
+    FlashInfer does not resolve symlinks, but a /usr/bin/nvcc shim pointing
+    into the real toolkit would otherwise reintroduce the same false negative.
+    """
+    nvcc = shutil.which("nvcc")
+    if not nvcc: return ()
+    roots = []
+    for path in (nvcc, os.path.realpath(nvcc)):
+        root = os.path.dirname(os.path.dirname(path))
+        if root and root not in roots: roots.append(root)
+    return tuple(roots)
+
+
+@functools.cache
+def _linker_default_dirs() -> "Tuple[str, ...]":
+    """The directories `ld` searches with no -L at all.
+
+    The NVIDIA driver installer creates the unversioned `libcuda.so` symlink in
+    a default directory (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu), so
+    `c++ ... -lcuda` often succeeds with no toolkit stubs directory in sight.
+    Ignoring these paths would make those machines false negatives.
+
+    `ld --verbose` prints the built-in linker script, whose SEARCH_DIR entries
+    are exactly that list; the leading `=` is the sysroot placeholder, empty
+    for a native link.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ld", "--verbose"],
+            capture_output = True, text = True, timeout = 20,
+        ).stdout
+    except Exception:
+        out = ""
+    dirs = [d.replace("=", "", 1) if d.startswith("=") else d
+            for d in re.findall(r'SEARCH_DIR\("([^"]*)"\)', out)]
+    # On a parse failure fall back rather than silently narrowing the search.
+    return tuple(dirs) if dirs else _FALLBACK_LINKER_DIRS
+
+
+def _can_link_libcuda() -> bool:
+    """Can a FlashInfer JIT build actually LINK, not merely compile?
+
+    nvcc and ninja being present only covers the compile. The link passes
+    `-lcuda` on Linux and so needs the driver STUB `libcuda.so`, not the
+    runtime `libcuda.so.1` that every machine with a driver has.
+
+    Container images routinely ship the runtime and omit the stub. Observed on
+    Kaggle: every check above passes, each .cu file compiles cleanly, and the
+    final step dies on
+
+        /usr/bin/ld: cannot find -lcuda
+
+    surfacing as `RuntimeError: Ninja build failed` after minutes of nvcc work.
+    No env var avoids it: disabling the FlashInfer SAMPLER just moves the build
+    to the attention kernels, and vLLM has no prefill-specific opt-out.
+
+    Platform scope matters. The `-lcuda`/`libcuda.so` mechanism is Linux-only;
+    on Windows the link resolves `cuda.lib` and searches LIB, so probing for
+    `libcuda.so` there would disable FlashInfer on a platform where it works.
+    Where the link cannot be checked positively, return True rather than claim
+    it will fail, keeping behaviour as before this check existed.
+    """
+    if sys.platform.startswith("win"):
+        search = [d for d in os.environ.get("LIB", "").split(os.pathsep) if d]
+        for var in ("CUDA_PATH", "CUDA_HOME"):
+            root = os.environ.get(var, "")
+            if root:
+                search += [os.path.join(root, sub)
+                           for sub in _FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS]
+        if not search:
+            # Nothing to go on. Stay out of the way rather than guess.
+            return True
+        return any(os.path.exists(os.path.join(d, "cuda.lib")) for d in search)
+
+    if not sys.platform.startswith("linux"):
+        # macOS and anything else: CUDA is not in play, so a negative would be
+        # an invention rather than an observation.
+        return True
+
+    search = list(_FLASHINFER_LINK_DIRS)
+    roots = [os.environ.get(var, "") for var in ("CUDA_HOME", "CUDA_PATH")]
+    # Neither var set is the common case; FlashInfer then infers the root from
+    # nvcc rather than assuming /usr/local/cuda.
+    roots += list(_cuda_roots_from_nvcc())
+    for root in roots:
+        if not root: continue
+        search += [os.path.join(root, sub) for sub in _CUDA_ROOT_LIB_SUBDIRS]
+    # LIBRARY_PATH is what the linker consults beyond its defaults, so a stub
+    # already supplied there counts.
+    search += [d for d in os.environ.get("LIBRARY_PATH", "").split(os.pathsep) if d]
+    # The defaults themselves hold the driver's own unversioned libcuda.so on a
+    # normal bare-metal install.
+    search += list(_linker_default_dirs())
+    return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
+
 def _clear_flashinfer_env_on_hip():
     # AMD ROCm: FlashInfer requires the CUDA nvcc compiler and never applies here.
     # Remove any forced FlashInfer selection unconditionally, even when the package
@@ -2034,6 +2219,181 @@ def _clear_flashinfer_env_on_hip():
     if _fi_forced or importlib.util.find_spec("flashinfer"):
         logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
     return True
+
+
+# Allocator config env vars. PYTORCH_CUDA_ALLOC_CONF is the legacy NVIDIA one,
+# PYTORCH_HIP_ALLOC_CONF the legacy AMD/ROCm one, PYTORCH_ALLOC_CONF the unified
+# one read from torch 2.10 onwards. All three must be checked on every platform.
+_ALLOC_CONF_ENV_VARS = (
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
+)
+
+# CuMemAllocator (standby / sleep mode) refuses to start when the caching
+# allocator runs with expandable segments. Both our patched __init__ and the
+# upstream vLLM one raise a deterministic AssertionError; match either wording.
+# This is a configuration failure, never an out of memory condition.
+#
+# The phrases are full ones on purpose. Torch's genuine OOM message *also*
+# mentions expandable segments ("... try setting
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation"), so
+# a bare "expandable_segments" test would mislabel real OOMs the other way.
+_EXPANDABLE_SEGMENTS_MARKERS = (
+    # unsloth_zoo.vllm_utils.patch_vllm_enable_sleep_mode
+    "not supported with expandable segments",
+    "not supported with expandable_segments",
+    # vllm/device_allocator/cumem.py
+    "expandable segments are not compatible",
+    "expandable_segments are not compatible",
+)
+
+# vLLM asserts free VRAM went *down* across its profiling forward pass
+# (gpu_worker.py, same opening phrase in xpu_worker.py). It fires when another
+# tenant on a shared GPU frees memory mid-profile, so free memory rose: a
+# transient race, not an out of memory condition. Checked before the out of
+# memory markers, since the text quotes "free memory" twice. Match the opening
+# phrase alone; the rest differs between workers and vLLM versions.
+_MEMORY_PROFILING_RACE_MARKERS = (
+    "error in memory profiling",
+)
+
+# The race clears on its own, so there is nothing to tune between attempts and
+# repeating the identical load is the whole remedy.
+_MEMORY_PROFILING_RACE_MAX_TRIALS = 3
+
+# Genuine out of memory signatures. Deliberately specific: a bare "alloc" or
+# "memory" substring also matches allocator *configuration* errors (which carry
+# words like PYTORCH_CUDA_ALLOC_CONF or "memory pool") and would mislabel them.
+_OUT_OF_MEMORY_MARKERS = (
+    "out of memory",
+    "outofmemoryerror",
+    "insufficient memory",
+    "not enough memory",
+    "no available memory",
+    # Kept on purpose: vLLM's real startup shortfall (v1/worker/utils.py) says
+    # only "Free memory on device ... is less than desired GPU memory
+    # utilization". The profiling race quotes the same words, so it is excluded
+    # by name below rather than by weakening this marker.
+    "free memory",
+    "available kv cache memory",
+    "kv cache is needed",
+    "std::bad_alloc",
+    "bad_alloc",
+    "failed to allocate",
+    "allocation failed",
+    "cudaerrormemoryallocation",
+    "hiperroroutofmemory",
+    "cannot allocate memory",
+    "unable to allocate",
+)
+
+
+def _is_memory_profiling_race_error(error_text):
+    # Another process on a shared GPU freed memory mid-profile. Transient, and
+    # retryable by repeating the identical load.
+    error_text = str(error_text).lower()
+    return any(marker in error_text for marker in _MEMORY_PROFILING_RACE_MARKERS)
+
+
+def _is_out_of_memory_error(error_text):
+    # A real out of memory condition, as opposed to anything that merely
+    # contains the letters "alloc" or the word "memory".
+    error_text = str(error_text).lower()
+    # The more specific phrase decides, which is why the race wins here while
+    # OOM wins over the expandable segments clash below: torch's OOM text merely
+    # *suggests* expandable segments, whereas "Error in memory profiling" comes
+    # from one assert and can only mean the race, whatever arithmetic it quotes.
+    if _is_memory_profiling_race_error(error_text):
+        return False
+    return any(marker in error_text for marker in _OUT_OF_MEMORY_MARKERS)
+
+
+def _is_expandable_segments_error(error_text):
+    # Standby mode + `expandable_segments:True` is a config clash, not an OOM.
+    # A real OOM wins: torch's OOM text suggests expandable segments as a fix,
+    # so it must never be routed to the configuration message.
+    error_text = str(error_text).lower()
+    if _is_out_of_memory_error(error_text):
+        return False
+    return any(marker in error_text for marker in _EXPANDABLE_SEGMENTS_MARKERS)
+
+
+def _expandable_segments_env_vars():
+    # Which allocator env vars actually carry expandable_segments:True right now.
+    return [
+        key for key in _ALLOC_CONF_ENV_VARS
+        if "expandable_segments:true" in os.environ.get(key, "").lower()
+    ]
+
+
+def _expandable_segments_standby_message(error):
+    # Note on why this is a message and not an automatic fix: torch parses the
+    # allocator config once (a process-wide singleton, read at torch import on
+    # 2.10+ and at first allocation before that), so clearing the env var here
+    # would NOT turn expandable segments off. Existing segments stay expandable
+    # (torch.cuda.memory_snapshot() still reports is_expandable=True), and we
+    # would have silenced the guard while the incompatibility remains, trading a
+    # deterministic assertion for a crash (pytorch/pytorch#147851). The variable
+    # has to be right before `import unsloth`, so we say exactly that.
+    offenders = _expandable_segments_env_vars()
+    if len(offenders) == 0:
+        # Not currently visible in this process (child process env, or already
+        # cleared), so name all three rather than guessing.
+        offenders = list(_ALLOC_CONF_ENV_VARS)
+        which = "your allocator config (" + ", ".join(offenders) + ")"
+    else:
+        which = ", ".join(offenders)
+    return (
+        f"Unsloth: vLLM standby mode cannot start because `expandable_segments:True` is set in {which}.\n"
+        f"This is a configuration clash, NOT an out of memory error, so lowering "
+        f"`gpu_memory_utilization` or using 4bit will not help.\n"
+        f"Standby mode uses vLLM's CuMemAllocator, which is incompatible with expandable segments.\n"
+        f"Try one of these fixes:\n"
+        f"  1. Set `os.environ['UNSLOTH_VLLM_STANDBY'] = '1'` BEFORE `import unsloth`, so Unsloth "
+        f"removes `expandable_segments` for you (in notebooks, restart and run the cells in order)\n"
+        f"  2. Remove `expandable_segments:True` yourself before importing unsloth, for example "
+        f"`os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ''` (`PYTORCH_HIP_ALLOC_CONF` on AMD ROCm, "
+        f"`PYTORCH_ALLOC_CONF` on torch >= 2.10)\n"
+        f"  3. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+        f"Original error: {error}"
+    )
+
+
+def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = False):
+    # Deliberately none of the out of memory advice. Free VRAM went *up*, so
+    # there was no shortage, and a smaller model, 4bit weights or a lower
+    # gpu_memory_utilization change nothing about an assert that only compares
+    # two free-memory snapshots.
+    attempts = ""
+    if trials > 1:
+        attempts = f"Unsloth already tried loading {trials} times.\n"
+    standby_note = ""
+    if unsloth_vllm_standby:
+        # CuMemAllocator is a process wide singleton and Unsloth runs the engine
+        # in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0), so the failed
+        # attempt's pool is still live and a fresh process is the only safe retry.
+        standby_note = (
+            "Standby mode is on, so Unsloth cannot safely reload inside this process: "
+            "vLLM's CuMemAllocator is a process wide singleton that still holds the failed "
+            "attempt's weights. Re-run the script, or restart the notebook kernel, and load again.\n"
+        )
+    return (
+        f"Unsloth: vLLM could not finish memory profiling because another process sharing this GPU "
+        f"released memory while vLLM was measuring it.\n"
+        f"This is a transient race on a shared GPU, NOT an out of memory error. Free VRAM went up "
+        f"during profiling rather than down, so lowering `gpu_memory_utilization`, using 4bit or "
+        f"picking a smaller model will not help.\n"
+        f"{attempts}"
+        f"{standby_note}"
+        f"Try one of these fixes:\n"
+        f"  1. Load the model again. The race is timing dependent and usually clears by itself\n"
+        f"  2. Load when the GPU is not shared, for example by pinning one to this process with "
+        f"CUDA_VISIBLE_DEVICES\n"
+        f"  3. Skip profiling altogether by fixing the KV cache size, for example "
+        f"kv_cache_memory_bytes=64_000_000_000\n"
+        f"Original error: {error}"
+    )
 
 
 def load_vllm(
@@ -2268,11 +2628,14 @@ def load_vllm(
             or os.path.isfile("/usr/local/cuda/bin/nvcc")
         )
         _has_ninja = shutil.which("ninja") is not None
+        # Compiling is not the same as linking; see _can_link_libcuda.
+        _can_link = _can_link_libcuda()
 
-        if not _has_nvcc or not _has_ninja:
+        if not _has_nvcc or not _has_ninja or not _can_link:
             _missing = []
             if not _has_nvcc:  _missing.append("nvcc (CUDA compiler)")
             if not _has_ninja: _missing.append("ninja (build tool)")
+            if not _can_link:  _missing.append("libcuda.so (the CUDA driver stub that -lcuda needs)")
             print(
                 f"Unsloth: FlashInfer requires JIT compilation but {' and '.join(_missing)} "
                 f"{'is' if len(_missing) == 1 else 'are'} not found.\n"
@@ -2280,6 +2643,10 @@ def load_vllm(
                 f"  To enable FlashInfer, install the missing tools:\n"
                 f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
                 f"    ninja - pip install ninja\n"
+                f"    libcuda.so - this image has the CUDA runtime but not the driver stub.\n"
+                f"      Install cuda-compat / the CUDA toolkit's stubs, or point LIBRARY_PATH\n"
+                f"      at a directory containing libcuda.so (a symlink to libcuda.so.1 or to\n"
+                f"      /usr/local/cuda/compat/libcuda.so is enough).\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
             # Clear any externally-set FlashInfer env vars so vLLM uses defaults
@@ -2647,6 +3014,7 @@ def load_vllm(
 
     # Keep trying until success (2 times)
     trials = 0
+    race_trials = 0
     while True:
         try:
             if use_async:
@@ -2658,17 +3026,47 @@ def load_vllm(
             pass
             break
         except Exception as error:
-            trials += 1
             # Cleanup
             for _ in range(3):
                 gc.collect()
                 torch.cuda.empty_cache()
             pass
             error = str(error)
+            # `expandable_segments:True` + sleep/standby mode is a deterministic
+            # config clash raised by CuMemAllocator.__init__, not an OOM, and
+            # retrying with a smaller gpu_memory_utilization can never clear it.
+            # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
+            # (upstream vLLM), so a loose "alloc" / "memory" substring test
+            # reported it as an OOM and sent users to fixes that cannot work.
+            if _is_expandable_segments_error(error):
+                raise RuntimeError(_expandable_segments_standby_message(error))
+            # A transient race: retry the *identical* load rather than fall
+            # through to the generic "memory" branch below, which would shrink
+            # gpu_memory_utilization and max_num_seqs for the rest of the run
+            # over a failure neither caused. Standby is excluded because
+            # CuMemAllocator is a singleton in this process, so a second load
+            # would stack on the failed attempt's pool. Counted separately from
+            # `trials` so a race followed by a genuine OOM still gets its
+            # shrink-and-retry.
+            if _is_memory_profiling_race_error(error):
+                race_trials += 1
+                if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                    print(
+                        f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
+                        f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                        f"Error:\n{error}"
+                    )
+                    continue
+                raise RuntimeError(_memory_profiling_race_message(
+                    error,
+                    trials = race_trials,
+                    unsloth_vllm_standby = unsloth_vllm_standby,
+                ))
+            trials += 1
             if trials >= 2 or unsloth_vllm_standby:
                 # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
                 # We can't do retry because vLLM will fail to load with said error.
-                if unsloth_vllm_standby and ("memory" in error.lower() or "alloc" in error.lower()):
+                if unsloth_vllm_standby and _is_out_of_memory_error(error):
                     raise MemoryError(
                         f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
                         f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
@@ -2819,7 +3217,7 @@ def prepare_vllm_lora_loading(model):
         vllm_loras_B .append((v_layer.self_attn.o_proj.lora_b_stacked[0], so,))
 
         model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
+        model_loras_A.append(m_layer.mlp.  up_proj.lora_A.default.weight)
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
         vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
 
@@ -2828,7 +3226,7 @@ def prepare_vllm_lora_loading(model):
         sg = None if sg == 1.0 else sg
         su = None if su == 1.0 else su
         model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
+        model_loras_B.append( m_layer.mlp.  up_proj.lora_B.default.weight)
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
         vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
 
@@ -3434,7 +3832,19 @@ def _test_get_vllm_state_dict(
         VLLM_SUPPORTED_VLM = get_vllm_supported_vlm()
         if model_type in VLLM_SUPPORTED_VLM:
             import transformers
-            model_class = getattr(transformers, config.architectures[0])
+            from .empty_model import _is_known_architecture
+            # `model_type` and `architectures` are independent fields of the same
+            # downloaded config.json, so the check above constrains neither this
+            # `getattr` nor the `from_pretrained` call below it: a config declaring a
+            # supported model_type and `architectures: ["AutoTokenizer"]` resolves and
+            # invokes an unrelated transformers class. Same gate as create_empty_vision_model.
+            architecture = config.architectures[0]
+            if not _is_known_architecture(architecture):
+                raise ValueError(
+                    f"Unsloth: config.json declares architecture `{architecture}`, which "
+                    f"is not a model architecture transformers registers."
+                )
+            model_class = getattr(transformers, architecture)
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 

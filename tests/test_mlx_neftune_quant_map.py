@@ -29,21 +29,10 @@ metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal
 # also gate the Linux mlx-cpu job rather than only the opt-in Apple Silicon one.
 mlx_only = pytest.mark.skipif(not _MLX, reason="requires the mlx runtime")
 
-# mlx 0.32 replaced the mutable `mx.random.state` list with a read-only
-# `_RandomState` sentinel. Tests that put the stream back have to ask first.
+# mlx 0.32 replaced the mutable `mx.random.state` list with a sentinel that
+# refuses item assignment, so tests rewind through the same reseed pair the
+# production code uses rather than writing the state back.
 _RNG_STATE_WRITABLE = _MLX and isinstance(mx.random.state, list)
-rng_restorable_only = pytest.mark.skipif(
-    not _RNG_STATE_WRITABLE,
-    reason="mx.random.state is read-only on this mlx (>=0.32)",
-)
-
-
-def _restore_rng(keys):
-    """Put the stream back where the backend allows it. Returns whether it did."""
-    if not _RNG_STATE_WRITABLE:
-        return False
-    mx.random.state[:] = keys
-    return True
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
@@ -380,20 +369,18 @@ def test_probe_leaves_no_trace(opts, resolves):
     flags = {p: m.training for p, m in model.named_modules()}
     classes = {p: type(m) for p, m in model.named_modules()}
     assert len(set(flags.values())) > 1, "a uniform tree hides a root-only restore"
-    keys = [mx.array(k) for k in mx.random.state]
+    from unsloth_zoo.mlx.utils import _mlx_rng_key, _restore_mlx_rng_key
+    key = _mlx_rng_key()
+    assert key is not None, "this mlx exposes no rewindable key; the probe cannot be checked"
     want = mx.random.uniform(shape=(3,))
     mx.eval(want)
-    stream_rewound = _restore_rng(keys)
+    _restore_mlx_rng_key(key)
     assert (_probe_vlm_embedding_module(model) is not None) is resolves
     assert {p: m.training for p, m in model.named_modules()} == flags
     assert {p: type(m) for p, m in model.named_modules()} == classes
-    if stream_rewound:
-        # Only assertable where the backend lets the stream be put back; mlx 0.32
-        # exposes mx.random.state read-only, and the probe leaves the draw it made
-        # on the caller's stream there rather than raising.
-        got = mx.random.uniform(shape=(3,))
-        mx.eval(got)
-        assert mx.array_equal(want, got), "probe consumed the caller's stream"
+    got = mx.random.uniform(shape=(3,))
+    mx.eval(got)
+    assert mx.array_equal(want, got), "probe consumed the caller's stream"
     assert bb.embed_tokens.flips == 0, "a mode flip requantizes real layers"
 
 
@@ -670,6 +657,32 @@ def test_probe_survives_the_backends_own_random_state():
     # And the sentinel must survive: rebinding it to a list shadows the object
     # mx.compile captured, which stops a compiled step redrawing.
     assert isinstance(mx.random.state, list) is _RNG_STATE_WRITABLE
+
+    # The rewind has to work on whatever this mlx exposes, not only on the
+    # pre-0.32 list form, so the stream is genuinely restored either way.
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.utils import _mlx_rng_key, _restore_mlx_rng_key
+
+    class Noisy(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+        def __call__(self, x):
+            return self.inner(x) + mx.random.uniform(-1e-6, 1e-6, (1, 3, H))
+
+    model = _tree()
+    backbone = model.language_model.model
+    backbone.embed_tokens = Noisy(backbone.embed_tokens)
+    key = _mlx_rng_key()
+    assert key is not None
+    want = mx.random.uniform(shape=(3,))
+    mx.eval(want)
+    _restore_mlx_rng_key(key)
+    assert _probe_vlm_embedding_module(model) is backbone.embed_tokens
+    got = mx.random.uniform(shape=(3,))
+    mx.eval(got)
+    assert mx.array_equal(want, got), \
+        "the probe advanced the caller's stream on this mlx"
 
 
 @mlx_only

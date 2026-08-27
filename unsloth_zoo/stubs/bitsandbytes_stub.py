@@ -15,12 +15,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Bitsandbytes stub for Apple Silicon / MLX.
+Bitsandbytes stub for hosts that skip GPU init (gated in unsloth_zoo/__init__.py).
 
-Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module.
-Only injected on macOS ARM64 with MLX (gated in unsloth_zoo/__init__.py).
+Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module. Injected only
+when no real bitsandbytes is installed: shadowing a working one makes bnb-quantized
+checkpoints unloadable.
 """
 
+import importlib.util
 import types
 import sys
 from importlib.abc import MetaPathFinder
@@ -62,6 +64,10 @@ def _make_module(name, attrs=None):
     mod = _PermissiveModule(name)
     mod.__path__ = []
     mod.__package__ = name
+    # Set on every stub module, including finder-minted ones: without a real attribute,
+    # the permissive __getattr__ answers the stub check with a falsy _Noop and every
+    # caller reads "this is a real wheel".
+    mod.IS_UNSLOTH_STUB = True
     if attrs:
         for k, v in attrs.items():
             setattr(mod, k, v)
@@ -99,6 +105,24 @@ def __getattr__(name):
     if name.startswith("__") and name.endswith("__"):
         raise AttributeError(name)
     return _Noop(f"bitsandbytes.{name}")
+
+
+def real_bitsandbytes_available():
+    """Whether a real (non-stub) bitsandbytes is installed.
+
+    Locates it rather than importing it: importing pulls in torch, which costs about a
+    second on the hosts that skip GPU init to avoid exactly that.
+    """
+    existing = sys.modules.get("bitsandbytes")
+    if existing is not None:
+        return not getattr(existing, "IS_UNSLOTH_STUB", False)
+    try:
+        spec = importlib.util.find_spec("bitsandbytes")
+    except Exception:  # noqa: BLE001 -- an unlocatable install is not usable either
+        return False
+    # A namespace package (loaderless, e.g. a half-removed install) imports to an empty
+    # module; standing aside for it leaves the caller with neither a wheel nor the stub.
+    return spec is not None and spec.loader is not None
 
 
 def inject_into_sys_modules():

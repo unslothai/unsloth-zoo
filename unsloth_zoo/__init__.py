@@ -14,7 +14,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-__version__ = "2026.8.2"
+# Keeps PEP 604 annotations (`str | Path`) from being evaluated at def time, which
+# is a TypeError on the 3.9 floor pyproject declares.
+from __future__ import annotations
+
+__version__ = "2026.8.15"
 
 import os
 import platform
@@ -146,7 +150,7 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 
 from importlib.util import find_spec
-from .mlx.runtime import is_mlx_available
+from unsloth_zoo.mlx.runtime import is_mlx_available
 from .model_lists import FORCE_FLOAT32
 
 # Import-time fixes live in ``unsloth/import_fixes.py`` and run at ``import
@@ -175,16 +179,22 @@ else:
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
 
-# Inject triton & bitsandbytes stubs whenever GPU init is skipped (MLX host or the
-# opt-in download child), so unsloth's CUDA-only imports resolve to a loud no-op stub
-# instead of a hard ImportError. Inert in the download child, which never touches them.
-# On a normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
+# Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
+# download child), so they resolve to a loud no-op instead of a hard ImportError. On a
+# normal CUDA/CPU run _SKIP_GPU_INIT is False and the real modules are untouched.
 if _SKIP_GPU_INIT:
-    from .stubs.triton_stub import inject_into_sys_modules as _inject_triton
+    from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
-    from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
-    _inject_bnb()
-    del _inject_triton, _inject_bnb
+    # bitsandbytes, unlike triton, ships a working arm64 macOS wheel, and shadowing a
+    # real install makes bnb-quantized checkpoints unloadable. Locating it imports
+    # nothing, so the download-only child can take this path too.
+    from unsloth_zoo.stubs.bitsandbytes_stub import (
+        inject_into_sys_modules as _inject_bnb,
+        real_bitsandbytes_available as _real_bnb,
+    )
+    if not _real_bnb():
+        _inject_bnb()
+    del _inject_triton, _inject_bnb, _real_bnb
 
 # Lazy bridge for downstream code that still imports the old flat MLX module
 # names. Installed on every host so external scripts don't hit a hard
@@ -499,14 +509,14 @@ if not _SKIP_GPU_INIT:
     # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
-    from .temporary_patches import (
+    from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )
 
     # Fused lm_head + cross_entropy auto-installer. On by default; set
     # UNSLOTH_FUSED_FORWARD=0 to disable.
     try:
-        from .fused_losses.forward_install import install_modeling_import_hook as _install_fused_forward
+        from unsloth_zoo.fused_losses.forward_install import install_modeling_import_hook as _install_fused_forward
         _install_fused_forward()
         del _install_fused_forward
     except Exception:
@@ -533,3 +543,33 @@ if not _SKIP_GPU_INIT:
         pass
 
     del os, warnings, re
+
+
+# Device constants under UNSLOTH_ZOO_DISABLE_GPU_INIT. The MLX branch sets these
+# four eagerly and the normal path imports them from `.device_type`; the skip
+# branch did neither, so `from . import DEVICE_TYPE` (compiler.py) raised.
+#
+# Lazy, not a top-level import: `.device_type` costs ~1.4s and pulls in torch,
+# and the download-only child the flag exists for never reads a constant.
+#
+# PEP 562: __getattr__ runs only when normal lookup fails, so the MLX and normal
+# paths, where all four are real globals, are unaffected.
+#
+# No "cpu" fallback: compiler.py has cuda/hip/xpu arms only, so "cpu" would fall
+# through all three. Driverless hosts opt in with UNSLOTH_ALLOW_CPU=1, which
+# `get_device_type` honours by returning the "cuda" sentinel.
+_LAZY_DEVICE_CONSTANTS = frozenset((
+    "DEVICE_TYPE",
+    "DEVICE_TYPE_TORCH",
+    "DEVICE_COUNT",
+    "ALLOW_PREQUANTIZED_MODELS",
+))
+
+
+def __getattr__(name):
+    if name not in _LAZY_DEVICE_CONSTANTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import device_type as _device_type
+    value = getattr(_device_type, name)
+    globals()[name] = value # resolve once; later lookups skip __getattr__
+    return value

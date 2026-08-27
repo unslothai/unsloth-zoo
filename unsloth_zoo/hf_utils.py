@@ -215,7 +215,18 @@ def get_transformers_model_type(config, trust_remote_code=False):
         model_type = model_type.replace("-", "_")
         model_type = model_type.replace("/", "_")
         model_type = model_type.replace(".", "_")
+        # PretrainedConfig.model_type defaults to "", so any nested sub-config that does
+        # not override it (dbrx attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up
+        # here as an empty sentinel that says nothing about the architecture
+        if not model_type.strip():
+            continue
+        # model_type is interpolated into an import path, so it must be a plain module name
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
         final_model_types.append(model_type)
+    # Every candidate was an empty sentinel, so the architecture is still unknown
+    if not final_model_types:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     final_model_types = sorted(final_model_types)
 
     # Check if model type is correct

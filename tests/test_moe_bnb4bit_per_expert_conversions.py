@@ -39,10 +39,17 @@ if not hasattr(_core_model_loading.WeightConverter, "target_patterns"):
 
 from transformers.core_model_loading import ConversionOps, WeightConverter
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
     _AUX_SUFFIXES,
     _bnb4bit_per_expert_conversions,
     _quantstate_absmax_fp32,
+)
+
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
 )
 
 
@@ -193,7 +200,7 @@ def test_fused_unquantized_falls_back_to_original_ops():
     assert out[op.base_source].shape == (3, 2, 4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_fused_prequantized_builds_params4bit():
     import bitsandbytes as bnb
     import torch.nn as nn
@@ -202,7 +209,7 @@ def test_fused_prequantized_builds_params4bit():
     twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
     op = twin.operations[0]
 
-    w = torch.randn(2, 8, 16, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, 8, 16, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)
     packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
     base = op.base_source
     input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
@@ -229,7 +236,7 @@ def test_fused_prequantized_builds_params4bit():
     assert torch.allclose(deq.float(), w.float(), atol=0.5)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_fused_prequantized_orientation_mismatch_raises():
     """A blob quantized in the transposed (checkpoint) layout must fail loudly:
     a transpose op cannot be applied to packed 4-bit data."""
@@ -240,7 +247,7 @@ def test_fused_prequantized_orientation_mismatch_raises():
     twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
     op = twin.operations[0]
 
-    w = torch.randn(2, 16, 8, device="cuda", dtype=torch.bfloat16)  # transposed layout
+    w = torch.randn(2, 16, 8, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)  # transposed layout
     packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
     base = op.base_source
     input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
@@ -288,7 +295,7 @@ def _stack_input_dict(op, weights_per_src):
     return input_dict
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 @pytest.mark.parametrize(
     "out_dim,in_dim,exact",
     [
@@ -306,7 +313,7 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
 
     n_experts = 2
     weights_per_src = [
-        [torch.randn(out_dim, in_dim, device="cuda", dtype=torch.bfloat16) for _ in range(n_experts)]
+        [torch.randn(out_dim, in_dim, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16) for _ in range(n_experts)]
         for _ in range(len(op.base_sources))
     ]
     input_dict = _stack_input_dict(op, weights_per_src)
@@ -350,7 +357,7 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
         assert err < 0.25, err
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_plain_dequant_skips_bnb_embedding4bit():
     import bitsandbytes as bnb
     import torch.nn as nn
@@ -364,10 +371,10 @@ def test_plain_dequant_skips_bnb_embedding4bit():
 
     model = Holder()
     model.emb = bnb.nn.Embedding4bit(16, 64)
-    model.emb = model.emb.cuda()  # quantizes weight into Params4bit
+    model.emb = model.emb.to(DEVICE_TYPE_TORCH)  # quantizes weight into Params4bit
     model.plain = Holder()
     packed, qs = bnb.functional.quantize_4bit(
-        torch.randn(4, 64, device="cuda", dtype=torch.bfloat16), quant_type="nf4"
+        torch.randn(4, 64, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16), quant_type="nf4"
     )
     from bitsandbytes.nn import Params4bit
     router = torch.Tensor._make_subclass(Params4bit, packed)
