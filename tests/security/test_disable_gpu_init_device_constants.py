@@ -127,9 +127,12 @@ def _cross_path_contract() -> set:
     return mlx & normal
 
 
-def _run(code: str) -> subprocess.CompletedProcess:
+def _run(code: str, skip_gpu_init: bool = True) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
+    if skip_gpu_init:
+        env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
+    else:
+        env.pop("UNSLOTH_ZOO_DISABLE_GPU_INIT", None)
     # CI runners have no accelerator; `get_device_type` honours this sentinel,
     # and `tests/conftest.py` sets it for the same reason.
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
@@ -188,17 +191,44 @@ def test_importing_the_package_does_not_pull_in_torch():
 @_needs_lazy_path
 @_needs_torch
 def test_reading_a_constant_is_what_pulls_torch_in():
-    """The other half of the pair, so the check above cannot pass vacuously."""
+    """The other half of the pair, so the check above cannot pass vacuously.
+
+    WITHOUT the flag. `get_device_type` answers `cpu` under it without asking torch
+    anything, which is the whole point of the flag: the download-only child it exists
+    for gets no GPU init and no torch import even if it does read a constant. So the
+    non-vacuousness control is the ordinary path, where reading the constant really is
+    what pulls torch in.
+    """
     result = _run(
         "import sys\n"
         "import unsloth_zoo\n"
         "unsloth_zoo.DEVICE_TYPE\n"
-        "print('torch' in sys.modules)\n"
+        "print('torch' in sys.modules)\n",
+        skip_gpu_init = False,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("True"), (
         "reading unsloth_zoo.DEVICE_TYPE did not import torch, so the previous "
         f"test proves nothing about laziness:\n{result.stdout}"
+    )
+
+
+@_needs_lazy_path
+@_needs_torch
+def test_reading_a_constant_under_the_skip_asks_torch_nothing():
+    """And under the flag it does not: the skip answers `cpu` on its own."""
+    result = _run(
+        "import sys\n"
+        "import unsloth_zoo\n"
+        "print(unsloth_zoo.DEVICE_TYPE, unsloth_zoo.DEVICE_COUNT)\n"
+        "print('torch' in sys.modules)\n"
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[-2].split() == ["cpu", "0"], result.stdout
+    assert lines[-1] == "False", (
+        "reading a device constant under UNSLOTH_ZOO_DISABLE_GPU_INIT=1 pulled torch "
+        f"in, so the flag no longer skips the work it exists to skip:\n{result.stdout}"
     )
 
 
