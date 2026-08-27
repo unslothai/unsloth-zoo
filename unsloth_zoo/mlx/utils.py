@@ -40,6 +40,7 @@ import textwrap
 import numpy as np
 import os
 import random
+import re
 import sys
 import shutil
 import struct
@@ -47,6 +48,7 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import unicodedata
 import warnings
 import weakref
 import zlib
@@ -15037,12 +15039,80 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+# Markers naming a repackaging, not a different model. The imatrix is published against the base,
+# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
+# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
+_REPACKAGED_MODEL_SUFFIX = re.compile(
+    r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
+    re.IGNORECASE,
+)
+
+
+def _exported_gguf_files(save_directory, imatrix_source=None):
+    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
+
+    imatrix_file may point inside save_directory. It is copied out before use, but the original
+    stays put, and both the summary and the Hub upload glob save_directory, so without this it
+    would be published as though it were an exported model.
+    """
+    files = sorted(Path(save_directory).glob("*.gguf"))
+    if imatrix_source is None:
+        return files
+    return [f for f in files if not _is_same_file(f, imatrix_source)]
+
+
+def _is_same_file(a, b):
+    """True when two paths name one file, asked of the filesystem rather than of the strings.
+
+    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
+    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        a, b = os.path.abspath(str(a)), os.path.abspath(str(b))
+        norm = lambda p: unicodedata.normalize("NFC", os.path.normcase(p))
+        return norm(a) == norm(b)
+
+
+def _gguf_imatrix_repo_candidates(model):
+    """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
+    repos = []
+    sources = (
+        getattr(model, "_hf_repo", None),
+        # Text models keep their config as a dict in _config; VLMs expose an object as .config.
+        _config_get(getattr(model, "_config", None), "_name_or_path"),
+        _config_get(getattr(model, "config", None), "_name_or_path"),
+    )
+    for raw in sources:
+        name = str(raw or "").strip()
+        if not name or os.path.isdir(name):
+            continue
+        if name.endswith("-GGUF"):
+            stems = [name]
+        else:
+            stem = name.split("/")[-1]
+            stems = [stem]
+            while True:
+                stripped = _REPACKAGED_MODEL_SUFFIX.sub("", stems[-1])
+                if stripped == stems[-1] or not stripped:
+                    break
+                stems.append(stripped)
+            stems = [f"unsloth/{s}-GGUF" for s in stems]
+        for repo in stems:
+            if repo not in repos:
+                repos.append(repo)
+    return repos
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
     save_directory,
     quantization_method="fast_quantized",
     first_conversion=None,
+    token=None,
+    imatrix_file=None,
 ):
     """Save LoRA-fused model in GGUF format for llama.cpp inference.
 
@@ -15067,18 +15137,22 @@ def save_pretrained_gguf(
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
             ``"f16"`` / ``"bf16"`` to force a specific intermediate
+        token: HuggingFace token for reading the upstream imatrix.
+        imatrix_file: None = off; a path = that file; True = download the
+            upstream unsloth/<base>-GGUF imatrix. Quants that need one
+            whatever the model are refused up front (IMATRIX_REQUIRED_QUANTS);
+            the rest are left to llama.cpp.
     """
     from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
+        quant_requires_imatrix,
+        resolve_imatrix_file,
         check_llama_cpp,
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
     )
-
-    save_directory = Path(save_directory)
-    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Map friendly names to llama.cpp quant types
     quant_map = {
@@ -15088,6 +15162,27 @@ def save_pretrained_gguf(
         None: "q8_0",
     }
     quant_type = quant_map.get(quantization_method, quantization_method)
+    # Normalize once so every later comparison agrees. The direct-conversion test below and the
+    # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
+    # that then went ahead without it.
+    quant_type = str(quant_type).strip().lower()
+
+    # Captured before the drop guard can clear imatrix_file: the path may sit inside
+    # save_directory, and must not be reported or uploaded as a file this export produced.
+    imatrix_source = None
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
+
+    # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
+    if quant_requires_imatrix(quant_type) and not imatrix_file:
+        raise RuntimeError(
+            f"Unsloth: '{quant_type}' cannot be quantized without an importance matrix. "
+            "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
+            "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+        )
+
+    save_directory = Path(save_directory)
+    save_directory.mkdir(parents=True, exist_ok=True)
 
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
@@ -15099,6 +15194,33 @@ def save_pretrained_gguf(
         else:
             # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
+    else:
+        first_conversion = str(first_conversion).strip().lower()
+
+    # llama-quantize runs only when the target differs from the direct conversion. Without it an
+    # imatrix has nothing to weight, so drop it rather than resolve an unusable one.
+    if imatrix_file and (
+        quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
+    ):
+        warnings.warn(
+            f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "
+            "so llama-quantize never runs."
+        )
+        imatrix_file = None
+
+    # An imatrix named like a file this export writes is destroyed by it: the outputs overwrite by
+    # name and the intermediate is then deleted, while resolution has already copied it out, so the
+    # export succeeds having eaten the caller's input. Refuse rather than relocate; where their
+    # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
+    if imatrix_source is not None:
+        base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
+        for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):
+            if _is_same_file(imatrix_source, out):
+                raise RuntimeError(
+                    f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
+                    f"'{os.path.basename(out)}', so the export would overwrite it.\n"
+                    "Move the imatrix outside save_directory, or rename it."
+                )
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
@@ -15112,6 +15234,15 @@ def save_pretrained_gguf(
 
     # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Before the merge so a bad path fails in seconds, and outside save_directory so the
+        # result is never mistaken for an exported model.
+        imatrix = resolve_imatrix_file(
+            imatrix_file,
+            dest_dir=os.path.join(tmp_dir, "imatrix"),
+            repo_candidates=_gguf_imatrix_repo_candidates(model),
+            token=token,
+        )
+
         tmp_path = Path(tmp_dir) / "merged"
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
@@ -15259,6 +15390,7 @@ def save_pretrained_gguf(
                 quant_type=quant_type,
                 quantizer_location=quantizer,
                 print_output=True,
+                imatrix=imatrix,
             )
             # Remove intermediate bf16 gguf to save space
             if os.path.exists(base_gguf) and base_gguf != final_gguf:
@@ -15266,7 +15398,7 @@ def save_pretrained_gguf(
                 print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
 
     # List produced files
-    gguf_files = sorted(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
@@ -15427,6 +15559,7 @@ def push_to_hub_gguf(
     token=None,
     private=None,
     first_conversion=None,
+    imatrix_file=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -15441,6 +15574,7 @@ def push_to_hub_gguf(
         first_conversion: Optional intermediate GGUF dtype passed through to
             save_pretrained_gguf. Placed after the pre-existing arguments so
             positional callers keep their meaning.
+        imatrix_file: Importance matrix passed through to save_pretrained_gguf.
     """
     from huggingface_hub import HfApi
 
@@ -15453,6 +15587,8 @@ def push_to_hub_gguf(
         save_directory,
         quantization_method=quantization_method,
         first_conversion=first_conversion,
+        token=token,
+        imatrix_file=imatrix_file,
     )
 
     # Upload GGUF files
@@ -15461,7 +15597,11 @@ def push_to_hub_gguf(
     # private=True request never silently leaks GGUF shards public.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
-    gguf_files = list(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(
+        save_directory,
+        os.path.expanduser(os.fspath(imatrix_file))
+        if isinstance(imatrix_file, (str, os.PathLike)) else None,
+    )
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),

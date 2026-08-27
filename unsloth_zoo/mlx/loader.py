@@ -5764,13 +5764,23 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
             "repo_id", "commit_message", "commit_description",
             "create_pr", "revision",
         ),
+        context="save_pretrained_merged",
     )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
-def _mlx_supported_kwargs(kwargs, supported):
-    """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
-    return {key: kwargs[key] for key in supported if key in kwargs}
+def _mlx_supported_kwargs(kwargs, supported, context=None):
+    """Keep CUDA-only kwargs out of MLX save/export APIs; `context` names the caller in the
+    warning, since a silently dropped save option misexports."""
+    kept = {key: kwargs[key] for key in supported if key in kwargs}
+    if context is not None:
+        dropped = sorted(set(kwargs) - set(kept))
+        if dropped:
+            warnings.warn(
+                f"Unsloth: {context} ignored unsupported argument(s) "
+                f"{', '.join(dropped)} on the MLX path."
+            )
+    return kept
 
 
 def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
@@ -5784,6 +5794,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
             "token", "private", "tags", "commit_message",
             "commit_description", "create_pr", "revision",
         ),
+        context="push_to_hub",
     )
     if save_directory is not None:
         _mlx_save_pretrained_merged(
@@ -5810,7 +5821,11 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion",))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "imatrix_file"),
+        context="save_pretrained_gguf",
+    )
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method, **kwargs)
 
@@ -5828,7 +5843,11 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion", "token", "private"))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "private", "imatrix_file"),
+        context="push_to_hub_gguf",
+    )
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 

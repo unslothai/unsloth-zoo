@@ -1444,8 +1444,12 @@ def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
         save_directory,
         quantization_method="fast_quantized",
         first_conversion=None,
+        token=None,
+        imatrix_file=None,
     ):
         calls["first_conversion"] = first_conversion
+        calls["imatrix_file"] = imatrix_file
+        calls["forwarded_token"] = token
         Path(save_directory).mkdir(parents=True, exist_ok=True)
         (Path(save_directory) / "model.F16.gguf").write_bytes(b"GGUF")
 
@@ -1460,7 +1464,9 @@ def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
         "hf_secret_token",
     )
     assert calls["token"] == "hf_secret_token"
+    assert calls["forwarded_token"] == "hf_secret_token"
     assert calls["first_conversion"] is None
+    assert calls["imatrix_file"] is None
     assert calls["uploads"] == ["model.F16.gguf"]
 
 
