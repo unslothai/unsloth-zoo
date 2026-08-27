@@ -347,6 +347,23 @@ def get_amd_flash_attn_func():
     return None
 
 
+def _cpu_fallback_requested():
+    """True when this process has declared it has no accelerator and wants none.
+
+    `UNSLOTH_ALLOW_CPU=1` is the long standing test-only escape hatch.
+    `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` is the newer flag a download-only child (and the
+    CPU security job) sets to skip the heavy GPU init entirely; `__init__.py` already
+    binds the package level device constants for it. Importing a module that reads
+    `device_type` directly - `temporary_patches.gpt_oss` does - then still ran this
+    detection and raised, so the flag only half kept its promise. Both flags mean the
+    same thing here, so both are honoured.
+    """
+    return (
+        os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1" or
+        os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
+    )
+
+
 @functools.cache
 def get_device_type():
     if _IS_MLX:
@@ -359,9 +376,9 @@ def get_device_type():
         return "xpu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
-            # Test-only CPU fallback. The env var is read exactly once per
+            # Test-only CPU fallback. The env vars are read exactly once per
             # process because get_device_type is @functools.cache'd.
-            if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+            if _cpu_fallback_requested():
                 return "cuda"
             amd_hint = _amd_installation_hint()
             if amd_hint is not None:
@@ -374,7 +391,7 @@ def get_device_type():
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
-    if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+    if _cpu_fallback_requested():
         return "cuda"
     amd_hint = _amd_installation_hint()
     if amd_hint is not None:

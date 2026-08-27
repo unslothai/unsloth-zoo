@@ -178,6 +178,20 @@ else:
     # The HF cache redirect above still runs, so the child shares the parent's cache.
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
+    if _SKIP_GPU_INIT:
+        # The device constants still have to EXIST. They are set below by the init
+        # this flag skips, and modules that are otherwise import-safe read them -
+        # `compiler.py` does `from . import DEVICE_TYPE` at module scope - so
+        # skipping the init turned any such import into
+        # `ImportError: cannot import name 'DEVICE_TYPE'`. That is what broke the
+        # security suite in CI, which sets this flag precisely because it has no
+        # device. The MLX branch above already binds them for the same reason;
+        # these are the honest values for "GPU init was skipped", and they are
+        # plain literals, so nothing heavy is imported to produce them.
+        DEVICE_TYPE = "cpu"
+        DEVICE_TYPE_TORCH = "cpu"
+        DEVICE_COUNT = 0
+        ALLOW_PREQUANTIZED_MODELS = False
 
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
 # download child), so they resolve to a loud no-op instead of a hard ImportError. On a
