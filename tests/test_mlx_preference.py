@@ -973,8 +973,12 @@ def _generation_common(tmp_path, **overrides):
     return common
 
 
-def _run_generation_trainer(trainer, monkeypatch, calls):
-    """Drive one training step whose evaluation samples, recording engine calls."""
+def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
+    """Drive one training step whose evaluation samples, recording engine calls.
+
+    ``generate_batch`` replaces the recording stub, for tests needing the engine
+    to fail or to return text of their own choosing.
+    """
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map
@@ -997,7 +1001,9 @@ def _run_generation_trainer(trainer, monkeypatch, calls):
             for index, _ in enumerate(requests)
         ]
 
-    monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+    monkeypatch.setattr(
+        generate_module, "generate_batch", generate_batch or fake_generate_batch,
+    )
 
     def value_and_grad_with_aux(model, fn):
         def wrapped(*args):
@@ -1499,6 +1505,213 @@ def test_the_best_metric_direction_reaches_callbacks_that_read_it(tmp_path):
             metric_for_best_model="eval_rewards/accuracies")))
     assert trainer.args.greater_is_better is True
 
+
+def test_sampled_text_cannot_drive_the_terminal(tmp_path, monkeypatch, capsys):
+    """Dataset prompts and model completions are untrusted text bound for a
+    terminal, and str.split() leaves ESC/BEL untouched, so an OSC sequence
+    arrived intact and a CSI erase could rewrite the log above it. Falsified
+    against the whitespace-only version: the raw escapes appear in the output.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3),
+        eval_dataset={"ev\x1b[2Kil": rows(2)},
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    def hostile_generate_batch(model, tokenizer, requests, *, defaults=None):
+        return [
+            types.SimpleNamespace(
+                token_ids=[1, 2],
+                text="ok\x1b]52;c;U0VDUkVU\x07forged‮desrever",
+                logprobs=[0.0, 0.0], finish_reason="length", stop_match=None,
+            )
+            for _ in requests
+        ]
+
+    _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=hostile_generate_batch,
+    )
+
+    printed = capsys.readouterr().out
+    assert "forged" in printed, "the text itself still shows"
+    for raw in ("\x1b]52", "\x07", "‮", "\x1b[2K"):
+        assert raw not in printed, f"{raw!r} reached the terminal"
+    assert "\\x1b" in printed, "the escape is shown, not executed"
+
+
+def test_a_failing_decode_joins_the_rank_consensus(tmp_path, monkeypatch):
+    """A rank that unwinds never reaches the _distributed_should_stop() call
+    between the two decodes, stranding a healthy peer there, so the failing rank
+    must join a consensus first. Falsified against an unguarded decode: no
+    consensus is joined at all.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)),
+    )
+
+    joined = []
+    original = trainer._distributed_any_flag
+    monkeypatch.setattr(
+        trainer, "_distributed_any_flag",
+        lambda flag: (joined.append(bool(flag)), original(flag))[1],
+    )
+
+    def exploding_generate_batch(model, tokenizer, requests, *, defaults=None):
+        raise RuntimeError("engine out of memory")
+
+    result = _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=exploding_generate_batch,
+    )
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert True in joined, "the failing rank never joined the consensus"
+    assert trainer.last_generation_samples == []
+    assert trainer._last_eval_metrics, "the evaluation was discarded"
+
+
+def test_a_failed_reference_decode_publishes_no_samples(
+    tmp_path, monkeypatch, capsys,
+):
+    """A referenced run that loses its reference half skips the whole set:
+    reference=None is what ORPO and reference-free DPO publish, so the policy
+    half would read as a legitimate policy-only set, after _decode already said
+    it was skipping. Falsified against the unguarded publish: two rows arrive,
+    each with reference None.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    model = _tiny_model(lora=True)
+    trainer = MLXDPOTrainer(
+        model, Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(tmp_path)),
+    )
+
+    seen = []
+
+    def failing_reference(model, tokenizer, requests, *, defaults=None):
+        seen.append(1)
+        if len(seen) > 1:
+            raise RuntimeError("engine out of memory")
+        return [
+            types.SimpleNamespace(
+                token_ids=[1, 2], text=f"policy{index}", logprobs=[0.0, 0.0],
+                finish_reason="length", stop_match=None,
+            )
+            for index, _ in enumerate(requests)
+        ]
+
+    result = _run_generation_trainer(
+        trainer, monkeypatch, [], generate_batch=failing_reference,
+    )
+
+    assert result is not None, "the run was aborted by a failed sampler"
+    assert len(seen) == 2, "the policy decode ran, then the reference one failed"
+    assert trainer.last_generation_samples == [], (
+        "a policy-only set was published for a failed reference pass"
+    )
+    printed = capsys.readouterr().out
+    assert "reference generation failed" in printed
+    assert "policy0" not in printed, "samples printed after saying they are skipped"
+    assert all(
+        module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
+    ), "scales restored after the failure"
+    assert trainer._last_eval_metrics, "the evaluation itself still stands"
+
+
+def test_best_model_without_a_cadence_says_so(tmp_path, capsys):
+    """Asking for best-model selection and silently getting none is the worst
+    outcome: _best_step stays None and the restore is skipped. A callback owning
+    the cadence is legitimate, so this is a notice, not a refusal."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    def _notice(eval_strategy=None, **overrides):
+        trainer = MLXDPOTrainer(
+            _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+            args=MLXDPOConfig(**_generation_common(
+                tmp_path, reference_free=True, generate_during_eval=False,
+                load_best_model_at_end=True, **overrides)),
+        )
+        # Not a config field; _ensure_callback_args_compat attaches it to args.
+        if eval_strategy is not None:
+            trainer.args.eval_strategy = eval_strategy
+        trainer._prepare_data(False)
+        return "no evaluation cadence is set" in capsys.readouterr().out
+
+    assert _notice(eval_steps=0) is True
+    assert _notice(eval_steps=1) is False
+    assert _notice(eval_steps=0, eval_strategy="epoch") is False
+
+
+def test_the_sampling_cadence_notice_understands_an_epoch_strategy(
+    tmp_path, capsys,
+):
+    """eval_strategy="epoch" is a cadence without eval_steps, so reading
+    eval_steps alone called a real cadence "no cadence". Falsified against the
+    eval_steps-only test: the notice prints for the epoch run."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, eval_steps=0)),
+    )
+    trainer.args.eval_strategy = "epoch"
+    trainer._prepare_data(False)
+    assert "no evaluation cadence" not in capsys.readouterr().out
+
+
+def test_an_eval_split_is_held_to_the_length_it_declares(tmp_path, monkeypatch):
+    """len() is checked at configuration time but the plan builder iterates to
+    exhaustion, so a split claiming 2 rows and yielding 3 had all 3 scored, and
+    an endless sized iterable would hang. Falsified against the unbounded loop:
+    3 rows are scored and nothing is raised."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    class LyingSplit:
+        """Declares two rows, yields three."""
+
+        def __init__(self, rows_):
+            self._rows = rows_
+
+        def __len__(self):
+            return len(self._rows) - 1
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=LyingSplit(rows(3)),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, max_steps=1, eval_steps=1,
+            generate_during_eval=False)),
+    )
+    # The plan is built at the first evaluation, not at _prepare_data.
+    with pytest.raises(ValueError, match="more rows than the 2 it declares"):
+        _run_generation_trainer(trainer, monkeypatch, [])
+
+
+def test_a_step_cadence_under_eval_strategy_no_is_no_cadence(tmp_path, capsys):
+    """eval_steps > 0 under eval_strategy="no" evaluates never, so reading
+    eval_steps alone suppressed the notice for the one case it exists to report.
+    Falsified against the eval_steps-only test: nothing prints.
+    """
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, reference_free=True, generate_during_eval=False,
+            load_best_model_at_end=True, eval_steps=1)),
+    )
+    trainer.args.eval_strategy = "no"
+    trainer._prepare_data(False)
+    assert "no evaluation cadence is set" in capsys.readouterr().out
 
 @pytest.mark.parametrize("objective", ["orpo", "dpo"])
 def test_evaluation_accepts_a_wrapped_model_output(objective):
