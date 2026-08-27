@@ -38,9 +38,8 @@ from packaging.version import Version  # noqa: E402
 _TX_VERSION = getattr(transformers, "__version__", "0.0.0")
 _TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
 # 5.16.0 (upstream PR #47579, the DTensor tensor parallel rewrite) deleted
-# transformers.integrations.mxfp4.dequantize and reduced
-# transformers.integrations.tensor_parallel.shard_and_distribute_module to a
-# tombstone that raises RuntimeError when called.
+# mxfp4.dequantize and reduced tensor_parallel.shard_and_distribute_module to a
+# tombstone that still imports but raises RuntimeError when called.
 _TX_GE_5_16 = Version(_TX_VERSION) >= Version("5.16.0")
 
 
@@ -240,12 +239,10 @@ def _assert_params_superset(
         )
 
 
-# Opcodes whose name operand is a module-level binding (a global or an import),
-# i.e. exactly the bindings a ``setattr(module, name, ...)`` patch can reach.
-# ``LOAD_ATTR``/``STORE_ATTR`` are deliberately NOT here: co_names is documented
-# as "names other than arguments and function locals", so it mixes attribute
-# names in with globals, and matching on it would let an unrelated
-# ``self.quantization_config.dequantize`` masquerade as a call to the
+# Opcodes whose name operand is a module-level binding, i.e. what a
+# ``setattr(module, name, ...)`` patch can reach. ``LOAD_ATTR``/``STORE_ATTR`` are
+# deliberately excluded: co_names mixes attribute names in with globals, so they
+# would let ``self.quantization_config.dequantize`` masquerade as a call to the
 # module-level ``dequantize``.
 _GLOBAL_NAME_OPS = frozenset((
     "LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL",
@@ -257,13 +254,10 @@ _GLOBAL_NAME_OPS = frozenset((
 def _referenced_global_names(obj) -> set[str]:
     """Every global name reachable from ``obj``'s code, nested code included.
 
-    Scanning the top-level code object alone is not enough: a call made inside a
-    comprehension, a nested def or a lambda lives in a child code object hanging
-    off ``co_consts``, so the name would be invisible. Walk the whole tree.
-
-    Filter on the opcode rather than reading ``co_names`` wholesale, otherwise
-    attribute accesses land in the result and the drift check passes
-    vacuously."""
+    Walks the whole tree because a call inside a comprehension, nested def or
+    lambda lives in a child code object off ``co_consts``. Filters on opcode
+    rather than reading ``co_names`` wholesale, otherwise attribute accesses land
+    in the result and the drift check passes vacuously."""
     code = getattr(obj, "__code__", None) or getattr(obj, "__func__", None)
     code = getattr(code, "__code__", code)
     if code is None or not hasattr(code, "co_names"):
@@ -282,14 +276,11 @@ def _referenced_global_names(obj) -> set[str]:
 def _assert_on_live_path(callee_name: str, caller, caller_label: str, zoo_file: str):
     """DRIFT-fail when ``caller`` no longer references ``callee_name``.
 
-    Existence-and-signature pinning is not sufficient on its own, and this suite
-    has the scar to prove it: zoo patched ``mxfp4.dequantize`` while every
-    transformers 5.x actually loaded through ``Mxfp4Dequantize`` ->
-    ``dequantize_convertops``. The symbol existed with the right signature all
-    the way to 5.15, so every detector stayed green while the patch reached
-    nothing and GPT-OSS loaded with dims 1 and 2 swapped. Asking "is the thing
-    we patch still CALLED by the thing that loads" is what closes that class of
-    gap, cheaply and statically."""
+    Existence-and-signature pinning is not enough: zoo patched ``mxfp4.dequantize``
+    while 5.x loaded through ``Mxfp4Dequantize`` -> ``dequantize_convertops``. The
+    symbol kept its signature to 5.15, so detectors stayed green while the patch
+    reached nothing. Asking whether the patched symbol is still CALLED closes that
+    gap statically."""
     if callee_name not in _referenced_global_names(caller):
         pytest.fail(
             f"DRIFT DETECTED: zoo temporary_patches/{zoo_file} patches "
@@ -1310,12 +1301,11 @@ def test_mxfp4_dequantize_signature():
     """mxfp4.py patches ``mxfp4.dequantize`` (module, param_name, param_value,
     target_device, dq_param_name, **kwargs) on transformers 4.x ONLY.
 
-    ``dequantize`` is the live per-parameter loader hook only on 4.x, where
-    quantizer_mxfp4 calls it. From 5.0 the live path is
-    ``Mxfp4Dequantize`` (a ConversionOps) -> ``dequantize_convertops``, leaving
-    ``dequantize`` defined but unreferenced, and 5.16.0 deleted it outright. Zoo
-    gates its patch to < 5.0.0 to match, so pinning the symbol above that range
-    would report drift against something zoo no longer touches. The 5.x
+    ``dequantize`` is the live loader hook only on 4.x, where quantizer_mxfp4 calls
+    it. From 5.1.0 the live path is ``Mxfp4Dequantize`` (a ConversionOps) ->
+    ``dequantize_convertops``, leaving ``dequantize`` defined but unreferenced until
+    5.16.0 deleted it. Zoo gates its patch to < 5.0.0, so pinning the symbol above
+    that range would report drift against something zoo no longer touches; the 5.x
     replacement is pinned by test_mxfp4_dequantize_convertops_signature below."""
     if _TX_IS_5X:
         pytest.skip(
@@ -1358,11 +1348,10 @@ def test_mxfp4_dequantize_convertops_signature():
     """mxfp4.py patches ``mxfp4.dequantize_convertops`` (blocks, scales) on
     transformers 5.x.
 
-    This is the 5.x replacement for the deleted module-level ``dequantize``:
-    ``Mxfp4Dequantize.convert`` is its only caller, and zoo rebinds it to
-    re-apply the ``transpose(1, 2)`` that its own un-transposed
-    ``convert_moe_packed_tensors`` leaves off. Absent on 4.x, where the legacy
-    ``dequantize`` hook carries the transpose instead."""
+    The 5.x replacement for module-level ``dequantize``: ``Mxfp4Dequantize.convert``
+    is its only caller, and zoo rebinds it to re-apply the ``transpose(1, 2)`` its
+    own un-transposed ``convert_moe_packed_tensors`` leaves off. Absent on 4.x, where
+    the legacy ``dequantize`` hook carries the transpose instead."""
     try:
         mod = importlib.import_module("transformers.integrations.mxfp4")
     except Exception as exc:
@@ -1389,8 +1378,8 @@ def test_mxfp4_dequantize_convertops_signature():
         zoo_file="mxfp4.py",
         label="dequantize_convertops",
     )
-    # Zoo's replacement is what Mxfp4Dequantize.convert calls, so the class and
-    # its call site must both still be there for the patch to reach the loader.
+    # The class and its call site must both still exist for the patch to reach
+    # the loader.
     cls = getattr(mod, "Mxfp4Dequantize", None)
     if cls is None:
         pytest.fail(
@@ -1413,14 +1402,13 @@ def test_mxfp4_dequantize_convertops_signature():
 def test_mxfp4_legacy_dequantize_is_on_the_live_path_on_4x():
     """On 4.x, ``mxfp4.dequantize`` must still be CALLED by quantizer_mxfp4.
 
-    Zoo patches it there, and a patch on a function nothing calls is a silent
-    no-op. That is precisely what happened on 5.x, where the symbol survived
-    until 5.16.0 with an unchanged signature while the loader had already moved
-    to the ConversionOps path.
+    Zoo patches it there, and a patch on a function nothing calls is a silent no-op,
+    which is what happened on 5.x: the symbol survived to 5.16.0 with an unchanged
+    signature while the loader had already moved to the ConversionOps path.
 
-    Best effort: transformers.quantizers pulls in optional heavy backends
-    (torchao and friends), and a broken one of those says nothing about drift,
-    so an unimportable caller module skips rather than fails."""
+    Best effort: transformers.quantizers pulls in optional heavy backends (torchao
+    and friends), and a broken one says nothing about drift, so an unimportable
+    caller module skips rather than fails."""
     if _TX_IS_5X:
         pytest.skip(
             f"transformers {_TX_VERSION}: the legacy dequantize hook is not on "
@@ -1462,13 +1450,11 @@ def test_mxfp4_legacy_dequantize_is_on_the_live_path_on_4x():
 def test_referenced_global_names_ignores_attribute_accesses():
     """The live-path detector must not be satisfied by a same-named ATTRIBUTE.
 
-    ``co_names`` is "names other than arguments and function locals", so it
-    carries ``LOAD_ATTR``/``STORE_ATTR`` operands alongside globals. Reading it
-    wholesale made the 4.x gate vacuous: ``Mxfp4HfQuantizer`` reads
-    ``self.quantization_config.dequantize`` in half a dozen methods, so the
-    name is present whether or not anything still calls the module-level
-    ``dequantize`` that zoo patches. Real transformers 5.x is the proof - the
-    call site is gone there while every config read remains."""
+    ``co_names`` carries ``LOAD_ATTR``/``STORE_ATTR`` operands alongside globals, so
+    reading it wholesale made the 4.x gate vacuous: ``Mxfp4HfQuantizer`` reads
+    ``self.quantization_config.dequantize`` in several methods, so the name is
+    present whether or not anything still calls the module-level ``dequantize``. On
+    real 5.x the call site is gone while every config read remains."""
     def attribute_only(cfg):
         cfg.dequantize = True
         return cfg.dequantize
@@ -1504,11 +1490,10 @@ def test_mxfp4_shard_and_distribute_module_present():
     and delegate to it when device_mesh != None. Positional arity must be 8
     for zoo's call to land.
 
-    5.16.0 replaced the function with a ``(*args, **kwargs)`` tombstone that
-    raises RuntimeError, so there is nothing left to pin above that version --
-    zoo gates both call sites off instead. Note the tombstone is a genuine
-    upstream stub, NOT a decorator wrapper: it has no ``__wrapped__``, so
-    ``follow_wrapped`` would not recover a real signature."""
+    5.16.0 replaced the function with a ``(*args, **kwargs)`` tombstone that raises
+    RuntimeError, so there is nothing left to pin above that version and zoo gates
+    both call sites off instead. It is a genuine upstream stub, NOT a decorator
+    wrapper: no ``__wrapped__``, so ``follow_wrapped`` recovers nothing."""
     try:
         mod = importlib.import_module("transformers.integrations.tensor_parallel")
     except Exception as exc:
@@ -1538,13 +1523,10 @@ def test_mxfp4_shard_and_distribute_module_present():
     ]
     if len(params) < 8:
         sig = inspect.signature(fn)
-        # A bare (*args, **kwargs) is not a function that stopped taking
-        # arguments, it is a passthrough: upstream's 5.16.0 tombstone accepts
-        # any call and unconditionally raises RuntimeError. Reporting that as
-        # "accepts only 0 positionals" sends the reader looking for a signature
-        # change that never happened, so name what it actually is. Worth
-        # stating explicitly that it is NOT a decorator wrapper either: it has
-        # no __wrapped__, so follow_wrapped recovers nothing.
+        # A bare (*args, **kwargs) is a passthrough, not a narrowed signature:
+        # upstream's 5.16.0 tombstone accepts any call and raises RuntimeError.
+        # Reporting "accepts only 0 positionals" would send the reader looking for
+        # a signature change that never happened, so name what it actually is.
         if _has_var_keyword(fn) and any(
             p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
         ):

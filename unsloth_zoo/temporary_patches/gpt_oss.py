@@ -458,10 +458,9 @@ def patch_gpt_oss():
             return raise_error("triton_kernels.matmul_ogs", e)
 
     # Legacy per-parameter TP loader hook. transformers 5.16.0 (upstream PR #47579,
-    # the DTensor tensor parallel rewrite) reduced it to a tombstone that raises
-    # RuntimeError, and dropped load_and_swizzle_mxfp4 in the same release, so the
-    # patch below is inert there. Resolve it leniently instead of bailing out, so
-    # replace_with_mxfp4_linear further down still gets patched on 5.16.0+.
+    # the DTensor tensor parallel rewrite) reduced it to a tombstone that raises when
+    # called, and dropped load_and_swizzle_mxfp4, so the patch below is inert there.
+    # The import itself still succeeds; skipping it is defensive.
     if transformers_version < Version("5.16.0"):
         try:
             from transformers.integrations.tensor_parallel import shard_and_distribute_module

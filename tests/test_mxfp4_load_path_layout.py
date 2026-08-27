@@ -16,27 +16,21 @@
 
 """The mxfp4 LOAD path must hand the model the same layout stock transformers would.
 
-This is the gap that let a silent weight corruption live across the whole
-transformers 5.x line. Zoo's `convert_moe_packed_tensors` replacement returns the
-UN-transposed [E, D, G*B*2] layout on purpose, and something downstream has to
-restore GPT-OSS's [E, G*B*2, D]. Which hook does that depends on the version:
+Zoo's `convert_moe_packed_tensors` replacement returns the UN-transposed
+[E, D, G*B*2] layout on purpose, so the live loader hook has to restore GPT-OSS's
+[E, G*B*2, D]:
 
-  * 4.x           -> module level `mxfp4.dequantize`, called by quantizer_mxfp4
-  * 5.0 and newer -> `Mxfp4Dequantize` (a ConversionOps) -> `dequantize_convertops`
+  * 4.x             -> module level `mxfp4.dequantize`, called by quantizer_mxfp4
+  * 5.1.0 and newer -> `Mxfp4Dequantize` (a ConversionOps) -> `dequantize_convertops`
 
-Zoo only ever patched `dequantize`. From 5.0 nothing calls it, so the transpose was
-dropped and GPT-OSS loaded with dims 1 and 2 swapped; 5.16.0 then deleted the
-function outright, which is what finally turned the drift detector red.
+Zoo only ever patched `dequantize`, so from 5.1.0 the transpose was dropped and
+GPT-OSS loaded with dims 1 and 2 swapped; 5.16.0 deleting the function is what
+finally turned the drift detector red. The existing mxfp4 tests missed it because
+they only exercise the SAVE path, which stayed self-consistent. So assert the
+LOADED layout: patch, then compare against pristine transformers on the same input.
 
-The existing mxfp4 tests did not catch any of that, because
-test_mxfp4_transpose_convention and test_mxfp4_convert_no_double_transpose both
-exercise the SAVE path, which stayed self-consistent throughout. So this file
-asserts the LOADED layout specifically: patch, then compare against the value
-pristine transformers produces for the same input.
-
-Runs in a subprocess because applying the patch mutates
-`transformers.integrations.mxfp4` process-wide, and CPU-only because the
-comparison is pure layout arithmetic with no accelerator needed.
+Subprocess because patching mutates `transformers.integrations.mxfp4` process-wide;
+CPU-only because the comparison is pure layout arithmetic.
 """
 
 import os
@@ -47,9 +41,8 @@ import textwrap
 import pytest
 
 
-# Golden is captured BEFORE the patch, in the same process and from the same input,
-# so this compares zoo against whatever the installed transformers actually does
-# rather than against a hardcoded shape that would itself need version gating.
+# Golden is captured BEFORE the patch, same process and input, so this compares zoo
+# against the installed transformers rather than a hardcoded, version-gated shape.
 _PROBE = textwrap.dedent(
     """
     import torch

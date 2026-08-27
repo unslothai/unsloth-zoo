@@ -156,35 +156,30 @@ def patch_convert_moe_packed_tensors():
     Transformers 4.55.4 did dequantized.transpose(1, 2).contiguous().to(target_device)
     but new versions > 4.56.0 removed the transpose(1, 2) and moved it into patch_convert_moe_packed_tensors
     """
-    # convert_moe_packed_tensors above deliberately returns the UN-transposed
-    # [E, D, G*B*2] layout -- saving_utils._mxfp4_base_returns_transposed keys the
-    # export path off exactly that convention -- so whichever loader hook is live
-    # has to restore GPT-OSS's [E, G*B*2, D] layout itself.
-    #
-    # Which hook is live depends on the transformers version:
-    #   4.x            -> module level mxfp4.dequantize, called by quantizer_mxfp4
-    #   5.0 and newer  -> Mxfp4Dequantize (a ConversionOps) -> dequantize_convertops
-    # On 5.0 to 5.15 mxfp4.dequantize still exists but nothing calls it, and 5.16.0
-    # (upstream PR #47579, the DTensor tensor parallel rewrite) deleted it outright
-    # together with shard_and_distribute_module. Patching only dequantize therefore
-    # dropped the transpose across the whole 5.x line and loaded GPT-OSS with dims 1
-    # and 2 silently swapped.
+    # convert_moe_packed_tensors above returns the UN-transposed [E, D, G*B*2] layout
+    # on purpose (saving_utils._mxfp4_base_returns_transposed keys the export path off
+    # that convention), so the live loader hook must restore GPT-OSS's [E, G*B*2, D].
+    # Which hook is live:
+    #   4.x             -> module level mxfp4.dequantize, called by quantizer_mxfp4
+    #   5.1.0 and newer -> Mxfp4Dequantize (a ConversionOps) -> dequantize_convertops
+    # (5.0.0's dequantize_convertops is 3-arg and excluded by pyproject.) mxfp4.dequantize
+    # survives unreferenced until 5.16.0 (upstream PR #47579, the DTensor TP rewrite)
+    # deletes it, so patching only dequantize dropped the transpose from 5.1.0 on and
+    # loaded GPT-OSS with dims 1 and 2 silently swapped.
 
     if hasattr(transformers.integrations.mxfp4, "dequantize_convertops"):
-        # 5.x path. Its only caller is Mxfp4Dequantize.convert. This closes over the
-        # un-transposed convert_moe_packed_tensors defined above instead of re-reading
-        # the module attribute, so the transpose stays correct even if the
-        # patch_function call above did not take and the attribute is still upstream's
-        # self-transposing version.
+        # 5.x path, called only by Mxfp4Dequantize.convert. Closes over the local
+        # un-transposed convert_moe_packed_tensors rather than re-reading the module
+        # attribute, so the transpose stays correct even if patch_function above did
+        # not take and upstream's self-transposing version is still installed.
         def dequantize_convertops(blocks, scales):
             dequantized = convert_moe_packed_tensors(blocks, scales)
             return torch.nn.Parameter(dequantized.transpose(1, 2).contiguous())
         patch_function(transformers.integrations.mxfp4, "dequantize_convertops", dequantize_convertops)
 
     if transformers_version < Version("5.0.0"):
-        # 4.x path. shard_and_distribute_module is only reachable from here, and only
-        # when a device_mesh is present, so it is imported inside the gate: on 5.16.0+
-        # the name survives as a tombstone that raises RuntimeError when called.
+        # 4.x path. shard_and_distribute_module is imported inside the gate because on
+        # 5.16.0+ it still imports fine but is a tombstone that raises when called.
         try:
             import transformers.integrations.mxfp4
             from transformers.integrations.tensor_parallel import shard_and_distribute_module
@@ -202,8 +197,8 @@ def patch_convert_moe_packed_tensors():
             for proj in ["gate_up_proj", "down_proj"]:
                 if proj in param_name:
                     if device_mesh is not None:
-                        # 8 positionals and no set_param: that kwarg only exists on 5.x,
-                        # and this branch is now 4.x only, where passing it TypeErrors.
+                        # 8 positionals, no set_param: that kwarg was removed in 4.57.0
+                        # (and is absent from 5.x), so passing it TypeErrors there.
                         param_value = shard_and_distribute_module(
                             model,
                             param_value,
