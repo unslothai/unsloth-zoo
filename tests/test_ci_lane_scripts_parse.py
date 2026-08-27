@@ -108,10 +108,42 @@ def test_no_double_backslash_continuations(workflow: str, job: str, name: str, r
     )
 
 
+# The twenty drift files the fused Core lane inherited from the three matrix cells it
+# replaced. Named rather than counted: the risk this guard exists for is a continuation
+# that silently DROPS files, and a name tells you which one went missing where a count
+# only tells you that one did. Adding a drift file is routine and must not fail here --
+# an exact count made #1114 (which legitimately added the mxfp4 load-path file) turn this
+# guard red, so the fix for a real bug was blocked by the test meant to protect it.
+# Removing a file from the lane is the deliberate act: drop it from this set too, in the
+# same commit, and the reviewer sees the coverage shrink.
+_FUSED_CORE_LANE_REQUIRED = frozenset({
+    "tests/test_compiler_dynamic_exec.py",
+    "tests/test_compiler_rewriter_exhaustive.py",
+    "tests/test_extended_dep_api_pins.py",
+    "tests/test_gemma4_dtype_drift_guards.py",
+    "tests/test_merge_e2e_hub_unreachable.py",
+    "tests/test_missing_parent_package_is_drift.py",
+    "tests/test_moe_merge_e2e_cpu.py",
+    "tests/test_peft_paramwrapper_layout_drift.py",
+    "tests/test_temporary_patches_exhaustive.py",
+    "tests/test_torchvision_video_removed_message.py",
+    "tests/test_transformers_moe_structure_drift.py",
+    "tests/test_unsloth_zoo_lora_merge.py",
+    "tests/test_upstream_import_fixes_drift.py",
+    "tests/test_upstream_pinned_symbols_accelerator.py",
+    "tests/test_upstream_pinned_symbols_transformers.py",
+    "tests/test_upstream_pinned_symbols_trl_vllm.py",
+    "tests/test_upstream_signatures.py",
+    "tests/test_upstream_source_patterns.py",
+    "tests/test_zoo_history_regressions_deep.py",
+    "tests/test_zoo_source_upstream_refs.py",
+})
+
+
 def test_the_fused_core_job_still_runs_every_drift_file() -> None:
     """
     A command can parse and still have lost most of its arguments. This pins the
-    count against the workflow the cells were fused from, so a continuation that
+    files against the workflow the cells were fused from, so a continuation that
     silently drops files fails here rather than going green having run three.
     """
     doc = yaml.safe_load((WORKFLOWS / "consolidated-tests-ci.yml").read_text(encoding = "utf-8"))
@@ -120,13 +152,22 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
 
     body = run[run.index("-m pytest"):]
     body = body[: body.index("|| trc=$?")]
-    # Join the continuations the way the shell does, then count what is left.
+    # Join the continuations the way the shell does, then read off what is left.
     joined = body.replace("\\\n", " ")
     files = re.findall(r"tests/\S+\.py", joined)
 
-    assert len(files) == 20, (
-        f"the fused Core lane invokes pytest on {len(files)} files; the three matrix "
-        f"cells it replaced each ran 20. Found: {files}"
+    missing = _FUSED_CORE_LANE_REQUIRED - set(files)
+    assert not missing, (
+        f"the fused Core lane no longer invokes pytest on {sorted(missing)}. The three "
+        f"matrix cells it replaced each ran all of them, so dropping one silently "
+        f"narrows upstream-drift coverage. Lane currently runs: {sorted(files)}"
+    )
+    # A name repeated across continuations parses as two entries and would mask a drop
+    # from the set check above, which is order- and multiplicity-blind.
+    duplicated = sorted({name for name in files if files.count(name) > 1})
+    assert not duplicated, (
+        f"the fused Core lane names {duplicated} more than once; pytest would collect "
+        f"the file twice and the duplicate could be hiding a file that went missing"
     )
     assert '>> "$log" 2>&1' in joined, (
         "the pytest output is no longer redirected into the lane log, so a failing "
