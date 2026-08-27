@@ -467,7 +467,7 @@ def test_the_resolved_budget_matches_each_objectives_arithmetic(
 def test_an_inherited_max_length_says_it_narrowed_the_budget():
     from unsloth_zoo.mlx.preference import resolve_preference_length_policy
 
-    def resolve(max_seq_length, explicit):
+    def resolve(max_seq_length, explicit, kind="dpo"):
         args = types.SimpleNamespace(
             max_length=1024, max_prompt_length=512,
             max_completion_length=None, truncation_mode="keep_end",
@@ -476,13 +476,18 @@ def test_an_inherited_max_length_says_it_narrowed_the_budget():
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             resolve_preference_length_policy(
-                "dpo", args, max_seq_length=max_seq_length,
+                kind, args, max_seq_length=max_seq_length,
             )
         return [str(item.message) for item in caught]
 
     said = resolve(2048, explicit=False)
     assert len(said) == 1 and "budgeted more tightly" in said[0]
-    assert "max_length=max_seq_length" in said[0]
+    assert "max_prompt_length=None" in said[0]
+    # ORPO has already turned an open prompt bound into 128, so telling an ORPO
+    # caller to pass None would cap their prompts rather than widen them.
+    orpo = resolve(2048, explicit=False, kind="orpo")
+    assert len(orpo) == 1 and "max_prompt_length=None" not in orpo[0]
+    assert "resolves to 128" in orpo[0]
     # A value the caller chose is theirs to mean, and a width the budget already
     # fills has nothing to report.
     assert resolve(2048, explicit=True) == []

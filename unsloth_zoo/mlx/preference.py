@@ -151,12 +151,19 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
     # than copied from a config, so take its value as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
     if max_seq_length > max_length and not max_length_explicit:
+        # The advice has to differ by objective: DPO treats an open prompt bound
+        # as no cap, while ORPO has already turned it into 128 above.
+        restore = (
+            "Pass max_length=max_seq_length, max_prompt_length=None"
+            if kind == "dpo" else
+            "Pass max_length=max_seq_length together with the max_prompt_length "
+            "you want reserved, since leaving it open resolves to 128"
+        )
         warnings.warn(
             f"Unsloth MLX preference: max_length defaults to {max_length}, below "
             f"max_seq_length={max_seq_length}, so rows are budgeted more tightly "
-            "than they were before this option existed. Pass "
-            "max_length=max_seq_length, max_prompt_length=None to keep the "
-            "previous budget.",
+            f"than they were before this option existed. {restore} to widen the "
+            "budget back.",
             RuntimeWarning, stacklevel=2,
         )
     # For DPO the prompt bound is a cap rather than reserved room, so it may
