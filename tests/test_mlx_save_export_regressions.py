@@ -3967,53 +3967,6 @@ def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it
     assert model.language_model["lm_head"] == "the head this model was trained with"
 
 
-def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
-    """A split into one tensor per expert, which no pair of parts can propose.
-
-    DBRX names the parts by index, so no vocabulary fragment stands for one and
-    the merge family cannot reach them. The second leaf keeps a recipe proved on
-    the first from standing for both: only `w2` is transposed as well as split.
-    """
-    import unsloth_zoo.mlx.utils as mutils
-
-    mx = mutils.mx
-
-    class Model:
-        def __init__(self):
-            self.checkpoint = {
-                f"blocks.{layer}.ffn.experts.mlp.{leaf}":
-                    mx.arange(24, dtype=mx.float32).reshape(12, 2) + layer
-                for layer in range(2)
-                for leaf in ("w1", "w2")
-            }
-            self.expected = self.sanitize(dict(self.checkpoint))
-
-        def named_modules(self):
-            yield "", self
-
-        def sanitize(self, weights):
-            out = {}
-            for name, tensor in weights.items():
-                if "experts.mlp" not in name:
-                    out[name] = tensor
-                    continue
-                for expert, part in enumerate(mx.split(tensor, 3, axis=0)):
-                    out[name.replace(".mlp", f".{expert}") + ".weight"] = (
-                        part.T if name.endswith("w2") else part
-                    )
-            return out
-
-    model = Model()
-    assert len(model.expected) == 12
-    assert all(name.endswith(".weight") for name in model.expected)
-    path = _stage_moe_directory(tmp_path, model)
-    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 12
-    rewritten = _staged_tensors(path)
-    assert sorted(rewritten) == sorted(model.checkpoint)
-    for name, tensor in model.checkpoint.items():
-        assert rewritten[name].tolist() == tensor.tolist()
-
-
 def _relocated(name):
     """A rename spelled outside the sanitizer, as mlx-vlm's qwen4_exp spells its own."""
     if name.startswith("outer.inner."):
@@ -4078,6 +4031,172 @@ def test_moe_gguf_export_relocates_a_namespace_every_tensor_carries(tmp_path):
     path = _stage_moe_directory(tmp_path, model)
     assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
     assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
+
+
+@pytest.mark.parametrize("added,rewrites", (("namespace", 0), ("reordered", 7), ("root", 7), ("container", 2), ("always", 7)))
+def test_moe_gguf_export_keeps_a_namespace_a_sanitizer_adds_back(added, rewrites, tmp_path):
+    """A namespace mlx-vlm's Gemma models add back replays either way, so the tower keeps the checkpoint's own spelling; the container the experts sit under is added back alike, and so is a bare `model.` outside a tower, which llama.cpp maps under other roots as readily as that one."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
+    prefix = {"namespace": "language_model.model.", "reordered": "model.language_model.",
+              "root": "", "container": "model.", "always": "language_model."}[added]
+
+    class Model:
+        # The names outside the tower hold each fragment under the ubiquity limit, where it is
+        # offered as a substitution rather than as a whole-name move.
+        # None of the leaves are ones the converter already reads, which a rewrite holds back.
+        checkpoint = {f"{prefix}layers.0.self_attn.{leaf}.weight": tensor(i)
+                      for i, leaf in enumerate(("q_norm", "k_norm", "sinks", "gate", "bias"))}
+        checkpoint.update((f"{prefix}layers.0.mlp.experts.{leaf}.weight", tensor(i))
+                          for i, leaf in enumerate(("down_proj", "gate_proj")))
+        checkpoint.update((f"vision_tower.layers.{n}.w", tensor(n)) for n in range(16))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, value in weights.items():
+                # "always" is the sanitizer the staged names do not replay through.
+                if added == "always":
+                    name = name.replace("language_model.", "language_model.model.")
+                elif added == "namespace" and "language_model.model" not in name:
+                    name = name.replace("language_model", "language_model.model")
+                elif added == "reordered":
+                    name = name.replace("model.language_model.", "language_model.model.")
+                elif added == "root" and name.startswith("layers."):
+                    name = "model." + name
+                elif added == "container" and "experts." in name and "switch_glu" not in name:
+                    name = name.replace("mlp.experts.", "mlp.experts.switch_glu.")
+                out[name] = value
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(Model.checkpoint))
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == rewrites
+    assert sorted(_staged_tensors(path)) == sorted(Model.checkpoint)
+
+
+def test_moe_gguf_export_refuses_a_rename_onto_a_name_the_split_rebuilds():
+    """Two names reaching the replay as one hide the loss, so the split's names count too."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+
+    class Model:
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            return {name.replace("old.", "new."): value for name, value in weights.items()}
+
+    staged = {
+        "a.b.new.w": mx.arange(4, dtype=mx.float32).reshape(1, 4),
+        "a.b.experts.w": mx.arange(8, dtype=mx.float32).reshape(2, 4),
+    }
+    # The colliding name is the second the split rebuilds, so reading only the first misses it.
+    split_plan = {"a.b.experts.w": ["a.b.other.w", "a.b.old.w"]}
+    assert mutils._build_mlx_moe_rename_plan(Model(), staged, split_plan)[0] == {}
+
+
+def test_moe_gguf_export_keeps_a_container_drop_when_the_namespace_goes_back(tmp_path):
+    """A sanitizer adding back both leaves the tower no rename that moved the namespace alone, and reading the namespace back must not bring the container with it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
+
+    class Model:
+        checkpoint = {f"language_model.model.layers.0.mlp.experts.{leaf}.weight": tensor(i)
+                      for i, leaf in enumerate(("down_proj", "gate_proj"))}
+        checkpoint.update((f"vision_tower.layers.{n}.w", tensor(n)) for n in range(16))
+
+        def named_modules(self):
+            yield "", self
+
+        # Its two literals are the whole vocabulary a rewrite reads, so the search reaches
+        # the spelling that drops both and the namespace has to be read back onto it.
+        def sanitize(self, weights):
+            out = {}
+            for name, value in weights.items():
+                if name.startswith("language_model.") and "language_model.model" not in name:
+                    name = name.replace("language_model.", "language_model.model.")
+                if "experts." in name and "switch_glu" not in name:
+                    name = name.replace("mlp.experts.", "mlp.experts.switch_glu.")
+                out[name] = value
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(Model.checkpoint))
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    assert sorted(_staged_tensors(path)) == sorted(Model.checkpoint)
+
+
+def test_moe_gguf_export_reads_a_namespace_back_only_onto_the_names_that_left_it():
+    """One left it, one never left it, one arrived from outside, one left the tower entirely."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    left = {
+        "language_model.model.layers.0.mlp.experts.down_proj.weight":
+            "language_model.layers.0.mlp.experts.down_proj.weight",
+    }
+    stayed = {
+        "language_model.model.norm.weight": "language_model.model.norm.weight",
+        "vision_tower.blocks.0.w": "language_model.visual.blocks.0.w",
+        "language_model.model.aux.weight": "visual.aux.weight",
+    }
+    for name, renamed in left.items():
+        assert mutils._mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)
+    for name, renamed in stayed.items():
+        assert not mutils._mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)
+
+
+def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
+    """A split into one tensor per expert, which no pair of parts can propose.
+
+    DBRX names the parts by index, so no vocabulary fragment stands for one and
+    the merge family cannot reach them. The second leaf keeps a recipe proved on
+    the first from standing for both: only `w2` is transposed as well as split.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"blocks.{layer}.ffn.experts.mlp.{leaf}":
+                    mx.arange(24, dtype=mx.float32).reshape(12, 2) + layer
+                for layer in range(2)
+                for leaf in ("w1", "w2")
+            }
+            self.expected = self.sanitize(dict(self.checkpoint))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                if "experts.mlp" not in name:
+                    out[name] = tensor
+                    continue
+                for expert, part in enumerate(mx.split(tensor, 3, axis=0)):
+                    out[name.replace(".mlp", f".{expert}") + ".weight"] = (
+                        part.T if name.endswith("w2") else part
+                    )
+            return out
+
+    model = Model()
+    assert len(model.expected) == 12
+    assert all(name.endswith(".weight") for name in model.expected)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 12
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    for name, tensor in model.checkpoint.items():
+        assert rewritten[name].tolist() == tensor.tolist()
 
 
 def test_moe_gguf_export_splits_a_tensor_a_sanitizer_fused_from_a_named_group(tmp_path):

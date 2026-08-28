@@ -15001,6 +15001,24 @@ def _mlx_moe_expert_names(name, num_experts, group, leaf_alias, parent=("", ""))
     return [f"{prefix}.{group}.{e}.{leaf}.{param}" for e in range(num_experts)]
 
 
+_GGUF_TEXT_TOWER_NAMESPACE = "language_model.model"
+
+
+def _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed):
+    """Whether this rename keeps a text tower but drops the namespace llama.cpp maps it under.
+
+    The converter strips `language_model.` and looks the rest up under `model.`, so a
+    rename off `language_model.model.` onto a `language_model.` that no longer carries it
+    moves the tensor out of the tables. Both ends are read, so a tensor renamed into the
+    tower never counts as having left it. Only a text tower is answered: outside one,
+    `transformer.blocks`, `encoder.layers` and a bare `layers` are each mapped under some
+    architecture, and nothing about a name says which a checkpoint is spelled in.
+    """
+    return (name.startswith(_GGUF_TEXT_TOWER_NAMESPACE + ".")
+            and renamed.startswith("language_model.")
+            and not renamed.startswith(_GGUF_TEXT_TOWER_NAMESPACE + "."))
+
+
 def _mlx_moe_parent_substitutions(renames):
     """The module relocations a set of proved renames is made of.
 
@@ -16216,6 +16234,19 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             sanitizers, probe, {**staged, **claimed}, markers, required
         )
 
+    # Read once: this is the whole split plan's output, and the check below runs for
+    # every candidate a search offers.
+    claimed_names = frozenset(claimed)
+
+    def produced_once(proposal):
+        """Whether every name it produces is distinct from the others and from the split's.
+
+        Two names landing on one, or on one the split already reconstructs, reach the
+        replay through a single probe entry, so it cannot see the loss.
+        """
+        produced = proposal.values()
+        return len(set(produced)) == len(proposal) and claimed_names.isdisjoint(produced)
+
     # A stacked expert tensor is recovered by splitting, not renaming, so a
     # substitution must not be judged on whether it also names one. Leaving them out
     # lets the relocation be read off the router tensors before the split plan.
@@ -16237,7 +16268,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
         # A substitution mapping a recovered name back onto the saved one would pass by
         # vacancy, undoing an earlier one. Recovered names may be refined, never dropped,
         # so equalling the last candidate is enough and losing one is not.
-        if len(set(candidate.values())) != len(candidate):
+        if not produced_once(candidate):
             continue
         if not recovered >= {name for name, p in proposal.items() if p != name}:
             continue
@@ -16252,11 +16283,30 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             candidate, candidate_corrections = _completed_mlx_moe_rename_candidate(
                 candidate, candidate_corrections, unproven, vocabulary, replay
             )
+            if not produced_once(candidate):
+                continue
             recovered = {name for name, p in candidate.items() if p != name}
         # Both halves matter: the floor keeps what the sanitizer already reproduces, and
         # `recovered` makes each new name earn its place -- a name the sanitizer drops is
         # reproduced under neither spelling, so it would be renamed on no evidence at all.
         if set(candidate_corrections) >= baseline | recovered:
+            proposal, corrections = candidate, candidate_corrections
+    # Several spellings replay alike, and the one the checkpoint was loaded from is worth
+    # no less than another, so the namespace it carries goes back on the names that left
+    # it wherever that replays as well. Only the namespace: a container the sanitizer adds
+    # back stays dropped, and where nothing else moved this leaves no rename at all.
+    restored = {name: _GGUF_TEXT_TOWER_NAMESPACE + renamed[len("language_model"):]
+                for name, renamed in proposal.items()
+                if _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)}
+    if restored:
+        candidate = {**proposal, **restored}
+        recovered = {name for name, p in candidate.items() if p != name}
+        candidate_corrections = replay(candidate, set(corrections) - recovered)
+        # Measured against what the search settled on rather than against the floor:
+        # the floor is what the staged names alone reproduce, which putting them back
+        # meets by construction.
+        if (produced_once(candidate)
+                and set(candidate_corrections) >= set(corrections) | recovered):
             proposal, corrections = candidate, candidate_corrections
     constants = {name: constant for name, (constant, _) in corrections.items() if constant}
     layouts = {name: layout for name, (_, layout) in corrections.items() if layout}
