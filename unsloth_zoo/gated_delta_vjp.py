@@ -499,31 +499,21 @@ def patch_gated_delta_vlm_shared():
 # order is semantically irrelevant.
 # --------------------------------------------------------------------------
 
-_KERNEL_CHUNK_SIZE = 64
+# BPTT chunk length, derived per call: longer amortizes the launch and the replay.
+_KERNEL_CHUNK_MIN = 64
+_KERNEL_CHUNK_MAX = 512
+_KERNEL_CHECKPOINT_BUDGET = 128 << 20
 
 
-# Blocked-sequential thread layout, shared by the three kernels below.
-#
-# mlx-lm's kernel gives every state row its own simdgroup: 32 lanes hold Dk/32
-# state columns each, every contraction costs a full simd_sum, and each of the
-# Dv rows re-reads the same k/q row from device memory. Here a thread owns a
-# W-wide segment of one row, P = Dk/W threads cover a row inside one simdgroup
-# (so a contraction is log2(P) shuffles), DB rows share a threadgroup, and each
-# threadgroup stages a TB-step time block of k/q/v/g/beta into threadgroup
-# memory once instead of re-reading it per row.
+# Blocked-sequential thread layout, shared by the three kernels below. mlx-lm
+# gives each state row its own simdgroup; here P = Dk/W threads cover a row
+# inside one, DB rows share a threadgroup, which stages a TB-step block once.
 
 _BLOCKED_TG_MEMORY = 32768   # Metal threadgroup-memory limit
 _BLOCKED_TG_THREADS = 256
 _BLOCKED_PAD = 8             # row padding, keeps threadgroup rows bank- and 8-byte-aligned
 
 class _BlockedCfg(NamedTuple):
-    """What a kernel needs from a thread layout.
-
-    `dk_rows`, `dv_rows` and `dv_f32_rows` count the Dk-wide, DB-wide and
-    DB-wide fp32 threadgroup arrays it stages per time step; `red_arrays`
-    counts its Dk-wide cross-row reduction rows, one per simdgroup. Together
-    they decide how long a time block fits in threadgroup memory.
-    """
     dk_rows: int
     dv_rows: int
     dv_f32_rows: int
@@ -1153,6 +1143,13 @@ def gated_delta_kernel_supported(q, g, mask, v=None, k=None) -> bool:
     )
 
 
+def _kernel_chunk_size(B, Hv, Dk, Dv, TB):
+    """Longest chunk whose checkpoints fit the budget, clamped to the length bounds
+    and so overridden by either; n blocks hold n - 1 states."""
+    states = _KERNEL_CHECKPOINT_BUDGET // max(1, B * Hv * Dv * Dk * 4)
+    return min(_KERNEL_CHUNK_MAX, max(_KERNEL_CHUNK_MIN, (states + 1) * TB))
+
+
 def gated_delta_kernel_efficient(
     q: mx.array,
     k: mx.array,
@@ -1179,6 +1176,7 @@ def gated_delta_kernel_efficient(
     Hv, Dv = v.shape[-2:]
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    chunk = _kernel_chunk_size(B, Hv, Dk, Dv, _blocked_layouts(q, g, v)[1][3])
 
     if (repeat_factor := Hv // Hk) > 1:
         # Repeat outside custom_function so autodiff folds the per-group
@@ -1207,9 +1205,10 @@ def gated_delta_kernel_efficient(
         )
 
     all_ys = []
-    s = state
-    for t_start in range(0, T, _KERNEL_CHUNK_SIZE):
-        t_end = min(t_start + _KERNEL_CHUNK_SIZE, T)
+    # fp32 across chunks: rounding per chunk makes the length observable in y.
+    s = state if T <= chunk else state.astype(mx.float32)
+    for t_start in range(0, T, chunk):
+        t_end = min(t_start + chunk, T)
         chunk_y, s = _chunk(
             q[:, t_start:t_end],
             k[:, t_start:t_end],
@@ -1221,4 +1220,4 @@ def gated_delta_kernel_efficient(
         all_ys.append(chunk_y)
 
     y = mx.concatenate(all_ys, axis=1) if len(all_ys) > 1 else all_ys[0]
-    return y, s
+    return y, s.astype(state.dtype)

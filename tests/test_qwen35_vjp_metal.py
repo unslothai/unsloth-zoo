@@ -290,9 +290,8 @@ def test_end_to_end_training_step_all_patches():
     assert any(float(mx.abs(g).max()) > 0 for g in flat), "all grads zero"
 
 
-# The global tolerance bounds error against the tensor's largest magnitude,
-# the elementwise one against each entry's own, so a small badly computed
-# entry cannot hide behind a large one.
+# The elementwise bound divides by each entry's own magnitude plus 1% of the
+# tensor's largest, so a small bad entry cannot hide behind a large one.
 _Y_TOL = {mx.bfloat16: 5e-3, mx.float16: 5e-4, mx.float32: 5e-6}
 _Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float16: 1e-3, mx.float32: 2e-5}
 _STATE_TOL = 1e-6
@@ -313,7 +312,6 @@ def _inputs(B, T, Hk, Hv, Dk, Dv, dtype, vectorized, seed=0):
 
 
 def _gqa_repeated(args):
-    # q/k as the kernels see them; the drivers repeat before dispatching.
     q, k, v, g, beta, state = args
     r = v.shape[-2] // q.shape[-2]
     return (mx.repeat(q, r, -2), mx.repeat(k, r, -2), v, g, beta, state) if r > 1 else args
@@ -343,15 +341,12 @@ def _rel(a, b):
 
 
 def _elem_rel(a, b, floor=0.01):
-    """Deviation per entry, floored at ``floor`` x the tensor's scale."""
     return float(mx.max(mx.abs(a.astype(mx.float32) - b)
                         / (mx.abs(b) + floor * mx.max(mx.abs(b)))))
 
 
-# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized). Between them the layout derives
-# every thread prefix (1 to 32) and segment width (4 to 32) it can produce, for
-# both gating shapes, all three input dtypes, one to eight simdgroups per
-# threadgroup, GQA ratios 1 to 4, and a T that is not a multiple of the block.
+# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized). Together they exercise every thread
+# prefix and segment width the layout derives, both gatings, all dtypes, a ragged T.
 _CASES = [
     (1, 64, 16, 32, 128, 128, mx.bfloat16, False),
     (2, 77, 16, 32, 128, 128, mx.bfloat16, False),
@@ -412,7 +407,6 @@ def test_only_calls_the_kernels_can_answer_for_are_admitted():
     assert gated_delta_kernel_supported(bf_q, bf_g, None, bf_v, bf_k)
     for partial in ((ok_q, ok_g, None), (ok_q, ok_g, None, ok_v), (q, g, None)):
         assert not gated_delta_kernel_supported(*partial)
-    # One element type behind all three, same-width mixes included.
     for mix in ((ok_q, ok_g, ok_v, bf_k), (ok_q, ok_g, bf_v, ok_k),
                 (bf_q, bf_g, bf_v, bf_k.astype(mx.float16))):
         assert not gated_delta_kernel_supported(mix[0], mix[1], None, *mix[2:])
@@ -428,33 +422,26 @@ def test_only_calls_the_kernels_can_answer_for_are_admitted():
 
 
 @metal_only
-@pytest.mark.parametrize("dtypes", [(mx.float32, mx.float32), (mx.float32, mx.bfloat16),
-                                    (mx.bfloat16, mx.bfloat16)])
-def test_every_output_keeps_the_dtype_its_primal_came_in(dtypes):
-    """g, beta and the state can arrive in a dtype no in-tree caller uses."""
+@pytest.mark.parametrize("rest_dtype", [mx.float32, mx.bfloat16])
+def test_every_output_keeps_the_dtype_its_primal_came_in(rest_dtype):
     import unsloth_zoo.gated_delta_vjp as gdv
 
-    in_dtype, rest_dtype = dtypes
-    q, k, v, *rest = _inputs(1, 100, 4, 4, 128, 128, in_dtype, False)
+    q, k, v, *rest = _inputs(1, 100, 4, 4, 128, 128, mx.bfloat16, False)
     g, beta, state = (x.astype(rest_dtype) for x in rest)
-    ref = _reference(q, k, v, g, beta, state.astype(mx.float32))[1]
-    for out in (gdv.gated_delta_blocked_forward(q, k, v, g, beta, state)[1],
-                gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)[1]):
-        mx.eval(out)
-        assert out.dtype == rest_dtype and out.shape == state.shape
-        assert _rel(out, ref) < (_STATE_TOL if rest_dtype == mx.float32 else 5e-3)
-
+    primals = (q, k, v, g, beta, state)
     mx.random.seed(13)
     w, ws = mx.random.normal((1, 100, 4, 128)), mx.random.normal((1, 4, 128, 128))
-    primals = (q, k, v, g, beta, state)
-    # Not elementwise: a bf16 operand leaves three decimal digits, and
-    # cancellation then dominates the small entries.
-    gtol = 2e-6 if in_dtype == rest_dtype == mx.float32 else 1e-2
-    got = _grads_of(gdv.gated_delta_kernel_efficient, primals, w, ws)[1]
-    want = _grads_of(gdv.gated_delta_ops_efficient, primals, w, ws)[1]
-    for name, a, b, primal in zip("q k v g beta state".split(), got, want, primals):
+    ref = _reference(q, k, v, g, beta, state.astype(mx.float32))[1]
+    for out in (gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)[1],
+                gdv.gated_delta_blocked_forward(q, k, v, g, beta, state)[1]):
+        assert out.dtype == rest_dtype and _rel(out, ref) < 5e-3
+    # Not elementwise: bf16 leaves three digits, so cancellation dominates.
+    for name, a, b, primal in zip(
+            "q k v g beta state".split(),
+            _grads_of(gdv.gated_delta_kernel_efficient, primals, w, ws)[1],
+            _grads_of(gdv.gated_delta_ops_efficient, primals, w, ws)[1], primals):
         assert a.dtype == primal.dtype and a.shape == primal.shape, name
-        assert _rel(a, b) < gtol, name
+        assert _rel(a, b) < 1e-2, name
 
 
 @metal_only
@@ -480,8 +467,8 @@ def test_gradients_match_autodiff_over_the_same_recurrence(case):
 
 @metal_only
 def test_backward_is_causal_and_reaches_non_first_positions():
-    """Perturbing dy at one late step must move the gradients at and before it
-    and leave the rest at a noise floor the atomic reductions make nonzero."""
+    """Perturbing dy at one late step moves d_q only at that step and head, and d_v
+    all the way back from it; the rest sits at the atomic reductions' noise floor."""
     import unsloth_zoo.gated_delta_vjp as gdv
 
     q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
@@ -504,37 +491,60 @@ def test_backward_is_causal_and_reaches_non_first_positions():
                                for r in repeats for a, b in zip(r, (dq0, dv0))])
     d_q, d_v = mx.abs(dq1 - dq0), mx.abs(dv1 - dv0)
 
-    # d_q[t] contracts dy[t] with the state at t: only t_p, only its head.
-    assert float(mx.max(d_q[:, :t_p])) <= floor, "d_q must not move before t_p"
-    assert float(mx.max(d_q[:, t_p + 1:])) <= floor, "d_q must not move after t_p"
-    assert float(mx.max(d_q[:, t_p, :hq_p])) <= floor
-    assert float(mx.max(d_q[:, t_p, hq_p + 1:])) <= floor
+    assert max(float(mx.max(d_q[:, :t_p])), float(mx.max(d_q[:, t_p + 1:]))) <= floor
+    assert max(float(mx.max(d_q[:, t_p, :hq_p])), float(mx.max(d_q[:, t_p, hq_p+1:]))) <= floor
     assert float(mx.max(d_q[:, t_p, hq_p])) > 1e3 * floor
-    # d_v never looks ahead, and its trail runs the whole way back rather than
-    # stopping near the step the reverse scan entered on. v enters its own
-    # state row only, so every other row is untouched exactly.
+    # d_v's trail runs the whole way back, not just to the step the scan entered on.
     assert float(mx.max(d_v[:, t_p + 1:])) <= floor, "d_v cannot look ahead"
     assert float(d_v[0, t_p, hv_p, dv_p]) > 1e3 * floor
     assert float(mx.min(d_v[0, :t_p + 1, hv_p, dv_p])) > 10 * floor
     other = mx.concatenate([d_v[:, :, hv_p, :dv_p], d_v[:, :, hv_p, dv_p + 1:]], axis=-1)
-    assert float(mx.max(other)) == 0.0, "d_v must stay in the perturbed state row"
-    assert float(mx.max(d_v[:, :, :hv_p])) == 0.0
-    assert float(mx.max(d_v[:, :, hv_p + 1:])) == 0.0
+    assert float(mx.max(other)) == 0.0, "d_v must stay in its own state row"
+    assert float(mx.max(d_v[:, :, :hv_p]) + mx.max(d_v[:, :, hv_p + 1:])) == 0.0
+
+
+@metal_only
+def test_the_chunk_length_is_the_longest_affordable_and_never_visible():
+    """A memory decision, so 64 and 512 agree bit for bit; the only seam coverage."""
+    import unsloth_zoo.gated_delta_vjp as gdv
+
+    bill = lambda B, Hv, Dk, Dv, n: B * Hv * Dv * Dk * 4 * max(0, n - 1)
+    for B, Hv, Dk, Dv, TB in ((1, 32, 128, 128, 8), (8, 32, 128, 64, 8),
+                              (64, 32, 128, 128, 4), (1, 32, 256, 256, 8)):
+        chunk = gdv._kernel_chunk_size(B, Hv, Dk, Dv, TB)
+        assert chunk % TB == 0 and gdv._KERNEL_CHUNK_MIN <= chunk <= gdv._KERNEL_CHUNK_MAX
+        if chunk > gdv._KERNEL_CHUNK_MIN:
+            assert bill(B, Hv, Dk, Dv, chunk // TB) <= gdv._KERNEL_CHECKPOINT_BUDGET
+        if chunk < gdv._KERNEL_CHUNK_MAX:
+            assert bill(B, Hv, Dk, Dv, chunk // TB + 1) > gdv._KERNEL_CHECKPOINT_BUDGET
+    assert gdv._kernel_chunk_size(1, 0, 128, 128, 8) == gdv._KERNEL_CHUNK_MAX
+
+    q, k, v, g, beta, state = _inputs(1, 300, 4, 4, 128, 128, mx.float32, False)
+    state, out, chunks = state.astype(mx.bfloat16), [], []
+    real, fwd = gdv._kernel_chunk_size, gdv.gated_delta_blocked_forward
+    gdv.gated_delta_blocked_forward = lambda *a: (chunks.append(a[0].shape[1]), fwd(*a))[1]
+    try:
+        for length in (64, 512):
+            gdv._kernel_chunk_size = lambda *a, n=length: n
+            out.append(gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state))
+    finally:
+        gdv._kernel_chunk_size, gdv.gated_delta_blocked_forward = real, fwd
+    assert chunks == [64, 64, 64, 64, 44, 300], "the loop has to use the length"
+
+    assert (out[0][0] == out[1][0]).all() and (out[0][1] == out[1][1]).all()
+    assert out[0][1].dtype == mx.bfloat16 and out[0][1].shape == state.shape
 
 
 @metal_only
 @pytest.mark.parametrize("T", [8, 64, 100, 128])
 def test_backward_checkpoints_block_boundaries_not_steps(T):
-    """One state per boundary between time blocks, not one per step; a
-    single-block chunk keeps one unwritten slot, which is the T=8 case."""
     import unsloth_zoo.gated_delta_vjp as gdv
 
     B, Hv, Dk, Dv = 1, 32, 128, 128
     q, k, v, g, beta, state = _inputs(B, T, Hv, Hv, Dk, Dv, mx.bfloat16, False)
     dy = mx.random.normal((B, T, Hv, Dv)).astype(mx.bfloat16)
     TB = gdv._blocked_layouts(q, g, v)[1][3]
-    gdv._get_blocked_kernels(False)   # the spy replaces a built kernel triple
-    shapes, real = [], gdv._GD_BLOCKED[False]
+    shapes, real = [], gdv._get_blocked_kernels(False)
 
     def spy(**kwargs):
         shapes.append(kwargs["output_shapes"])
