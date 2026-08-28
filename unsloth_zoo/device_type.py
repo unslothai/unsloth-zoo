@@ -348,22 +348,10 @@ def get_amd_flash_attn_func():
 
 
 def _cpu_fallback():
-    """The device name to fall back to on a host with no accelerator, or None.
+    """The device name for a host with no accelerator, or None.
 
-    Two flags reach here and they do NOT mean the same thing, so they do not give the
-    same answer.
-
-    `UNSLOTH_ALLOW_CPU=1` is the long standing test-only escape hatch, and it answers
-    `"cuda"` deliberately: callers keep taking their CUDA branches against a CPU torch.
-    That is unchanged.
-
-    `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` is the newer flag a download-only child (and the
-    CPU security job) sets to skip the heavy GPU init entirely. Importing a module that
-    reads `device_type` directly - `temporary_patches.gpt_oss` does - still ran this
-    detection and raised, so the flag only half kept its promise. It answers `"cpu"`,
-    which is what `__init__.py` already publishes as the package level `DEVICE_TYPE` on
-    that path. Answering `"cuda"` here instead left one process holding both values at
-    once, so two modules picked different device branches.
+    `UNSLOTH_ALLOW_CPU=1` answers "cuda" so callers keep their CUDA branches against a
+    CPU torch. `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` answers "cpu" to match `__init__.py`.
     """
     if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
         return "cuda"
@@ -372,24 +360,16 @@ def _cpu_fallback():
     return None
 
 
-# Read once, at module scope, so every reader below agrees. `get_device_type` is
-# `@functools.cache`d, so it would read the environment once per process anyway.
 _GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
 
 
 @functools.cache
 def get_device_type():
     if _IS_MLX:
-        # MLX keeps its precedence: a macOS/arm64 host answers "mlx" whatever the
-        # skip flag says, which is what `__init__.py` publishes there too.
         return "mlx"
     if _GPU_INIT_SKIPPED:
-        # BEFORE the hardware probes, not after. `__init__.py` publishes
-        # `DEVICE_TYPE = "cpu"` on this path unconditionally, so consulting the flag
-        # only in the no-accelerator fallback left a CUDA or XPU host holding both
-        # answers at once: the package said "cpu" and a direct
-        # `import unsloth_zoo.device_type` said "cuda". It also ran the very
-        # detection the flag promises to skip.
+        # BEFORE the hardware probes: `__init__.py` publishes "cpu" unconditionally, so
+        # checking only in the no-accelerator fallback left a CUDA host with both.
         return "cpu"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
@@ -399,8 +379,7 @@ def get_device_type():
         return "xpu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
-            # Test-only CPU fallback. The env vars are read exactly once per
-            # process because get_device_type is @functools.cache'd.
+            # Test-only CPU fallback; get_device_type is @functools.cache'd.
             fallback = _cpu_fallback()
             if fallback is not None:
                 return fallback
@@ -432,9 +411,7 @@ elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 @functools.cache
 def get_device_count():
     if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
-        # Answered HERE, not only on the constant below: a caller using the getter was
-        # being handed 1 while `DEVICE_COUNT` said 0 in the same process. No device
-        # was looked for at all on this path, which is what 0 says.
+        # The getter too, not only the constant below: they were handed 1 and 0.
         return 0
     if DEVICE_TYPE in ("cuda", "hip"):
         return torch.cuda.device_count()
@@ -450,8 +427,7 @@ DEVICE_COUNT : int = get_device_count()
 # If AMD, we cannot load pre-quantized models for now :(
 ALLOW_PREQUANTIZED_MODELS : bool = True
 if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
-    # Same argument as `DEVICE_COUNT` above: `__init__.py` publishes False here, and
-    # the two import paths must not disagree about what the process can load.
+    # As with DEVICE_COUNT: the two import paths must not disagree.
     ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True

@@ -3,17 +3,8 @@
 
 """`UNSLOTH_ZOO_DISABLE_GPU_INIT=1` must not remove the device constants.
 
-The flag skips the heavy torch/device init. It is what CI sets to run this very
-suite, because the runner has no GPU and the init ends in
-`find_spec("unsloth") is None -> ImportError`.
-
-But modules that are otherwise import-safe read those constants at module scope -
-`compiler.py` does `from . import DEVICE_TYPE` - so skipping the init used to turn
-any such import into `ImportError: cannot import name 'DEVICE_TYPE'`. The whole
-security job then failed during COLLECTION, which means it was not running at all
-while still reporting a result.
-
-CPU-only and network-free: this reads source and runs a subprocess with the flag set.
+CI sets the flag to run this suite, and `compiler.py` imports `DEVICE_TYPE` at module
+scope, so the job failed during COLLECTION while still reporting a result.
 """
 
 from __future__ import annotations
@@ -30,23 +21,17 @@ import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-# The MLX branch of `__init__.py` runs BEFORE the skip flag is consulted and answers
-# "mlx", deliberately, so the CPU expectations below are not the right ones there.
-# Read without importing torch: `is_mlx_available` is import-light.
+# MLX answers before the skip flag is read, so the CPU expectations do not hold there.
 try:
     from unsloth_zoo.mlx.runtime import is_mlx_available as _is_mlx_available
     _IS_MLX_HOST = bool(_is_mlx_available())
 except Exception:
     _IS_MLX_HOST = False
 
-# The security lane installs `.[core]` and NOT `unsloth`, and the full init ends in
-# `find_spec("unsloth") is None -> ImportError`. Only the tests that deliberately turn
-# the skip flag OFF reach that, so they are the only ones guarded.
+# The security lane installs `.[core]` and not `unsloth`, so the full init raises.
 _HAS_UNSLOTH = importlib.util.find_spec("unsloth") is not None
 
-# `UNSLOTH_ALLOW_CPU=1` is a fallback for a host with NO accelerator, so it is only
-# reached where none is visible. Clearing `CUDA_VISIBLE_DEVICES` does that for CUDA
-# and not for XPU, which stays available and is answered before the hatch.
+# Clearing `CUDA_VISIBLE_DEVICES` hides CUDA but not XPU, answered before the hatch.
 def _has_non_cuda_accelerator():
     try:
         import torch
@@ -58,21 +43,14 @@ def _has_non_cuda_accelerator():
 _HAS_NON_CUDA_ACCELERATOR = _has_non_cuda_accelerator()
 _INIT = _ROOT / "unsloth_zoo" / "__init__.py"
 
-# Bound by the MLX branch and by the skip branch alike, and by the real init below
-# both. A module reading any of them must not care which path ran.
 _CONSTANTS = ("DEVICE_TYPE", "DEVICE_TYPE_TORCH", "DEVICE_COUNT", "ALLOW_PREQUANTIZED_MODELS")
 
 
 def _child(code: str):
     environment = dict(os.environ)
     environment["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
-    # `tests/conftest.py` sets `UNSLOTH_ALLOW_CPU=1` for the whole run, and inheriting
-    # it here would have let that unrelated escape hatch stand in for the skip path
-    # this test is about: the promise is that `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` alone
-    # keeps the module importable, so the child is asked exactly that question.
+    # conftest sets this run-wide; inheriting it would stand in for the skip path.
     environment.pop("UNSLOTH_ALLOW_CPU", None)
-    # A subprocess, not an import: this package is already imported in-process with
-    # the flag unset, so an in-process check would prove nothing about the flag.
     return subprocess.run(
         [sys.executable, "-c", code],
         cwd = _ROOT, env = environment, capture_output = True, text = True, timeout = 300,
@@ -95,14 +73,7 @@ def test_a_module_that_reads_them_still_imports():
 
 @pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
 def test_the_two_device_type_spellings_agree_on_the_skip_path():
-    """One process must not hold two different answers for the same question.
-
-    `__init__.py` publishes `DEVICE_TYPE = "cpu"` on the skip path, and
-    `device_type.get_device_type()` has to say the same, or a module reading one and a
-    module reading the other take different device branches in the same run. The older
-    `UNSLOTH_ALLOW_CPU=1` hatch deliberately answers `"cuda"`; that is a different
-    question and is checked separately below.
-    """
+    """One process must not hold two answers: two modules would branch differently."""
     result = _child(
         "import unsloth_zoo, unsloth_zoo.device_type as d;"
         "print(unsloth_zoo.DEVICE_TYPE, d.DEVICE_TYPE, d.DEVICE_TYPE_TORCH)"
@@ -115,12 +86,7 @@ def test_the_two_device_type_spellings_agree_on_the_skip_path():
 @pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
 @pytest.mark.parametrize("name", _CONSTANTS)
 def test_both_import_paths_publish_the_same_constant(name):
-    """Not just the device NAME: a reader cannot tell which spelling it got.
-
-    `DEVICE_COUNT` and `ALLOW_PREQUANTIZED_MODELS` disagreed - the package published
-    0 and False, and `device_type` computed 1 and left True - so two modules in one
-    process could hold contradictory device capabilities.
-    """
+    """`DEVICE_COUNT` and `ALLOW_PREQUANTIZED_MODELS` disagreed too: 0/False vs 1/True."""
     result = _child(
         "import unsloth_zoo, unsloth_zoo.device_type as d;"
         f"print(unsloth_zoo.{name}, d.{name})"
@@ -133,8 +99,7 @@ def test_both_import_paths_publish_the_same_constant(name):
 @pytest.mark.skipif(_IS_MLX_HOST, reason = "MLX takes precedence over the skip flag")
 @pytest.mark.skipif(_IS_MLX_HOST, reason = "the MLX install ships no torch to import")
 def test_the_compiler_binds_its_old_arch_flag_on_the_skip_path():
-    """`fuse_lm_head = True` reads `OLD_CUDA_ARCH_VERSION`, which only the CUDA, HIP
-    and XPU branches used to bind, so the "cpu" value raised NameError."""
+    """`fuse_lm_head` reads `OLD_CUDA_ARCH_VERSION`, which "cpu" left unbound."""
     result = _child(
         "import unsloth_zoo.compiler as c; print(c.OLD_CUDA_ARCH_VERSION)"
     )
@@ -166,11 +131,7 @@ def test_the_legacy_cpu_hatch_still_answers_cuda(monkeypatch):
 
 
 def test_the_skip_branch_binds_every_constant_the_mlx_branch_does():
-    """Read off the source, so a constant added to one branch cannot be forgotten.
-
-    The two branches answer the same question - "the heavy init did not run" - and a
-    reader of these names cannot tell which one it got.
-    """
+    """Read off the source, so a constant added to one branch cannot be forgotten."""
     tree = ast.parse(_INIT.read_text(encoding = "utf-8"))
 
     bound = []

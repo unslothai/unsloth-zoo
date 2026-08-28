@@ -188,10 +188,7 @@ def test_importing_the_package_does_not_pull_in_torch():
     )
 
 
-# Without the flag, `unsloth_zoo/__init__.py` raises `ImportError: Please install
-# Unsloth` when unsloth is absent - which is exactly the case in the security-audit
-# lane, where `.[core]` is installed and the flag is what bypasses that check. The
-# control below is the one test here that drops the flag, so it needs unsloth present.
+# Without the flag the init raises when unsloth is absent, as in the security lane.
 _needs_unsloth = pytest.mark.skipif(
     importlib.util.find_spec("unsloth") is None,
     reason = "unsloth is not installed; importing unsloth_zoo without the skip flag raises",
@@ -202,14 +199,7 @@ _needs_unsloth = pytest.mark.skipif(
 @_needs_torch
 @_needs_unsloth
 def test_reading_a_constant_is_what_pulls_torch_in():
-    """The other half of the pair, so the check above cannot pass vacuously.
-
-    WITHOUT the flag. `get_device_type` answers `cpu` under it without asking torch
-    anything, which is the whole point of the flag: the download-only child it exists
-    for gets no GPU init and no torch import even if it does read a constant. So the
-    non-vacuousness control is the ordinary path, where reading the constant really is
-    what pulls torch in.
-    """
+    """The non-vacuous half: without the flag, reading a constant does pull torch in."""
     result = _run(
         "import sys\n"
         "import unsloth_zoo\n"
