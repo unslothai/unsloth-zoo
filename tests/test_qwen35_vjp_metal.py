@@ -290,13 +290,11 @@ def test_end_to_end_training_step_all_patches():
     assert any(float(mx.abs(g).max()) > 0 for g in flat), "all grads zero"
 
 
-# Two tolerances per output. The global one bounds error against the tensor's
-# largest magnitude; the elementwise one bounds each output against its own
-# magnitude, so a single badly-computed small entry cannot hide behind a large
-# one. bf16 inputs quantize y to ~4e-3 either way; the fp32 state carries no
-# such rounding and is held to fp32 accumulation error.
-_Y_TOL = {mx.bfloat16: 5e-3, mx.float32: 5e-6}
-_Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float32: 2e-5}
+# The global tolerance bounds error against the tensor's largest magnitude,
+# the elementwise one against each entry's own, so a small badly computed
+# entry cannot hide behind a large one.
+_Y_TOL = {mx.bfloat16: 5e-3, mx.float16: 5e-4, mx.float32: 5e-6}
+_Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float16: 1e-3, mx.float32: 2e-5}
 _STATE_TOL = 1e-6
 _STATE_ELEM_TOL = 2e-5
 
@@ -311,9 +309,14 @@ def _inputs(B, T, Hk, Hv, Dk, Dv, dtype, vectorized, seed=0):
     g = mx.exp(-mx.random.uniform(shape=g_shape).astype(mx.float32) * 0.5)
     beta = mx.random.uniform(shape=(B, T, Hv)).astype(dtype)
     state = mx.random.normal((B, Hv, Dv, Dk)).astype(mx.float32) * 0.1
-    if Hv > Hk:
-        q, k = mx.repeat(q, Hv // Hk, -2), mx.repeat(k, Hv // Hk, -2)
     return q, k, v, g, beta, state
+
+
+def _gqa_repeated(args):
+    # q/k as the kernels see them; the drivers repeat before dispatching.
+    q, k, v, g, beta, state = args
+    r = v.shape[-2] // q.shape[-2]
+    return (mx.repeat(q, r, -2), mx.repeat(k, r, -2), v, g, beta, state) if r > 1 else args
 
 
 def _reference(q, k, v, g, beta, state):
@@ -328,44 +331,50 @@ def _reference(q, k, v, g, beta, state):
     return mx.stack(ys, axis=1), s
 
 
+def _grads_of(fn, args, w, ws):
+    def inner(q, k, v, g, beta, state):
+        y, s = fn(q, k, v, g, beta, state)
+        return (y.astype(mx.float32) * w).sum() + (s.astype(mx.float32) * ws).sum()
+    return mx.value_and_grad(inner, argnums=(0, 1, 2, 3, 4, 5))(*args)
+
+
 def _rel(a, b):
     return float(mx.max(mx.abs(a.astype(mx.float32) - b)) / mx.max(mx.abs(b)))
 
 
 def _elem_rel(a, b, floor=0.01):
-    """Worst deviation relative to each element's own magnitude.
-
-    The denominator carries a floor of ``floor`` x the tensor's scale so that
-    outputs that are near zero by construction do not divide by ~0.
-    """
-    d = mx.abs(a.astype(mx.float32) - b)
-    return float(mx.max(d / (mx.abs(b) + floor * mx.max(mx.abs(b)))))
+    """Deviation per entry, floored at ``floor`` x the tensor's scale."""
+    return float(mx.max(mx.abs(a.astype(mx.float32) - b)
+                        / (mx.abs(b) + floor * mx.max(mx.abs(b)))))
 
 
-# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized) -- one case per P the layout can
-# derive (2, 4, 8, 16, 32, so every step of the shuffle reduction runs), the
-# segment widths that are not 16 (W=20, 24, 28), both gating shapes, both input
-# dtypes, threadgroups that do and do not fill a simdgroup, and a T that is not
-# a multiple of the time block.
+# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized). Between them the layout derives
+# every thread prefix (1 to 32) and segment width (4 to 32) it can produce, for
+# both gating shapes, all three input dtypes, one to eight simdgroups per
+# threadgroup, GQA ratios 1 to 4, and a T that is not a multiple of the block.
 _CASES = [
     (1, 64, 16, 32, 128, 128, mx.bfloat16, False),
     (2, 77, 16, 32, 128, 128, mx.bfloat16, False),
     (1, 64, 32, 32, 128, 128, mx.float32, False),
     (1, 33, 4, 8, 64, 64, mx.bfloat16, False),
-    (1, 40, 2, 4, 96, 128, mx.bfloat16, False),
+    (1, 40, 2, 4, 96, 128, mx.bfloat16, False),   # W=24 forward, W=12 backward
     (1, 64, 8, 16, 128, 128, mx.bfloat16, True),
-    (1, 20, 2, 4, 32, 128, mx.float32, False),   # P=2, DB=128
-    (1, 20, 2, 4, 160, 128, mx.float32, False),  # W=20, Dk not a power of two
-    (1, 20, 2, 4, 256, 128, mx.float32, False),  # P=16, TB=8
-    (1, 20, 2, 4, 128, 3, mx.float32, False),    # 24 threads: partial simdgroup
-    (1, 20, 2, 4, 32, 6, mx.float32, True),      # 12 threads, per-column gating
-    (1, 20, 2, 4, 224, 128, mx.float32, False),  # W=28
-    (1, 20, 2, 4, 512, 128, mx.bfloat16, False), # P=32: the off=16 shuffle step
+    (1, 20, 2, 4, 32, 128, mx.float32, False),    # P=1 forward, P=2 backward
+    (1, 20, 2, 4, 160, 128, mx.float32, False),   # W=20, Dk not a power of two
+    (1, 20, 2, 4, 256, 128, mx.float32, False),   # P=16 backward
+    (1, 20, 2, 4, 128, 4, mx.float32, False),     # 32 threads, one simdgroup
+    (1, 20, 2, 4, 128, 40, mx.float32, False),    # Dv not a multiple of the cap
+    (1, 20, 2, 4, 224, 128, mx.float32, False),
+    (1, 20, 2, 4, 64, 128, mx.float32, True),     # per-column gating, P=2/P=4
+    (1, 20, 2, 4, 128, 2, mx.float32, False),
+    (1, 20, 2, 4, 128, 1, mx.float32, True),      # P=32, W=4: the off=16 shuffle
+    (1, 20, 2, 8, 128, 128, mx.bfloat16, False),
+    (1, 20, 2, 4, 128, 128, mx.float16, False),
 ]
 
 
 def _case_id(c):
-    return f"B{c[0]}T{c[1]}_Dk{c[4]}Dv{c[5]}_{'vec' if c[7] else 'scalar'}_{str(c[6])[10:]}"
+    return f"B{c[0]}T{c[1]}_Dk{c[4]}Dv{c[5]}_{'vec' if c[7] else 'scalar'}_{str(c[6])[9:]}"
 
 
 @metal_only
@@ -373,7 +382,7 @@ def _case_id(c):
 def test_blocked_forward_matches_fp32_reference(case):
     from unsloth_zoo.gated_delta_vjp import gated_delta_blocked_forward
 
-    q, k, v, g, beta, state = _inputs(*case)
+    q, k, v, g, beta, state = _gqa_repeated(_inputs(*case))
     out = gated_delta_blocked_forward(q, k, v, g, beta, state)
     assert out is not None, "layout should be supported for this shape"
     y, s_out = out
@@ -386,56 +395,158 @@ def test_blocked_forward_matches_fp32_reference(case):
 
 
 @metal_only
-def test_blocked_forward_is_causal_per_step_and_independent_per_v_row():
-    """Perturb a late timestep and a non-zero v row; check both directions."""
-    from unsloth_zoo.gated_delta_vjp import gated_delta_blocked_forward
-
-    q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
-    y0, _ = gated_delta_blocked_forward(q, k, v, g, beta, state)
-
-    t_p, dv_p = 37, 71  # deliberately not step 0 and not row 0
-    v2 = mx.array(v)
-    v2[0, t_p, 5, dv_p] = v2[0, t_p, 5, dv_p] + 1.0
-    y1, _ = gated_delta_blocked_forward(q, k, v2, g, beta, state)
-    d = mx.abs(y1 - y0)
-    assert float(mx.max(d[:, :t_p])) == 0.0, "a step must not affect earlier steps"
-    assert float(mx.max(d[:, t_p:, 5, dv_p])) > 0.0, "later steps of the row must move"
-    assert float(mx.max(d[:, :, 4])) == 0.0, "other v heads must not move"
-    other = mx.concatenate([d[:, :, 5, :dv_p], d[:, :, 5, dv_p + 1:]], axis=-1)
-    assert float(mx.max(other)) == 0.0, "other rows of the same head must not move"
-
-
-@metal_only
-def test_unsupported_layout_falls_back_to_the_stock_kernel():
+def test_only_calls_the_kernels_can_answer_for_are_admitted():
     from unsloth_zoo.gated_delta_vjp import (
-        _blocked_layout, gated_delta_blocked_forward, gated_delta_kernel_efficient,
+        _blocked_layouts, gated_delta_blocked_backward, gated_delta_blocked_forward,
+        gated_delta_kernel_supported,
     )
 
-    assert _blocked_layout(40, 128, mx.bfloat16, False) is None  # Dk % 16 != 0
-    assert _blocked_layout(128, 40, mx.bfloat16, False) is None  # Dv % DB != 0
-    assert _blocked_layout(128, 128, mx.bfloat16, False)[:2] == (8, 16)
-    # Dv=40 satisfies gated_delta_kernel_supported but derives no blocked
-    # layout, so the whole path has to run on the stock forward.
-    q, k, v, g, beta, state = _inputs(1, 40, 2, 4, 128, 40, mx.float32, False)
+    q, k, v, g, beta, state = _inputs(1, 8, 1, 1, 288, 128, mx.float32, False)
+    assert _blocked_layouts(q, g, v) is None   # Dk=288 passes every other rule
+    assert not gated_delta_kernel_supported(q, g, None, v, k)
     assert gated_delta_blocked_forward(q, k, v, g, beta, state) is None
-    y, s = gated_delta_kernel_efficient(q, k, v, g, beta, state)
-    y_ref, s_ref = _reference(q, k, v, g, beta, state)
-    assert _rel(y, y_ref) < _Y_TOL[mx.float32] and _rel(s, s_ref) < _STATE_TOL
+
+    ok_q, ok_k, ok_v, ok_g, _, _ = _inputs(1, 8, 1, 1, 128, 128, mx.float32, False)
+    bf_q, bf_k, bf_v, bf_g = (x.astype(mx.bfloat16) for x in (ok_q, ok_k, ok_v, ok_g))
+    assert gated_delta_kernel_supported(ok_q, ok_g, None, ok_v, ok_k)
+    assert gated_delta_kernel_supported(bf_q, bf_g, None, bf_v, bf_k)
+    for partial in ((ok_q, ok_g, None), (ok_q, ok_g, None, ok_v), (q, g, None)):
+        assert not gated_delta_kernel_supported(*partial)
+    # One element type behind all three, same-width mixes included.
+    for mix in ((ok_q, ok_g, ok_v, bf_k), (ok_q, ok_g, bf_v, ok_k),
+                (bf_q, bf_g, bf_v, bf_k.astype(mx.float16))):
+        assert not gated_delta_kernel_supported(mix[0], mix[1], None, *mix[2:])
+    fwd, bwd = gated_delta_blocked_forward, gated_delta_blocked_backward
+    args = list(_inputs(1, 16, 4, 4, 128, 128, mx.float32, False))
+    dy, d_state = mx.random.normal((1, 16, 4, 128)), mx.zeros_like(args[5])
+    assert fwd(*args) is not None and bwd(*args, dy, d_state) is not None
+    for i in (1, 2):
+        mixed = list(args)
+        mixed[i] = mixed[i].astype(mx.bfloat16)
+        assert fwd(*mixed) is None and bwd(*mixed, dy, d_state) is None
+    assert bwd(*args, dy.astype(mx.bfloat16), d_state) is None
 
 
 @metal_only
-def test_kernel_efficient_forward_uses_the_blocked_kernel():
+@pytest.mark.parametrize("dtypes", [(mx.float32, mx.float32), (mx.float32, mx.bfloat16),
+                                    (mx.bfloat16, mx.bfloat16)])
+def test_every_output_keeps_the_dtype_its_primal_came_in(dtypes):
+    """g, beta and the state can arrive in a dtype no in-tree caller uses."""
     import unsloth_zoo.gated_delta_vjp as gdv
 
-    q, k, v, g, beta, state = _inputs(1, 96, 32, 32, 128, 128, mx.float32, False)
-    calls, real = [], gdv.gated_delta_blocked_forward
-    gdv.gated_delta_blocked_forward = lambda *a: (calls.append(1), real(*a))[1]
+    in_dtype, rest_dtype = dtypes
+    q, k, v, *rest = _inputs(1, 100, 4, 4, 128, 128, in_dtype, False)
+    g, beta, state = (x.astype(rest_dtype) for x in rest)
+    ref = _reference(q, k, v, g, beta, state.astype(mx.float32))[1]
+    for out in (gdv.gated_delta_blocked_forward(q, k, v, g, beta, state)[1],
+                gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)[1]):
+        mx.eval(out)
+        assert out.dtype == rest_dtype and out.shape == state.shape
+        assert _rel(out, ref) < (_STATE_TOL if rest_dtype == mx.float32 else 5e-3)
+
+    mx.random.seed(13)
+    w, ws = mx.random.normal((1, 100, 4, 128)), mx.random.normal((1, 4, 128, 128))
+    primals = (q, k, v, g, beta, state)
+    # Not elementwise: a bf16 operand leaves three decimal digits, and
+    # cancellation then dominates the small entries.
+    gtol = 2e-6 if in_dtype == rest_dtype == mx.float32 else 1e-2
+    got = _grads_of(gdv.gated_delta_kernel_efficient, primals, w, ws)[1]
+    want = _grads_of(gdv.gated_delta_ops_efficient, primals, w, ws)[1]
+    for name, a, b, primal in zip("q k v g beta state".split(), got, want, primals):
+        assert a.dtype == primal.dtype and a.shape == primal.shape, name
+        assert _rel(a, b) < gtol, name
+
+
+@metal_only
+@pytest.mark.parametrize("case", _CASES, ids=_case_id)
+def test_gradients_match_autodiff_over_the_same_recurrence(case):
+    """Different accumulation orders, so the elementwise bound exposes a misroute."""
+    import unsloth_zoo.gated_delta_vjp as gdv
+
+    args = _inputs(*case)
+    B, T, Hk, Hv, Dk, Dv, dtype, _ = case
+    mx.random.seed(11)
+    w = mx.random.normal((B, T, Hv, Dv))
+    ws = mx.random.normal((B, Hv, Dv, Dk))
+    tol, elem_tol = (2e-6, 2e-5) if dtype == mx.float32 else (5e-3, 2e-2)
+    l_k, g_k = _grads_of(gdv.gated_delta_kernel_efficient, args, w, ws)
+    l_o, g_o = _grads_of(gdv.gated_delta_ops_efficient, args, w, ws)
+    assert abs(float(l_k) - float(l_o)) <= tol * max(abs(float(l_o)), 1.0)
+    for name, a, b, primal in zip("q k v g beta state".split(), g_k, g_o, args):
+        assert a.shape == b.shape and a.dtype == primal.dtype, name
+        assert _rel(a, b) < tol, name
+        assert _elem_rel(a, b) < elem_tol, name
+
+
+@metal_only
+def test_backward_is_causal_and_reaches_non_first_positions():
+    """Perturbing dy at one late step must move the gradients at and before it
+    and leave the rest at a noise floor the atomic reductions make nonzero."""
+    import unsloth_zoo.gated_delta_vjp as gdv
+
+    q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
+    t_p, hv_p, dv_p = 31, 5, 97   # deliberately none of them index 0
+    hq_p = hv_p // (8 // 4)       # d_q is folded back to the 4 key heads
+
+    def grads(dy):
+        def inner(q, k, v, g, beta, state):
+            y, _ = gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)
+            return (y.astype(mx.float32) * dy).sum()
+        return mx.grad(inner, argnums=(0, 2))(q, k, v, g, beta, state)
+
+    mx.random.seed(7)
+    dy0 = mx.random.normal((1, 40, 8, 128))
+    dy1 = mx.array(dy0)
+    dy1[0, t_p, hv_p, dv_p] += 1.0
+    (dq0, dv0), (dq1, dv1) = grads(dy0), grads(dy1)
+    repeats = [grads(dy0) for _ in range(4)]
+    floor = 8 * max([1e-12] + [float(mx.max(mx.abs(a - b)))
+                               for r in repeats for a, b in zip(r, (dq0, dv0))])
+    d_q, d_v = mx.abs(dq1 - dq0), mx.abs(dv1 - dv0)
+
+    # d_q[t] contracts dy[t] with the state at t: only t_p, only its head.
+    assert float(mx.max(d_q[:, :t_p])) <= floor, "d_q must not move before t_p"
+    assert float(mx.max(d_q[:, t_p + 1:])) <= floor, "d_q must not move after t_p"
+    assert float(mx.max(d_q[:, t_p, :hq_p])) <= floor
+    assert float(mx.max(d_q[:, t_p, hq_p + 1:])) <= floor
+    assert float(mx.max(d_q[:, t_p, hq_p])) > 1e3 * floor
+    # d_v never looks ahead, and its trail runs the whole way back rather than
+    # stopping near the step the reverse scan entered on. v enters its own
+    # state row only, so every other row is untouched exactly.
+    assert float(mx.max(d_v[:, t_p + 1:])) <= floor, "d_v cannot look ahead"
+    assert float(d_v[0, t_p, hv_p, dv_p]) > 1e3 * floor
+    assert float(mx.min(d_v[0, :t_p + 1, hv_p, dv_p])) > 10 * floor
+    other = mx.concatenate([d_v[:, :, hv_p, :dv_p], d_v[:, :, hv_p, dv_p + 1:]], axis=-1)
+    assert float(mx.max(other)) == 0.0, "d_v must stay in the perturbed state row"
+    assert float(mx.max(d_v[:, :, :hv_p])) == 0.0
+    assert float(mx.max(d_v[:, :, hv_p + 1:])) == 0.0
+
+
+@metal_only
+@pytest.mark.parametrize("T", [8, 64, 100, 128])
+def test_backward_checkpoints_block_boundaries_not_steps(T):
+    """One state per boundary between time blocks, not one per step; a
+    single-block chunk keeps one unwritten slot, which is the T=8 case."""
+    import unsloth_zoo.gated_delta_vjp as gdv
+
+    B, Hv, Dk, Dv = 1, 32, 128, 128
+    q, k, v, g, beta, state = _inputs(B, T, Hv, Hv, Dk, Dv, mx.bfloat16, False)
+    dy = mx.random.normal((B, T, Hv, Dv)).astype(mx.bfloat16)
+    TB = gdv._blocked_layouts(q, g, v)[1][3]
+    gdv._get_blocked_kernels(False)   # the spy replaces a built kernel triple
+    shapes, real = [], gdv._GD_BLOCKED[False]
+
+    def spy(**kwargs):
+        shapes.append(kwargs["output_shapes"])
+        return real[1](**kwargs)
+
+    gdv._GD_BLOCKED[False] = (real[0], spy, real[2])
     try:
-        y, s = gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)
+        mx.eval(gdv.gated_delta_blocked_backward(
+            q, k, v, g, beta, state, dy, mx.zeros_like(state)))
     finally:
-        gdv.gated_delta_blocked_forward = real
-    assert calls, "the chunked forward must dispatch the blocked kernel"
-    y_ref, s_ref = _reference(q, k, v, g, beta, state)
-    assert _rel(y, y_ref) < _Y_TOL[mx.float32]
-    assert _elem_rel(y, y_ref) < _Y_ELEM_TOL[mx.float32]
-    assert _rel(s, s_ref) < _STATE_TOL
+        gdv._GD_BLOCKED[False] = real
+
+    (ckpt_shape, kv_shape), = shapes
+    assert ckpt_shape == (B, Hv, max(1, -(-T // TB) - 1), Dv, Dk)
+    assert kv_shape == (B, Hv, T, Dv)
