@@ -488,9 +488,10 @@ def patch_gated_delta_vlm_shared():
 #
 # The ops VJP above is memory-correct but dispatch-bound (~T*12 lazy
 # primitives per layer per step, unfusable by mx.compile). These kernels work
-# at chunk granularity: forward reuses mlx-lm's gated_delta_kernel per chunk;
-# backward replays chunk states (K1) and reverse-scans with atomic grad
-# accumulation (K2). Eligible on Metal GPU, mask=None, Dk % 32 == 0, for both
+# at chunk granularity: forward runs the blocked-sequential kernel below (or
+# mlx-lm's gated_delta_kernel for shapes it does not cover); backward replays
+# chunk states (K1) and reverse-scans with atomic grad accumulation (K2).
+# Eligible on Metal GPU, mask=None, Dk % 32 == 0, for both
 # scalar (qwen3_5/qwen3_next) and vectorized (kimi_linear) gating; else falls
 # back to the ops VJP. Atomic accumulation leaves low-order gradient bits
 # nondeterministic, as elsewhere on Metal.
@@ -504,6 +505,235 @@ def patch_gated_delta_vlm_shared():
 _KERNEL_CHUNK_SIZE = 64
 _KERNEL_THREADGROUP_X = 32
 _KERNEL_THREADGROUP_Y = 4
+
+
+# Blocked-sequential layout for the forward kernel below.
+#
+# mlx-lm's kernel gives every state row its own simdgroup: 32 lanes hold Dk/32
+# state columns each, every contraction costs a full simd_sum, and each of the
+# Dv rows re-reads the same k/q row from device memory. Here a thread owns a
+# W-wide segment of one row, P = Dk/W threads cover a row inside one simdgroup
+# (so a contraction is log2(P) shuffles), DB rows share a threadgroup, and each
+# threadgroup stages a TB-step time block of k/q/v/g/beta into threadgroup
+# memory once instead of re-reading it per row.
+
+_BLOCKED_TB_CHOICES = (32, 16, 8)
+_BLOCKED_TG_MEMORY = 32768   # Metal threadgroup-memory limit
+_BLOCKED_TG_THREADS = 256
+_BLOCKED_PAD = 8             # row padding, keeps threadgroup rows bank- and 8-byte-aligned
+
+
+def _blocked_layout(Dk, Dv, in_dtype, vectorized):
+    """Derive (P, W, DB, TB, threads) for these dimensions, or None if none fits.
+
+    None means the caller keeps the 32-lanes-per-row kernel, so widening the
+    support predicate is never required to add this path.
+    """
+    if Dk % 16 != 0 or Dv <= 0:
+        return None
+    P = 1
+    while P * 2 <= min(32, Dk // 16):
+        P *= 2
+    W = Dk // P
+    if W % 4 != 0 or 32 % P != 0:
+        return None
+    DB = min(Dv, _BLOCKED_TG_THREADS // P)
+    if DB == 0 or Dv % DB != 0:
+        return None
+    threads = P * DB
+    isz = in_dtype.size
+    for TB in _BLOCKED_TB_CHOICES:
+        used = 2 * TB * (Dk + _BLOCKED_PAD) * isz + TB * (DB + _BLOCKED_PAD) * isz
+        used += TB * 4 * (1 + (Dk + _BLOCKED_PAD if vectorized else 1))
+        if used <= _BLOCKED_TG_MEMORY:
+            return P, W, DB, TB, threads
+    return None
+
+
+_BLOCKED_PREAMBLE = """
+        constexpr int NV = W / 4;
+        constexpr int TG = P * DB;
+        constexpr int PAD = 8;
+
+        const int tid = thread_position_in_threadgroup.x;
+        const int blk = threadgroup_position_in_grid.x;
+        const int hv  = threadgroup_position_in_grid.y;
+        const int b   = threadgroup_position_in_grid.z;
+        const int hk  = hv / (Hv / Hk);
+        const int dv0 = blk * DB;
+
+        // thread -> (row in the dv block, W-wide segment of Dk)
+        const int dv  = tid / P;
+        const int seg = tid % P;
+        const int d0  = seg * W;
+        const int row_lane = (tid % 32) / P * P;
+
+        const size_t krow = (size_t)Hk * Dk;
+        const size_t vrow = (size_t)Hv * Dv;
+"""
+
+_BLOCKED_FORWARD_SRC = """
+        threadgroup InT k_s[TB][Dk + PAD];
+        threadgroup InT q_s[TB][Dk + PAD];
+        threadgroup InT v_s[TB][DB + PAD];
+        threadgroup float b_s[TB];
+        {g_decl}
+
+        const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+        const device InT* q_base = q + ((size_t)b * T * Hk + hk) * Dk;
+        auto v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
+        auto y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
+
+        float4 st[NV];
+        {{
+          auto s_in = state_in + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0;
+          for (int i = 0; i < NV; ++i) {{
+            st[i] = float4(static_cast<float>(s_in[4 * i + 0]),
+                           static_cast<float>(s_in[4 * i + 1]),
+                           static_cast<float>(s_in[4 * i + 2]),
+                           static_cast<float>(s_in[4 * i + 3]));
+          }}
+        }}
+
+        for (int t0 = 0; t0 < T; t0 += TB) {{
+          const int tt = (TB < T - t0) ? TB : (int)(T - t0);
+          for (int p = tid; p < tt * Dk; p += TG) {{
+            const int r = p / Dk, d = p % Dk;
+            k_s[r][d] = static_cast<InT>(k_base[(size_t)(t0 + r) * krow + d]);
+            q_s[r][d] = static_cast<InT>(q_base[(size_t)(t0 + r) * krow + d]);
+          }}
+          for (int p = tid; p < tt * DB; p += TG) {{
+            const int r = p / DB, d = p % DB;
+            v_s[r][d] = static_cast<InT>(v_base[(size_t)(t0 + r) * vrow + d]);
+          }}
+          for (int p = tid; p < tt; p += TG) {{
+            b_s[p] = static_cast<float>(beta[((size_t)b * T + t0 + p) * Hv + hv]);
+          }}
+          {g_stage}
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          for (int t = 0; t < tt; ++t) {{
+            const float bt = b_s[t];
+            {g_load}
+            const threadgroup vec<InT, 4>* k4 =
+                (const threadgroup vec<InT, 4>*)&k_s[t][d0];
+            const threadgroup vec<InT, 4>* q4 =
+                (const threadgroup vec<InT, 4>*)&q_s[t][d0];
+
+            float4 kf[NV];
+            float part4 = 0.0f;
+            float4 acc = 0.0f;
+            for (int i = 0; i < NV; ++i) {{
+              kf[i] = float4(k4[i]);
+              st[i] *= {g_decay};
+              acc += st[i] * kf[i];
+            }}
+            part4 = acc.x + acc.y + acc.z + acc.w;
+            for (int off = P / 2; off > 0; off >>= 1) {{
+              part4 += simd_shuffle_down(part4, off);
+            }}
+            const float kv_mem = simd_shuffle(part4, row_lane);
+            const float delta = (static_cast<float>(v_s[t][dv]) - kv_mem) * bt;
+
+            float4 o4 = 0.0f;
+            for (int i = 0; i < NV; ++i) {{
+              st[i] += kf[i] * delta;
+              o4 += st[i] * float4(q4[i]);
+            }}
+            float out = o4.x + o4.y + o4.z + o4.w;
+            for (int off = P / 2; off > 0; off >>= 1) {{
+              out += simd_shuffle_down(out, off);
+            }}
+            if (seg == 0) {{
+              y_base[(size_t)(t0 + t) * vrow + dv] = static_cast<InT>(out);
+            }}
+          }}
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        {{
+          auto s_out = state_out + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0;
+          for (int i = 0; i < NV; ++i) {{
+            s_out[4 * i + 0] = st[i].x;
+            s_out[4 * i + 1] = st[i].y;
+            s_out[4 * i + 2] = st[i].z;
+            s_out[4 * i + 3] = st[i].w;
+          }}
+        }}
+"""
+
+
+def _blocked_gating(vectorized):
+    """Threadgroup staging and per-step decay for scalar vs per-column gating."""
+    if vectorized:
+        return {
+            "g_decl": "threadgroup float g_s[TB][Dk + PAD];",
+            "g_stage": """for (int p = tid; p < tt * Dk; p += TG) {
+            const int r = p / Dk, d = p % Dk;
+            g_s[r][d] = static_cast<float>(
+                g[(((size_t)b * T + t0 + r) * Hv + hv) * Dk + d]);
+          }""",
+            "g_load": "const threadgroup float4* g4 = (const threadgroup float4*)&g_s[t][d0];",
+            "g_decay": "g4[i]",
+        }
+    return {
+        "g_decl": "threadgroup float g_s[TB];",
+        "g_stage": """for (int p = tid; p < tt; p += TG) {
+            g_s[p] = static_cast<float>(g[((size_t)b * T + t0 + p) * Hv + hv]);
+          }""",
+        "g_load": "const float gt = g_s[t];",
+        "g_decay": "gt",
+    }
+
+
+def _make_gd_blocked_forward_kernel(vectorized=False):
+    """Blocked-sequential GDN forward: same recurrence, restructured access."""
+    if not mx.metal.is_available():
+        return None
+    source = _BLOCKED_PREAMBLE + _BLOCKED_FORWARD_SRC.format(**_blocked_gating(vectorized))
+    return mx.fast.metal_kernel(
+        name=f"unsloth_gd_blocked_fwd{'_vec' if vectorized else ''}",
+        input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_GD_BLOCKED_FWD: dict = {}
+
+
+def _get_blocked_forward(vectorized=False):
+    if vectorized not in _GD_BLOCKED_FWD:
+        _GD_BLOCKED_FWD[vectorized] = _make_gd_blocked_forward_kernel(vectorized)
+    return _GD_BLOCKED_FWD[vectorized]
+
+
+def gated_delta_blocked_forward(q, k, v, g, beta, state):
+    """Forward half of the fused path; None when the layout does not fit.
+
+    Contract matches mlx_lm.models.gated_delta.gated_delta_kernel for the
+    unmasked case: returns (y [B, T, Hv, Dv] in q.dtype, state_out in
+    state.dtype).
+    """
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    vectorized = g.ndim == 4
+    layout = _blocked_layout(Dk, Dv, q.dtype, vectorized)
+    kernel = _get_blocked_forward(vectorized)
+    if layout is None or kernel is None:
+        return None
+    P, W, DB, TB, threads = layout
+    return kernel(
+        inputs=[q, k, v, g, beta, state, T],
+        template=[
+            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv),
+            ("TB", TB), ("P", P), ("W", W), ("DB", DB),
+        ],
+        grid=(threads * (Dv // DB), Hv, B),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape],
+        output_dtypes=[q.dtype, state.dtype],
+    )
 
 
 def _make_gd_chunk_states_kernel(vectorized=False):
@@ -850,7 +1080,10 @@ def gated_delta_kernel_efficient(
 
     @mx.custom_function
     def _chunk(q_c, k_c, v_c, g_c, beta_c, state_in):
-        return gated_delta_kernel(q_c, k_c, v_c, g_c, beta_c, state_in)
+        out = gated_delta_blocked_forward(q_c, k_c, v_c, g_c, beta_c, state_in)
+        if out is None:
+            return gated_delta_kernel(q_c, k_c, v_c, g_c, beta_c, state_in)
+        return out
 
     @_chunk.vjp
     def _chunk_vjp(primals, cotangents, outputs):

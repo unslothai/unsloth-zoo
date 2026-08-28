@@ -10,18 +10,15 @@ These bugs ONLY manifest on Metal (``mx.metal.is_available()`` and the default
 device is the GPU). On CPU, mlx-vlm already falls back to differentiable ops, so
 every test here is skipped on non-Metal machines with a loud notice.
 
-Run on an Apple Silicon machine (CI installs unsloth-zoo with ``pip install -e .``):
-
-    pytest tests/test_pr738_qwen35_vjp_metal.py -v
-
 Target runtime: well under ~2 minutes on an M1.
 """
 
 import pytest
 
+mx = pytest.importorskip("mlx.core", reason="MLX is not installed.")
+import mlx.nn as nn
+
 try:
-    import mlx.core as mx
-    import mlx.nn as nn
     _HAS_METAL = mx.metal.is_available() and mx.default_device() == mx.gpu
 except Exception:
     _HAS_METAL = False
@@ -291,3 +288,154 @@ def test_end_to_end_training_step_all_patches():
     assert flat, "no gradients produced"
     assert all(bool(mx.all(mx.isfinite(g))) for g in flat), "non-finite grads"
     assert any(float(mx.abs(g).max()) > 0 for g in flat), "all grads zero"
+
+
+# Two tolerances per output. The global one bounds error against the tensor's
+# largest magnitude; the elementwise one bounds each output against its own
+# magnitude, so a single badly-computed small entry cannot hide behind a large
+# one. bf16 inputs quantize y to ~4e-3 either way; the fp32 state carries no
+# such rounding and is held to fp32 accumulation error.
+_Y_TOL = {mx.bfloat16: 5e-3, mx.float32: 5e-6}
+_Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float32: 2e-5}
+_STATE_TOL = 1e-6
+_STATE_ELEM_TOL = 2e-5
+
+
+def _inputs(B, T, Hk, Hv, Dk, Dv, dtype, vectorized, seed=0):
+    mx.random.seed(seed)
+    q = mx.random.normal((B, T, Hk, Dk)).astype(dtype)
+    k = mx.random.normal((B, T, Hk, Dk)).astype(dtype)
+    k = k / mx.linalg.norm(k.astype(mx.float32), axis=-1, keepdims=True).astype(dtype)
+    v = mx.random.normal((B, T, Hv, Dv)).astype(dtype)
+    g_shape = (B, T, Hv, Dk) if vectorized else (B, T, Hv)
+    g = mx.exp(-mx.random.uniform(shape=g_shape).astype(mx.float32) * 0.5)
+    beta = mx.random.uniform(shape=(B, T, Hv)).astype(dtype)
+    state = mx.random.normal((B, Hv, Dv, Dk)).astype(mx.float32) * 0.1
+    if Hv > Hk:
+        q, k = mx.repeat(q, Hv // Hk, -2), mx.repeat(k, Hv // Hk, -2)
+    return q, k, v, g, beta, state
+
+
+def _reference(q, k, v, g, beta, state):
+    q, k, v = (x.astype(mx.float32) for x in (q, k, v))
+    beta = beta.astype(mx.float32)
+    s, ys = state, []
+    for t in range(q.shape[1]):
+        s = s * (g[:, t][..., None, None] if g.ndim == 3 else g[:, t][..., None, :])
+        delta = (v[:, t] - (s * k[:, t][..., None, :]).sum(-1)) * beta[:, t][..., None]
+        s = s + k[:, t][..., None, :] * delta[..., None]
+        ys.append((s * q[:, t][..., None, :]).sum(-1))
+    return mx.stack(ys, axis=1), s
+
+
+def _rel(a, b):
+    return float(mx.max(mx.abs(a.astype(mx.float32) - b)) / mx.max(mx.abs(b)))
+
+
+def _elem_rel(a, b, floor=0.01):
+    """Worst deviation relative to each element's own magnitude.
+
+    The denominator carries a floor of ``floor`` x the tensor's scale so that
+    outputs that are near zero by construction do not divide by ~0.
+    """
+    d = mx.abs(a.astype(mx.float32) - b)
+    return float(mx.max(d / (mx.abs(b) + floor * mx.max(mx.abs(b)))))
+
+
+# (B, T, Hk, Hv, Dk, Dv, dtype, vectorized) -- one case per P the layout can
+# derive (2, 4, 8, 16, 32, so every step of the shuffle reduction runs), the
+# segment widths that are not 16 (W=20, 24, 28), both gating shapes, both input
+# dtypes, threadgroups that do and do not fill a simdgroup, and a T that is not
+# a multiple of the time block.
+_CASES = [
+    (1, 64, 16, 32, 128, 128, mx.bfloat16, False),
+    (2, 77, 16, 32, 128, 128, mx.bfloat16, False),
+    (1, 64, 32, 32, 128, 128, mx.float32, False),
+    (1, 33, 4, 8, 64, 64, mx.bfloat16, False),
+    (1, 40, 2, 4, 96, 128, mx.bfloat16, False),
+    (1, 64, 8, 16, 128, 128, mx.bfloat16, True),
+    (1, 20, 2, 4, 32, 128, mx.float32, False),   # P=2, DB=128
+    (1, 20, 2, 4, 160, 128, mx.float32, False),  # W=20, Dk not a power of two
+    (1, 20, 2, 4, 256, 128, mx.float32, False),  # P=16, TB=8
+    (1, 20, 2, 4, 128, 3, mx.float32, False),    # 24 threads: partial simdgroup
+    (1, 20, 2, 4, 32, 6, mx.float32, True),      # 12 threads, per-column gating
+    (1, 20, 2, 4, 224, 128, mx.float32, False),  # W=28
+    (1, 20, 2, 4, 512, 128, mx.bfloat16, False), # P=32: the off=16 shuffle step
+]
+
+
+def _case_id(c):
+    return f"B{c[0]}T{c[1]}_Dk{c[4]}Dv{c[5]}_{'vec' if c[7] else 'scalar'}_{str(c[6])[10:]}"
+
+
+@metal_only
+@pytest.mark.parametrize("case", _CASES, ids=_case_id)
+def test_blocked_forward_matches_fp32_reference(case):
+    from unsloth_zoo.gated_delta_vjp import gated_delta_blocked_forward
+
+    q, k, v, g, beta, state = _inputs(*case)
+    out = gated_delta_blocked_forward(q, k, v, g, beta, state)
+    assert out is not None, "layout should be supported for this shape"
+    y, s_out = out
+    assert (y.dtype, s_out.dtype) == (q.dtype, state.dtype)
+    y_ref, s_ref = _reference(q, k, v, g, beta, state)
+    assert _rel(y, y_ref) < _Y_TOL[case[6]]
+    assert _elem_rel(y, y_ref) < _Y_ELEM_TOL[case[6]]
+    assert _rel(s_out, s_ref) < _STATE_TOL
+    assert _elem_rel(s_out, s_ref) < _STATE_ELEM_TOL
+
+
+@metal_only
+def test_blocked_forward_is_causal_per_step_and_independent_per_v_row():
+    """Perturb a late timestep and a non-zero v row; check both directions."""
+    from unsloth_zoo.gated_delta_vjp import gated_delta_blocked_forward
+
+    q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
+    y0, _ = gated_delta_blocked_forward(q, k, v, g, beta, state)
+
+    t_p, dv_p = 37, 71  # deliberately not step 0 and not row 0
+    v2 = mx.array(v)
+    v2[0, t_p, 5, dv_p] = v2[0, t_p, 5, dv_p] + 1.0
+    y1, _ = gated_delta_blocked_forward(q, k, v2, g, beta, state)
+    d = mx.abs(y1 - y0)
+    assert float(mx.max(d[:, :t_p])) == 0.0, "a step must not affect earlier steps"
+    assert float(mx.max(d[:, t_p:, 5, dv_p])) > 0.0, "later steps of the row must move"
+    assert float(mx.max(d[:, :, 4])) == 0.0, "other v heads must not move"
+    other = mx.concatenate([d[:, :, 5, :dv_p], d[:, :, 5, dv_p + 1:]], axis=-1)
+    assert float(mx.max(other)) == 0.0, "other rows of the same head must not move"
+
+
+@metal_only
+def test_unsupported_layout_falls_back_to_the_stock_kernel():
+    from unsloth_zoo.gated_delta_vjp import (
+        _blocked_layout, gated_delta_blocked_forward, gated_delta_kernel_efficient,
+    )
+
+    assert _blocked_layout(40, 128, mx.bfloat16, False) is None  # Dk % 16 != 0
+    assert _blocked_layout(128, 40, mx.bfloat16, False) is None  # Dv % DB != 0
+    assert _blocked_layout(128, 128, mx.bfloat16, False)[:2] == (8, 16)
+    # Dv=40 satisfies gated_delta_kernel_supported but derives no blocked
+    # layout, so the whole path has to run on the stock forward.
+    q, k, v, g, beta, state = _inputs(1, 40, 2, 4, 128, 40, mx.float32, False)
+    assert gated_delta_blocked_forward(q, k, v, g, beta, state) is None
+    y, s = gated_delta_kernel_efficient(q, k, v, g, beta, state)
+    y_ref, s_ref = _reference(q, k, v, g, beta, state)
+    assert _rel(y, y_ref) < _Y_TOL[mx.float32] and _rel(s, s_ref) < _STATE_TOL
+
+
+@metal_only
+def test_kernel_efficient_forward_uses_the_blocked_kernel():
+    import unsloth_zoo.gated_delta_vjp as gdv
+
+    q, k, v, g, beta, state = _inputs(1, 96, 32, 32, 128, 128, mx.float32, False)
+    calls, real = [], gdv.gated_delta_blocked_forward
+    gdv.gated_delta_blocked_forward = lambda *a: (calls.append(1), real(*a))[1]
+    try:
+        y, s = gdv.gated_delta_kernel_efficient(q, k, v, g, beta, state)
+    finally:
+        gdv.gated_delta_blocked_forward = real
+    assert calls, "the chunked forward must dispatch the blocked kernel"
+    y_ref, s_ref = _reference(q, k, v, g, beta, state)
+    assert _rel(y, y_ref) < _Y_TOL[mx.float32]
+    assert _elem_rel(y, y_ref) < _Y_ELEM_TOL[mx.float32]
+    assert _rel(s, s_ref) < _STATE_TOL
