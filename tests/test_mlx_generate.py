@@ -16,7 +16,8 @@ if importlib.util.find_spec("mlx") is None:
 
 from unsloth_zoo.mlx.generate import (  # noqa: E402
     GenerationDefaults, GenerationRequest, SamplingParams,
-    _GENERATION_MODE_LOCK, _PendingResult, _StopStringScanner, _TextBatchAdapter,
+    _GENERATION_MODE_LOCK, _PendingResult, _PerRowSeededSampler,
+    _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
     _generation_cache_hygiene, _restore_training_flags,
     _validate_text_requests, generate_batch, generation_mode,
@@ -871,6 +872,13 @@ def test_detokenizer_never_re_emits_after_a_shortening_decode():
 class _EosTokenizer(_CharTokenizer):
     eos_token_id = 3
 
+def _sample_utils():
+    """The release's filtering stages, as a seeded sampler reaches for them."""
+    return types.SimpleNamespace(
+        apply_top_p=lambda x, p: x, apply_min_p=lambda x, p, n: x,
+        apply_top_k=lambda x, k: x,
+    )
+
 def _audio_events(*specs):
     """Sequential events; `finish` omitted models releases carrying no reason.
 
@@ -894,6 +902,7 @@ def _audio_adapter(events, tokenizer=None, stops=()):
     adapter.sampler = object()
     adapter.sampler_kwargs = {}
     adapter.make_sampler = lambda **k: (adapter.sampler_kwargs.update(k), adapter.sampler)[1]
+    adapter.sample_utils = _sample_utils()
     adapter._wired_limit = contextlib.nullcontext
     adapter.stream_calls = []
     def stream(*args, **kwargs):
@@ -1021,3 +1030,15 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
     model = types.SimpleNamespace(_is_vlm_model=True, _processor=processor)
     assert engine_generate_batch(model, object(), [GenerationRequest(prompt="a")]) == ["ok"]
     assert seen["tok"] is processor
+
+
+def test_seed_is_reduced_onto_the_random_key_domain():
+    """Any int is accepted; mx.random.key rejects negatives and >= 2**64."""
+    assert SamplingParams().seed is None
+    assert SamplingParams(seed = 0).seed == 0
+    assert SamplingParams(seed = -1).seed == 2**64 - 1
+    assert SamplingParams(seed = 2**64 + 5).seed == 5
+    for bad in (True, 1.5, "7"):
+        with pytest.raises(TypeError):
+            SamplingParams(seed = bad)
+

@@ -128,11 +128,16 @@ class SamplingParams:
     top_p: float = 0.0
     top_k: int = 0
     min_p: float = 0.0
+    seed: int | None = None
 
     def __post_init__(self):
         temperature = float(self.temperature)
         top_p = float(self.top_p)
         min_p = float(self.min_p)
+        if self.seed is not None:
+            if isinstance(self.seed, bool) or not isinstance(self.seed, Integral):
+                raise TypeError("seed must be an integer or None.")
+            object.__setattr__(self, "seed", int(self.seed) % (2**64))
         if not math.isfinite(temperature) or temperature < 0:
             raise ValueError("temperature must be a finite value >= 0.")
         if not math.isfinite(top_p) or not 0 <= top_p <= 1:
@@ -474,6 +479,108 @@ def _probe_sampler_api(sample_utils_module):
         signature.bind(temp=0.0, top_p=0.0, top_k=0, min_p=0.0)
     except TypeError as exc:
         raise _api_shape_error("make_sampler call signature is incompatible") from exc
+
+
+def _draws_seeded(sampling: SamplingParams) -> bool:
+    """Whether this request's seed changes anything: argmax draws nothing."""
+    return sampling.seed is not None and sampling.temperature != 0
+
+
+def _seeded_sampler(sample_utils_module, params: SamplingParams):
+    """``make_sampler``'s chain drawing from a request key instead of global RNG."""
+    import mlx.core as mx
+
+    if params.temperature == 0:
+        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+    stages = []
+    if 0 < params.top_p < 1.0:
+        stages.append(lambda x: sample_utils_module.apply_top_p(x, params.top_p))
+    if params.min_p != 0.0:
+        stages.append(lambda x: sample_utils_module.apply_min_p(x, params.min_p, 1))
+    if params.top_k > 0:
+        stages.append(lambda x: sample_utils_module.apply_top_k(x, params.top_k))
+
+    state = {"key": mx.random.key(params.seed)}
+
+    def sampler(logprobs):
+        for stage in stages:
+            logprobs = stage(logprobs)
+        state["key"], subkey = mx.random.split(state["key"])
+        return mx.random.categorical(logprobs * (1 / params.temperature), key=subkey)
+
+    return sampler
+
+
+class _PerRowSeededSampler:
+    """One RNG stream per row for a backend that takes only one sampler.
+
+    mlx-vlm's ``BatchGenerator`` holds a single sampler for the whole batch and
+    hands every row the same ``row_ids`` and ``positions`` in the plain decode
+    path, so rows sharing a prompt sample identically -- an ``n``-way fan-out
+    returns one answer ``n`` times. Identity therefore has to come from the
+    caller: ``row_uids`` is the live row order, set before each step from the
+    finish reasons the event stream already reports. Width is checked against it
+    as a guard -- it catches a batch that admitted or retired rows this adapter
+    did not see, which is the failure that would silently swap RNG streams; it
+    cannot confirm the order itself.
+
+    Rows without a seed fall through to ``fallback``, which draws from the global
+    RNG exactly as an unbatched unseeded request does.
+    """
+
+    def __init__(self, seeds, *, params: SamplingParams, sample_utils_module, fallback):
+        self._params = params
+        self._sample_utils = sample_utils_module
+        self._fallback = fallback
+        self._seeds = list(seeds)
+        self._by_uid: dict[Any, Any] = {}
+        self._samplers: dict[Any, Any] = {}
+        self.row_uids: list[Any] = []
+
+    def bind_uids(self, uids) -> None:
+        if len(uids) != len(self._seeds):
+            raise RuntimeError(
+                f"batch admitted {len(uids)} rows for {len(self._seeds)} seeded "
+                "requests; per-row seeds cannot be matched to rows."
+            )
+        self._by_uid = dict(zip(uids, self._seeds))
+        self.row_uids = list(uids)
+
+    def _row_sampler(self, uid):
+        sampler = self._samplers.get(uid)
+        if sampler is None:
+            seed = self._by_uid.get(uid)
+            sampler = (
+                self._fallback
+                if seed is None
+                else _seeded_sampler(
+                    self._sample_utils,
+                    replace(self._params, seed=seed),
+                )
+            )
+            self._samplers[uid] = sampler
+        return sampler
+
+    def __call__(self, logprobs):
+        import mlx.core as mx
+
+        width = logprobs.shape[0]
+        if width != len(self.row_uids):
+            raise RuntimeError(
+                f"{_installed_mlx_vlm_version()} stepped a batch of {width} rows "
+                f"while {len(self.row_uids)} were tracked as live, so per-row "
+                "seeds cannot be matched to rows. Generate without seeds, or "
+                "pin a release whose batch admits and retires rows through its "
+                "event stream."
+            )
+        return mx.concatenate(
+            [
+                self._row_sampler(uid)(logprobs[row : row + 1])
+                for row, uid in enumerate(self.row_uids)
+            ],
+            axis=0,
+        )
 
 
 def _iter_model_modules(model) -> list[Any]:
@@ -1080,6 +1187,7 @@ class _TextBatchAdapter:
         _probe_sampler_api(sample_utils_module)
         self.batch_generator_type = generate_module.BatchGenerator
         self.make_sampler = sample_utils_module.make_sampler
+        self.sample_utils = sample_utils_module
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
@@ -1095,7 +1203,9 @@ class _TextBatchAdapter:
             for request in requests
         ]
         samplers = [
-            self.make_sampler(
+            _seeded_sampler(self.sample_utils, params)
+            if params.seed is not None
+            else self.make_sampler(
                 temp=params.temperature,
                 top_p=params.top_p,
                 top_k=params.top_k,
@@ -1388,6 +1498,7 @@ class _VLMBatchAdapter:
         sample_utils = importlib.import_module("mlx_lm.sample_utils")
         _probe_sampler_api(sample_utils)
         self.make_sampler = sample_utils.make_sampler
+        self.sample_utils = sample_utils
         self.model = model
         self.processor = processor
         self.defaults = defaults
@@ -1572,18 +1683,27 @@ class _VLMBatchAdapter:
         for index, request in enumerate(requests):
             if request.audio is None:
                 groups.setdefault(self._group_key(request), []).append(index)
-        # Older releases slice shared kwargs from row zero on every prefill
-        # batch, pairing later prompts with earlier embeddings, so they run one
-        # chunk per generator. Per-row releases keep the configured sizes.
-        capacity = (
-            None
-            if self.per_row_prompt_kwargs
-            else min(
-                self.defaults.prefill_batch_size,
-                self.defaults.completion_batch_size,
-            )
-        )
         for indices in groups.values():
+            # Older releases slice shared kwargs from row zero on every prefill
+            # batch, pairing later prompts with earlier embeddings, so they run one
+            # chunk per generator. Per-row releases keep the configured sizes.
+            #
+            # A group carrying per-row seeds takes the smaller sizes too: seeds
+            # identify rows by the live batch width, which is unambiguous only
+            # while it never grows, and a chunk larger than the prefill batch
+            # admits its rows in waves. Only the groups that need it pay.
+            seeded = any(
+                _draws_seeded(requests[index].sampling or self.defaults.sampling)
+                for index in indices
+            )
+            capacity = (
+                None
+                if self.per_row_prompt_kwargs and not seeded
+                else min(
+                    self.defaults.prefill_batch_size,
+                    self.defaults.completion_batch_size,
+                )
+            )
             step = capacity or len(indices)
             for start in range(0, len(indices), step):
                 chunk = indices[start : start + step]
@@ -1623,11 +1743,15 @@ class _VLMBatchAdapter:
             request.prompt,
             audio=request.audio,
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
-            sampler=self.make_sampler(
-                temp=sampling.temperature,
-                top_p=sampling.top_p,
-                top_k=sampling.top_k,
-                min_p=sampling.min_p,
+            sampler=(
+                _seeded_sampler(self.sample_utils, sampling)
+                if _draws_seeded(sampling)
+                else self.make_sampler(
+                    temp=sampling.temperature,
+                    top_p=sampling.top_p,
+                    top_k=sampling.top_k,
+                    min_p=sampling.min_p,
+                )
             ),
         )
         for event in events:
@@ -1716,8 +1840,25 @@ class _VLMBatchAdapter:
                 min_p=sampling.min_p,
             ),
         }
+        # Grouping keys on the sampling knobs but not the seed, so one chunk can
+        # carry several seeds and the fan-out case -- one prompt, n seeds -- stays
+        # a single batch.
+        seeds = [
+            (request.sampling or self.defaults.sampling).seed
+            if _draws_seeded(request.sampling or self.defaults.sampling)
+            else None
+            for request in chunk
+        ]
+        row_sampler = None
+        if any(seed is not None for seed in seeds):
+            row_sampler = _PerRowSeededSampler(
+                seeds,
+                params=sampling,
+                sample_utils_module=self.sample_utils,
+                fallback=options["sampler"],
+            )
+            options["sampler"] = row_sampler
         if "compute_logprobs" in self.constructor_params:
-            # The public helper turns this off, but logprobs are contract here.
             options["compute_logprobs"] = True
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
@@ -1732,8 +1873,6 @@ class _VLMBatchAdapter:
                     mask=mask,
                     **data_kwargs,
                 )
-                # Optional fields enumerate as None and would overwrite valid
-                # prepare_inputs values; upstream filters them the same way.
                 gen_kwargs = {**data_kwargs, **{
                     key: value
                     for key, value in embedding_output.to_dict().items()
@@ -1767,7 +1906,9 @@ class _VLMBatchAdapter:
                     )
                 else:
                     uids = generator.insert(token_ids, max_tokens)
-                return self._drive(generator, uids, gen_kwargs)
+                if row_sampler is not None:
+                    row_sampler.bind_uids(uids)
+                return self._drive(generator, uids, gen_kwargs, row_sampler)
         except BaseException as exc:
             active_error = exc
             raise
@@ -1789,7 +1930,13 @@ class _VLMBatchAdapter:
                     except BaseException:
                         pass
 
-    def _drive(self, generator, uids, gen_kwargs) -> list[GenerationResult]:
+    def _drive(
+        self,
+        generator,
+        uids,
+        gen_kwargs,
+        row_sampler=None,
+    ) -> list[GenerationResult]:
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pending = {
             uid: _PendingResult(
@@ -1799,7 +1946,14 @@ class _VLMBatchAdapter:
             for uid in uids
         }
         completed: dict[int, GenerationResult] = {}
+        # Rows still in the batch, in batch order. A per-row sampler reads this to
+        # tell its rows apart, since the release gives it nothing that can (see
+        # _PerRowSeededSampler). Retirement is observable: a row leaves on its
+        # finish reason, or when a stop string cancels it below.
+        live = list(uids)
         while pending:
+            if row_sampler is not None:
+                row_sampler.row_uids = list(live)
             if self.per_row_prompt_kwargs:
                 if not generator.has_work:
                     raise RuntimeError(
@@ -1820,10 +1974,12 @@ class _VLMBatchAdapter:
                     )
                 continue
             for event in events:
+                finish_reason = event.finish_reason
+                if finish_reason is not None and event.uid in live:
+                    live.remove(event.uid)
                 state = pending.get(event.uid)
                 if state is None:
                     continue
-                finish_reason = event.finish_reason
                 if finish_reason is None:
                     stopped = state.append(
                         tokenizer,
@@ -1831,11 +1987,10 @@ class _VLMBatchAdapter:
                         _event_logprob(event),
                     )
                     if stopped:
-                        # Where the release cannot cancel, the sequence keeps
-                        # decoding upstream and its later events are ignored;
-                        # results match either way, only wasted decode differs.
                         if self.cancel is not None:
                             self.cancel(generator, event.uid)
+                            if event.uid in live:
+                                live.remove(event.uid)
                         completed[event.uid] = state.result(tokenizer)
                         del pending[event.uid]
                     continue
@@ -1875,8 +2030,6 @@ def generate_batch(
         defaults = GenerationDefaults()
     if not isinstance(defaults, GenerationDefaults):
         raise TypeError("defaults must be GenerationDefaults.")
-    # Routing follows the model, not the request: a vision model preprocesses
-    # text-only prompts too.
     is_vlm = bool(getattr(model, "_is_vlm_model", False))
     validated = (
         _validate_vlm_requests(requests, defaults)
@@ -1886,8 +2039,6 @@ def generate_batch(
     if not validated:
         return []
     if is_vlm:
-        # A text-only multimodal load stays on the vision path but publishes its
-        # inner tokenizer, which cannot drive mlx-vlm preprocessing.
         tokenizer_or_processor = (
             getattr(model, "_processor", None) or tokenizer_or_processor
         )
