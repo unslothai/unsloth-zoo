@@ -142,13 +142,14 @@ def test_gated_delta_kernel_grad_raises_without_patch():
 # (b) GDN: patch fixes grad; output matches the use_kernel=False reference
 # --------------------------------------------------------------------------- #
 @metal_only
-def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference():
+def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference(monkeypatch):
     import importlib
 
     import mlx_vlm.models.qwen3_5.gated_delta as vlm_gd
     from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
 
     importlib.reload(vlm_gd)
+    vlm_gd._unsloth_gated_delta_patched = False
     # Reference forward (differentiable ops path) BEFORE patching.
     q, k, v, a, b, A_log, dt_bias = _gdn_inputs()
     ref_out, _ = vlm_gd.gated_delta_update(
@@ -157,30 +158,35 @@ def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference():
     mx.eval(ref_out)
 
     patch_gated_delta_vlm()
-    assert getattr(vlm_gd, "_unsloth_gated_delta_patched", False)
+    assert vlm_gd.gated_delta_update.__name__ == "patched_vlm_gated_delta_update"
 
     def loss(q_, k_, v_):
         out = vlm_gd.gated_delta_update(
             q_, k_, v_, a, b, A_log, dt_bias,
-            state=None, mask=None, use_kernel=True,
+            state=None, mask=None, use_kernel=False,
         )
         y = out[0] if isinstance(out, tuple) else out
         return y.astype(mx.float32).sum()
 
-    val, (dq, dk, dv) = mx.value_and_grad(loss, argnums=(0, 1, 2))(q, k, v)
-    mx.eval(val, dq, dk, dv)
-
-    for name, g in (("dq", dq), ("dk", dk), ("dv", dv)):
-        assert bool(mx.all(mx.isfinite(g))), f"{name} non-finite after patch"
-    assert any(float(mx.abs(g).max()) > 0 for g in (dq, dk, dv)), "all grads zero"
-
-    pat_out, _ = vlm_gd.gated_delta_update(
+    # An empty cache alone is prefill: the fused kernel returns a raw list.
+    assert isinstance(vlm_gd.gated_delta_update(
         q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True
+    ), list)
+
+    # Upstream's fallbacks differentiate too, and which exist varies by version.
+    for _n in ("gated_delta_ops", "gated_delta_chunked"):
+        monkeypatch.setattr(vlm_gd, _n, lambda *a: pytest.fail("upstream"), raising=False)
+
+    val, (dq, dk, dv) = mx.value_and_grad(loss, argnums=(0, 1, 2))(q, k, v)
+    pat_out, _ = vlm_gd.gated_delta_update(
+        q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=False
     )
-    mx.eval(pat_out)
-    assert mx.allclose(
-        ref_out.astype(mx.float32), pat_out.astype(mx.float32), rtol=2e-2, atol=2e-2
-    ), float(mx.abs(ref_out.astype(mx.float32) - pat_out.astype(mx.float32)).max())
+    mx.eval(val, dq, dk, dv, pat_out)
+
+    assert all(bool(mx.all(mx.isfinite(g))) for g in (dq, dk, dv)), "non-finite grads"
+    assert any(float(mx.abs(g).max()) > 0 for g in (dq, dk, dv)), "all grads zero"
+    assert mx.allclose(ref_out.astype(mx.float32), pat_out.astype(mx.float32),
+                       rtol=2e-2, atol=2e-2)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,15 +265,17 @@ def test_end_to_end_training_step_all_patches():
     cfg = _tiny_text_config(full_attention_interval=2)  # 1 GDN + 1 attention layer
     model = qlang.Qwen3_5Model(cfg)
     mx.eval(model.parameters())
-    # The model must report training so use_kernel=not self.training picks the
-    # ops path on the inference branch; the patch handles state=None regardless.
+    # `use_kernel=not self.training` asks for the differentiable path.
     model.train()
 
-    # Apply the full PR 738 patch set, exactly as trainer.py does.
+    # Trainer order: patch_gated_delta's sweep warns about an unpatched copy.
     _fix_qwen35_attention_cache(model)
     _disable_fused_mrope(model)
-    patch_gated_delta()
     patch_gated_delta_vlm()
+    patch_gated_delta()
+
+    # Grads alone prove nothing: upstream's ops path differentiates too.
+    assert qlang.gated_delta_update.__name__ == "patched_vlm_gated_delta_update"
 
     inputs = mx.array([[1, 2, 3, 4, 5, 6]])
 

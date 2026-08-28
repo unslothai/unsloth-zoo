@@ -593,6 +593,10 @@ from .utils import (
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
+    acquire_mlx_training_patches,
+    pause_mlx_training_patches,
+    release_mlx_training_patches,
+    resume_mlx_training_patches,
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
@@ -619,6 +623,7 @@ from .compile import (
     explain_compile_support,
     get_compile_qualification,
     model_has_gated_delta_layers,
+    model_has_qwen35_attention_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -4542,6 +4547,9 @@ class MLXTrainer:
         _prev_norm_output_cast_state = snapshot_mlx_norm_output_cast_state(
             iter_mlx_norm_output_cast_classes(model)
         )
+        _training_patches_held = False
+        _unfused_projection_modules = []
+        _unfused_mrope_modules = []
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -4825,27 +4833,33 @@ class MLXTrainer:
                 apply_gradient_checkpointing(model)
                 _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
 
-            # Qwen3.5-specific fixes
+            # Keeps routers, gather-sort and sparse block selection differentiable,
+            # and marks the process as inside a training run.
+            acquire_mlx_training_patches()
+            _training_patches_held = True
+            # Routed by module tree, not model_type: qwen4_exp reuses the Qwen3.5
+            # classes under its own name.
             config = getattr(model, "_config", {})
             model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-            gated_delta_patched = False
-            if "qwen3_5" in model_type:
+            if model_has_gated_delta_layers(model):
+                from unsloth_zoo.gated_delta_vjp import (
+                    patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared)
+                # mlx-vlm's copies first, or patch_gated_delta's sweep warns about them.
+                patch_gated_delta_vlm()
+                patch_gated_delta_vlm_shared()
+                patch_gated_delta()
+            if model_has_qwen35_attention_layers(model):
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
-                _disable_fused_mrope(model)
-                from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
-                patch_gated_delta()
-                patch_gated_delta_vlm()
-                gated_delta_patched = True
-            # Structural check: qwen3_next / kimi_linear also need the VJP.
-            if not gated_delta_patched and model_has_gated_delta_layers(model):
-                from unsloth_zoo.gated_delta_vjp import patch_gated_delta
-                patch_gated_delta()
+                _unfused_mrope_modules = _disable_fused_mrope(model)
+            # Full fine-tuning updates projections a fusion cached once.
+            from .loader import _disable_fused_input_projections
+            _unfused_projection_modules = _disable_fused_input_projections(model)
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
                 from .loader import _disable_fused_mrope
-                _disable_fused_mrope(model)
+                _unfused_mrope_modules += _disable_fused_mrope(model)
 
             # Register W&B/TensorBoard reporters after arg auto-tuning so the
             # W&B config snapshot reflects the settings actually used (e.g. VLM
@@ -4894,6 +4908,23 @@ class MLXTrainer:
                 restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
             except Exception:
                 pass
+            # Each guarded like its neighbours above: a failure restoring an
+            # optional fast path must not replace the exception that ended the run.
+            try:
+                if _training_patches_held:
+                    release_mlx_training_patches()
+            except Exception:
+                pass
+            for _module in _unfused_projection_modules:
+                try:
+                    _module.fuse_in = True
+                except Exception:
+                    pass
+            for _module in _unfused_mrope_modules:
+                try:
+                    _module.fused_apply = True
+                except Exception:
+                    pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
@@ -6530,12 +6561,14 @@ class MLXTrainer:
             if _pf is not None:
                 _pf.quiesce()
             _metrics_before_eval = self._last_eval_metrics
+            _paused_window = pause_mlx_training_patches()
             try:
                 val_loss, ppl = self._evaluate(
                     current_eval_batches, preference_eval_fn or loss_fn,
                     is_vlm=is_vlm,
                 )
             finally:
+                resume_mlx_training_patches(_paused_window)
                 if _pf is not None:
                     _pf.resume()
             model.train()

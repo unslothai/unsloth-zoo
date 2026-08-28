@@ -28,6 +28,7 @@ import mlx.utils
 import ast
 import collections
 import contextlib
+import contextvars
 import copy
 import inspect
 import importlib
@@ -397,6 +398,142 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
+# MLX raises instead of returning zero when a backward pass reaches a
+# gather/scatter index, aborting every graph that derives indices from activations:
+# MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
+# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+_MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
+_MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
+    "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
+    "gather_mm": (2, 3), "gather_qmm": (4, 5)}
+_MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
+_MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
+_MLX_INDEX_GRADIENT_LOCK = threading.RLock()
+# Two depths, with different scopes. Physical: how many runs still need `mlx.core`
+# wrapped. Global under the lock, since unpatching is process-wide.
+_MLX_TRAINING_PATCH_DEPTH = 0
+# Logical: is THIS context inside a training step. Context-local because a global
+# one is wrong both ways -- never cleared, a nested evaluation reads as training;
+# always cleared, one trainer's evaluation clears the flag under another that is
+# still differentiating, and a call site passing no `use_kernel` (GLM-5.x) then
+# routes its backward to the fused kernel, which has no VJP. ContextVar covers
+# threads and asyncio Tasks; `threading.local` would cover only the first.
+_MLX_TRAINING_ACTIVE_DEPTH = contextvars.ContextVar(
+    "unsloth_mlx_training_active_depth", default=0)
+# Tuple, not list: a mutable ContextVar default is shared by every context that
+# never set one, putting the stack straight back in global scope.
+_MLX_TRAINING_PAUSE_STACK = contextvars.ContextVar(
+    "unsloth_mlx_training_pause_stack", default=())
+# MLX differentiates integer arrays, so only real index positions are detached.
+_MLX_INTEGER_DTYPES = frozenset((mx.int8, mx.int16, mx.int32, mx.int64,
+                                 mx.uint8, mx.uint16, mx.uint32, mx.uint64))
+
+
+def _detach_if_index(value):
+    return (mx.stop_gradient(value)
+            if getattr(value, "dtype", None) in _MLX_INTEGER_DTYPES else value)
+
+
+def _wrap_mlx_index_op(name, original):
+    positions = _MLX_INDEX_CONSUMERS.get(name)
+
+    @wraps(original)
+    def wrapper(*args, **kwargs):
+        if positions is None:  # producer: the result is entirely an index
+            return mx.stop_gradient(original(*args, **kwargs))
+        return original(
+            *(_detach_if_index(arg) if i in positions else arg
+              for i, arg in enumerate(args)),
+            **{key: _detach_if_index(value) if key in _MLX_INDEX_KEYWORDS
+               else value for key, value in kwargs.items()},
+        )
+
+    wrapper._unsloth_index_stop_gradient = True
+    wrapper._unsloth_index_original = original
+    return wrapper
+
+
+def _set_mlx_index_gradient_stop(enabled: bool) -> None:
+    for name in _MLX_INDEX_OP_NAMES:
+        current = getattr(mx, name, None)
+        if current is None:
+            continue
+        patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+        if enabled and not patched:
+            setattr(mx, name, _wrap_mlx_index_op(name, current))
+        elif not enabled and patched:
+            setattr(mx, name, current._unsloth_index_original)
+
+
+def acquire_mlx_training_patches() -> None:
+    """Reference-counted: the `mlx.core` patches are process-wide while trainer
+    runs are not, so an inner run must not unpatch an outer one."""
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+        _MLX_TRAINING_PATCH_DEPTH += 1
+    _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
+
+
+def release_mlx_training_patches() -> None:
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            return
+        _MLX_TRAINING_PATCH_DEPTH -= 1
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(False)
+    _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
+
+
+def pause_mlx_training_patches() -> bool:
+    """Evaluation runs under `model.eval()` but inside the trainer's window, which
+    would otherwise route it down the training paths.
+
+    Always clears the logical flag, but only for THIS context, so a second trainer
+    on another thread keeps its own. The return value reports only whether the
+    process-wide patches came off: they stay while another run needs them, which
+    costs nothing, since they stop gradients into gather indices and evaluation
+    takes none.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH
+    _MLX_TRAINING_PAUSE_STACK.set(
+        _MLX_TRAINING_PAUSE_STACK.get() + (_MLX_TRAINING_ACTIVE_DEPTH.get(),))
+    _MLX_TRAINING_ACTIVE_DEPTH.set(0)
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH != 1:
+            return False
+        _MLX_TRAINING_PATCH_DEPTH = 0
+        _set_mlx_index_gradient_stop(False)
+        return True
+
+
+def resume_mlx_training_patches(paused: bool) -> None:
+    """Give back exactly what `pause_mlx_training_patches` took.
+
+    By increment, never assignment: another trainer may have acquired during the
+    pause, and assigning 1 there would drop this run's reference, so that
+    trainer's release would unpatch `mlx.core` mid-differentiation. The logical
+    depth comes off this context's own stack, so it does not count a second run
+    the way `acquire()` would.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if paused:
+            if _MLX_TRAINING_PATCH_DEPTH == 0:
+                _set_mlx_index_gradient_stop(True)
+            _MLX_TRAINING_PATCH_DEPTH += 1
+    stack = _MLX_TRAINING_PAUSE_STACK.get()
+    if stack:
+        _MLX_TRAINING_ACTIVE_DEPTH.set(stack[-1])
+        _MLX_TRAINING_PAUSE_STACK.set(stack[:-1])
+
+
+def mlx_training_patches_active() -> bool:
+    return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
+
+
 def _get_transformer_layers(model):
     """Find transformer layers, unwrapping VLM wrappers if needed.
 
@@ -433,6 +570,21 @@ def _get_vision_encoder_layers(model):
     return None
 
 
+def _detach_integer_arrays(value):
+    """`mx.checkpoint` makes every argument a primal of the recomputed function,
+    so a layer that embeds the token ids it was handed derives a gather index."""
+    if isinstance(value, list):
+        return [_detach_integer_arrays(v) for v in value]
+    if isinstance(value, tuple):
+        detached = tuple(_detach_integer_arrays(v) for v in value)
+        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would
+        # turn a layer's `payload.ids` into an AttributeError.
+        return type(value)(*detached) if hasattr(value, "_fields") else detached
+    if isinstance(value, dict):
+        return {k: _detach_integer_arrays(v) for k, v in value.items()}
+    return _detach_if_index(value)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -444,6 +596,8 @@ def _patch_layer_class_for_gc(layer_cls):
         if slot is None:
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                args = tuple(_detach_integer_arrays(a) for a in args)
+                kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
             return mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
@@ -453,6 +607,8 @@ def _patch_layer_class_for_gc(layer_cls):
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            args = tuple(_detach_integer_arrays(a) for a in args)
+            kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
@@ -2726,6 +2882,7 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm_ocr",
     # Not compile-patched, and opens with `grid_thw.tolist()`.
     "muse_glimmer",
+    "glm5_next",
 })
 
 
@@ -3174,6 +3331,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_vl_moe",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
