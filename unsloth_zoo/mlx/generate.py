@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from numbers import Integral
-from typing import Any, Literal, Sequence
+from typing import Any, Iterator, Literal, Sequence
 
 
 _TEXT_EVENT_FIELDS = frozenset(("uid", "token", "logprobs", "finish_reason"))
@@ -957,6 +957,33 @@ def _install_arrays_cache_advance_fix():
             _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED = True
 
 
+@dataclass(frozen=True)
+class GenerationEvent:
+    """One row's progress through a batch, in the order the batch produced it."""
+
+    index: int
+    delta: str = ""
+    result: GenerationResult | None = None
+
+
+def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEvent]:
+    delta = state.release()
+    if delta:
+        yield GenerationEvent(index=index, delta=delta)
+
+
+def _finished_events(
+    index: int,
+    state: "_PendingResult",
+    tokenizer,
+) -> Iterator[GenerationEvent]:
+    yield GenerationEvent(
+        index=index,
+        delta=state.release(),
+        result=state.result(tokenizer),
+    )
+
+
 class _StopStringScanner:
     """Incrementally search new detokenized text with longest-stop lookback."""
 
@@ -1074,8 +1101,15 @@ class _PendingResult:
     token_ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     text: str = ""
+    released: int = 0
     finish_reason: Literal["stop", "length", "stop_string"] | None = None
     stop_match: str | None = None
+
+    def release(self) -> str:
+        """Text this row has not handed out yet."""
+        delta = self.text[self.released :]
+        self.released = len(self.text)
+        return delta
 
     def _apply_stop_match(
         self,
@@ -1097,6 +1131,7 @@ class _PendingResult:
         del self.token_ids[keep:]
         del self.logprobs[keep:]
         self.text = _replay_stream_text(self.detokenizer, self.token_ids)
+        self.released = min(self.released, len(self.text))
         self.finish_reason = "stop_string"
 
     def add_terminal(self, token: int, logprob: float):
@@ -1192,7 +1227,7 @@ class _TextBatchAdapter:
         self.tokenizer = tokenizer
         self.defaults = defaults
 
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+    def stream(self, requests: Sequence[GenerationRequest]) -> Iterator[GenerationEvent]:
         prompts = [_encode_prompt(self.tokenizer, request) for request in requests]
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens)
@@ -1236,7 +1271,7 @@ class _TextBatchAdapter:
                 )
                 for uid in uids
             }
-            completed: dict[int, GenerationResult] = {}
+            row_of = {uid: row for row, uid in enumerate(uids)}
             while pending:
                 events = generator.next_generated()
                 if not events:
@@ -1248,6 +1283,7 @@ class _TextBatchAdapter:
                     state = pending.get(event.uid)
                     if state is None:
                         continue
+                    row = row_of[event.uid]
                     finish_reason = event.finish_reason
                     if finish_reason is None:
                         stopped = state.append(
@@ -1255,11 +1291,12 @@ class _TextBatchAdapter:
                             int(event.token),
                             _sampled_logprob(event),
                         )
-                        if stopped:
-                            generator.remove([event.uid])
-                            completed[event.uid] = state.result(self.tokenizer)
-                            del pending[event.uid]
+                        if not stopped:
+                            yield from _text_events(row, state)
                             continue
+                        generator.remove([event.uid])
+                        yield from _finished_events(row, state, self.tokenizer)
+                        del pending[event.uid]
                         continue
                     if finish_reason not in ("stop", "length"):
                         raise RuntimeError(
@@ -1272,9 +1309,8 @@ class _TextBatchAdapter:
                             _sampled_logprob(event),
                         )
                     state.finish(self.tokenizer, finish_reason)
-                    completed[event.uid] = state.result(self.tokenizer)
+                    yield from _finished_events(row, state, self.tokenizer)
                     del pending[event.uid]
-            return [completed[uid] for uid in uids]
         except BaseException as exc:
             active_error = exc
             raise
@@ -1471,7 +1507,9 @@ class _VLMBatchAdapter:
     release's chunked-prefill policy, and the wired-limit window.
     """
 
-    def __init__(self, model, processor, defaults: GenerationDefaults):
+    def __init__(
+        self, model, processor, defaults: GenerationDefaults, *, audio_warn_stacklevel = 3,
+    ):
         batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
         if batch_module is None:
             raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
@@ -1502,6 +1540,7 @@ class _VLMBatchAdapter:
         self.model = model
         self.processor = processor
         self.defaults = defaults
+        self.audio_warn_stacklevel = audio_warn_stacklevel
 
     def _wired_limit(self):
         """Raise the wired limit, which ``generation_mode`` restores but never raises."""
@@ -1663,22 +1702,20 @@ class _VLMBatchAdapter:
             f"Got {type(image).__name__}."
         )
 
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+    def stream(self, requests: Sequence[GenerationRequest]) -> Iterator[GenerationEvent]:
         requests = [self._decode_image(request) for request in requests]
-        results: list[GenerationResult | None] = [None] * len(requests)
-        audio_indices = [
+        audio_rows = [
             index for index, request in enumerate(requests) if request.audio is not None
         ]
-        if audio_indices:
-            # No supported release batches audio.
+        if audio_rows:
             warnings.warn(
-                f"{len(audio_indices)} audio request(s) decode one at a time: "
+                f"{len(audio_rows)} audio request(s) decode one at a time: "
                 f"{_installed_mlx_vlm_version()} batches text and images only.",
                 RuntimeWarning,
-                stacklevel=3,
+                stacklevel = self.audio_warn_stacklevel,
             )
-            for index in audio_indices:
-                results[index] = self._generate_sequentially(requests[index])
+        for index in audio_rows:
+            yield from self._stream_sequentially(index, requests[index])
         groups: dict[Any, list[int]] = {}
         for index, request in enumerate(requests):
             if request.audio is None:
@@ -1706,18 +1743,13 @@ class _VLMBatchAdapter:
             )
             step = capacity or len(indices)
             for start in range(0, len(indices), step):
-                chunk = indices[start : start + step]
-                for index, result in zip(chunk, self._run_chunk(requests, chunk)):
-                    results[index] = result
-        if any(result is None for result in results):
-            raise RuntimeError(
-                "Internal error: batched vision generation produced no result "
-                f"for {sum(result is None for result in results)} of "
-                f"{len(results)} requests."
-            )
-        return results
+                yield from self._run_chunk(requests, indices[start : start + step])
 
-    def _generate_sequentially(self, request: GenerationRequest) -> GenerationResult:
+    def _stream_sequentially(
+        self,
+        index: int,
+        request: GenerationRequest,
+    ) -> Iterator[GenerationEvent]:
         """One audio request through the release's sequential stream.
 
         The stream's terminal event carries no new token: it repeats the last
@@ -1760,14 +1792,17 @@ class _VLMBatchAdapter:
                 int(previous.token),
                 _event_logprob(previous),
             ):
-                return state.result(tokenizer)
+                yield from _finished_events(index, state, tokenizer)
+                return
+            if previous is not None:
+                yield from _text_events(index, state)
             previous = event
         if previous is None:
             raise RuntimeError(
                 "mlx-vlm produced no events for an audio request."
             )
         state.finish(tokenizer, self._terminal_reason(previous, tokenizer))
-        return state.result(tokenizer)
+        yield from _finished_events(index, state, tokenizer)
 
     @staticmethod
     def _terminal_reason(event, tokenizer) -> Literal["stop", "length"]:
@@ -1797,7 +1832,7 @@ class _VLMBatchAdapter:
         self,
         requests: Sequence[GenerationRequest],
         indices: Sequence[int],
-    ) -> list[GenerationResult]:
+    ) -> Iterator[GenerationEvent]:
         chunk = [requests[index] for index in indices]
         batch_size = len(chunk)
         prompts = [request.prompt for request in chunk]
@@ -1908,7 +1943,9 @@ class _VLMBatchAdapter:
                     uids = generator.insert(token_ids, max_tokens)
                 if row_sampler is not None:
                     row_sampler.bind_uids(uids)
-                return self._drive(generator, uids, gen_kwargs, row_sampler)
+                yield from self._drive(
+                    generator, uids, indices, gen_kwargs, row_sampler,
+                )
         except BaseException as exc:
             active_error = exc
             raise
@@ -1934,9 +1971,10 @@ class _VLMBatchAdapter:
         self,
         generator,
         uids,
+        indices,
         gen_kwargs,
         row_sampler=None,
-    ) -> list[GenerationResult]:
+    ) -> Iterator[GenerationEvent]:
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pending = {
             uid: _PendingResult(
@@ -1945,7 +1983,7 @@ class _VLMBatchAdapter:
             )
             for uid in uids
         }
-        completed: dict[int, GenerationResult] = {}
+        row_of = dict(zip(uids, indices))
         # Rows still in the batch, in batch order. A per-row sampler reads this to
         # tell its rows apart, since the release gives it nothing that can (see
         # _PerRowSeededSampler). Retirement is observable: a row leaves on its
@@ -1986,13 +2024,15 @@ class _VLMBatchAdapter:
                         int(event.token),
                         _event_logprob(event),
                     )
-                    if stopped:
-                        if self.cancel is not None:
-                            self.cancel(generator, event.uid)
-                            if event.uid in live:
-                                live.remove(event.uid)
-                        completed[event.uid] = state.result(tokenizer)
-                        del pending[event.uid]
+                    if not stopped:
+                        yield from _text_events(row_of[event.uid], state)
+                        continue
+                    if self.cancel is not None:
+                        self.cancel(generator, event.uid)
+                        if event.uid in live:
+                            live.remove(event.uid)
+                    yield from _finished_events(row_of[event.uid], state, tokenizer)
+                    del pending[event.uid]
                     continue
                 if finish_reason not in ("stop", "length"):
                     raise RuntimeError(
@@ -2002,9 +2042,8 @@ class _VLMBatchAdapter:
                 if finish_reason == "length":
                     state.add_terminal(int(event.token), _event_logprob(event))
                 state.finish(tokenizer, finish_reason)
-                completed[event.uid] = state.result(tokenizer)
+                yield from _finished_events(row_of[event.uid], state, tokenizer)
                 del pending[event.uid]
-        return [completed[uid] for uid in uids]
 
 
 @contextmanager
@@ -2026,6 +2065,48 @@ def generate_batch(
     with them.
     """
 
+    results: list[GenerationResult | None] = [None] * len(requests)
+    for event in _stream_batch(
+        model, tokenizer_or_processor, requests, defaults=defaults,
+        audio_warn_stacklevel=3,
+    ):
+        if event.result is not None:
+            results[event.index] = event.result
+    if any(result is None for result in results):
+        raise RuntimeError(
+            "Internal error: batched generation produced no result for "
+            f"{sum(result is None for result in results)} of {len(results)} requests."
+        )
+    return results
+
+
+def stream_batch(
+    model,
+    tokenizer_or_processor,
+    requests: Sequence[GenerationRequest],
+    *,
+    defaults: GenerationDefaults | None = None,
+) -> Iterator[GenerationEvent]:
+    """``generate_batch``, reporting each row as it goes."""
+    if defaults is not None and defaults.stop_strings:
+        raise ValueError(
+            "stream_batch cannot apply stop_strings: they cut on token "
+            "boundaries, which would retract text already streamed. Scan the "
+            "deltas for them instead, or use generate_batch."
+        )
+    return _stream_batch(
+        model, tokenizer_or_processor, requests, defaults=defaults,
+    )
+
+
+def _stream_batch(
+    model,
+    tokenizer_or_processor,
+    requests: Sequence[GenerationRequest],
+    *,
+    defaults: GenerationDefaults | None = None,
+    audio_warn_stacklevel: int = 2,
+) -> Iterator[GenerationEvent]:
     if defaults is None:
         defaults = GenerationDefaults()
     if not isinstance(defaults, GenerationDefaults):
@@ -2037,7 +2118,7 @@ def generate_batch(
         else _validate_text_requests(requests, defaults)
     )
     if not validated:
-        return []
+        return
     if is_vlm:
         tokenizer_or_processor = (
             getattr(model, "_processor", None) or tokenizer_or_processor
@@ -2052,11 +2133,14 @@ def generate_batch(
     with generation_mode(model):
         with _generation_cache_hygiene():
             adapter = (
-                _VLMBatchAdapter(model, tokenizer_or_processor, defaults)
+                _VLMBatchAdapter(
+                    model, tokenizer_or_processor, defaults,
+                    audio_warn_stacklevel = audio_warn_stacklevel + 1,
+                )
                 if is_vlm
                 else _TextBatchAdapter(model, tokenizer_or_processor, defaults)
             )
-            return adapter.generate(validated)
+            yield from adapter.stream(validated)
 
 
 def fast_generate(
@@ -2127,10 +2211,12 @@ def fast_generate(
 
 __all__ = [
     "GenerationDefaults",
+    "GenerationEvent",
     "GenerationRequest",
     "GenerationResult",
     "SamplingParams",
     "fast_generate",
     "generate_batch",
     "generation_mode",
+    "stream_batch",
 ]

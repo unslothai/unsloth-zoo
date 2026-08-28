@@ -5,6 +5,7 @@ import inspect
 import pathlib
 import sys
 import types
+import warnings
 from dataclasses import make_dataclass
 import pytest
 
@@ -15,7 +16,7 @@ if importlib.util.find_spec("mlx") is None:
     simulate_mlx_on_torch()
 
 from unsloth_zoo.mlx.generate import (  # noqa: E402
-    GenerationDefaults, GenerationRequest, SamplingParams,
+    GenerationDefaults, GenerationEvent, GenerationRequest, SamplingParams,
     _GENERATION_MODE_LOCK, _PendingResult, _PerRowSeededSampler,
     _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
@@ -339,19 +340,19 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     adapter.defaults = GenerationDefaults(stop_strings=("<STOP>",), prefill_batch_size=2, completion_batch_size=3, max_kv_size=16)
     adapter.batch_generator_type = Generator
     adapter.make_sampler = lambda **_kwargs: None
-    result = adapter.generate([GenerationRequest(prompt_token_ids=[9])])[0]
+    result = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert result.token_ids == [1] and Generator.instances[-1].removed == [7]
     assert tuple(Generator.instances[-1].kwargs[name] for name in ("prefill_batch_size", "completion_batch_size", "max_kv_size")) == (2, 3, 16)
     assert Generator.instances[-1].closed is True
     Generator.eos = True
-    eos = adapter.generate([GenerationRequest(prompt_token_ids=[9])])[0]
+    eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert eos.token_ids == [1] and eos.finish_reason == "stop"
     Generator.eos = False
     Generator.fail = True
     Generator.close_fail = True
     with pytest.warns(RuntimeWarning, match=r"close\(\) failed"):
         with pytest.raises(RuntimeError, match="event failure"):
-            adapter.generate([GenerationRequest(prompt_token_ids=[9])])
+            _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
     assert Generator.instances[-1].closed is True
 
 def test_generation_mode_releases_lock_when_limit_restore_raises(monkeypatch):
@@ -534,7 +535,7 @@ def test_vlm_adapter_drives_both_upstream_protocols(per_row):
     adapter.per_row_prompt_kwargs = per_row
     adapter.defaults = GenerationDefaults()
     adapter.processor = _CharTokenizer()
-    results = adapter._drive(generator, [0], {})
+    results = _results(adapter._drive(generator, [0], [0], {}))
     assert ([r.token_ids for r in results], results[0].finish_reason) == ([[1]], "stop")
 
 
@@ -555,7 +556,7 @@ def test_vlm_adapter_isolates_detokenizers_and_reads_scalar_logprobs():
     generator = _vlm_stub(True, events=[
         [(0, 1, None), (1, 4, None)], [(0, 3, "stop"), (1, 3, "stop")]])(
         object(), object())
-    results = adapter._drive(generator, [0, 1], {})
+    results = _results(adapter._drive(generator, [0, 1], [0, 1], {}))
     # Distinct buffers: a shared one concatenates both sequences into the first.
     assert [(r.token_ids, r.text) for r in results] == [
         ([1], "hello "), ([4], "tailSTOPsuffix")] and results[0].logprobs == [-0.5]
@@ -569,11 +570,12 @@ def test_vlm_chunking_respects_release_capabilities():
     chunks = []
     adapter._group_key = lambda request: "same"
     adapter._run_chunk = lambda requests, indices: (
-        chunks.append(list(indices)) or [object() for _ in indices])
+        chunks.append(list(indices))
+        or [GenerationEvent(index = index, result = object()) for index in indices])
     requests = [GenerationRequest(prompt="p") for _ in range(5)]
     for per_row, expected in ((True, [[0, 1, 2, 3, 4]]), (False, [[0, 1], [2, 3], [4]])):
         chunks.clear(); adapter.per_row_prompt_kwargs = per_row  # noqa: E702
-        adapter.generate(requests)
+        _results(adapter.stream(requests))
         assert chunks == expected
 
 
@@ -589,7 +591,10 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
-    adapter._add_special_tokens, adapter._drive = (lambda: True), (lambda *a: ["ok"] * 2)
+    adapter._add_special_tokens = lambda: True
+    adapter._drive = lambda *a: iter(
+        [GenerationEvent(index = row, result = "ok") for row in a[2]]
+    )
     adapter._split_prompt_kwargs = lambda kw, n: (seen.update(kwargs=kw), [{}] * n)[1]
     # Recording on ENTRY proves embeddings run inside the wired-limit context.
     adapter._wired_limit = lambda: _entry_ctx(order)  # records on ENTRY
@@ -600,7 +605,8 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
         get_input_embeddings=lambda *a, **k: (order.append("embed"), embeds)[1])
     adapter.generator_type = lambda *a, **k: (order.append("construct"),
         seen.update(ctor=k), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
-    assert adapter._run_chunk([GenerationRequest(prompt="p")] * 2, [0, 1]) == ["ok", "ok"]
+    assert [event.result for event in
+            adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == ["ok", "ok"]
     assert order == ["wired", "embed", "policy", "construct"]
     assert seen["policy"]["prefill_kwargs"]["inputs_embeds"] == "E"
     assert seen["kwargs"]["extra"] == "D"
@@ -651,11 +657,12 @@ def test_vlm_images_are_decoded_once_and_flow_to_preprocessing():
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
     adapter.process_image = lambda src, shape, proc: loads.append(src) or decoded
     adapter._run_chunk = lambda requests, indices: (
-        seen.update(image=requests[indices[0]].image), [object()])[1]
-    adapter.generate([GenerationRequest(prompt="p", image="/tmp/one-use.png")])
+        seen.update(image=requests[indices[0]].image),
+        [GenerationEvent(index=indices[0], result=object())])[1]
+    _results(adapter.stream([GenerationRequest(prompt="p", image="/tmp/one-use.png")]))
     assert loads == ["/tmp/one-use.png"] and seen["image"] is decoded
     with pytest.raises(ValueError, match="raw bytes"):
-        adapter.generate([GenerationRequest(prompt="p", image=b"\x89PNG")])
+        _results(adapter.stream([GenerationRequest(prompt="p", image=b"\x89PNG")]))
 
 
 def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
@@ -734,7 +741,9 @@ def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
                     self._prompt_batch, self._generation_batch = None, [1]
                 return ([], [])
             return super().next(**kwargs)
-    assert adapter._drive(LongPrefill(object(), object()), [0], {})[0].finish_reason == "stop"
+    assert _results(
+        adapter._drive(LongPrefill(object(), object()), [0], [0], {})
+    )[0].finish_reason == "stop"
     class Stalled(base):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
@@ -744,7 +753,7 @@ def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
         def next(self, **kwargs):
             return ([], [])
     with pytest.raises(RuntimeError, match="admitted no prompt"):
-        adapter._drive(Stalled(object(), object()), [0], {})
+        _results(adapter._drive(Stalled(object(), object()), [0], [0], {}))
 
 
 def test_vlm_requests_group_by_sampling_params():
@@ -755,17 +764,20 @@ def test_vlm_requests_group_by_sampling_params():
     adapter.process_image = None
     chunks = []
     adapter._run_chunk = lambda requests, indices: (
-        chunks.append(list(indices)) or [object() for _ in indices])
+        chunks.append(list(indices))
+        or [GenerationEvent(index = index, result = object()) for index in indices])
     hot = SamplingParams(temperature=0.9)
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="b", sampling=hot),
-                      GenerationRequest(prompt="c")])
+    _results(adapter.stream([GenerationRequest(prompt="a"),
+                             GenerationRequest(prompt="b", sampling=hot),
+                             GenerationRequest(prompt="c")]))
     assert sorted(chunks) == [[0, 2], [1]]
     # Preprocessing stacks a group without padding, so differing prompt lengths
     # must not share a chunk; upstream raises when they do.
     chunks.clear()
-    adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="bb"),
-                      GenerationRequest(prompt="c")])
+    _results(adapter.stream([GenerationRequest(prompt="a"),
+                             GenerationRequest(prompt="bb"),
+                             GenerationRequest(prompt="c")]))
     assert sorted(chunks) == [[0, 2], [1]]
 
 
@@ -784,7 +796,7 @@ def test_vlm_stop_strings_trim_and_cancel_in_the_release_form(plural):
     adapter.per_row_prompt_kwargs = True
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
     adapter.cancel = _resolve_cancel(Generator)
-    result = adapter._drive(Generator(object(), object()), [0], {})[0]
+    result = _results(adapter._drive(Generator(object(), object()), [0], [0], {}))[0]
     # "<ST" + "OP>" completes the stop string: trimmed back to the boundary.
     assert (result.token_ids, result.finish_reason, result.stop_match) == ([], "stop_string", "STOP")
     assert cancelled == [[0]]
@@ -804,7 +816,8 @@ def test_vlm_stop_strings_drop_later_events_when_the_release_cannot_cancel():
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
     adapter.cancel = _resolve_cancel(Generator)
     assert adapter.cancel is None  # no cancellation on this release
-    stopped, sibling = adapter._drive(Generator(object(), object()), [0, 1], {})
+    stopped, sibling = _results(
+        adapter._drive(Generator(object(), object()), [0, 1], [0, 1], {}))
     assert (stopped.token_ids, stopped.finish_reason, stopped.stop_match) == (
         [], "stop_string", "STOP")
     assert (sibling.token_ids, sibling.finish_reason) == ([1, 1, 1], "length")
@@ -879,6 +892,15 @@ def _sample_utils():
         apply_top_k=lambda x, k: x,
     )
 
+def _results(events):
+    """Row-ordered results from a streaming driver, as generate_batch collects them."""
+    out = {}
+    for event in events:
+        if event.result is not None:
+            out[event.index] = event.result
+    return [out[index] for index in sorted(out)]
+
+
 def _audio_events(*specs):
     """Sequential events; `finish` omitted models releases carrying no reason.
 
@@ -905,11 +927,19 @@ def _audio_adapter(events, tokenizer=None, stops=()):
     adapter.sample_utils = _sample_utils()
     adapter._wired_limit = contextlib.nullcontext
     adapter.stream_calls = []
+    adapter.audio_warn_stacklevel = 3
     def stream(*args, **kwargs):
         adapter.stream_calls.append((args, kwargs))
         return iter(events)
     adapter.stream_module = types.SimpleNamespace(stream_generate=stream)
     return adapter
+
+
+def _audio_row(adapter, request):
+    """The one row an audio request produces, and the deltas it streamed."""
+    events = list(adapter._stream_sequentially(0, request))
+    assert all(event.index == 0 for event in events)
+    return events[-1].result, "".join(event.delta for event in events)
 
 
 class _CriteriaTokenizer(_CharTokenizer):
@@ -934,9 +964,11 @@ class _CriteriaTokenizer(_CharTokenizer):
     (((None, "length"),), None, ([], "length")),
 ])
 def test_audio_fallback_keeps_the_batched_result_contract(specs, tokenizer, expected):
-    result = _audio_adapter(_audio_events(*specs), tokenizer)._generate_sequentially(
+    result, streamed = _audio_row(
+        _audio_adapter(_audio_events(*specs), tokenizer),
         GenerationRequest(prompt="p", audio="a.wav"))
     assert (result.token_ids, result.finish_reason) == expected
+    assert streamed == result.text
     # Logprobs must belong to the tokens they sit beside, not to their successors.
     assert result.logprobs == [-0.5 - n for n in range(len(result.token_ids))]
     assert result.text == "".join(_CharTokenizer.pieces[t] for t in result.token_ids)
@@ -945,16 +977,17 @@ def test_audio_fallback_keeps_the_batched_result_contract(specs, tokenizer, expe
 def test_audio_terminal_event_flushes_text_held_back_during_streaming():
     # Cleanup withholds a trailing space until finalize; losing it truncates.
     tokenizer = _TableTokenizer({(1,): "a ", (1, 2): "a b "}, clean=True)
-    result = _audio_adapter(_audio_events((1, None), (2, None), (2, None)),
-                            tokenizer)._generate_sequentially(
+    result, streamed = _audio_row(
+        _audio_adapter(_audio_events((1, None), (2, None), (2, None)), tokenizer),
         GenerationRequest(prompt="p", audio="a.wav"))
     assert (result.token_ids, result.text) == ([1, 2], "a b ")
+    assert streamed == result.text
 
 
 def test_audio_fallback_forwards_the_request_to_the_stream():
     # A dropped audio payload or ignored control shows up in the stream call.
     adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
-    adapter._generate_sequentially(GenerationRequest(
+    _audio_row(adapter, GenerationRequest(
         prompt="p", audio="a.wav", max_tokens=9,
         sampling=SamplingParams(temperature=0.25, top_k=7)))
     args, kwargs = adapter.stream_calls[0]
@@ -967,8 +1000,9 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
 
 def test_audio_fallback_honours_stop_strings():
     # Audio reaches the same scanner: "<ST" + "OP>" completes the stop string.
-    result = _audio_adapter(_audio_events((2, None), (3, None), (3, "length")),
-                            stops=("STOP",))._generate_sequentially(
+    result, _streamed = _audio_row(
+        _audio_adapter(_audio_events((2, None), (3, None), (3, "length")),
+                       stops=("STOP",)),
         GenerationRequest(prompt="p", audio="a.wav"))
     assert (result.token_ids, result.finish_reason, result.stop_match) == (
         [], "stop_string", "STOP")
@@ -979,17 +1013,22 @@ def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkey
     # old blanket audio rejection came back.
     from unsloth_zoo.mlx import generate as engine
     seen = []
-    monkeypatch.setattr(engine._VLMBatchAdapter, "__init__",
-                        lambda self, *a: setattr(self, "per_row_prompt_kwargs", True))
     monkeypatch.setattr(engine._VLMBatchAdapter, "_decode_image", lambda self, r: r)
-    monkeypatch.setattr(engine._VLMBatchAdapter, "_generate_sequentially",
-                        lambda self, request: seen.append(request.audio) or "audio")
+    monkeypatch.setattr(
+        engine._VLMBatchAdapter, "_stream_sequentially",
+        lambda self, index, request: iter(
+            [GenerationEvent(index=index,
+                             result=seen.append(request.audio) or "audio")]))
     model = types.SimpleNamespace(_is_vlm_model=True, training=False, eval=lambda: None)
     model.named_modules = lambda: [("", model)]
-    with pytest.warns(RuntimeWarning, match="decode one at a time"):
-        results = engine.generate_batch(
-            model, object(), [GenerationRequest(prompt="p", audio="a.wav")])
+    request = [GenerationRequest(prompt="p", audio="a.wav")]
+    with pytest.warns(RuntimeWarning, match="decode one at a time") as collected:
+        results = engine.generate_batch(model, object(), request)
     assert (results, seen) == (["audio"], ["a.wav"])
+    assert collected[0].filename == __file__
+    with pytest.warns(RuntimeWarning, match="decode one at a time") as collected:
+        _results(engine.stream_batch(model, object(), request))
+    assert collected[0].filename == __file__
     # The at-most-one-media invariant has to survive audio becoming supported.
     with pytest.raises(ValueError, match="both an image and audio"):
         engine.generate_batch(model, object(),
@@ -1005,11 +1044,12 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     adapter._group_key = lambda request: "g"
     adapter.per_row_prompt_kwargs = True
     adapter._run_chunk = lambda chunk, indices: (
-        batched.append(list(indices)), ["batched"] * len(chunk))[1]
+        batched.append(list(indices)),
+        [GenerationEvent(index = index, result = "batched") for index in indices])[1]
     requests = [GenerationRequest(prompt="a"), GenerationRequest(prompt="b", audio="a.wav"),
                 GenerationRequest(prompt="c")]
     with pytest.warns(RuntimeWarning, match="decode one at a time"):
-        results = _VLMBatchAdapter.generate(adapter, requests)
+        results = _results(_VLMBatchAdapter.stream(adapter, requests))
     assert batched == [[0, 2]]  # the audio row never reached the batched path
     assert [results[0], results[2]] == ["batched", "batched"]
     assert results[1].token_ids == [1]
@@ -1022,8 +1062,9 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
     from unsloth_zoo.mlx import generate as engine
     seen = {}
     class _Adapter:
-        def __init__(self, model, tok, defaults): seen["tok"] = tok
-        def generate(self, requests): return ["ok"]
+        def __init__(self, model, tok, defaults, **kwargs): seen["tok"] = tok
+        def stream(self, requests):
+            return iter([GenerationEvent(index=0, result="ok")])
     monkeypatch.setattr(engine, "_VLMBatchAdapter", _Adapter)
     monkeypatch.setattr(engine, "generation_mode", lambda model: contextlib.nullcontext())
     processor = object()
@@ -1042,3 +1083,30 @@ def test_seed_is_reduced_onto_the_random_key_domain():
         with pytest.raises(TypeError):
             SamplingParams(seed = bad)
 
+
+def test_a_row_is_reported_as_it_goes_and_its_deltas_rebuild_its_text():
+    """The streaming contract: deltas as they settle, then the result once."""
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.per_row_prompt_kwargs = True
+    adapter.defaults = GenerationDefaults()
+    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.cancel = None
+    generator = _vlm_stub(True, events=[
+        [(0, 1, None), (1, 1, None)],
+        [(0, 2, "length"), (1, 1, None)],
+        [(1, 2, "length")],
+    ])(object(), object())
+    events = list(adapter._drive(generator, [0, 1], [7, 9], {}))
+
+    assert {event.index for event in events} == {7, 9}
+    finished = [index for index, event in enumerate(events) if event.result is not None]
+    assert events[finished[0]].index == 7
+    nine = [index for index, event in enumerate(events) if event.index == 9]
+    assert any(index < finished[0] for index in nine)
+    assert any(index > finished[0] for index in nine)
+
+    for index in (7, 9):
+        row = [event for event in events if event.index == index]
+        assert "".join(event.delta for event in row) == row[-1].result.text

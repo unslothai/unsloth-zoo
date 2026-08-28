@@ -97,25 +97,25 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
     # The cache patch must be installed before any decoding runs.
     order = []
     real_install = generate_module._install_arrays_cache_advance_fix
-    real_adapter_generate = generate_module._TextBatchAdapter.generate
+    real_adapter_stream = generate_module._TextBatchAdapter.stream
 
     def record_install():
         order.append("install")
         return real_install()
 
-    def record_generate(self, requests):
-        order.append("generate")
-        return real_adapter_generate(self, requests)
+    def record_stream(self, requests):
+        order.append("stream")
+        return real_adapter_stream(self, requests)
 
     generate_module._install_arrays_cache_advance_fix = record_install
-    generate_module._TextBatchAdapter.generate = record_generate
+    generate_module._TextBatchAdapter.stream = record_stream
     try:
         batched = generate_batch(model, tokenizer, requests, defaults=defaults)
     finally:
         generate_module._install_arrays_cache_advance_fix = real_install
-        generate_module._TextBatchAdapter.generate = real_adapter_generate
+        generate_module._TextBatchAdapter.stream = real_adapter_stream
     from mlx_lm.models.cache import ArraysCache
-    assert order == ["install", "generate"]
+    assert order == ["install", "stream"]
     assert generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
     assert isinstance(ArraysCache.left_padding, property)
     sequential = []
