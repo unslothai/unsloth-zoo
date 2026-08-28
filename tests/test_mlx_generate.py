@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import inspect
 import pathlib
+import sys
 import types
 from dataclasses import make_dataclass
 import pytest
@@ -158,6 +159,66 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.warns(RuntimeWarning, match="clear_cache"), pytest.raises(ValueError, match="body"):
         with _generation_cache_hygiene():
             raise ValueError("body")
+
+def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+    events = []
+    monkeypatch.setattr(
+        "mlx.core.synchronize",
+        lambda stream=None: events.append(f"synchronize:{stream if stream else 'default'}"),
+    )
+    if has_clear_cache:
+        monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
+    else:
+        monkeypatch.delattr("mlx.core.clear_cache", raising=False)
+    return events
+
+def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with _generation_cache_hygiene():
+        events.append("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_the_generation_stream_is_drained_not_just_the_default_one(monkeypatch):
+    # Generation runs on mlx-lm's / mlx-vlm's own thread-local stream, so draining
+    # only the default stream would leave exactly the work we care about in flight.
+    events = _record_cache_calls(monkeypatch)
+    # mlx-vlm moves this symbol between release layouts, so every candidate counts.
+    for name in ("mlx_lm.generate", "mlx_vlm.generate.dispatch"):
+        monkeypatch.setitem(
+            sys.modules, name,
+            types.SimpleNamespace(generation_stream=f"stream<{name}>"),
+        )
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<mlx_lm.generate>") == 2
+    assert events.count("synchronize:stream<mlx_vlm.generate.dispatch>") == 2
+    assert events.index("synchronize:stream<mlx_lm.generate>") < events.index("clear_cache")
+
+def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with pytest.raises(ValueError, match="body"):
+        with _generation_cache_hygiene():
+            raise ValueError("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "synchronize:default", "clear_cache",
+    ]
+
+@pytest.mark.parametrize("metal", [
+    types.SimpleNamespace(),
+    # Refused even when the pre-0.22 shape is present: this path never accepted it.
+    types.SimpleNamespace(clear_cache=lambda: None),
+])
+def test_missing_clear_cache_is_rejected_before_any_work(monkeypatch, metal):
+    events = _record_cache_calls(monkeypatch, has_clear_cache=False)
+    monkeypatch.setattr("mlx.core.metal", metal, raising=False)
+    with pytest.raises(RuntimeError, match="clear_cache missing"):
+        with _generation_cache_hygiene():
+            pytest.fail("body must not run when the runtime cannot clear its cache")
+    assert events == []
 
 def test_training_flag_restore_attempts_every_module():
     class Module:

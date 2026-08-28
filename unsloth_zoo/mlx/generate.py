@@ -23,6 +23,7 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import threading
 import warnings
 from collections.abc import Mapping
@@ -617,6 +618,17 @@ def generation_mode(model):
                 pass
 
 
+# mlx-lm and mlx-vlm both run generation on their own thread-local stream, so a
+# no-argument mx.synchronize() -- which waits on the default stream -- drains none of it.
+# Only already-imported modules are inspected: a cleanup path must not import mlx-vlm.
+def _drain_generation_streams(mx):
+    for name in ("mlx_lm.generate",) + _VLM_STREAM_MODULES:
+        stream = getattr(sys.modules.get(name), "generation_stream", None)
+        if stream is not None:
+            mx.synchronize(stream)
+    mx.synchronize()
+
+
 @contextmanager
 def _generation_cache_hygiene():
     """Cache hygiene around one burst; limits stay owned by ``generation_mode``."""
@@ -628,6 +640,8 @@ def _generation_cache_hygiene():
         raise RuntimeError(
             "Unsupported MLX runtime API shape (mlx.core.clear_cache missing)."
         )
+    # MLX pins buffers a live command buffer reads, but not an output array dropped mid-flight.
+    _drain_generation_streams(mx)
     clear_cache()
     active_error = None
     try:
@@ -637,14 +651,15 @@ def _generation_cache_hygiene():
         raise
     finally:
         try:
+            _drain_generation_streams(mx)
             clear_cache()
-        except BaseException as clear_error:
+        except BaseException as cleanup_error:
             if active_error is None:
                 raise
             try:
                 warnings.warn(
-                    "mlx.core.clear_cache() failed while preserving an active "
-                    f"{type(active_error).__name__}: {clear_error}",
+                    "mlx.core.synchronize()/clear_cache() failed while preserving an "
+                    f"active {type(active_error).__name__}: {cleanup_error}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
