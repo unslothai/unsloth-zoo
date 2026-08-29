@@ -18,9 +18,11 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import inspect
+import textwrap
 import math
 import os
 import sys
@@ -513,72 +515,103 @@ def _seeded_sampler(sample_utils_module, params: SamplingParams):
     return sampler
 
 
-class _PerRowSeededSampler:
-    """One RNG stream per row for a backend that takes only one sampler.
+def _sampler_key(params: SamplingParams):
+    """The settings one sampler can serve. A seed is not among them: rows"""
+    return (params.temperature, params.top_p, params.top_k, params.min_p)
 
-    mlx-vlm's ``BatchGenerator`` holds a single sampler for the whole batch and
-    hands every row the same ``row_ids`` and ``positions`` in the plain decode
-    path, so rows sharing a prompt sample identically -- an ``n``-way fan-out
-    returns one answer ``n`` times. Identity therefore has to come from the
-    caller: ``row_uids`` is the live row order, set before each step from the
-    finish reasons the event stream already reports. Width is checked against it
-    as a guard -- it catches a batch that admitted or retired rows this adapter
-    did not see, which is the failure that would silently swap RNG streams; it
-    cannot confirm the order itself.
 
-    Rows without a seed fall through to ``fallback``, which draws from the global
-    RNG exactly as an unbatched unseeded request does.
-    """
+def _sampler_for(sample_utils_module, params: SamplingParams, make_sampler):
+    """The sampler one request's settings ask for."""
+    if _draws_seeded(params):
+        return _seeded_sampler(sample_utils_module, params)
+    return make_sampler(
+        temp=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        min_p=params.min_p,
+    )
 
-    def __init__(self, seeds, *, params: SamplingParams, sample_utils_module, fallback):
-        self._params = params
+
+class _PerRowSampler:
+    """One sampler per row for a backend that takes only one for the batch."""
+
+    def __init__(self, params, *, sample_utils_module, make_sampler):
         self._sample_utils = sample_utils_module
-        self._fallback = fallback
-        self._seeds = list(seeds)
+        self._make_sampler = make_sampler
+        self._params = list(params)
         self._by_uid: dict[Any, Any] = {}
         self._samplers: dict[Any, Any] = {}
+        self._generator = None
         self.row_uids: list[Any] = []
 
     def bind_uids(self, uids) -> None:
-        if len(uids) != len(self._seeds):
+        if len(uids) != len(self._params):
             raise RuntimeError(
-                f"batch admitted {len(uids)} rows for {len(self._seeds)} seeded "
-                "requests; per-row seeds cannot be matched to rows."
+                f"batch admitted {len(uids)} rows for {len(self._params)} "
+                "requests; per-row sampling cannot be matched to rows."
             )
-        self._by_uid = dict(zip(uids, self._seeds))
+        self._by_uid = dict(zip(uids, self._params))
         self.row_uids = list(uids)
+
+    def bind_generator(self, generator) -> None:
+        self._generator = generator
 
     def _row_sampler(self, uid):
         sampler = self._samplers.get(uid)
         if sampler is None:
-            seed = self._by_uid.get(uid)
-            sampler = (
-                self._fallback
-                if seed is None
-                else _seeded_sampler(
-                    self._sample_utils,
-                    replace(self._params, seed=seed),
+            params = self._by_uid.get(uid)
+            if params is None:
+                raise RuntimeError(
+                    f"{_installed_mlx_vlm_version()} drew a row this batch was "
+                    "not given, so per-row sampling cannot be matched to rows."
                 )
-            )
+            sampler = _sampler_for(self._sample_utils, params, self._make_sampler)
             self._samplers[uid] = sampler
         return sampler
 
-    def __call__(self, logprobs):
-        import mlx.core as mx
+    def _drawing_uids(self, width, positions):
+        """The rows of this draw, in the order their logprobs are stacked."""
 
-        width = logprobs.shape[0]
+        if self._generator is not None and positions is not None:
+            name = (
+                "_prompt_batch"
+                if all(position == 0 for position in positions)
+                else "_generation_batch"
+            )
+            batch = getattr(self._generator, name, _MISSING)
+            if batch is not _MISSING:
+                uids = list(getattr(batch, "uids", ()) or ())
+                if len(uids) != width:
+                    raise RuntimeError(
+                        f"{_installed_mlx_vlm_version()} drew {width} rows from a "
+                        f"{name.lstrip('_').replace('_', ' ')} holding {len(uids)}, "
+                        "so per-row sampling cannot be matched to rows."
+                    )
+                return uids
         if width != len(self.row_uids):
             raise RuntimeError(
                 f"{_installed_mlx_vlm_version()} stepped a batch of {width} rows "
                 f"while {len(self.row_uids)} were tracked as live, so per-row "
-                "seeds cannot be matched to rows. Generate without seeds, or "
-                "pin a release whose batch admits and retires rows through its "
-                "event stream."
+                "sampling cannot be matched to rows. Give every request in a "
+                "batch the same sampling settings and no seed, or pin a release "
+                "whose batch admits and retires rows through its event stream."
             )
+        return self.row_uids
+
+    def sample_target(self, logprobs, *, row_ids=None, positions=None):
+        return self._draw(logprobs, positions)
+
+    def __call__(self, logprobs):
+        return self._draw(logprobs, None)
+
+    def _draw(self, logprobs, positions):
+        import mlx.core as mx
+
+        uids = self._drawing_uids(logprobs.shape[0], positions)
         return mx.concatenate(
             [
                 self._row_sampler(uid)(logprobs[row : row + 1])
-                for row, uid in enumerate(self.row_uids)
+                for row, uid in enumerate(uids)
             ],
             axis=0,
         )
@@ -1524,6 +1557,65 @@ def _probe_vlm_api(batch_module):
     return constructor, insert, _resolve_cancel(generator)
 
 
+def _statements(body):
+    """Every node written in this body, skipping nested definitions."""
+
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield node
+        yield from _statements(list(ast.iter_child_nodes(node)))
+
+
+def _draws_by_position(owner, method) -> bool:
+    """Whether this draw hands the sampler the rows and positions it draws at."""
+
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(owner, method))))
+    except (AttributeError, OSError, TypeError, SyntaxError, IndentationError):
+        return False
+    definition = tree.body[0] if tree.body else None
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for node in _statements(definition.body):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func
+        name = (
+            called.attr if isinstance(called, ast.Attribute)
+            else called.id if isinstance(called, ast.Name)
+            else None
+        )
+        if name != "_sample_with_positions":
+            continue
+        given = {keyword.arg: keyword.value for keyword in node.keywords}
+        if not {"row_ids", "positions"}.issubset(given):
+            continue
+        if any(
+            isinstance(given[argument], ast.Constant) and given[argument].value is None
+            for argument in ("row_ids", "positions")
+        ):
+            continue
+        return True
+    return False
+
+
+def _vlm_batches_observable(batch_module) -> bool:
+    """Whether a sampler can tell which of a release's rows a draw is for."""
+
+    generator = getattr(batch_module, "BatchGenerator", None)
+    code = getattr(getattr(generator, "__init__", None), "__code__", None)
+    if not {"_prompt_batch", "_generation_batch"}.issubset(
+        getattr(code, "co_names", ())
+    ):
+        return False
+    return _draws_by_position(
+        getattr(batch_module, "PromptProcessingBatch", None), "generate"
+    ) and _draws_by_position(
+        getattr(batch_module, "GenerationBatch", None), "_step"
+    )
+
+
 def _resolve_cancel(generator):
     """How this generator cancels one sequence, decided once.
 
@@ -1621,6 +1713,7 @@ class _VLMBatchAdapter:
         self.batch_module = batch_module
         self.generator_type = batch_module.BatchGenerator
         self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
+        self.batches_observable = _vlm_batches_observable(batch_module)
         self.stream_module = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
         utils = importlib.import_module("mlx_vlm.utils")
         self.prepare_inputs = utils.prepare_inputs
@@ -1733,18 +1826,13 @@ class _VLMBatchAdapter:
         # Prompt length is part of the key: preprocessing stacks a group without
         # padding, so mixing lengths raises instead of generating. Grouping by
         # length keeps varied batches working, at the cost of smaller groups.
-        sampling = request.sampling or self.defaults.sampling
         shape = self._image_shape(request.image)
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        return (
-            sampling.temperature,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-            request.image is None,
-            shape,
-            len(tokenizer.encode(request.prompt)),
-        )
+        key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
+        if self.batches_observable:
+            return key
+        sampling = request.sampling or self.defaults.sampling
+        return (_sampler_key(sampling), *key)
 
     def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
         """Load a path or URL image once, before grouping.
@@ -1813,21 +1901,13 @@ class _VLMBatchAdapter:
             if request.audio is None:
                 groups.setdefault(self._group_key(request), []).append(index)
         for indices in groups.values():
-            # Older releases slice shared kwargs from row zero on every prefill
-            # batch, pairing later prompts with earlier embeddings, so they run one
-            # chunk per generator. Per-row releases keep the configured sizes.
-            #
-            # A group carrying per-row seeds takes the smaller sizes too: seeds
-            # identify rows by the live batch width, which is unambiguous only
-            # while it never grows, and a chunk larger than the prefill batch
-            # admits its rows in waves. Only the groups that need it pay.
-            seeded = any(
+            inferred_rows = not self.batches_observable and any(
                 _draws_seeded(requests[index].sampling or self.defaults.sampling)
                 for index in indices
             )
             capacity = (
                 None
-                if self.per_row_prompt_kwargs and not seeded
+                if self.per_row_prompt_kwargs and not inferred_rows
                 else min(
                     self.defaults.prefill_batch_size,
                     self.defaults.completion_batch_size,
@@ -1931,7 +2011,10 @@ class _VLMBatchAdapter:
         batch_size = len(chunk)
         prompts = [request.prompt for request in chunk]
         images = [request.image for request in chunk if request.image is not None]
-        sampling = chunk[0].sampling or self.defaults.sampling
+        row_sampling = [
+            request.sampling or self.defaults.sampling for request in chunk
+        ]
+        sampling = row_sampling[0]
         config = getattr(self.model, "config", None)
         inputs = self.prepare_inputs(
             self.processor,
@@ -1969,22 +2052,14 @@ class _VLMBatchAdapter:
                 min_p=sampling.min_p,
             ),
         }
-        # Grouping keys on the sampling knobs but not the seed, so one chunk can
-        # carry several seeds and the fan-out case -- one prompt, n seeds -- stays
-        # a single batch.
-        seeds = [
-            (request.sampling or self.defaults.sampling).seed
-            if _draws_seeded(request.sampling or self.defaults.sampling)
-            else None
-            for request in chunk
-        ]
         row_sampler = None
-        if any(seed is not None for seed in seeds):
-            row_sampler = _PerRowSeededSampler(
-                seeds,
-                params=sampling,
+        if any(_draws_seeded(params) for params in row_sampling) or len(
+            {_sampler_key(params) for params in row_sampling}
+        ) > 1:
+            row_sampler = _PerRowSampler(
+                row_sampling,
                 sample_utils_module=self.sample_utils,
-                fallback=options["sampler"],
+                make_sampler=self.make_sampler,
             )
             options["sampler"] = row_sampler
         if "compute_logprobs" in self.constructor_params:
@@ -2037,6 +2112,7 @@ class _VLMBatchAdapter:
                     uids = generator.insert(token_ids, max_tokens)
                 if row_sampler is not None:
                     row_sampler.bind_uids(uids)
+                    row_sampler.bind_generator(generator)
                 yield from self._drive(
                     generator, uids, indices, gen_kwargs, row_sampler,
                     prompt_token_count=len(token_ids[0]),
@@ -2082,10 +2158,6 @@ class _VLMBatchAdapter:
             for uid in uids
         }
         row_of = dict(zip(uids, indices))
-        # Rows still in the batch, in batch order. A per-row sampler reads this to
-        # tell its rows apart, since the release gives it nothing that can (see
-        # _PerRowSeededSampler). Retirement is observable: a row leaves on its
-        # finish reason, or when a stop string cancels it below.
         live = list(uids)
         while pending:
             if row_sampler is not None:

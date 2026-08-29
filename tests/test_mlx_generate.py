@@ -17,7 +17,7 @@ if importlib.util.find_spec("mlx") is None:
 
 from unsloth_zoo.mlx.generate import (  # noqa: E402
     GenerationDefaults, GenerationEvent, GenerationRequest, SamplingParams,
-    _GENERATION_MODE_LOCK, _PendingResult, _PerRowSeededSampler,
+    _GENERATION_MODE_LOCK, _PendingResult, _PerRowSampler,
     _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
     _generation_cache_hygiene, _restore_training_flags,
@@ -568,6 +568,7 @@ def test_vlm_chunking_respects_release_capabilities():
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
     adapter.defaults = GenerationDefaults(prefill_batch_size=2, completion_batch_size=4)
+    adapter.batches_observable = True
     chunks = []
     adapter._group_key = lambda request: "same"
     adapter._run_chunk = lambda requests, indices: (
@@ -656,6 +657,7 @@ def test_vlm_images_are_decoded_once_and_flow_to_preprocessing():
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
     adapter.defaults, adapter.per_row_prompt_kwargs = GenerationDefaults(), True
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
+    adapter.batches_observable = True
     adapter.process_image = lambda src, shape, proc: loads.append(src) or decoded
     adapter._run_chunk = lambda requests, indices: (
         seen.update(image=requests[indices[0]].image),
@@ -755,31 +757,6 @@ def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
             return ([], [])
     with pytest.raises(RuntimeError, match="admitted no prompt"):
         _results(adapter._drive(Stalled(object(), object()), [0], [0], {}))
-
-
-def test_vlm_requests_group_by_sampling_params():
-    # Differing sampling must not share one constructor-level sampler.
-    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
-    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults, adapter.per_row_prompt_kwargs = GenerationDefaults(), True
-    adapter.process_image = None
-    chunks = []
-    adapter._run_chunk = lambda requests, indices: (
-        chunks.append(list(indices))
-        or [GenerationEvent(index = index, result = object()) for index in indices])
-    hot = SamplingParams(temperature=0.9)
-    adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    _results(adapter.stream([GenerationRequest(prompt="a"),
-                             GenerationRequest(prompt="b", sampling=hot),
-                             GenerationRequest(prompt="c")]))
-    assert sorted(chunks) == [[0, 2], [1]]
-    # Preprocessing stacks a group without padding, so differing prompt lengths
-    # must not share a chunk; upstream raises when they do.
-    chunks.clear()
-    _results(adapter.stream([GenerationRequest(prompt="a"),
-                             GenerationRequest(prompt="bb"),
-                             GenerationRequest(prompt="c")]))
-    assert sorted(chunks) == [[0, 2], [1]]
 
 
 @pytest.mark.parametrize("plural", (True, False))
@@ -1049,6 +1026,7 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
     adapter._decode_image = lambda request: request
     adapter._group_key = lambda request: "g"
     adapter.per_row_prompt_kwargs = True
+    adapter.batches_observable = True
     adapter._run_chunk = lambda chunk, indices: (
         batched.append(list(indices)),
         [GenerationEvent(index = index, result = "batched") for index in indices])[1]
@@ -1088,6 +1066,113 @@ def test_seed_is_reduced_onto_the_random_key_domain():
     for bad in (True, 1.5, "7"):
         with pytest.raises(TypeError):
             SamplingParams(seed = bad)
+
+
+def _rows(width):
+    return types.SimpleNamespace(shape = (width,))
+
+
+def _row_sampler(params):
+    return _PerRowSampler(
+        params,
+        sample_utils_module = types.SimpleNamespace(),
+        make_sampler = lambda **knobs: (lambda logprobs: logprobs),
+    )
+
+
+def test_a_per_row_sampler_refuses_a_batch_it_cannot_match_to_rows():
+    """Silence here would cross two requests' draws."""
+    sampler = _row_sampler(
+        [SamplingParams(temperature = 0.9, seed = 11),
+         SamplingParams(temperature = 0.9, seed = 22)],
+    )
+    sampler.bind_uids([4, 9])
+    assert sampler.row_uids == [4, 9]
+    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
+        sampler(_rows(3))
+    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
+        sampler(_rows(1))
+
+    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
+        sampler.bind_uids([1, 2, 3])
+
+
+def _knob_sampler(**knobs):
+    """A sampler that reports every knob it was built for."""
+    import mlx.core as mx
+    token = (int(round(knobs["temp"] * 10)) + 10 * int(round(knobs["top_p"] * 10))
+             + 100 * knobs["top_k"] + 1000 * int(round(knobs["min_p"] * 10)))
+    return lambda logprobs: mx.array([token])
+
+
+def _batched_generator(prompt_uids = None, generation_uids = None):
+    return types.SimpleNamespace(
+        _prompt_batch = (
+            None if prompt_uids is None
+            else types.SimpleNamespace(uids = list(prompt_uids))
+        ),
+        _generation_batch = (
+            None if generation_uids is None
+            else types.SimpleNamespace(uids = list(generation_uids))
+        ),
+    )
+
+
+def _warm(temps):
+    return [SamplingParams(temperature = temp) for temp in temps]
+
+
+def test_a_per_row_sampler_places_rows_by_the_batch_that_is_drawing():
+    """The batch's own row order decides, not the order this adapter inferred."""
+    import mlx.core as mx
+    sampler = _PerRowSampler(
+        _warm([0.1, 0.2, 0.3]),
+        sample_utils_module = types.SimpleNamespace(),
+        make_sampler = _knob_sampler,
+    )
+    sampler.bind_uids([10, 20, 30])
+    sampler.row_uids = [30, 20, 10]
+    logprobs = mx.zeros((3, 4))
+
+    sampler.bind_generator(_batched_generator(generation_uids = [10, 20, 30]))
+    assert sampler.sample_target(logprobs, row_ids = [0] * 3,
+                                 positions = [1, 2, 3]).tolist() == [1, 2, 3]
+    sampler.bind_generator(_batched_generator(generation_uids = [30, 10, 20]))
+    assert sampler.sample_target(logprobs, row_ids = [0] * 3,
+                                 positions = [4, 5, 6]).tolist() == [3, 1, 2]
+    sampler.bind_generator(_batched_generator(generation_uids = [30, 20]))
+    assert sampler.sample_target(mx.zeros((2, 4)), row_ids = [0] * 2,
+                                 positions = [7, 8]).tolist() == [3, 2]
+
+
+def test_a_per_row_sampler_builds_each_row_every_knob_it_asked_for():
+    """Temperature is the obvious one, and the filters are the easy ones to drop."""
+    import mlx.core as mx
+    rows = [
+        SamplingParams(temperature = 0.5),
+        SamplingParams(temperature = 0.5, top_p = 0.8),
+        SamplingParams(temperature = 0.5, top_k = 3),
+        SamplingParams(temperature = 0.5, min_p = 0.2),
+    ]
+    sampler = _PerRowSampler(
+        rows,
+        sample_utils_module = types.SimpleNamespace(),
+        make_sampler = _knob_sampler,
+    )
+    sampler.bind_uids([10, 20, 30, 40])
+    sampler.bind_generator(_batched_generator(generation_uids = [10, 20, 30, 40]))
+    drawn = sampler.sample_target(
+        mx.zeros((4, 4)), row_ids = [0] * 4, positions = [1, 2, 3, 4],
+    ).tolist()
+    assert len(set(drawn)) == 4
+    assert drawn == [5, 85, 305, 2005]
+
+
+_UNREADABLE: dict = {}
+exec(compile(
+    "def draw(self):\n"
+    "    return _sample_with_positions(self.sampler, None, row_ids=[0], positions=[1])\n",
+    "<generated>", "exec"), _UNREADABLE)
 
 
 def test_a_row_is_reported_as_it_goes_and_its_deltas_rebuild_its_text():
