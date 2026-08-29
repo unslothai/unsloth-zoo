@@ -21,7 +21,7 @@ from unsloth_zoo.mlx.generate import (  # noqa: E402
     _StopStringScanner, _TextBatchAdapter,
     _eos_stop_tokens, _new_detokenizer, _probe_sampler_api, _probe_text_api,
     _generation_cache_hygiene, _restore_training_flags,
-    _validate_text_requests, generate_batch, generation_mode,
+    _validate_text_requests, generate_batch, generation_mode, stream_batch,
 )
 
 class _CharDetokenizer:
@@ -1116,3 +1116,122 @@ def test_a_row_is_reported_as_it_goes_and_its_deltas_rebuild_its_text():
     for index in (7, 9):
         row = [event for event in events if event.index == index]
         assert "".join(event.delta for event in row) == row[-1].result.text
+
+class _OpenBatchGenerator:
+    """A BatchGenerator that reports one token per row per step, for as long as"""
+
+    def __init__(self, *_args, **_kwargs):
+        self.rows: dict[int, int] = {}
+        self.removed: list[int] = []
+        self.closed = False
+        self.steps = 0
+        self._next_uid = 100
+
+    def insert(self, prompts, max_tokens=None, samplers=None, logits_processors=None):
+        uids = []
+        for index in range(len(prompts)):
+            self._next_uid += 1
+            budget = (max_tokens or [1])[index]
+            self.rows[self._next_uid] = int(budget)
+            uids.append(self._next_uid)
+        return uids
+
+    def next_generated(self):
+        self.steps += 1
+        events = []
+        for uid in list(self.rows):
+            self.rows[uid] -= 1
+            events.append(types.SimpleNamespace(
+                uid=uid, token=1, logprobs=[-9.0, -0.1, -0.2, -0.3],
+                finish_reason="length" if self.rows[uid] <= 0 else None,
+            ))
+            if self.rows[uid] <= 0:
+                del self.rows[uid]
+        return events
+
+    def remove(self, uids):
+        self.removed.extend(uids)
+        for uid in uids:
+            self.rows.pop(uid, None)
+
+    def close(self):
+        self.closed = True
+
+
+def _stub_generation_mode(monkeypatch, generator_type=_OpenBatchGenerator):
+    """A model that can enter generation mode, decoding through a fake generator."""
+    import unsloth_zoo.mlx.generate as module
+
+    def adapter(model, tok, defaults_):
+        built = object.__new__(_TextBatchAdapter)
+        built.model, built.tokenizer, built.defaults = model, tok, defaults_
+        built.batch_generator_type = generator_type
+        built.make_sampler = lambda **_kwargs: None
+        built.sample_utils = None
+        return built
+
+    monkeypatch.setattr(module, "_TextBatchAdapter", adapter)
+    monkeypatch.setattr(module, "_generation_cache_hygiene", contextlib.nullcontext)
+    monkeypatch.setattr(module, "_snapshot_metal_limits", dict)
+    monkeypatch.setattr(module, "_restore_metal_limits", lambda _snapshot: None)
+    model = types.SimpleNamespace(training=False, eval=lambda: None)
+    model.named_modules = lambda: [("", model)]
+    return model
+
+
+def _open_stream(monkeypatch, generator_type=_OpenBatchGenerator, **defaults):
+    """A BatchStream over a fake generator, with the generation lock stubbed out."""
+    from unsloth_zoo.mlx.generate import BatchStream
+
+    tokenizer = _CharTokenizer()
+    tokenizer.eos_token_ids = ()
+    model = _stub_generation_mode(monkeypatch, generator_type=generator_type)
+    return BatchStream(model, tokenizer, defaults=GenerationDefaults(**defaults))
+
+
+def test_a_batch_left_open_patches_the_cache_before_it_decodes(monkeypatch):
+    """mlx-lm's ArraysCache.advance strands a Metal buffer per token until it is
+    replaced, and a batch left open decodes for as long as the session lasts."""
+    from unsloth_zoo.mlx import generate as engine
+
+    installed = []
+    monkeypatch.setattr(
+        engine, "_install_arrays_cache_advance_fix", lambda: installed.append(True))
+    stream = _open_stream(monkeypatch, max_tokens=2)
+    try:
+        assert installed == [True]
+    finally:
+        stream.close()
+
+
+def test_a_row_added_mid_batch_decodes_with_the_rows_already_running(monkeypatch):
+    """A request that arrived later joins the batch already running: serving"""
+    stream = _open_stream(monkeypatch, max_tokens=6)
+    try:
+        first = stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=6))
+        early = [event.index for _ in range(2) for event in stream.step()]
+        second = stream.add(GenerationRequest(prompt_token_ids=[9, 9], max_tokens=3))
+        together = [event.index for _ in range(2) for event in stream.step()]
+    finally:
+        stream.close()
+
+    assert (first, second) == (0, 1)
+    assert early == [0, 0]
+    assert together == [0, 1, 0, 1]
+
+
+def test_a_cancelled_row_leaves_the_batch_and_its_neighbour_runs_on(monkeypatch):
+    stream = _open_stream(monkeypatch, max_tokens=8)
+    try:
+        stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=8))
+        stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=8))
+        assert [event.index for event in stream.step()] == [0, 1]
+        generator = stream._session.generator
+        assert stream.cancel(1) is True
+        assert generator.removed == [102]
+        assert [event.index for event in stream.step()] == [0]
+        assert stream.rows_in_flight == 1
+        assert stream.cancel(1) is False and stream.cancel(7) is False
+    finally:
+        stream.close()
+

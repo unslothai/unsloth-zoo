@@ -28,7 +28,7 @@ import threading
 import types
 import warnings
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from numbers import Integral
 from typing import Any, Iterator, Literal, Sequence
@@ -1217,6 +1217,171 @@ def _sampled_logprob(event) -> float:
     return float(value)
 
 
+def _warn_preserving(
+    what: str,
+    active_error: BaseException,
+    secondary: BaseException,
+) -> None:
+    """Report a second failure that must not replace the error already in flight."""
+    try:
+        warnings.warn(
+            f"{what} failed while preserving an active "
+            f"{type(active_error).__name__}: {secondary}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    except BaseException:
+        pass
+
+
+class _TextBatchSession:
+    """One mlx-lm ``BatchGenerator`` with its row set left open."""
+
+    def __init__(self, adapter: "_TextBatchAdapter"):
+        self.adapter = adapter
+        defaults = adapter.defaults
+        self.generator = adapter.batch_generator_type(
+            adapter.model,
+            max_tokens=defaults.max_tokens,
+            stop_tokens=_eos_stop_tokens(adapter.tokenizer),
+            prefill_batch_size=defaults.prefill_batch_size,
+            completion_batch_size=defaults.completion_batch_size,
+            max_kv_size=defaults.max_kv_size,
+        )
+        self._pending: dict[int, _PendingResult] = {}
+        self._row_of: dict[int, int] = {}
+        self._uid_of: dict[int, int] = {}
+        self._next_row = 0
+        self.usable = True
+
+    @property
+    def rows_in_flight(self) -> int:
+        return len(self._pending)
+
+    def add(self, request: GenerationRequest) -> int:
+        adapter = self.adapter
+        defaults = adapter.defaults
+        prompt = _encode_prompt(adapter.tokenizer, request)
+        params = request.sampling or defaults.sampling
+        sampler = (
+            _seeded_sampler(adapter.sample_utils, params)
+            if params.seed is not None
+            else adapter.make_sampler(
+                temp=params.temperature,
+                top_p=params.top_p,
+                top_k=params.top_k,
+                min_p=params.min_p,
+            )
+        )
+        try:
+            uids = self.generator.insert(
+                [prompt],
+                max_tokens=[int(request.max_tokens or defaults.max_tokens)],
+                samplers=[sampler],
+                logits_processors=[[]],
+            )
+        except BaseException:
+            self.usable = False
+            raise
+        try:
+            if len(uids) != 1:
+                raise RuntimeError(
+                    f"mlx-lm answered a one-prompt insert with {len(uids)} uids."
+                )
+            uid = uids[0]
+            state = _PendingResult(
+                detokenizer=_new_detokenizer(adapter.tokenizer),
+                scanner=_StopStringScanner(defaults.stop_strings),
+                prompt_token_count=len(prompt),
+            )
+        except BaseException as active_error:
+            try:
+                self.generator.remove(list(uids))
+            except BaseException as rollback_error:
+                self.usable = False
+                _warn_preserving(
+                    "handing a rejected row back to mlx-lm",
+                    active_error,
+                    rollback_error,
+                )
+            raise
+        row = self._next_row
+        self._next_row += 1
+        self._pending[uid] = state
+        self._row_of[uid] = row
+        self._uid_of[row] = uid
+        return row
+
+    def cancel(self, row: int) -> bool:
+        """Withdraw a row. False if it was never added, or has already ended."""
+        uid = self._uid_of.get(row)
+        if uid is None or uid not in self._pending:
+            return False
+        try:
+            self.generator.remove([uid])
+        except BaseException:
+            self.usable = False
+            raise
+        self._retire(uid)
+        return True
+
+    def step(self) -> Iterator[GenerationEvent]:
+        """One decode step's worth of events, or none while no row is in flight."""
+        if not self._pending:
+            return
+        try:
+            responses = self.generator.next_generated()
+            if not responses:
+                raise RuntimeError(
+                    "mlx-lm ended its event stream before every request "
+                    "reported a finish reason."
+                )
+            for response in responses:
+                yield from self._consume(response)
+        except BaseException:
+            self.usable = False
+            raise
+
+    def close(self):
+        self.generator.close()
+
+    def _retire(self, uid: int):
+        row = self._row_of.pop(uid, None)
+        self._pending.pop(uid, None)
+        if row is not None:
+            self._uid_of.pop(row, None)
+
+    def _consume(self, response) -> Iterator[GenerationEvent]:
+        state = self._pending.get(response.uid)
+        if state is None:
+            return
+        row = self._row_of[response.uid]
+        finish_reason = response.finish_reason
+        if finish_reason is None:
+            stopped = state.append(
+                self.adapter.tokenizer,
+                int(response.token),
+                _sampled_logprob(response),
+            )
+            if not stopped:
+                yield from _text_events(row, state)
+                return
+            self.generator.remove([response.uid])
+            yield from _finished_events(row, state, self.adapter.tokenizer)
+            self._retire(response.uid)
+            return
+        if finish_reason not in ("stop", "length"):
+            raise RuntimeError(
+                "mlx-lm emitted an unsupported finish reason: "
+                f"{finish_reason!r}."
+            )
+        if finish_reason == "length":
+            state.add_terminal(int(response.token), _sampled_logprob(response))
+        state.finish(self.adapter.tokenizer, finish_reason)
+        yield from _finished_events(row, state, self.adapter.tokenizer)
+        self._retire(response.uid)
+
+
 class _TextBatchAdapter:
     def __init__(self, model, tokenizer, defaults: GenerationDefaults):
         generate_module = importlib.import_module("mlx_lm.generate")
@@ -1231,96 +1396,19 @@ class _TextBatchAdapter:
         self.defaults = defaults
 
     def stream(self, requests: Sequence[GenerationRequest]) -> Iterator[GenerationEvent]:
-        prompts = [_encode_prompt(self.tokenizer, request) for request in requests]
-        max_tokens = [
-            int(request.max_tokens or self.defaults.max_tokens)
-            for request in requests
-        ]
-        sampling = [
-            request.sampling or self.defaults.sampling
-            for request in requests
-        ]
-        samplers = [
-            _seeded_sampler(self.sample_utils, params)
-            if params.seed is not None
-            else self.make_sampler(
-                temp=params.temperature,
-                top_p=params.top_p,
-                top_k=params.top_k,
-                min_p=params.min_p,
-            )
-            for params in sampling
-        ]
-        generator = self.batch_generator_type(
-            self.model,
-            max_tokens=self.defaults.max_tokens,
-            stop_tokens=_eos_stop_tokens(self.tokenizer),
-            prefill_batch_size=self.defaults.prefill_batch_size,
-            completion_batch_size=self.defaults.completion_batch_size,
-            max_kv_size=self.defaults.max_kv_size,
-        )
+        session = _TextBatchSession(self)
         active_error = None
         try:
-            uids = generator.insert(
-                prompts,
-                max_tokens=max_tokens,
-                samplers=samplers,
-                logits_processors=[[] for _ in requests],
-            )
-            pending = {
-                uid: _PendingResult(
-                    detokenizer=_new_detokenizer(self.tokenizer),
-                    scanner=_StopStringScanner(self.defaults.stop_strings),
-                    prompt_token_count=len(prompt),
-                )
-                for uid, prompt in zip(uids, prompts)
-            }
-            row_of = {uid: row for row, uid in enumerate(uids)}
-            while pending:
-                events = generator.next_generated()
-                if not events:
-                    raise RuntimeError(
-                        "mlx-lm ended its event stream before every request "
-                        "reported a finish reason."
-                    )
-                for event in events:
-                    state = pending.get(event.uid)
-                    if state is None:
-                        continue
-                    row = row_of[event.uid]
-                    finish_reason = event.finish_reason
-                    if finish_reason is None:
-                        stopped = state.append(
-                            self.tokenizer,
-                            int(event.token),
-                            _sampled_logprob(event),
-                        )
-                        if not stopped:
-                            yield from _text_events(row, state)
-                            continue
-                        generator.remove([event.uid])
-                        yield from _finished_events(row, state, self.tokenizer)
-                        del pending[event.uid]
-                        continue
-                    if finish_reason not in ("stop", "length"):
-                        raise RuntimeError(
-                            "mlx-lm emitted an unsupported finish reason: "
-                            f"{finish_reason!r}."
-                        )
-                    if finish_reason == "length":
-                        state.add_terminal(
-                            int(event.token),
-                            _sampled_logprob(event),
-                        )
-                    state.finish(self.tokenizer, finish_reason)
-                    yield from _finished_events(row, state, self.tokenizer)
-                    del pending[event.uid]
+            for request in requests:
+                session.add(request)
+            while session.rows_in_flight:
+                yield from session.step()
         except BaseException as exc:
             active_error = exc
             raise
         finally:
             try:
-                generator.close()
+                session.close()
             except BaseException as close_error:
                 if active_error is None:
                     raise
@@ -2090,6 +2178,140 @@ def generate_batch(
     return results
 
 
+class BatchStream:
+    """A batch left open: rows join and leave while the batch decodes.
+
+    ``stream_batch`` decodes one fixed set of requests and ends. This is the
+    same decode with the set open, so a server can merge requests that arrived
+    separately into one batch, and retire each row where it ends rather than at
+    the end of the batch. Rows are numbered in the order they were added and
+    keep their number for the stream's life.
+
+    The process-wide generation lock is held from construction until ``close``,
+    and it belongs to the thread *and* the asyncio task that took it: the same
+    one constructs, adds, steps, and closes. Use it as a context manager, or
+    close it in a ``finally``. A call from anywhere else is refused before
+    anything is torn down, so the stream stays closable by its owner.
+
+    Text models only. A vision batch is grouped by image shape and prefilled
+    together, so its rows cannot join a decode already running; ``stream_batch``
+    serves those.
+
+    ``stop_strings`` are unavailable here for the reason ``stream_batch`` gives:
+    they cut on token boundaries, which would retract text already handed out.
+
+    Any call that raises where it may already have changed the batch retires the
+    whole stream: mlx-lm takes and releases a row in several steps, so what it
+    holds afterwards is a question neither side can answer. ``add``, ``step`` and
+    ``cancel`` then refuse; only ``close`` still works. Open another.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        *,
+        defaults: GenerationDefaults | None = None,
+    ):
+        if defaults is None:
+            defaults = GenerationDefaults()
+        if not isinstance(defaults, GenerationDefaults):
+            raise TypeError("defaults must be GenerationDefaults.")
+        _install_arrays_cache_advance_fix()
+        if defaults.stop_strings:
+            raise ValueError(
+                "BatchStream cannot apply stop_strings: they cut on token "
+                "boundaries, which would retract text already streamed. Scan "
+                "the deltas for them instead."
+            )
+        if bool(getattr(model, "_is_vlm_model", False)):
+            raise ValueError(
+                "BatchStream decodes text models. A vision batch is grouped by "
+                "image shape and prefilled together, so its rows cannot join a "
+                "decode already running; use stream_batch."
+            )
+        if tokenizer is None:
+            raise ValueError("Text batched generation requires a tokenizer.")
+        self._stack = ExitStack()
+        self._session = None
+        self._closed = False
+        self._owner = (threading.get_ident(), _current_async_task())
+        try:
+            self._stack.enter_context(generation_mode(model))
+            self._stack.enter_context(_generation_cache_hygiene())
+            adapter = _TextBatchAdapter(model, tokenizer, defaults)
+            self._session = _TextBatchSession(adapter)
+            self._stack.callback(self._session.close)
+        except BaseException as active_error:
+            try:
+                self._stack.close()
+            except BaseException as close_error:
+                _warn_preserving("tearing the batch down", active_error, close_error)
+            raise
+
+    def __enter__(self) -> "BatchStream":
+        return self
+
+    def __exit__(self, _exc_type, active_error, _traceback) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if active_error is None:
+                raise
+            _warn_preserving("tearing the batch down", active_error, close_error)
+
+
+
+    @property
+    def rows_in_flight(self) -> int:
+        """Rows added and not yet finished or cancelled."""
+        return 0 if self._session is None else self._session.rows_in_flight
+
+    def add(self, request: GenerationRequest) -> int:
+        """Admit one request, and answer with the row number reporting it."""
+        session = self._require_open()
+        (validated,) = _validate_text_requests([request], session.adapter.defaults)
+        return session.add(validated)
+
+    def cancel(self, row: int) -> bool:
+        """Withdraw a row. False if it was never added, or has already ended."""
+        return self._require_open().cancel(row)
+
+    def step(self) -> list[GenerationEvent]:
+        """What the batch produced in one decode step."""
+        return list(self._require_open().step())
+
+    def close(self) -> None:
+        """Release the batch and the generation lock. Safe to call twice."""
+        if self._closed:
+            return
+        self._require_owner()
+        self._closed = True
+        self._session = None
+        self._stack.close()
+
+    def _require_open(self) -> "_TextBatchSession":
+        if self._session is None:
+            raise RuntimeError("This BatchStream is closed.")
+        self._require_owner()
+        if not self._session.usable:
+            raise RuntimeError(
+                "This BatchStream holds a batch neither it nor mlx-lm can "
+                "answer for, left by an earlier call that failed partway. "
+                "Close it and open another."
+            )
+        return self._session
+
+    def _require_owner(self) -> None:
+        current = (threading.get_ident(), _current_async_task())
+        if current == self._owner:
+            return
+        raise RuntimeError(
+            "This BatchStream belongs to the thread and task that opened it: "
+            "the generation lock it holds can only be released there."
+        )
+
+
 def stream_batch(
     model,
     tokenizer_or_processor,
@@ -2220,6 +2442,7 @@ def fast_generate(
 
 
 __all__ = [
+    "BatchStream",
     "GenerationDefaults",
     "GenerationEvent",
     "GenerationRequest",
