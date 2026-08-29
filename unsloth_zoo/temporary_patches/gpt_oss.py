@@ -40,6 +40,7 @@ from .utils import (
     dedent,
     KWARGS_TYPE,
     raise_error,
+    skip_patch,
     logger,
     Cache,
     process_return,
@@ -134,11 +135,12 @@ def patch_gpt_oss():
 
             transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
         except Exception as e:
-            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+            skip_patch("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
         if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
             transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
 
+        matmul_ogs_available = False
         try:
             from triton_kernels import matmul_ogs, swiglu
 
@@ -148,8 +150,9 @@ def patch_gpt_oss():
                 matmul_ogs.matmul_ogs,
             )
             swiglu_fn = swiglu.swiglu_fn
+            matmul_ogs_available = True
         except Exception as e:
-            return raise_error("triton_kernels", e)
+            skip_patch("triton_kernels", e)
     else:
         # Leave is_kernels_available intact so transformers' validate_environment()
         # correctly sets dequantize=True, enabling bf16 fallback.
@@ -188,266 +191,269 @@ def patch_gpt_oss():
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
-    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
-        @staticmethod
-        def forward(
-            ctx,
-            hidden_states,
-            self_class,
-            routing_data,
-            gather_idx,
-            scatter_idx,
-        ):
-            pre_activation = matmul_ogs(
-                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
-                self_class.gate_up_proj,
-                self_class.gate_up_proj_bias,
+    if matmul_ogs_available:
+        class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx,
+                hidden_states,
+                self_class,
                 routing_data,
-                gather_indx=gather_idx,
-                scatter_indx=None,
-                precision_config=self_class.gate_up_proj_precision_config,
-                gammas=None,
-                fused_activation=None,
-            )
-            swiglu_output = swiglu_torch_forward(
-                pre_activation,
-                self_class.alpha,
-                self_class.limit,
-            )
-            out = matmul_ogs(
-                swiglu_output,
-                self_class.down_proj,
-                self_class.down_proj_bias,
-                routing_data,
-                gather_indx=None,
-                scatter_indx=scatter_idx,
-                precision_config=self_class.down_proj_precision_config,
-                gammas=routing_data.gate_scal,
-                fused_activation=None,
-            )
-            ctx.save_for_backward(
-                pre_activation,
-                routing_data.gate_scal,
-                gather_idx.src_indx,
-                gather_idx.dst_indx,
-                scatter_idx.src_indx,
-                scatter_idx.dst_indx,
-            )
-            ctx.self_class   = self_class
-            ctx.gather_idx   = gather_idx
-            ctx.scatter_idx  = scatter_idx
-            ctx.routing_data = routing_data
-            return out
+                gather_idx,
+                scatter_idx,
+            ):
+                pre_activation = matmul_ogs(
+                    hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                    self_class.gate_up_proj,
+                    self_class.gate_up_proj_bias,
+                    routing_data,
+                    gather_indx=gather_idx,
+                    scatter_indx=None,
+                    precision_config=self_class.gate_up_proj_precision_config,
+                    gammas=None,
+                    fused_activation=None,
+                )
+                swiglu_output = swiglu_torch_forward(
+                    pre_activation,
+                    self_class.alpha,
+                    self_class.limit,
+                )
+                out = matmul_ogs(
+                    swiglu_output,
+                    self_class.down_proj,
+                    self_class.down_proj_bias,
+                    routing_data,
+                    gather_indx=None,
+                    scatter_indx=scatter_idx,
+                    precision_config=self_class.down_proj_precision_config,
+                    gammas=routing_data.gate_scal,
+                    fused_activation=None,
+                )
+                ctx.save_for_backward(
+                    pre_activation,
+                    routing_data.gate_scal,
+                    gather_idx.src_indx,
+                    gather_idx.dst_indx,
+                    scatter_idx.src_indx,
+                    scatter_idx.dst_indx,
+                )
+                ctx.self_class   = self_class
+                ctx.gather_idx   = gather_idx
+                ctx.scatter_idx  = scatter_idx
+                ctx.routing_data = routing_data
+                return out
+            pass
+    
+            @staticmethod
+            def backward(ctx, grad_token):
+                raise NotImplementedError(
+                    "Backwards pass using MXFP4 is still under construction!\n"
+                    "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"
+                    "Or, use `load_in_4bit = True` which allows finetuning."
+                )
+                (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
+                self_class = ctx.self_class
+                limit = self_class.limit
+                alpha = self_class.alpha
+    
+                # 1) token ➜ expert (reverse of forward scatter)
+                grad_exp = grad_token.index_select(0, scatter_src)
+                grad_exp.mul_(gamma.unsqueeze(-1))
+                # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
+                Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
+                g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
+                del Wd_T
+                # 3) activation derivative
+                g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
+                # 4) g1 · Wuᵀ
+                Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
+                dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
+                del Wu_T
+    
+                # 5) expert ➜ token (reverse of forward gather)
+                dx_token = torch.zeros_like(grad_token)
+                dx_token.index_add_(0, gather_dst, dx_exp)
+                return (dx_token, None, None, None, None,)
+            pass
+    
         pass
-
-        @staticmethod
-        def backward(ctx, grad_token):
-            raise NotImplementedError(
-                "Backwards pass using MXFP4 is still under construction!\n"
-                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"
-                "Or, use `load_in_4bit = True` which allows finetuning."
-            )
-            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
-            self_class = ctx.self_class
-            limit = self_class.limit
-            alpha = self_class.alpha
-
-            # 1) token ➜ expert (reverse of forward scatter)
-            grad_exp = grad_token.index_select(0, scatter_src)
-            grad_exp.mul_(gamma.unsqueeze(-1))
-            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
-            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
-            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
-            del Wd_T
-            # 3) activation derivative
-            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
-            # 4) g1 · Wuᵀ
-            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
-            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
-            del Wu_T
-
-            # 5) expert ➜ token (reverse of forward gather)
-            dx_token = torch.zeros_like(grad_token)
-            dx_token.index_add_(0, gather_dst, dx_exp)
-            return (dx_token, None, None, None, None,)
-        pass
-
-    pass
-
-    class Mxfp4GptOssExperts(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-
-            self.num_experts = config.num_local_experts
-            self.intermediate_size = config.intermediate_size
-            self.hidden_size = config.hidden_size
-
-            # MXFP4 quantized format (blocks + scales)
-            self.gate_up_proj_blocks = nn.Parameter(
-                torch.zeros(
-                    self.num_experts,
-                    2 * self.intermediate_size,
-                    self.hidden_size // 32,
-                    16,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.gate_up_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False,
-            )
-
-            self.down_proj_blocks = nn.Parameter(
-                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8), requires_grad=False
-            )
-            self.down_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8), requires_grad=False
-            )
-            self.down_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
-            )
-
-            self.alpha = 1.702
-            self.limit = getattr(config, "swiglu_limit", 7.0)
-            self.gate_up_proj_precision_config = None
-            self.down_proj_precision_config = None
-
-        @property
-        def gate_up_proj(self):
-            """gate_up_proj tensor, from blocks/scales or stored directly."""
-            # Already set from checkpoint loading or previous dequantization
-            if "_gate_up_proj" in self.__dict__:
-                return self.__dict__["_gate_up_proj"]
-
-            # MXFP4 weights present when blocks/scales are not all zeros
-            blocks_valid = (
-                self.gate_up_proj_blocks.device.type != "meta"
-                and self.gate_up_proj_blocks.numel() > 0
-                and self.gate_up_proj_blocks.any()
-            )
-
-            if not blocks_valid:
-                raise AttributeError(
-                    f"Mxfp4GptOssExperts.gate_up_proj: No weights loaded. "
-                    f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
+    
+        class Mxfp4GptOssExperts(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+    
+                self.num_experts = config.num_local_experts
+                self.intermediate_size = config.intermediate_size
+                self.hidden_size = config.hidden_size
+    
+                # MXFP4 quantized format (blocks + scales)
+                self.gate_up_proj_blocks = nn.Parameter(
+                    torch.zeros(
+                        self.num_experts,
+                        2 * self.intermediate_size,
+                        self.hidden_size // 32,
+                        16,
+                        dtype=torch.uint8,
+                    ),
+                    requires_grad=False,
                 )
-
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
-            try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
-                self.__dict__["_gate_up_proj"] = dequantized
-                return dequantized
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
-                    f"Ensure transformers.integrations.mxfp4.dequantize is available."
+                self.gate_up_proj_scales = nn.Parameter(
+                    torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                    requires_grad=False,
                 )
-
-        @gate_up_proj.setter
-        def gate_up_proj(self, value):
-            """Set gate_up_proj tensor (during checkpoint loading)."""
-            self.__dict__["_gate_up_proj"] = value
-
-        @property
-        def down_proj(self):
-            """down_proj tensor, from blocks/scales or stored directly."""
-            if "_down_proj" in self.__dict__:
-                return self.__dict__["_down_proj"]
-
-            blocks_valid = (
-                self.down_proj_blocks.device.type != "meta"
-                and self.down_proj_blocks.numel() > 0
-                and self.down_proj_blocks.any()
-            )
-
-            if not blocks_valid:
-                raise AttributeError(
-                    f"Mxfp4GptOssExperts.down_proj: No weights loaded."
+                self.gate_up_proj_bias = nn.Parameter(
+                    torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False,
                 )
-
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
-            try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
-                self.__dict__["_down_proj"] = dequantized
-                return dequantized
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 down_proj: {e}"
+    
+                self.down_proj_blocks = nn.Parameter(
+                    torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8), requires_grad=False
                 )
-
-        @down_proj.setter
-        def down_proj(self, value):
-            """Set down_proj tensor (during checkpoint loading)."""
-            self.__dict__["_down_proj"] = value
-
-        def forward(
-            self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx
-        ) -> torch.Tensor:
-            with torch_cuda_device(hidden_states.device):
-                if not hasattr(self, "act"):
-                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
-                if not hidden_states.requires_grad:
-                    intermediate_cache1 = matmul_ogs(
-                        hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
-                        self.gate_up_proj,
-                        self.gate_up_proj_bias,
-                        routing_data,
-                        gather_indx=gather_idx,
-                        precision_config=self.gate_up_proj_precision_config,
-                        gammas=None,
-                        fused_activation=self.act,
+                self.down_proj_scales = nn.Parameter(
+                    torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8), requires_grad=False
+                )
+                self.down_proj_bias = nn.Parameter(
+                    torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
+                )
+    
+                self.alpha = 1.702
+                self.limit = getattr(config, "swiglu_limit", 7.0)
+                self.gate_up_proj_precision_config = None
+                self.down_proj_precision_config = None
+    
+            @property
+            def gate_up_proj(self):
+                """gate_up_proj tensor, from blocks/scales or stored directly."""
+                # Already set from checkpoint loading or previous dequantization
+                if "_gate_up_proj" in self.__dict__:
+                    return self.__dict__["_gate_up_proj"]
+    
+                # MXFP4 weights present when blocks/scales are not all zeros
+                blocks_valid = (
+                    self.gate_up_proj_blocks.device.type != "meta"
+                    and self.gate_up_proj_blocks.numel() > 0
+                    and self.gate_up_proj_blocks.any()
+                )
+    
+                if not blocks_valid:
+                    raise AttributeError(
+                        f"Mxfp4GptOssExperts.gate_up_proj: No weights loaded. "
+                        f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
                     )
-                    intermediate_cache3 = matmul_ogs(
-                        intermediate_cache1,
-                        self.down_proj,
-                        self.down_proj_bias,
-                        routing_data,
-                        scatter_indx=scatter_idx,
-                        precision_config=self.down_proj_precision_config,
-                        gammas=routing_data.gate_scal if routing_data else None,
+    
+                # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+                try:
+                    from transformers.integrations.mxfp4 import dequantize
+                    dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
+                    self.__dict__["_gate_up_proj"] = dequantized
+                    return dequantized
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
+                        f"Ensure transformers.integrations.mxfp4.dequantize is available."
                     )
-                else:
-                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
-                        hidden_states,
-                        self,
-                        routing_data,
-                        gather_idx,
-                        scatter_idx,
+    
+            @gate_up_proj.setter
+            def gate_up_proj(self, value):
+                """Set gate_up_proj tensor (during checkpoint loading)."""
+                self.__dict__["_gate_up_proj"] = value
+    
+            @property
+            def down_proj(self):
+                """down_proj tensor, from blocks/scales or stored directly."""
+                if "_down_proj" in self.__dict__:
+                    return self.__dict__["_down_proj"]
+    
+                blocks_valid = (
+                    self.down_proj_blocks.device.type != "meta"
+                    and self.down_proj_blocks.numel() > 0
+                    and self.down_proj_blocks.any()
+                )
+    
+                if not blocks_valid:
+                    raise AttributeError(
+                        f"Mxfp4GptOssExperts.down_proj: No weights loaded."
                     )
-            return intermediate_cache3
+    
+                # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+                try:
+                    from transformers.integrations.mxfp4 import dequantize
+                    dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
+                    self.__dict__["_down_proj"] = dequantized
+                    return dequantized
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to dequantize MXFP4 down_proj: {e}"
+                    )
+    
+            @down_proj.setter
+            def down_proj(self, value):
+                """Set down_proj tensor (during checkpoint loading)."""
+                self.__dict__["_down_proj"] = value
+    
+            def forward(
+                self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx
+            ) -> torch.Tensor:
+                with torch_cuda_device(hidden_states.device):
+                    if not hasattr(self, "act"):
+                        self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
+                    if not hidden_states.requires_grad:
+                        intermediate_cache1 = matmul_ogs(
+                            hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
+                            self.gate_up_proj,
+                            self.gate_up_proj_bias,
+                            routing_data,
+                            gather_indx=gather_idx,
+                            precision_config=self.gate_up_proj_precision_config,
+                            gammas=None,
+                            fused_activation=self.act,
+                        )
+                        intermediate_cache3 = matmul_ogs(
+                            intermediate_cache1,
+                            self.down_proj,
+                            self.down_proj_bias,
+                            routing_data,
+                            scatter_indx=scatter_idx,
+                            precision_config=self.down_proj_precision_config,
+                            gammas=routing_data.gate_scal if routing_data else None,
+                        )
+                    else:
+                        intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
+                            hidden_states,
+                            self,
+                            routing_data,
+                            gather_idx,
+                            scatter_idx,
+                        )
+                return intermediate_cache3
+    
+            pass
+    
+        patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
-        pass
-
-    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
-
-    if HAS_TRITON_KERNELS:
+    if matmul_ogs_available:
         try:
             routing = triton_kernels.routing.routing
             routing = torch.compiler.disable(routing)
         except Exception as e:
-            return raise_error("triton_kernels.routing.routing", e)
+            skip_patch("triton_kernels.routing.routing", e)
+        else:
+            def mlp_forward(self, hidden_states):
+                batch_size = hidden_states.shape[0]
+                hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+                router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
 
-        def mlp_forward(self, hidden_states):
-            batch_size = hidden_states.shape[0]
-            hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
-            router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+                with torch_cuda_device(router_logits.device):
+                    routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
 
-            with torch_cuda_device(router_logits.device):
-                routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
+                routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+                routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+                return routed_out, router_logits
 
-            routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
-            routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
-            return routed_out, router_logits
+            patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
 
-        patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
-
-    if HAS_TRITON_KERNELS:
+    load_and_swizzle_ready = False
+    shard_and_distribute_module = None
+    if matmul_ogs_available:
         try:
             PrecisionConfig, FlexCtx, InFlexData = (
                 triton_kernels.matmul_ogs.PrecisionConfig,
@@ -455,111 +461,118 @@ def patch_gpt_oss():
                 triton_kernels.matmul_ogs.InFlexData,
             )
         except Exception as e:
-            return raise_error("triton_kernels.matmul_ogs", e)
+            skip_patch("triton_kernels.matmul_ogs", e)
+        else:
+            try:
+                from transformers.integrations.tensor_parallel import shard_and_distribute_module
+            except Exception as e:
+                skip_patch("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+            load_and_swizzle_ready = True
 
-    try:
-        from transformers.integrations.tensor_parallel import shard_and_distribute_module
-    except Exception as e:
-        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+    if load_and_swizzle_ready:
+        def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
+            model = kwargs.get("model", None)
+            empty_param = kwargs.get("empty_param", None)
+            casting_dtype = kwargs.get("casting_dtype", None)
+            to_contiguous = kwargs.get("to_contiguous", None)
+            rank = kwargs.get("rank", None)
+            device_mesh = kwargs.get("device_mesh", None)
 
-    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
-        model = kwargs.get("model", None)
-        empty_param = kwargs.get("empty_param", None)
-        casting_dtype = kwargs.get("casting_dtype", None)
-        to_contiguous = kwargs.get("to_contiguous", None)
-        rank = kwargs.get("rank", None)
-        device_mesh = kwargs.get("device_mesh", None)
-
-        for proj in ["gate_up_proj", "down_proj"]:
-            if proj in param_name:
-                if device_mesh is not None:
-                    shard_and_distribute_module(model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh)
-                else:
-                    setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
-                blocks_attr = f"{proj}_blocks"
-                scales_attr = f"{proj}_scales"
-                blocks = getattr(module, blocks_attr)
-                scales = getattr(module, scales_attr)
-                # Valid = blocks/scales off meta AND non-zero (all-zeros means init, not checkpoint)
-                blocks_valid = (
-                    blocks.device.type != "meta"
-                    and scales.device.type != "meta"
-                    and blocks.numel() > 0
-                    and blocks.any()  # At least some non-zero values
-                )
-                if blocks_valid:
-                    # need it for ep
-                    local_experts = blocks.size(0)
-                    if proj == "gate_up_proj":
-                        blocks = blocks.view(local_experts, module.intermediate_size * 2, -1)
+            for proj in ["gate_up_proj", "down_proj"]:
+                if proj in param_name:
+                    if device_mesh is not None:
+                        if shard_and_distribute_module is None:
+                            raise RuntimeError(
+                                "Tensor parallel MXFP4 loading requires "
+                                "transformers.integrations.tensor_parallel.shard_and_distribute_module"
+                            )
+                        shard_and_distribute_module(model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh)
                     else:
-                        blocks = blocks.view(local_experts, -1, module.intermediate_size // 2)
-                    # TODO: we need to have the weights on cuda, refactor later
-                    if getattr(target_device, "type", target_device) == "cpu":
-                        target_device = "cuda"
-                    # TODO: check why we still do move the tensors despite the context manager
-                    blocks = blocks.to(target_device)
-                    scales = scales.to(target_device)
-                    with torch.cuda.device(target_device):
-                        triton_weight_tensor, weight_scale = swizzle_mxfp4(
-                            blocks.transpose(-2, -1), scales.transpose(-2, -1)
-                        )
-
-                    # need to overwrite the shapes for the kernels
-                    if proj == "gate_up_proj":
-                        triton_weight_tensor.shape = torch.Size(
-                            [local_experts, module.hidden_size, module.intermediate_size * 2]
-                        )
-                    else:
-                        triton_weight_tensor.shape = torch.Size(
-                            [local_experts, module.intermediate_size, module.hidden_size]
-                        )
-
-                    # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
-                    setattr(module, proj, triton_weight_tensor)
-                    setattr(
-                        module,
-                        f"{proj}_precision_config",
-                        PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
+                        setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
+                    blocks_attr = f"{proj}_blocks"
+                    scales_attr = f"{proj}_scales"
+                    blocks = getattr(module, blocks_attr)
+                    scales = getattr(module, scales_attr)
+                    # Valid = blocks/scales off meta AND non-zero (all-zeros means init, not checkpoint)
+                    blocks_valid = (
+                        blocks.device.type != "meta"
+                        and scales.device.type != "meta"
+                        and blocks.numel() > 0
+                        and blocks.any()  # At least some non-zero values
                     )
+                    if blocks_valid:
+                        # need it for ep
+                        local_experts = blocks.size(0)
+                        if proj == "gate_up_proj":
+                            blocks = blocks.view(local_experts, module.intermediate_size * 2, -1)
+                        else:
+                            blocks = blocks.view(local_experts, -1, module.intermediate_size // 2)
+                        # TODO: we need to have the weights on cuda, refactor later
+                        if getattr(target_device, "type", target_device) == "cpu":
+                            target_device = "cuda"
+                        # TODO: check why we still do move the tensors despite the context manager
+                        blocks = blocks.to(target_device)
+                        scales = scales.to(target_device)
+                        with torch.cuda.device(target_device):
+                            triton_weight_tensor, weight_scale = swizzle_mxfp4(
+                                blocks.transpose(-2, -1), scales.transpose(-2, -1)
+                            )
 
-                    # delete blocks and scales
-                    delattr(module, scales_attr)
-                    delattr(module, blocks_attr)
-                    # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
-                    del blocks
+                        # need to overwrite the shapes for the kernels
+                        if proj == "gate_up_proj":
+                            triton_weight_tensor.shape = torch.Size(
+                                [local_experts, module.hidden_size, module.intermediate_size * 2]
+                            )
+                        else:
+                            triton_weight_tensor.shape = torch.Size(
+                                [local_experts, module.intermediate_size, module.hidden_size]
+                            )
 
-    pass
-    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
+                        # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
+                        setattr(module, proj, triton_weight_tensor)
+                        setattr(
+                            module,
+                            f"{proj}_precision_config",
+                            PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
+                        )
+
+                        # delete blocks and scales
+                        delattr(module, scales_attr)
+                        delattr(module, blocks_attr)
+                        # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
+                        del blocks
+
+        pass
+        patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
 
     try:
         from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
     except Exception as e:
-        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
+        skip_patch("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
+    else:
+        def replace_with_mxfp4_linear(
+            model,
+            modules_to_not_convert=None,
+            current_key_name=None,
+            quantization_config=None,
+            config=None,
+        ):
+            if quantization_config.dequantize: return model
+            modules_to_not_convert = (["lm_head"] if modules_to_not_convert is None else modules_to_not_convert)
+            if quantization_config.modules_to_not_convert is not None:
+                modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
+            modules_to_not_convert = list(set(modules_to_not_convert))
+            model, has_been_replaced = _replace_with_mxfp4_linear(model, modules_to_not_convert, current_key_name, quantization_config, config=config)
+            if not has_been_replaced:
+                logger.warning_once(
+                    "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                    " Please double check your model architecture, or submit an issue on github if you think this is"
+                    " a bug."
+                )
 
-    def replace_with_mxfp4_linear(
-        model,
-        modules_to_not_convert=None,
-        current_key_name=None,
-        quantization_config=None,
-        config=None,
-    ):
-        if quantization_config.dequantize: return model
-        modules_to_not_convert = (["lm_head"] if modules_to_not_convert is None else modules_to_not_convert)
-        if quantization_config.modules_to_not_convert is not None:
-            modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
-        modules_to_not_convert = list(set(modules_to_not_convert))
-        model, has_been_replaced = _replace_with_mxfp4_linear(model, modules_to_not_convert, current_key_name, quantization_config, config=config)
-        if not has_been_replaced:
-            logger.warning_once(
-                "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
-                " Please double check your model architecture, or submit an issue on github if you think this is"
-                " a bug."
-            )
+            return model
 
-        return model
-
-    patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
+        patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
