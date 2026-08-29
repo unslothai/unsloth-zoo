@@ -556,10 +556,11 @@ def test_vlm_adapter_isolates_detokenizers_and_reads_scalar_logprobs():
     generator = _vlm_stub(True, events=[
         [(0, 1, None), (1, 4, None)], [(0, 3, "stop"), (1, 3, "stop")]])(
         object(), object())
-    results = _results(adapter._drive(generator, [0, 1], [0, 1], {}))
+    results = _results(adapter._drive(generator, [0, 1], [0, 1], {}, prompt_token_count=37))
     # Distinct buffers: a shared one concatenates both sequences into the first.
     assert [(r.token_ids, r.text) for r in results] == [
         ([1], "hello "), ([4], "tailSTOPsuffix")] and results[0].logprobs == [-0.5]
+    assert [r.prompt_token_count for r in results] == [37, 37]
 
 
 def test_vlm_chunking_respects_release_capabilities():
@@ -592,8 +593,8 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
     adapter._add_special_tokens = lambda: True
-    adapter._drive = lambda *a: iter(
-        [GenerationEvent(index = row, result = "ok") for row in a[2]]
+    adapter._drive = lambda *a, **k: iter(
+        [GenerationEvent(index = row, result = k["prompt_token_count"]) for row in a[2]]
     )
     adapter._split_prompt_kwargs = lambda kw, n: (seen.update(kwargs=kw), [{}] * n)[1]
     # Recording on ENTRY proves embeddings run inside the wired-limit context.
@@ -606,7 +607,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     adapter.generator_type = lambda *a, **k: (order.append("construct"),
         seen.update(ctor=k), _vlm_stub(True, events=[[(0, 1, "stop")]])(*a[:2]))[2]
     assert [event.result for event in
-            adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == ["ok", "ok"]
+            adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [1, 1]
     assert order == ["wired", "embed", "policy", "construct"]
     assert seen["policy"]["prefill_kwargs"]["inputs_embeds"] == "E"
     assert seen["kwargs"]["extra"] == "D"
@@ -909,7 +910,11 @@ def _audio_events(*specs):
     """
     made = []
     for position, (token, finish) in enumerate(specs):
-        fields = {"token": token, "logprobs": {token: -0.5 - position}}
+        fields = {
+            "token": token,
+            "logprobs": {token: -0.5 - position},
+            "prompt_tokens": 40,
+        }
         if finish is not None:
             fields["finish_reason"] = finish
         made.append(types.SimpleNamespace(**fields))
@@ -987,9 +992,10 @@ def test_audio_terminal_event_flushes_text_held_back_during_streaming():
 def test_audio_fallback_forwards_the_request_to_the_stream():
     # A dropped audio payload or ignored control shows up in the stream call.
     adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
-    _audio_row(adapter, GenerationRequest(
+    result, _ = _audio_row(adapter, GenerationRequest(
         prompt="p", audio="a.wav", max_tokens=9,
         sampling=SamplingParams(temperature=0.25, top_k=7)))
+    assert result.prompt_token_count == 40
     args, kwargs = adapter.stream_calls[0]
     assert args[2] == "p"  # the rendered prompt, after model and processor
     assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)

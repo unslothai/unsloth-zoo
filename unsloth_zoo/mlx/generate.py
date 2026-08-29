@@ -219,13 +219,14 @@ class GenerationRequest:
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """Sampled-token output with text from the backend's streaming detokenizer."""
+    """One row's outcome: its sampled tokens, their text, and what the prompt cost."""
 
     token_ids: list[int]
     text: str
     logprobs: list[float]
     finish_reason: Literal["stop", "length", "stop_string"]
     stop_match: str | None = None
+    prompt_token_count: int = 0
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -1098,6 +1099,7 @@ def _replay_stream_text(detokenizer, token_ids: Sequence[int]) -> str:
 class _PendingResult:
     detokenizer: Any
     scanner: _StopStringScanner
+    prompt_token_count: int = 0
     token_ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     text: str = ""
@@ -1166,6 +1168,7 @@ class _PendingResult:
             logprobs=list(self.logprobs),
             finish_reason=self.finish_reason,
             stop_match=self.stop_match,
+            prompt_token_count=self.prompt_token_count,
         )
 
 
@@ -1268,8 +1271,9 @@ class _TextBatchAdapter:
                 uid: _PendingResult(
                     detokenizer=_new_detokenizer(self.tokenizer),
                     scanner=_StopStringScanner(self.defaults.stop_strings),
+                    prompt_token_count=len(prompt),
                 )
-                for uid in uids
+                for uid, prompt in zip(uids, prompts)
             }
             row_of = {uid: row for row, uid in enumerate(uids)}
             while pending:
@@ -1787,6 +1791,8 @@ class _VLMBatchAdapter:
             ),
         )
         for event in events:
+            if previous is None:
+                state.prompt_token_count = int(getattr(event, "prompt_tokens", 0) or 0)
             if previous is not None and state.append(
                 tokenizer,
                 int(previous.token),
@@ -1945,6 +1951,7 @@ class _VLMBatchAdapter:
                     row_sampler.bind_uids(uids)
                 yield from self._drive(
                     generator, uids, indices, gen_kwargs, row_sampler,
+                    prompt_token_count=len(token_ids[0]),
                 )
         except BaseException as exc:
             active_error = exc
@@ -1974,12 +1981,15 @@ class _VLMBatchAdapter:
         indices,
         gen_kwargs,
         row_sampler=None,
+        prompt_token_count=0,
     ) -> Iterator[GenerationEvent]:
+        """Report the chunk's rows. ``prompt_token_count`` is what it prefilled,"""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pending = {
             uid: _PendingResult(
                 detokenizer=_new_detokenizer(tokenizer, require_independent=True),
                 scanner=_StopStringScanner(self.defaults.stop_strings),
+                prompt_token_count=prompt_token_count,
             )
             for uid in uids
         }
