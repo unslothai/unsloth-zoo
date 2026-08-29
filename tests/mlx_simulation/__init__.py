@@ -124,3 +124,22 @@ def _spoof_apple_silicon_platform():
     if not hasattr(platform, "_orig_machine_for_mlx_shim"):
         platform._orig_machine_for_mlx_shim = platform.machine
         platform.machine = _scoped(platform._orig_machine_for_mlx_shim, "arm64")
+
+
+def mlx_is_simulated() -> bool:
+    """True when the ``mlx`` in ``sys.modules`` is this shim rather than a real one.
+
+    ``simulate_mlx_on_torch`` installs process-wide, and one test module calls it
+    while being IMPORTED. Collection imports every module in the session, so a
+    later module's ``import mlx`` can succeed against the shim without that module
+    ever having asked for it -- and whether it does depends on collection order,
+    which under ``-n N --dist loadfile`` is not stable. A test that needs real mlx
+    semantics must ask this, not just whether the import worked.
+    """
+    import sys
+
+    module = sys.modules.get("mlx.core") or sys.modules.get("mlx")
+    if module is None:
+        return False
+    origin = f"{getattr(module, '__name__', '')} {getattr(module, '__file__', '') or ''}"
+    return "mlx_simulation" in origin
