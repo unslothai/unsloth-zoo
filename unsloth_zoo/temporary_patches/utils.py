@@ -71,6 +71,17 @@ def raise_error(f: str, exception: Any = None):
     return
 pass
 
+def skip_patch(f: str, exception: Any = None):
+    """Record a failed optional patch without abandoning later patches."""
+    if UNSLOTH_ENABLE_LOGGING:
+        raise_error(f, exception)
+        return
+    message = f"Unsloth: skipped patch for {f}"
+    if exception is not None:
+        message = f"{message}: {exception}"
+    logger.warning_once(message)
+pass
+
 # Fastpath: output classes sometimes drop args.
 global PROCESS_RETURN_ALLOWED_TYPES
 PROCESS_RETURN_ALLOWED_TYPES = {}
