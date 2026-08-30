@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import importlib
 import importlib.util
 import inspect
 import pathlib
@@ -418,6 +419,16 @@ def test_fast_generate_binds_text_and_vision_models_and_maps_shared_controls(mon
 def _entry_ctx(order):
     order.append("wired")
     yield
+
+
+@contextlib.contextmanager
+def _wired_ctx(order):
+    """Records both ends, so holding it for a session is observable."""
+    order.append("held")
+    try:
+        yield
+    finally:
+        order.append("released")
 
 
 def _vlm_stub(per_row, *, events):
@@ -1319,4 +1330,223 @@ def test_a_cancelled_row_leaves_the_batch_and_its_neighbour_runs_on(monkeypatch)
         assert stream.cancel(1) is False and stream.cancel(7) is False
     finally:
         stream.close()
+
+
+class _OpenVLMGenerator:
+    """mlx-vlm's open-batch surface: insert answers with uids, next reports."""
+
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        self.inserted = []
+        self.removed = []
+        self.closed = False
+        self.events = []
+        self._next_uid = 0
+        self._prompt_batch = None
+        self._generation_batch = types.SimpleNamespace(uids = [])
+        self._unprocessed_sequences = []
+
+    def insert(self, prompts, max_tokens, **kwargs):
+        self.inserted.append((list(prompts), list(max_tokens), kwargs))
+        uids = list(range(self._next_uid, self._next_uid + len(prompts)))
+        self._next_uid += len(prompts)
+        self._generation_batch.uids.extend(uids)
+        return uids
+
+    @property
+    def has_work(self):
+        return bool(self.events)
+
+    def next(self):
+        return [], self.events.pop(0) if self.events else []
+
+    def remove(self, uids):
+        self.removed.append(list(uids))
+
+    def close(self):
+        self.closed = True
+
+
+def _vlm_adapter(generator_type = None):
+    """The release surface a vision session actually uses, over fakes."""
+    def embeddings(input_ids, *a, **k):
+        width = len(input_ids.tolist()[0])
+        embeds = types.SimpleNamespace(shape = (1, width, 4), width = width)
+        return types.SimpleNamespace(to_dict = lambda: {"inputs_embeds": embeds})
+
+    def keeps_nothing(input_ids, *a, **k):
+        return embeddings(input_ids, *a, **k)
+
+    adapter = types.SimpleNamespace(
+        defaults = GenerationDefaults(max_tokens = 5),
+        processor = types.SimpleNamespace(tokenizer = _CharTokenizer()),
+        sample_utils = types.SimpleNamespace(),
+        make_sampler = lambda **knobs: (lambda logprobs: logprobs),
+        constructor_params = {"prefill_batch_size", "completion_batch_size",
+                              "sampler", "compute_logprobs", "prefill_step_size"},
+        per_row_prompt_kwargs = True,
+        batches_observable = True,
+        padded_prompt_kwargs = frozenset({"inputs_embeds", "position_ids"}),
+        cancel = lambda generator, uid: generator.remove([uid]),
+        model = types.SimpleNamespace(
+            config = types.SimpleNamespace(image_token_index = None),
+            language_model = object(),
+            get_input_embeddings = keeps_nothing,
+        ),
+        prepare_inputs = lambda processor, **k: {
+            "input_ids": types.SimpleNamespace(
+                tolist = lambda: [[1] * len(k["prompts"][0])]),
+        },
+        generator_type = generator_type or _OpenVLMGenerator,
+    )
+    adapter.wired = []
+    adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
+    adapter._decode_image = lambda request: request
+    adapter._add_special_tokens = lambda: True
+    adapter._split_prompt_kwargs = lambda kwargs, n: [dict(kwargs)] * n
+    adapter._admission_stalled = lambda generator: False
+    adapter._stall_error = lambda: RuntimeError("stalled")
+    return adapter
+
+
+def _vlm_session(generator_type = None):
+    from unsloth_zoo.mlx.generate import _VLMBatchSession
+
+    return _VLMBatchSession(_vlm_adapter(generator_type))
+
+
+def test_a_model_keeping_state_one_call_down_is_still_seen_to_keep_it():
+    """Several models do the assignment in a helper rather than in
+    get_input_embeddings itself, where reading that method alone misses it."""
+    from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
+
+    class Clean:
+        def _measure(self, ids):
+            return len(ids)
+
+        def get_input_embeddings(self, ids):
+            return self._measure(ids)
+
+    class Deep:
+        def _remember(self, ids):
+            self.language_model._position_ids = ids
+
+        def _prepare(self, ids):
+            self._remember(ids)
+
+        def get_input_embeddings(self, ids):
+            self._prepare(ids)
+
+    class Circular:
+        def _left(self, ids):
+            return self._right(ids)
+
+        def _right(self, ids):
+            return self._left(ids)
+
+        def get_input_embeddings(self, ids):
+            return self._left(ids)
+
+    class Submodule:
+        def __call__(self, pixels):
+            return pixels
+
+    class Tower:
+        """Every vision model runs its tower as ``self.<submodule>(...)``."""
+
+        def __init__(self):
+            self.vision_tower = Submodule()
+
+        def get_input_embeddings(self, ids, pixels):
+            return self.vision_tower(pixels)
+
+    class Opaque:
+        get_input_embeddings = Submodule()
+
+    assert _keeps_what_it_prepared(Clean()) is False
+    assert _keeps_what_it_prepared(Deep()) is True
+    assert _keeps_what_it_prepared(Circular()) is False
+    assert _keeps_what_it_prepared(Tower()) is False
+    assert _keeps_what_it_prepared(Opaque()) is True
+
+
+def test_a_shipped_vision_model_is_not_refused_for_running_its_tower():
+    """A tower is run as ``self.<submodule>(...)``, which has no body to read.
+    Reading that as retained state refuses every vision model mlx-vlm ships."""
+    pytest.importorskip("mlx_vlm")
+    from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
+
+    checked = {}
+    for name in ("gemma3", "llava", "qwen2_vl", "smolvlm", "idefics3"):
+        try:
+            module = importlib.import_module(f"mlx_vlm.models.{name}.{name}")
+        except ImportError:
+            continue
+        model = module.Model
+        checked[name] = _keeps_what_it_prepared(model.__new__(model))
+
+    assert len(checked) >= 3, checked
+    assert not any(checked.values()), checked
+
+
+def test_a_release_settling_its_prefill_before_any_prompt_keeps_no_batch_open():
+    """A batch left open is built first and admits prompts after, so a release
+    deciding how to prefill at construction would chunk a prompt whose model
+    needs one pass. The releases that re-decide per prompt are the ones exposing
+    the policy helper."""
+    from unsloth_zoo.mlx.generate import _require_streamable_vlm
+
+    adapter = _vlm_adapter()
+    adapter.batch_module = types.SimpleNamespace()
+    with pytest.raises(ValueError, match = "settles how to prefill"):
+        _require_streamable_vlm(adapter)
+    adapter.batch_module = types.SimpleNamespace(
+        _chunked_prefill_enabled = lambda model, **kwargs: True)
+    assert _require_streamable_vlm(adapter) is None
+
+
+def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
+    """A key only some rows carry leaves the merged batch with fewer of it than"""
+    session = _vlm_session()
+    plain = session.adapter.model.get_input_embeddings
+    assert session.add(GenerationRequest(prompt = "abc")) == 0
+    def with_positions(input_ids, *a, **k):
+        out = plain(input_ids, *a, **k).to_dict()
+        return types.SimpleNamespace(
+            to_dict = lambda: {**out, "position_ids": "P"})
+    session.adapter.model.get_input_embeddings = with_positions
+    with pytest.raises(ValueError, match = "unlike the batch's other requests"):
+        session.add(GenerationRequest(prompt = "de"))
+    assert (session.rows_in_flight, len(session.generator.inserted)) == (1, 1)
+    session.adapter.model.get_input_embeddings = plain
+    assert session.add(GenerationRequest(prompt = "fg")) == 1
+
+
+def _vlm_event(uid, token, finish_reason):
+    return types.SimpleNamespace(
+        uid = uid, token = token, finish_reason = finish_reason, token_logprob = -0.5,
+    )
+
+
+def test_a_vision_batch_reports_each_row_and_polls_quietly_through_a_prefill():
+    """A poll with nothing in it is ordinary here: a long prompt prefills over"""
+    session = _vlm_session()
+    session.add(GenerationRequest(prompt = "ab"))
+    session.add(GenerationRequest(prompt = "cd"))
+    session.generator.events = [
+        [],                                          # prefill still running
+        [_vlm_event(0, 1, None), _vlm_event(1, 4, None)],
+        [_vlm_event(0, 1, "stop")],
+        [_vlm_event(1, 1, None)],
+    ]
+    quiet = list(session.step())
+    assert (quiet, session.rows_in_flight) == ([], 2)
+    assert [(event.index, event.delta) for event in session.step()] == [
+        (0, "hello "), (1, "tailSTOPsuffix"),
+    ]
+    finished = list(session.step())
+    assert [event.index for event in finished] == [0]
+    assert finished[-1].result.finish_reason == "stop"
+    assert session.rows_in_flight == 1
+    assert [(event.index, event.delta) for event in session.step()] == [(1, "hello ")]
 
