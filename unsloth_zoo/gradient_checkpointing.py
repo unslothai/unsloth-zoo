@@ -628,12 +628,10 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             major_version, minor_version = torch.cuda.get_device_capability()
             SUPPORTS_BFLOAT16 = (major_version >= 8)
         elif DEVICE_TYPE == "hip":
-            # Ask rather than assume. RDNA 1 and 2 (gfx101x, gfx103x) have no native
-            # bf16 arithmetic, and Triton then selects a bf16 dot intrinsic LLVM cannot
-            # lower for the target, killing the process with no Python exception (see
-            # unslothai/unsloth issue 7922). Unsloth patches this probe on HIP so every
-            # caller gets one answer; unpatched, ROCm still answers True here, which is
-            # exactly the behaviour this line had before.
+            # Ask rather than assume: RDNA 1/2 (gfx101x, gfx103x) have no native bf16,
+            # so Triton picks a dot intrinsic LLVM cannot lower and the process dies
+            # with no Python exception (unslothai/unsloth issue 7922). Unpatched ROCm
+            # still answers True here, so this is inert until unsloth patches the probe.
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
