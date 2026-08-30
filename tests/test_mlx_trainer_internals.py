@@ -35,10 +35,23 @@ import torch
 def _install_shim():
     import sys
     shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
+    # this fixture drops them and the next importer therefore builds a NEW module
+    # object. Anything that ran earlier in this process and did
+    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
+    # it and the code under test end up on two copies of the same module globals:
+    # the training window one opens is invisible to the other, and a gated-delta
+    # op quietly takes the cached path instead of the VJP. Serially that never
+    # happens (alphabetical order puts this file after the pair it would break);
+    # under `-n N --dist loadfile` it depends on which worker draws which file.
     real_mlx_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        name: module for name, module in sys.modules.items() if _owned(name)
     }
     from mlx_simulation import simulate_mlx_on_torch
     from mlx_simulation.mlx_stub import _MLXFinder
@@ -48,10 +61,7 @@ def _install_shim():
             sys.modules.pop(name, None)
     yield
     for name in list(sys.modules):
-        if (
-            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
-            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-        ):
+        if _owned(name):
             sys.modules.pop(name, None)
     sys.meta_path[:] = [
         finder for finder in sys.meta_path
