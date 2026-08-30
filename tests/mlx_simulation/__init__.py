@@ -143,3 +143,58 @@ def mlx_is_simulated() -> bool:
         return False
     origin = f"{getattr(module, '__name__', '')} {getattr(module, '__file__', '') or ''}"
     return "mlx_simulation" in origin
+
+
+def snapshot_modules(is_owned):
+    """Record every currently-imported module the caller is about to disturb."""
+    import sys
+
+    return {name: module for name, module in sys.modules.items() if is_owned(name)}
+
+
+def restore_modules(saved, is_owned):
+    """Undo a fixture's sys.modules surgery, PARENT PACKAGE ATTRIBUTES INCLUDED.
+
+    Putting the old entries back in sys.modules is only half of it. Dropping
+    `unsloth_zoo.mlx` and letting it be re-imported makes the import machinery
+    bind `unsloth_zoo.mlx = <the new module>` as an attribute on the parent
+    package, and that binding outlives the sys.modules entry that produced it.
+
+    The two then disagree, because they are read by different things:
+    `import unsloth_zoo.mlx.trainer as t` walks parent attributes, while a
+    `from unsloth_zoo.mlx.trainer import MLXTrainer` inside the code under test
+    resolves through sys.modules. A file that does both is left holding two live
+    copies of one module, and `isinstance(trainer, MLXTrainer)` is False for an
+    object the other copy built. That is not hypothetical: it is what
+    dataset_utils.train_on_responses_only does to decide whether it is looking at
+    an MLXTrainer, and it silently took the Hugging Face branch instead.
+
+    So sys.modules and the parent attributes are put back together, or the next
+    file inherits a split that only shows up under `-n N --dist loadfile`.
+    """
+    import sys
+
+    disturbed = sorted(name for name in sys.modules if is_owned(name))
+    for name in disturbed:
+        sys.modules.pop(name, None)
+    sys.modules.update(saved)
+
+    # Shortest names first so a parent is itself restored before its children are
+    # re-pointed at it.
+    for name in sorted(set(disturbed) | set(saved), key = lambda n: (n.count("."), n)):
+        parent_name, _, child = name.rpartition(".")
+        if not parent_name:
+            continue
+        parent = sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        module = sys.modules.get(name)
+        if module is not None:
+            setattr(parent, child, module)
+        elif hasattr(parent, child):
+            # Imported only while the shim was up, so the attribute is a dangling
+            # reference to a module nothing can reach through sys.modules.
+            try:
+                delattr(parent, child)
+            except AttributeError:
+                pass

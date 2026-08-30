@@ -50,24 +50,24 @@ def _install_shim():
     # op quietly takes the cached path instead of the VJP. Serially that never
     # happens (alphabetical order puts this file after the pair it would break);
     # under `-n N --dist loadfile` it depends on which worker draws which file.
-    real_mlx_modules = {
-        name: module for name, module in sys.modules.items() if _owned(name)
-    }
-    from mlx_simulation import simulate_mlx_on_torch
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
     from mlx_simulation.mlx_stub import _MLXFinder
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
     for name in list(sys.modules):
         if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
             sys.modules.pop(name, None)
     yield
-    for name in list(sys.modules):
-        if _owned(name):
-            sys.modules.pop(name, None)
     sys.meta_path[:] = [
         finder for finder in sys.meta_path
         if not isinstance(finder, _MLXFinder)
     ]
-    sys.modules.update(real_mlx_modules)
+    restore_modules(real_mlx_modules, _owned)
 
 
 def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
