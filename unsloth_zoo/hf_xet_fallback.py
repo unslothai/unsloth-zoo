@@ -2682,7 +2682,12 @@ def _download_with_xet_fallback(
                     _hold_unproven_xet_failure("Xet returned an incomplete snapshot")
                     disable_xet = True
                     continue
-                pending_xet_failure = None
+                # Both rungs came back short: as with the fault branch, an UNPROVEN reason is not
+                # evidence against this machine's Xet, but a stall the watchdog proved on this machine
+                # survives and must still be charged on the way out.
+                if pending_needs_http_success:
+                    pending_xet_failure = None
+                _flush_pending_failure()
                 raise DownloadStallError(
                     f"Download for '{label}' returned an incomplete snapshot even with "
                     f"HF_HUB_DISABLE_XET=1 -- missing files, check your network connection"
@@ -2824,6 +2829,11 @@ def _download_with_xet_fallback(
             _flush_pending_failure()
             disable_xet = True
             continue
+        # An HTTP stall is not evidence against Xet on its own, but a Xet stall held from an earlier
+        # attempt already was, and this exit is the last door out of the ladder.
+        if pending_needs_http_success:
+            pending_xet_failure = None
+        _flush_pending_failure()
         raise DownloadStallError(
             f"Download stalled for '{label}' even with HF_HUB_DISABLE_XET=1 "
             f"-- check your network connection"

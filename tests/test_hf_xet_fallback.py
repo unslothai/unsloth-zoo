@@ -5834,3 +5834,59 @@ def test_blob_identity_scan_uses_device_and_inode(monkeypatch, tmp_path):
     after = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
     assert {n for (n, _, _) in after} == {partial.name}
     assert not (before & after), "an unlink plus create must not look like the same partial"
+
+
+def _stall_then_fault_then(monkeypatch, final):
+    """Xet stalls, a Xet retry faults, and the ladder ends on HTTP with *final*.
+
+    The stall is PROVEN: the watchdog saw no progress on this machine, so it is charged whichever
+    door the ladder finally leaves by. The fault that follows it is unproven and must not displace
+    it. This shape is the degraded CDN the ladder exists for.
+    """
+    outcomes = []
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "2")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "1")
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: False)
+    _install(monkeypatch, [("stall", "no progress for 30s after 1.2 GB"),
+                           ("retryable_error", "503"), final])
+    return outcomes
+
+
+def test_a_proven_stall_is_charged_when_http_also_returns_an_incomplete_snapshot(monkeypatch):
+    """A terminal HTTP incomplete snapshot must not swallow a stall proven on this machine.
+
+    Dropping it means an actually stalling machine never reaches the tracker's two-failure demotion
+    threshold, so every later download keeps paying the full Xet stall timeout before falling back.
+    """
+    monkeypatch.setattr(xf, "_snapshot_payload_incomplete", lambda p, **k: p == "INCOMPLETE")
+    outcomes = _stall_then_fault_then(monkeypatch, ("ok", "INCOMPLETE"))
+    with pytest.raises(xf.DownloadStallError):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert outcomes == [False], "the proven Xet stall was dropped on the way out"
+
+
+def test_a_proven_stall_is_charged_when_http_stalls_too(monkeypatch):
+    """The same for the other terminal door: an HTTP stall raising directly."""
+    outcomes = _stall_then_fault_then(monkeypatch, ("stall", "no progress for 30s after 1 GB"))
+    with pytest.raises(xf.DownloadStallError):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert outcomes == [False], "the proven Xet stall was dropped on the way out"
+
+
+def test_an_unproven_failure_is_still_dropped_on_those_same_doors(monkeypatch):
+    """The counterpart, and the reason the flush is conditional: with no stall anywhere, a fault
+    that hit BOTH rungs is a degraded CDN, not a bad Xet path on this machine, so it stays unproven
+    and the tracker is not charged."""
+    outcomes = []
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "2")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "1")
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: False)
+    _install(monkeypatch, [("retryable_error", "503"), ("retryable_error", "503"),
+                           ("stall", "no progress for 30s after 1 GB")])
+    with pytest.raises(xf.DownloadStallError):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert outcomes == [], "a fault both rungs met is not evidence against this machine's Xet"
