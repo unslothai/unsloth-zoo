@@ -4196,12 +4196,13 @@ def _guard_host_token_output(value, state, context):
     return value
 
 
-def encode_mlx_text(tokenizer, text, state=None):
+def encode_mlx_text(tokenizer, text, state=None, *, add_special_tokens=None):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
-    add_special_tokens = True
-    bos_token = getattr(tokenizer, "bos_token", None)
-    if bos_token is not None and text.startswith(bos_token):
-        add_special_tokens = False
+    if add_special_tokens is None:
+        add_special_tokens = True
+        bos_token = getattr(tokenizer, "bos_token", None)
+        if bos_token is not None and text.startswith(bos_token):
+            add_special_tokens = False
 
     try:
         encoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)
@@ -4881,14 +4882,34 @@ class _MLXPromptCompletionTokens:
     prompt_length: int
 
 
-def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
-    """Locate the completion after tolerating one boundary-merged token."""
+def _mlx_prompt_completion_boundary(
+    prompt_ids, input_ids, *, strict=True, step_back=False,
+):
+    """Locate the completion after tolerating one boundary-merged token.
+
+    Without ``strict`` it may fall wherever the two tokenizations stop agreeing.
+
+    ``step_back`` drops the verification rather than raising on it. That is what
+    ORPOTrainer.build_tokenized_answer does in trl/trainer/orpo_trainer.py: when
+    the prompt is not a token prefix it steps back exactly one token and never
+    checks what precedes it. Reproducing that is deliberate parity, not an
+    oversight, and only the preference path asks for it: a recovered prompt is a
+    character prefix and so lands mid-token routinely, where SFT's prompt is
+    tokenized from the same text it re-tokenizes and a mismatch is a real error.
+    """
     prompt_ids = tuple(prompt_ids)
     input_ids = tuple(input_ids)
     if input_ids[:len(prompt_ids)] == prompt_ids:
         return len(prompt_ids)
+    if not strict:
+        shared = 0
+        while shared < min(len(prompt_ids), len(input_ids)):
+            if prompt_ids[shared] != input_ids[shared]:
+                break
+            shared += 1
+        return shared
     prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
-    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+    if not step_back and input_ids[:prompt_length] != prompt_ids[:prompt_length]:
         raise ValueError(
             "Unsloth MLX: tokenized prompt and prompt+completion differ before "
             "the final prompt token; only a boundary merge is supported."
@@ -4898,6 +4919,7 @@ def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
 
 def _encode_mlx_prompt_completion(
     tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+    step_back=False,
 ):
     """Encode a prompt and its full text with one EOS policy."""
     prompt_ids = tuple(int(x) for x in encode_mlx_text(
@@ -4915,7 +4937,12 @@ def _encode_mlx_prompt_completion(
     return _MLXPromptCompletionTokens(
         prompt_ids,
         input_ids,
-        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
+        # A template may re-render the prompt's last message once a completion
+        # follows, leaving it no longer even a text prefix.
+        _mlx_prompt_completion_boundary(
+            prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
+            step_back=step_back,
+        ),
     )
 
 
