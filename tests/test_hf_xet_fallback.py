@@ -743,11 +743,12 @@ class _FakeAttempt:
                 repo_type = repo_type,
             )
         )
-        if self.owned_incomplete is not None:
-            # The real attempt reports the basenames its child held open this way, and the ladder
-            # pops the key back off; a fake that never sets it silently skips that scoping.
+        result = self._results[len(self.calls) - 1]
+        if self.owned_incomplete is not None and result[0] == "stall":
+            # Fidelity: the real attempt publishes the basenames its child held open ONLY on the
+            # stall return, never on a fault, a crash or a deterministic error.
             params["_owned_incomplete_blobs"] = set(self.owned_incomplete)
-        return self._results[len(self.calls) - 1]
+        return result
 
 
 def _install(monkeypatch, results, owned_incomplete = None):
@@ -1271,7 +1272,7 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
 
     def _names(*a, **k):
         seen["n"] += 1
-        return {("blob.incomplete", 1, 7)} if seen["n"] == 1 else set()
+        return {("blob.incomplete", 7)} if seen["n"] == 1 else set()
 
     monkeypatch.setattr(xf, "_incomplete_blob_identities", _names)
     fake = _install(
@@ -1296,7 +1297,7 @@ def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
-        xf, "_incomplete_blob_identities", lambda *a, **k: {("blob.incomplete", 1, 7)}
+        xf, "_incomplete_blob_identities", lambda *a, **k: {("blob.incomplete", 7)}
     )
     fake = _install(
         monkeypatch,
@@ -5783,7 +5784,7 @@ def test_a_same_named_replacement_partial_releases_the_latch(monkeypatch):
     def _identities(*a, **k):
         seen["n"] += 1
         # Same name throughout; the inode changes once the forced child recreates the file.
-        return {("blob.incomplete", 1, 7 if seen["n"] == 1 else 8)}
+        return {("blob.incomplete", 7 if seen["n"] == 1 else 8)}
 
     monkeypatch.setattr(xf, "_incomplete_blob_identities", _identities)
     fake = _install(
@@ -5796,31 +5797,7 @@ def test_a_same_named_replacement_partial_releases_the_latch(monkeypatch):
     )
 
 
-def test_a_live_siblings_partial_does_not_hold_the_latch(monkeypatch):
-    """The unsafe set is scoped by the same owned-blob set as the purge.
-
-    The purge deliberately spares a partial a LIVE sibling holds open. Counting that partial as
-    unsafe would keep force_download latched for the rest of the ladder while the sibling downloads
-    an entirely different file, so the scoping has to match on both sides."""
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
-    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
-    # Our child owned "mine"; "sibling" belongs to another live download and never goes away.
-    monkeypatch.setattr(
-        xf, "_incomplete_blob_identities",
-        lambda *a, **k: {("sibling.incomplete", 1, 9)},
-    )
-    fake = _install(
-        monkeypatch,
-        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
-        owned_incomplete = {"mine.incomplete"},
-    )
-    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
-    assert [c.force_download for c in fake.calls] == [False, True, False], (
-        "the sibling's partial is not ours to wait on"
-    )
-
-
-def test_blob_identity_scan_uses_device_and_inode(monkeypatch, tmp_path):
+def test_blob_identity_scan_uses_the_inode(monkeypatch, tmp_path):
     """Recreating the file under the same name yields a different identity on a real filesystem."""
     blobs = tmp_path / "blobs"
     blobs.mkdir()
@@ -5828,12 +5805,14 @@ def test_blob_identity_scan_uses_device_and_inode(monkeypatch, tmp_path):
     partial.write_bytes(b"abc")
     monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path]))
     before = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
-    assert {n for (n, _, _) in before} == {partial.name}
+    assert {n for (n, _) in before} == {partial.name}
     partial.unlink()
     partial.write_bytes(b"defg")
     after = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
-    assert {n for (n, _, _) in after} == {partial.name}
-    assert not (before & after), "an unlink plus create must not look like the same partial"
+    assert {n for (n, _) in after} == {partial.name}
+    assert not xf._surviving_unsafe_partials(before, after), (
+        "an unlink plus create must not look like the same partial"
+    )
 
 
 def _stall_then_fault_then(monkeypatch, final):
@@ -5890,3 +5869,59 @@ def test_an_unproven_failure_is_still_dropped_on_those_same_doors(monkeypatch):
     with pytest.raises(xf.DownloadStallError):
         xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert outcomes == [], "a fault both rungs met is not evidence against this machine's Xet"
+
+
+def test_an_unresolvable_inode_is_not_read_as_a_changed_one():
+    """``st_ino = 0`` means "the filesystem would not say", not "a different file".
+
+    Windows reaches this exactly when it matters: ``os.stat`` falls back to a directory entry that
+    carries no file index when the file is LOCKED, and a locked partial is precisely why the purge
+    failed and the latch engaged. So the transition scan can report 0 and a later scan, taken after
+    the handle is dropped, can report the real inode. Reading that asymmetry as a change would
+    release the guard on the machines least able to survive a corrupt blob.
+    """
+    captured = {("blob.incomplete", 0)}
+    assert xf._surviving_unsafe_partials(captured, {("blob.incomplete", 4242)}), (
+        "unresolved at capture, resolved later: the name is still there, so the latch must hold"
+    )
+    assert xf._surviving_unsafe_partials({("blob.incomplete", 4242)}, {("blob.incomplete", 0)}), (
+        "resolved at capture, unresolved later: still unknown, so the latch must hold"
+    )
+    assert not xf._surviving_unsafe_partials(captured, {("other.incomplete", 0)}), (
+        "the name is gone, which is the one unambiguous proof of disappearance"
+    )
+
+
+def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, tmp_path):
+    """The unsafe set is UNSCOPED, and scoping it by the purge's owned-blob set is backwards.
+
+    The purge skips every blob outside that set, so the partials that SURVIVE it are exactly the
+    ones outside it, and they are why has_active_incomplete_blobs() returned True in the first
+    place. Filtering them out empties the unsafe set and hands the next HTTP child a sparse partial
+    to resume, which finalizes a silently corrupt blob. Real cache layout, real scan.
+    """
+    blobs = tmp_path / "models--o--r" / "blobs"
+    blobs.mkdir(parents = True)
+    # Left by an earlier crashed run: not owned by this download's child, so the purge spares it.
+    stale = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
+    stale.write_bytes(b"\0" * 64)
+    monkeypatch.setattr(
+        xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
+    )
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    fake = _install(
+        monkeypatch,
+        [("stall", "no progress for 30s after 1.2 GB"), ("retryable_error", "503"),
+         ("retryable_error", "503"), ("ok", "/cache/x")],
+        owned_incomplete = {f"cafebabe{xf.INCOMPLETE_SUFFIX}"},
+    )
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "3")
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert stale.exists(), "the purge is scoped, so this partial is still there"
+    http_forces = [c.force_download for c in fake.calls if c.disable_xet]
+    assert all(http_forces), (
+        f"a surviving sparse partial was handed to an unforced HTTP child: {http_forces}"
+    )
