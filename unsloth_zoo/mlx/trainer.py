@@ -6008,8 +6008,7 @@ class MLXTrainer:
                     max_new_tokens=args.generation_max_tokens,
                 )
             except ValueError:
-                # A recovered prompt is empty when the completions differ at
-                # character 0. That row still trains, so free the slot, do not fail.
+                # An empty recovery still trains, so free the slot, do not fail.
                 budget[0] -= 1
                 return
             _generation_source.append((split_name,) + encoded)

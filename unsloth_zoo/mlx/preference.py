@@ -133,9 +133,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
         before_clamp = max_length
         max_length = max_seq_length
         if kind == "orpo" and before_clamp > max_prompt_length >= max_length:
-            # The answer gets max_length minus max_prompt_length, so a clamp down
-            # to the prompt bound leaves it nothing. A bound the caller set at or
-            # above their own max_length is theirs to mean: TRL's slice stands.
+            # The answer gets max_length minus max_prompt_length, so clamping to the
+            # prompt bound leaves none. A bound the caller set themselves stands.
             max_prompt_length = max(1, max_length // 2)
             warnings.warn(
                 f"Unsloth MLX ORPO: max_prompt_length no longer leaves room for "
@@ -143,9 +142,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
                 f"{max_prompt_length}.",
                 RuntimeWarning, stacklevel=2,
             )
-    # A config predating max_length carries the default, not a choice, and it sits
-    # below the width, so the same call now trains on less. No marker means
-    # duck-typed rather than copied from a config, so take the value as meant.
+    # A config predating max_length carries the default, not a choice, so the same
+    # call now trains on less. No marker means duck-typed, so take the value as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
     if max_seq_length > max_length and not max_length_explicit:
         # DPO reads an open prompt bound as no cap; ORPO already made it 128 above.
@@ -206,8 +204,7 @@ def _truncate_orpo(
         return len(prompt_ids) + longer <= policy.max_length
 
     if keep is None and not (fits(chosen_prompt) and fits(rejected_prompt)):
-        # Only an overflowing row reads the bound; name it rather than let the
-        # slices below negate a None.
+        # Only an overflowing row reads the bound; name it rather than negate a None.
         raise ValueError(
             "Unsloth MLX ORPO: this row overruns max_length="
             f"{policy.max_length}, and max_prompt_length is the room reserved "
@@ -261,9 +258,8 @@ def _extract_prompt(chosen, rejected):
         )
     for index in range(limit):
         if chosen[index] != rejected[index]:
-            # TRL strips a space before the divergence via chosen[index - 1],
-            # which at index 0 wraps to chosen's LAST character and invents a
-            # prompt. Deliberate divergence: nothing precedes character 0.
+            # TRL strips a space via chosen[index - 1], which at index 0 wraps to
+            # chosen's LAST character and invents a prompt. Deliberate divergence.
             if index > 0 and chosen[index - 1] == " ":
                 index -= 1
             break
@@ -512,8 +508,8 @@ def tokenize_preference_row(
         )
         rejected_prompt = list(chosen_prompt)
     else:
-        # A recovered prompt lands mid-token often, so step back one token and
-        # ask no more, as build_tokenized_answer does.
+        # A recovered prompt lands mid-token often, so step back one token and ask
+        # no more, as build_tokenized_answer does.
         chosen = _encode_mlx_prompt_completion(
             tokenizer, prompt_text, chosen_text, append_eos=append_eos,
             step_back=True,
@@ -774,8 +770,7 @@ def create_preference_batch_plan(
             )
         rendered = None
         if prompt_sink is not None:
-            # One rendering for the sampler and the tokenizer alike: a stateful
-            # chat template need not render the same text twice.
+            # One rendering for sampler and tokenizer: a stateful template may differ.
             rendered = prepare_preference_row(tokenizer, row)
             prompt_sink(rendered[0])
         try:
@@ -784,8 +779,7 @@ def create_preference_batch_plan(
                 append_eos=append_eos, rendered=rendered,
             ))
         except ValueError as exc:
-            # Every row is tokenized up front, so without the index one bad row
-            # in a large dataset aborts the run with nothing to look at.
+            # Tokenized up front, so without the index one bad row aborts blindly.
             raise ValueError(
                 f"Unsloth MLX preference: dataset row {index} could not be "
                 f"tokenized. {exc}"

@@ -4938,7 +4938,7 @@ def _encode_mlx_prompt_completion(
         prompt_ids,
         input_ids,
         # A template may re-render the prompt's last message once a completion
-        # follows, leaving the prompt no longer even a text prefix.
+        # follows, leaving it no longer even a text prefix.
         _mlx_prompt_completion_boundary(
             prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
             step_back=step_back,
