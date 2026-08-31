@@ -24,10 +24,9 @@ Inert until unslothai/unsloth#7682 lands, because `is_bf16_supported` returns
 True for `torch.version.hip` BEFORE any architecture check -- so a test proving
 only "float16 now" would prove a regression for every current ROCm user.
 
-Runs on a CPU runner. `device_count` is stubbed to 0, which is what makes that
-possible: the function then allocates no device buffer, no stream and no event,
-so only the dtype decision is left. Skipping on CPU would leave the decision
-unexecuted everywhere, since no job here has an AMD runner.
+Runs on a CPU runner, since no job here has an AMD one and skipping would leave
+the decision unexecuted everywhere. Stubbing `device_count` to 0 is what makes
+that work: no device buffer, no stream and no event, so only the dtype is left.
 """
 import ast
 import inspect
@@ -79,8 +78,7 @@ def test_the_hip_branch_asks_rather_than_hardcoding_true():
 
 
 def _globals_the_init_writes():
-    """Read the `global` declarations rather than listing them, so the restore
-    below cannot fall behind a new one."""
+    """Read rather than list them, so the restore cannot fall behind a new one."""
     tree = ast.parse(inspect.getsource(gc.initialize_unsloth_gradient_checkpointing).lstrip())
     return sorted(
         {name for node in ast.walk(tree) if isinstance(node, ast.Global) for name in node.names}
@@ -91,13 +89,10 @@ def _globals_the_init_writes():
 def run_init(monkeypatch):
     """Drive the real function on a CPU box and hand back the buffer dtype.
 
-    `pin_memory = True` needs a CUDA context, so `torch.empty` is unwrapped rather
-    than reimplemented: same call, minus the pin, and the dtype under test is
-    still the module's own choice rather than the test's.
-
-    Every module global the call writes is restored afterwards. The gate runs this
-    file in one process with thirty others, and `USE_UNSLOTH_GC = True` plus 200
-    pinned-buffer stand-ins left behind would follow them.
+    `torch.empty` is unwrapped, not reimplemented -- same call minus the pin,
+    which needs a CUDA context -- so the dtype is still the module's own choice.
+    Every global the call writes is restored: the gate runs this file in one
+    process with thirty others, and `USE_UNSLOTH_GC = True` would follow them.
     """
     real_empty = torch.empty
     saved = {name: getattr(gc, name, _MISSING) for name in _globals_the_init_writes()}
@@ -156,8 +151,8 @@ def test_a_patched_probe_saying_no_gets_float16(run_init):
 def test_cuda_still_decides_on_compute_capability_not_the_probe(
     run_init, capability, expected
 ):
-    """The other vendors must not move. The probe answers the opposite of the
-    capability in both rows, so a CUDA branch that started consulting it fails."""
+    """The probe answers the opposite of the capability in both rows, so a CUDA
+    branch that started consulting it fails."""
     got = run_init("cuda", lambda *a, **k: capability[0] < 8, capability = capability)
     assert got is expected, (
         f"CUDA picked {got} on a compute-capability {capability[0]}.x card; the "
