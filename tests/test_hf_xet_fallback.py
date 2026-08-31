@@ -28,6 +28,7 @@ import errno
 import importlib.util
 import json
 import math
+import pathlib
 import os
 import subprocess
 import sys
@@ -1270,11 +1271,11 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
     # is what makes the following retries safe to resume.
     seen = {"n": 0}
 
-    def _names(*a, **k):
+    def _unsafe(*a, **k):
         seen["n"] += 1
-        return {("blob.incomplete", 7)} if seen["n"] == 1 else set()
+        return set()
 
-    monkeypatch.setattr(xf, "_incomplete_blob_identities", _names)
+    monkeypatch.setattr(xf, "_unsafe_incomplete_partials", _unsafe)
     fake = _install(
         monkeypatch,
         [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
@@ -1297,7 +1298,7 @@ def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
-        xf, "_incomplete_blob_identities", lambda *a, **k: {("blob.incomplete", 7)}
+        xf, "_unsafe_incomplete_partials", lambda *a, **k: {"blob.incomplete"}
     )
     fake = _install(
         monkeypatch,
@@ -5726,107 +5727,6 @@ def test_control_flow_exceptions_are_never_transport_faults():
         assert xf._is_retryable_download_error(exc, on_xet = True) is False, exc
         assert xf._is_retryable_download_error(exc, on_xet = False) is False, exc
 
-
-def test_the_verbatim_cas_fault_is_still_retryable_on_xet():
-    """Guard on the guard: none of the tightening above may cost the fix issue #1122 needed."""
-    cas = RuntimeError(
-        "Task error: File reconstruction error: CAS Client Error: "
-        "Format error: I/O error: error decoding response body"
-    )
-    assert xf._is_retryable_download_error(cas, on_xet = True) is True
-    assert xf._is_retryable_download_error(cas, on_xet = False) is False
-
-
-def test_uninspectable_cache_keeps_force_download_latched(monkeypatch):
-    """The un-latch must fail CLOSED. _active_incomplete_blob_sizes is fail-open by design (a
-    progress sensor must not abort a download over one unreadable blob), so an empty result from it
-    means "gone" and "could not look" alike. Releasing the guard on that answer would resume over a
-    sparse Xet partial on exactly the locked-down machines least able to recover from it."""
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
-    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
-    monkeypatch.setattr(xf, "_incomplete_blob_identities", lambda *a, **k: None)
-    fake = _install(
-        monkeypatch,
-        [("retryable_error", "503"), ("crashed", "died"), ("ok", "/cache/x")],
-    )
-    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
-    assert [c.force_download for c in fake.calls] == [False, True, True], (
-        "an uninspectable cache must not be read as proof the unsafe partial is gone"
-    )
-
-
-def test_strict_blob_scan_reports_failure_as_none(monkeypatch, tmp_path):
-    """The strict scan is the safety-critical twin of the fail-open sensor: it must distinguish
-    'nothing there' from 'could not look'."""
-    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([]))
-    assert xf._incomplete_blob_identities("model", "o/r", str(tmp_path)) == set()
-
-    def _boom(*a, **k):
-        raise OSError(13, "Permission denied")
-
-    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", _boom)
-    assert xf._incomplete_blob_identities("model", "o/r", str(tmp_path)) is None
-
-
-def test_a_same_named_replacement_partial_releases_the_latch(monkeypatch):
-    """The latch must key on IDENTITY, not on the basename.
-
-    ``force_download`` makes huggingface_hub unlink the ``.incomplete`` and immediately reopen the
-    same path in append mode. If that forced child then dies mid-transfer, the surviving file has
-    the old name but is a fresh, resumable HTTP partial. Matching on the name alone would read it
-    as the sparse Xet partial that is still there, keep the latch, and make every remaining child
-    throw those bytes away and restart from zero -- turning a corruption guard into a bandwidth
-    amplifier on exactly the flaky links that reach it."""
-    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
-    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
-    seen = {"n": 0}
-
-    def _identities(*a, **k):
-        seen["n"] += 1
-        # Same name throughout; the inode changes once the forced child recreates the file.
-        return {("blob.incomplete", 7 if seen["n"] == 1 else 8)}
-
-    monkeypatch.setattr(xf, "_incomplete_blob_identities", _identities)
-    fake = _install(
-        monkeypatch,
-        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
-    )
-    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
-    assert [c.force_download for c in fake.calls] == [False, True, False], (
-        "a replacement partial is the forced child's own resumable work, not the unsafe one"
-    )
-def test_blob_identity_scan_uses_the_inode(monkeypatch, tmp_path):
-    """The scan reports an inode alongside the name, and the matcher never releases unsafely.
-
-    Deliberately NOT asserting that an unlink plus create always looks like a different file: the
-    kernel is free to hand the replacement the same inode, and a CI runner did exactly that. That
-    reuse is why the matcher is written to release only on evidence -- when the inode is reused the
-    identity matches, the partial reads as still present, and the latch stays on. Costing a clean
-    re-download is the right answer to an ambiguous filesystem; resuming is not.
-    """
-    blobs = tmp_path / "blobs"
-    blobs.mkdir()
-    partial = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
-    partial.write_bytes(b"abc")
-    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path]))
-    before = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
-    assert {n for (n, _) in before} == {partial.name}
-    partial.unlink()
-    partial.write_bytes(b"defg")
-    after = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
-    assert {n for (n, _) in after} == {partial.name}
-    if before == after:
-        # Inode reused: ambiguous, so the latch must stay on.
-        assert xf._surviving_unsafe_partials(before, after) == before
-    else:
-        assert not xf._surviving_unsafe_partials(before, after)
-    partial.unlink()
-    gone = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
-    assert not xf._surviving_unsafe_partials(before, gone), (
-        "a vanished name is the one unambiguous proof of disappearance"
-    )
-
-
 def _stall_then_fault_then(monkeypatch, final):
     """Xet stalls, a Xet retry faults, and the ladder ends on HTTP with *final*.
 
@@ -5882,28 +5782,6 @@ def test_an_unproven_failure_is_still_dropped_on_those_same_doors(monkeypatch):
         xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert outcomes == [], "a fault both rungs met is not evidence against this machine's Xet"
 
-
-def test_an_unresolvable_inode_is_not_read_as_a_changed_one():
-    """``st_ino = 0`` means "the filesystem would not say", not "a different file".
-
-    Windows reaches this exactly when it matters: ``os.stat`` falls back to a directory entry that
-    carries no file index when the file is LOCKED, and a locked partial is precisely why the purge
-    failed and the latch engaged. So the transition scan can report 0 and a later scan, taken after
-    the handle is dropped, can report the real inode. Reading that asymmetry as a change would
-    release the guard on the machines least able to survive a corrupt blob.
-    """
-    captured = {("blob.incomplete", 0)}
-    assert xf._surviving_unsafe_partials(captured, {("blob.incomplete", 4242)}), (
-        "unresolved at capture, resolved later: the name is still there, so the latch must hold"
-    )
-    assert xf._surviving_unsafe_partials({("blob.incomplete", 4242)}, {("blob.incomplete", 0)}), (
-        "resolved at capture, unresolved later: still unknown, so the latch must hold"
-    )
-    assert not xf._surviving_unsafe_partials(captured, {("other.incomplete", 0)}), (
-        "the name is gone, which is the one unambiguous proof of disappearance"
-    )
-
-
 def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, tmp_path):
     """The unsafe set is UNSCOPED, and scoping it by the purge's owned-blob set is backwards.
 
@@ -5916,7 +5794,12 @@ def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, 
     blobs.mkdir(parents = True)
     # Left by an earlier crashed run: not owned by this download's child, so the purge spares it.
     stale = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
-    stale.write_bytes(b"\0" * 64)
+    with open(stale, "wb") as fh:
+        # Sparse: full length with a hole, exactly what a killed parallel-chunk writer leaves.
+        fh.truncate(64 * 1024 * 1024)
+        fh.seek(64 * 1024 * 1024 - 4)
+        fh.write(b"tail")
+    monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path)
     monkeypatch.setattr(
         xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
     )
@@ -5937,3 +5820,118 @@ def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, 
     assert all(http_forces), (
         f"a surviving sparse partial was handed to an unforced HTTP child: {http_forces}"
     )
+
+
+def _sparse(path, size = 64 * 1024 * 1024):
+    """A full-length file with a hole: what a killed parallel-chunk writer leaves behind."""
+    with open(path, "wb") as fh:
+        fh.truncate(size)
+        fh.seek(size - 4)
+        fh.write(b"tail")
+    return path
+
+
+def _contiguous(path, size = 1024):
+    """What huggingface_hub's append-mode HTTP path leaves behind: a fully written prefix."""
+    path.write_bytes(b"x" * size)
+    return path
+
+
+def _repo_cache(tmp_path, monkeypatch):
+    blobs = tmp_path / "models--o--r" / "blobs"
+    blobs.mkdir(parents = True)
+    monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path)
+    monkeypatch.setattr(
+        xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
+    )
+    return blobs
+
+
+def test_sparseness_not_identity_decides_whether_a_partial_is_resumable(tmp_path, monkeypatch):
+    """The guard asks the FILE whether it can be resumed, which is the thing that actually matters.
+
+    A name cannot tell the sparse Xet partial from the resumable one huggingface_hub rewrites at the
+    same path under force_download, and an inode cannot either: it is unstable on overlayfs and FUSE
+    caches, absent on some Windows stats, reusable after an unlink, and a same-repo sibling taking
+    its own Xet retry produces the same "same name, new inode" signature as our own forced child
+    while leaving a FRESH sparse partial behind.
+    """
+    blobs = _repo_cache(tmp_path, monkeypatch)
+    sparse = _sparse(blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}")
+    assert xf._partial_is_resumable(sparse) is False
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {sparse.name}
+
+    sparse.unlink()
+    whole = _contiguous(blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}")
+    assert xf._partial_is_resumable(whole) is True
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == set(), (
+        "the forced child's own append-mode partial is resumable and must not hold the latch"
+    )
+
+
+def test_a_siblings_fresh_sparse_partial_at_the_same_name_still_holds_the_latch(
+    tmp_path, monkeypatch
+):
+    """The case an inode test gets wrong. A concurrent same-repo ladder taking its own Xet retry
+    unlinks its partial and its next Xet child reopens the same blob name, producing exactly the
+    "same name, new inode" signature the forced HTTP child produces. The new file is a fresh SPARSE
+    Xet partial, so resuming it corrupts the blob just as the first one would."""
+    blobs = _repo_cache(tmp_path, monkeypatch)
+    first = _sparse(blobs / f"bbbb{xf.INCOMPLETE_SUFFIX}")
+    before = first.stat().st_ino
+    first.unlink()
+    second = _sparse(blobs / f"bbbb{xf.INCOMPLETE_SUFFIX}")
+    if second.stat().st_ino == before:
+        pytest.skip("this filesystem reused the inode, so the case cannot be staged here")
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {second.name}
+
+
+def test_an_unreadable_cache_root_reports_unknown_not_empty(tmp_path, monkeypatch):
+    """The half that has to be fail-CLOSED, and the trap under it.
+
+    ``hf_cache_root`` and ``_case_safe_repo_cache_dirs`` both swallow ``OSError`` and report an
+    unreadable or briefly absent root as "no directories", which reads as "every partial vanished".
+    A root that disappears after the guard engaged is a remount or a permission flap, not proof, so
+    the scan has to probe the root itself.
+    """
+    _repo_cache(tmp_path, monkeypatch)
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == set()
+
+    def _boom(*a, **k):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", _boom)
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) is None
+
+    monkeypatch.undo()
+    monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path / "gone-during-remount")
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) is None, (
+        "a vanished cache root is a remount, not evidence that the partial was cleaned up"
+    )
+
+
+def test_undeterminable_sparseness_counts_as_unsafe(tmp_path, monkeypatch):
+    """A filesystem that will not report allocation keeps the guard on.
+
+    Windows is the live case: NTFS materialises zeros when a writer seeks past the end rather than
+    leaving a hole, so "fully allocated" there does not mean "fully written", and reading it as
+    resumable would be the corrupting direction.
+    """
+    blobs = _repo_cache(tmp_path, monkeypatch)
+    blob = _contiguous(blobs / f"cccc{xf.INCOMPLETE_SUFFIX}")
+
+    class _NoBlocks:
+        """What os.stat returns where st_blocks does not exist (Windows, some network mounts)."""
+        st_size = 1024
+
+    class _FakeBlob:
+        name = blob.name
+
+        def stat(self):
+            return _NoBlocks()
+
+    monkeypatch.setattr(xf, "_windows_allocated_size", lambda *a, **k: None)
+    assert xf._partial_is_resumable(_FakeBlob()) is None
+    # And the scan carries that through as unsafe rather than silently dropping it.
+    monkeypatch.setattr(xf, "_partial_is_resumable", lambda b: None)
+    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {blob.name}

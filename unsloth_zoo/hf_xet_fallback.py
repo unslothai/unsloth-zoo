@@ -81,6 +81,7 @@ from unsloth_zoo.hf_cache_state import (
     _selected_shard_index_incomplete,
     _sentence_transformers_subfolder_incomplete,
     _weight_shard_index_complete,
+    _windows_allocated_size,
     blob_bytes_present,
     has_active_incomplete_blobs,
     hf_cache_root,
@@ -604,33 +605,53 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
-def _incomplete_blob_identities(
+def _partial_is_resumable(blob: Path) -> Optional[bool]:
+    """Is *blob* an ``.incomplete`` an HTTP resume can safely continue? ``None`` if undeterminable.
+
+    This is the property the corruption guard actually cares about, and it is readable from the file
+    rather than inferred from its name or inode. huggingface_hub's HTTP path appends, so its partial
+    is a contiguous prefix: fully allocated up to its length. A partial written by parallel chunk
+    writers (hf_transfer, older hf_xet) has holes -- full ``st_size``, far fewer blocks. Resuming
+    over that one appends past the holes and finalizes a silently corrupt blob.
+
+    Windows deliberately answers ``None`` for anything not visibly sparse. NTFS materialises zeros
+    when a writer seeks past the end instead of leaving a hole, so "fully allocated" there does not
+    mean "fully written", and treating it as resumable would be the corrupting direction. Sparse is
+    still conclusive when it is visible, so that direction is trusted on every platform.
+    """
+    st = blob.stat()
+    if st.st_size == 0:
+        return True
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is not None:
+        return blocks * 512 >= st.st_size
+    allocated = _windows_allocated_size(blob)
+    if allocated is not None and allocated < st.st_size:
+        return False
+    return None
+
+
+def _unsafe_incomplete_partials(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
-    """``{(name, inode)}`` for the repo's ``*.incomplete`` partials, ``None`` if unreadable.
+    """Names of the repo's ``*.incomplete`` partials that are NOT safe to resume over.
 
-    Two deliberate differences from ``_active_incomplete_blob_sizes``:
+    ``None`` means the cache could not be inspected, which is not the same answer as "none of them"
+    and must never release the guard. Getting that distinction right takes an explicit probe of the
+    cache root: ``hf_cache_root`` and ``_case_safe_repo_cache_dirs`` both swallow ``OSError`` and
+    report an unreadable or briefly absent root as "no directories", which reads as "everything
+    vanished". A root that disappears after the guard engaged is a remount or a permission flap, not
+    proof, so it is reported as unknown here.
 
-    Fail-CLOSED. That helper swallows per-file and outer errors and returns whatever it managed to
-    read, which is right for a progress sensor, where an unreadable blob should not abort a
-    download. It is wrong for a safety check, where an empty result would then mean "gone" and
-    "could not look" alike -- and the caller releases a corruption guard on that answer.
-
-    Identity, not name alone. The name cannot distinguish the sparse Xet partial the purge failed
-    to remove from the fresh, resumable one huggingface_hub writes at the SAME path after unlinking
-    it under ``force_download``, so a name-only check re-latches on the very HTTP progress it should
-    be preserving and restarts every remaining child from zero. The inode separates them, because an
-    unlink plus create changes it.
-
-    ``st_ino`` is reported as ``0`` when the filesystem could not supply one -- notably on Windows,
-    where ``os.stat`` falls back to a directory entry that carries no file index precisely when the
-    file is locked, which is also the reason the purge failed and the latch engaged. That zero is
-    carried through rather than hidden, and ``_surviving_unsafe_partials`` treats it as unresolvable
-    rather than as a difference. ``st_dev`` is left out on purpose: it is not stable across an
-    autofs remount of a network cache, which would read as a change with no change.
+    Undeterminable safety counts as unsafe, so a filesystem that will not answer keeps the guard on.
     """
-    identities: set = set()
+    unsafe: set = set()
     try:
+        root = hf_cache_root(cache_dir = cache_dir)
+        if root is None:
+            return None
+        # Deliberately allowed to raise: this is the probe the helpers below swallow.
+        list(root.iterdir())
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
@@ -639,35 +660,16 @@ def _incomplete_blob_identities(
                 if not blob.name.endswith(INCOMPLETE_SUFFIX):
                     continue
                 try:
-                    st = blob.stat()
+                    resumable = _partial_is_resumable(blob)
                 except FileNotFoundError:
-                    # Vanished between listing and stat. That is the disappearance this scan looks
-                    # for, not a failure to look, so skip it rather than failing closed.
+                    # Vanished between listing and stat, which is the disappearance being looked
+                    # for, not a failure to look.
                     continue
-                identities.add((blob.name, getattr(st, "st_ino", 0) or 0))
+                if resumable is not True:
+                    unsafe.add(blob.name)
     except Exception:
         return None
-    return identities
-
-
-def _surviving_unsafe_partials(captured: set, present: set) -> set:
-    """Which of the *captured* unsafe partials are still on disk, per *present*.
-
-    Only a vanished NAME counts as disappearance. A name that is still there with a different inode
-    is the case the identity test exists for, but only when both scans could actually resolve one:
-    an unresolvable inode on either side means the answer is unknown, and unknown has to read as
-    "still there", or the guard releases on exactly the locked-file and remounted-cache machines
-    least able to survive a corrupt blob.
-    """
-    present_names = {name for name, _ in present}
-    unresolved_names = {name for name, ino in present if not ino}
-    surviving = set()
-    for name, ino in captured:
-        if name not in present_names:
-            continue
-        if not ino or name in unresolved_names or (name, ino) in present:
-            surviving.add((name, ino))
-    return surviving
+    return unsafe
 
 
 def _child_rss(pid: int) -> Optional[int]:
@@ -2524,10 +2526,6 @@ def _download_with_xet_fallback(
     # can be handed back once that partial is provably gone.
     caller_force_download = params.get("force_download", False)
     forced_clean_redownload = False
-    # The exact unsafe partials seen at the transition, or None if the cache could not be read.
-    # The latch is released only when NONE of them is still on disk -- see the un-latch branch below
-    # for why "a child ran" is not enough, and why None must not count as "gone".
-    unsafe_partials: Optional[set] = set()
     # The Xet -> HTTP purge runs at the TRANSITION only. Repeating it per HTTP child would spare the
     # partial the failed HTTP child just wrote (it is younger than active_grace), leaving
     # has_active_incomplete_blobs true and forcing force_download, so every HTTP retry would restart
@@ -2600,45 +2598,33 @@ def _download_with_xet_fallback(
                 )
                 params = {**params, "force_download": True}
                 forced_clean_redownload = True
-                # Remember WHICH partials are unsafe, so the latch can be released on evidence.
-                # An uninspectable cache yields None, which keeps the latch on forever below --
-                # a clean re-download costs bandwidth, resuming over a sparse partial costs the blob.
-                # Deliberately UNSCOPED, unlike the purge above. Scoping this by owned_incomplete
-                # looks symmetric and is backwards: the purge skips every blob outside that set, so
-                # the partials that SURVIVE it are exactly the ones outside it -- they are why
-                # has_active_incomplete_blobs() just returned True. Filtering them out empties the
-                # set, releases the latch on the next iteration, and hands the next child a sparse
-                # partial to resume. The cost of not scoping is that a live sibling's partial can
-                # hold the latch and make retries re-download; that is bandwidth, and the guard is
-                # here to protect the blob.
-                unsafe_partials = _incomplete_blob_identities(repo_type, repo_id, cache_dir)
         elif disable_xet and forced_clean_redownload:
-            # Release the latch only once every partial that was unsafe at the transition is gone.
-            # "One HTTP child has run" is NOT proof it did: huggingface_hub unlinks the .incomplete
+            # Release the latch only once no partial that is unsafe to resume is on disk.
+            # "One HTTP child has run" is NOT proof of that: huggingface_hub unlinks the .incomplete
             # only after the HEAD/metadata call, so a child that died on a 5xx there -- the degraded
             # CDN this ladder exists for -- leaves the sparse Xet partial untouched. Handing the next
-            # child force_download=False would then resume it, and an HTTP resume over a sparse Xet
-            # partial finalizes a silently corrupt blob, which is what the purge above prevents.
-            # Fail closed on both halves: a scan that could not run (None, either now or at the
-            # transition) is not evidence of disappearance, so the latch stays on. Matched on
-            # ``(name, dev, ino)``, so a same-named replacement written by the forced HTTP child
-            # counts as disappearance -- that partial IS resumable, and re-latching on it would
-            # throw away the bytes this ladder just paid for.
-            present = _incomplete_blob_identities(repo_type, repo_id, cache_dir)
-            still_unsafe = (
-                None if (unsafe_partials is None or present is None)
-                else _surviving_unsafe_partials(unsafe_partials, present)
-            )
-            if still_unsafe is not None and not still_unsafe:
+            # child force_download=False would then resume it and finalize a corrupt blob.
+            #
+            # The question is asked of the FILE, not of its name or its inode. A name cannot tell the
+            # sparse Xet partial from the resumable one huggingface_hub rewrites at the same path
+            # under force_download, and an inode cannot either: it is unstable on overlayfs and FUSE
+            # caches, absent on some Windows stats, reusable after an unlink, and a same-repo sibling
+            # taking its own Xet retry produces the same "same name, new inode" signature as our own
+            # forced child while leaving a FRESH sparse partial behind. Sparseness is none of those
+            # things -- it is what actually makes a resume unsafe.
+            #
+            # Re-read each time rather than intersecting with a set captured at the transition, so a
+            # partial that appears AFTER the release still re-arms the guard.
+            unsafe_now = _unsafe_incomplete_partials(repo_type, repo_id, cache_dir)
+            if unsafe_now is not None and not unsafe_now:
                 forced_clean_redownload = False
-                unsafe_partials = set()
                 params = {**params, "force_download": caller_force_download}
             else:
                 logger.debug(
                     "Keeping force_download for '%s': %s",
                     label,
-                    "cache not inspectable" if still_unsafe is None
-                    else f"{len(still_unsafe)} unsafe partial(s) still present",
+                    "cache not inspectable" if unsafe_now is None
+                    else f"{len(unsafe_now)} partial(s) unsafe to resume",
                 )
 
         kind_result, payload = _run_download_attempt(
