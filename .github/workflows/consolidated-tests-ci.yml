@@ -305,6 +305,11 @@ jobs:
         # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
         # so this job exercises the regressed regime on every pull request.
         #
+        # test_olmoe_moe_routing pins the OLMoE fused-experts routing through the MoE
+        # backend and its preprocessor registration (#850): stub OlmoeConfig, CPU-pure,
+        # sub-second. The zoo-specific step below is continue-on-error, so a
+        # regression there would only ever be yellow.
+        #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
         # y` binds to whatever `tests` package is importable; unsloth's CI runs
@@ -318,6 +323,7 @@ jobs:
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_loss_normalization_contract.py \
+            tests/test_olmoe_moe_routing.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \

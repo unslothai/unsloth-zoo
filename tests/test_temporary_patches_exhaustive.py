@@ -1614,6 +1614,30 @@ def test_mxfp4_mxfp4_config_top_level_class():
         )
 
 
+# olmoe.py: OlmoeExperts.forward (5.0+-only).
+
+def test_olmoe_experts_forward_signature_5x():
+    """patch_olmoe_moe patches OlmoeExperts.forward(hidden_states, top_k_index,
+    top_k_weights) via ``get_forward_moe_backend()`` with strict signature
+    matching, so all three names are load-bearing: a rename makes patch_function
+    decline and the native forward keeps crashing on 4-bit (#850)."""
+    cls = _try_get_class(
+        "transformers.models.olmoe.modeling_olmoe", "OlmoeExperts",
+    )
+    if cls is None:
+        pytest.skip(
+            f"OlmoeExperts absent on transformers {_TX_VERSION} "
+            "(5.0+-only; transformers < 5 keeps OLMoE experts as a ModuleList)"
+        )
+    fwd = _assert_method_exists(cls, "forward", "olmoe.py")
+    _assert_params_superset(
+        fwd,
+        required=["hidden_states", "top_k_index", "top_k_weights"],
+        zoo_file="olmoe.py",
+        label="OlmoeExperts.forward",
+    )
+
+
 # pixtral.py: PixtralAttention.{__init__, forward}.
 
 def test_pixtral_attention_init_signature():
