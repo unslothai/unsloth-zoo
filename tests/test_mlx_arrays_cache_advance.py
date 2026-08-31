@@ -171,7 +171,8 @@ def test_install_is_idempotent(fresh, monkeypatch):
 
 
 def test_a_failed_attempt_is_not_a_decision(fresh, monkeypatch):
-    fresh(stock_bodied_cache())
+    cls = fresh(stock_bodied_cache())
+    real_matcher = engine._has_replaceable_advance
 
     def explode(arrays_cache):
         raise RuntimeError("transient")
@@ -180,10 +181,13 @@ def test_a_failed_attempt_is_not_a_decision(fresh, monkeypatch):
     engine._install_arrays_cache_advance_fix()
     assert not engine._ARRAYS_CACHE_ADVANCE_RESOLVED
 
-    monkeypatch.undo()
-    monkeypatch.setattr(engine, "_ARRAYS_CACHE_ADVANCE_RESOLVED", False)
+    # Restore just the matcher. monkeypatch.undo() would also revert the module
+    # this fixture injected, leaving the retry with nothing to import and no way
+    # to tell "declined to latch" from "could not look".
+    monkeypatch.setattr(engine, "_has_replaceable_advance", real_matcher)
     engine._install_arrays_cache_advance_fix()
     assert engine._ARRAYS_CACHE_ADVANCE_RESOLVED
+    assert cls._unsloth_advance_patched is True
 
 
 def test_a_missing_mlx_lm_is_inert(fresh, monkeypatch):
