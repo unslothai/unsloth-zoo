@@ -1434,3 +1434,37 @@ def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
     assert mx.gather_qmm._unsloth_gather_qmm_guard
     import inspect   # the only production install site
     assert "apply_gather_qmm_nax_guard()" in inspect.getsource(FastMLXModel.from_pretrained)
+
+
+@metal_only
+@pytest.mark.parametrize("failing", ["_gather_qmm_conditions",
+                                     "_gather_qmm_quantization",
+                                     "_gather_qmm_target_device"])
+def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
+                                                      raw_gather_qmm):
+    """Reading a call is not worth failing it.
+
+    This wrapper stands on a core mlx op, so anything the predicate raises would break
+    calls plain mlx handles. The reachable cause is an mlx older than the signatures the
+    predicate asks for: `mx.quantize(bits=None, mode=...)` needs 0.29.4, while `.[core]`
+    floors mlx at 0.22.0, so `pip install -U unsloth_zoo --no-deps` over an older mlx
+    reaches the untransposed branch and raises TypeError out of `mx.gather_qmm` itself.
+    Those versions also predate the NAX kernels entirely, so declining to guard there
+    costs no protection.
+    """
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_UNREADABLE", False)
+    seen = {}
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL",
+                        lambda *a, **kw: seen.update(kw) or "result")
+
+    def boom(*args, **kwargs):
+        raise TypeError("quantize(): incompatible function arguments")
+
+    monkeypatch.setattr(mlx_utils, failing, boom)
+    x, w, kw = _gather_qmm_call(k=96)
+    assert mlx_utils._gather_qmm_guarded(
+        x, w, mx.zeros((8, 64, 3), dtype=mx.bfloat16), None, group_size=32,
+        **kw) == "result"
+    # Untouched, not rerouted: an unreadable call is passed through exactly as given.
+    assert seen["sorted_indices"] is True
+    assert mlx_utils._MLX_GATHER_QMM_UNREADABLE is True   # warns once, not per call

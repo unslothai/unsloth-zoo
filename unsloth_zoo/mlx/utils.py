@@ -559,6 +559,8 @@ _MLX_MIN_PROBE_K = 96
 _MLX_GATHER_QMM_ORIGINAL = None
 _MLX_GATHER_QMM_CANARIES = {}
 _MLX_GATHER_QMM_DEFAULTS = {}
+# Set once if reading a call ever fails, so the warning does not repeat per call.
+_MLX_GATHER_QMM_UNREADABLE = False
 
 
 def _gather_qmm_probe_k(condition, group_size):
@@ -731,14 +733,29 @@ def _gather_qmm_conditions(x, w, args, kwargs):
 
 
 def _gather_qmm_guarded(x, w, *args, **kwargs):
-    conditions = _gather_qmm_conditions(x, w, args, kwargs)
-    if conditions:
-        group_size, bits, mode = _gather_qmm_quantization(args, kwargs)
-        device = _gather_qmm_target_device(kwargs)
-        # Either defect alone corrupts the result; the cheaper probe is tried first.
-        if any(_gather_qmm_canary_defective(condition, group_size, bits, mode, device)
-               for condition in conditions):
-            kwargs = dict(kwargs, sorted_indices=False)
+    global _MLX_GATHER_QMM_UNREADABLE
+    try:
+        conditions = _gather_qmm_conditions(x, w, args, kwargs)
+        if conditions:
+            group_size, bits, mode = _gather_qmm_quantization(args, kwargs)
+            device = _gather_qmm_target_device(kwargs)
+            # Either defect alone corrupts the result; the cheaper probe is tried first.
+            if any(_gather_qmm_canary_defective(condition, group_size, bits, mode,
+                                                device)
+                   for condition in conditions):
+                kwargs = dict(kwargs, sorted_indices=False)
+    except Exception as error:
+        # Failing to READ a call is not a reason to fail the call. This wrapper stands
+        # on a core mlx op, so an exception here breaks calls plain mlx handles fine.
+        # The reachable cause is an mlx older than the signatures the predicate asks
+        # for -- `quantize(bits=None, mode=...)` needs 0.29.4, and `.[core]` floors mlx
+        # at 0.22.0 -- which is also an mlx generations older than the NAX kernels, so
+        # there is nothing there to guard. Warn once, then behave as the unpatched op.
+        if not _MLX_GATHER_QMM_UNREADABLE:
+            _MLX_GATHER_QMM_UNREADABLE = True
+            print(f"Unsloth: could not inspect this gather_qmm call "
+                  f"({type(error).__name__}: {error}); the sorted NAX guard is "
+                  f"inactive for this process.")
     return _MLX_GATHER_QMM_ORIGINAL(x, w, *args, **kwargs)
 
 
