@@ -1275,7 +1275,7 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
         seen["n"] += 1
         return set()
 
-    monkeypatch.setattr(xf, "_unsafe_incomplete_partials", _unsafe)
+    monkeypatch.setattr(xf, "_incomplete_partial_names", _unsafe)
     fake = _install(
         monkeypatch,
         [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
@@ -1298,7 +1298,7 @@ def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
-        xf, "_unsafe_incomplete_partials", lambda *a, **k: {"blob.incomplete"}
+        xf, "_incomplete_partial_names", lambda *a, **k: {"blob.incomplete"}
     )
     fake = _install(
         monkeypatch,
@@ -5831,12 +5831,6 @@ def _sparse(path, size = 64 * 1024 * 1024):
     return path
 
 
-def _contiguous(path, size = 1024):
-    """What huggingface_hub's append-mode HTTP path leaves behind: a fully written prefix."""
-    path.write_bytes(b"x" * size)
-    return path
-
-
 def _repo_cache(tmp_path, monkeypatch):
     blobs = tmp_path / "models--o--r" / "blobs"
     blobs.mkdir(parents = True)
@@ -5845,45 +5839,6 @@ def _repo_cache(tmp_path, monkeypatch):
         xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
     )
     return blobs
-
-
-def test_sparseness_not_identity_decides_whether_a_partial_is_resumable(tmp_path, monkeypatch):
-    """The guard asks the FILE whether it can be resumed, which is the thing that actually matters.
-
-    A name cannot tell the sparse Xet partial from the resumable one huggingface_hub rewrites at the
-    same path under force_download, and an inode cannot either: it is unstable on overlayfs and FUSE
-    caches, absent on some Windows stats, reusable after an unlink, and a same-repo sibling taking
-    its own Xet retry produces the same "same name, new inode" signature as our own forced child
-    while leaving a FRESH sparse partial behind.
-    """
-    blobs = _repo_cache(tmp_path, monkeypatch)
-    sparse = _sparse(blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}")
-    assert xf._partial_is_resumable(sparse) is False
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {sparse.name}
-
-    sparse.unlink()
-    whole = _contiguous(blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}")
-    assert xf._partial_is_resumable(whole) is True
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == set(), (
-        "the forced child's own append-mode partial is resumable and must not hold the latch"
-    )
-
-
-def test_a_siblings_fresh_sparse_partial_at_the_same_name_still_holds_the_latch(
-    tmp_path, monkeypatch
-):
-    """The case an inode test gets wrong. A concurrent same-repo ladder taking its own Xet retry
-    unlinks its partial and its next Xet child reopens the same blob name, producing exactly the
-    "same name, new inode" signature the forced HTTP child produces. The new file is a fresh SPARSE
-    Xet partial, so resuming it corrupts the blob just as the first one would."""
-    blobs = _repo_cache(tmp_path, monkeypatch)
-    first = _sparse(blobs / f"bbbb{xf.INCOMPLETE_SUFFIX}")
-    before = first.stat().st_ino
-    first.unlink()
-    second = _sparse(blobs / f"bbbb{xf.INCOMPLETE_SUFFIX}")
-    if second.stat().st_ino == before:
-        pytest.skip("this filesystem reused the inode, so the case cannot be staged here")
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {second.name}
 
 
 def test_an_unreadable_cache_root_reports_unknown_not_empty(tmp_path, monkeypatch):
@@ -5895,43 +5850,57 @@ def test_an_unreadable_cache_root_reports_unknown_not_empty(tmp_path, monkeypatc
     the scan has to probe the root itself.
     """
     _repo_cache(tmp_path, monkeypatch)
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == set()
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == set()
 
     def _boom(*a, **k):
         raise OSError(13, "Permission denied")
 
     monkeypatch.setattr(pathlib.Path, "iterdir", _boom)
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) is None
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) is None
 
     monkeypatch.undo()
     monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path / "gone-during-remount")
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) is None, (
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) is None, (
         "a vanished cache root is a remount, not evidence that the partial was cleaned up"
     )
 
 
-def test_undeterminable_sparseness_counts_as_unsafe(tmp_path, monkeypatch):
-    """A filesystem that will not report allocation keeps the guard on.
+def test_a_surviving_partial_holds_the_latch_however_whole_it_looks(tmp_path, monkeypatch):
+    """Absence is the only evidence the guard accepts, and this is why.
 
-    Windows is the live case: NTFS materialises zeros when a writer seeks past the end rather than
-    leaving a hole, so "fully allocated" there does not mean "fully written", and reading it as
-    resumable would be the corrupting direction.
+    Three ways of judging a partial that is still on disk to be a safe prefix were tried here and
+    each released the guard on a real filesystem: the basename, which cannot tell the sparse Xet
+    partial from the resumable one huggingface_hub rewrites at the same path; the inode, which is
+    unstable on overlayfs and FUSE caches, absent from some Windows stats, reusable after an unlink,
+    and identical in shape to what a same-repo sibling's own Xet retry produces; and allocation
+    metadata, which is worse still, because XFS turns speculative preallocation into unwritten
+    extents that are counted in st_blocks and read back as zeros.
+
+    So a partial that is present holds the latch no matter how complete it looks. Getting this wrong
+    installs a zero-filled file under its sha256 blob name with no error at all, because the HTTP
+    path verifies size and not content.
     """
     blobs = _repo_cache(tmp_path, monkeypatch)
-    blob = _contiguous(blobs / f"cccc{xf.INCOMPLETE_SUFFIX}")
+    # Fully allocated, no holes, indistinguishable from a good prefix by any allocation test.
+    whole = blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}"
+    whole.write_bytes(b"x" * 4096)
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == {whole.name}
 
-    class _NoBlocks:
-        """What os.stat returns where st_blocks does not exist (Windows, some network mounts)."""
-        st_size = 1024
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "3")
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"),
+         ("retryable_error", "503"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    http_forces = [c.force_download for c in fake.calls if c.disable_xet]
+    assert all(http_forces), f"a surviving partial was handed to a resuming child: {http_forces}"
 
-    class _FakeBlob:
-        name = blob.name
-
-        def stat(self):
-            return _NoBlocks()
-
-    monkeypatch.setattr(xf, "_windows_allocated_size", lambda *a, **k: None)
-    assert xf._partial_is_resumable(_FakeBlob()) is None
-    # And the scan carries that through as unsafe rather than silently dropping it.
-    monkeypatch.setattr(xf, "_partial_is_resumable", lambda b: None)
-    assert xf._unsafe_incomplete_partials("model", "o/r", str(tmp_path)) == {blob.name}
+    whole.unlink()
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == set(), (
+        "once nothing is left there is nothing to resume over, which is the one safe release"
+    )
