@@ -714,6 +714,7 @@ class _FakeAttempt:
     def __init__(self, results):
         self._results = list(results)
         self.calls = []
+        self.owned_incomplete = None
 
     def __call__(
         self,
@@ -742,11 +743,16 @@ class _FakeAttempt:
                 repo_type = repo_type,
             )
         )
+        if self.owned_incomplete is not None:
+            # The real attempt reports the basenames its child held open this way, and the ladder
+            # pops the key back off; a fake that never sets it silently skips that scoping.
+            params["_owned_incomplete_blobs"] = set(self.owned_incomplete)
         return self._results[len(self.calls) - 1]
 
 
-def _install(monkeypatch, results):
+def _install(monkeypatch, results, owned_incomplete = None):
     fake = _FakeAttempt(results)
+    fake.owned_incomplete = owned_incomplete
     monkeypatch.setattr(xf, "_run_download_attempt", fake)
     return fake
 
@@ -1265,9 +1271,9 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
 
     def _names(*a, **k):
         seen["n"] += 1
-        return {"blob.incomplete"} if seen["n"] == 1 else set()
+        return {("blob.incomplete", 1, 7)} if seen["n"] == 1 else set()
 
-    monkeypatch.setattr(xf, "_incomplete_blob_names_strict", _names)
+    monkeypatch.setattr(xf, "_incomplete_blob_identities", _names)
     fake = _install(
         monkeypatch,
         [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
@@ -1290,7 +1296,7 @@ def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
-        xf, "_incomplete_blob_names_strict", lambda *a, **k: {"blob.incomplete"}
+        xf, "_incomplete_blob_identities", lambda *a, **k: {("blob.incomplete", 1, 7)}
     )
     fake = _install(
         monkeypatch,
@@ -5737,7 +5743,7 @@ def test_uninspectable_cache_keeps_force_download_latched(monkeypatch):
     sparse Xet partial on exactly the locked-down machines least able to recover from it."""
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
-    monkeypatch.setattr(xf, "_incomplete_blob_names_strict", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "_incomplete_blob_identities", lambda *a, **k: None)
     fake = _install(
         monkeypatch,
         [("retryable_error", "503"), ("crashed", "died"), ("ok", "/cache/x")],
@@ -5752,10 +5758,79 @@ def test_strict_blob_scan_reports_failure_as_none(monkeypatch, tmp_path):
     """The strict scan is the safety-critical twin of the fail-open sensor: it must distinguish
     'nothing there' from 'could not look'."""
     monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([]))
-    assert xf._incomplete_blob_names_strict("model", "o/r", str(tmp_path)) == set()
+    assert xf._incomplete_blob_identities("model", "o/r", str(tmp_path)) == set()
 
     def _boom(*a, **k):
         raise OSError(13, "Permission denied")
 
     monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", _boom)
-    assert xf._incomplete_blob_names_strict("model", "o/r", str(tmp_path)) is None
+    assert xf._incomplete_blob_identities("model", "o/r", str(tmp_path)) is None
+
+
+def test_a_same_named_replacement_partial_releases_the_latch(monkeypatch):
+    """The latch must key on IDENTITY, not on the basename.
+
+    ``force_download`` makes huggingface_hub unlink the ``.incomplete`` and immediately reopen the
+    same path in append mode. If that forced child then dies mid-transfer, the surviving file has
+    the old name but is a fresh, resumable HTTP partial. Matching on the name alone would read it
+    as the sparse Xet partial that is still there, keep the latch, and make every remaining child
+    throw those bytes away and restart from zero -- turning a corruption guard into a bandwidth
+    amplifier on exactly the flaky links that reach it."""
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    seen = {"n": 0}
+
+    def _identities(*a, **k):
+        seen["n"] += 1
+        # Same name throughout; the inode changes once the forced child recreates the file.
+        return {("blob.incomplete", 1, 7 if seen["n"] == 1 else 8)}
+
+    monkeypatch.setattr(xf, "_incomplete_blob_identities", _identities)
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.force_download for c in fake.calls] == [False, True, False], (
+        "a replacement partial is the forced child's own resumable work, not the unsafe one"
+    )
+
+
+def test_a_live_siblings_partial_does_not_hold_the_latch(monkeypatch):
+    """The unsafe set is scoped by the same owned-blob set as the purge.
+
+    The purge deliberately spares a partial a LIVE sibling holds open. Counting that partial as
+    unsafe would keep force_download latched for the rest of the ladder while the sibling downloads
+    an entirely different file, so the scoping has to match on both sides."""
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    # Our child owned "mine"; "sibling" belongs to another live download and never goes away.
+    monkeypatch.setattr(
+        xf, "_incomplete_blob_identities",
+        lambda *a, **k: {("sibling.incomplete", 1, 9)},
+    )
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
+        owned_incomplete = {"mine.incomplete"},
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.force_download for c in fake.calls] == [False, True, False], (
+        "the sibling's partial is not ours to wait on"
+    )
+
+
+def test_blob_identity_scan_uses_device_and_inode(monkeypatch, tmp_path):
+    """Recreating the file under the same name yields a different identity on a real filesystem."""
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    partial = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
+    partial.write_bytes(b"abc")
+    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path]))
+    before = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
+    assert {n for (n, _, _) in before} == {partial.name}
+    partial.unlink()
+    partial.write_bytes(b"defg")
+    after = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
+    assert {n for (n, _, _) in after} == {partial.name}
+    assert not (before & after), "an unlink plus create must not look like the same partial"
