@@ -21,8 +21,11 @@ except Exception:
 
 if not _METAL:
     print("NOTICE: Metal unavailable; all MLX e2e training tests will be skipped.")
+    _U, _CPU = lambda *s: None, None   # parametrization evaluates before the skip
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+_K_REM, _ROW_OVF = "k_remainder", "row_overflow"
+_UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=None)
 
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
@@ -30,10 +33,12 @@ if _METAL:
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.utils import (
         FiniteTextBatchPlan, _FiniteTextRow, collect_mlx_lora_adapter_tensors,
         make_baseline_loss_fn,
     )
+    _U, _CPU = lambda *s: mx.zeros(s, dtype=mx.uint32), mx.default_stream(mx.cpu)
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
@@ -1322,3 +1327,127 @@ def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
 
     assert float(scaled) == pytest.approx(reference, rel=2e-2)
     assert abs(float(scaled) - float(unscaled)) > 1e-3
+
+
+def _gather_qmm_call(k=96, rows=64, m=1, out_width=64, pack_bits=4, **overrides):
+    """One sorted call; an untransposed one is judged on `out_width`."""
+    kw = {"rhs_indices": _U(rows), "transpose": True, "sorted_indices": True,
+          "bits": 4, **overrides}
+    w = ((8, 64, k * pack_bits // 32) if kw["transpose"]
+         else (8, k, out_width * pack_bits // 32))
+    return mx.zeros((rows, m, k), dtype=mx.bfloat16), _U(*w), kw
+
+
+@pytest.fixture
+def raw_gather_qmm(monkeypatch):
+    raw = mlx_utils._MLX_GATHER_QMM_ORIGINAL or mx.gather_qmm
+    monkeypatch.setattr(mx, "gather_qmm", raw)
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL", raw)
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_CANARIES", {})
+    return raw
+
+
+@metal_only
+@pytest.mark.parametrize("case, expected", [
+    (dict(k=96), (_K_REM,)),
+    (dict(k=64, rows=32769), (_ROW_OVF,)),
+    (dict(k=96, rows=32769), (_K_REM, _ROW_OVF)),
+    (dict(k=96, sorted_indices=False), ()),
+    (dict(k=96, lhs_indices=_U(64, 1)), ()),
+    (dict(k=96, rhs_indices=None, lhs_indices=_U(64, 1)), ()),
+    (dict(k=96, m=2), ()),
+    (dict(k=96, stream=_CPU), ()),
+    (dict(k=192, out_width=96, transpose=False), (_K_REM,)),
+    (dict(k=192, out_width=96, pack_bits=8, bits=None, mode="mxfp8", transpose=False),
+     (_K_REM,)),
+    ({**_UNTRANSPOSED, "rows": 32769, "rhs_indices": _U(1)}, (_ROW_OVF,)),
+    ({**_UNTRANSPOSED, "lhs_indices": _U(4097, 1)}, (_ROW_OVF,)),
+    ({**_UNTRANSPOSED, "lhs_indices": _U(4096, 8)}, ()),
+])
+def test_gather_qmm_guard_predicate(case, expected):
+    """4097 lhs indices over 8 experts broadcast to 32776 rows; 4096 x 8 is 32768."""
+    assert (mlx_utils._MLX_MAX_SORTED_ROWS, mlx_utils._MLX_K_REMAINDER) == (32768, _K_REM)
+    x, w, kw = _gather_qmm_call(**case)
+    assert mlx_utils._gather_qmm_conditions(x, w, (), kw) == expected
+
+
+@metal_only
+@pytest.mark.parametrize("mode, group_size",
+                         [("affine", 32), ("mxfp4", 32), ("mxfp8", 32), ("nvfp4", 16)])
+def test_gather_qmm_canary_probes_the_real_kernel(mode, group_size, monkeypatch, raw_gather_qmm):
+    """Magnitude alone is no oracle: the unsorted path measures just as small."""
+    probe_k, rows = mlx_utils._gather_qmm_probe_k, mlx_utils._MLX_PROBE_ROWS
+    k, row_k = probe_k(_K_REM, group_size), probe_k(_ROW_OVF, group_size)
+    assert k % 64 and k % group_size == 0 and k >= 96 and probe_k(_K_REM, 64) is None
+    assert row_k % 64 == 0 and rows[_ROW_OVF] % 2 and rows[_ROW_OVF] > 32768
+    seen = {}
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL",
+                        lambda *a, **kw: seen.update(kw) or raw_gather_qmm(*a, **kw))
+    dev = mx.default_device()
+    error = mlx_utils._gather_qmm_canary_error(_K_REM, group_size, None, mode, dev)
+    assert (seen["mode"], seen["bits"], seen["sorted_indices"]) == (mode, None, True)
+    assert mx.array_equal(seen["rhs_indices"], mx.sort(seen["rhs_indices"])).item()
+    assert (error < 0.25 or error > 4.0) and mlx_utils._MLX_CANARY_ERROR_LIMIT == 1.0
+    monkeypatch.setattr(mlx_utils, "_gather_qmm_canary_error", lambda *a: float("nan"))
+    assert mlx_utils._gather_qmm_canary_defective(_K_REM, group_size, None, mode, dev)
+    assert [*mlx_utils._MLX_GATHER_QMM_CANARIES] == [(_K_REM, group_size, None, mode, str(dev))]
+
+
+@metal_only
+@pytest.mark.parametrize("defective", [False, True])
+def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gather_qmm):
+    """Injects the verdict, not corruption."""
+    seen = {}
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL", lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(mlx_utils, "_gather_qmm_canary_error",
+                        lambda c, *a: 99.0 if defective and c == _ROW_OVF else 0.0)
+    scales = mx.zeros((8, 64, 3), dtype=mx.bfloat16)
+    x, w, kw = _gather_qmm_call(k=96, rows=32769)
+    mlx_utils._gather_qmm_guarded(x, w, scales, None, group_size=32, **kw)
+    assert seen["sorted_indices"] is not defective
+    monkeypatch.setattr(mlx_utils, "_gather_qmm_quantization", lambda *a: pytest.fail("probed"))
+    x, w, kw = _gather_qmm_call(k=64)
+    mlx_utils._gather_qmm_guarded(x, w, scales, None, group_size=32, **kw)
+    assert seen["sorted_indices"] is True
+
+
+@metal_only
+def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
+    """The guard must end up beneath the index-stop wrapper, even mid-training."""
+    monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "0")
+    assert mlx_utils.apply_gather_qmm_nax_guard() is False
+    monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    mlx_utils.acquire_mlx_training_patches()
+    try:
+        assert mlx_utils.apply_gather_qmm_nax_guard() is True
+        assert mlx_utils.apply_gather_qmm_nax_guard() is False
+        assert mx.gather_qmm._unsloth_index_original._unsloth_gather_qmm_guard
+    finally:
+        mlx_utils.release_mlx_training_patches()
+    assert mx.gather_qmm._unsloth_gather_qmm_guard
+    import inspect   # the only production install site
+    assert "apply_gather_qmm_nax_guard()" in inspect.getsource(FastMLXModel.from_pretrained)
+
+
+@metal_only
+@pytest.mark.parametrize("failing", ["_gather_qmm_conditions",
+                                     "_gather_qmm_quantization",
+                                     "_gather_qmm_target_device"])
+def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
+                                                      raw_gather_qmm):
+    """Not worth failing a call: the mlx that raises here predates the NAX kernels."""
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_UNREADABLE", False)
+    seen = {}
+    monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL",
+                        lambda *a, **kw: seen.update(kw) or "result")
+
+    def boom(*args, **kwargs):
+        raise TypeError("quantize(): incompatible function arguments")
+
+    monkeypatch.setattr(mlx_utils, failing, boom)
+    x, w, kw = _gather_qmm_call(k=96)
+    assert mlx_utils._gather_qmm_guarded(
+        x, w, mx.zeros((8, 64, 3), dtype=mx.bfloat16), None, group_size=32,
+        **kw) == "result"
+    assert seen["sorted_indices"] is True
+    assert mlx_utils._MLX_GATHER_QMM_UNREADABLE is True   # warns once, not per call
