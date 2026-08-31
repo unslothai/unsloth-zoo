@@ -544,24 +544,28 @@ def _blocked_layout(Dk, Dv, in_dtype, vectorized, cfg):
         red_arrays += 1        # per-column d_g reduces the same way d_k does
     if Dk <= 0 or Dv <= 0:
         return None
-    P = 1
-    while P <= 32:
-        W = Dk // P
-        # Whole simdgroups only: the backward reduces d_q/d_k across the 32 / P
-        # state rows a simdgroup holds, and a partial one would read idle lanes.
-        DB = (None if Dk % P or W % 4 or W > max_segment else
-              _blocked_dv_block(Dv, min(Dv, _BLOCKED_TG_THREADS // P), 32 // P))
-        if DB is not None:
-            # Cross-row reduction scratch: one Dk-wide row per simdgroup.
-            fixed = red_arrays * (P * DB // 32) * Dk * 4
-            for TB in tb_choices:
-                used = TB * (
-                    in_dtype.size * (dk_rows * (Dk + _BLOCKED_PAD) + dv_rows * (DB + _BLOCKED_PAD))
-                    + 4 * dv_f32_rows * (DB + _BLOCKED_PAD)
-                    + 4 * (1 + (Dk + _BLOCKED_PAD if vectorized else 1)))
-                if used + fixed <= _BLOCKED_TG_MEMORY:
-                    return P, W, DB, TB, P * DB
-        P *= 2
+    # Halving the threadgroup costs far less than losing the fused path entirely.
+    threads_cap = _BLOCKED_TG_THREADS
+    while threads_cap >= 32:
+        P = 1
+        while P <= 32:
+            W = Dk // P
+            # Whole simdgroups: the backward reduces across the 32/P rows one holds.
+            DB = (None if Dk % P or W % 4 or W > max_segment else
+                  _blocked_dv_block(Dv, min(Dv, threads_cap // P), 32 // P))
+            if DB is not None:
+                # Cross-row reduction scratch: one Dk-wide row per simdgroup.
+                fixed = red_arrays * (P * DB // 32) * Dk * 4
+                for TB in tb_choices:
+                    used = TB * (
+                        in_dtype.size * (dk_rows * (Dk + _BLOCKED_PAD)
+                                         + dv_rows * (DB + _BLOCKED_PAD))
+                        + 4 * dv_f32_rows * (DB + _BLOCKED_PAD)
+                        + 4 * (1 + (Dk + _BLOCKED_PAD if vectorized else 1)))
+                    if used + fixed <= _BLOCKED_TG_MEMORY:
+                        return P, W, DB, TB, P * DB
+            P *= 2
+        threads_cap //= 2
     return None
 
 

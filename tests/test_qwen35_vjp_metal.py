@@ -360,6 +360,7 @@ _CASES = [
     (1, 20, 2, 4, 128, 4, mx.float32, False),     # 32 threads, one simdgroup
     (1, 20, 2, 4, 128, 40, mx.float32, False),    # Dv not a multiple of the cap
     (1, 20, 2, 4, 224, 128, mx.float32, False),
+    (1, 20, 2, 4, 256, 128, mx.float32, True),    # backward needs a narrowed threadgroup
     (1, 20, 2, 4, 64, 128, mx.float32, True),     # per-column gating, P=2/P=4
     (1, 20, 2, 4, 128, 2, mx.float32, False),
     (1, 20, 2, 4, 128, 1, mx.float32, True),      # P=32, W=4: the off=16 shuffle
