@@ -96,8 +96,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
         getattr(args, "max_completion_length", None), "max_completion_length",
     )
     if kind == "orpo":
-        # ORPO divides the budget between prompt and answer, so neither bound
-        # can be left open.
+        # ORPO splits the budget between prompt and answer, so neither may be open.
         if max_length is None:
             max_length = 512
             warnings.warn(
@@ -134,11 +133,9 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
         before_clamp = max_length
         max_length = max_seq_length
         if kind == "orpo" and before_clamp > max_prompt_length >= max_length:
-            # ORPO spends max_length minus max_prompt_length on the answer, so
-            # a budget clamped down to the prompt bound leaves the answer none
-            # and clamped below it erases any answer no longer than the gap.
-            # A bound the caller themselves set at or above their own
-            # max_length is theirs to mean, and TRL's slice is reproduced.
+            # The answer gets max_length minus max_prompt_length, so a clamp down
+            # to the prompt bound leaves it nothing. A bound the caller set at or
+            # above their own max_length is theirs to mean: TRL's slice stands.
             max_prompt_length = max(1, max_length // 2)
             warnings.warn(
                 f"Unsloth MLX ORPO: max_prompt_length no longer leaves room for "
@@ -146,15 +143,12 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
                 f"{max_prompt_length}.",
                 RuntimeWarning, stacklevel=2,
             )
-    # A config that predates max_length carries its default rather than a choice,
-    # and that default sits below the batch width, so the run would train on a
-    # smaller budget than the same call used to. Say so once, and say how to get
-    # the old budget back. An args object without the marker is duck-typed rather
-    # than copied from a config, so take its value as meant.
+    # A config predating max_length carries the default, not a choice, and it sits
+    # below the width, so the same call now trains on less. No marker means
+    # duck-typed rather than copied from a config, so take the value as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
     if max_seq_length > max_length and not max_length_explicit:
-        # The advice has to differ by objective: DPO treats an open prompt bound
-        # as no cap, while ORPO has already turned it into 128 above.
+        # DPO reads an open prompt bound as no cap; ORPO already made it 128 above.
         restore = (
             "Pass max_length=max_seq_length, max_prompt_length=None"
             if kind == "dpo" else
@@ -168,8 +162,7 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
             "budget back.",
             RuntimeWarning, stacklevel=2,
         )
-    # For DPO the prompt bound is a cap rather than reserved room, so it may
-    # stand above max_length.
+    # DPO's prompt bound is a cap, not reserved room, so it may exceed max_length.
     return PreferenceLengthPolicy(
         kind, max_length, max_prompt_length, max_completion_length,
         truncation_mode, max_seq_length,
@@ -179,9 +172,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
 def _truncate_dpo_branch(prompt_ids, response_ids, policy):
     """Cap the prompt's end and the response's start, then the concatenation.
 
-    DPOTrainer truncates the concatenation in the forward pass, where the batch
-    is prompt-left- and completion-right-padded, so each row is one contiguous
-    block and its batched slice is exactly this per-row slice.
+    DPOTrainer truncates in the forward pass over a prompt-left-, completion-
+    right-padded batch, so each row is contiguous and its batched slice is this one.
     """
     if policy.max_prompt_length is not None:
         prompt_ids = prompt_ids[-policy.max_prompt_length:]
@@ -214,9 +206,8 @@ def _truncate_orpo(
         return len(prompt_ids) + longer <= policy.max_length
 
     if keep is None and not (fits(chosen_prompt) and fits(rejected_prompt)):
-        # Only an overflowing row consults the bound, so a policy that leaves it
-        # open still serves every row that fits. Say what is missing rather than
-        # letting the slices below negate a None.
+        # Only an overflowing row reads the bound; name it rather than let the
+        # slices below negate a None.
         raise ValueError(
             "Unsloth MLX ORPO: this row overruns max_length="
             f"{policy.max_length}, and max_prompt_length is the room reserved "
@@ -270,15 +261,9 @@ def _extract_prompt(chosen, rejected):
         )
     for index in range(limit):
         if chosen[index] != rejected[index]:
-            # TRL drops a space sitting immediately before the divergence, and
-            # reads chosen[index - 1] to find it. At index 0 that subscript
-            # wraps to the LAST character of chosen, so a row whose completions
-            # differ from the first character and whose chosen ends in a space
-            # takes index to -1: the prompt becomes everything but chosen's
-            # last character, and the rejected completion loses everything but
-            # its own. Deliberate divergence from TRL, recorded as one: there
-            # is nothing before the first character to strip, and reproducing
-            # it would silently train the row on invented text.
+            # TRL strips a space before the divergence via chosen[index - 1],
+            # which at index 0 wraps to chosen's LAST character and invents a
+            # prompt. Deliberate divergence: nothing precedes character 0.
             if index > 0 and chosen[index - 1] == " ":
                 index -= 1
             break
@@ -417,12 +402,10 @@ def _shared_prefix(prompt_text, *full_texts):
 
 
 def _emitted_bos_id(tokenizer):
-    """The BOS this tokenizer's own add_special_tokens policy actually emits.
+    """The BOS this tokenizer's add_special_tokens policy actually emits.
 
-    Not simply ``bos_token_id``: Phi-4-mini declares one that add_special_tokens
-    never emits, and forcing it in would give DPO a leading token that MLX's own
-    SFT and ORPO paths, and TRL's DPOTrainer, all leave out. Asking the
-    tokenizer keeps the two objectives on one policy per model.
+    Not ``bos_token_id``: Phi-4-mini declares one it never emits, and forcing that
+    in gives DPO a leading token MLX's SFT and ORPO, and TRL's DPOTrainer, omit.
     """
     bos_id = getattr(tokenizer, "bos_token_id", None)
     if bos_id is None:
@@ -439,17 +422,12 @@ def _encode_dpo_branches(
 ):
     """Tokenize the prompt and each completion apart, as TRL's DPOTrainer does.
 
-    ORPO re-tokenizes prompt and completion together and folds a merged
-    boundary token back into the completion; DPO never sees the pair, so a
-    prompt ending mid-token simply splits there.
+    ORPO tokenizes the pair together and folds a merged boundary token back into
+    the completion; DPO never sees the pair, so a mid-token prompt splits there.
     """
     prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
-    # The completions below are encoded without automatic special tokens, so say
-    # the same for the prompt rather than leaning on the shared default: a
-    # tokenizer that closes with its own EOS would otherwise land one between
-    # the prompt and a completion encoded apart from it. Re-adding a missing BOS
-    # keeps MLX's existing policy, and is what TRL's own ORPO does through
-    # add_bos_token_if_needed.
+    # add_special_tokens=False for the prompt too, or a tokenizer closing with its
+    # own EOS lands one between prompt and completion. The BOS is re-added below.
     prompt_ids = [int(x) for x in encode_mlx_text(
         tokenizer, prompt_text, add_special_tokens=False,
     )]
@@ -474,11 +452,9 @@ def _encode_dpo_branches(
 def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
     """Refuse an ORPO row whose two prompt encodings disagree beyond a merge.
 
-    ORPOTrainer.tokenize_row allows the last prompt token to move, because a
-    tokenizer can merge it with the first token of the answer, and nothing
-    beyond that. It compares over the pair and separately bounds the length
-    gap; comparing over the overlap and bounding the gap here accepts exactly
-    the same rows, without depending on zip's strict= raising for us.
+    ORPOTrainer.tokenize_row lets only the last prompt token move, since a
+    tokenizer may merge it with the answer's first. Comparing over the overlap and
+    bounding the gap accepts the same rows without relying on zip's strict=.
     """
     overlap = min(len(chosen_prompt_ids), len(rejected_prompt_ids))
     different = sum(
@@ -501,9 +477,8 @@ def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
 def _require_preference_fields(row):
     if not isinstance(row, Mapping):
         raise ValueError("Unsloth MLX preference: each dataset row must be a mapping.")
-    # prompt is no longer required: TRL's DPO and ORPO both map
-    # maybe_extract_prompt first, so a row that names only its two completions
-    # recovers its prompt rather than being refused.
+    # prompt is optional: TRL's DPO and ORPO both maybe_extract_prompt first, so a
+    # row naming only its completions recovers a prompt instead of being refused.
     missing = {"chosen", "rejected"} - set(row)
     if missing:
         raise ValueError(
@@ -524,9 +499,8 @@ def tokenize_preference_row(
 ):
     """Tokenize one row and preserve a shared prompt boundary.
 
-    ``rendered`` passes back a ``prepare_preference_row`` result the caller
-    already has: a chat template may carry state, so rendering twice is not
-    guaranteed to give the same text.
+    ``rendered`` reuses a ``prepare_preference_row`` result the caller already has:
+    a chat template may carry state, so two renderings need not agree.
     """
     prompt_text, chosen_text, rejected_text = (
         prepare_preference_row(tokenizer, row) if rendered is None else rendered
@@ -538,10 +512,8 @@ def tokenize_preference_row(
         )
         rejected_prompt = list(chosen_prompt)
     else:
-        # A prompt the row left implicit is recovered as a character prefix, so
-        # it lands mid-token often enough that verifying the tokens before the
-        # boundary would refuse rows ORPOTrainer trains on. It steps back one
-        # token and asks no more, so ask no more here either.
+        # A recovered prompt lands mid-token often, so step back one token and
+        # ask no more, as build_tokenized_answer does.
         chosen = _encode_mlx_prompt_completion(
             tokenizer, prompt_text, chosen_text, append_eos=append_eos,
             step_back=True,
@@ -554,22 +526,14 @@ def tokenize_preference_row(
         if not all(
             text.startswith(prompt_text) for text in (chosen_text, rejected_text)
         ):
-            # One branch can leave the prompt earlier than the other, and both
-            # mask the same prompt, so neither keeps more than both prove shared.
+            # Both mask one prompt, so neither keeps more than both prove shared.
             boundaries = [min(boundaries)] * 2
         chosen_prompt = list(chosen.input_ids[:boundaries[0]])
         rejected_prompt = list(rejected.input_ids[:boundaries[1]])
         chosen_response = list(chosen.input_ids[boundaries[0]:])
         rejected_response = list(rejected.input_ids[boundaries[1]:])
-        # Stepping back one token mirrors build_tokenized_answer, but that is
-        # only half of what ORPOTrainer does: it then refuses a row whose two
-        # prompt encodings differ by more than the single token a merge can
-        # move. Without this, two materially different prefixes reach the loss
-        # and ORPO compares the responses as though they shared one context.
-        # This runs on the boundaries as finally resolved, not the raw pair: a
-        # branch that leaves the prompt early is clipped to the shared minimum
-        # just above, and judging it before that would refuse rows whose two
-        # prompts end up identical.
+        # Without this two different prefixes reach the loss as one context. On the
+        # resolved boundaries: judging before the clip refuses rows that agree.
         _reject_diverging_orpo_prompts(chosen_prompt, rejected_prompt)
     if not chosen_response or not rejected_response:
         raise ValueError(
@@ -590,11 +554,8 @@ def tokenize_preference_row(
         rejected_prompt, rejected_response = _truncate_dpo_branch(
             rejected_prompt, rejected_response, length_policy,
         )
-    # A response token is only scoreable if something precedes it to predict
-    # from. ORPO averages a branch's log probability over that branch alone, so
-    # one unscoreable branch makes the whole row meaningless; DPO only ever sums
-    # it, and an unscoreable branch cancels against the reference, leaving the
-    # other branch's gradient intact. So DPO needs one scoreable branch, ORPO both.
+    # A response token needs something before it. ORPO averages per branch, so one
+    # bad branch voids the row; DPO sums and it cancels against the reference.
     unscoreable = [
         len(prompt) + len(response) < 2 or not response
         for prompt, response in (
@@ -610,11 +571,8 @@ def tokenize_preference_row(
             "max_length or lower max_prompt_length if the length budget cut it "
             "down; otherwise the row itself is too short to train on."
         )
-    # A prompt bound above max_length turns ORPO's answer cut into a tail cut,
-    # which can leave the row wider than the batch. Materializing that would
-    # silently drop the response tokens past the width, and once the prompt
-    # alone is wider it would report a prompt longer than the row, masking the
-    # response out of the loss entirely.
+    # A prompt bound above max_length turns ORPO's answer cut into a tail cut that
+    # can outrun the width, silently masking the response out of the loss.
     kept = max(
         len(chosen_prompt) + len(chosen_response),
         len(rejected_prompt) + len(rejected_response),
@@ -641,8 +599,7 @@ def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
     completion to merge with. Not the generation engine's own encoder either,
     which omits the special tokens training adds.
     """
-    # Recover an implicit prompt here too, so a row without a prompt column
-    # samples the same prompt it trains against instead of failing to render.
+    # Recover here too, so a row with no prompt column samples what it trains on.
     prompt_text, _, _ = prepare_preference_row(tokenizer, row)
     return encode_generation_prompt_text(
         tokenizer, prompt_text,
@@ -817,10 +774,8 @@ def create_preference_batch_plan(
             )
         rendered = None
         if prompt_sink is not None:
-            # Render once and hand the SAME text to both the sampler and the
-            # tokenizer: a stateful chat template need not render twice alike.
-            # The prompt given to the sampler is the recovered one, so a row
-            # without a prompt column samples what it trains against.
+            # One rendering for the sampler and the tokenizer alike: a stateful
+            # chat template need not render the same text twice.
             rendered = prepare_preference_row(tokenizer, row)
             prompt_sink(rendered[0])
         try:

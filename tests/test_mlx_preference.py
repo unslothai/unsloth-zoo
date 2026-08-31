@@ -335,9 +335,7 @@ def test_sft_and_preference_share_boundary_merge_tolerance():
 def test_sft_rejects_a_prompt_mismatch_before_the_boundary():
     from unsloth_zoo.mlx.utils import _tokenize_mlx_prompt_completion
 
-    # SFT tokenizes the prompt from the same text it re-tokenizes, so a
-    # mismatch earlier than the last token is a real error rather than a
-    # boundary that has to land mid-token.
+    # SFT re-tokenizes the same text, so an early mismatch is a real error.
     with pytest.raises(ValueError, match="differ before the final prompt token"):
         _tokenize_mlx_prompt_completion(
             MappingTokenizer({"abc": [1, 2, 3], "abcd": [9, 2, 4, 5]}),
@@ -348,9 +346,8 @@ def test_sft_rejects_a_prompt_mismatch_before_the_boundary():
 def test_orpo_steps_back_one_token_the_way_trl_does():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
-    # ORPOTrainer.build_tokenized_answer drops one prompt token whenever the
-    # prompt is not a token prefix and verifies nothing further, which is what
-    # keeps a recovered prompt that lands mid-token trainable.
+    # build_tokenized_answer drops one prompt token when the prompt is not a token
+    # prefix and checks no further, which keeps a mid-token recovery trainable.
     tokenizer = MappingTokenizer(
         {
                 "abc": [1, 2, 3],
@@ -371,10 +368,8 @@ def test_orpo_steps_back_one_token_the_way_trl_does():
 def test_orpo_refuses_two_prompts_that_disagree_beyond_a_merge():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
-    # One differing prompt token is a tokenizer merge, which the test above
-    # keeps trainable. Two is not reachable that way: the branches would be
-    # answering different contexts, and ORPOTrainer.tokenize_row refuses the
-    # row rather than averaging across them.
+    # Two differing prompt tokens is not a merge: the branches answer different
+    # contexts, and ORPOTrainer.tokenize_row refuses rather than average them.
     tokenizer = MappingTokenizer(
         {
             "abc": [1, 2, 3],
@@ -426,14 +421,10 @@ def resolved(kind="dpo", **kwargs):
 @pytest.mark.parametrize(
     "kind,options,chosen,rejected,row",
     [
-        # DPO caps the prompt keep-end and each completion keep-start, then
-        # truncates the pair, eating a response head only once its prompt is gone.
         ("dpo", dict(max_prompt_length=5, max_completion_length=3),
          ((-5, None), (None, 3)), ((-5, None), (None, 3)), LONG_ROW),
         ("dpo", dict(max_length=8),
          ((0, 0), (-8, None)), ((-3, None), (None, None)), LONG_ROW),
-        # ORPO caps both prompts against the longer response whichever branch
-        # carries it, then cuts by max_length minus the prompt bound.
         ("orpo", dict(max_length=14, max_prompt_length=8),
          ((-8, None), (None, 6)), ((-8, None), (None, 6)), LONG_ROW),
         ("orpo", dict(max_length=14, max_prompt_length=8),
@@ -452,8 +443,6 @@ def test_truncation_follows_each_trl_trainer(kind, options, chosen, rejected, ro
 @pytest.mark.parametrize(
     "kind,row,options,message",
     [
-        # A cut inside the prompt, a lone token in one branch or in both, and a
-        # bound whose tail cut overflows the batch; one lone branch stops ORPO.
         ("dpo", {"prompt": PROMPT, "chosen": CHOSEN, "rejected": CHOSEN[::-1]},
          dict(max_length=15, truncation_mode="keep_start"), "anything before it to predict from"),
         ("dpo", {"prompt": "", "chosen": "y", "rejected": "n"},
@@ -484,9 +473,6 @@ def test_the_length_guards_refuse_only_untrainable_rows(kind, row, options, mess
 @pytest.mark.parametrize(
     "kind,overrides,expected,warning",
     [
-        # ORPO spends max_length minus the prompt bound on the answer, so it
-        # cannot leave either open and clamping max_length to the batch width
-        # brings its prompt bound down too, where DPO's caps the prompt alone.
         ("orpo", dict(max_length=None), (512, 512), "is not set"),
         ("orpo", dict(max_prompt_length=None), (1024, 128), "is not set"),
         ("dpo", dict(max_length=None, max_prompt_length=None, max_seq_length=300),
@@ -529,13 +515,11 @@ def test_an_inherited_max_length_says_it_narrowed_the_budget():
     said = resolve(2048, explicit=False)
     assert len(said) == 1 and "budgeted more tightly" in said[0]
     assert "max_prompt_length=None" in said[0]
-    # ORPO has already turned an open prompt bound into 128, so telling an ORPO
-    # caller to pass None would cap their prompts rather than widen them.
+    # ORPO already made an open prompt bound 128, so advising None would cap
+    # their prompts rather than widen them.
     orpo = resolve(2048, explicit=False, kind="orpo")
     assert len(orpo) == 1 and "max_prompt_length=None" not in orpo[0]
     assert "resolves to 128" in orpo[0]
-    # A value the caller chose is theirs to mean, and a width the budget already
-    # fills has nothing to report.
     assert resolve(2048, explicit=True) == []
     assert resolve(1024, explicit=False) == []
 
@@ -550,7 +534,6 @@ def test_orpo_says_what_an_open_prompt_bound_costs_only_when_it_matters():
         Tokenizer(), {"prompt": "ab", "chosen": "cd", "rejected": "ef"},
         length_policy=open_bound,
     )
-    # One that overruns used to negate the None inside a slice.
     with pytest.raises(ValueError, match="cannot be left open here"):
         tokenize_preference_row(
             Tokenizer(),
@@ -562,8 +545,6 @@ def test_orpo_says_what_an_open_prompt_bound_costs_only_when_it_matters():
 @pytest.mark.parametrize(
     "row,expected",
     [
-        # The prompt is the common prefix less its joining space. It splits on
-        # whole messages, and a wrong-kind prompt is re-derived.
         ({"chosen": "The sky is blue.", "rejected": "The sky is green."},
          ("The sky is", " blue.", " green.")),
         ({"prompt": "Q1", "chosen": TURN + [ANSWER], "rejected": TURN + [OTHER]},
@@ -579,9 +560,7 @@ def test_an_implicit_prompt_is_recovered_the_way_trl_recovers_it(row, expected):
 
 
 def test_dpo_tokenizes_the_prompt_and_each_completion_the_way_trl_does():
-    # DPO never tokenizes the pair the way ORPO does, so a prompt recovered from
-    # plain text -- a character prefix, so mid-token here -- splits there rather
-    # than the row being refused.
+    # DPO never tokenizes the pair, so a mid-token recovery splits, not refuses.
     tokenized = tokenize(
         {"chosen": "foobar", "rejected": "foobaz"}, max_length=16,
         tokenizer=MappingTokenizer({"fooba": [1, 2], "foobar": [3], "foobaz": [4],
@@ -610,8 +589,8 @@ SCRIPTED_ROW = {
 
 
 def test_orpo_scans_for_the_boundary_only_once_the_prompt_stops_being_a_prefix():
-    # Neither branch still starts with the rendered prompt, so verifying every
-    # token but the last would refuse a row that only has to split earlier.
+    # Neither branch still starts with the rendered prompt, so verifying all but
+    # the last token would refuse a row that only has to split earlier.
     tokenized = tokenize(
         SCRIPTED_ROW, "orpo", append_eos=False, max_length=8, max_prompt_length=4,
         tokenizer=TemplateScriptTokenizer(["abc", "aXY", "aXZ"]),
@@ -622,8 +601,7 @@ def test_orpo_scans_for_the_boundary_only_once_the_prompt_stops_being_a_prefix()
 
 
 def test_orpo_keeps_only_the_boundary_both_branches_prove_shared():
-    # One branch still starts with the rendered prompt and the other does not,
-    # so the two boundaries disagree and both prompts stop at the lower one.
+    # The boundaries disagree, so both prompts stop at the lower.
     tokenized = tokenize(
         SCRIPTED_ROW, "orpo", append_eos=False, max_length=8, max_prompt_length=4,
         tokenizer=TemplateScriptTokenizer(["ab", "abc", "aXc"]),
@@ -634,8 +612,7 @@ def test_orpo_keeps_only_the_boundary_both_branches_prove_shared():
 
 
 def test_dpo_clips_the_prompt_to_what_both_branches_still_agree_with():
-    # The clip lands mid-token, which is exactly what DPO tolerates and what
-    # keeping the whole rendered prompt would turn into an empty response.
+    # Mid-token clip: what DPO tolerates, and what the whole prompt would empty.
     tokenizer = TemplateScriptTokenizer(
         ["abXc", "abXd", "abXe"], merges=("Xc", "Xd", "Xe"),
     )
@@ -714,8 +691,8 @@ def test_an_explicit_partial_assistant_turn_is_finished_by_its_completions():
 def test_a_recovered_prompt_never_absorbs_its_completions():
     from unsloth_zoo.mlx.preference import tokenize_preference_row
 
-    # The prompt was recovered from the completions, so its final assistant
-    # message is a whole turn rather than one the completions continue.
+    # A recovered prompt's final assistant message is a whole turn, not one the
+    # completions continue.
     tokenizer = CapturingTokenizer()
     tokenize_preference_row(
         tokenizer,

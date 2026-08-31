@@ -1350,10 +1350,8 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
-        # The preference configs default max_length to TRL's 1024, which is below
-        # the usual max_seq_length, so a run that predates those fields would be
-        # budgeted more tightly than before without ever saying so. Record whether
-        # the caller chose the value so the resolver can tell the two apart.
+        # max_length defaults to TRL's 1024, below the usual max_seq_length, so a
+        # run predating these fields silently narrows. Record the caller's intent.
         self._unsloth_mlx_max_length_explicit = "max_length" in provided
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
@@ -6010,10 +6008,8 @@ class MLXTrainer:
                     max_new_tokens=args.generation_max_tokens,
                 )
             except ValueError:
-                # A recovered prompt is empty when the two completions differ at
-                # the first character. That row still trains; it just has nothing
-                # to sample from, so give the slot back and keep filling the
-                # quota rather than failing the whole evaluation pass.
+                # A recovered prompt is empty when the completions differ at
+                # character 0. That row still trains, so free the slot, do not fail.
                 budget[0] -= 1
                 return
             _generation_source.append((split_name,) + encoded)
