@@ -1349,15 +1349,15 @@ def raw_gather_qmm(monkeypatch):
 
 @metal_only
 @pytest.mark.parametrize("case, expected", [
-    (dict(k=96), (_K_REM,)),                               # K % 64 != 0
-    (dict(k=64, rows=32769), (_ROW_OVF,)),                 # one row past the bound
-    (dict(k=96, rows=32769), (_K_REM, _ROW_OVF)),          # cheaper probe reported first
-    (dict(k=96, sorted_indices=False), ()),                # the flag selects the kernel
-    (dict(k=96, lhs_indices=_U(64, 1)), ()),               # both sides: mlx drops it
-    (dict(k=96, rhs_indices=None, lhs_indices=_U(64, 1)), ()),   # lhs-only, transposed
-    (dict(k=96, m=2), ()),                                 # dispatcher needs M == 1
-    (dict(k=96, stream=_CPU), ()),                         # no Metal kernel from a CPU
-    (dict(k=192, out_width=96, transpose=False), (_K_REM,)),     # the gradient's width
+    (dict(k=96), (_K_REM,)),
+    (dict(k=64, rows=32769), (_ROW_OVF,)),
+    (dict(k=96, rows=32769), (_K_REM, _ROW_OVF)),
+    (dict(k=96, sorted_indices=False), ()),
+    (dict(k=96, lhs_indices=_U(64, 1)), ()),
+    (dict(k=96, rhs_indices=None, lhs_indices=_U(64, 1)), ()),
+    (dict(k=96, m=2), ()),
+    (dict(k=96, stream=_CPU), ()),
+    (dict(k=192, out_width=96, transpose=False), (_K_REM,)),
     (dict(k=192, out_width=96, pack_bits=8, bits=None, mode="mxfp8", transpose=False),
      (_K_REM,)),
     ({**_UNTRANSPOSED, "rows": 32769, "rhs_indices": _U(1)}, (_ROW_OVF,)),
@@ -1365,9 +1365,7 @@ def raw_gather_qmm(monkeypatch):
     ({**_UNTRANSPOSED, "lhs_indices": _U(4096, 8)}, ()),
 ])
 def test_gather_qmm_guard_predicate(case, expected):
-    """Bounds spelled out, not derived from the constant they pin. The gradient cases
-    broadcast against indices mlx implies from the other operand: 4097 lhs over 8
-    experts is 32776 rows, and 4096 x 8 overlapping axes is 32768, not 262144."""
+    """4097 lhs indices over 8 experts broadcast to 32776 rows; 4096 x 8 is 32768."""
     assert (mlx_utils._MLX_MAX_SORTED_ROWS, mlx_utils._MLX_K_REMAINDER) == (32768, _K_REM)
     x, w, kw = _gather_qmm_call(**case)
     assert mlx_utils._gather_qmm_conditions(x, w, (), kw) == expected
@@ -1377,9 +1375,7 @@ def test_gather_qmm_guard_predicate(case, expected):
 @pytest.mark.parametrize("mode, group_size",
                          [("affine", 32), ("mxfp4", 32), ("mxfp8", 32), ("nvfp4", 16)])
 def test_gather_qmm_canary_probes_the_real_kernel(mode, group_size, monkeypatch, raw_gather_qmm):
-    """Magnitude is no oracle alone -- affine, or the unsorted path, measures just as
-    small here -- and a probe widened to an aligned K never fires at all. `bits` stays
-    omitted as callers omit it; mlx resolves mxfp8 to 8 bits where the rest are 4."""
+    """Magnitude alone is no oracle: the unsorted path measures just as small."""
     probe_k, rows = mlx_utils._gather_qmm_probe_k, mlx_utils._MLX_PROBE_ROWS
     k, row_k = probe_k(_K_REM, group_size), probe_k(_ROW_OVF, group_size)
     assert k % 64 and k % group_size == 0 and k >= 96 and probe_k(_K_REM, 64) is None
@@ -1392,7 +1388,6 @@ def test_gather_qmm_canary_probes_the_real_kernel(mode, group_size, monkeypatch,
     assert (seen["mode"], seen["bits"], seen["sorted_indices"]) == (mode, None, True)
     assert mx.array_equal(seen["rhs_indices"], mx.sort(seen["rhs_indices"])).item()
     assert (error < 0.25 or error > 4.0) and mlx_utils._MLX_CANARY_ERROR_LIMIT == 1.0
-    # NaN reads as corrupt, and the verdict is this mode's and this device's alone.
     monkeypatch.setattr(mlx_utils, "_gather_qmm_canary_error", lambda *a: float("nan"))
     assert mlx_utils._gather_qmm_canary_defective(_K_REM, group_size, None, mode, dev)
     assert [*mlx_utils._MLX_GATHER_QMM_CANARIES] == [(_K_REM, group_size, None, mode, str(dev))]
@@ -1401,10 +1396,9 @@ def test_gather_qmm_canary_probes_the_real_kernel(mode, group_size, monkeypatch,
 @metal_only
 @pytest.mark.parametrize("defective", [False, True])
 def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gather_qmm):
-    """Injects the verdict, not corruption, which would test the threshold on a fiction."""
+    """Injects the verdict, not corruption."""
     seen = {}
     monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL", lambda *a, **kw: seen.update(kw))
-    # Both trip, only the row probe fires: consulting the first alone keeps the flag.
     monkeypatch.setattr(mlx_utils, "_gather_qmm_canary_error",
                         lambda c, *a: 99.0 if defective and c == _ROW_OVF else 0.0)
     scales = mx.zeros((8, 64, 3), dtype=mx.bfloat16)
@@ -1419,15 +1413,14 @@ def test_gather_qmm_reroutes_only_when_defective(defective, monkeypatch, raw_gat
 
 @metal_only
 def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
-    """The index-stop wrapper removes itself by inspecting whatever sits on `mx`, so the
-    guard must end up beneath it even when a model loads mid-training."""
+    """The guard must end up beneath the index-stop wrapper, even mid-training."""
     monkeypatch.setenv("UNSLOTH_MLX_GATHER_QMM_GUARD", "0")
     assert mlx_utils.apply_gather_qmm_nax_guard() is False
     monkeypatch.delenv("UNSLOTH_MLX_GATHER_QMM_GUARD")
     mlx_utils.acquire_mlx_training_patches()
     try:
         assert mlx_utils.apply_gather_qmm_nax_guard() is True
-        assert mlx_utils.apply_gather_qmm_nax_guard() is False   # idempotent
+        assert mlx_utils.apply_gather_qmm_nax_guard() is False
         assert mx.gather_qmm._unsloth_index_original._unsloth_gather_qmm_guard
     finally:
         mlx_utils.release_mlx_training_patches()
@@ -1442,16 +1435,7 @@ def test_gather_qmm_guard_install(monkeypatch, raw_gather_qmm):
                                      "_gather_qmm_target_device"])
 def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
                                                       raw_gather_qmm):
-    """Reading a call is not worth failing it.
-
-    This wrapper stands on a core mlx op, so anything the predicate raises would break
-    calls plain mlx handles. The reachable cause is an mlx older than the signatures the
-    predicate asks for: `mx.quantize(bits=None, mode=...)` needs 0.29.4, while `.[core]`
-    floors mlx at 0.22.0, so `pip install -U unsloth_zoo --no-deps` over an older mlx
-    reaches the untransposed branch and raises TypeError out of `mx.gather_qmm` itself.
-    Those versions also predate the NAX kernels entirely, so declining to guard there
-    costs no protection.
-    """
+    """Not worth failing a call: the mlx that raises here predates the NAX kernels."""
     monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_UNREADABLE", False)
     seen = {}
     monkeypatch.setattr(mlx_utils, "_MLX_GATHER_QMM_ORIGINAL",
@@ -1465,6 +1449,5 @@ def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
     assert mlx_utils._gather_qmm_guarded(
         x, w, mx.zeros((8, 64, 3), dtype=mx.bfloat16), None, group_size=32,
         **kw) == "result"
-    # Untouched, not rerouted: an unreadable call is passed through exactly as given.
     assert seen["sorted_indices"] is True
     assert mlx_utils._MLX_GATHER_QMM_UNREADABLE is True   # warns once, not per call

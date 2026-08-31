@@ -534,42 +534,27 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted right-hand-side `gather_qmm` -- the MoE expert projection, entered every
-# training step through SwitchGLU -- dispatches on neural-accelerator Metal GPUs to
-# `*_gather_qmm_rhs_nax`, which corrupts its output without raising: the unaligned-K
-# tail bounds the activation tile by the block size rather than the K remainder
-# (ml-explore/mlx#3887, open), and rows past 32768 wrap negative through a `short`
-# narrowing and are never written (ml-explore/mlx#3856, fixed by #3922 on main).
-# `sorted_indices` only selects that kernel, so it is dropped for calls a probe has
-# measured as affected: healthy machines keep the fast path, and the guard retires
-# itself once mlx ships fixed kernels. Kill switch: UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Sorted `gather_qmm` silently corrupts its output on neural-accelerator Metal GPUs:
+# unaligned K (ml-explore/mlx#3887, open) and rows past 32768 (ml-explore/mlx#3856,
+# fixed by #3922). `sorted_indices` is only a dispatch hint, so dropping it where a
+# probe measures corruption is safe. Kill switch: UNSLOTH_MLX_GATHER_QMM_GUARD=0.
 _MLX_MAX_SORTED_ROWS = 32768
-# Healthy bf16 rounding measures ~0.06; corruption lands at output magnitude.
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
 _MLX_ROW_OVERFLOW = "row_overflow"
-# Both clear the kernel's own selection rule (one output row per matmul, >= 16 rows,
-# >= 4 per expert); the overflow count is unaligned, which is what reaches the cast.
 _MLX_PROBE_ROWS = {_MLX_K_REMAINDER: 64, _MLX_ROW_OVERFLOW: _MLX_MAX_SORTED_ROWS + 1}
 _MLX_PROBE_EXPERTS = 8
 _MLX_PROBE_OUT_DIM = 64
-# One degenerate group, where mlx's sorted nvfp4 path is already wrong without a
-# neural accelerator; probing there would arm healthy machines.
+# Below this, nvfp4 degenerates to one group that mlx gets wrong even without a NAX.
 _MLX_MIN_PROBE_K = 96
 _MLX_GATHER_QMM_ORIGINAL = None
 _MLX_GATHER_QMM_CANARIES = {}
 _MLX_GATHER_QMM_DEFAULTS = {}
-# Set once if reading a call ever fails, so the warning does not repeat per call.
 _MLX_GATHER_QMM_UNREADABLE = False
 
 
 def _gather_qmm_probe_k(condition, group_size):
-    """Probe width for `condition`, or None when it is out of reach.
-
-    K is a whole number of groups, so a group size that is itself a multiple of 64
-    leaves no K remainder -- for the probe or for any real call. The overflow probe
-    needs the opposite, an aligned K, to isolate the row bound.
-    """
+    """Probe width, or None: a 64-multiple group size leaves no K remainder to probe."""
     if condition == _MLX_ROW_OVERFLOW:
         return math.lcm(group_size, 64)
     if group_size % 64 == 0:
@@ -581,9 +566,7 @@ def _gather_qmm_probe_k(condition, group_size):
 
 
 def _gather_qmm_canary_error(condition, group_size, bits, mode, device) -> float:
-    """`gather_mm` is the float32 reference: its NAX kernel bounds both tiles by the K
-    remainder and takes its row minimum in `int`, carrying neither defect. Gathering
-    rather than materializing `weights[indices]` keeps it small at 32769 rows."""
+    """`gather_mm` is the reference: its NAX kernel carries neither defect."""
     with mx.stream(mx.default_stream(device)):
         rows = _MLX_PROBE_ROWS[condition]
         k = _gather_qmm_probe_k(condition, group_size)
@@ -592,7 +575,7 @@ def _gather_qmm_canary_error(condition, group_size, bits, mode, device) -> float
             (_MLX_PROBE_EXPERTS, _MLX_PROBE_OUT_DIM, k), key=keys[0]).astype(mx.bfloat16)
         quantized = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
         wq, scales = quantized[0], quantized[1]
-        biases = quantized[2] if len(quantized) > 2 else None  # float formats have none
+        biases = quantized[2] if len(quantized) > 2 else None
         x = (mx.random.normal((rows, 1, k), key=keys[1]) * 0.5).astype(mx.bfloat16)
         indices = mx.sort(mx.random.randint(
             0, _MLX_PROBE_EXPERTS, (rows,), key=keys[2]).astype(mx.uint32))
@@ -608,9 +591,7 @@ def _gather_qmm_canary_error(condition, group_size, bits, mode, device) -> float
 
 
 def _gather_qmm_canary_defective(condition, group_size, bits, mode, device) -> bool:
-    """Affine and the float formats compile to different kernels carrying different
-    defects, and a verdict measured on one device says nothing about another, so each
-    is probed once. Keyed by device name: mlx devices hash by identity, not value."""
+    """Keyed by device name: mlx devices hash by identity, not value."""
     if _gather_qmm_probe_k(condition, group_size) is None:
         return False
     key = (condition, group_size, bits, mode, str(device))
@@ -623,9 +604,10 @@ def _gather_qmm_canary_defective(condition, group_size, bits, mode, device) -> b
     try:
         max_error = _gather_qmm_canary_error(condition, group_size, bits, mode, device)
     except Exception as error:
-        # Uncached and answered defensively: an unusable probe proves nothing, and
-        # rerouting a healthy call costs throughput where admitting a corrupt one
-        # costs gradients. A later call re-probes.
+        # Fails CLOSED, unlike the pass-through in `_gather_qmm_guarded`: an unusable
+        # probe proves nothing, and rerouting a healthy call only costs throughput
+        # where admitting a corrupt one costs gradients. Uncached, so a later call
+        # re-probes.
         print(f"Unsloth: sorted gather_qmm {condition} probe failed ({error}); "
               f"rerouting this call.")
         return True
@@ -638,10 +620,7 @@ def _gather_qmm_canary_defective(condition, group_size, bits, mode, device) -> b
 
 
 def _gather_qmm_resolved_quantization(bits, mode):
-    """The group size and bit width mlx picks when the caller names neither. Asked of
-    mlx, not inferred: quantization groups along the last axis, so a scales tensor
-    reveals the group size only for transposed weights, and both defaults vary by
-    mode (mxfp8 is 8 bits, the rest 4)."""
+    """Asked of mlx: scales reveal the group size only for transposed weights."""
     cached = _MLX_GATHER_QMM_DEFAULTS.get((bits, mode))
     if cached is not None:
         return cached
@@ -663,8 +642,7 @@ def _gather_qmm_quantization(args, kwargs):
 
 
 def _gather_qmm_target_device(kwargs):
-    """Where the call runs: mlx takes a stream, device or device type, and falls back
-    to the default device, which need not be where this call was sent."""
+    """mlx takes a stream, device or device type here."""
     stream = kwargs.get("stream")
     if stream is None:
         return mx.default_device()
@@ -673,9 +651,7 @@ def _gather_qmm_target_device(kwargs):
 
 
 def _gather_qmm_gradient_rows(x, w, lhs_indices, rhs_indices):
-    """The gradient's input is the forward's output, whose batch axes mlx builds by
-    broadcasting the two index arrays, filling an absent one in from the batch axes of
-    whichever operand it would have indexed. Asked of mlx so its rules decide here."""
+    """mlx fills an absent index side in from the operand it would have indexed."""
     left = lhs_indices.shape if lhs_indices is not None else x.shape[:-2]
     right = rhs_indices.shape if rhs_indices is not None else w.shape[:-2]
     batch = mx.broadcast_shapes(tuple(left), tuple(right))
@@ -683,16 +659,9 @@ def _gather_qmm_gradient_rows(x, w, lhs_indices, rhs_indices):
 
 
 def _gather_qmm_conditions(x, w, args, kwargs):
-    """Defects this call is exposed to, empty when it misses the kernel.
-
-    Positional layout after the positional-only `(x, w)`: scales, biases, lhs_indices,
-    rhs_indices, transpose, group_size, bits, mode. `sorted_indices` is keyword-only.
-
-    The answer is per-geometry, so it has to be re-derived per geometry. Under
-    `mx.compile` it is: a changed shape misses the trace cache and runs this again.
-    A `shapeless=True` trace would not, and would freeze one call's answer onto every
-    later one -- the sorted flag is baked into the traced primitive.
-    """
+    """Defects this call is exposed to, empty when it misses the kernel. Re-derived
+    per geometry: a `shapeless=True` trace would instead freeze one call's answer onto
+    every later one, since the sorted flag is baked into the traced primitive."""
     if not kwargs.get("sorted_indices"):
         return ()
     if _gather_qmm_target_device(kwargs).type != mx.gpu:
@@ -703,24 +672,16 @@ def _gather_qmm_conditions(x, w, args, kwargs):
     # mlx records the sorted flag only when exactly one index side is given.
     if (lhs_indices is None) == (rhs_indices is None):
         return ()
-    # The dispatcher takes this kernel at one output row per matmul, and the gradient
-    # inherits that count, so a wider -- prefill-shaped -- call reaches it from neither
-    # direction. The two batch heuristics beside it are marked for retuning upstream
-    # and are deliberately not mirrored; this one is structural.
+    # The kernel is dispatched at one output row per matmul; the gradient inherits it.
     if x.shape[-2] != 1:
         return ()
     conditions = []
     if transpose:
-        # The forward reaches the kernel only as an rhs-indexed gather; an lhs-indexed
-        # one misses it and its gradient arrives untransposed. mlx passes the kernel
-        # `x.size() / K` from the caller's own x, before broadcasting.
         if rhs_indices is None:
             return ()
         k, rows = x.shape[-1], x.size // x.shape[-1]
     else:
-        # The forward misses, but the VJP re-issues it transposed, rhs-indexed and
-        # still sorted, whichever side the caller indexed. It contracts over the
-        # forward's output width, which mlx derives from the packed weight.
+        # The forward misses, but the VJP re-issues it transposed, rhs-indexed, sorted.
         bits = args[6] if len(args) > 6 else kwargs.get("bits")
         mode = args[7] if len(args) > 7 else kwargs.get("mode", "affine")
         k = w.shape[-1] * 32 // _gather_qmm_resolved_quantization(bits, mode)[1]
@@ -739,18 +700,13 @@ def _gather_qmm_guarded(x, w, *args, **kwargs):
         if conditions:
             group_size, bits, mode = _gather_qmm_quantization(args, kwargs)
             device = _gather_qmm_target_device(kwargs)
-            # Either defect alone corrupts the result; the cheaper probe is tried first.
             if any(_gather_qmm_canary_defective(condition, group_size, bits, mode,
                                                 device)
                    for condition in conditions):
                 kwargs = dict(kwargs, sorted_indices=False)
     except Exception as error:
-        # Failing to READ a call is not a reason to fail the call. This wrapper stands
-        # on a core mlx op, so an exception here breaks calls plain mlx handles fine.
-        # The reachable cause is an mlx older than the signatures the predicate asks
-        # for -- `quantize(bits=None, mode=...)` needs 0.29.4, and `.[core]` floors mlx
-        # at 0.22.0 -- which is also an mlx generations older than the NAX kernels, so
-        # there is nothing there to guard. Warn once, then behave as the unpatched op.
+        # Failing to READ a call is not a reason to fail it: this stands on a core mlx
+        # op, and the reachable cause is an mlx predating the NAX kernels. Pass through.
         if not _MLX_GATHER_QMM_UNREADABLE:
             _MLX_GATHER_QMM_UNREADABLE = True
             print(f"Unsloth: could not inspect this gather_qmm call "
@@ -759,14 +715,12 @@ def _gather_qmm_guarded(x, w, *args, **kwargs):
     return _MLX_GATHER_QMM_ORIGINAL(x, w, *args, **kwargs)
 
 
-# Set directly, not through `wraps`: that copies __dict__, and the index-stop wrapper
-# identifies its own wrappers by attribute, so inherited markers would make its
-# removal restore the wrong callable.
+# Not `wraps`: copied __dict__ markers make the index-stop removal restore the wrong callable.
 _gather_qmm_guarded._unsloth_gather_qmm_guard = True
 
 
 def is_gather_qmm_nax_guard_applied() -> bool:
-    """True when the guard is anywhere in the chain, index-stop wrapper included."""
+    """True for the guard anywhere in the chain, index-stop wrapper included."""
     current = mx.gather_qmm
     while current is not None:
         if getattr(current, "_unsloth_gather_qmm_guard", False):
@@ -776,12 +730,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 
 
 def apply_gather_qmm_nax_guard() -> bool:
-    """Install the reroute on `mx.gather_qmm`. Idempotent and thread-safe.
-
-    The guard must end up UNDER the index-stop wrapper, which removes itself by
-    inspecting whatever sits on `mx`; installed on top it would bury that wrapper's
-    marker and strand it for the process.
-    """
+    """Idempotent, thread-safe, and installed UNDER the index-stop wrapper, which
+    removes itself by inspecting `mx` and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
     if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
         return False
@@ -793,15 +743,12 @@ def apply_gather_qmm_nax_guard() -> bool:
                 and current is not _MLX_GATHER_QMM_ORIGINAL
                 and getattr(current, "_unsloth_index_original", None)
                 is not _MLX_GATHER_QMM_ORIGINAL):
-            # Capturing an opaque wrapper would make the guard reachable from its own
-            # original, and every call would recurse until the stack ran out.
+            # Capturing an opaque wrapper makes the guard reachable from its original.
             print("Unsloth: mx.gather_qmm was replaced by an unrecognized wrapper; "
                   "leaving the NAX guard as it stands.")
             return False
         if getattr(current, "_unsloth_index_stop_gradient", False):
-            # One assignment. Taking the index stop down and putting it back would
-            # unwrap every index op process-wide, and ordinary calls hold no lock, so
-            # a concurrent trainer could execute a raw one in that window.
+            # One assignment: removing the index stop would unwrap every index op.
             _MLX_GATHER_QMM_ORIGINAL = current._unsloth_index_original
             mx.gather_qmm = _wrap_mlx_index_op("gather_qmm", _gather_qmm_guarded)
         else:
