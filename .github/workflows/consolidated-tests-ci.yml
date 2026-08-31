@@ -59,29 +59,48 @@ jobs:
       # Four interpreters on one runner. Each `id` exposes python-path, which is how
       # a lane addresses an interpreter that is no longer the one on PATH -- only the
       # last of these wins PATH, and that is fine because no lane uses it.
+      #
+      # None of them carries `cache: 'pip'`, and none should. All four interpreters
+      # share one `~/.cache/pip` on the runner, so four cache-enabled steps do not
+      # cache four things: they save the identical directory four times under four
+      # python-version keys. Observed on main 2026-08-23, where the 3.10 and 3.11
+      # entries were byte-identical at 2011216266 and 3.13 differed by 1524 bytes
+      # -- 3.7 GiB of exact duplicates, against a 20 GiB repo ceiling. (3.12 looked
+      # small only because repo-tests-cpu had already written that key four minutes
+      # earlier and the duplicate save was skipped; same-key saves are
+      # first-writer-wins.)
+      #
+      # One restore for the whole job, from the pip-cache pair below, which also
+      # keeps the save on main. It lands in the shared directory ahead of the
+      # install step, so every lane reads the wheels of every interpreter from it.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py310
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py311
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py312
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py313
         with:
           python-version: '3.13'
-          cache: 'pip'
+
+      # After all four interpreters, before the one step that installs. The lanes
+      # install `.[core]`, so pyproject.toml is what describes their downloads.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: collect
+          key-files: |
+            pyproject.toml
 
       - name: Install and collect on every interpreter (concurrently)
         env:
@@ -112,7 +131,7 @@ jobs:
           }
 
           # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
-          # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+          # satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
           lane() {
             version="$1"; interpreter="$2"
             venv=".lanes/venv-$version"
@@ -149,6 +168,17 @@ jobs:
           lane 3.13 "$PY313"
           wait
           echo "all four lanes finished"
+
+      # Immediately after the install, not at the end of the job. A composite step
+      # with no `if:` is SKIPPED once an earlier step has failed, so the action's
+      # own always() only covers steps between the restore and here. Placed after
+      # the lanes, the wheels are saved whenever they were actually downloaded --
+      # including when the next step exits 1 because one interpreter failed.
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: What each interpreter said
         if: always()
@@ -195,10 +225,16 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: repo-tests
+          key-files: |
+            pyproject.toml
 
       - name: Install runtime + test deps
-        # --no-deps unsloth satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
@@ -206,6 +242,12 @@ jobs:
           pip install -e .[core]
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3 pyyaml==6.0.2
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: pytest tests/security (HARD GATE)
         run: python -m pytest tests/security -v
@@ -282,6 +324,7 @@ jobs:
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
+            tests/test_mlx_trainer_internals.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -355,7 +398,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # One restore for both venvs: they share the runner's pip cache even though
+      # they must not share an environment.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: mlx-lanes
+          key-files: |
+            pyproject.toml
 
       - name: Build both environments (concurrently)
         run: |
@@ -423,6 +474,12 @@ jobs:
             [ "$rc" = "0" ] || { echo "::error::$id environment could not be built (status $rc)"; exit 1; }
           done
 
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
+
       - name: Assert the real MLX runtime is what got installed
         # All the MLX files importorskip mlx.core, and a module that skips
         # wholesale still exits 0, so without this the job could go green having
@@ -462,6 +519,19 @@ jobs:
           .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
           if grep -qiE '[0-9]+ skipped' out.txt; then
             echo "real mlx is installed but the numeric tests skipped"; exit 1
+          fi
+
+      - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
+        # Embedding identification, embed-scale resolution and probe cleanup are
+        # pure logic over a synthetic module tree: real mlx, no Metal, no
+        # downloads. The metal_only half skips here and runs on the mlx job.
+        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+
+      - name: Fail if the NEFTune logic tests all skipped
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -q -rs | tee neftune.txt
+          if ! grep -qiE '[1-9][0-9]* passed' neftune.txt; then
+            echo "real mlx is installed but no NEFTune logic test ran"; exit 1
           fi
 
       - name: tests/test_mlx_rng_rewind.py (HARD GATE)
@@ -510,7 +580,7 @@ jobs:
       # Pure-Python protobuf parser; transformers' bundled *_pb2.py is rejected by C++ protobuf 4+/5+.
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
       UNSLOTH_COMPILE_DISABLE: '1'
-      # Secondary handshake after find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+      # Secondary handshake after the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
       UNSLOTH_IS_PRESENT: '1'
     steps:
       - name: Harden runner (audit)
@@ -526,7 +596,22 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # pyproject.toml only, even though the transformers/trl/peft specs for two
+      # of the three lanes are written inline below. Adding this workflow file to
+      # the key would roll the cache on every edit to it, including edits to the
+      # other three jobs and to comments -- and buy nothing, because a pip HTTP
+      # cache is addressed by URL and content hash and cannot serve the wrong
+      # wheel. Changing an inline spec just misses on the wheels that actually
+      # changed and still hits on the rest. The hash exists to roll the entry
+      # forward occasionally so stale wheels do not accumulate, not to protect
+      # correctness.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: core-drift
+          key-files: |
+            pyproject.toml
 
       - name: Run all three upstream pins (concurrently)
         run: |
@@ -626,6 +711,18 @@ jobs:
 
               if [ "$rc" -eq 0 ]; then
                 trc=0
+                # test_mxfp4_load_path_layout runs here, not in repo-tests-cpu, for
+                # two reasons. It is version-aware by construction -- red on 5.5.0
+                # and 5.16.x, skipped on 4.57.6 -- so it only means anything across
+                # more than one pin, and these lanes are the only ones that provide
+                # them. And its probe runs in a subprocess, which conftest does not
+                # reach, so it sets its own environment rather than relying on this
+                # job's `env`. The binding constraint there is find_spec("unsloth"),
+                # not the UNSLOTH_IS_PRESENT set below: unsloth is installed with
+                # `|| true` above, and unsloth_zoo raises on the missing spec before
+                # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
+                # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
+                # cannot turn these lanes red.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -640,6 +737,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_temporary_patches_exhaustive.py \
+                  tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \
@@ -660,6 +758,12 @@ jobs:
           wait
           echo "all three lanes finished"
           df -h / | tail -1
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: What each pin said
         if: always()

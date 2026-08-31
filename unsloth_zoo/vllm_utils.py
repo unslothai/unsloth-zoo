@@ -3832,7 +3832,19 @@ def _test_get_vllm_state_dict(
         VLLM_SUPPORTED_VLM = get_vllm_supported_vlm()
         if model_type in VLLM_SUPPORTED_VLM:
             import transformers
-            model_class = getattr(transformers, config.architectures[0])
+            from .empty_model import _is_known_architecture
+            # `model_type` and `architectures` are independent fields of the same
+            # downloaded config.json, so the check above constrains neither this
+            # `getattr` nor the `from_pretrained` call below it: a config declaring a
+            # supported model_type and `architectures: ["AutoTokenizer"]` resolves and
+            # invokes an unrelated transformers class. Same gate as create_empty_vision_model.
+            architecture = config.architectures[0]
+            if not _is_known_architecture(architecture):
+                raise ValueError(
+                    f"Unsloth: config.json declares architecture `{architecture}`, which "
+                    f"is not a model architecture transformers registers."
+                )
+            model_class = getattr(transformers, architecture)
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 

@@ -178,13 +178,15 @@ def _keep_norm_parameters_float32(model) -> None:
     if not needs_cast:
         return
 
-    model.update(tree_map_with_path(
+    casted = tree_map_with_path(
         lambda k, v: v.astype(mx.float32)
         if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
         parameters,
-    ))
-    mx.eval(model.parameters())
+    )
+    model.update(casted)
+    # Evaluating the whole tree would page every weight into one command buffer.
+    mx.eval([v for k, v in tree_flatten(casted) if is_mlx_norm_parameter_path(k)])
 
 
 def _seed_mlx_random_state(random_state):
@@ -2562,19 +2564,38 @@ _VLM_MODEL_FIXUPS = (
 
 
 def _disable_fused_mrope(model):
-    """Flip fused_apply off so MRoPE training uses the differentiable
-    cos/sin fallback; the fused Metal kernel has no VJP."""
-    count = 0
+    """The fused MRoPE Metal kernel has no VJP; training needs the cos/sin fallback."""
+    changed = []
     try:
         modules = model.modules()
     except Exception:
-        return
+        return changed
     for module in modules:
         if getattr(module, "fused_apply", False):
             module.fused_apply = False
-            count += 1
-    if count:
-        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {len(changed)} modules for training (no VJP).")
+    return changed
+
+
+def _disable_fused_input_projections(model):
+    """GLM-5.x linear attention concatenates the raw `.weight` of its six input
+    projections once and caches it: a LoRA wrapper has no `.weight` to read, and a
+    full fine-tune would keep the pre-training copy."""
+    changed = []
+    try:
+        modules = model.modules()
+    except Exception:
+        return changed
+    for module in modules:
+        if getattr(module, "fuse_in", False) and hasattr(module, "_fused_ready"):
+            module.fuse_in = False
+            module._fused_ready = False
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused input projections on {len(changed)} modules.")
+    return changed
 
 
 def _safe_getsource(obj) -> str:
@@ -2608,6 +2629,32 @@ def _get_mlx_lm_model_class(model_type: str):
     return getattr(module, "Model", None)
 
 
+_VLM_TEXT_PATH_MODEL_TYPES = frozenset({
+    "muse_glimmer",
+    # Hybrid linear-attention decoders mlx_lm has no class for. Both reproduce a
+    # fresh model bitwise across a width or batch change, so the position tensor
+    # qwen4_exp caches between calls never leaks into the next text batch.
+    "qwen4_exp",
+    "glm5_next",
+})
+
+
+def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
+    """Whether mlx-vlm's text path for this architecture is known to train.
+
+    Listed rather than inferred, because nothing readable before loading proves
+    it: mlx-vlm's encoder-decoder and masked-diffusion families declare the same
+    token-logit output as the causal ones, and the Qwen, GLM and Paddle towers
+    holding `_position_ids` across calls declare nothing about it. An unlisted
+    architecture keeps the mlx_lm "Model type ... not supported" it had before.
+    """
+    if not model_type:
+        return False
+    # Shared with utils' vision-grid family set so the two cannot disagree on spelling.
+    from .utils import _mlx_vlm_canonical_model_type
+    return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
+
+
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     """Whether a multimodal wrapper should stay on the VLM load path.
 
@@ -2615,6 +2662,11 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     stripping modality towers in `sanitize()`, meaning it reconstructs a
     different object graph than the checkpoint. Keeping the VLM path is more
     robust than a per-family sanitizer workaround.
+
+    Multimodal architectures also land in mlx-vlm before mlx_lm has them, or
+    without mlx_lm ever gaining them. mlx_lm cannot construct those at all, so
+    a text-only request loads the wrapper and trains its text tower rather than
+    failing with "Model type ... not supported".
     """
 
     if not _is_vlm(config):
@@ -2622,7 +2674,7 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 
     cls = _get_mlx_lm_model_class(model_type)
     if cls is None:
-        return False
+        return _mlx_vlm_text_path_is_verified(model_type)
 
     return _has_multimodal_strip_sanitize(cls)
 
@@ -5764,13 +5816,23 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
             "repo_id", "commit_message", "commit_description",
             "create_pr", "revision",
         ),
+        context="save_pretrained_merged",
     )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
-def _mlx_supported_kwargs(kwargs, supported):
-    """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
-    return {key: kwargs[key] for key in supported if key in kwargs}
+def _mlx_supported_kwargs(kwargs, supported, context=None):
+    """Keep CUDA-only kwargs out of MLX save/export APIs; `context` names the caller in the
+    warning, since a silently dropped save option misexports."""
+    kept = {key: kwargs[key] for key in supported if key in kwargs}
+    if context is not None:
+        dropped = sorted(set(kwargs) - set(kept))
+        if dropped:
+            warnings.warn(
+                f"Unsloth: {context} ignored unsupported argument(s) "
+                f"{', '.join(dropped)} on the MLX path."
+            )
+    return kept
 
 
 def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
@@ -5784,6 +5846,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
             "token", "private", "tags", "commit_message",
             "commit_description", "create_pr", "revision",
         ),
+        context="push_to_hub",
     )
     if save_directory is not None:
         _mlx_save_pretrained_merged(
@@ -5810,7 +5873,11 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion",))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "imatrix_file"),
+        context="save_pretrained_gguf",
+    )
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method, **kwargs)
 
@@ -5828,7 +5895,11 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion", "token", "private"))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "private", "imatrix_file"),
+        context="push_to_hub_gguf",
+    )
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 
@@ -5998,9 +6069,16 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
-    processor = getattr(self, "_tokenizer", None)
+    # A text-only multimodal load publishes an inner tokenizer that cannot drive
+    # mlx-vlm preprocessing. By presence, so a falsy processor is not replaced by it.
+    processor = getattr(self, "_processor", None)
     if processor is None:
-        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+        processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError(
+            "Unsloth MLX: VLM generate() requires model._processor or "
+            "model._tokenizer."
+        )
 
     inputs = {}
     if args:
@@ -8170,6 +8248,8 @@ class FastMLXModel:
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
+        # Adapters are invisible to a cached weight fusion.
+        _disable_fused_input_projections(model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):

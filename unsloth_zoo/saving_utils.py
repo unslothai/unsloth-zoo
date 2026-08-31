@@ -2705,7 +2705,12 @@ def prepare_saving(
     pass
 
     if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
-    assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
+    # `output_dtype` defaults to a value derived from the downloaded config.json and is
+    # interpolated into the generated `save_pretrained` source below, so this is the only
+    # thing pinning it to a real dtype. An `assert` disappears under `python -O`, which
+    # would leave the interpolation unguarded, so raise instead.
+    if output_dtype not in (torch.float32, torch.float16, torch.float64, torch.bfloat16):
+        raise ValueError(f"Unsloth: Unsupported output dtype `{output_dtype}`.")
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
 

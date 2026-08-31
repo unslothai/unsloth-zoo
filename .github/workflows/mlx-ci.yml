@@ -64,7 +64,14 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # `.[mlx]` plus a few inline pins; pyproject.toml is what moves.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: mlx
+          key-files: |
+            pyproject.toml
 
       - name: Install zoo with MLX extras
         # pyproject gates MLX deps on darwin+arm64; `.[mlx]` picks them up
@@ -85,6 +92,12 @@ jobs:
           # The vision model used by tests/test_mlx_generate_metal.py loads
           # remote processor code that imports timm, which .[mlx] does not pull.
           pip install timm
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: Adopt the newest MLX (detection leg only)
         # pyproject pins mlx and mlx-lm exactly so nobody installing unsloth_zoo is
@@ -178,6 +191,13 @@ jobs:
         # 8-bit first-moment numerics on Metal: the affine quantizer rounds
         # differently per backend, so the mlx-cpu job is not a substitute.
         run: python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+
+      - name: tests/test_mlx_neftune_quant_map.py
+        # NEFTune: quantization-map survival across the __class__ swap, VLM
+        # embedding identification, and the transformers-matched noise scale.
+        # The metal_only half needs real quantized models and a compiled step;
+        # the mlx_only half also runs on the Linux mlx-cpu job.
+        run: python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
 
       # The three VLM/shape/batching suites, also run on Linux CPU MLX by
       # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm

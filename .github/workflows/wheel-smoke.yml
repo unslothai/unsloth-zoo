@@ -97,7 +97,7 @@ jobs:
           PY
 
       - name: Import smoke (clean venv)
-        # unsloth_zoo/__init__.py:128 raises ImportError when parent `unsloth` is
+        # unsloth_zoo/__init__.py raises ImportError when parent `unsloth` is
         # absent (deliberate guardrail). A bare `import unsloth_zoo` in a wheel-only
         # venv will fail by design, so the smoke pivots to reading the version
         # string from dist-info METADATA via importlib.metadata.

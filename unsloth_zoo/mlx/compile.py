@@ -37,6 +37,7 @@ import mlx.core as mx
 import numpy as np
 import pkgutil
 import re
+import sys
 import textwrap
 from typing import Any, Callable, Iterable, Mapping
 
@@ -1397,18 +1398,19 @@ def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQual
     return tuple(qualifications)
 
 
-def _module_is_gated_delta(module) -> bool:
-    """Match gated-delta (GDN linear attention) layers structurally.
+def _defined_beside_gated_delta_update(module) -> bool:
+    """Mamba/SSM mixers carry the same gate-decay parameters but never bind it."""
+    return hasattr(sys.modules.get(type(module).__module__), "gated_delta_update")
 
-    Class-name + parameter check: GatedDeltaNet / Qwen3NextGatedDeltaNet /
-    Qwen3_5GatedDeltaNet / KimiDeltaAttention all contain "delta" and carry
-    the A_log + dt_bias pair. Mamba/SSM mixers carry the same parameters but
-    never the name, so they are deliberately not matched here.
-    """
+
+def _module_is_gated_delta(module) -> bool:
+    """Match gated-delta (GDN linear attention) layers structurally: most name
+    themselves after the recurrence, but GLM-5.x calls it `Glm5NextLinearAttention`."""
+    if not (hasattr(module, "A_log") and hasattr(module, "dt_bias")):
+        return False
     return (
         "delta" in type(module).__name__.lower()
-        and hasattr(module, "A_log")
-        and hasattr(module, "dt_bias")
+        or _defined_beside_gated_delta_update(module)
     )
 
 
@@ -1419,6 +1421,16 @@ def model_has_gated_delta_layers(model) -> bool:
     except Exception:
         return False
     return any(_module_is_gated_delta(module) for _, module in modules)
+
+
+def model_has_qwen35_attention_layers(model) -> bool:
+    """qwen4_exp reuses mlx-vlm's Qwen3.5 attention class under its own model_type."""
+    try:
+        modules = model.named_modules()
+    except Exception:
+        return False
+    return any(any(b.__name__ == "Qwen3_5Attention" for b in type(m).__mro__)
+               for _, m in modules)
 
 
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:

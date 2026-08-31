@@ -348,8 +348,8 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
     dir than the override) and raise ModuleNotFoundError, aborting the
     patcher before AST arch extraction + branding could run.
 
-    We assert the contract by replacing `_load_module_from_path` with a
-    sentinel that fails the test if called, then driving the patcher end-
+    We assert the contract by replacing the monolith-only arch extractor with
+    a sentinel that fails the test if called, then driving the patcher end-
     to-end with `UNSLOTH_LLAMA_CPP_SCRIPTS_DIR` set."""
     llama_cpp = _load_llama_cpp_module()
 
@@ -380,12 +380,12 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(root))
 
     # Sentinel: any call here means the patcher fell through to the
-    # module-load path on package layout, which is the bug we're guarding.
+    # monolith path on package layout, which is the bug we're guarding.
     called = {"hit": False}
     def _trap(*a, **kw):
         called["hit"] = True
-        raise AssertionError("monolith-only _load_module_from_path called on package layout")
-    monkeypatch.setattr(llama_cpp, "_load_module_from_path", _trap)
+        raise AssertionError("monolith-only arch extraction ran on package layout")
+    monkeypatch.setattr(llama_cpp, "_extract_archs_from_monolith_source", _trap)
 
     # Cache must be cleared between runs because @lru_cache(1) keys include
     # the resolved local_script_info -- but a stale entry from a previous
