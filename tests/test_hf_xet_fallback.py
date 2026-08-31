@@ -1263,11 +1263,11 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
     # is what makes the following retries safe to resume.
     seen = {"n": 0}
 
-    def _sizes(*a, **k):
+    def _names(*a, **k):
         seen["n"] += 1
-        return {"blob.incomplete": 1} if seen["n"] == 1 else {}
+        return {"blob.incomplete"} if seen["n"] == 1 else set()
 
-    monkeypatch.setattr(xf, "_active_incomplete_blob_sizes", _sizes)
+    monkeypatch.setattr(xf, "_incomplete_blob_names_strict", _names)
     fake = _install(
         monkeypatch,
         [("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
@@ -1290,7 +1290,7 @@ def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
-        xf, "_active_incomplete_blob_sizes", lambda *a, **k: {"blob.incomplete": 1}
+        xf, "_incomplete_blob_names_strict", lambda *a, **k: {"blob.incomplete"}
     )
     fake = _install(
         monkeypatch,
@@ -5728,3 +5728,34 @@ def test_the_verbatim_cas_fault_is_still_retryable_on_xet():
     )
     assert xf._is_retryable_download_error(cas, on_xet = True) is True
     assert xf._is_retryable_download_error(cas, on_xet = False) is False
+
+
+def test_uninspectable_cache_keeps_force_download_latched(monkeypatch):
+    """The un-latch must fail CLOSED. _active_incomplete_blob_sizes is fail-open by design (a
+    progress sensor must not abort a download over one unreadable blob), so an empty result from it
+    means "gone" and "could not look" alike. Releasing the guard on that answer would resume over a
+    sparse Xet partial on exactly the locked-down machines least able to recover from it."""
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    monkeypatch.setattr(xf, "_incomplete_blob_names_strict", lambda *a, **k: None)
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("crashed", "died"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert [c.force_download for c in fake.calls] == [False, True, True], (
+        "an uninspectable cache must not be read as proof the unsafe partial is gone"
+    )
+
+
+def test_strict_blob_scan_reports_failure_as_none(monkeypatch, tmp_path):
+    """The strict scan is the safety-critical twin of the fail-open sensor: it must distinguish
+    'nothing there' from 'could not look'."""
+    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([]))
+    assert xf._incomplete_blob_names_strict("model", "o/r", str(tmp_path)) == set()
+
+    def _boom(*a, **k):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", _boom)
+    assert xf._incomplete_blob_names_strict("model", "o/r", str(tmp_path)) is None

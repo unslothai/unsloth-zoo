@@ -604,6 +604,31 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
+def _incomplete_blob_names_strict(
+    repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
+) -> Optional[set]:
+    """``*.incomplete`` names for the repo, or ``None`` if the cache could not be inspected.
+
+    ``_active_incomplete_blob_sizes`` is deliberately fail-OPEN: it swallows per-file and outer
+    errors and returns whatever it managed to read, which is right for a progress sensor, where an
+    unreadable blob should not abort a download. It is wrong for a safety check, where an empty
+    result would then mean "gone" and "could not look" alike -- and the caller below releases a
+    guard on that answer. Same walk, fail-CLOSED: any error is reported as ``None``.
+    """
+    names: set = set()
+    try:
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            blobs_dir = entry / "blobs"
+            if not blobs_dir.is_dir():
+                continue
+            for blob in blobs_dir.iterdir():
+                if blob.name.endswith(INCOMPLETE_SUFFIX):
+                    names.add(blob.name)
+    except Exception:
+        return None
+    return names
+
+
 def _child_rss(pid: int) -> Optional[int]:
     """Resident bytes of child *pid*, or ``None`` when undeterminable.
 
@@ -2458,9 +2483,10 @@ def _download_with_xet_fallback(
     # can be handed back once that partial is provably gone.
     caller_force_download = params.get("force_download", False)
     forced_clean_redownload = False
-    # The exact unsafe partials seen at the transition. The latch is released only when NONE of them
-    # is still on disk -- see the un-latch branch below for why "a child ran" is not enough.
-    unsafe_partials: set = set()
+    # The exact unsafe partials seen at the transition, or None if the cache could not be read.
+    # The latch is released only when NONE of them is still on disk -- see the un-latch branch below
+    # for why "a child ran" is not enough, and why None must not count as "gone".
+    unsafe_partials: Optional[set] = set()
     # The Xet -> HTTP purge runs at the TRANSITION only. Repeating it per HTTP child would spare the
     # partial the failed HTTP child just wrote (it is younger than active_grace), leaving
     # has_active_incomplete_blobs true and forcing force_download, so every HTTP retry would restart
@@ -2534,9 +2560,10 @@ def _download_with_xet_fallback(
                 params = {**params, "force_download": True}
                 forced_clean_redownload = True
                 # Remember WHICH partials are unsafe, so the latch can be released on evidence.
-                unsafe_partials = set(
-                    _active_incomplete_blob_sizes(repo_type, repo_id, cache_dir)
-                )
+                # An uninspectable cache yields None, which keeps the latch on forever below --
+                # a clean re-download costs bandwidth, resuming over a sparse partial costs the blob.
+                seen = _incomplete_blob_names_strict(repo_type, repo_id, cache_dir)
+                unsafe_partials = seen if seen is not None else None
         elif disable_xet and forced_clean_redownload:
             # Release the latch only once every partial that was unsafe at the transition is gone.
             # "One HTTP child has run" is NOT proof it did: huggingface_hub unlinks the .incomplete
@@ -2544,17 +2571,23 @@ def _download_with_xet_fallback(
             # CDN this ladder exists for -- leaves the sparse Xet partial untouched. Handing the next
             # child force_download=False would then resume it, and an HTTP resume over a sparse Xet
             # partial finalizes a silently corrupt blob, which is what the purge above prevents.
-            still_unsafe = unsafe_partials & set(
-                _active_incomplete_blob_sizes(repo_type, repo_id, cache_dir)
+            # Fail closed on both halves: a scan that could not run (None, either now or at the
+            # transition) is not evidence of disappearance, so the latch stays on.
+            present = _incomplete_blob_names_strict(repo_type, repo_id, cache_dir)
+            still_unsafe = (
+                None if (unsafe_partials is None or present is None)
+                else (unsafe_partials & present)
             )
-            if not still_unsafe:
+            if still_unsafe is not None and not still_unsafe:
                 forced_clean_redownload = False
                 unsafe_partials = set()
                 params = {**params, "force_download": caller_force_download}
             else:
                 logger.debug(
-                    "Keeping force_download for '%s': %d unsafe partial(s) still present",
-                    label, len(still_unsafe),
+                    "Keeping force_download for '%s': %s",
+                    label,
+                    "cache not inspectable" if still_unsafe is None
+                    else f"{len(still_unsafe)} unsafe partial(s) still present",
                 )
 
         kind_result, payload = _run_download_attempt(
@@ -2655,8 +2688,10 @@ def _download_with_xet_fallback(
             # which is not a DownloadStallError -- so the caller logs "continuing with the normal
             # load" and hands a transport that just failed twice to the unguarded in-process path.
             # That is issue #1122's shape, one rung further along. Keep it inside the guard.
-            # Deliberately narrow: only when a transport fault is already established, so an ordinary
-            # unknown error on a healthy ladder still falls through as it does today.
+            # Scoped, not universal: only once Xet has ALREADY failed in a way that was held pending
+            # an HTTP rescue (a transport fault, a child crash, or an incomplete snapshot -- whatever
+            # set pending_needs_http_success). A ladder that started on HTTP, or one whose Xet rung
+            # was fine, still surfaces an unknown error exactly as it does today.
             if pending_needs_http_success and disable_xet:
                 type_name = payload.split(":", 1)[0].strip() if ":" in (payload or "") else ""
                 if _resolve_exception_class(type_name) is None:
