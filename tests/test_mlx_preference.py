@@ -110,6 +110,18 @@ class SpecialTokenizer(Tokenizer):
         return values
 
 
+class DeclaredOnlyBosTokenizer(Tokenizer):
+    """Declares a bos_token_id its add_special_tokens never emits.
+
+    Phi-4-mini is the real one: bos_token_id is set, but encoding with
+    add_special_tokens=True produces no BOS, so the model's own convention is
+    to have none. Asking the id alone would put one in for DPO only.
+    """
+
+    bos_token = None
+    bos_token_id = 7
+
+
 class TrailingSpecialTokenizer(SpecialTokenizer):
     """Also closes with its EOS, as tokenizers with add_eos_token set do."""
 
@@ -652,6 +664,34 @@ def test_the_dpo_prompt_keeps_its_bos_and_gains_no_trailing_special():
     )
     assert tokenized.chosen_prompt_ids == (tokenizer.bos_token_id,) + encoded("ab")
     assert tokenized.chosen_ids == encoded("cd")
+
+
+def test_dpo_adds_no_bos_the_tokenizer_itself_would_not_emit():
+    """A declared bos_token_id is not a promise the tokenizer emits one.
+
+    DPO encodes the prompt with add_special_tokens=False and re-adds the BOS,
+    so reading bos_token_id directly would give DPO a leading token that this
+    tokenizer's SFT and ORPO paths, and TRL's own DPOTrainer, all leave out --
+    the two objectives would then disagree on the same model.
+    """
+    tokenizer = DeclaredOnlyBosTokenizer()
+    rows = {"prompt": "ab", "chosen": "cd", "rejected": "ef"}
+    dpo = tokenize(rows, "dpo", tokenizer=tokenizer, append_eos=False,
+                   max_length=16)
+    orpo = tokenize(rows, "orpo", tokenizer=tokenizer, append_eos=False,
+                    max_length=16)
+    assert dpo.chosen_prompt_ids[0] != tokenizer.bos_token_id
+    assert dpo.chosen_prompt_ids == orpo.chosen_prompt_ids
+
+
+def test_dpo_still_adds_a_bos_the_tokenizer_does_emit():
+    """The converse: where add_special_tokens emits a BOS, DPO keeps it."""
+    tokenizer = SpecialTokenizer()
+    tokenized = tokenize(
+        {"prompt": "ab", "chosen": "cd", "rejected": "ef"}, "dpo",
+        tokenizer=tokenizer, append_eos=False, max_length=16,
+    )
+    assert tokenized.chosen_prompt_ids[0] == tokenizer.bos_token_id
 
 
 def test_an_explicit_partial_assistant_turn_is_finished_by_its_completions():

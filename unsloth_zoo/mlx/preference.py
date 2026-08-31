@@ -416,6 +416,24 @@ def _shared_prefix(prompt_text, *full_texts):
     return prompt_text[:shared]
 
 
+def _emitted_bos_id(tokenizer):
+    """The BOS this tokenizer's own add_special_tokens policy actually emits.
+
+    Not simply ``bos_token_id``: Phi-4-mini declares one that add_special_tokens
+    never emits, and forcing it in would give DPO a leading token that MLX's own
+    SFT and ORPO paths, and TRL's DPOTrainer, all leave out. Asking the
+    tokenizer keeps the two objectives on one policy per model.
+    """
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None:
+        return None
+    try:
+        probe = [int(x) for x in encode_mlx_text(tokenizer, "x")]
+    except Exception:
+        return None
+    return int(bos_id) if probe[:1] == [int(bos_id)] else None
+
+
 def _encode_dpo_branches(
     tokenizer, prompt_text, chosen_text, rejected_text, *, append_eos,
 ):
@@ -435,9 +453,9 @@ def _encode_dpo_branches(
     prompt_ids = [int(x) for x in encode_mlx_text(
         tokenizer, prompt_text, add_special_tokens=False,
     )]
-    bos_id = getattr(tokenizer, "bos_token_id", None)
-    if bos_id is not None and (not prompt_ids or prompt_ids[0] != int(bos_id)):
-        prompt_ids.insert(0, int(bos_id))
+    bos_id = _emitted_bos_id(tokenizer)
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
+        prompt_ids.insert(0, bos_id)
     eos_id = getattr(tokenizer, "eos_token_id", None)
 
     def response(text):
