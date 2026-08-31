@@ -2820,6 +2820,14 @@ def _download_with_xet_fallback(
                     f"{label}: download crashed, retrying "
                     f"(attempt {http_used + 1} of {http_budget})",
                 )
+                # HTTP has now died the same way, which settles what the held reason was waiting on:
+                # the incident hit both rungs and is not evidence against this machine's Xet. Drop it
+                # here rather than at the terminal exit, or a later HTTP retry succeeding flushes it
+                # and charges Xet for an incident that had simply passed. Same rule as the transient
+                # HTTP error branch above. A PROVEN stall is not unproven and survives.
+                if pending_needs_http_success:
+                    pending_xet_failure = None
+                    pending_needs_http_success = False
                 _wait_before_http_retry(cancel_event)
                 continue
             if pending_needs_http_success:

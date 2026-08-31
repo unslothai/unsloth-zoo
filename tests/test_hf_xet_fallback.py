@@ -6001,3 +6001,62 @@ def test_hub_short_download_error_spends_the_http_retry_budget():
     # A genuinely local OSError under the Xet cache stays terminal, which is the rule this sits in.
     local = PermissionError(13, "Permission denied", "/home/u/.cache/huggingface/xet/chunks")
     assert xf._is_retryable_download_error(local, on_xet = True) is False
+
+
+def _held_then_http(monkeypatch, first, http_first):
+    """Xet fails with *first*, HTTP then fails with *http_first*, and a later HTTP retry succeeds."""
+    outcomes = []
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "2")
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: False)
+    _install(monkeypatch, [first, http_first, ("ok", "/cache/x")])
+    return outcomes
+
+
+def test_an_http_crash_clears_an_unproven_xet_reason(monkeypatch):
+    """The symmetric case to the transient-HTTP-error branch, and it was missed.
+
+    Once HTTP has died the same way, the incident is shown to have hit both rungs, so it is not
+    evidence against this machine's Xet. Clearing only at the terminal exit meant a later HTTP retry
+    succeeding flushed the held reason and charged Xet, and two such downloads demote a healthy
+    machine to HTTP for 24 hours.
+    """
+    outcomes = _held_then_http(
+        monkeypatch, ("retryable_error", "503"), ("crashed", "exited (code=-9) without a result")
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert outcomes == [], "a fault both rungs met is not evidence against this machine's Xet"
+
+
+def test_an_http_crash_after_a_xet_crash_also_clears(monkeypatch):
+    """Same for a crash on both rungs."""
+    outcomes = _held_then_http(
+        monkeypatch, ("crashed", "exited (code=-9) without a result"),
+        ("crashed", "exited (code=-9) without a result"),
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert outcomes == []
+
+
+def test_an_http_crash_does_not_clear_a_proven_stall(monkeypatch):
+    """The counterpart that keeps the clearing honest: a stall the watchdog proved on this machine
+    is not unproven, so an HTTP crash afterwards must not discard it."""
+    outcomes = _held_then_http(
+        monkeypatch, ("stall", "no progress for 30s after 1.2 GB"),
+        ("crashed", "exited (code=-9) without a result"),
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert outcomes == [False], "the proven stall was dropped"
+
+
+def test_a_lone_xet_fault_rescued_by_http_is_still_charged(monkeypatch):
+    """And the control: with no matching HTTP failure, an HTTP success IS the proof that only the
+    Xet path was broken, so the tracker is charged exactly as before."""
+    outcomes = _held_then_http(
+        monkeypatch, ("retryable_error", "503"), ("ok", "/cache/x")
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    assert outcomes == [False]
