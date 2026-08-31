@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 """The ArraysCache.advance patch, on any platform.
 
 Everything that decides *whether* to rewrite a third-party class -- the body
@@ -54,9 +57,6 @@ def fresh(monkeypatch):
     return aim
 
 
-# --------------------------------------------------------------------------
-# The matcher
-# --------------------------------------------------------------------------
 
 
 def test_matcher_accepts_the_body_it_reproduces():
@@ -118,16 +118,12 @@ def test_matcher_rejects_reads_already_mediated_by_descriptors():
 
 
 def test_matcher_rejects_a_staticmethod_carrying_the_same_body():
-    # A plain attribute read unwraps staticmethod, so without an explicit check
-    # this compares a body that would be bound differently from the replacement.
+    # A plain read unwraps staticmethod, comparing a body bound differently from ours.
     cls = stock_bodied_cache()
     cls.advance = staticmethod(cls.advance)
     assert not engine._has_replaceable_advance(cls)
 
 
-# --------------------------------------------------------------------------
-# Installation
-# --------------------------------------------------------------------------
 
 
 def test_install_replaces_a_matching_class(fresh):
@@ -181,9 +177,8 @@ def test_a_failed_attempt_is_not_a_decision(fresh, monkeypatch):
     engine._install_arrays_cache_advance_fix()
     assert not engine._ARRAYS_CACHE_ADVANCE_RESOLVED
 
-    # Restore just the matcher. monkeypatch.undo() would also revert the module
-    # this fixture injected, leaving the retry with nothing to import and no way
-    # to tell "declined to latch" from "could not look".
+    # Not undo(): it reverts the injected module too, so the retry could not tell
+    # "declined to latch" from "nothing to look at".
     monkeypatch.setattr(engine, "_has_replaceable_advance", real_matcher)
     engine._install_arrays_cache_advance_fix()
     assert engine._ARRAYS_CACHE_ADVANCE_RESOLVED
@@ -198,9 +193,8 @@ def test_a_missing_mlx_lm_is_inert(fresh, monkeypatch):
 
 
 def test_mlx_vlm_vendored_cache_is_patched_too(fresh):
-    # mlx-vlm re-exports mlx-lm's class up to 0.5.x and vendors its own copy of
-    # this same body from 0.6.4, so patching mlx-lm alone leaves the vision batch
-    # path leaking on the range the pins allow.
+    # mlx-vlm vendors its own copy of this body from 0.6.4, which patching mlx-lm
+    # alone never reaches.
     text_cache = fresh(stock_bodied_cache())
     vision_cache = fresh(stock_bodied_cache(), "mlx_vlm.models.cache")
     sys.modules.setdefault("mlx_vlm", types.ModuleType("mlx_vlm"))
@@ -219,9 +213,6 @@ def test_mlx_vlm_is_not_imported_by_a_text_only_run(fresh, monkeypatch):
     assert "mlx_vlm" not in sys.modules
 
 
-# --------------------------------------------------------------------------
-# The deferred arithmetic
-# --------------------------------------------------------------------------
 
 
 def test_advance_defers_and_folds_on_read(fresh):
@@ -252,8 +243,7 @@ def test_writing_a_field_supersedes_its_pending_count(fresh):
 
 
 def test_advance_with_a_non_integer_step_keeps_stock_arithmetic(fresh):
-    # Stock accepts whatever the array subtraction accepts. A float cannot go in
-    # a Python counter, and deferring it would move the error to a later reader.
+    # A float cannot go in the counter, and deferring moves the error to a later reader.
     cls = fresh(stock_bodied_cache())
     engine._install_arrays_cache_advance_fix()
 
@@ -278,8 +268,7 @@ def test_a_cache_built_before_installation_keeps_its_metadata(fresh):
 
 
 def test_a_partly_installed_class_is_still_correct(fresh):
-    # The six class assignments are not atomic and readers do not take the lock,
-    # so every prefix of the installation has to leave the class usable.
+    # The class assignments are not atomic and readers do not take the lock.
     steps = [
         lambda c: setattr(c, "_lengths", None),
         lambda c: setattr(c, "_lengths_pending", 0),
@@ -299,9 +288,6 @@ def test_a_partly_installed_class_is_still_correct(fresh):
         assert (cache.lengths, cache.left_padding) == (7, 2), f"broken after {prefix} steps"
 
 
-# --------------------------------------------------------------------------
-# Ordering
-# --------------------------------------------------------------------------
 
 
 def test_generate_batch_installs_before_it_generates(monkeypatch):

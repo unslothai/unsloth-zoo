@@ -94,8 +94,7 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
         GenerationRequest(prompt="Two plus two equals", max_tokens=8),
     ]
     defaults = GenerationDefaults()
-    # The mlx-lm cache patch has to be installed before any decoding runs, so record
-    # the two calls in the order generate_batch makes them.
+    # The cache patch must be installed before any decoding runs.
     order = []
     real_install = generate_module._install_arrays_cache_advance_fix
     real_adapter_generate = generate_module._TextBatchAdapter.generate
@@ -295,16 +294,14 @@ def test_arrays_cache_advance_patch_only_replaces_the_body_it_reproduces():
     )
 
     _install_arrays_cache_advance_fix()
-    # Descriptors mediate these reads now, so the class is no longer a candidate and
-    # a second install must leave the ones already in place untouched.
+    # Descriptors now mediate these reads, so a second install must be a no-op.
     assert not _has_replaceable_advance(ArraysCache)
     installed = (ArraysCache.left_padding, ArraysCache.lengths)
     generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED = False
     _install_arrays_cache_advance_fix()
     assert (ArraysCache.left_padding, ArraysCache.lengths) == installed
 
-    # Candidacy follows the compiled body, so an advance that means something else is
-    # rejected however similar it reads.
+    # Candidacy follows the compiled body, however similar a different one reads.
     class Incrementing:
         lengths = left_padding = None
 
@@ -315,8 +312,7 @@ def test_arrays_cache_advance_patch_only_replaces_the_body_it_reproduces():
                 self.left_padding += N
 
     class Decrementing(Incrementing):
-        # Deciding candidacy must never construct or run the candidate, so a matcher
-        # that reached for an instance would trip this rather than pass quietly.
+        # A matcher that reached for an instance trips this instead of passing quietly.
         def __init__(self):
             raise AssertionError("candidacy must not instantiate the candidate")
 
@@ -366,8 +362,7 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     advances = [1] * 4000 + [2] * 4000
     for step in advances:
         cache.advance(step)
-    # Stock strands a live scalar buffer per field per call, which
-    # mx.clear_cache() cannot reclaim because it is active rather than cached.
+    # Stock strands a live scalar per field per call; clear_cache() cannot reclaim it.
     assert mx.get_active_memory() - before < len(advances)
     total = sum(advances)
     assert cache.left_padding.tolist() == [-total, 3 - total]
@@ -392,8 +387,7 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     batch.advance(5)
     assert batch.lengths is None and batch.left_padding is None
 
-    # A cache built before the patch keeps its metadata instead of losing it to
-    # the descriptors that now shadow those names.
+    # A pre-patch cache keeps its metadata despite the descriptors now shadowing it.
     legacy = ArraysCache(1)
     legacy.__dict__.clear()
     legacy.__dict__.update(cache=[None], left_padding=mx.array([2]), lengths=None)

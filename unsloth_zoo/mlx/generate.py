@@ -662,10 +662,8 @@ _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED = False
 def _adopt_deferred_metadata(cache):
     """Move a cache built before the patch onto the deferred slots.
 
-    Only a field the descriptors already mediate is moved. Installation assigns the
-    two properties one at a time, and a thread reading a cache in that window would
-    otherwise strip the field whose descriptor is not in place yet into a private
-    slot nothing reads, leaving ``cache.left_padding`` raising ``AttributeError``.
+    Mediated fields only: the two properties are installed one at a time, and moving
+    the other one mid-window would strip it into a slot nothing reads.
     """
 
     state = cache.__dict__
@@ -700,10 +698,8 @@ def _deferred_metadata(name):
 def _deferred_advance(self, N):
     _adopt_deferred_metadata(self)
     if not isinstance(N, int):
-        # Stock accepts whatever the array subtraction accepts, including a
-        # per-row array. That cannot go in a Python counter, and testing it for
-        # truth later would force the sync this patch exists to avoid, so keep
-        # the stock arithmetic for it.
+        # Stock takes anything the subtraction takes, including a per-row array;
+        # counting that would force the sync this patch exists to avoid.
         if self._lengths is not None:
             self.lengths = self.lengths - N
         if self._left_padding is not None:
@@ -715,10 +711,8 @@ def _deferred_advance(self, N):
         self._left_padding_pending += N
 
 
-# Compared against the installed mlx-lm, never installed, never called. Comparing the
-# compiled body and signature identifies the implementation this patch reproduces
-# without depending on source files or formatting, and separates it from one whose
-# `advance` means something else.
+# Never installed, never called: compiled body + signature identify the implementation
+# this patch reproduces, independent of source files and formatting.
 def _stock_advance(self, N):
     if self.lengths is not None:
         self.lengths -= N
@@ -745,9 +739,7 @@ def _has_replaceable_advance(arrays_cache):
         for name in ("lengths", "left_padding")
     ):
         return False
-    # A plain attribute read unwraps staticmethod and classmethod, so a candidate
-    # whose `advance` is not an ordinary method would be judged on a body that is
-    # bound differently from the one being installed.
+    # A plain read unwraps staticmethod, judging a body bound differently from ours.
     if not isinstance(
         inspect.getattr_static(arrays_cache, "advance", None), types.FunctionType
     ):
@@ -756,7 +748,7 @@ def _has_replaceable_advance(arrays_cache):
 
 
 def _install_deferred_metadata(arrays_cache):
-    """Put the deferred slots, descriptors and ``advance`` on one cache class."""
+    """Install the deferred slots, descriptors and ``advance`` on one cache class."""
 
     arrays_cache._lengths = None
     arrays_cache._lengths_pending = 0
@@ -764,8 +756,7 @@ def _install_deferred_metadata(arrays_cache):
     arrays_cache._left_padding_pending = 0
     arrays_cache.lengths = _deferred_metadata("lengths")
     arrays_cache.left_padding = _deferred_metadata("left_padding")
-    # Keep the replaced implementation reachable, and leave a marker, so a patched
-    # class is recognisable when someone is diffing behaviour against upstream.
+    # Marker + original, so a patched class is recognisable when diffing upstream.
     arrays_cache._unsloth_stock_advance = arrays_cache.advance
     arrays_cache.advance = _deferred_advance
     arrays_cache._unsloth_advance_patched = True
@@ -774,19 +765,14 @@ def _install_deferred_metadata(arrays_cache):
 def _install_arrays_cache_advance_fix():
     """Keep mlx-lm's ``ArraysCache.advance`` from stranding a Metal buffer per call.
 
-    ``advance`` rebinds ``lengths``/``left_padding`` with ``-=``, building an
-    unevaluated subtract whose integer operand is materialised as a scalar array that
-    owns a live buffer. The metadata is absent from ``ArraysCache.state``, and during
-    batched decoding only the cache owning the shared mask has its chain forced each
-    step, so every other linear-attention layer strands one buffer per token until
-    Metal refuses to allocate. Deferring the subtraction into a Python counter keeps
-    the arithmetic and allocates nothing until the value is read.
+    ``-=`` rebinds to an unevaluated subtract whose scalar operand owns a live buffer.
+    The metadata is absent from ``ArraysCache.state``, so during batched decode only
+    the mask-owning cache is forced and every other linear-attention layer strands one
+    buffer per token. A Python counter keeps the arithmetic and allocates nothing.
 
-    mlx-vlm is visited too. It re-exports mlx-lm's class up to 0.5.x, vendors its own
-    copy carrying this same body from 0.6.4, and only defers for itself from 0.6.17,
-    so on the pinned range the vision batch path leaks through a second class that
-    patching mlx-lm alone does not reach. It is visited only once it is already
-    imported, so a text-only run does not pull in an optional dependency.
+    mlx-vlm needs visiting separately: it re-exports mlx-lm's class up to 0.5.x, vendors
+    this same body from 0.6.4, and only defers for itself from 0.6.17. Visited only once
+    already imported, so a text-only run does not pull in an optional dependency.
     """
 
     global _ARRAYS_CACHE_ADVANCE_RESOLVED, _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED
@@ -801,7 +787,6 @@ def _install_arrays_cache_advance_fix():
             except Exception:
                 # A failed attempt is not a decision: retry on the next call.
                 return
-            # Any other body keeps stock.
             if replaceable:
                 _install_deferred_metadata(arrays_cache)
             seen.append(arrays_cache)
