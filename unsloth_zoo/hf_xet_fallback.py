@@ -2492,6 +2492,10 @@ def _download_with_xet_fallback(
     # force itself onto HTTP from the start.
     with _SPAWN_ENV_LOCK:
         disable_xet = xet_force_disabled()
+    # WHY Xet is off matters on the way out: a user-level disable is an env var the caller's
+    # in-process fallback inherits, while the health demotion below is internal to this module and
+    # leaves that fallback with Xet still ENABLED. See the terminal unknown-error wrap.
+    xet_disabled_by_user = disable_xet
 
     # Skip a doomed Xet attempt on a machine already known to be bad at it (too little RAM,
     # unreachable CAS, recent failures): the ladder still recovers, but the user would pay the full
@@ -2712,9 +2716,12 @@ def _download_with_xet_fallback(
             # rebuild an unknown class), which is not a DownloadStallError -- so the caller logs
             # "continuing with the normal load" and hands a twice-failed transport to the unguarded
             # in-process path: issue #1122 one rung further along. Keep it inside the guard.
-            # Scoped to a ladder that ALREADY fell back from Xet; keying it on
-            # pending_needs_http_success left a hole, since a PROVEN stall is held with that False.
-            if started_on_xet and disable_xet:
+            # Scoped by WHY Xet is off, not by whether this ladder used it. pending_needs_http_success
+            # left a hole (a PROVEN stall is held with it False); started_on_xet left another (the
+            # health tracker can demote a machine to HTTP before the ladder begins, and that demotion
+            # is internal, so the caller's in-process fallback still has Xet ENABLED). Only an
+            # explicit user disable is left alone: that one is an env var the fallback inherits.
+            if disable_xet and not xet_disabled_by_user:
                 type_name = payload.split(":", 1)[0].strip() if ":" in (payload or "") else ""
                 if _resolve_exception_class(type_name) is None:
                     raise DownloadTransportError(payload)

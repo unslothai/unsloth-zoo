@@ -6051,3 +6051,52 @@ def test_a_lone_xet_fault_rescued_by_http_is_still_charged(monkeypatch):
     )
     assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
     assert outcomes == [False]
+
+
+def _unknown_on_http(monkeypatch, *, health_demote = False, user_disable = False):
+    for var in ("UNSLOTH_DISABLE_XET", "HF_HUB_DISABLE_XET", "UNSLOTH_STABLE_DOWNLOADS"):
+        monkeypatch.delenv(var, raising = False)
+    if user_disable:
+        monkeypatch.setenv("UNSLOTH_DISABLE_XET", "1")
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "1")
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: False)
+    monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": None)
+    if health_demote:
+        demoted = _types.SimpleNamespace(use_xet = False, reason = "recent failures")
+        monkeypatch.setattr(xf, "_xet_health_or_none", lambda *a, **k: demoted)
+    else:
+        monkeypatch.setattr(xf, "_xet_health_or_none", lambda *a, **k: None)
+    script = [("error", "SomeBrandNewHubError: kaboom")]
+    if not (health_demote or user_disable):
+        script.insert(0, ("retryable_error", "503"))
+    _install(monkeypatch, script)
+
+
+def test_a_health_demotion_to_http_keeps_unknown_errors_inside_the_guard(monkeypatch):
+    """The health tracker can put a machine on HTTP before the ladder starts, and that demotion is
+    internal to this module. The caller's in-process fallback therefore still has Xet ENABLED, so
+    letting a bare RuntimeError escape there reproduces the unguarded hang this PR exists to stop.
+    Scoping the wrap by whether THIS ladder used Xet missed it."""
+    _unknown_on_http(monkeypatch, health_demote = True)
+    with pytest.raises(xf.DownloadStallError):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+
+
+def test_an_explicit_user_disable_still_surfaces_unknown_errors_unchanged(monkeypatch):
+    """The counterpart, and the reason the wrap is scoped rather than universal: a user-level
+    disable is an environment variable the in-process load inherits, so its fallback really is
+    Xet-free and can still be allowed to run. Wrapping here would turn a load that currently
+    succeeds into a hard failure."""
+    _unknown_on_http(monkeypatch, user_disable = True)
+    with pytest.raises(RuntimeError) as exc:
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
+    assert not isinstance(exc.value, xf.DownloadStallError)
+
+
+def test_falling_back_from_xet_still_keeps_unknown_errors_inside_the_guard(monkeypatch):
+    """Unchanged by the rescoping."""
+    _unknown_on_http(monkeypatch)
+    with pytest.raises(xf.DownloadStallError):
+        xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
