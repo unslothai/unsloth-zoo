@@ -5795,10 +5795,15 @@ def test_a_same_named_replacement_partial_releases_the_latch(monkeypatch):
     assert [c.force_download for c in fake.calls] == [False, True, False], (
         "a replacement partial is the forced child's own resumable work, not the unsafe one"
     )
-
-
 def test_blob_identity_scan_uses_the_inode(monkeypatch, tmp_path):
-    """Recreating the file under the same name yields a different identity on a real filesystem."""
+    """The scan reports an inode alongside the name, and the matcher never releases unsafely.
+
+    Deliberately NOT asserting that an unlink plus create always looks like a different file: the
+    kernel is free to hand the replacement the same inode, and a CI runner did exactly that. That
+    reuse is why the matcher is written to release only on evidence -- when the inode is reused the
+    identity matches, the partial reads as still present, and the latch stays on. Costing a clean
+    re-download is the right answer to an ambiguous filesystem; resuming is not.
+    """
     blobs = tmp_path / "blobs"
     blobs.mkdir()
     partial = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
@@ -5810,8 +5815,15 @@ def test_blob_identity_scan_uses_the_inode(monkeypatch, tmp_path):
     partial.write_bytes(b"defg")
     after = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
     assert {n for (n, _) in after} == {partial.name}
-    assert not xf._surviving_unsafe_partials(before, after), (
-        "an unlink plus create must not look like the same partial"
+    if before == after:
+        # Inode reused: ambiguous, so the latch must stay on.
+        assert xf._surviving_unsafe_partials(before, after) == before
+    else:
+        assert not xf._surviving_unsafe_partials(before, after)
+    partial.unlink()
+    gone = xf._incomplete_blob_identities("model", "o/r", str(tmp_path))
+    assert not xf._surviving_unsafe_partials(before, gone), (
+        "a vanished name is the one unambiguous proof of disappearance"
     )
 
 
