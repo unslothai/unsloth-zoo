@@ -33,9 +33,17 @@ import types
 
 import pytest
 
-_HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None
+from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
+
+# `find_spec("mlx")` alone answers "can mlx be imported", which is NOT the same
+# question once any sibling module has installed the torch shim: that registers
+# `mlx` in sys.modules and a finder in sys.meta_path, so the spec exists and this
+# file concludes it is on real MLX. It then runs the `requires_real_mlx` tests
+# against a shim where `mx.argpartition` is a `_Noop`. Whether that happens comes
+# down to collection order, which is why it surfaced only when a new sibling
+# sorting before this one began installing the shim at import.
+_HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
-    from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
