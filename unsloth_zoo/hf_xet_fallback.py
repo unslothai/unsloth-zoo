@@ -82,6 +82,7 @@ from unsloth_zoo.hf_cache_state import (
     _sentence_transformers_subfolder_incomplete,
     _weight_shard_index_complete,
     blob_bytes_present,
+    repo_cache_dir_name,
     has_active_incomplete_blobs,
     hf_cache_root,
     iter_active_repo_cache_dirs,
@@ -149,6 +150,11 @@ DEFAULT_HTTP_RETRY_BACKOFF = 5.0
 # ~49.7 days (``PY_TIMEOUT_MAX``) -- past it they raise OverflowError, which is NOT a
 # DownloadStallError and so escapes the caller's guard into the unguarded in-process load.
 _MAX_HTTP_RETRY_BACKOFF = 300.0
+# huggingface_hub's short-download error, raised as a bare EnvironmentError so nothing about its
+# TYPE says "network". See file_download.py's consistency_error_message.
+_HUB_CONSISTENCY_ERROR_RE = re.compile(
+    r"consistency check failed: file should be of size", re.IGNORECASE
+)
 
 # "The disk cannot take it" errnos, built defensively: CPython compiles each errno constant behind an
 # #ifdef, so which names exist is a platform property (EDQUOT reaches Windows only through a
@@ -631,9 +637,24 @@ def _incomplete_partial_names(
         root = hf_cache_root(cache_dir = cache_dir)
         if root is None:
             return None
-        # Deliberately allowed to raise: this is the probe the helpers below swallow.
-        list(root.iterdir())
-        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+        # The repo-dir selection is done HERE, off a single root listing, rather than through
+        # iter_active_repo_cache_dirs. That helper swallows OSError on its own root listing and on
+        # its case-collision probe, so a permission flap or a remount between two enumerations came
+        # back as "no repo dirs" and then as "no partials" -- the empty set that releases the guard.
+        # One listing, and every error out of it surfaces. The rule below mirrors
+        # _case_safe_repo_cache_dirs: prefer an exact-case match, accept a single folded match only
+        # on a case-insensitive filesystem, and attribute a 2+ way collision to neither repo.
+        target = repo_cache_dir_name(repo_type, repo_id)
+        folded_target = target.lower()
+        entries = [e for e in root.iterdir() if e.name.lower() == folded_target]
+        exact = [e for e in entries if e.name == target]
+        if exact:
+            repo_dirs = exact
+        elif len(entries) == 1 and (root / target).exists():
+            repo_dirs = entries
+        else:
+            repo_dirs = []
+        for entry in repo_dirs:
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
                 continue
@@ -1303,6 +1324,15 @@ def _is_retryable_download_error(exc: BaseException, *, on_xet: bool) -> bool:
     # reads as a transient transport fault -- the very case this rule exists to exclude. The network
     # subclasses stay retryable by type, which is also more robust than matching their wording.
     if _is_builtin_oserror(exc):
+        # One exception to the class rule, and it is not a local filesystem error at all:
+        # huggingface_hub raises a bare EnvironmentError (an alias of OSError) when a download ends
+        # at the wrong length, and says so itself -- "This is usually due to network issues while
+        # downloading the file. Please retry". A short response is precisely what the HTTP retry
+        # budget added by this PR is for, so deciding it by class alone would surface it immediately
+        # and never spend that budget. Matched on the Hub's own wording, which cannot collide with a
+        # filename the way the "xet" hint does.
+        if _HUB_CONSISTENCY_ERROR_RE.search(str(exc)):
+            return True
         return isinstance(exc, (ConnectionError, TimeoutError, BrokenPipeError, BlockingIOError))
     text = f"{name}: {exc}".lower()
     if any(hint in text for hint in _TRANSIENT_ERROR_HINTS):
@@ -2571,36 +2601,48 @@ def _download_with_xet_fallback(
                 )
                 params = {**params, "force_download": True}
                 forced_clean_redownload = True
-        elif disable_xet and forced_clean_redownload:
-            # Release the latch only once the repo has NO *.incomplete partial left at all.
-            # "One HTTP child has run" is not proof of that: huggingface_hub unlinks the .incomplete
-            # only after the HEAD/metadata call, so a child that died on a 5xx there -- the degraded
-            # CDN this ladder exists for -- leaves the sparse Xet partial untouched, and handing the
-            # next child force_download=False would resume it into a corrupt blob.
+        elif disable_xet:
+            # Re-read before EVERY later HTTP child, in both directions. Releasing once and never
+            # looking again was wrong: a concurrent Xet downloader can create a partial under the
+            # same blob name after the release -- typically while this child is still waiting on the
+            # blob lock -- and that child would then resume it unforced and finalize a corrupt blob.
             #
-            # Absence is the ONLY evidence used, deliberately. Judging a partial that is still there
-            # to be a safe prefix is not something the filesystem can support: the name cannot tell
-            # a sparse Xet partial from the resumable one huggingface_hub rewrites at the same path,
-            # the inode is unstable on overlayfs and FUSE caches and reusable after an unlink, and
-            # allocation metadata is worse still -- XFS unwritten extents report a partial with
-            # hundreds of megabytes of holes as fully allocated. Each of those was tried here and
-            # each released the guard on a real filesystem. The cost of not judging is that a
-            # partial the forced child itself wrote keeps the latch on, so the remaining retries
-            # re-download rather than resume. That is bandwidth; the alternative was the blob.
+            # Release only once the repo has NO *.incomplete left at all. "One HTTP child has run" is
+            # not proof of that: huggingface_hub unlinks the .incomplete only after the HEAD/metadata
+            # call, so a child that died on a 5xx there -- the degraded CDN this ladder exists for --
+            # leaves the sparse Xet partial untouched.
             #
-            # Re-read per child rather than compared against a set captured at the transition, so a
-            # partial that appears AFTER a release re-arms the guard.
+            # Absence is the ONLY evidence accepted, deliberately. Judging a partial that is still
+            # there to be a safe prefix is not something the filesystem can support: the name cannot
+            # tell a sparse Xet partial from the resumable one huggingface_hub rewrites at the same
+            # path, the inode is unstable on overlayfs and FUSE caches and reusable after an unlink,
+            # and allocation metadata is worse still, because XFS unwritten extents report a partial
+            # with hundreds of megabytes of holes as fully allocated. Each was tried here and each
+            # released the guard on a real filesystem. The cost is that a partial the forced child
+            # itself wrote also holds the latch, so the remaining retries re-download rather than
+            # resume. That is bandwidth; the alternative was the blob.
             present = _incomplete_partial_names(repo_type, repo_id, cache_dir)
-            if present is not None and not present:
-                forced_clean_redownload = False
-                params = {**params, "force_download": caller_force_download}
-            else:
-                logger.debug(
-                    "Keeping force_download for '%s': %s",
-                    label,
-                    "cache not inspectable" if present is None
-                    else f"{len(present)} partial(s) still present",
+            if forced_clean_redownload:
+                if present is not None and not present:
+                    forced_clean_redownload = False
+                    params = {**params, "force_download": caller_force_download}
+                else:
+                    logger.debug(
+                        "Keeping force_download for '%s': %s",
+                        label,
+                        "cache not inspectable" if present is None
+                        else f"{len(present)} partial(s) still present",
+                    )
+            elif present:
+                # Positive evidence only. An uninspectable cache leaves the guard as it was rather
+                # than forcing a clean re-download on every machine whose cache briefly cannot be
+                # read, which would be a heavy cost for no proof.
+                logger.warning(
+                    "Partial for '%s' appeared after the guard was released; forcing a clean "
+                    "HTTP re-download instead of an unsafe resume.", label
                 )
+                forced_clean_redownload = True
+                params = {**params, "force_download": True}
 
         kind_result, payload = _run_download_attempt(
             repo_id,
@@ -2705,11 +2747,13 @@ def _download_with_xet_fallback(
             # which is not a DownloadStallError -- so the caller logs "continuing with the normal
             # load" and hands a transport that just failed twice to the unguarded in-process path.
             # That is issue #1122's shape, one rung further along. Keep it inside the guard.
-            # Scoped, not universal: only once Xet has ALREADY failed in a way that was held pending
-            # an HTTP rescue (a transport fault, a child crash, or an incomplete snapshot -- whatever
-            # set pending_needs_http_success). A ladder that started on HTTP, or one whose Xet rung
-            # was fine, still surfaces an unknown error exactly as it does today.
-            if pending_needs_http_success and disable_xet:
+            # Scoped, not universal: only once the ladder has ALREADY fallen back from Xet. Keying
+            # this on pending_needs_http_success instead left a hole, because a PROVEN stall is held
+            # with that flag False: Xet child 1 stalls, the Xet retry faults without displacing the
+            # stall, HTTP then raises something unrecognized, and the bare RuntimeError escaped the
+            # guard on exactly the run that had already failed twice. A ladder that started on HTTP,
+            # or one whose Xet rung was fine, still surfaces an unknown error as it does today.
+            if started_on_xet and disable_xet:
                 type_name = payload.split(":", 1)[0].strip() if ":" in (payload or "") else ""
                 if _resolve_exception_class(type_name) is None:
                     raise DownloadTransportError(payload)
@@ -2739,6 +2783,13 @@ def _download_with_xet_fallback(
                     f"{label}: transient HTTP error, retrying "
                     f"(attempt {http_used + 1} of {http_budget})",
                 )
+                # HTTP has now met the SAME fault, which settles the question the held reason was
+                # waiting on: the incident was shared, not Xet-specific. Drop it here rather than at
+                # the terminal exit, because a later HTTP retry succeeding would otherwise flush it
+                # and charge Xet for a CDN that had simply recovered. A proven stall still survives.
+                if pending_needs_http_success:
+                    pending_xet_failure = None
+                    pending_needs_http_success = False
                 _wait_before_http_retry(cancel_event)
                 continue
             # Both rungs met the same transport fault: that is not evidence against this machine's

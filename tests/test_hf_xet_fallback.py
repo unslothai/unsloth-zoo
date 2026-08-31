@@ -5790,7 +5790,7 @@ def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, 
     place. Filtering them out empties the unsafe set and hands the next HTTP child a sparse partial
     to resume, which finalizes a silently corrupt blob. Real cache layout, real scan.
     """
-    blobs = tmp_path / "models--o--r" / "blobs"
+    blobs = tmp_path / xf.repo_cache_dir_name("model", DL_REPO) / "blobs"
     blobs.mkdir(parents = True)
     # Left by an earlier crashed run: not owned by this download's child, so the purge spares it.
     stale = blobs / f"deadbeef{xf.INCOMPLETE_SUFFIX}"
@@ -5800,9 +5800,6 @@ def test_a_partial_the_purge_could_not_scope_still_holds_the_latch(monkeypatch, 
         fh.seek(64 * 1024 * 1024 - 4)
         fh.write(b"tail")
     monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path)
-    monkeypatch.setattr(
-        xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
-    )
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     fake = _install(
@@ -5831,13 +5828,16 @@ def _sparse(path, size = 64 * 1024 * 1024):
     return path
 
 
-def _repo_cache(tmp_path, monkeypatch):
-    blobs = tmp_path / "models--o--r" / "blobs"
+def _repo_cache(tmp_path, monkeypatch, repo_id = "o/r"):
+    """A real cache layout for *repo_id*, with the scan pointed at it.
+
+    Deliberately a real directory tree rather than a stubbed iterator: the scan does its own
+    single-listing repo-dir selection so an OSError there cannot be swallowed, and stubbing that
+    out would silently stop exercising it.
+    """
+    blobs = tmp_path / xf.repo_cache_dir_name("model", repo_id) / "blobs"
     blobs.mkdir(parents = True)
     monkeypatch.setattr(xf, "hf_cache_root", lambda *a, **k: tmp_path)
-    monkeypatch.setattr(
-        xf, "iter_active_repo_cache_dirs", lambda *a, **k: iter([tmp_path / "models--o--r"])
-    )
     return blobs
 
 
@@ -5880,11 +5880,11 @@ def test_a_surviving_partial_holds_the_latch_however_whole_it_looks(tmp_path, mo
     installs a zero-filled file under its sha256 blob name with no error at all, because the HTTP
     path verifies size and not content.
     """
-    blobs = _repo_cache(tmp_path, monkeypatch)
+    blobs = _repo_cache(tmp_path, monkeypatch, DL_REPO)
     # Fully allocated, no holes, indistinguishable from a good prefix by any allocation test.
     whole = blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}"
     whole.write_bytes(b"x" * 4096)
-    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == {whole.name}
+    assert xf._incomplete_partial_names("model", DL_REPO, str(tmp_path)) == {whole.name}
 
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
@@ -5901,6 +5901,103 @@ def test_a_surviving_partial_holds_the_latch_however_whole_it_looks(tmp_path, mo
     assert all(http_forces), f"a surviving partial was handed to a resuming child: {http_forces}"
 
     whole.unlink()
-    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) == set(), (
+    assert xf._incomplete_partial_names("model", DL_REPO, str(tmp_path)) == set(), (
         "once nothing is left there is nothing to resume over, which is the one safe release"
     )
+
+
+def test_the_repo_dir_scan_fails_closed_when_the_root_flaps(tmp_path, monkeypatch):
+    """One root listing, and any error out of it is reported as unknown.
+
+    The scan used to probe the root and then hand the repo-dir selection to a helper that lists the
+    root AGAIN and swallows OSError. A permission flap or a FUSE/network remount between the two
+    listings therefore came back as "no repo dirs", then as "no partials" -- the empty set that
+    releases the guard and lets the next child resume a sparse partial.
+    """
+    blobs = _repo_cache(tmp_path, monkeypatch)
+    (blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}").write_bytes(b"x")
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) is not None
+
+    real_iterdir = pathlib.Path.iterdir
+    listings = {"n": 0}
+
+    def _counting(self):
+        if self == tmp_path:
+            listings["n"] += 1
+        return real_iterdir(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", _counting)
+    xf._incomplete_partial_names("model", "o/r", str(tmp_path))
+    assert listings["n"] == 1, (
+        f"the root must be enumerated exactly once, not {listings['n']} times; a second listing is "
+        "where the swallowed OSError used to turn a flap into an empty set"
+    )
+
+    def _boom(self):
+        if self == tmp_path:
+            raise OSError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", _boom)
+    assert xf._incomplete_partial_names("model", "o/r", str(tmp_path)) is None, (
+        "a root that stopped being readable is not evidence the partial was cleaned up"
+    )
+
+
+def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeypatch):
+    """The guard has to re-arm, not just release once.
+
+    A concurrent Xet downloader can create a partial under the same blob name after the guard
+    released, typically while this child is still waiting on the blob lock. Releasing permanently on
+    the first empty scan let that child resume it unforced and finalize a corrupt blob.
+    """
+    blobs = _repo_cache(tmp_path, monkeypatch, DL_REPO)
+    partial = blobs / f"aaaa{xf.INCOMPLETE_SUFFIX}"
+    partial.write_bytes(b"x" * 16)
+    monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
+    monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
+    monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "4")
+    monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
+
+    calls = {"n": 0}
+    real = xf._incomplete_partial_names
+
+    def _staged(*a, **k):
+        # Gone by the second HTTP child (the guard releases), then a sibling recreates it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            partial.unlink()
+        elif calls["n"] == 2:
+            partial.write_bytes(b"y" * 16)
+        return real(*a, **k)
+
+    monkeypatch.setattr(xf, "_incomplete_partial_names", _staged)
+    fake = _install(
+        monkeypatch,
+        [("retryable_error", "503"), ("retryable_error", "503"),
+         ("retryable_error", "503"), ("retryable_error", "503"), ("ok", "/cache/x")],
+    )
+    assert xf.hf_hub_download_with_xet_fallback(DL_REPO, FILE, None) == "/cache/x"
+    http_forces = [c.force_download for c in fake.calls if c.disable_xet]
+    assert http_forces[0] is True, "the first HTTP child re-downloads cleanly"
+    assert False in http_forces, "the guard must release once the partial is gone"
+    assert http_forces[-1] is True, (
+        f"a partial that reappeared after the release must re-arm the guard: {http_forces}"
+    )
+
+
+def test_hub_short_download_error_spends_the_http_retry_budget():
+    """huggingface_hub raises a bare EnvironmentError when a download ends at the wrong length, and
+    its own message says it is usually a network issue and to retry. Deciding builtin OSErrors by
+    class alone surfaced it immediately, so the HTTP retry budget this PR adds never applied to the
+    one failure it most obviously covers."""
+    msg = (
+        "Consistency check failed: file should be of size 100 but has size 40 (model.safetensors).\n"
+        "This is usually due to network issues while downloading the file. "
+        "Please retry with `force_download=True`."
+    )
+    assert xf._is_retryable_download_error(EnvironmentError(msg), on_xet = False) is True
+    # A genuinely local OSError under the Xet cache stays terminal, which is the rule this sits in.
+    local = PermissionError(13, "Permission denied", "/home/u/.cache/huggingface/xet/chunks")
+    assert xf._is_retryable_download_error(local, on_xet = True) is False
