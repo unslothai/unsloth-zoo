@@ -33,9 +33,22 @@ import types
 
 import pytest
 
-_HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None
-if not _HAS_REAL_MLX:
-    from mlx_simulation import simulate_mlx_on_torch
+from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch  # noqa: E402
+
+# Not "the import worked": several test modules install the MLX-on-torch shim into
+# sys.modules while being IMPORTED, and collection imports every module, so `mlx`
+# can already BE that shim by the time this file is reached. Gating on find_spec
+# alone then reads the shim as real, and the cases marked requires_real_mlx run
+# against it -- they need mx.checkpoint, a vjp that differentiates integer arrays,
+# and mlx_vlm's glm5_next, none of which the shim implements. That made the file
+# pass or fail on collection order: stable serially, where alphabetical order puts
+# no installer first, and not under `-n N --dist loadfile`, where worker assignment
+# decides. Same gate, and same reason, as test_mlx_neftune_quant_map.py.
+_SHIM_ALREADY_INSTALLED = mlx_is_simulated()
+_HAS_REAL_MLX = (
+    importlib.util.find_spec("mlx") is not None and not _SHIM_ALREADY_INSTALLED
+)
+if not _HAS_REAL_MLX and not _SHIM_ALREADY_INSTALLED:
     simulate_mlx_on_torch()
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
