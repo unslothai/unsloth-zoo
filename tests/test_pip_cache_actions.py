@@ -335,7 +335,13 @@ def _cache_writer_steps():
         for name, steps in _jobs(path):
             for step in steps:
                 yield f"{path.name}:{name}", step
-    for action in sorted((REPO / ".github" / "actions").rglob("action.yml")):
+    # Both spellings, for the same reason WORKFLOWS takes both: GitHub accepts
+    # `action.yaml` for composite-action metadata, and a scan for `action.yml`
+    # alone would let an unguarded writer live in one unseen.
+    actions_dir = REPO / ".github" / "actions"
+    for action in sorted(
+        p for ext in ("action.yml", "action.yaml") for p in actions_dir.rglob(ext)
+    ):
         doc = yaml.safe_load(action.read_text()) or {}
         for step in ((doc.get("runs") or {}).get("steps") or []):
             yield f"action {action.parent.name}", step
@@ -374,11 +380,23 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                     continue
                 label = f"{path.name}:{name}: {step.get('name') or 'save'}"
                 condition = " ".join(str(step.get("if", "")).split())
-                # The producer is the step whose OUTCOME the save is gated on. A
-                # `.outputs.` reference is not one: the checkpoint save reads
-                # `steps.hf-cache.outputs.cache-hit`, which is the RESTORE, and
-                # accepting that let the save sit above the step that fills the
-                # directory and still pass.
+                path_saved = str((step.get("with") or {}).get("path", "")).strip()
+
+                # The producer has to sit strictly BETWEEN the restore of the same
+                # path and this save. Anything looser is satisfiable by the wrong
+                # step: a `.outputs.` reference matched the restore's own
+                # `cache-hit`, and merely "some earlier step's .outcome" matches the
+                # restore too, so a save moved up next to the restore still passed
+                # while the directory was empty. Only a step in that window can be
+                # what filled it.
+                restore_at = max(
+                    (
+                        j for j, s in enumerate(steps[:i])
+                        if "actions/cache/restore@" in str(s.get("uses", ""))
+                        and str((s.get("with") or {}).get("path", "")).strip() == path_saved
+                    ),
+                    default=None,
+                )
                 producers = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outcome", condition))
                 if not producers:
                     offenders.append(
@@ -390,10 +408,16 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 if unknown:
                     offenders.append(f"{label} references unknown step id(s) {unknown}")
                     continue
-                late = sorted(p for p in producers if ids[p] > i)
-                if late:
+                lower = -1 if restore_at is None else restore_at
+                between = [p for p in producers if lower < ids[p] < i]
+                if not between:
+                    where = (
+                        f"after the restore at step {restore_at}"
+                        if restore_at is not None else "before it"
+                    )
                     offenders.append(
-                        f"{label} is gated on {late}, which run AFTER it, so it would "
-                        f"save the directory before those steps fill it"
+                        f"{label} is gated on {sorted(producers)}, none of which runs "
+                        f"{where} and before the save, so nothing between the restore "
+                        f"and the save is known to have filled {path_saved!r}"
                     )
     assert not offenders, "\n  ".join(offenders)
