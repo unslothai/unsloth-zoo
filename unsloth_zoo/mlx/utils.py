@@ -15539,7 +15539,10 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
     # The floor: a sanitizer can drop a sibling once the fused tensor is present. Read
     # from the whole checkpoint, since what it does to a sibling can depend on the parts.
     try:
-        floor = sanitizer.sanitize(dict(floor_probe))
+        # Through the probe, like every other replay: `others` holds the same marker
+        # objects, so a sanitizer offsetting a norm with `+=` would write through and
+        # the floor would be measured one step ahead of the recipes it gates.
+        floor = _mlx_moe_sanitized_probe(sanitizer, floor_probe)
     except Exception:
         return
     kept = {name: floor[name] for name in others if name in floor}

@@ -316,3 +316,52 @@ def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
             for expert in range(3):
                 name = f"model.layers.{layer}.mlp.experts.{expert}.{leaf}.weight"
                 assert mutils._mlx_arrays_match(recovered[name], source[expert]), name
+
+
+def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
+    """mlx-vlm's Qwen3.5-VL-MoE splits `experts.gate_up_proj` into two `switch_mlp`
+    tensors and offsets a 1-D norm with `+=` in the same sanitize
+    (mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py:38-48 and :89). Under mlx that `+=`
+    reassigns the caller's own array descriptor, so a probe handed straight to the
+    sanitizer is written through. The merge proof's floor probe shares its marker
+    objects with the set it later compares, so measuring the floor without a copy put
+    it one offset ahead of every recipe and no merge was ever proved: the export kept
+    the MLX spelling llama.cpp cannot map.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                "model.layers.0.mlp.fused.weight":
+                    mx.reshape(mx.arange(8, dtype=mx.float32), (4, 2)),
+                "model.layers.0.post_attention_layernorm.weight":
+                    mx.arange(2, dtype=mx.float32) + 5.0,
+            }
+            self.expected = self.sanitize(dict(self.checkpoint))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                if "fused" in name:
+                    for leaf, half in zip(("left", "right"),
+                                          mx.split(tensor, 2, axis=0)):
+                        out[name.replace("fused", leaf)] = half
+                else:
+                    out[name] = tensor
+            for name in list(out):
+                if name.endswith("layernorm.weight") and out[name].ndim == 1:
+                    out[name] += 1.0
+            return out
+
+    reg = _regressions()
+    model = Model()
+    path = reg._stage_moe_directory(tmp_path, model, shards=1)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) > 0
+    assert sorted(_staged(path)) == sorted(model.checkpoint)

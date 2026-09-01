@@ -375,7 +375,12 @@ class array(metaclass=_ArrayMeta):
         if data is None:
             return torch.tensor([])
         if isinstance(data, torch.Tensor):
-            return data.to(dtype) if dtype is not None else data
+            # A copy, as mlx's own constructor is: `mx.array(a)` placement-news a fresh
+            # array, so a later `a += b` (which reassigns only a's descriptor) cannot
+            # write through it. Handing `data` back aliased instead, which silently
+            # disarmed every defensive copy the code under test makes.
+            out = data.to(dtype) if dtype is not None else data
+            return out.clone() if out is data else out
         return torch.tensor(data, dtype=dtype)
 
 
