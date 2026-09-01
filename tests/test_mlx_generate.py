@@ -164,7 +164,11 @@ def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
     events = []
     monkeypatch.setattr(
         "mlx.core.synchronize",
-        lambda stream=None: events.append(f"synchronize:{stream if stream else 'default'}"),
+        # `is None`, not truthiness: a falsey stream object is still a stream, and
+        # labelling it "default" would make an over-drain indistinguishable from a hit.
+        lambda stream=None: events.append(
+            f"synchronize:{'default' if stream is None else stream}"
+        ),
     )
     if has_clear_cache:
         monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
@@ -202,6 +206,80 @@ def test_the_generation_stream_is_drained_not_just_the_default_one(monkeypatch):
     assert events.count("synchronize:stream<mlx_lm.generate>") == 2
     assert events.count("synchronize:stream<mlx_vlm.generate.dispatch>") == 2
     assert events.index("synchronize:stream<mlx_lm.generate>") < events.index("clear_cache")
+
+def _fake_stream_module(monkeypatch, name, stream):
+    monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(generation_stream=stream))
+
+def test_the_speculative_decoding_stream_is_drained_too(monkeypatch):
+    # mlx_vlm.speculative.common owns its own stream from 0.6.0 on, created on import
+    # and never routed through wired_limit, so nothing else ever drains it.
+    events = _record_cache_calls(monkeypatch)
+    _fake_stream_module(monkeypatch, "mlx_vlm.speculative.common", "stream<speculative>")
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<speculative>") == 2
+
+def test_one_stream_shared_by_several_modules_is_drained_once(monkeypatch):
+    # 0.6.x defines generation_stream in mlx_vlm/generate/common.py and re-exports it
+    # from every candidate name, so identity, not name, decides what is outstanding.
+    events = _record_cache_calls(monkeypatch)
+    shared = "stream<shared>"
+    for name in ("mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar"):
+        _fake_stream_module(monkeypatch, name, shared)
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<shared>") == 2
+
+def test_a_stream_that_cannot_be_drained_does_not_stop_the_clear(monkeypatch):
+    # A plain mx.new_stream (mlx-vlm 0.4.4, the pin floor) raises when synchronized
+    # from a thread that did not create it. Not draining is the old behaviour and is
+    # survivable; losing the clear, or the generation burst, is not.
+    events = _record_cache_calls(monkeypatch)
+    def synchronize(stream=None):
+        if stream == "stream<foreign>":
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+        events.append(f"synchronize:{'default' if stream is None else stream}")
+    monkeypatch.setattr("mlx.core.synchronize", synchronize)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<foreign>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_module_getattr_that_raises_does_not_stop_the_clear(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    module = types.ModuleType("mlx_vlm.generate")
+    def module_getattr(name):
+        raise RuntimeError(f"lazy attribute {name} exploded")
+    module.__getattr__ = module_getattr
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", module)
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_runtime_without_synchronize_still_clears(monkeypatch):
+    # mx.synchronize has shipped since mlx 0.12.0, two releases before any clear_cache
+    # shape, so this is about partial test doubles rather than a real runtime -- but a
+    # missing drain must degrade to the pre-drain behaviour, not to an AttributeError.
+    events = _record_cache_calls(monkeypatch)
+    monkeypatch.setattr("mlx.core.synchronize", None, raising=False)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<mlx_lm>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == ["clear_cache", "body", "clear_cache"]
 
 def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
     events = _record_cache_calls(monkeypatch)

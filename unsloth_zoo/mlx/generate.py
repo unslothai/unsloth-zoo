@@ -621,12 +621,53 @@ def generation_mode(model):
 # mlx-lm and mlx-vlm both run generation on their own thread-local stream, so a
 # no-argument mx.synchronize() -- which waits on the default stream -- drains none of it.
 # Only already-imported modules are inspected: a cleanup path must not import mlx-vlm.
+# mlx_vlm.speculative.common owns a SECOND stream in every 0.6.x, created on import and
+# never routed through wired_limit, so it is listed here but not in _VLM_STREAM_MODULES,
+# which resolves wired_limit and must not grow a module that does not export one.
+def _drain_stream_modules():
+    # A function, not a module constant: _VLM_STREAM_MODULES is defined further down.
+    return ("mlx_lm.generate",) + _VLM_STREAM_MODULES + ("mlx_vlm.speculative.common",)
+
+
 def _drain_generation_streams(mx):
-    for name in ("mlx_lm.generate",) + _VLM_STREAM_MODULES:
-        stream = getattr(sys.modules.get(name), "generation_stream", None)
-        if stream is not None:
-            mx.synchronize(stream)
-    mx.synchronize()
+    """Best effort: a drain that cannot run must not stop the cache clear.
+
+    Both call sites reached clear_cache() unconditionally before this existed, and
+    draining is a safety margin on top of that, not a precondition for it. The calls
+    below can genuinely fail: at the mlx-vlm pin floor (0.4.4) generation_stream is a
+    plain mx.new_stream, and synchronizing one of those from a thread that did not
+    create it raises "There is no Stream(gpu, N) in current thread". Failing to drain
+    is no worse than the old behaviour; refusing to clear, or killing the burst the
+    entry call sits in front of, is strictly worse.
+
+    Draining a thread-local stream from a foreign thread does not raise, but it does
+    not drain either -- mlx maps it through a thread_local table and creates a fresh
+    stream on miss -- so this is only effective on the thread that generated.
+    """
+
+    synchronize = getattr(mx, "synchronize", None)
+    if not callable(synchronize):
+        return
+    drained = []
+    for name in _drain_stream_modules():
+        try:
+            stream = getattr(sys.modules.get(name), "generation_stream", None)
+        except Exception:
+            # Module-level __getattr__ runs arbitrary code; getattr's default only
+            # swallows AttributeError.
+            continue
+        # 0.6.x aliases one object across every mlx_vlm.generate name.
+        if stream is None or any(stream is seen for seen in drained):
+            continue
+        drained.append(stream)
+        try:
+            synchronize(stream)
+        except Exception:
+            continue
+    try:
+        synchronize()
+    except Exception:
+        pass
 
 
 @contextmanager
