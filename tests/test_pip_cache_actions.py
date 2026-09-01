@@ -71,7 +71,7 @@ def test_no_builtin_setup_python_pip_cache():
     offenders = [
         f"{where}: {step.get('name') or step.get('uses')}"
         for where, step in _cache_writer_steps()
-        if str(step.get("uses", "")).startswith("actions/setup-python@")
+        if _uses(step).startswith("actions/setup-python@")
         and "cache" in (step.get("with") or {})
     ]
     assert not offenders, (
@@ -211,6 +211,18 @@ def test_save_runs_on_the_default_branch_only():
 # problem first.
 
 _CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
+
+
+def _uses(step):
+    """A step's `uses`, casefolded, because GitHub resolves owner/repo case-insensitively.
+
+    `Actions/Cache/Save@v6` runs the same action as the lowercase spelling, so a
+    case-sensitive match here let a writer skip every guard while still working. Only
+    the owner/repo half is case-insensitive; the ref after `@` is a git ref and is not,
+    but nothing below matches on the ref. Local `./.github/actions/...` paths are real
+    filesystem paths on the runner and stay case-sensitive, so they are compared raw.
+    """
+    return str(step.get("uses", "")).casefold()
 
 
 def _split_top(expr, op):
@@ -375,7 +387,7 @@ def _cache_writer_steps():
 def test_no_cache_save_reaches_a_pull_request_ref():
     offenders = []
     for where, step in _cache_writer_steps():
-        uses = str(step.get("uses", ""))
+        uses = _uses(step)
         # `actions/cache/restore@` is read-only and correct on every ref.
         if not any(w in uses for w in _CACHE_WRITERS):
             continue
@@ -411,7 +423,7 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
         for name, steps in _jobs(path):
             ids = {s.get("id"): i for i, s in enumerate(steps) if s.get("id")}
             for i, step in enumerate(steps):
-                if "actions/cache/save@" not in str(step.get("uses", "")):
+                if "actions/cache/save@" not in _uses(step):
                     continue
                 label = f"{path.name}:{name}: {step.get('name') or 'save'}"
                 condition = " ".join(str(step.get("if", "")).split())
@@ -427,11 +439,22 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 restore_at = max(
                     (
                         j for j, s in enumerate(steps[:i])
-                        if "actions/cache/restore@" in str(s.get("uses", ""))
+                        if "actions/cache/restore@" in _uses(s)
                         and str((s.get("with") or {}).get("path", "")).strip() == path_saved
                     ),
                     default=None,
                 )
+                # No restore above the save is an offender, not "the top of the job".
+                # Treating it as position -1 accepted a job whose restore sits BELOW
+                # its save, which writes the entry every run and reads it never, so
+                # every leg re-downloads the payload the cache exists to avoid.
+                if restore_at is None:
+                    offenders.append(
+                        f"{label} saves {path_saved!r} with no restore of that path "
+                        f"above it, so the entry is written on every run and read on "
+                        f"none"
+                    )
+                    continue
                 producers = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outcome", condition))
                 want = _EXPECTED_PRODUCER.get((path.name, name, path_saved))
                 if want is None:
@@ -458,16 +481,12 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 if unknown:
                     offenders.append(f"{label} references unknown step id(s) {unknown}")
                     continue
-                lower = -1 if restore_at is None else restore_at
-                between = [p for p in producers if lower < ids[p] < i]
+                between = [p for p in producers if restore_at < ids[p] < i]
                 if not between:
-                    where = (
-                        f"after the restore at step {restore_at}"
-                        if restore_at is not None else "before it"
-                    )
                     offenders.append(
                         f"{label} is gated on {sorted(producers)}, none of which runs "
-                        f"{where} and before the save, so nothing between the restore "
-                        f"and the save is known to have filled {path_saved!r}"
+                        f"after the restore at step {restore_at} and before the save, so "
+                        f"nothing between the restore and the save is known to have "
+                        f"filled {path_saved!r}"
                     )
     assert not offenders, "\n  ".join(offenders)
