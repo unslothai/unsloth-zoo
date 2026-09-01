@@ -267,6 +267,37 @@ def test_the_recovered_checkpoint_is_the_one_the_model_was_saved_from(
         assert mutils._mlx_arrays_match(replayed[name], tensor), name
 
 
+def test_a_helper_called_from_inside_a_comprehension_is_still_read():
+    """The vocabulary walk must not depend on the interpreter.
+
+    Before 3.12 a comprehension compiles to its own code object, so a helper called
+    from inside one is absent from the enclosing `co_names`; 3.12 inlines it and the
+    same sanitizer reads differently. pyproject supports 3.9 upwards, and a sanitizer
+    spelling its rename in a dict comprehension is the ordinary shape, so a walk that
+    stops at the comprehension quietly recovers fewer architectures on the older
+    interpreters than the newer ones.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    class Model:
+        def sanitize(self, weights):
+            return _renamed_through_a_comprehension(weights)
+
+    vocabulary = mutils._mlx_sanitizer_vocabulary(mutils._mlx_moe_sanitizers(Model()))
+    assert "model.layers." in vocabulary
+    assert "language_model.model.layers." in vocabulary
+
+
+def _renamed_through_a_comprehension(weights):
+    # The call this test is about: reached only from inside the comprehension.
+    return {_a_spelling_only_the_helper_holds(name): tensor
+            for name, tensor in weights.items()}
+
+
+def _a_spelling_only_the_helper_holds(name):
+    return name.replace("model.layers.", "language_model.model.layers.")
+
+
 def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
     """Expert 3's weights must be expert 3's, not expert 0's: a permutation replays
     identically only if the sanitizer's own order is reproduced."""

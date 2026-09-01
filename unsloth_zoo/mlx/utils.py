@@ -15145,8 +15145,22 @@ def _mlx_sanitizer_code(sanitizers):
             return
         package = (getattr(function, "__module__", "") or "").split(".")[0]
         namespace = getattr(function, "__globals__", None) or {}
-        mentioned = set(code.co_names)
-        for name in code.co_names:
+        # The nested code objects too, not this one alone. Before 3.12 a comprehension
+        # compiles to its own code object, so a helper called from inside one does not
+        # appear in `code.co_names` and the walk stops at the comprehension -- and a
+        # sanitizer spelling its rename in a dict comprehension is the ordinary shape.
+        # 3.12 inlines them, which is why this only ever showed on the older
+        # interpreters pyproject still supports.
+        names, mentioned, pending = [], set(), [code]
+        while pending:
+            current = pending.pop(0)
+            for name in current.co_names:
+                if name not in mentioned:
+                    mentioned.add(name)
+                    names.append(name)
+            pending.extend(const for const in current.co_consts
+                           if hasattr(const, "co_consts"))
+        for name in names:
             for called in _mlx_sanitizer_own_functions(
                 namespace.get(name), package, mentioned
             ):
