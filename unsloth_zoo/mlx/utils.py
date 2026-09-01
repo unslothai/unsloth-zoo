@@ -14915,6 +14915,13 @@ class _MlxReplayedSanitizers:
         try:
             for owner in self.owners:
                 weights = owner.sanitize(weights)
+                # Every caller reads the result as a mapping, and most read it outside
+                # the guard they replay under, so a sanitize that forgot its `return`
+                # would raise out of `save_pretrained_gguf` mid-save. Refusing here is
+                # read as the failed replay it is, and the export is then exactly what
+                # it is without this pass.
+                if not isinstance(weights, Mapping):
+                    raise TypeError("sanitize did not return a mapping")
             return weights
         finally:
             for module, items, attributes in state:
