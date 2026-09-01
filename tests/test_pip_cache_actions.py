@@ -36,7 +36,11 @@ import yaml
 
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
+# Both extensions: GitHub runs `.yaml` workflows too, and a glob for `.yml` alone would
+# let an unguarded cache writer added in a `.yaml` file bypass every check in this file.
+WORKFLOWS = sorted(
+    p for ext in ("*.yml", "*.yaml") for p in (REPO / ".github" / "workflows").glob(ext)
+)
 RESTORE = "./.github/actions/pip-cache-restore"
 SAVE = "./.github/actions/pip-cache-save"
 
@@ -203,8 +207,8 @@ def test_save_runs_on_the_default_branch_only():
 _CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
 
 
-def _or_alternatives(expr):
-    """``expr`` split on its TOP-LEVEL ``||``, ignoring ``||`` inside parens or quotes."""
+def _split_top(expr, op):
+    """``expr`` split on its TOP-LEVEL ``op``, ignoring occurrences in parens or quotes."""
     parts, depth, quote, buf, i = [], 0, "", [], 0
     while i < len(expr):
         ch = expr[i]
@@ -221,7 +225,7 @@ def _or_alternatives(expr):
         elif ch == ")":
             depth -= 1
             buf.append(ch)
-        elif ch == "|" and depth == 0 and expr[i:i + 2] == "||":
+        elif depth == 0 and expr[i:i + 2] == op:
             parts.append("".join(buf))
             buf = []
             i += 2
@@ -233,6 +237,24 @@ def _or_alternatives(expr):
     return parts
 
 
+def _balanced(expr):
+    """Whether parentheses in ``expr`` are balanced outside quotes."""
+    depth, quote = 0, ""
+    for ch in expr:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 # A POSITIVE equality, in either quote style. `!=` must not match: a condition restricting
 # a save to everything EXCEPT main is the exact inversion of the rule, and a substring
 # search for "refs/heads/main" accepts it.
@@ -242,12 +264,33 @@ _MAIN_ONLY = re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]")
 def _restricted_to_main(expr):
     """Whether ``expr`` can only be true on the default branch.
 
-    Every alternative of a top-level `||` has to carry the check, because `||` is how a
-    condition GAINS refs: `github.ref == 'refs/heads/main' || github.event_name ==
-    'pull_request'` mentions main and still runs on every PR.
+    Evaluated over the whole boolean structure, not just the top level. `||` is how a
+    condition GAINS refs, so an OR restricts only if EVERY branch restricts; `&&` narrows,
+    so an AND restricts if ANY branch does. Parentheses matter: splitting only on
+    top-level `||` accepted `always() && (github.ref == 'refs/heads/main' ||
+    github.event_name == 'pull_request')`, which runs on every PR. Anything negated is
+    refused outright rather than reasoned about, because `!(github.ref ==
+    'refs/heads/main')` contains a positive main equality and is its exact inverse.
     """
-    alternatives = _or_alternatives(expr)
-    return bool(expr.strip()) and all(_MAIN_ONLY.search(a) for a in alternatives)
+    if not expr.strip():
+        return False
+
+    def restricted(part):
+        part = part.strip()
+        while part.startswith("(") and part.endswith(")") and _balanced(part[1:-1]):
+            part = part[1:-1].strip()
+        ors = _split_top(part, "||")
+        if len(ors) > 1:
+            return all(restricted(p) for p in ors)
+        ands = _split_top(part, "&&")
+        if len(ands) > 1:
+            return any(restricted(p) for p in ands)
+        # A leaf. `!` anywhere outside a `!=` is a negation we will not reason about.
+        if re.search(r"!(?!=)", part):
+            return False
+        return bool(_MAIN_ONLY.search(part))
+
+    return restricted(expr)
 
 
 @pytest.mark.parametrize(
@@ -258,6 +301,27 @@ def _restricted_to_main(expr):
         ("github.ref != 'refs/heads/main'", False),
         ("github.ref == 'refs/heads/main' || github.event_name == 'pull_request'", False),
         ("", False),
+        # A `||` inside parens is still a `||`. Splitting only the top level read this
+        # as one alternative containing the main equality and accepted it, while it
+        # actually runs on every pull request.
+        (
+            "always() && (github.ref == 'refs/heads/main' "
+            "|| github.event_name == 'pull_request')",
+            False,
+        ),
+        # Contains a positive main equality and means its exact opposite.
+        ("!(github.ref == 'refs/heads/main')", False),
+        # Parenthesised but genuinely restricted, so the fix must not over-reject.
+        ("(github.ref == 'refs/heads/main') && always()", True),
+        ("always() && (github.ref == 'refs/heads/main' && !cancelled())", True),
+        # An OR restricts only when every branch does.
+        (
+            "(github.ref == 'refs/heads/main' && always()) "
+            "|| (github.ref == 'refs/heads/main' && failure())",
+            True,
+        ),
+        # A `||` inside a string is not a split point.
+        ("github.ref == 'refs/heads/main' && contains(x, 'a||b')", True),
     ],
 )
 def test_the_main_only_check_reads_the_expression(expr, restricted):
@@ -304,15 +368,32 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
     offenders = []
     for path in WORKFLOWS:
         for name, steps in _jobs(path):
-            saves = [
-                i for i, s in enumerate(steps)
-                if "actions/cache/save@" in str(s.get("uses", ""))
-            ]
-            for i in saves:
-                condition = " ".join(str(steps[i].get("if", "")).split())
-                if "outcome ==" not in condition and ".outputs." not in condition:
+            ids = {s.get("id"): i for i, s in enumerate(steps) if s.get("id")}
+            for i, step in enumerate(steps):
+                if "actions/cache/save@" not in str(step.get("uses", "")):
+                    continue
+                label = f"{path.name}:{name}: {step.get('name') or 'save'}"
+                condition = " ".join(str(step.get("if", "")).split())
+                # The producer is the step whose OUTCOME the save is gated on. A
+                # `.outputs.` reference is not one: the checkpoint save reads
+                # `steps.hf-cache.outputs.cache-hit`, which is the RESTORE, and
+                # accepting that let the save sit above the step that fills the
+                # directory and still pass.
+                producers = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outcome", condition))
+                if not producers:
                     offenders.append(
-                        f"{path.name}:{name}: {steps[i].get('name') or 'save'} is not "
-                        f"gated on the outcome of the step that produced its contents"
+                        f"{label} is not gated on the outcome of any step, so nothing "
+                        f"establishes that the directory it saves was populated"
+                    )
+                    continue
+                unknown = sorted(p for p in producers if p not in ids)
+                if unknown:
+                    offenders.append(f"{label} references unknown step id(s) {unknown}")
+                    continue
+                late = sorted(p for p in producers if ids[p] > i)
+                if late:
+                    offenders.append(
+                        f"{label} is gated on {late}, which run AFTER it, so it would "
+                        f"save the directory before those steps fill it"
                     )
     assert not offenders, "\n  ".join(offenders)
