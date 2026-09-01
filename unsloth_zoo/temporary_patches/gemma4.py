@@ -990,15 +990,10 @@ def patch_Gemma4TextMLP():
         # Zero overflows so the residual identity path survives.
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
-        # Left eager on purpose: `fullgraph = None` means do not compile, since
-        # `patch_function` only compiles when `fullgraph` is a bool. That drops the
-        # direct `torch.compile` wrapper this call site used to install, so the MLP
-        # is no longer its own compile entry point with its own recompile cache.
-        # It does NOT make this an eager boundary: a compiled caller still inlines
-        # the body into its own graph, exactly as it inlined the wrapped version
-        # before. The fp16 clamp is pure eager tensor work either way, and off the
-        # fp16 path the uncompiled patch is bit exact with upstream where the
-        # compiled one drifted.
+        # `fullgraph = None` means do not compile (patch_function only compiles on a
+        # bool), dropping this call site's own torch.compile wrapper and recompile
+        # cache. Not an eager boundary: a compiled caller still inlines the body,
+        # as it did the wrapped version. Off the fp16 path eager is bit exact.
         patch_function(
             Gemma4TextMLP, "forward", forward, fullgraph=None,
         )

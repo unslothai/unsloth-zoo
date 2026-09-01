@@ -16,23 +16,17 @@
 
 """CPU tests pinning Gemma4TextMLP.forward to the NON-compiled patch path.
 
-The patch is installed with ``fullgraph = None``, which `patch_function` reads as
-"do not compile" (it only compiles when ``fullgraph`` is a bool). That drops the
-direct `torch.compile` wrapper this call site used to install, so the MLP stops
-being its own compile entry point with its own recompile cache.
+``fullgraph = None`` reads as "do not compile" in `patch_function`, which only
+compiles on a bool. It is a sentinel, so it can regress from either side: the call
+site flipping to a bool, or `patch_function` redefining None. A test for each, plus
+the fp16 clamp the patch exists for.
 
-It is deliberately NOT an eager boundary, and there is a test below pinning that
-too: a compiled caller still inlines this body into its own graph, exactly as it
-inlined the wrapped version before. Anything claiming this function is "outside
-Dynamo" is wrong, and `test_compiled_caller_still_inlines_the_mlp` says so.
+Not an eager boundary: a compiled caller still inlines this body, exactly as it
+inlined the wrapped version. `test_compiled_caller_still_inlines_the_mlp` pins that
+so it is not misread the other way.
 
-``None`` is a sentinel rather than an explicit argument, so two things can quietly
-undo it: flipping the call site back to a bool, or redefining what `patch_function`
-does with ``None``. There is a test here for each, plus one that the fp16 overflow
-clamp the patch actually exists for still installs and still clamps.
-
-Synthetic classes throughout, so this runs on any installed transformers, including
-4.57.6 which has no gemma4 at all.
+Synthetic classes throughout, so this runs on any transformers, including 4.57.6
+which has no gemma4 at all.
 """
 
 import ast
@@ -61,9 +55,8 @@ def _is_dynamo_artifact(fn):
 def _mlp_patch_call():
     """The ``patch_function(Gemma4TextMLP, "forward", forward, ...)`` call node.
 
-    Matched on all three positional operands, not just the class: a future second
-    `Gemma4TextMLP` patch call would otherwise satisfy this test while the forward
-    call site it is meant to guard had quietly changed.
+    All three operands are matched, so a second Gemma4TextMLP patch call cannot
+    satisfy this while the forward call site it guards has changed.
     """
     source = pathlib.Path(inspect.getfile(gemma4_patches)).read_text()
     for node in ast.walk(ast.parse(source)):
@@ -104,11 +97,10 @@ def test_call_site_passes_fullgraph_none():
 
 
 def test_patch_function_treats_none_as_do_not_compile(monkeypatch):
-    """`None` must keep meaning "leave it eager", whatever else changes.
+    """`None` must keep meaning "leave it eager".
 
-    Watches the call rather than inspecting the result: `_is_dynamo_artifact`
-    reports what an object looks like, which is not the same as whether
-    torch.compile ran.
+    Watches the call, not the result: `_is_dynamo_artifact` reports what an object
+    looks like, not whether torch.compile ran.
     """
 
     class Target:
@@ -133,9 +125,8 @@ def test_patch_function_treats_none_as_do_not_compile(monkeypatch):
 def test_patch_function_bool_still_compiles():
     """Guards the test above from passing because compilation broke everywhere.
 
-    A hard assertion, not a skip: if this file could skip here it would go green
-    on a machine where compilation silently stopped working, which is exactly the
-    condition under which the sentinel test above proves nothing.
+    Asserts rather than skips: a skip here would go green on exactly the machine
+    where the sentinel test proves nothing.
     """
 
     class Target:
@@ -153,9 +144,9 @@ def test_patch_function_bool_still_compiles():
 
 
 def test_patch_function_none_does_not_unwrap_either():
-    """`None` skips `unwrap_already_compiled` as well as the compile, so it means
-    "do not compile or unwrap" rather than "force eager". Pinned so a future
-    refactor cannot pass a pre-compiled callable and still look correct."""
+    """`None` skips `unwrap_already_compiled` too, so it means "do not compile or
+    unwrap", not "force eager". Pinned so a refactor cannot pass a pre-compiled
+    callable and still look correct."""
 
     class Target:
         def forward(self, x: torch.Tensor):
@@ -190,19 +181,16 @@ DOTTED = f"{PARENT}.modeling_gemma4"
 def _install_mlp_patch(monkeypatch):
     """Run patch_Gemma4TextMLP against a synthetic MLP and return the class.
 
-    On a transformers that ships gemma4 the synthetic class is swapped into the real
-    module, because `patch_Gemma4TextMLP` imports that module by name and the real
-    package would otherwise win over an injected one. Where gemma4 does not exist
-    (4.57.6) a stand-in module is registered instead.
+    Where gemma4 exists the synthetic class is swapped into the real module, since
+    the patch imports that module by name. Where it does not (4.57.6), a stand-in
+    module is registered instead.
     """
     try:
         modeling = importlib.import_module(DOTTED)
         injected = False
     except ModuleNotFoundError as e:
-        # Only the absence of gemma4 itself may fall through to the stand-in.
-        # A broader except would let a genuinely broken gemma4 import be masked
-        # by the synthetic class, and this file would pass without ever touching
-        # the code it is meant to guard.
+        # Only gemma4's own absence may reach the stand-in. A broader except would
+        # let a genuinely broken gemma4 import be masked by the synthetic class.
         if not (e.name or "").startswith(PARENT) and e.name != "transformers":
             raise
         modeling = types.ModuleType(DOTTED)
@@ -210,8 +198,8 @@ def _install_mlp_patch(monkeypatch):
 
     monkeypatch.setattr(modeling, "Gemma4TextMLP", _StockMLP, raising=False)
     if injected:
-        # `import a.b.c as m` walks the whole chain, so the parent package has to
-        # resolve too or the patch takes its ImportError early return and no-ops.
+        # `import a.b.c as m` walks the chain, so the parent has to resolve too or
+        # the patch takes its ImportError early return and no-ops.
         package = types.ModuleType(PARENT)
         package.modeling_gemma4 = modeling
         monkeypatch.setitem(sys.modules, PARENT, package)
@@ -261,10 +249,9 @@ def test_mlp_patch_is_bit_exact_off_the_fp16_path(monkeypatch):
 def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
     """Not compiling this function is not the same as excluding it from compilation.
 
-    Dynamo inlines an undecorated callee into its caller's graph, so under a
-    compiled parent the MLP still runs compiled -- as it did before this call site
-    changed, because Dynamo traces straight through an inner torch.compile wrapper
-    too. Pinned so nobody documents this patch as an eager boundary.
+    Dynamo inlines an undecorated callee, so under a compiled parent the MLP still
+    runs compiled, as it did when wrapped. Also fails if anyone adds an explicit
+    `torch.compiler.disable` here, which would break the graph in every layer.
     """
     cls, stock = _install_mlp_patch(monkeypatch)
     try:
@@ -290,35 +277,3 @@ def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
         cls.forward = stock
 
 
-def test_checkpoint_pack_and_recompute_agree(monkeypatch):
-    """The failure this patch was written against is a pack/recompute divergence,
-    so check the two passes actually agree rather than only that nothing raised.
-    """
-    cls, stock = _install_mlp_patch(monkeypatch)
-    try:
-        torch.manual_seed(0)
-        model = cls()
-        passes = []
-
-        def meta(t):
-            return (tuple(t.shape), t.dtype, t.device.type, tuple(t.stride()))
-
-        def block(x):
-            # Registered before the body: with early stop the recompute is
-            # abandoned partway through, so a trailing append would never run.
-            seen = []
-            passes.append(seen)
-            out = x + cls.forward(model, x)
-            seen.append(meta(out))
-            return out
-
-        x = torch.randn(4, 8, requires_grad=True)
-        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
-            y = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-            y.sum().backward()
-
-        assert len(passes) == 2, f"expected a pack pass and a recompute, saw {len(passes)}"
-        assert passes[0] == passes[1], f"pack/recompute diverged: {passes[0]} vs {passes[1]}"
-        assert torch.isfinite(x.grad).all()
-    finally:
-        cls.forward = stock

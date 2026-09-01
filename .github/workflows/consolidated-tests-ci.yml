@@ -296,14 +296,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
-        # test_gemma4_mlp_not_compiled pins Gemma4TextMLP.forward to the eager
-        # install, which rests on `fullgraph = None` meaning "do not compile" in
-        # patch_function. That is a sentinel rather than a named argument, so both
-        # halves can regress silently: the call site could flip back to a bool, or
-        # the None semantics could be redefined. Sits next to the eager-fallback and
-        # checkpoint-compile files above because it pins the same boundary from the
-        # patch_function side. CPU-pure, needs no gemma4 in transformers (it
-        # synthesizes the class), runs in about a tenth of a second.
+        # test_gemma4_mlp_not_compiled pins Gemma4TextMLP.forward eager. It rests on
+        # the `fullgraph = None` sentinel, so it can regress from either side: the
+        # call site flipping to a bool, or patch_function redefining None. CPU-pure,
+        # synthesizes the class so it needs no gemma4 in transformers.
         #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one
