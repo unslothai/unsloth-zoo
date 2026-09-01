@@ -96,6 +96,33 @@ def test_real_mlx_is_not_decided_by_find_spec_alone(path: Path):
     )
 
 
+def _in_a_shimmed_process(body: str):
+    """Run ``body`` in a fresh interpreter that has the shim installed.
+
+    Installing it HERE would be wrong on a machine that has real MLX. The shim is
+    process-wide and permanent -- it displaces `mlx` in sys.modules for every test
+    that follows, and mlx-vlm registers an atexit handler calling mx.clear_streams,
+    which then lands on a `_Noop` and prints an ignored exception at interpreter
+    shutdown. On Linux CI nothing notices, because there the shim is all there is.
+    A subprocess is what keeps these checks honest on Apple Silicon.
+    """
+    import subprocess
+    import sys as _sys
+
+    script = (
+        f"import sys\n"
+        f"sys.path.insert(0, {str(_TESTS)!r})\n"
+        f"from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch\n"
+        f"simulate_mlx_on_torch()\n"
+    ) + body
+    result = subprocess.run(
+        [_sys.executable, "-c", script],
+        capture_output=True, text=True, cwd=str(_TESTS.parent), timeout=300,
+    )
+    assert result.returncode == 0, f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+    return result.stdout
+
+
 def test_the_shim_makes_find_spec_lie():
     """The trap itself, so the rule above keeps its reason when someone reads it.
 
@@ -103,17 +130,13 @@ def test_the_shim_makes_find_spec_lie():
     obsolete rather than merely unsatisfied, and should be reconsidered, not
     silenced.
     """
-    import importlib.util
-
-    from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
-
-    simulate_mlx_on_torch()
-    assert importlib.util.find_spec("mlx") is not None, (
-        "the shim no longer registers mlx, so find_spec is no longer misleading"
-    )
-    assert mlx_is_simulated() is True, (
-        "mlx_is_simulated() must see through the shim; it is the only "
-        "order-independent answer available to a test module"
+    _in_a_shimmed_process(
+        "import importlib.util\n"
+        "assert importlib.util.find_spec('mlx') is not None, (\n"
+        "    'the shim no longer registers mlx, so find_spec is no longer misleading')\n"
+        "assert mlx_is_simulated() is True, (\n"
+        "    'mlx_is_simulated() must see through the shim; it is the only '\n"
+        "    'order-independent answer available to a test module')\n"
     )
 
 
@@ -124,14 +147,18 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
     gate wrongly said "real MLX". A `_Noop` raises on CALL, not on attribute access,
     so nothing catches it until the test is already running.
     """
-    from mlx_simulation import simulate_mlx_on_torch
-
-    simulate_mlx_on_torch()
-    import mlx.core as mx
-
-    for symbol in ("argpartition", "put_along_axis"):
-        with pytest.raises(NotImplementedError, match="mlx-shim"):
-            getattr(mx, symbol)()
+    _in_a_shimmed_process(
+        "import mlx.core as mx\n"
+        "for symbol in ('argpartition', 'put_along_axis'):\n"
+        "    try:\n"
+        "        getattr(mx, symbol)()\n"
+        "    except NotImplementedError as error:\n"
+        "        assert 'mlx-shim' in str(error), error\n"
+        "    else:\n"
+        "        raise AssertionError(\n"
+        "            f'mx.{symbol} no longer raises under the shim, so the gate it '\n"
+        "            f'protects would fail later and less legibly')\n"
+    )
 
 
 # --------------------------------------------------------------------------- #
