@@ -60,19 +60,25 @@ def test_workflows_exist():
     assert WORKFLOWS, "no workflows found; the layout moved and this file is stale"
 
 
-@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
-def test_no_builtin_setup_python_pip_cache(path):
-    for job, steps in _jobs(path):
-        for step in steps:
-            uses = str(step.get("uses", ""))
-            if not uses.startswith("actions/setup-python@"):
-                continue
-            with_ = step.get("with") or {}
-            assert "cache" not in with_, (
-                f"{path.name}:{job} uses setup-python's built-in cache. It saves on "
-                f"the PR ref, where nothing else can read it. Use {RESTORE} plus "
-                f"{SAVE} instead."
-            )
+def test_no_builtin_setup_python_pip_cache():
+    """Every step in the repo, including the ones inside composite actions.
+
+    Scanning only workflows left a hole: a composite action may run setup-python
+    itself, and a PR workflow that calls it gets the same post-step writing a
+    PR-scoped cache. The save guard below does not cover it either, because that one
+    filters on the `actions/cache` spellings.
+    """
+    offenders = [
+        f"{where}: {step.get('name') or step.get('uses')}"
+        for where, step in _cache_writer_steps()
+        if str(step.get("uses", "")).startswith("actions/setup-python@")
+        and "cache" in (step.get("with") or {})
+    ]
+    assert not offenders, (
+        "these steps use setup-python's built-in cache. It saves on the PR ref, where "
+        f"nothing else can read it. Use {RESTORE} plus {SAVE} instead:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
@@ -259,6 +265,11 @@ def _balanced(expr):
 # a save to everything EXCEPT main is the exact inversion of the rule, and a substring
 # search for "refs/heads/main" accepts it.
 _MAIN_ONLY = re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]")
+# A whole leaf that is nothing but the equality, in either operand order.
+_LEAF_MAIN = re.compile(
+    r"github\.ref\s*==\s*['\"]refs/heads/main['\"]"
+    r"|['\"]refs/heads/main['\"]\s*==\s*github\.ref"
+)
 
 
 def _restricted_to_main(expr):
@@ -288,15 +299,13 @@ def _restricted_to_main(expr):
         # A leaf. `!` anywhere outside a `!=` is a negation we will not reason about.
         if re.search(r"!(?!=)", part):
             return False
-        # Exactly one comparison, and it must be the main equality. A second one
-        # is how a leaf inverts itself while still containing the equality:
-        # `(github.ref == 'refs/heads/main') == false` is true off main, and
-        # `... != true` is the same trick. Quoted literals are blanked first so a
-        # `==` inside a string is not counted.
-        bare = re.sub(r"'[^']*'|\"[^\"]*\"", "''", part)
-        if len(re.findall(r"[=!]=", bare)) != 1:
-            return False
-        return bool(_MAIN_ONLY.search(part))
+        # The leaf must BE the equality, not merely contain it. Searching inside
+        # accepted every wrapper that inverts it while quoting it: `(... ) == false`
+        # and `... != true` chain a second comparison, and `startsWith(..., 'false')`
+        # is true off main because GitHub casts the inner boolean to the string
+        # 'false' for string functions. A whitelist ends that class rather than
+        # naming its members.
+        return bool(_LEAF_MAIN.fullmatch(part))
 
     return restricted(expr)
 
@@ -324,6 +333,11 @@ def _restricted_to_main(expr):
         # Comparing the equality to a boolean inverts it while still containing it.
         ("(github.ref == 'refs/heads/main') == false", False),
         ("github.ref == 'refs/heads/main' != true", False),
+        # String functions cast the inner boolean, so these are true only OFF main.
+        ("startsWith(github.ref == 'refs/heads/main', 'false')", False),
+        ("contains(github.ref == 'refs/heads/main', 'false')", False),
+        # The reversed operand order is the same guard and stays accepted.
+        ("'refs/heads/main' == github.ref", True),
         ("always() && (github.ref == 'refs/heads/main' && !cancelled())", True),
         # An OR restricts only when every branch does.
         (
@@ -374,6 +388,16 @@ def test_no_cache_save_reaches_a_pull_request_ref():
     )
 
 
+# (workflow, job, cached path) -> the step id whose success means the directory is
+# populated. Declared rather than inferred: the interval check below narrows WHERE the
+# producer may sit, but any step in that window satisfies it, including a no-op placed
+# there deliberately. Naming the step is the only thing that ties the guard to the work.
+# A new save with no entry here fails, which is the point: adding one is a decision.
+_EXPECTED_PRODUCER = {
+    ("gemma4-audio-probe.yml", "probe", "~/.cache/huggingface"): "probe",
+}
+
+
 def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
     """A save placed where the restore sits stores an empty directory under the key.
 
@@ -409,6 +433,21 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                     default=None,
                 )
                 producers = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outcome", condition))
+                want = _EXPECTED_PRODUCER.get((path.name, name, path_saved))
+                if want is None:
+                    offenders.append(
+                        f"{label} saves {path_saved!r} but no producer is declared for "
+                        f"it in _EXPECTED_PRODUCER. Position alone cannot say which "
+                        f"step fills a directory, so each save names its own"
+                    )
+                    continue
+                if want not in producers:
+                    offenders.append(
+                        f"{label} is gated on {sorted(producers)}, not on the declared "
+                        f"producer {want!r}. A no-op step in the right position "
+                        f"satisfies the interval below while filling nothing"
+                    )
+                    continue
                 if not producers:
                     offenders.append(
                         f"{label} is not gated on the outcome of any step, so nothing "
