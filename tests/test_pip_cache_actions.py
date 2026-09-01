@@ -36,8 +36,8 @@ import yaml
 
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-# Both extensions: GitHub runs `.yaml` workflows too, and a glob for `.yml` alone would
-# let an unguarded cache writer added in a `.yaml` file bypass every check in this file.
+# Both extensions: GitHub runs `.yaml` workflows too, and a `.yml`-only glob would let a
+# writer added in one bypass every check here.
 WORKFLOWS = sorted(
     p for ext in ("*.yml", "*.yaml") for p in (REPO / ".github" / "workflows").glob(ext)
 )
@@ -195,32 +195,22 @@ def test_save_runs_on_the_default_branch_only():
 
 # --- every cache save, not just the pip pair ------------------------------------------
 #
-# The rule above is enforced on the pip-cache-save action, which is the only thing that
-# was writing PR-scoped entries when it was written. It is not the only thing that CAN.
-# `gemma4-audio-probe.yml` used a bare read-write `actions/cache`, which registers its own
-# post-step and saves on whatever ref the job ran on, exactly like the setup-python form
-# this file exists to keep out. That workflow triggers on a label, so a labelled PR wrote
-# a 3.4 GB checkpoint to refs/pull/N/merge that only that PR's re-runs could restore,
-# seven macOS legs racing the one key.
-#
-# The janitor could not have cleaned it up either: `hf-gemma4-e2b-4bit-v1` carries no
-# trailing dependency hash, so cache-janitor.yml's generation ranking skips it entirely
-# and only closing the PR would ever have freed the bytes.
-#
-# So the check is on the shape, everywhere, rather than on the one action that had the
-# problem first.
+# The rule above covers pip-cache-save, the only PR-scoped writer when it was written but
+# not the only possible one. `gemma4-audio-probe.yml` used a bare read-write
+# `actions/cache`, whose post-step saves on whatever ref ran, so a labelled PR wrote a
+# 3.4 GB checkpoint to refs/pull/N/merge that only its own re-runs could restore. The
+# janitor could not reclaim it either: `hf-gemma4-e2b-4bit-v1` has no trailing dependency
+# hash, so generation ranking skips it. Hence a check on the shape, everywhere.
 
 _CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
 
 
 def _uses(step):
-    """A step's `uses`, casefolded, because GitHub resolves owner/repo case-insensitively.
+    """A step's `uses`, casefolded: GitHub resolves owner/repo case-insensitively.
 
-    `Actions/Cache/Save@v6` runs the same action as the lowercase spelling, so a
-    case-sensitive match here let a writer skip every guard while still working. Only
-    the owner/repo half is case-insensitive; the ref after `@` is a git ref and is not,
-    but nothing below matches on the ref. Local `./.github/actions/...` paths are real
-    filesystem paths on the runner and stay case-sensitive, so they are compared raw.
+    `Actions/Cache/Save@v6` is the same action, so a case-sensitive match let a writer
+    skip every guard. The ref after `@` is case-sensitive but nothing here matches on
+    it, and local `./.github/actions/...` paths are compared raw.
     """
     return str(step.get("uses", "")).casefold()
 
@@ -311,12 +301,10 @@ def _restricted_to_main(expr):
         # A leaf. `!` anywhere outside a `!=` is a negation we will not reason about.
         if re.search(r"!(?!=)", part):
             return False
-        # The leaf must BE the equality, not merely contain it. Searching inside
-        # accepted every wrapper that inverts it while quoting it: `(... ) == false`
-        # and `... != true` chain a second comparison, and `startsWith(..., 'false')`
-        # is true off main because GitHub casts the inner boolean to the string
-        # 'false' for string functions. A whitelist ends that class rather than
-        # naming its members.
+        # The leaf must BE the equality, not contain it. Searching inside accepted
+        # every wrapper that quotes it and inverts it: `(...) == false`, `... != true`,
+        # and `startsWith(..., 'false')`, which is true off main because GitHub casts
+        # the inner boolean to a string. A whitelist ends the class.
         return bool(_LEAF_MAIN.fullmatch(part))
 
     return restricted(expr)
@@ -372,9 +360,7 @@ def _cache_writer_steps():
         for name, steps in _jobs(path):
             for step in steps:
                 yield f"{path.name}:{name}", step
-    # Both spellings, for the same reason WORKFLOWS takes both: GitHub accepts
-    # `action.yaml` for composite-action metadata, and a scan for `action.yml`
-    # alone would let an unguarded writer live in one unseen.
+    # Both spellings, as WORKFLOWS does: GitHub accepts `action.yaml` too.
     actions_dir = REPO / ".github" / "actions"
     for action in sorted(
         p for ext in ("action.yml", "action.yaml") for p in actions_dir.rglob(ext)
@@ -401,10 +387,9 @@ def test_no_cache_save_reaches_a_pull_request_ref():
 
 
 # (workflow, job, cached path) -> the step id whose success means the directory is
-# populated. Declared rather than inferred: the interval check below narrows WHERE the
-# producer may sit, but any step in that window satisfies it, including a no-op placed
-# there deliberately. Naming the step is the only thing that ties the guard to the work.
-# A new save with no entry here fails, which is the point: adding one is a decision.
+# populated. Declared, not inferred: the interval below narrows where the producer may
+# sit, but any step there satisfies it, including a deliberate no-op. A save with no
+# entry fails, which is the point -- adding one is a decision.
 _EXPECTED_PRODUCER = {
     ("gemma4-audio-probe.yml", "probe", "~/.cache/huggingface"): "probe",
 }
@@ -429,13 +414,10 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 condition = " ".join(str(step.get("if", "")).split())
                 path_saved = str((step.get("with") or {}).get("path", "")).strip()
 
-                # The producer has to sit strictly BETWEEN the restore of the same
-                # path and this save. Anything looser is satisfiable by the wrong
-                # step: a `.outputs.` reference matched the restore's own
-                # `cache-hit`, and merely "some earlier step's .outcome" matches the
-                # restore too, so a save moved up next to the restore still passed
-                # while the directory was empty. Only a step in that window can be
-                # what filled it.
+                # Strictly BETWEEN the restore of the same path and this save. Looser
+                # forms are satisfied by the wrong step: `.outputs.` matched the
+                # restore's own `cache-hit`, and "some earlier .outcome" matches the
+                # restore, so a save moved up beside it passed on an empty directory.
                 restore_at = max(
                     (
                         j for j, s in enumerate(steps[:i])
@@ -445,9 +427,8 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                     default=None,
                 )
                 # No restore above the save is an offender, not "the top of the job".
-                # Treating it as position -1 accepted a job whose restore sits BELOW
-                # its save, which writes the entry every run and reads it never, so
-                # every leg re-downloads the payload the cache exists to avoid.
+                # Position -1 accepted a restore sitting BELOW its save, which writes
+                # the entry every run and reads it never.
                 if restore_at is None:
                     offenders.append(
                         f"{label} saves {path_saved!r} with no restore of that path "
