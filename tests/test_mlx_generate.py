@@ -169,7 +169,12 @@ def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
     if has_clear_cache:
         monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
     else:
-        monkeypatch.delattr("mlx.core.clear_cache", raising=False)
+        # None, not delattr: under tests/mlx_simulation the attribute cannot be
+        # removed -- the shim synthesises a trampoline for any missing name, so
+        # getattr() still returns something callable and the guard never fires.
+        # A non-callable is what the guard actually tests for, and it reads the
+        # same on real MLX and on the shim.
+        monkeypatch.setattr("mlx.core.clear_cache", None, raising=False)
     return events
 
 def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
