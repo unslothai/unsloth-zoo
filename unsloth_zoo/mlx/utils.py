@@ -14511,15 +14511,14 @@ def _has_vlm_gguf_rewrite_candidate(name, tensor):
 
 
 def _mlx_tensors_identical(actual, expected):
-    """The same tensor as stored: dtype and bits, not numeric equality."""
+    """Same dtype and same bits, not numeric equality."""
     held = getattr(actual, "dtype", None)
     wanted = getattr(expected, "dtype", None)
     if (held is None) != (wanted is None) or (held is not None and held != wanted):
         return False
     if held is not None and getattr(actual, "shape", None) == getattr(expected, "shape", None):
         try:
-            # Flattened first: a scalar cannot be viewed as a type of another
-            # size, and a checkpoint may hold one.
+            # Flattened first: a scalar cannot be viewed as another-sized type.
             return bool(mx.all(mx.view(mx.reshape(actual, (-1,)), mx.uint8)
                                == mx.view(mx.reshape(expected, (-1,)), mx.uint8)))
         except Exception:
@@ -14590,8 +14589,7 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps, norm_offset=1
     return name, tensor, False
 
 
-# `None` is a real measurement -- the source could not be read. Only this says
-# nobody has measured yet, so the two passes never act on different answers.
+# Distinct from None, which is a real measurement (source unreadable).
 _UNMEASURED = object()
 
 
@@ -14765,10 +14763,8 @@ def _prepare_mlx_gguf_export_directory(
 ):
     """Restore HF tensor names, layouts and norm convention in the export dir.
 
-    ``replay_sanitizers`` gates the mlx-vlm name/layout inversion, VLM-only; the
-    norm correction runs for every model. ``norm_offsets`` lets a caller running
-    more than one pass measure the source once and hand both the same answer.
-    """
+    ``replay_sanitizers`` gates the VLM-only name/layout inversion; the norm correction
+    always runs. ``norm_offsets`` is one source measurement shared by every pass."""
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -14851,10 +14847,8 @@ def _prepare_mlx_gguf_export_directory(
     return rewritten
 
 
-# mlx-lm stacks an MoE block's per-expert HF tensors into one SwitchLinear parameter,
-# whose name llama.cpp cannot map. Legacy leaf names come first and the identity map
-# last: where a sanitizer renames then stacks (LFM2 turns w1/w2/w3 into gate/down/up)
-# both replay, and only the legacy one names tensors the converter reads.
+# mlx-lm stacks per-expert HF tensors into one SwitchLinear name llama.cpp cannot map.
+# Legacy leaf names first, identity last: only they name tensors the converter reads.
 _MOE_EXPERT_GROUPS = ("experts", "mlp")
 _MOE_EXPERT_LEAF_ALIASES = (
     {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"},
@@ -14881,8 +14875,7 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
     for path, module in named_modules():
         if not path or not _is_mlx_switch_expert_module(module):
             continue
-        # LoRA keeps the base SwitchLinear at ".linear", so the module path is
-        # one or more components longer than the saved parameter path.
+        # LoRA keeps the base SwitchLinear at ".linear", lengthening the module path.
         while path and f"{path}.weight" not in tensor_names:
             path = path.rsplit(".", 1)[0] if "." in path else ""
         if not path or path.count(".") < 2:
@@ -14895,39 +14888,28 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
 
 
 class _MlxReplayedSanitizers:
-    """Sanitizers replayed in order, leaving no module of the model changed.
-
-    A vision-language model's saved names are the composition's image, so no
-    single sanitizer reproduces them. And some write to their module: Gemma 3 ties
-    its output head and drops `lm_head` when what arrives carries no
-    `lm_head.weight`, which is exactly what a search renaming that tensor hands it.
-    """
+    """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
+    ties its head and drops `lm_head` if handed no `lm_head.weight`."""
 
     def __init__(self, owners, held):
         self.owners = tuple(owners)
         self.held = tuple(held)
 
     def sanitize(self, weights):
-        # An mlx `Module` is a dict of its parameters and children with
-        # everything else an ordinary attribute, and Gemma 3 writes one of each.
+        # An mlx `Module` is a dict of parameters/children plus plain attributes.
         state = [(module, dict(module) if isinstance(module, dict) else None,
                   dict(vars(module))) for module in self.held]
         try:
             for owner in self.owners:
                 weights = owner.sanitize(weights)
-                # Every caller reads the result as a mapping, and most read it outside
-                # the guard they replay under, so a sanitize that forgot its `return`
-                # would raise out of `save_pretrained_gguf` mid-save. Refusing here is
-                # read as the failed replay it is, and the export is then exactly what
-                # it is without this pass.
+                # A failed replay writes nothing: the export is then what it was without this pass.
                 if not isinstance(weights, Mapping):
                     raise TypeError("sanitize did not return a mapping")
             return weights
         finally:
             for module, items, attributes in state:
                 if items is not None:
-                    # Through `dict`: a `Module` reads `update` as replacing its parameters from a
-                    # nested tree rather than as putting its own items back.
+                    # Through `dict`: `Module.update` reads a nested parameter tree.
                     dict.clear(module)
                     dict.update(module, items)
                 vars(module).clear()
@@ -14935,11 +14917,7 @@ class _MlxReplayedSanitizers:
 
 
 def _mlx_moe_sanitizers(model):
-    """Sanitizers that may own an MoE block's expert stacking.
-
-    The composition first, since a VLM's saved names are only its image; the parts
-    after, since a sub-model owning a whole block is still reproduced by one of them.
-    """
+    """Sanitizers that may own an MoE block's expert stacking, composition first."""
     owners = []
     for owner in (model, getattr(model, "vision_tower", None),
                   getattr(model, "language_model", None),
@@ -14956,14 +14934,10 @@ def _mlx_moe_sanitizers(model):
 
 
 def _mlx_moe_sanitized_probe(sanitizer, probe):
-    """Replay a probe, copying the tensors a sanitizer writing in place could reach.
-
-    mlx-vlm offsets a norm weight with `+=`, which writes through to the caller's
-    tensor, so an uncopied probe is measured against itself -- and the markers being
-    cached by shape, one written to misreports every later tensor sharing it. Only the
-    1-D tensors an offset is read from are copied; wider ones would cost a
-    synchronization the search is otherwise free of.
-    """
+    """Replay a probe, copying the tensors a sanitizer writing in place could reach:
+    mlx-vlm offsets a norm weight with `+=`, writing through to the caller's tensor and
+    to every later tensor sharing that shape-cached marker. 1-D only, as wider copies
+    would cost a synchronization."""
     if _mlx_sanitizer_writes_in_place(sanitizer):
         probe = {
             name: mx.array(tensor) if getattr(tensor, "ndim", 0) == 1 else tensor
@@ -14973,20 +14947,15 @@ def _mlx_moe_sanitized_probe(sanitizer, probe):
 
 
 def _mlx_augmented_assignment(instruction):
-    """Both spellings: 3.11 replaced `INPLACE_*` with a `BINARY_OP` carrying the operator, and this package supports 3.9."""
+    """Both spellings: 3.11 replaced `INPLACE_*` with `BINARY_OP`, and we support 3.9."""
     return (instruction.opname.startswith("INPLACE_")
             or (instruction.opname == "BINARY_OP"
                 and instruction.argrepr.endswith("=")))
 
 
 def _mlx_sanitizer_writes_in_place(sanitizer):
-    """Whether a sanitizer's code holds an augmented assignment, which may write through.
-
-    Read from the code because measuring costs the synchronization this exists to
-    avoid, and answered for the operator rather than the type it applies to: a store
-    into a tensor is spelled like the store into the dictionary every sanitizer builds.
-    One that writes some other way is left to the confirmation.
-    """
+    """Whether a sanitizer's code holds an augmented assignment, which may write
+    through. From bytecode, since measuring costs the synchronization this avoids."""
     if getattr(sanitizer, "_writes_in_place", None) is None:
         sanitizer._writes_in_place = any(
             _mlx_augmented_assignment(instruction)
@@ -15012,26 +14981,16 @@ _GGUF_TEXT_TOWER_NAMESPACE = "language_model.model"
 
 
 def _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed):
-    """Whether this rename keeps a text tower but drops the namespace llama.cpp maps it under.
-
-    The converter strips `language_model.` and looks the rest up under `model.`, so a
-    rename off `language_model.model.` onto a `language_model.` that no longer carries it
-    moves the tensor out of the tables. Both ends are read, so a tensor renamed into the
-    tower never counts as having left it. Only a text tower is answered: outside one,
-    `transformer.blocks`, `encoder.layers` and a bare `layers` are each mapped under some
-    architecture, and nothing about a name says which a checkpoint is spelled in.
-    """
+    """Whether this rename keeps a text tower but drops the namespace llama.cpp maps it
+    under: the converter strips `language_model.` and looks the rest up under `model.`,
+    so a rename off `language_model.model.` moves the tensor out of the tables."""
     return (name.startswith(_GGUF_TEXT_TOWER_NAMESPACE + ".")
             and renamed.startswith("language_model.")
             and not renamed.startswith(_GGUF_TEXT_TOWER_NAMESPACE + "."))
 
 
 def _mlx_moe_parent_substitutions(renames):
-    """The module relocations a set of proved renames is made of.
-
-    A relocated block moves its router and shared experts too, and those are plain
-    renames, so the relocation is read off them once rather than per candidate.
-    """
+    """The module relocations a set of proved renames is made of."""
     substitutions = [("", "")]
     for name, renamed in renames.items():
         head = len(os.path.commonprefix([name, renamed]))
@@ -15043,7 +15002,7 @@ def _mlx_moe_parent_substitutions(renames):
 
 
 def _mlx_moe_probe_tensor(shape, value):
-    """A marker tensor of the same rank as a per-expert slice, but tiny."""
+    """A tiny marker of the same rank as a per-expert slice."""
     return mx.full(tuple(min(dim, 2) for dim in shape), value, dtype=mx.float32)
 
 
@@ -15078,8 +15037,7 @@ def _candidate_mlx_moe_unstack_plans(stacked, parents=(("", ""),)):
 def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", ""),)):
     """Recover per-expert HF names, then prove them by replaying sanitize()."""
     sanitizers = _mlx_moe_sanitizers(model)
-    # Sanitizers read non-expert weights too, so replay against the whole
-    # checkpoint. Only the markers are evaluated; MLX keeps the rest lazy.
+    # Sanitizers read non-expert weights too, so replay against the whole checkpoint.
     others = {name: tensor for name, tensor in staged.items() if name not in stacked}
     for plan in _candidate_mlx_moe_unstack_plans(stacked, parents):
         probe = dict(others)
@@ -15102,21 +15060,14 @@ def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", "")
     return None
 
 
-# Read from the sanitizer's constant pool rather than tabulated, which covers
-# architectures no static table anticipated; the replay decides whether one applies.
+# From the sanitizer's constant pool, not a table, so unanticipated architectures work.
 _MOE_VOCABULARY_DEPTH = 5
 _MOE_VOCABULARY_UBIQUITY = 0.5
-# How far a sanitizer's calls are followed. Every installed architecture spells its names
-# one call away, so two is measured margin for one that delegates twice.
 _MOE_VOCABULARY_CALLS = 2
 
 
 def _mlx_sanitizer_own_functions(found, package, mentioned):
-    """The package's own functions one global name reaches.
-
-    Only the attributes named beside a class, since following every method would cost a
-    vocabulary the sanitizer never mentions.
-    """
+    """The package's own functions one global name reaches, only those named beside a class."""
     def owned(value):
         return (inspect.isfunction(value)
                 and (getattr(value, "__module__", "") or "").split(".")[0] == package)
@@ -15128,11 +15079,8 @@ def _mlx_sanitizer_own_functions(found, package, mentioned):
 
 
 def _mlx_sanitizer_code(sanitizers):
-    """Every code object a sanitizer reaches inside the model's own package.
-
-    Only the model's own package is followed: a walk into mlx or numpy would cost
-    a vocabulary of everything and prove nothing.
-    """
+    """Every code object a sanitizer reaches inside the model's own package; a walk
+    into mlx or numpy would cost a vocabulary of everything and prove nothing."""
     reached, walked = [], set()
 
     def walk(function, calls):
@@ -15145,12 +15093,8 @@ def _mlx_sanitizer_code(sanitizers):
             return
         package = (getattr(function, "__module__", "") or "").split(".")[0]
         namespace = getattr(function, "__globals__", None) or {}
-        # The nested code objects too, not this one alone. Before 3.12 a comprehension
-        # compiles to its own code object, so a helper called from inside one does not
-        # appear in `code.co_names` and the walk stops at the comprehension -- and a
-        # sanitizer spelling its rename in a dict comprehension is the ordinary shape.
-        # 3.12 inlines them, which is why this only ever showed on the older
-        # interpreters pyproject still supports.
+        # Descend into nested code objects: before PEP 709 (3.12) a comprehension gets
+        # its own, hiding from `co_names` the helper a rename is spelled in.
         names, mentioned, pending = [], set(), [code]
         while pending:
             current = pending.pop(0)
@@ -15199,13 +15143,8 @@ def _mlx_sanitizer_vocabulary(sanitizers):
 
 
 def _mlx_sanitizer_fusion_groups(sanitizers):
-    """Each tuple of names a sanitizer holds, with the fragments beside it.
-
-    Which names belong to one split would otherwise cost the vocabulary to the
-    power of the part count. A sanitizer that fuses several tensors names them in
-    one tuple, so the tuple is the group, in the order they were concatenated, and
-    only the fragments from the same function are worth substituting into.
-    """
+    """Each tuple of names a sanitizer holds, with the fragments beside it. A fuser
+    names its inputs in one tuple in concatenation order, so the tuple is the group."""
     def named(obj):
         return (isinstance(obj, tuple) and 1 < len(obj) <= _MOE_SPLIT_PARTS
                 and len(set(obj)) == len(obj)
@@ -15225,25 +15164,19 @@ def _mlx_sanitizer_fusion_groups(sanitizers):
 
 
 def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
-    """Substitutions worth trying, as (replaced, replacement) pairs.
-
-    ``ubiquity`` of 1 offers every fragment, which is right once the names have
-    been narrowed to the few a candidate could not account for.
-    """
+    """Substitutions worth trying, as (replaced, replacement) pairs; ``ubiquity`` of 1
+    offers every fragment, right once ``names`` is already narrowed."""
     limit = max(1, int(len(names) * ubiquity))
     for replaced in vocabulary:
         carried = [name for name in names if replaced in name]
         if not carried:
             continue
-        # A fragment carried by most tensors names the checkpoint's shape, not one block's
-        # layout -- unless every name carrying it starts with it, which is a namespace, and
-        # a relocated namespace is what qwen4_exp's 86 of 88 names differ by.
+        # A fragment on most tensors names the checkpoint's shape, not a block layout,
+        # unless every carrier starts with it: a relocated namespace, as in qwen4_exp.
         relocation = len(carried) > limit
         if relocation and not all(name.startswith(replaced) for name in carried):
             continue
-        # A relocation moves a namespace and does not invent one, so it is only
-        # offered fragments spelling the same components in another order: pairing
-        # one with the whole vocabulary costs a replay per name in the checkpoint.
+        # A relocation moves a namespace, so only its own components reordered are offered.
         components = sorted(part for part in replaced.split(".") if part)
         for replacement in vocabulary:
             if replacement == replaced:
@@ -15253,14 +15186,12 @@ def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQU
             ) != components:
                 continue
             yield replaced, replacement
-        # A checkpoint can spell a tensor with one fragment fewer rather than a
-        # different one -- mlx-lm appends `.weight` to a name carried bare -- and no
-        # fragment stands for its absence.
+        # Deletion: mlx-lm appends `.weight` to a name carried bare.
         yield replaced, ""
 
 
 def _mlx_moe_renamed(names, replaced, replacement):
-    """Apply one substitution, keeping only the names it actually changes."""
+    """Apply one substitution, keeping only the names it changes."""
     renamed = {}
     for name in names:
         if replaced in name:
@@ -15270,19 +15201,14 @@ def _mlx_moe_renamed(names, replaced, replacement):
     return renamed if len(set(renamed.values())) == len(renamed) else {}
 
 
-# Two probes, as (base, spread): tensor at position n is marked base + n * spread. One
-# cannot tell a constant offset from a coincidence, nor -- a 1-D marker being one repeated
-# value -- a doubled tensor from one with a constant added. Two spreading alike could not
-# tell a constant from a swap, the gap between neighbours being constant too.
+# Two probes, as (base, spread): tensor n is marked base + n * spread. One cannot tell a
+# doubled 1-D tensor from an offset one; two alike could not tell a constant from a swap.
 _MOE_PROBE_MARKERS = ((3.0, 1.0), (5.0, 7.0))
 
 def _mlx_moe_replay_marker(shape, value):
-    """A marker for replay measurement, full width where a shift can hide.
-
-    1-D tensors are carried whole, since a shift along one reads as a constant from a
-    truncated corner. Wider ones are truncated to avoid materializing the checkpoint, and
-    counted rather than filled so an axis move still shows.
-    """
+    """A marker for replay measurement: 1-D whole, since a shift along one reads as a
+    constant from a truncated corner; wider ones truncated, and counted rather than
+    filled so an axis move still shows."""
     if len(shape) == 1:
         return mx.full(shape, value, dtype=mx.float32)
     shape = tuple(min(dim, 2) for dim in shape)
@@ -15293,8 +15219,7 @@ def _mlx_moe_replay_marker(shape, value):
 
 
 def _mlx_moe_constant_offset(sanitized, marker):
-    # A sanitizer hands back what it does not change, so identity settles almost
-    # every tensor. The comparison below costs a device synchronization each.
+    # Identity settles almost every tensor; the comparison below costs a sync each.
     if sanitized is marker:
         return 0.0
     if sanitized is None or tuple(getattr(sanitized, "shape", ())) != tuple(marker.shape):
@@ -15304,9 +15229,7 @@ def _mlx_moe_constant_offset(sanitized, marker):
         if not bool(mx.all(difference == difference[0])):
             return None
         constant = float(difference[0])
-        # Only a full-width probe proves a constant: a truncated one can show a shift
-        # uniform in the corner and not beyond it, so a wider tensor is only ever
-        # accepted as untouched.
+        # Only a full-width probe proves a constant, so wider ones must be untouched.
         if constant and len(marker.shape) != 1:
             return None
         return constant
@@ -15314,18 +15237,14 @@ def _mlx_moe_constant_offset(sanitized, marker):
         return None
 
 
-# Axis pairs an mlx-lm sanitizer moves, as (source, destination) HF to MLX. Kimi
-# Linear's KDA convolutions are stored (d_inner, d_conv, 1) where the checkpoint
-# holds (d_inner, 1, d_conv).
+# Axis pairs an mlx-lm sanitizer moves, (source, destination) HF to MLX: Kimi Linear
+# stores KDA convolutions (d_inner, d_conv, 1) for (d_inner, 1, d_conv).
 _MOE_TENSOR_LAYOUTS = ((2, 1), (1, 0), (2, 0))
 
 
 def _mlx_moe_replay_match(sanitized, marker):
-    """What a sanitizer did to one marker: a constant added and an axis moved.
-
-    Measured with the name rather than after it, since a sanitizer that re-lays a
-    tensor out cannot be inverted by renaming. None when neither explains it.
-    """
+    """What a sanitizer did to one marker: a constant added and an axis moved, or None.
+    Measured with the name, since a re-laid-out tensor cannot be inverted by renaming."""
     if sanitized is marker:
         return 0.0, None
     if sanitized is None:
@@ -15345,19 +15264,14 @@ def _mlx_moe_replay_match(sanitized, marker):
 
 
 def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, required=()):
-    """For each saved tensor a sanitizer still produces, how it produced it.
-
-    Sanitizers do more than rename: step3p5 stores a norm weight one greater than the
-    checkpoint and llama.cpp adds the same one back, and Kimi Linear's KDA convolutions
-    arrive transposed.
-    """
+    """For each saved tensor a sanitizer still produces, how it produced it: step3p5
+    stores a norm weight one greater, Kimi Linear's KDA convolutions transposed."""
     markers = {} if markers is None else markers
     for sanitizer in sanitizers:
         corrections, replays = {}, []
         for base, spread in _MOE_PROBE_MARKERS:
             probe = {}
-            # A distinct value per tensor, so a sanitizer that swapped two
-            # same-shaped tensors could not be read as having left both alone.
+            # A distinct value per tensor, so a swap of two same-shaped ones shows.
             for position, (name, proposed) in enumerate(proposal.items()):
                 shape, value = tuple(staged[name].shape), base + position * spread
                 if (shape, value) not in markers:
@@ -15368,8 +15282,7 @@ def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, re
             except Exception:
                 replays = []
                 break
-            # A candidate already short of what it has to keep costs one replay and no
-            # comparisons rather than two and all; nothing below recovers a missing name.
+            # Nothing below recovers a missing name, so bail on the first replay.
             if not required <= set(sanitized):
                 replays = []
                 break
@@ -15389,7 +15302,7 @@ def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, re
 
 
 def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabulary, replay):
-    """Try to finish a candidate with a second substitution on what it missed."""
+    """Finish a candidate with a second substitution on what it missed."""
     for replaced, replacement in _mlx_moe_rename_candidates(
         vocabulary, [candidate[name] for name in unproven], ubiquity=1
     ):
@@ -15401,8 +15314,7 @@ def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabu
             continue
         for name in unproven:
             repaired[name] = fixed.get(candidate[name], candidate[name])
-        # A second substitution putting a name back to the one already saved proves
-        # nothing: that name is reproduced by definition.
+        # Restoring a name to the one already saved proves nothing.
         if any(repaired[name] == name for name in unproven):
             continue
         if len(set(repaired.values())) != len(repaired):
@@ -15413,10 +15325,8 @@ def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabu
     return candidate, corrections
 
 
-# The splits reached here are in two: a gate/up pair, or an MLA key/value pair. DBRX
-# splits per expert instead, which the stack family reaches -- widening this grouping
-# would cost a factor of the vocabulary per part, and a per-expert split's parts carry no
-# name to substitute.
+# Splits reached here are in two (gate/up, or MLA key/value); DBRX's per-expert split
+# belongs to the stack family. Widening costs a factor of the vocabulary per part.
 _MOE_MERGE_PARTS = 2
 _MOE_MERGE_PROBE_WIDTHS = (2, None)
 _MOE_MERGE_ROUNDS = 4
@@ -15425,23 +15335,20 @@ _MOE_MERGE_KEPT = ((None,), 0, False)
 
 
 def _mlx_moe_moved_shape(shape, layout):
-    """The shape a part has once the axis move a sanitizer applied is undone."""
+    """The shape a part has once the sanitizer's axis move is undone."""
     if layout is None:
         return tuple(shape)
     return tuple(mx.moveaxis(mx.zeros(tuple(shape)), layout[1], layout[0]).shape)
 
 
 def _mlx_moe_group_recipe(parts, recipe):
-    """The recipe a group follows: the merge, or the identity for a lone part."""
+    """A group's recipe: the merge, or the identity for a lone part."""
     return (parts,) + (recipe if len(parts) > 1 else _MOE_MERGE_KEPT)
 
 
 def _mlx_moe_merged(parts, recipe):
-    """Rebuild the checkpoint tensor a sanitizer split into `parts`.
-
-    A share says the sanitizer went the other way and fused several checkpoint
-    tensors into the one part read here, so what comes back is one slice of it.
-    """
+    """Rebuild the checkpoint tensor a sanitizer split into `parts`. A share means it
+    instead fused several into one part, so what comes back is one slice of it."""
     _, layouts, axis, flattened, *share = recipe
     merged = mx.concatenate(
         [
@@ -15480,9 +15387,7 @@ def _mlx_moe_merge_recipes(shapes):
                 for shape in moved
             ):
                 continue
-            # A sanitizer that reshapes cannot tell a merged tensor from the same values
-            # folded into its leading axes, so the flatter form goes first: a checkpoint
-            # stores a projection weight flat, and a split needing the axes rejects it.
+            # A reshape hides the difference between a merge and its flattening, so flatter first.
             for flattened in (True, False):
                 if flattened and (axis == 0 or axis + 1 == rank):
                     continue
@@ -15490,17 +15395,12 @@ def _mlx_moe_merge_recipes(shapes):
 
 
 def _mlx_moe_merge_groups(staged, substitutions):
-    """The staged tensors each substituted name collects, in substitution order.
-
-    Checkpoint order would let one layer collect its parts the other way round.
-    Whether one arrangement holds for every group is what the proof reads.
-    """
+    """The staged tensors each substituted name collects, in substitution order:
+    checkpoint order would let one layer collect its parts the other way round."""
     groups = {}
     for name in staged:
         for rank, (replaced, replacement) in enumerate(substitutions):
-            # The first match only: one part's fragment can be a fragment of the fused name
-            # the other restores to -- `up_proj` inside `gate_up_proj` -- so applying the
-            # rest in turn would land the two parts of one split in two groups.
+            # First match only: `up_proj` sits inside `gate_up_proj`, splitting a group in two.
             if replaced in name:
                 target = name.replace(replaced, replacement)
                 if target != name:
@@ -15523,11 +15423,8 @@ def _mlx_moe_merge_arrivals(staged, vocabulary):
 
 def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
                                  native=False):
-    """The recipe under which the sanitizer reproduces every merged part.
-
-    Yields the name of a tensor the sanitizer wanted and did not find, which is
-    what a grouping still misses.
-    """
+    """The recipe under which the sanitizer reproduces every merged part, else the name
+    of a tensor it wanted and did not find."""
     merged_parts = {part for parts in groups.values() for part in parts}
     others, floor_probe = {}, {}
     for position, (name, tensor) in enumerate(staged.items()):
@@ -15536,12 +15433,10 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
         floor_probe[name] = marker
         if name not in merged_parts:
             others[name] = marker
-    # The floor: a sanitizer can drop a sibling once the fused tensor is present. Read
-    # from the whole checkpoint, since what it does to a sibling can depend on the parts.
+    # The floor: a sanitizer can drop a sibling once the fused tensor is present.
     try:
-        # Through the probe, like every other replay: `others` holds the same marker
-        # objects, so a sanitizer offsetting a norm with `+=` would write through and
-        # the floor would be measured one step ahead of the recipes it gates.
+        # Must go through the probe helper: `floor_probe` shares marker objects with
+        # `others`, so an in-place `+=` measures the floor one step ahead.
         floor = _mlx_moe_sanitized_probe(sanitizer, floor_probe)
     except Exception:
         return
@@ -15571,8 +15466,7 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
                     markers, _mlx_moe_group_recipe(parts, recipe)
                 )
         except Exception:
-            # A truncated probe only fits a recipe that leaves the last axis
-            # alone; the full-width pass reaches the rest.
+            # A truncated probe only fits recipes leaving the last axis alone.
             continue
         probe.update(others)
         try:
@@ -15587,8 +15481,7 @@ def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
             for name, value in kept.items()
         ):
             continue
-        # A group at a time: the comparison materializes the marker and what was built
-        # from it, so holding all at once would cost the checkpoint again.
+        # A group at a time: comparing materializes both sides.
         proved = True
         for target, parts in groups.items():
             for part in parts:
@@ -15613,8 +15506,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
         if not parts or len(parts) != count or set(groups) & set(staged):
             return None
         shapes = [tuple(staged[part].shape) for part in parts]
-        # A recipe is an arrangement rather than a size, so groups agree on rank and not
-        # extent: layers holding different widths are still split the same way.
+        # A recipe is an arrangement, not a size, so groups agree on rank and not extent.
         ranks = {len(shape) for shape in shapes}
         if any(
             {len(staged[part].shape) for part in group} != ranks
@@ -15622,9 +15514,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
             if len(group) > 1
         ):
             return None
-        # Every layer's target collects the same parts, so the grouping is what has been
-        # tried, not the target it was read off. Recording it only once it is worth
-        # replaying keeps one that never got that far from being lost to one that did.
+        # Keyed by the grouping, not the target, and only once worth replaying.
         grouping = tuple(sorted((t, tuple(g)) for t, g in groups.items()))
         if grouping in attempted:
             return None
@@ -15638,9 +15528,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
                     if recipe is None:
                         wanted = wanted or missing
                         continue
-                    # A corner in float32 makes the search affordable and can support a recipe the
-                    # whole tensor contradicts. Rejecting one here lets the full-width pass find the
-                    # recipe that does hold, which refusing the finished rewrite could only lose.
+                    # A float32 corner can support a recipe the tensor contradicts: confirm natively.
                     if not any(
                         confirmed is not None
                         for confirmed, _ in _proved_mlx_moe_merge_recipe(
@@ -15652,9 +15540,7 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
                         merged: _mlx_moe_group_recipe(group, recipe)
                         for merged, group in groups.items()
                     }
-        # A sanitizer that pops a sibling unconditionally throws until the probe carries
-        # it, and names the one it wanted, so the companion rename is read off the
-        # failure rather than searched for.
+        # A sanitizer popping a sibling throws naming what it wanted: read the companion off it.
         claimed = {part for group in groups.values() for part in group}
         companion = next(
             (
@@ -15671,19 +15557,13 @@ def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutio
 
 
 def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
-    """Recover checkpoint tensors a sanitizer split into several staged ones.
-
-    GraniteMoE stores a layer's gate and up projections as one tensor, so no rename
-    reaches them: the checkpoint name has no staged counterpart at all. Proposing the
-    concatenation with the name makes the pair provable, and a marker with no two
-    elements alike proves the arrangement, not just the shape.
-    """
+    """Recover checkpoint tensors a sanitizer split into several staged ones, as
+    GraniteMoE's fused gate/up projection no rename reaches."""
     owned = _mlx_moe_sanitizers(model)
     vocabulary = _mlx_sanitizer_vocabulary(owned)
     if not vocabulary:
         return {}
-    # The vocabulary is the model's own either way: a sanitizer wrapped to
-    # spell its output differently carries no name fragments of its own.
+    # The vocabulary stays the model's own: a wrapped sanitizer has no fragments.
     sanitizers = sanitizers or owned
     arrivals = _mlx_moe_merge_arrivals(staged, vocabulary)
     collected = {}
@@ -15691,8 +15571,6 @@ def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
         for target in targets:
             collected.setdefault(target, []).append(name)
 
-    # The same grouping is reached from every layer's target, so replaying it
-    # once is what keeps the search from scaling with the layer count.
     attempted = set()
     for target, sources in collected.items():
         for chosen in itertools.permutations(sources, _MOE_MERGE_PARTS):
@@ -15710,7 +15588,7 @@ def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
 
 
 class _MlxRelabelledSanitizer:
-    """A sanitizer whose output is spelled the way a proved rename spells it."""
+    """A sanitizer relabelled to spell its output the way a proved rename does."""
 
     def __init__(self, inner, renames):
         self.inner, self.renames = inner, renames
@@ -15722,18 +15600,13 @@ class _MlxRelabelledSanitizer:
 
 
 def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
-    """Merges the checkpoint still needs once the renames have been proved.
-
-    A sanitizer that splits as well as relocates leaves no staged name one substitution
-    from the checkpoint's: Qwen3-VL-MoE saves `switch_mlp.gate_proj.weight` for a
-    checkpoint holding `experts.gate_up_proj`. From the proved name it is one, so the
-    search runs again there with both sides relabelled to checkpoint names.
-    """
+    """Merges the checkpoint still needs once the renames have been proved: splitting
+    plus relocating leaves no staged name one substitution from the checkpoint's, but
+    the proved name is one away (Qwen3-VL-MoE)."""
     if not renames:
         return {}
     renamed = {renames.get(name, name): tensor for name, tensor in staged.items()}
-    # A rename can land on a name the search never saw, since names a merge claimed
-    # are held out of it, and two staged tensors under one name is not a checkpoint.
+    # Two staged tensors under one name is not a checkpoint.
     if len(renamed) != len(staged):
         return {}
     merges = _build_mlx_moe_merge_plan(
@@ -15745,9 +15618,7 @@ def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
     restored = {}
     for target, (parts, *recipe) in merges.items():
         parts = [staged_names.get(part, part) for part in parts]
-        # A group no rename touched is one the first search saw under these very names
-        # and reaches the same recipe; dropping it keeps this search to what the renames
-        # made reachable.
+        # A group no rename touched was already covered by the first search.
         if all(part not in renames for part in parts):
             continue
         restored[target] = (parts, *recipe)
@@ -15755,11 +15626,9 @@ def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
 
 
 def _mlx_moe_expert_stacks(staged):
-    """Staged names alike but for one component spelling a run of experts.
-
-    DBRX builds each part's name with an f-string, leaving no fragment standing
-    for the index, so the run itself is what identifies them.
-    """
+    """Staged names alike but for one component spelling a run of experts. DBRX builds
+    each with an f-string, so no fragment stands for the index and the run identifies
+    them."""
     runs = {}
     for name in staged:
         components = name.split(".")
@@ -15774,11 +15643,9 @@ def _mlx_moe_expert_stacks(staged):
 
 
 def _mlx_moe_stack_recipes(rank, count):
-    """Every concatenation of the parts one split produced, arranged alike.
-
-    A sanitizer splits every expert the same way, so one layout stands for all and the
-    search stays layouts times axes rather than layouts to the expert count.
-    """
+    """Every concatenation of the parts one split produced, all arranged alike: every
+    expert is split the same way, so the search stays layouts times axes rather than
+    layouts to the expert count."""
     choices = [None] + [layout for layout in _MOE_TENSOR_LAYOUTS
                         if max(layout) < rank]
     for layout in choices:
@@ -15795,9 +15662,7 @@ def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
     stripped = fragment.strip(".")
     if not stripped or "." in stripped:
         return None
-    # The checkpoint may or may not carry the `.weight` mlx-lm appends -- DBRX's
-    # converter reads the fused name only without it -- so the two spellings are
-    # separate proposals.
+    # DBRX's converter reads the fused name only without the `.weight` mlx-lm appends.
     for trimmed in (False, True):
         groups = {}
         for head, parts in heads.items():
@@ -15807,13 +15672,10 @@ def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
                     break
                 target = target[: -len(".weight")]
             groups[target] = parts
-        # Short when the spelling did not apply to every head, and a spelling
-        # only some of them can take is not one.
+        # Short when the spelling did not apply to every head.
         if len(groups) != len(heads):
             continue
-        # A group cannot rebuild one of its own parts, which a fragment spelling an index
-        # in the run reaches. Nothing else refuses it: the floor holds the parts out, so
-        # it cannot see the rest written away.
+        # A group cannot rebuild its own part, and the floor holds the parts out.
         if any(target in parts for target, parts in groups.items()):
             continue
         for width in _MOE_MERGE_PROBE_WIDTHS:
@@ -15834,26 +15696,19 @@ def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
 
 
 def _build_mlx_moe_expert_stack_plan(model, staged):
-    """Recover a checkpoint tensor a sanitizer split into one tensor per expert.
-
-    Neither a rename nor a merge reaches DBRX's: the parts are told apart by index
-    rather than by name, and there are as many as the model has experts, which no
-    arrangement of a pair can propose. So the run of indices finds a group, the
-    vocabulary only names what it restores to, and the parts go in index order.
-    """
+    """Recover a checkpoint tensor a sanitizer split into one tensor per expert: DBRX's
+    parts are told apart by index, so the run of indices finds the group."""
     sanitizers = _mlx_moe_sanitizers(model)
     vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
     if not vocabulary:
         return {}
-    # Grouping by the tail the indexed component precedes is what separates a
-    # run of expert indices from the run of layer indices beside it.
+    # Grouping by the tail separates a run of expert indices from one of layer indices.
     by_tail = {}
     for (head, tail), parts in _mlx_moe_expert_stacks(staged).items():
         by_tail.setdefault(tail, {})[head] = parts
 
     plan = {}
     for tail, heads in sorted(by_tail.items()):
-        # Rank rather than extent, as a merge reads it.
         ranks = {len(staged[part].shape) for parts in heads.values() for part in parts}
         counts = {len(parts) for parts in heads.values()}
         if len(ranks) != 1 or len(counts) != 1:
@@ -15869,34 +15724,24 @@ def _build_mlx_moe_expert_stack_plan(model, staged):
     return plan
 
 
-# How many tensors one staged tensor is split back into. Three covers the KDA
-# convolutions glm5_next fuses; a group longer than this is a table of names
-# rather than the parts of one tensor.
+# How many tensors one staged tensor splits back into; longer is a name table.
 _MOE_SPLIT_PARTS = 4
 
 
 def _mlx_moe_split_recipes(rank, count):
-    """Every way one staged tensor could be the concatenation of `count` parts.
-
-    Both directions of every axis move, unlike a merge's: a merge undoes what the
-    sanitizer did to a part it was given, a split does it to one it hands over.
-    """
+    """Every way one staged tensor could be the concatenation of `count` parts. Both
+    directions of every axis move, unlike a merge's: a merge undoes what the sanitizer
+    did to a part it was given, a split does it to one it hands over."""
     moves = [layout for layout in _MOE_TENSOR_LAYOUTS if max(layout) < rank]
-    # Moved layouts first, identity last: a sanitizer only moves an axis because
-    # some checkpoint stores it the other way, so where both replay -- as they do
-    # for glm5_next's convolutions -- the moved one is what llama.cpp reads.
+    # Moved layouts first, identity last: where both replay the moved one is right.
     for layout in moves + [(after, before) for before, after in moves] + [None]:
         for axis in range(rank):
             yield (layout,), axis
 
 
 def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
-    """The naming and recipe under which the sanitizer fuses parts into `source`.
-
-    A merge's proof reads markers back under the names it gave; here the names are
-    new, so what has to come back is the one tensor they were built into. The floor
-    is replayed once for the source: what it holds does not depend on the naming.
-    """
+    """The naming and recipe under which the sanitizer fuses parts into `source`: the
+    names are new, so what must come back is the one tensor they were built into."""
     others = {name: mx.full(tuple(tensor.shape), float(position), dtype=mx.float32)
               for position, (name, tensor) in enumerate(staged.items())
               if name != source}
@@ -15904,7 +15749,6 @@ def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
         floor = sanitizer.sanitize(dict(others))
     except Exception:
         return None
-    # The floor, as the merge proof reads it, against the source arriving as parts.
     kept = {name: floor[name] for name in others if name in floor}
 
     shape = tuple(staged[source].shape)
@@ -15940,12 +15784,8 @@ def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
 
 
 def _build_mlx_moe_name_split_plan(model, staged, claimed):
-    """Recover checkpoint tensors a sanitizer fused into one staged tensor.
-
-    glm5_next concatenates a layer's three KDA convolutions and moves an axis, so
-    neither a rename nor a merge reaches them: the checkpoint holds the parts and
-    the staged form the whole. Each part is a share of the tensor it came from.
-    """
+    """Recover checkpoint tensors a sanitizer fused into one staged tensor, as glm5_next
+    does a layer's three KDA convolutions. Each part is a share of what it came from."""
     sanitizers = _mlx_moe_sanitizers(model)
     groups = _mlx_sanitizer_fusion_groups(sanitizers)
     if not groups:
@@ -15956,7 +15796,7 @@ def _build_mlx_moe_name_split_plan(model, staged, claimed):
         if source in claimed or _kept_for_the_gguf_converter(source):
             continue
         rank = len(staged[source].shape)
-        # The names first, since they are string work and a replay is not.
+        # Names first: string work, unlike a replay.
         proposals = []
         for group, fragments in groups:
             for replaced in fragments:
@@ -15985,12 +15825,8 @@ def _build_mlx_moe_name_split_plan(model, staged, claimed):
 
 
 def _mlx_moe_merge_placement(files, merges):
-    """Which shard receives each merged tensor, and which shard holds each part.
-
-    Parts may live in different shards, so the merged tensor goes in the first of
-    theirs to be written, which leaves the rest still there to be read: rewriting
-    a shard drops the parts it held.
-    """
+    """Which shard receives each merged tensor, and which holds each part. Rewriting a
+    shard drops the parts it held, so a merge goes in the first of its parts'."""
     owned, owner, anchors = {}, {}, {}
     if merges:
         consumed = {part for parts, *_ in merges.values() for part in parts}
@@ -16006,11 +15842,9 @@ def _mlx_moe_merge_placement(files, merges):
 
 
 def _mlx_moe_written_order(files, plan, merges, owned):
-    """Every name the rewrite writes, in the order it will be read back in.
-
-    Asked rather than predicted: what a file hands back depends on its names alone,
-    so a file of one byte apiece answers it without writing the checkpoint again.
-    """
+    """Every name the rewrite writes, in the order it will be read back in. Asked, not
+    predicted: order depends on the names alone, so a file of one byte apiece answers
+    it without writing the checkpoint again."""
     consumed = {part for parts, *_ in merges.values() for part in parts}
     order = []
     with tempfile.TemporaryDirectory() as directory:
@@ -16032,10 +15866,7 @@ def _mlx_moe_written_order(files, plan, merges, owned):
 
 def _mlx_moe_shard_merges(file, tensors, owner, owned):
     """Every merged tensor one shard receives, built from the shards holding the parts.
-
-    A call rather than a block, so what it read is let go when it returns: a name
-    still bound to a shard would keep that shard alive through the writes after.
-    """
+    A call, not a block, so the shards it read are released when it returns."""
     built, loaded = {}, {}
     for target, recipe in owned.items():
         parts = recipe[0]
@@ -16044,8 +15875,7 @@ def _mlx_moe_shard_merges(file, tensors, owner, owned):
             if part_file == file:
                 shard = tensors
             else:
-                # Opened once for every merge this shard receives: one shard can anchor a merge
-                # for each layer with their parts in another, a descriptor apiece if reopened.
+                # Cached: one shard can anchor a merge per layer, a descriptor apiece if reopened.
                 shard = loaded.get(part_file)
                 if shard is None:
                     shard = loaded[part_file] = mx.load(str(part_file))
@@ -16056,12 +15886,8 @@ def _mlx_moe_shard_merges(file, tensors, owner, owned):
 
 
 def _mlx_moe_rewritten_checkpoint(staged, plan, offsets, layouts, merges):
-    """The names and tensors the rewrite writes, or None if two of them collide.
-
-    Refused rather than resolved: each tensor is placed in a shard one of its
-    sources came from, so two reconstructions sharing a name survive in different
-    shards and the index picks by position, which no single mapping stands for.
-    """
+    """The names and tensors the rewrite writes, or None if two collide: colliding
+    reconstructions land in different shards and the index picks by position."""
     consumed = {part for parts, *_ in merges.values() for part in parts}
     written = {
         target: _mlx_moe_merged([staged[part] for part in recipe[0]], recipe)
@@ -16090,16 +15916,10 @@ def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges
                                restored=(), owned=None):
     """Whether replaying the whole rewrite hands the staged checkpoint back.
 
-    On the checkpoint rather than on markers: at bfloat16's eight significant bits a
-    marker stops being distinguishable, and two tensors the sanitizer cannot tell apart
-    are two the rewrite cannot get wrong.
-
-    Each reconstruction was proved alone; what reaches the sanitizer is all of them at
-    once, and two that hold apart need not hold together. Doing nothing is the floor: a
-    tensor the sanitizer already does not reproduce is not the rewrite's to lose, and
-    every tensor the rewrite claims has to come back whatever the floor says. One the
-    source checkpoint already corrected is held to neither.
-    """
+    On the checkpoint, not markers, which bfloat16's eight bits cannot tell apart, and
+    all at once, since reconstructions proved singly need not hold together. The floor
+    is doing nothing: what the sanitizer already fails to reproduce is not the
+    rewrite's to lose, but everything the rewrite claims must come back."""
     claimed = set(plan) | set(offsets) | set(layouts)
     claimed.update(part for parts, *_ in merges.values() for part in parts)
     order = _mlx_moe_written_order(files, plan, merges, owned or {})
@@ -16107,8 +15927,7 @@ def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges
         floor = _mlx_moe_floor_names(sanitizer, files, claimed)
         if floor is None:
             continue
-        # Which written names each staged tensor accounts for, so that both it
-        # and they can be let go the moment it has been compared.
+        # Which written names each staged tensor accounts for, to release both early.
         produced, required = {}, floor - set(restored)
         for file in files:
             for name in mx.load(str(file)):
@@ -16118,9 +15937,7 @@ def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges
                 produced[part] = ()
         for target, (parts, *_) in merges.items():
             produced[parts[-1]] = (target,)
-        # Every replay here assumes the sanitizer reads a mapping and not an order, and
-        # replaying reversed makes that assumption falsifiable rather than silent. Any
-        # disagreement is refused, since the disagreement is what says order was read.
+        # Replaying reversed falsifies the assumption that sanitize reads a mapping.
         forwards = _replayed_mlx_moe_rewrite(
             sanitizer, files, plan, offsets, layouts, merges, produced, required,
             order, reverse=False)
@@ -16128,8 +15945,7 @@ def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges
             return False
         if forwards is None:
             continue
-        # Compared as the second replay produces it, so that one replay's
-        # residue is held rather than both.
+        # Compared as the second replay produces it, holding one residue not both.
         if _replayed_mlx_moe_rewrite(
             sanitizer, files, plan, offsets, layouts, merges, produced, required,
             order, reverse=True, mirrored=forwards
@@ -16162,27 +15978,21 @@ def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
                               produced, required, order, reverse, mirrored=None):
     """Replay the rewritten checkpoint once, against the shards as they stand.
 
-    Answers with whatever the replay produced that the shards could not account for,
-    which is all the other replay has to be compared with. Given `mirrored`, what that
-    one left over, each is compared as produced. None says this replay did not hand the
-    checkpoint back, disagreed with the other, or could not run; `_MOE_REWRITE_COLLIDES`
-    says the plan wants one name twice.
-
-    One replay is alive at a time: each holds every shard open while its tensors are
-    needed, and a checkpoint may have more shards than that allows.
-    """
+    Answers with the residue the shards could not account for; given `mirrored` (the
+    other replay's residue), each is compared as produced. None says this replay did not
+    hand the checkpoint back, disagreed, or could not run; `_MOE_REWRITE_COLLIDES` says
+    the plan wants one name twice. Only one replay may be alive: each holds every
+    shard."""
     try:
         written = _mlx_moe_rewritten_checkpoint(
             _mlx_staged_checkpoint(files), plan, offsets, layouts, merges)
         if written is None:
             return _MOE_REWRITE_COLLIDES
-        # The order the rewritten directory hands back follows the names, which the
-        # rewrite changes, so it is neither the staged order nor its reverse.
+        # Read-back order follows the rewritten names, not the staged order.
         written = {name: written[name] for name in
                    (reversed(order) if reverse else order) if name in written}
         out = sanitizer.sanitize(dict(written))
-        # Compared one tensor at a time and dropped from every mapping holding it: a
-        # sanitizer rebuilds a stacked expert tensor to hand it back.
+        # One at a time, dropped from every mapping holding it.
         unaccounted = {}
         for file in files:
             for name, tensor in mx.load(str(file)).items():
@@ -16200,7 +16010,7 @@ def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
             if not _kept_mlx_moe_residue(unaccounted, mirrored, name,
                                          _mlx_tensor_held(out.pop(name))):
                 return None
-        # A name the other replay produced and this one did not.
+        # Leftovers: a name the other replay produced and this one did not.
         if mirrored:
             return None
     except Exception:
@@ -16209,11 +16019,8 @@ def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
 
 
 def _kept_mlx_moe_residue(unaccounted, mirrored, name, tensor):
-    """Hold one residue for the other replay, or hold it to what that one left.
-
-    The name is looked up before the value: a name the other replay never produced is a
-    disagreement whatever it holds.
-    """
+    """Hold one residue for the other replay, or hold it to what that one left. Name
+    before value: one the other replay never produced is a disagreement."""
     if mirrored is None:
         unaccounted[name] = tensor
         return True
@@ -16223,7 +16030,7 @@ def _kept_mlx_moe_residue(unaccounted, mirrored, name, tensor):
 
 
 def _mlx_tensor_held(tensor):
-    """A tensor holding its own memory, so the shard it was read from can close: a replay's output can be a view of the shards it was given."""
+    """A copy owning its memory, since a replay's output can be a view of a shard."""
     if tensor is None:
         return None
     held = mx.array(tensor)
@@ -16238,8 +16045,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
     if not vocabulary:
         return {}, {}, {}
 
-    # Architectures that relocate a whole MoE block rename its experts and its
-    # router together, so the probe has to carry both reconstructions at once.
+    # A relocated MoE block renames experts and router together.
     claimed = {}
     for name, expert_names in (split_plan or {}).items():
         for expert_name in expert_names:
@@ -16247,8 +16053,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
                 tuple(staged[name].shape)[1:], dtype=staged[name].dtype
             )
 
-    # One cache for the whole search: shapes repeat across layers and every
-    # candidate re-marks the same tensors.
+    # One cache for the whole search: every candidate re-marks the same shapes.
     markers = {}
 
     def replay(proposal, required=frozenset()):
@@ -16258,22 +16063,15 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             sanitizers, probe, {**staged, **claimed}, markers, required
         )
 
-    # Read once: this is the whole split plan's output, and the check below runs for
-    # every candidate a search offers.
     claimed_names = frozenset(claimed)
 
     def produced_once(proposal):
-        """Whether every name it produces is distinct from the others and from the split's.
-
-        Two names landing on one, or on one the split already reconstructs, reach the
-        replay through a single probe entry, so it cannot see the loss.
-        """
+        """Whether every name it produces is distinct from the others and the split's:
+        two landing on one reach the replay through a single probe entry."""
         produced = proposal.values()
         return len(set(produced)) == len(proposal) and claimed_names.isdisjoint(produced)
 
-    # A stacked expert tensor is recovered by splitting, not renaming, so a
-    # substitution must not be judged on whether it also names one. Leaving them out
-    # lets the relocation be read off the router tensors before the split plan.
+    # Stacked expert tensors are recovered by splitting, so hold them out here.
     held = set(split_plan or {}) | set(exclude)
     open_names = [name for name in staged if name not in held]
     proposal = {name: name for name in open_names}
@@ -16289,19 +16087,13 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             for name, proposed in proposal.items()
         }
         recovered = {name for name, p in candidate.items() if p != name}
-        # A substitution mapping a recovered name back onto the saved one would pass by
-        # vacancy, undoing an earlier one. Recovered names may be refined, never dropped,
-        # so equalling the last candidate is enough and losing one is not.
+        # Recovered names may be refined, never dropped: mapping one back passes by vacancy.
         if not produced_once(candidate):
             continue
         if not recovered >= {name for name, p in proposal.items() if p != name}:
             continue
-        # Names this candidate leaves alone must keep coming back and the ones it renamed
-        # must not: falling short on exactly those is what the completion reads.
         candidate_corrections = replay(candidate, baseline - recovered)
-        # One relocation can leave a tensor short by moving two ways at once: Kimi Linear's
-        # router bias changes parent module and gains a `.gate.` component. Completing for
-        # exactly the names it missed reaches those without trying every pair.
+        # One relocation can move two ways at once (Kimi Linear), so complete on what missed.
         unproven = (baseline | recovered) - set(candidate_corrections)
         if unproven and unproven <= recovered:
             candidate, candidate_corrections = _completed_mlx_moe_rename_candidate(
@@ -16310,15 +16102,10 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
             if not produced_once(candidate):
                 continue
             recovered = {name for name, p in candidate.items() if p != name}
-        # Both halves matter: the floor keeps what the sanitizer already reproduces, and
-        # `recovered` makes each new name earn its place -- a name the sanitizer drops is
-        # reproduced under neither spelling, so it would be renamed on no evidence at all.
+        # `recovered` stops a name the sanitizer drops being renamed on no evidence.
         if set(candidate_corrections) >= baseline | recovered:
             proposal, corrections = candidate, candidate_corrections
-    # Several spellings replay alike, and the one the checkpoint was loaded from is worth
-    # no less than another, so the namespace it carries goes back on the names that left
-    # it wherever that replays as well. Only the namespace: a container the sanitizer adds
-    # back stays dropped, and where nothing else moved this leaves no rename at all.
+    # Where several spellings replay alike, prefer the loaded checkpoint's namespace.
     restored = {name: _GGUF_TEXT_TOWER_NAMESPACE + renamed[len("language_model"):]
                 for name, renamed in proposal.items()
                 if _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)}
@@ -16326,9 +16113,7 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
         candidate = {**proposal, **restored}
         recovered = {name for name, p in candidate.items() if p != name}
         candidate_corrections = replay(candidate, set(corrections) - recovered)
-        # Measured against what the search settled on rather than against the floor:
-        # the floor is what the staged names alone reproduce, which putting them back
-        # meets by construction.
+        # Against what the search settled on: the floor is met by construction.
         if (produced_once(candidate)
                 and set(candidate_corrections) >= set(corrections) | recovered):
             proposal, corrections = candidate, candidate_corrections
@@ -16338,9 +16123,8 @@ def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
     return renames, constants, layouts
 
 
-# The per-layer projections llama.cpp maps under `model.layers.{bid}.`, spelled the
-# way mlx-lm spells them. Deliberately the wider set -- a pure MoE model has no dense
-# feed-forward -- since a rewrite never takes one of these away, whatever it reads.
+# The per-layer projections llama.cpp maps under `model.layers.{bid}.`, as mlx-lm
+# spells them. Deliberately wider than any one architecture needs.
 _GGUF_MAPPED_LAYER_LEAVES = frozenset((
     "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
     "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
@@ -16350,15 +16134,9 @@ _GGUF_MAPPED_LAYER_LEAVES = frozenset((
 def _kept_for_the_gguf_converter(name):
     """Whether this is a name the rewrite leaves alone.
 
-    Answered from the names alone -- telling "unmappable" from "already mapped" exactly
-    would need llama.cpp's own per-architecture table -- so it answers for the HF layer
-    prefix and not for every name that table maps: a checkpoint spelling its layers
-    otherwise has names mapped there and not held back here, which no rewrite reaches on
-    any architecture measured. It errs towards keeping, since taking away a name the
-    converter reads breaks a working export: mlx-lm rebuilds dense Hunyuan's
-    `mlp.gate_and_up_proj` from the two parts beside it, and llama.cpp maps the parts and
-    not the whole.
-    """
+    Exactness would need llama.cpp's own per-architecture table, so this reads the HF
+    layer prefix and errs towards keeping: taking away a name the converter reads
+    breaks a working export (mlx-lm rebuilds dense Hunyuan's `mlp.gate_and_up_proj`)."""
     parts = name.split(".")
     return (len(parts) > 4 and parts[0] == "model" and parts[1] == "layers"
             and parts[2].isdigit()
@@ -16375,7 +16153,6 @@ def _mlx_staged_checkpoint(files):
 
 def _mlx_staged_tensor_stubs(files):
     # Planning never reads a value, so stand-ins let each shard close again.
-    # Keeping the real ones would hold a descriptor and a mapping per shard.
     staged = {}
     for file in files:
         for name, tensor in mx.load(str(file)).items():
@@ -16386,40 +16163,33 @@ def _mlx_staged_tensor_stubs(files):
 def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
     staged = _mlx_staged_tensor_stubs(files)
     stacked = _mlx_stacked_expert_tensor_names(model, staged)
-    # A block relocation shows on its router and shared experts, which are ordinary
-    # renames, so learn it there before spending it on the expert tensors.
+    # A block relocation shows as ordinary renames on its router and shared experts.
     parents = _mlx_moe_parent_substitutions(
         _build_mlx_moe_rename_plan(model, staged, None, exclude=stacked)[0]
     )
-    # Architectures whose stacked layout llama.cpp already maps (Llama 4 keeps its
-    # experts fused in HF too) have no per-expert names to recover.
+    # Architectures llama.cpp already maps stacked (Llama 4) have no names to recover.
     split = (
         _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents)
         if stacked
         else None
     )
-    # Tensors a sanitizer split apart have no staged counterpart to rename, so
-    # they are rebuilt first and then kept out of the rename search.
+    # Split tensors have no staged counterpart to rename: rebuild first, then exclude.
     merges = _build_mlx_moe_expert_stack_plan(model, staged)
     merges.update(_build_mlx_moe_merge_plan(model, staged))
     consumed = {part for parts, *_ in merges.values() for part in parts}
     renames, offsets, layouts = _build_mlx_moe_rename_plan(
         model, staged, split, exclude=consumed
     )
-    # A sanitizer that splits a tensor as well as relocating it is out of the
-    # first search's reach, and in the second's once the relocation is proved.
+    # Splitting plus relocating needs the relocation proved first.
     late = _build_mlx_moe_renamed_merge_plan(model, staged, renames)
-    # A part goes into its merge as the checkpoint holds it, so whatever the
-    # renames proved for one the merge consumes goes with it.
+    # A part enters its merge as the checkpoint holds it, so drop its own rename.
     for parts, *_ in late.values():
         for part in parts:
             renames.pop(part, None)
             offsets.pop(part, None)
             layouts.pop(part, None)
     merges.update(late)
-    # A fused tensor has no staged counterpart, so the split runs over what nothing
-    # else claimed, and its own rename is dropped: the parts carry the name now, and
-    # two reconstructions of one tensor is not a checkpoint.
+    # A fused tensor has no staged counterpart, so drop its rename: parts carry it now.
     fused = _build_mlx_moe_name_split_plan(
         model, staged,
         set(merges) | {part for parts, *_ in merges.values() for part in parts}
@@ -16433,16 +16203,13 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
     plan = dict(split or {})
     # A rename is a one-name split, so the rewrite below needs no second path.
     plan.update((name, [renamed]) for name, renamed in renames.items())
-    # Measuring from the sanitizer alone needs no source, which is what reaches an
-    # already-converted checkpoint, but it must not subtract a second time from what
-    # the source measurement covered.
+    # Never subtract twice from what the source measurement already covered.
     offsets = {
         name: constant
         for name, constant in offsets.items()
         if name not in (source_norm_offsets or {})
     }
-    # Nothing the converter already reads is taken away, whatever the sanitizer
-    # can rebuild it from.
+    # Never take away a name the converter already reads.
     plan = {name: names for name, names in plan.items()
             if not _kept_for_the_gguf_converter(name)}
     merges = {target: recipe for target, recipe in merges.items()
@@ -16456,8 +16223,7 @@ def _prepare_moe_gguf_export_directory(
     """Restore the MoE tensor names and values llama.cpp converters read."""
     path = Path(path)
     files = sorted(path.glob("*.safetensors"))
-    # The caller passes the one norm measurement both passes act on, so they
-    # cannot disagree about what the source checkpoint already covered.
+    # One shared measurement, so the two passes cannot disagree about the source.
     if source_norm_offsets is _UNMEASURED:
         source_norm_offsets = _mlx_sanitizer_norm_offsets(model)
     plan, offsets, layouts, merges = _plan_mlx_moe_gguf_rewrite(
@@ -16466,7 +16232,6 @@ def _prepare_moe_gguf_export_directory(
     if not plan and not merges and not offsets and not layouts:
         return 0
 
-    # The one pass holding every shard open.
     owned, owner, anchors = _mlx_moe_merge_placement(files, merges)
     if not _confirmed_mlx_moe_rewrite(
         _mlx_moe_sanitizers(model), files, plan, offsets, layouts, merges,
@@ -16474,12 +16239,9 @@ def _prepare_moe_gguf_export_directory(
     ):
         return 0
 
-    # A merge is built as its receiving shard is written, so what is held is one shard
-    # rather than the checkpoint.
     name_map = {}
     consumed = {part: target for target, (parts, *_) in merges.items() for part in parts}
-    # A split's targets all read one tensor, so its anchor collects them rather
-    # than the last one winning and the index losing the rest.
+    # A split's anchor collects its targets; otherwise the index loses all but one.
     for target, anchor in sorted(anchors.items()):
         name_map[anchor] = name_map.get(anchor, ()) + (target,)
     for target, anchor in sorted(anchors.items()):
@@ -16488,8 +16250,7 @@ def _prepare_moe_gguf_export_directory(
                 name_map[part] = ()
 
     for file in files:
-        # One shard at a time: mx.eval below materializes everything this shard
-        # holds, so keeping earlier shards alive would scale with the model.
+        # One shard at a time: the mx.eval below materializes all of it.
         tensors = mx.load(str(file))
         if file not in owned and not any(
             name in plan or name in offsets or name in layouts or name in consumed
@@ -16518,8 +16279,7 @@ def _prepare_moe_gguf_export_directory(
                 for expert, expert_name in enumerate(expert_names):
                     updated[expert_name] = tensor[expert]
             name_map[name] = expert_names
-        # mx.load() arrays may be file-backed; saving over the source can
-        # truncate them before they materialize, so write beside and replace.
+        # mx.load() arrays may be file-backed: write beside the source and replace.
         mx.eval(*updated.values())
         tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
         mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
@@ -17368,15 +17128,13 @@ def save_pretrained_gguf(
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
-        # Measured once: both passes subtract against the same answer, and the
-        # source checkpoint is read once rather than per pass.
+        # Measured once so both passes subtract against the same answer.
         norm_offsets = _mlx_sanitizer_norm_offsets(model)
         rewritten = _prepare_mlx_gguf_export_directory(
             tmp_path, model=model, replay_sanitizers=is_vlm_model,
             norm_offsets=norm_offsets,
         )
-        # After the norm convention is restored, so the offsets it measures are
-        # still keyed by the names the merged save wrote.
+        # Must run after the norm pass, whose offsets are keyed by the saved names.
         rewritten += _prepare_moe_gguf_export_directory(
             tmp_path, model=model, source_norm_offsets=norm_offsets,
         )

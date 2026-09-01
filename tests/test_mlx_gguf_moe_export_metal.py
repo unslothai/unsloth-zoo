@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real-runtime check that GGUF staging restores the per-expert tensor names a real
-mlx-lm MoE model was built from: llama.cpp cannot map MLX's stacked ``switch_mlp``
-parameters, so the staged directory has to carry the HF names."""
+"""Real-runtime check that GGUF staging restores the per-expert HF tensor names a real
+mlx-lm MoE model was built from: llama.cpp cannot map stacked ``switch_mlp``."""
 
 import json
 import os
@@ -75,7 +74,7 @@ def test_moe_staging_restores_names_mlx_sanitize_maps_back_bitwise(tmp_path):
     assert set(index["weight_map"]) == set(rewritten)
 
     # Replaying mlx-lm's own HF -> MLX map must land the rewritten names back on the
-    # exact tensors the model was saved from.
+    # tensors the model was saved from.
     restored = model.sanitize(dict(rewritten))
     for name in stacked_names:
         assert _bytes_identical(restored[name], staged[name]), name
@@ -105,9 +104,8 @@ def test_moe_staging_holds_no_more_shards_open_as_a_checkpoint_is_split(
         monkeypatch.undo()
         return peak - before
 
-    # A slope, not a ceiling: fixed loading and sampling cost cancels, so only
-    # retention that scales with the checkpoint shows. The small checkpoint goes
-    # first so warm-up lands in the baseline.
+    # A slope, not a ceiling: fixed cost cancels, so only retention that scales with
+    # the checkpoint shows. Small checkpoint first, so warm-up lands in the baseline.
     assert descriptor_growth(2) >= descriptor_growth(32)
 
 

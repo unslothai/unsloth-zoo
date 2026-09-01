@@ -1114,8 +1114,7 @@ def _gguf_export_scaffold(
         "_prepare_mlx_gguf_export_directory",
         lambda path, model=None, replay_sanitizers=True, norm_offsets=None: 0,
     )
-    # The MoE pass runs beside the one above on every export, and this scaffold's
-    # directory holds none of the shards it would read.
+    # The MoE pass also runs on every export, and this scaffold has no shards for it.
     monkeypatch.setattr(
         mutils,
         "_prepare_moe_gguf_export_directory",

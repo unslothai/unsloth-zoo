@@ -1660,8 +1660,7 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
         return 0
 
     def fake_moe_prepare(path, model=None, source_norm_offsets=None):
-        # Raising here rather than above is what makes the MoE pass something this test
-        # reaches: it used to stop at the first one.
+        # Raising here, not above, is what makes this test reach the MoE pass.
         calls["moe_model"] = model
         raise _StopAfterExportPrep
 
@@ -3696,8 +3695,7 @@ def _make_quirky_moe_model(quirk=None, leaves=("mlp.switch_mlp.gate_proj",),
             yield "", self
 
         def sanitize(self, weights):
-            # A literal table, as mlx-lm writes them: the names live in this function's
-            # constants, which is where the rewrite reads them from.
+            # A literal table, as mlx-lm writes them: the rewrite reads these constants.
             remappings = (
                 (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
                 (".moe.router_bias.", ".mlp.gate.router_bias."),
@@ -3851,10 +3849,8 @@ def test_moe_gguf_export_restores_an_axis_a_sanitizer_moved(tmp_path):
 def _make_composed_moe_model():
     """A model whose expert tensors only the two sanitizers together reproduce.
 
-    The outer sanitizer relocates the MoE block and splits its fused expert tensor
-    while the inner renames what is left inside it, so neither reproduces a saved name
-    alone. The inner reads the whole leaf, so of the three fragments between the saved
-    name and the checkpoint's the last two prove together or not at all. The tensors
+    The outer relocates the MoE block and splits its fused expert tensor, the inner
+    renames what is left inside it, so neither reproduces a saved name alone. Tensors
     outside the block, reproduced by both, hold the floor.
     """
     import unsloth_zoo.mlx.utils as mutils
@@ -3877,7 +3873,7 @@ def _make_composed_moe_model():
             self.checkpoint = {
                 "outer.inner.layers.0.mlp.experts.gate_up_proj":
                     mx.arange(24, dtype=mx.float32).reshape(2, 3, 4),
-                # Untouched by both sanitizers: without them a fragment every name carries reads
+                # Untouched by both: otherwise a fragment every name carries would read
                 # as the checkpoint's own shape, which the search will not substitute.
                 "vision.blocks.0.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
                 "vision.blocks.1.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
@@ -3892,8 +3888,8 @@ def _make_composed_moe_model():
         def sanitize(self, weights):
             out = {}
             for name, tensor in weights.items():
-                # Both under the checkpoint's namespace: the split is how the relocated block is
-                # stored, not something that happens to any tensor with the name.
+                # Both under the checkpoint's namespace: the split is how the relocated
+                # block is stored, not something any tensor with the name gets.
                 if "outer.inner" in name:
                     name = name.replace("outer.inner", "inner.outer")
                     if "gate_up_proj" in name:
@@ -3924,12 +3920,9 @@ def test_moe_gguf_export_replays_the_sanitizers_a_model_composes(tmp_path):
 
 def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it(
         tmp_path):
-    """The export must not change the model it planned against.
-
-    Gemma 3 ties its output head and drops `lm_head` when handed weights without
-    `lm_head.weight`, and the search hands it every spelling of that name. What
-    is exported is one thing; the model the caller goes on to run is another.
-    """
+    """The export must not change the model it planned against: Gemma 3 ties its head
+    and drops `lm_head` when handed weights without `lm_head.weight`, and the search
+    hands it every spelling of that name."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -4035,7 +4028,7 @@ def test_moe_gguf_export_relocates_a_namespace_every_tensor_carries(tmp_path):
 
 @pytest.mark.parametrize("added,rewrites", (("namespace", 0), ("reordered", 7), ("root", 7), ("container", 2), ("always", 7)))
 def test_moe_gguf_export_keeps_a_namespace_a_sanitizer_adds_back(added, rewrites, tmp_path):
-    """A namespace mlx-vlm's Gemma models add back replays either way, so the tower keeps the checkpoint's own spelling; the container the experts sit under is added back alike, and so is a bare `model.` outside a tower, which llama.cpp maps under other roots as readily as that one."""
+    """A namespace mlx-vlm's Gemma models add back replays either way, so the tower keeps the checkpoint's own spelling."""
     import unsloth_zoo.mlx.utils as mutils
     mx = mutils.mx
     tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
@@ -4043,9 +4036,8 @@ def test_moe_gguf_export_keeps_a_namespace_a_sanitizer_adds_back(added, rewrites
               "root": "", "container": "model.", "always": "language_model."}[added]
 
     class Model:
-        # The names outside the tower hold each fragment under the ubiquity limit, where it is
-        # offered as a substitution rather than as a whole-name move.
-        # None of the leaves are ones the converter already reads, which a rewrite holds back.
+        # Names outside the tower keep each fragment under the ubiquity limit, and no
+        # leaf is one the converter already reads (which a rewrite holds back).
         checkpoint = {f"{prefix}layers.0.self_attn.{leaf}.weight": tensor(i)
                       for i, leaf in enumerate(("q_norm", "k_norm", "sinks", "gate", "bias"))}
         checkpoint.update((f"{prefix}layers.0.mlp.experts.{leaf}.weight", tensor(i))
@@ -4101,7 +4093,7 @@ def test_moe_gguf_export_refuses_a_rename_onto_a_name_the_split_rebuilds():
 
 
 def test_moe_gguf_export_keeps_a_container_drop_when_the_namespace_goes_back(tmp_path):
-    """A sanitizer adding back both leaves the tower no rename that moved the namespace alone, and reading the namespace back must not bring the container with it."""
+    """Reading the namespace back must not bring the container with it."""
     import unsloth_zoo.mlx.utils as mutils
     mx = mutils.mx
     tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
@@ -4114,8 +4106,8 @@ def test_moe_gguf_export_keeps_a_container_drop_when_the_namespace_goes_back(tmp
         def named_modules(self):
             yield "", self
 
-        # Its two literals are the whole vocabulary a rewrite reads, so the search reaches
-        # the spelling that drops both and the namespace has to be read back onto it.
+        # Its two literals are the whole vocabulary, so the search reaches the spelling
+        # that drops both and the namespace has to be read back onto it.
         def sanitize(self, weights):
             out = {}
             for name, value in weights.items():
@@ -4155,9 +4147,8 @@ def test_moe_gguf_export_reads_a_namespace_back_only_onto_the_names_that_left_it
 def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
     """A split into one tensor per expert, which no pair of parts can propose.
 
-    DBRX names the parts by index, so no vocabulary fragment stands for one and
-    the merge family cannot reach them. The second leaf keeps a recipe proved on
-    the first from standing for both: only `w2` is transposed as well as split.
+    DBRX names parts by index, so no fragment stands for one. Only `w2` is transposed
+    as well as split, so a recipe proved on the first leaf cannot stand for both.
     """
     import unsloth_zoo.mlx.utils as mutils
 
