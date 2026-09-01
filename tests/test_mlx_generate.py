@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import pathlib
 import sys
+import threading
 import types
 import warnings
 from dataclasses import make_dataclass
@@ -1320,14 +1321,18 @@ def test_a_cancelled_row_leaves_the_batch_and_its_neighbour_runs_on(monkeypatch)
     stream = _open_stream(monkeypatch, max_tokens=8)
     try:
         stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=8))
-        stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=8))
+        stream.add(GenerationRequest(prompt_token_ids=[9, 9, 9], max_tokens=8))
         assert [event.index for event in stream.step()] == [0, 1]
         generator = stream._session.generator
-        assert stream.cancel(1) is True
+        managed = stream.withdraw(1)
+        assert managed is not None and managed.finish_reason == "stop"
+        assert managed.prompt_token_count == 3
+        assert managed.text and len(managed.token_ids) == len(managed.logprobs) > 0
         assert generator.removed == [102]
         assert [event.index for event in stream.step()] == [0]
         assert stream.rows_in_flight == 1
-        assert stream.cancel(1) is False and stream.cancel(7) is False
+        assert stream.withdraw(1) is None and stream.withdraw(7) is None
+        assert stream.cancel(1) is False, "and the older answer is the same answer"
     finally:
         stream.close()
 

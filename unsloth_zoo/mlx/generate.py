@@ -714,6 +714,14 @@ def _restore_metal_limits(snapshot: dict[str, int] | None):
         raise first_error
 
 
+def _require_evaluable(model):
+    """The model's eval(), or a refusal: what generation mode needs to switch a model"""
+    switch = getattr(model, "eval", None)
+    if not callable(switch):
+        raise TypeError("generation_mode requires a model with eval().")
+    return switch
+
+
 @contextmanager
 def generation_mode(model):
     """Temporarily switch a model to eval mode and steward global MLX limits.
@@ -735,10 +743,7 @@ def generation_mode(model):
         if _GENERATION_MODE_DEPTH == 0:
             _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
         training_states = _snapshot_training_flags(model)
-        eval_model = getattr(model, "eval", None)
-        if not callable(eval_model):
-            raise TypeError("generation_mode requires a model with eval().")
-        eval_model()
+        _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
         yield model
@@ -1020,6 +1025,10 @@ class GenerationEvent:
     result: GenerationResult | None = None
 
 
+class BatchRowRefused(ValueError):
+    """A row a batch will not take, for what it is rather than for being wrong."""
+
+
 def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEvent]:
     delta = state.release()
     if delta:
@@ -1146,6 +1155,13 @@ def _replay_stream_text(detokenizer, token_ids: Sequence[int]) -> str:
         text += detokenizer.last_segment
     detokenizer.finalize()
     return text + detokenizer.last_segment
+
+
+def _cancelled_result(tokenizer, state: "_PendingResult") -> GenerationResult:
+    """What a row had managed when it was withdrawn."""
+    if state.finish_reason is None:
+        state.finish(tokenizer, "stop")
+    return state.result(tokenizer)
 
 
 @dataclass
@@ -1368,16 +1384,26 @@ class _TextBatchSession:
 
     def cancel(self, row: int) -> bool:
         """Withdraw a row. False if it was never added, or has already ended."""
+        return self._take_back(row) is not None
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        """Withdraw a row, answering with what it managed."""
+        state = self._take_back(row)
+        return None if state is None else _cancelled_result(self.adapter.tokenizer, state)
+
+    def _take_back(self, row: int) -> "_PendingResult | None":
+        """Take a row out of the batch, answering with what it was holding."""
         uid = self._uid_of.get(row)
         if uid is None or uid not in self._pending:
-            return False
+            return None
         try:
             self.generator.remove([uid])
         except BaseException:
             self.usable = False
             raise
+        state = self._pending[uid]
         self._retire(uid)
-        return True
+        return state
 
     def step(self) -> Iterator[GenerationEvent]:
         """One decode step's worth of events, or none while no row is in flight."""
@@ -2403,31 +2429,7 @@ def generate_batch(
 
 
 class _VLMBatchSession:
-    """One mlx-vlm ``BatchGenerator`` with its row set left open.
-
-    The vision counterpart of ``_TextBatchSession``, under the same contract:
-    rows keep the number they were given, and ``usable`` goes false where a call
-    may already have changed the batch.
-
-    A row is let go only once the batch can no longer draw it, since its
-    settings go with it. mlx-vlm will not withdraw a row being prefilled beside
-    others, so a cancelled one stays the caller's until it is decoding and can
-    be withdrawn; where it cannot stay -- its text is already out, or it was
-    never recorded -- the batch is no longer answerable and ``usable`` goes
-    false.
-
-    Each row is preprocessed alone and admitted with its own embeddings, which
-    is what lets rows of unrelated image shapes and prompt lengths merge: the
-    release left-pads them to the batch's longest before the prefill forward,
-    which preprocessing a whole chunk at once cannot do.
-
-    Preparing rows apart is what the merging costs. It serves only models that
-    keep nothing from preparing one request, which is settled before any row is
-    admitted, and requests whose preparation lines up with what the batch's
-    other rows prepared -- the same values of the same shapes, but for the
-    length the release evens out. What a request prepares follows the request
-    and not the model, so that second condition is asked of every row.
-    """
+    """One mlx-vlm ``BatchGenerator`` with its row set left open."""
 
     def __init__(self, adapter: "_VLMBatchAdapter"):
         self.adapter = adapter
@@ -2459,7 +2461,7 @@ class _VLMBatchSession:
         adapter = self.adapter
         defaults = adapter.defaults
         if request.audio is not None:
-            raise ValueError(
+            raise BatchRowRefused(
                 "An audio request decodes on its own and cannot join a batch; "
                 "generate it with generate_batch or stream_batch."
             )
@@ -2511,26 +2513,29 @@ class _VLMBatchSession:
         return row
 
     def cancel(self, row: int) -> bool:
-        """Withdraw a row. False if it was never added, or has already ended.
+        """Withdraw a row. False if it was never added, has already ended, or the"""
+        return self._take_back(row) is not None
 
-        Also false where the batch would not give it back, which mlx-vlm answers
-        for a row being prefilled beside others. The row is still the caller's
-        then -- it keeps reporting, and cancelling it once it is decoding works
-        -- because retiring it here would leave it decoding where nothing can
-        see it and nothing can end it.
-        """
+    def withdraw(self, row: int) -> GenerationResult | None:
+        """Withdraw a row, answering with what it managed."""
+        state = self._take_back(row)
+        return None if state is None else _cancelled_result(self.tokenizer, state)
+
+    def _take_back(self, row: int) -> "_PendingResult | None":
+        """Take a row out of the batch, answering with what it was holding."""
         uid = self._uid_of.get(row)
         if uid is None or uid not in self._pending:
-            return False
+            return None
         try:
             withdrawn = self._withdraw(uid)
         except BaseException:
             self.usable = False
             raise
         if not withdrawn:
-            return False
+            return None
+        state = self._pending[uid]
         self._retire(uid)
-        return True
+        return state
 
     def step(self) -> Iterator[GenerationEvent]:
         """One decode step's worth of events, or none while no row is in flight."""
@@ -2604,7 +2609,7 @@ class _VLMBatchSession:
         }}
         layered = sorted(_LAYER_MAJOR_PROMPT_KWARGS.intersection(prepared))
         if layered:
-            raise ValueError(
+            raise BatchRowRefused(
                 f"This request comes back with {', '.join(layered)} per layer, "
                 "which merging lines up as though the layers were rows. "
                 "Generate it with generate_batch or stream_batch, which prepare "
@@ -2616,7 +2621,7 @@ class _VLMBatchSession:
                 key for key in set(signature) | set(self._row_signature)
                 if signature.get(key, _MISSING) != self._row_signature.get(key, _MISSING)
             )
-            raise ValueError(
+            raise BatchRowRefused(
                 f"This request prepares {', '.join(differing)} unlike the "
                 "batch's other requests, which merging lines up against rows "
                 "that do not match it. Generate it with generate_batch or "
@@ -2693,34 +2698,52 @@ class _VLMBatchSession:
         self._retire(event.uid)
 
 
+def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
+    """What a stream settles before it takes anything: the request it was asked"""
+    if defaults.stop_strings:
+        raise ValueError(
+            "BatchStream cannot apply stop_strings: they cut on token "
+            "boundaries, which would retract text already streamed. Scan "
+            "the deltas for them instead."
+        )
+    is_vlm = bool(getattr(model, "_is_vlm_model", False))
+    if is_vlm:
+        tokenizer = getattr(model, "_processor", None) or tokenizer
+    if tokenizer is None:
+        raise ValueError(
+            "Batched generation requires a processor."
+            if is_vlm
+            else "Text batched generation requires a tokenizer."
+        )
+    if is_vlm:
+        adapter = _VLMBatchAdapter(model, tokenizer, defaults)
+        _require_streamable_vlm(adapter)
+    else:
+        adapter = _TextBatchAdapter(model, tokenizer, defaults)
+    return is_vlm, adapter
+
+
+def stream_unavailable_reason(
+    model,
+    tokenizer = None,
+    *,
+    defaults: GenerationDefaults | None = None,
+) -> str | None:
+    """Why ``BatchStream`` would refuse this model here, or None if nothing here"""
+    if defaults is None:
+        defaults = GenerationDefaults()
+    if not isinstance(defaults, GenerationDefaults):
+        raise TypeError("defaults must be GenerationDefaults.")
+    try:
+        _stream_setup(model, tokenizer, defaults)
+        _require_evaluable(model)
+    except Exception as refusal:
+        return str(refusal)
+    return None
+
+
 class BatchStream:
-    """A batch left open: rows join and leave while the batch decodes.
-
-    ``stream_batch`` decodes one fixed set of requests and ends. This is the
-    same decode with the set open, so a server can merge requests that arrived
-    separately into one batch, and retire each row where it ends rather than at
-    the end of the batch. Rows are numbered in the order they were added and
-    keep their number for the stream's life.
-
-    The process-wide generation lock is held from construction until ``close``,
-    and it belongs to the thread *and* the asyncio task that took it: the same
-    one constructs, adds, steps, and closes. Use it as a context manager, or
-    close it in a ``finally``. A call from anywhere else is refused before
-    anything is torn down, so the stream stays closable by its owner.
-
-    Vision models are served too, on a release whose batch can place a drawn row
-    and take a row's embeddings with it; where it cannot, a vision model is
-    refused rather than mis-sampled and ``stream_batch`` serves it. Audio rows
-    decode on their own and never join.
-
-    ``stop_strings`` are unavailable here for the reason ``stream_batch`` gives:
-    they cut on token boundaries, which would retract text already handed out.
-
-    Any call that raises where it may already have changed the batch retires the
-    whole stream: the engine takes and releases a row in several steps, so what
-    it holds afterwards is a question neither side can answer. ``add``, ``step`` and
-    ``cancel`` then refuse; only ``close`` still works. Open another.
-    """
+    """A batch left open: rows join and leave while the batch decodes."""
 
     def __init__(
         self,
@@ -2734,25 +2757,7 @@ class BatchStream:
         if not isinstance(defaults, GenerationDefaults):
             raise TypeError("defaults must be GenerationDefaults.")
         _install_arrays_cache_advance_fix()
-        if defaults.stop_strings:
-            raise ValueError(
-                "BatchStream cannot apply stop_strings: they cut on token "
-                "boundaries, which would retract text already streamed. Scan "
-                "the deltas for them instead."
-            )
-        # Routing follows the model, not the request: a vision model
-        # preprocesses text-only prompts too.
-        is_vlm = bool(getattr(model, "_is_vlm_model", False))
-        if is_vlm:
-            # A text-only multimodal load stays on the vision path but publishes
-            # its inner tokenizer, which cannot drive mlx-vlm preprocessing.
-            tokenizer = getattr(model, "_processor", None) or tokenizer
-        if tokenizer is None:
-            raise ValueError(
-                "Batched generation requires a processor."
-                if is_vlm
-                else "Text batched generation requires a tokenizer."
-            )
+        is_vlm, adapter = _stream_setup(model, tokenizer, defaults)
         self._stack = ExitStack()
         self._session = None
         self._is_vlm = is_vlm
@@ -2761,14 +2766,9 @@ class BatchStream:
         try:
             self._stack.enter_context(generation_mode(model))
             self._stack.enter_context(_generation_cache_hygiene())
-            if is_vlm:
-                adapter = _VLMBatchAdapter(model, tokenizer, defaults)
-                _require_streamable_vlm(adapter)
-                self._session = _VLMBatchSession(adapter)
-            else:
-                self._session = _TextBatchSession(
-                    _TextBatchAdapter(model, tokenizer, defaults)
-                )
+            self._session = (
+                _VLMBatchSession(adapter) if is_vlm else _TextBatchSession(adapter)
+            )
             self._stack.callback(self._session.close)
         except BaseException as active_error:
             try:
@@ -2805,6 +2805,10 @@ class BatchStream:
     def cancel(self, row: int) -> bool:
         """Withdraw a row, answering whether it is gone."""
         return self._require_open().cancel(row)
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        """The same, answering with what the row managed rather than whether it"""
+        return self._require_open().withdraw(row)
 
     def step(self) -> list[GenerationEvent]:
         """What the batch produced in one decode step."""
@@ -2971,6 +2975,7 @@ def fast_generate(
 
 
 __all__ = [
+    "BatchRowRefused",
     "BatchStream",
     "GenerationDefaults",
     "GenerationEvent",
@@ -2981,4 +2986,5 @@ __all__ = [
     "generate_batch",
     "generation_mode",
     "stream_batch",
+    "stream_unavailable_reason",
 ]
