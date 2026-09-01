@@ -357,22 +357,25 @@ def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
     assert sorted(_staged(path)) == sorted(model.checkpoint)
 
 
+@pytest.mark.parametrize("shape", [(2, 3, 4), (2, 3, 3)])
 def test_a_layout_the_vlm_pass_already_inverted_is_not_inverted_again(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, shape
 ):
     """The two passes run back to back over one directory, so the second reads what the
     first wrote. An adjacent-axis move is its own inverse, so a second inversion replays
     to exactly what is on disk and the confirmation accepts it: the tensor would ship
     transposed off the HF layout llama.cpp reads. `depthwise_conv1d.weight` is the shape
     both passes claim (_vlm_gguf_tensor_candidates transposes (0, 2, 1); (2, 1) is in
-    _MOE_TENSOR_LAYOUTS)."""
+    _MOE_TENSOR_LAYOUTS). The equal-extent shape is the one a shape comparison cannot
+    see: the axes swap, the shape does not."""
     import json
 
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
     name = "vision_tower.depthwise_conv1d.weight"
-    hf = mx.reshape(mx.arange(2 * 3 * 4, dtype=mx.float32), (2, 3, 4))
+    size = shape[0] * shape[1] * shape[2]
+    hf = mx.reshape(mx.arange(size, dtype=mx.float32), shape)
 
     class Model:
         @staticmethod

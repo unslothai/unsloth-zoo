@@ -14471,17 +14471,26 @@ def _vlm_gguf_name_candidates(name):
     return candidates
 
 
+def _vlm_gguf_layout_candidates(name, tensor):
+    """The candidates that only move axes, named apart so a caller can tell one won.
+
+    A permutation of equally sized axes leaves the shape alone, so a caller comparing
+    shapes cannot see it; the MoE pass reads this directory next and would move those
+    axes a second time."""
+    shape = getattr(tensor, "shape", ())
+    if len(shape) == 5:
+        return [mx.transpose(tensor, (0, 4, 1, 2, 3))]
+    if len(shape) == 4:
+        return [mx.transpose(tensor, (0, 3, 1, 2))]
+    if len(shape) == 3 and "depthwise_conv1d.weight" in name:
+        return [mx.transpose(tensor, (0, 2, 1))]
+    return []
+
+
 def _vlm_gguf_tensor_candidates(name, tensor, norm_offset=1.0):
     """Yield HF-layout tensor candidates for an MLX VLM tensor."""
-    candidates = []
+    candidates = _vlm_gguf_layout_candidates(name, tensor)
     shape = getattr(tensor, "shape", ())
-
-    if len(shape) == 5:
-        candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
-    elif len(shape) == 4:
-        candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
-    elif len(shape) == 3 and "depthwise_conv1d.weight" in name:
-        candidates.append(mx.transpose(tensor, (0, 2, 1)))
 
     if norm_offset and len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
         candidates.append(tensor - norm_offset)
@@ -14814,13 +14823,15 @@ def _prepare_mlx_gguf_export_directory(
                 raise RuntimeError(
                     f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
-            # A moved axis shows in the shape. The MoE pass reads this directory after
-            # it, and an adjacent-axis move is its own inverse, so replaying the
-            # sanitizer over a second inversion hands back what is on disk and the
-            # confirmation accepts it: the tensor would ship transposed off HF layout.
-            if relaid_out is not None and getattr(
-                tensor, "shape", None
-            ) != getattr(original_tensor, "shape", None):
+            # Which candidate won, not what the shape says: a permutation of equally
+            # sized axes leaves the shape alone. The MoE pass reads this directory
+            # after this one, and an adjacent-axis move is its own inverse, so
+            # replaying the sanitizer over a second inversion hands back what is on
+            # disk and the confirmation accepts it, transposed off HF layout.
+            if relaid_out is not None and changed and any(
+                _mlx_arrays_match(tensor, candidate)
+                for candidate in _vlm_gguf_layout_candidates(name, original_tensor)
+            ):
                 relaid_out.add(new_name)
             updated[new_name] = tensor
             name_map[name] = new_name
