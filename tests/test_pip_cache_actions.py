@@ -285,6 +285,16 @@ def _restricted_to_main(expr):
     refused outright rather than reasoned about, because `!(github.ref ==
     'refs/heads/main')` contains a positive main equality and is its exact inverse.
     """
+    return _requires(expr, _LEAF_MAIN)
+
+
+def _requires(expr, leaf):
+    """Whether ``expr`` can only be true when a ``leaf``-shaped condition holds.
+
+    The same reading for every guard: an OR restricts only when every branch does, an
+    AND when any branch does, parens are descended, and a `!` outside a `!=` is a
+    negation we refuse to reason about.
+    """
     if not expr.strip():
         return False
 
@@ -305,7 +315,7 @@ def _restricted_to_main(expr):
         # every wrapper that quotes it and inverts it: `(...) == false`, `... != true`,
         # and `startsWith(..., 'false')`, which is true off main because GitHub casts
         # the inner boolean to a string. A whitelist ends the class.
-        return bool(_LEAF_MAIN.fullmatch(part))
+        return bool(leaf.fullmatch(part))
 
     return restricted(expr)
 
@@ -418,11 +428,16 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 # forms are satisfied by the wrong step: `.outputs.` matched the
                 # restore's own `cache-hit`, and "some earlier .outcome" matches the
                 # restore, so a save moved up beside it passed on an empty directory.
+                key_saved = str((step.get("with") or {}).get("key", "")).strip()
+                # Same key AND same path. Matching on the path alone accepted a restore
+                # whose key had drifted from the save's, so every run would read one key
+                # and write another and the download would never be reused.
                 restore_at = max(
                     (
                         j for j, s in enumerate(steps[:i])
                         if "actions/cache/restore@" in _uses(s)
                         and str((s.get("with") or {}).get("path", "")).strip() == path_saved
+                        and str((s.get("with") or {}).get("key", "")).strip() == key_saved
                     ),
                     default=None,
                 )
@@ -431,9 +446,9 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                 # the entry every run and reads it never.
                 if restore_at is None:
                     offenders.append(
-                        f"{label} saves {path_saved!r} with no restore of that path "
-                        f"above it, so the entry is written on every run and read on "
-                        f"none"
+                        f"{label} saves {path_saved!r} under {key_saved!r} with no "
+                        f"restore of that same key and path above it, so the entry is "
+                        f"written on every run and read on none"
                     )
                     continue
                 producers = set(re.findall(r"steps\.([A-Za-z0-9_-]+)\.outcome", condition))
@@ -450,6 +465,20 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                         f"{label} is gated on {sorted(producers)}, not on the declared "
                         f"producer {want!r}. A no-op step in the right position "
                         f"satisfies the interval below while filling nothing"
+                    )
+                    continue
+                # Mentioning the producer is not requiring it to have SUCCEEDED.
+                # `steps.probe.outcome != 'success'` and
+                # `(steps.probe.outcome == 'success' || always())` both name it and both
+                # save when it failed, writing a half-downloaded tree under a key that
+                # is immutable once created. Read with the same rigour as the ref guard.
+                success = re.compile(
+                    rf"steps\.{re.escape(want)}\.outcome\s*==\s*['\"]success['\"]"
+                )
+                if not _requires(condition, success):
+                    offenders.append(
+                        f"{label} names {want!r} but does not require it to have "
+                        f"succeeded, so it can save what a failed run left behind"
                     )
                     continue
                 if not producers:
