@@ -132,3 +132,99 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
     for symbol in ("argpartition", "put_along_axis"):
         with pytest.raises(NotImplementedError, match="mlx-shim"):
             getattr(mx, symbol)()
+
+
+# --------------------------------------------------------------------------- #
+# The same rule, asked of the VALUE rather than of the source.
+#
+# Everything above is syntactic: it proves a module consults mlx_is_simulated(),
+# not that it consults it correctly. `find_spec("mlx") is not None OR not
+# mlx_is_simulated()` satisfies the rule and is still True under the shim, and a
+# gate computed before the module installs its own shim would pass too. So each
+# gate is also EVALUATED, in a subprocess with the shim already up, which is the
+# state a sibling module leaves behind during collection.
+# --------------------------------------------------------------------------- #
+
+def _gate_assignments(tree: ast.AST) -> set:
+    """Module-level names whose value is derived from a real-mlx probe.
+
+    Three spellings are in use: find_spec("mlx"), mlx_is_simulated(), and reading
+    "mlx_simulation" out of mx.__file__. Anything built from one of those is a gate,
+    whatever it is named -- the suite currently uses _HAS_REAL_MLX, _HAS_MLX and _MLX.
+    """
+    def _is_probe(value) -> bool:
+        for node in ast.walk(value):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name == "mlx_is_simulated":
+                    return True
+                if name == "find_spec" and node.args:
+                    first = node.args[0]
+                    if isinstance(first, ast.Constant) and first.value == "mlx":
+                        return True
+            if isinstance(node, ast.Constant) and node.value == "mlx_simulation":
+                return True
+        return False
+
+    names, queue = set(), list(tree.body)
+    while queue:
+        node = queue.pop()
+        if isinstance(node, ast.Assign) and _is_probe(node.value):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, (ast.Try, ast.If)):
+            queue.extend(node.body + node.orelse + getattr(node, "finalbody", []))
+            for handler in getattr(node, "handlers", []):
+                queue.extend(handler.body)
+    return names
+
+
+_EVAL_PROBE = """
+import sys
+sys.path.insert(0, {tests_dir!r})
+from mlx_simulation import simulate_mlx_on_torch, mlx_is_simulated
+simulate_mlx_on_torch()
+assert mlx_is_simulated(), "shim did not install; this probe would prove nothing"
+import importlib
+module = importlib.import_module({module!r})
+for name in {names!r}:
+    print("GATE", name, bool(getattr(module, name)))
+"""
+
+
+def _modules_with_gates():
+    for path in _test_modules():
+        if path.name == Path(__file__).name:
+            continue
+        names = _gate_assignments(ast.parse(path.read_text(encoding="utf-8")))
+        if names:
+            yield path, sorted(names)
+
+
+@pytest.mark.parametrize("path, names", list(_modules_with_gates()), ids=lambda a: getattr(a, "name", ""))
+def test_a_gate_evaluates_to_false_under_the_shim(path: Path, names: list):
+    import subprocess
+    import sys as _sys
+
+    result = subprocess.run(
+        [_sys.executable, "-c",
+         _EVAL_PROBE.format(tests_dir=str(_TESTS), module=path.stem, names=names)],
+        capture_output=True, text=True, cwd=str(_TESTS.parent), timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"{path.name} does not import with the MLX shim installed, which is the state "
+        f"any sibling leaves behind during collection:\n{result.stderr[-2000:]}"
+    )
+    verdicts = dict(
+        (line.split()[1], line.split()[2] == "True")
+        for line in result.stdout.splitlines() if line.startswith("GATE ")
+    )
+    assert verdicts, f"probe printed nothing for {path.name}:\n{result.stdout}\n{result.stderr}"
+    true_gates = [name for name, value in verdicts.items() if value]
+    assert not true_gates, (
+        f"{path.name} has {', '.join(true_gates)} True while `mlx` in sys.modules is the "
+        f"torch shim. The source mentions the right helper, so the syntactic rule above is "
+        f"satisfied, but the expression still reads the shim as real -- an `or` where an "
+        f"`and` belongs, or a probe evaluated before this module installs its own shim. "
+        f"Tests behind that gate will run against a stub whose ops raise on CALL."
+    )
