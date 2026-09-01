@@ -273,3 +273,76 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
     except Exception:
         # Module absent (partial checkout / security-only suite): nothing to isolate.
         yield
+
+
+# A test that swaps a module into sys.modules and does not swap it back breaks whatever
+# imports that name later IN THE SAME PROCESS. Serially that is often invisible, because
+# the victim happens to sort before the polluter and never sees it; under pytest-xdist a
+# worker can take them the other way round and the victim fails for a reason that has
+# nothing to do with it.
+#
+# That is not hypothetical. test_vllm_to_hf_conversion installed a bitsandbytes.functional
+# carrying only dequantize_4bit and left it there, so every later
+# `from bitsandbytes.functional import QuantState` -- which is what
+# temporary_patches/moe_utils_bnb4bit.py does at import time -- failed with
+#
+#     cannot import name 'QuantState' from 'bitsandbytes.functional' (unknown location)
+#
+# Six tests in test_moe_bnb4bit_per_expert_conversions.py failed that way under -n 4 while
+# passing serially, because m sorts before v.
+#
+# Narrow on purpose. It watches the names that have actually been swapped here rather than
+# all of sys.modules, because reloading a module under test is a legitimate and common
+# thing to do in this suite and a blanket check would flag all of it. The remedy is always
+# the same and is already used elsewhere in these files: monkeypatch.setitem, which puts
+# the original back.
+_GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
+_MODULE_SNAPSHOT_KEY = "_unsloth_guarded_module_snapshot"
+
+
+def _is_module_stub(mod):
+    """A real module has a file behind it; these substitutes are bare ModuleType.
+
+    That is also why the resulting ImportError says "(unknown location)".
+    """
+    return mod is not None and getattr(mod, "__file__", None) is None
+
+
+def pytest_runtest_setup(item):
+    import sys as _sys
+
+    setattr(item, _MODULE_SNAPSHOT_KEY, {n: _sys.modules.get(n) for n in _GUARDED_MODULES})
+
+
+@_pytest.hookimpl(trylast = True)
+def pytest_runtest_teardown(item, nextitem):
+    """Checked here rather than in an autouse fixture, and that is not a style choice.
+
+    Fixtures tear down in reverse order of setup, and _isolate_xet_health_state above
+    requests monkeypatch, which pulls monkeypatch's setup earlier than any fixture
+    defined after it. A fixture-based check therefore ran BEFORE the test's own
+    monkeypatch had put sys.modules back, and reported every correct test as a leak.
+    A trylast teardown hook runs after fixture finalisation, which is the point.
+    """
+    import sys as _sys
+
+    before = getattr(item, _MODULE_SNAPSHOT_KEY, None)
+    if before is None:
+        return
+    leaked = []
+    for name, was in before.items():
+        now = _sys.modules.get(name)
+        if now is was:
+            continue
+        if was is None and not _is_module_stub(now):
+            # Nothing was there and the test imported the real thing. That is an
+            # import, not a swap, and flagging it would fail every test that touches
+            # the package.
+            continue
+        leaked.append(name)
+    if leaked:
+        raise AssertionError(
+            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back, "
+            f"so every later test in this process imports the substitute. Use "
+            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown."
+        )

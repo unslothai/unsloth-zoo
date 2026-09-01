@@ -143,6 +143,7 @@ import torch.nn as nn
 __all__ = [
     "DeviceMapInfeasible",
     "DeviceMapPlan",
+    "detect_logit_transforms",
     "logit_headroom_bytes",
     "plan_device_map",
     "plan_device_map_for_pretrained",
@@ -158,6 +159,171 @@ class DeviceMapInfeasible(RuntimeError):
 
 class _SearchExhausted(Exception):
     """Internal: the bounded exact-packing search hit its node budget."""
+
+
+# --------------------------------------------------------------------------- #
+# logit transform detection
+# --------------------------------------------------------------------------- #
+def _config_attr(holder, name, default = None):
+    """``getattr`` that a hostile config cannot break out of.
+
+    ``getattr``'s default only swallows ``AttributeError``, but a remote-code
+    config can raise anything. Sub-configs left as plain dicts are read as dicts.
+    """
+    try:
+        if isinstance(holder, Mapping):
+            return holder.get(name, default)
+        return getattr(holder, name, default)
+    except Exception:
+        return default
+
+
+# The names ``PretrainedConfig.get_text_config`` searches, in its order. Asking
+# the method is not enough: T5Gemma overrides it to return ``self`` on
+# transformers 4.56.x, hiding the soft cap on ``config.decoder``.
+_TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
+
+
+def _model_config(model_or_config):
+    """The config, through the wrappers a training model arrives in.
+
+    ``nn.Module.__getattr__`` resolves submodules, not plain attributes, so DDP
+    and ``torch.compile`` wrappers have no ``.config``; unwrap those two. PEFT
+    already forwards ``config``, and a config itself falls straight through.
+    """
+    obj = model_or_config
+    for _ in range(4):
+        config = _config_attr(obj, "config")
+        if config is not None:
+            return config
+        inner = _config_attr(obj, "module")
+        if inner is None:
+            inner = _config_attr(obj, "_orig_mod")
+        if inner is None or inner is obj:
+            break
+        obj = inner
+    return model_or_config
+
+
+# Composites that build their own ``lm_head`` over a bare ``AutoModel`` tower
+# instead of the family's ``*ForCausalLM``. The tower's config still declares the
+# scale but the wrapper's ``forward`` never applies it (``logit_scale`` does not
+# appear in ``modeling_aya_vision.py`` / ``modeling_cohere2_vision.py``), so
+# crediting it reserves a temporary nobody allocates. Not here: Granite Speech
+# (builds an ``AutoModelForCausalLM``, so it does divide) and Gemma 3n
+# (re-applies the cap in its own ``forward``).
+_OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
+
+# Config field -> which magnitude it contributes, by default.
+_TRANSFORM_FIELDS = (
+    ("logit_softcapping",
+     ("final_logit_softcapping", "logits_soft_cap", "output_logit_soft_cap")),
+    ("logit_scale_multiply",
+     ("logit_scale", "lm_head_multiplier", "output_multiplier")),
+    ("logit_scale_divide", ("logits_scaling",)),
+)
+
+# ``logits_scaling`` is not one knob. Granite divides the logits by it;
+# HyperCLOVA X multiplies, as transformers notes on the line itself ("MuP:
+# multiply logits by logits_scaling (cf. GraniteForCausalLM which divides)");
+# MiniCPM3 scales the HIDDEN STATES before the head, so it is not a logit
+# transform at all. Keyed on the ``model_type`` of the config the field came
+# from, so a composite is judged by the tower it wraps.
+_BUCKET_OVERRIDES = {
+    ("logits_scaling", "hyperclovax"): "logit_scale_multiply",
+    ("logits_scaling", "minicpm3"): None,
+}
+
+
+def _text_configs(config):
+    """``config`` and every text sub-config it exposes, outermost first.
+
+    Composites put the head's settings on a sub-config (Gemma 3 on
+    ``text_config``, T5Gemma on ``decoder``). First holder to report a transform
+    wins, so this order is the precedence order.
+    """
+    seen = [config]
+    candidates = [_config_attr(config, name) for name in _TEXT_CONFIG_ATTRS]
+    get_text_config = _config_attr(config, "get_text_config")
+    if callable(get_text_config):
+        try:
+            candidates.append(get_text_config())
+        except Exception:
+            pass
+    for candidate in candidates:
+        # Identity, not equality: two sub-configs can compare equal.
+        if candidate is None or any(candidate is s for s in seen):
+            continue
+        seen.append(candidate)
+    return seen
+
+
+def detect_logit_transforms(model_or_config) -> dict:
+    """What the loss will do to the logits, read off the model config.
+
+    The planner sizes a temporary for each of these and the GRPO loss applies
+    them; both derive from here, or the reserve stops matching the allocation.
+
+    Returns ``logit_softcapping``, ``logit_scale_multiply`` and
+    ``logit_scale_divide``, ``0.0`` when the architecture does not use one:
+
+    * ``final_logit_softcapping`` (Gemma 2/3/3n, T5Gemma, VaultGemma), its
+      RecurrentGemma spelling ``logits_soft_cap`` and its xLSTM spelling
+      ``output_logit_soft_cap``.
+    * ``logit_scale`` multiplies (Cohere, Cohere 2), as do ``lm_head_multiplier``
+      (Falcon-H1, on the ``lm_head`` call itself) and ``output_multiplier``
+      (Muse Glimmer, which then soft caps as well).
+    * ``logits_scaling`` divides (Granite and its MoE variants), except in
+      HyperCLOVA X where it multiplies and MiniCPM3 where it scales the hidden
+      states before the head and so is not a logit transform.
+
+    Every scale field is applied unguarded in its ``forward``, so a no-op value
+    like ``1.0`` still allocates the buffer and still owes the reserve.
+
+    CLIP-style models also carry a ``logit_scale``, but it scales image-text
+    similarity, not an output head, and is never what the planner is asked about.
+
+    Never raises, short of ``KeyboardInterrupt`` and friends: an unreadable
+    config or field is skipped on its own and reported as zero, leaving the
+    caller on the behaviour it had before this existed.
+    """
+    zero = {
+        "logit_softcapping": 0.0,
+        "logit_scale_multiply": 0.0,
+        "logit_scale_divide": 0.0,
+    }
+    try:
+        config = _model_config(model_or_config)
+        if config is None:
+            return zero
+        found = dict(zero)
+        # A re-heading wrapper carries the tower's transforms without applying
+        # them, so only its own top-level config counts.
+        own_head = _config_attr(config, "model_type") in _OWN_UNTRANSFORMED_HEAD
+        for holder in _text_configs(config):
+            if own_head and holder is not config:
+                continue
+            model_type = _config_attr(holder, "model_type")
+            for key, names in _TRANSFORM_FIELDS:
+                for name in names:
+                    # Same spelling, different meaning in some families.
+                    bucket = _BUCKET_OVERRIDES.get((name, model_type), key)
+                    if bucket is None or found[bucket]:
+                        continue
+                    value = _config_attr(holder, name)
+                    if value is None:
+                        continue
+                    try:
+                        found[bucket] = float(value)
+                    except Exception:
+                        # Anything at all: a huge int raises OverflowError, and
+                        # the outer handler would discard the fields already
+                        # read.
+                        continue
+                    break
+        return found
+    except Exception:
+        return zero
 
 
 # --------------------------------------------------------------------------- #
@@ -369,9 +535,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
         weight = getattr(head, "weight", None)
         if weight is not None and weight.dim() >= 1:
             return int(weight.shape[0])
-    cfg = getattr(model, "config", None)
-    for holder in (getattr(cfg, "text_config", None), cfg):
-        v = getattr(holder, "vocab_size", None)
+    cfg = _config_attr(model, "config")
+    for holder in (_config_attr(cfg, "text_config"), cfg):
+        v = _config_attr(holder, "vocab_size")
         if isinstance(v, int) and v > 0:
             return v
     return 0
@@ -379,9 +545,9 @@ def resolve_head_width(model: nn.Module, head: nn.Module | None) -> int:
 
 def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
     """True when the output head shares storage with the input embedding."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
-        flag = getattr(holder, "tie_word_embeddings", None)
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
+        flag = _config_attr(holder, "tie_word_embeddings")
         if flag is True:
             return True
     if head is None:
@@ -399,10 +565,10 @@ def head_is_tied(model: nn.Module, head: nn.Module | None) -> bool:
 
 def _model_dtype(model: nn.Module) -> Any:
     """The dtype the checkpoint will be loaded in, as the config declares it."""
-    cfg = getattr(model, "config", None)
-    for holder in (cfg, getattr(cfg, "text_config", None)):
+    cfg = _config_attr(model, "config")
+    for holder in (cfg, _config_attr(cfg, "text_config")):
         for attr in ("dtype", "torch_dtype"):
-            d = getattr(holder, attr, None)
+            d = _config_attr(holder, attr)
             if isinstance(d, torch.dtype):
                 return d
     for t in model.parameters():
@@ -737,7 +903,7 @@ def plan_device_map(
     vocab_size: int | None = None,
     logit_dtype: torch.dtype | None = None,
     softcapped: bool | None = None,
-    logit_scaled: bool = False,
+    logit_scaled: bool | None = None,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,
@@ -759,10 +925,10 @@ def plan_device_map(
         vocab_size: override the detected head width.
         logit_dtype: dtype of the logits; defaults to the head's dtype.
         softcapped: whether a non-zero ``logit_softcapping`` is in play.
-            ``None`` (default) reads ``final_logit_softcapping`` (or its
-            RecurrentGemma alias ``logits_soft_cap``) off the config.
-        logit_scaled: whether the caller passes a non-zero
-            ``logit_scale_multiply`` or ``logit_scale_divide``.
+            ``None`` (default) detects it from the config, aliases and text
+            sub-configs included.
+        logit_scaled: whether the logits are multiplied or divided before the
+            loss. ``None`` (default) detects it. See ``detect_logit_transforms``.
         temperature_scaled: whether the caller divides by a temperature != 1.
         headroom_bytes: bypass the formula entirely.
         safety_bytes: slack added to the headroom.
@@ -831,17 +997,16 @@ def plan_device_map(
         w = getattr(head_mod, "weight", None)
         logit_dtype = w.dtype if w is not None and w.dtype.is_floating_point else torch.bfloat16
 
-    if softcapped is None:
-        cfg = getattr(model, "config", None)
-        # `logits_soft_cap` is the RecurrentGemma spelling of the same knob, and
-        # the repository's own `_detect_logit_softcap` already treats them as
-        # aliases. Missing it drops the tanh temporary and the retained soft-cap
-        # buffer from the headroom, so the head's card is under-reserved.
-        softcapped = any(
-            bool(getattr(h, name, None))
-            for h in (cfg, getattr(cfg, "text_config", None))
-            for name in ("final_logit_softcapping", "logits_soft_cap")
-        )
+    if softcapped is None or logit_scaled is None:
+        # Missing a transform drops its temporary from the headroom and
+        # under-reserves the head's card.
+        transforms = detect_logit_transforms(model)
+        if softcapped is None:
+            softcapped = bool(transforms["logit_softcapping"])
+        if logit_scaled is None:
+            logit_scaled = bool(
+                transforms["logit_scale_multiply"] or transforms["logit_scale_divide"]
+            )
 
     if headroom_bytes is None:
         headroom = logit_headroom_bytes(
@@ -966,6 +1131,10 @@ def plan_device_map(
     reserve_is_explicit = activation_reserve_bytes is not None
     requested_reserve = activation_reserve_bytes
 
+    # Per head candidate, the balanced reserve the flat-average planner asked
+    # for. `attempt` relaxes from it as well as from the prorated one.
+    flat_reserve: dict[int, dict[int, int]] = {}
+
     def reserve_for(head_device: int) -> dict[int, int]:
         """The per-device reserve to try for this head candidate.
 
@@ -1019,11 +1188,85 @@ def plan_device_map(
                 # each device at 0 still keeps the head's own reserve
                 # non-negative, so `attempt` -- which only relaxes the OTHER
                 # cards -- is never handed an infeasible head budget.
-                share = max(-(-total // len(devices)), pinned_bytes)
+                #
+                # Charge each device the weight IT holds, not the flat average.
+                # The packing is capacity-proportional, so on unequal cards the
+                # average is the weight of no device: 16 + 80 GiB holding a
+                # 62.81 GiB model gives an average of 31.41, which is larger
+                # than the whole 16 GiB card, so its cap went to -15.41 and the
+                # clamp zeroed its reserve -- and the packing then filled it to
+                # 0.09 GiB free (99.4%) while the 80 GiB card kept 16.41. Same
+                # shape at 24 + 48.
+                #
+                # Prorating only ever LOOSENS the flat-average share, never
+                # tightens it (`min` below), and that one-sidedness is load
+                # bearing twice over. The proration is symmetric, so it charges
+                # the BIGGER card more than the average -- and the bigger card
+                # is the one the head lands on, the only one that also pays the
+                # headroom. Charged both, its own cap can go where the small
+                # card's used to: budgets 852 + 1089 with 1368 of weights, 358
+                # of headroom and a 168-byte pinned head kept 107 and 47, and
+                # the raw proportional share turns that into 107 and 0. On a
+                # real pair, 10 + 18 GiB carrying a 4-layer 8192-wide model with
+                # 12 GiB of logit headroom loses the head's whole 1.094 GiB
+                # reserve. Taking the smaller of the two shares fixes the small
+                # card without ever moving the big one: the cap is per device
+                # monotone against the flat-average planner, so no card can come
+                # out of this with less than it had.
+                #
+                # On identical cards the prorated share IS the flat average, so
+                # `min` collapses onto the old expression and the measured Muse
+                # Glimmer arithmetic stands: 13.104 each of 26.208 gives 10.155,
+                # caps 2.949 and -1.155. Ceiling division on both sides is what
+                # makes the two agree byte for byte. Single-device budgets are
+                # unchanged too (the share is the whole model either way).
+                #
+                # The pinned floor is the HEAD's alone, because the head's card
+                # is the only one that holds the pinned units. Charging it to
+                # every card is what the flat-average planner did, and it
+                # recreates on a small card exactly the zero reserve this branch
+                # exists to remove: `_Bins([100, 50], head = 150)` on budgets
+                # 400 + 2000 with no headroom has 1200 bytes of weights and a
+                # 600-byte pinned head, so cuda:0's proportional share is 200
+                # but a shared floor raises it to 600, its cap 400 - 600 clamps
+                # to zero and the in-order walk fills all 400 bytes of the card
+                # while cuda:1 leaves 1200 free. Head-only, cuda:0 keeps 200.
+                # The cap stays per device monotone against the flat-average
+                # planner either way (`min(flat, prorated) <= flat <=
+                # max(flat, pinned_bytes)`), and `attempt`'s per-card legacy
+                # floor is what guarantees the higher non-head ask can never
+                # settle BELOW the old answer: measured over 36,460 configs, 0
+                # devices anywhere come out under 7c9a7ac0, and 3 x 80 GiB on a
+                # 4-layer 8192-wide model -- the shape that regressed when the
+                # floor was head-only and that guard did not yet exist -- is
+                # byte identical.
+                capacity = sum(raw_budgets.values()) or 1
+                flat = -(-total // len(devices))
+                share = {
+                    d: max(
+                        min(flat, -(-total * raw_budgets[d] // capacity)),
+                        pinned_bytes if d == head_device else 0,
+                    )
+                    for d in devices
+                }
                 per_device = {
                     d: int(max(0, min(
                         value,
-                        raw_budgets[d] - share
+                        raw_budgets[d] - share[d]
+                        - (headroom if d == head_device else 0),
+                    )))
+                    for d in devices
+                }
+                # What the flat-average planner would have asked for. `attempt`
+                # walks this ladder too, so every rung it used stays reachable.
+                # It keeps the SHARED pinned floor on purpose: this mapping has
+                # to reproduce the old planner exactly, floor included, or the
+                # per-card guarantee `attempt` derives from it is not a
+                # statement about the previous release.
+                flat_reserve[head_device] = {
+                    d: int(max(0, min(
+                        value,
+                        raw_budgets[d] - max(flat, pinned_bytes)
                         - (headroom if d == head_device else 0),
                     )))
                     for d in devices
@@ -1051,9 +1294,9 @@ def plan_device_map(
             return _fill(head_device, reserve, max(reserve.values()))
 
         # The reserve is per device now, so it is a range: the top is what we
-        # would like every card to keep, the floor is exactly what the old
-        # shared `min` cap handed all of them (`min` of a clamp is the clamp of
-        # the `min`). Relaxing from the top alone can land BELOW that floor --
+        # would like every card to keep, the floor the least of it (`min` of a
+        # clamp is the clamp of the `min`). Relaxing from the top alone can
+        # land BELOW that floor --
         # a request missing by one percent is answered by a whole 5% rung -- so
         # 4 x 80 GiB holding a 144 GiB model kept 41.72 GiB per card where the
         # shared cap kept 43.68.
@@ -1062,41 +1305,90 @@ def plan_device_map(
         # non-head cards stepped down from the per-device range and from the
         # old shared floor, then both ladders again with the head's own reserve
         # relaxed too. The old planner's ladders are in that set rung for rung,
-        # and ordering by the smallest reserve any card keeps means the
-        # accepted plan can never keep less than it did. The head-relaxing
+        # and the per-card floor below is what stops a rung with a larger
+        # minimum from being taken when it keeps some card less. The head-relaxing
         # rungs exist because relaxing only the OTHER cards can miss the head's
         # card by less than its reserve and refuse a model that fits. The logit
         # headroom is never touched by any of them.
-        top, floor = max(reserve.values()), min(reserve.values())
-        rungs = sorted(
-            {top * (20 - step) // 20 for step in range(21)} |
-            {floor * (20 - step) // 20 for step in range(21)},
-            reverse = True,
-        )
-        candidates = []
-        for other in rungs:
-            candidates.append({d: reserve[d] if d == head_device else min(reserve[d], other)
-                               for d in devices})
-            candidates.append({d: floor if d == head_device else min(floor, other)
-                               for d in devices})
-        for step in range(1, 21):
-            candidates.append({d: v * (20 - step) // 20 for d, v in reserve.items()})
-            candidates.append(dict.fromkeys(devices, floor * (20 - step) // 20))
+        def ladder(base: dict[int, int]) -> list[dict[int, int]]:
+            top, floor = max(base.values()), min(base.values())
+            rungs = sorted(
+                {top * (20 - step) // 20 for step in range(21)} |
+                {floor * (20 - step) // 20 for step in range(21)},
+                reverse = True,
+            )
+            out = []
+            for other in rungs:
+                out.append({d: base[d] if d == head_device else min(base[d], other)
+                            for d in devices})
+                out.append({d: floor if d == head_device else min(floor, other)
+                            for d in devices})
+            for step in range(1, 21):
+                out.append({d: v * (20 - step) // 20 for d, v in base.items()})
+                out.append(dict.fromkeys(devices, floor * (20 - step) // 20))
+            return out
 
-        seen = set()
-        ordered = []
-        for kept in candidates:
-            key = tuple(kept[d] for d in devices)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(kept)
-        # Most-kept first. Passing `max(kept.values())` as the non-head cap
-        # makes `_fill` keep exactly this mapping.
-        ordered.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
+        # Both ladders, because a rung is 5% of the mapping it is scaled from:
+        # prorating raises the non-head asks on unequal cards, and the coarser
+        # ladder off that higher start can step straight PAST a flat-average
+        # rung that fit. Budgets 1264 + 1354, 1368 of weights and 3 of headroom
+        # ask 580/623 flat and 603/623 prorated; free units of 272 and 768 make
+        # the flat 493 rung fit, and the prorated ladder lands on 482 instead.
+        candidates = ladder(reserve)
+        flat = flat_reserve.get(head_device)
+        legacy = ladder(flat) if flat is not None and flat != reserve else []
+        candidates += legacy
+
+        def _ordered(cands):
+            # Most-kept first. Passing `max(kept.values())` as the non-head cap
+            # makes `_fill` keep exactly this mapping.
+            seen = set()
+            out = []
+            for kept in cands:
+                key = tuple(kept[d] for d in devices)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(kept)
+            out.sort(key = lambda k: (min(k.values()), k[head_device], sum(k.values())),
                      reverse = True)
-        for kept in ordered:
-            r = _fill(head_device, kept, max(kept.values()))
+            return out
+
+        filled = {}
+        def _try(kept):
+            key = tuple(kept[d] for d in devices)
+            if key not in filled:
+                filled[key] = _fill(head_device, kept, max(kept.values()))
+            return filled[key]
+
+        # What the flat-average planner would have kept: its own ladder, walked
+        # on its own. Ordering by the smallest reserve any card keeps is not
+        # coordinate-wise monotone, so merging the two ladders and taking the
+        # largest minimum can hand one card LESS than that planner did while
+        # another gains. `_Bins([249, 230, 144, 203, 223, 68], head = 32)` on
+        # budgets 3050 + 3977 with 504 of headroom asks 752/963 flat and
+        # 963/963 prorated; 963 does not fit, the prorated ladder's next rung
+        # 914/914 does, and its larger minimum sorts ahead of the still feasible
+        # 752/963 -- so the head, the card that also pays the logit headroom,
+        # comes out 49 short of what it used to keep. That fixture scales
+        # linearly, so on real cards it is gigabytes of activation reserve. A
+        # 1500 config fuzz at MiB scale put it at 58 shapes.
+        #
+        # So a candidate is only better if it is at least the legacy reserve on
+        # EVERY card. The legacy rung itself always passes that test, so this
+        # can never refuse a plan the old planner accepted, and the best rung
+        # above it is still taken: the fixture ends on 866/963, keeping the
+        # head whole AND lifting the small card 114 over the old answer.
+        legacy_kept = None
+        for kept in _ordered(legacy):
+            if _try(kept) is not None:
+                legacy_kept = kept
+                break
+
+        for kept in _ordered(candidates):
+            if legacy_kept is not None and any(kept[d] < legacy_kept[d] for d in devices):
+                continue
+            r = _try(kept)
             if r is not None:
                 return r
         return None
@@ -1536,7 +1828,7 @@ def plan_device_map_for_pretrained(
     retained_rows: int = 0,
     vocab_size: int | None = None,
     softcapped: bool | None = None,
-    logit_scaled: bool = False,
+    logit_scaled: bool | None = None,
     temperature_scaled: bool = False,
     headroom_bytes: int | None = None,
     safety_bytes: int = 256 * 1024 ** 2,

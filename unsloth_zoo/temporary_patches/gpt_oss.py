@@ -457,10 +457,17 @@ def patch_gpt_oss():
         except Exception as e:
             return raise_error("triton_kernels.matmul_ogs", e)
 
-    try:
-        from transformers.integrations.tensor_parallel import shard_and_distribute_module
-    except Exception as e:
-        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+    # Legacy per-parameter TP loader hook. transformers 5.16.0 (upstream PR #47579,
+    # the DTensor tensor parallel rewrite) reduced it to a tombstone that raises when
+    # called, and dropped load_and_swizzle_mxfp4, so the patch below is inert there.
+    # The import itself still succeeds; skipping it is defensive.
+    if transformers_version < Version("5.16.0"):
+        try:
+            from transformers.integrations.tensor_parallel import shard_and_distribute_module
+        except Exception as e:
+            return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+    else:
+        shard_and_distribute_module = None
 
     def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
         model = kwargs.get("model", None)
@@ -473,6 +480,12 @@ def patch_gpt_oss():
         for proj in ["gate_up_proj", "down_proj"]:
             if proj in param_name:
                 if device_mesh is not None:
+                    if shard_and_distribute_module is None:
+                        raise RuntimeError(
+                            "Unsloth: tensor parallel MXFP4 loading needs transformers < 5.16.0, "
+                            "which still provides shard_and_distribute_module. On 5.16.0 and newer "
+                            "load with from_pretrained(..., tp_plan=...) instead."
+                        )
                     shard_and_distribute_module(model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh)
                 else:
                     setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
@@ -1391,9 +1404,11 @@ from unsloth_zoo.device_type import DEVICE_TYPE
 # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
 # with is_available() like device_synchronize() does.
 if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+    # Only total capacity is needed. mem_get_info() can create a device context at
+    # import time, leaving otherwise idle processes with persistent device memory.
+    device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+    device_memory = torch.cuda.get_device_properties(0).total_memory
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True

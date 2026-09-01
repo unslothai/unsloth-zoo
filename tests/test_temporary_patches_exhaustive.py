@@ -18,8 +18,12 @@ in zoo; an upstream rename/drop makes that patch silently no-op via
 
 from __future__ import annotations
 
+import dis
 import importlib
 import importlib.util
+import types
+
+from _pytest import outcomes as _pytest_outcomes
 import inspect
 import os
 from typing import Iterable
@@ -33,6 +37,17 @@ from packaging.version import Version  # noqa: E402
 
 _TX_VERSION = getattr(transformers, "__version__", "0.0.0")
 _TX_IS_5X = Version(_TX_VERSION) >= Version("5.0.0")
+# 5.16.0 (upstream PR #47579, the DTensor tensor parallel rewrite) deleted
+# mxfp4.dequantize and reduced tensor_parallel.shard_and_distribute_module to a
+# tombstone that still imports but raises RuntimeError when called.
+_TX_GE_5_16 = Version(_TX_VERSION) >= Version("5.16.0")
+# transformers 5.10.0 was published from a stale branch, yanked on PyPI ~14 minutes
+# later ("We pushed from a week old main branch ... missing a bunch of fixes") and
+# superseded by 5.10.1. Its tree carries an in-progress refactor in which
+# integrations/tensor_parallel.py had been moved to distributed/tensor_parallel.py
+# and shard_and_distribute_module did not exist anywhere; 5.10.1 restored the
+# integrations layout. It is a retracted artifact, not an upstream API decision.
+_TX_IS_YANKED_5_10_0 = Version(_TX_VERSION) == Version("5.10.0")
 
 
 def _skip_if_transformers_5x(reason: str) -> None:
@@ -46,13 +61,56 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
+def _unimportable(dotted_module: str, exc: BaseException) -> str:
+    return (
+        f"{dotted_module!r} raised on import, so nothing can be said about "
+        f"upstream drift here: {type(exc).__name__}: {exc}"
+    )
+
+
+def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
+    """Did the import fail because OUR target is gone, rather than a dependency?
+
+    ``exc.name`` is the deepest package that could not be found, which for a
+    removed model package is the PARENT, not the module we asked for: dropping
+    ``transformers/models/siglip/`` makes importing
+    ``transformers.models.siglip.modeling_siglip`` raise with
+    ``name == "transformers.models.siglip"``. Comparing only against the full
+    path and the top-level package therefore read a removed target as a broken
+    dependency and skipped, so the hard gate passed while the patch target had
+    disappeared. Any package prefix of the target counts.
+
+    The trailing dot is what keeps this a PACKAGE prefix: without it
+    ``transformers.models.siglip`` would also claim
+    ``transformers.models.siglipx.modeling_x``.
+    """
+    name = exc.name or ""
+    return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
+
+
 def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
-    Used to skip 5.0+-gated tests on a 4.x install."""
+    Used to skip 5.0+-gated tests on a 4.x install.
+
+    ``None`` means drift, and 15 of the 23 callers below fail on it: either the
+    module imported without the attribute, or a ``ModuleNotFoundError`` named
+    the module we asked for. A module that exists but RAISES on the way in says
+    nothing about upstream, so it skips instead. Swallowing every exception
+    conflated the two and reported "Gemma3nRMSNorm missing on transformers
+    4.57.6" for a class transformers 4.57.6 ships: configuration_gemma3n imports
+    ImageNetInfo from timm.data, which a newer timm dropped, so every gemma3n
+    class looked deleted and eight tests blamed transformers.
+    """
     try:
         mod = importlib.import_module(dotted_module)
-    except Exception:
-        return None
+    except ModuleNotFoundError as exc:
+        # An absent target module IS drift, so callers still get None and judge.
+        # One naming something else is a broken dependency: skip below.
+        if _names_the_target(exc, dotted_module):
+            return None
+        pytest.skip(_unimportable(dotted_module, exc))
+    except Exception as exc:
+        pytest.skip(_unimportable(dotted_module, exc))
     return getattr(mod, class_name, None)
 
 
@@ -185,6 +243,58 @@ def _assert_params_superset(
             f"DRIFT DETECTED: zoo temporary_patches/{zoo_file} expects "
             f"{label}({sorted(required)}) but installed transformers "
             f"{_TX_VERSION} has signature {sig} (missing {sorted(missing)})"
+        )
+
+
+# Opcodes whose name operand is a module-level binding, i.e. what a
+# ``setattr(module, name, ...)`` patch can reach. ``LOAD_ATTR``/``STORE_ATTR`` are
+# deliberately excluded: co_names mixes attribute names in with globals, so they
+# would let ``self.quantization_config.dequantize`` masquerade as a call to the
+# module-level ``dequantize``.
+_GLOBAL_NAME_OPS = frozenset((
+    "LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL",
+    "LOAD_NAME", "STORE_NAME", "DELETE_NAME",
+    "IMPORT_NAME", "IMPORT_FROM",
+))
+
+
+def _referenced_global_names(obj) -> set[str]:
+    """Every global name reachable from ``obj``'s code, nested code included.
+
+    Walks the whole tree because a call inside a comprehension, nested def or
+    lambda lives in a child code object off ``co_consts``. Filters on opcode
+    rather than reading ``co_names`` wholesale, otherwise attribute accesses land
+    in the result and the drift check passes vacuously."""
+    code = getattr(obj, "__code__", None) or getattr(obj, "__func__", None)
+    code = getattr(code, "__code__", code)
+    if code is None or not hasattr(code, "co_names"):
+        return set()
+    found: set[str] = set()
+    stack = [code]
+    while stack:
+        current = stack.pop()
+        for instruction in dis.get_instructions(current):
+            if instruction.opname in _GLOBAL_NAME_OPS and isinstance(instruction.argval, str):
+                found.add(instruction.argval)
+        stack += [c for c in current.co_consts if hasattr(c, "co_names")]
+    return found
+
+
+def _assert_on_live_path(callee_name: str, caller, caller_label: str, zoo_file: str):
+    """DRIFT-fail when ``caller`` no longer references ``callee_name``.
+
+    Existence-and-signature pinning is not enough: zoo patched ``mxfp4.dequantize``
+    while 5.x loaded through ``Mxfp4Dequantize`` -> ``dequantize_convertops``. The
+    symbol kept its signature to 5.15, so detectors stayed green while the patch
+    reached nothing. Asking whether the patched symbol is still CALLED closes that
+    gap statically."""
+    if callee_name not in _referenced_global_names(caller):
+        pytest.fail(
+            f"DRIFT DETECTED: zoo temporary_patches/{zoo_file} patches "
+            f"{callee_name}, but {caller_label} no longer references it on "
+            f"transformers {_TX_VERSION}. The patch would still apply cleanly "
+            f"and silently reach nothing, which is exactly how the un-transposed "
+            f"MXFP4 layout survived from 5.0.0 to 5.16.0."
         )
 
 
@@ -1195,8 +1305,21 @@ def test_mxfp4_convert_moe_packed_tensors_signature():
 
 
 def test_mxfp4_dequantize_signature():
-    """mxfp4.py:220 patches ``mxfp4.dequantize`` (module, param_name,
-    param_value, target_device, dq_param_name, **kwargs)."""
+    """mxfp4.py patches ``mxfp4.dequantize`` (module, param_name, param_value,
+    target_device, dq_param_name, **kwargs) on transformers 4.x ONLY.
+
+    ``dequantize`` is the live loader hook only on 4.x, where quantizer_mxfp4 calls
+    it. From 5.1.0 the live path is ``Mxfp4Dequantize`` (a ConversionOps) ->
+    ``dequantize_convertops``, leaving ``dequantize`` defined but unreferenced until
+    5.16.0 deleted it. Zoo gates its patch to < 5.0.0, so pinning the symbol above
+    that range would report drift against something zoo no longer touches; the 5.x
+    replacement is pinned by test_mxfp4_dequantize_convertops_signature below."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: mxfp4.dequantize is not the live "
+            "loader hook on 5.x and zoo gates its patch to < 5.0.0; the "
+            "ConversionOps replacement is pinned separately"
+        )
     mod_name = "transformers.integrations.mxfp4"
     try:
         mod = importlib.import_module(mod_name)
@@ -1205,7 +1328,7 @@ def test_mxfp4_dequantize_signature():
     fn = getattr(mod, "dequantize", None)
     if fn is None:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:220 expects "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
             "transformers.integrations.mxfp4.dequantize but it is missing on "
             f"transformers {_TX_VERSION}"
         )
@@ -1220,12 +1343,166 @@ def test_mxfp4_dequantize_signature():
     )
     if not _has_var_keyword(fn):
         pytest.fail(
-            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py:185 forwards "
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py forwards "
             f"by name (model=..., empty_param=..., casting_dtype=..., "
             f"to_contiguous=..., rank=..., device_mesh=...) via **kwargs but "
             f"upstream transformers.integrations.mxfp4.dequantize lost its "
             f"**kwargs catch-all on {_TX_VERSION}: {inspect.signature(fn)}"
         )
+
+
+# Every upstream shape zoo's mxfp4.py knows how to replace. MUST be kept in sync
+# with the replacement defined in temporary_patches/mxfp4.py: patch_function refuses
+# a replacement whose parameters do not match the original exactly, so a shape that
+# is not listed here is a shape zoo cannot patch.
+# 5.0.0 alone takes target_device; 5.1.0 and newer leave placement to the caller.
+# If the 5.0.0 arm in mxfp4.py is ever dropped, drop the 3-tuple here too, or this
+# test will pass on a version zoo can no longer patch.
+_CONVERTOPS_HANDLED_SIGNATURES = (
+    ("blocks", "scales"),
+    ("blocks", "scales", "target_device"),
+)
+
+
+def test_mxfp4_dequantize_convertops_signature():
+    """mxfp4.py patches ``mxfp4.dequantize_convertops`` on transformers 5.x.
+
+    The 5.x replacement for module-level ``dequantize``: ``Mxfp4Dequantize.convert``
+    is its only caller, and zoo rebinds it to re-apply the ``transpose(1, 2)`` its
+    own un-transposed ``convert_moe_packed_tensors`` leaves off. Absent on 4.x, where
+    the legacy ``dequantize`` hook carries the transpose instead.
+
+    EXACT parameter tuple, not a superset. ``can_safely_patch`` refuses any arity
+    the replacement does not match exactly, so a superset check is the wrong
+    predicate here: 5.0.0's 3-arg ``(blocks, scales, target_device)`` IS a superset
+    of ``["blocks", "scales"]`` and sailed through this test while the patch it was
+    meant to police was being rejected at runtime with "Parameter count mismatch:
+    3 vs 2", leaving GPT-OSS loading with dims 1 and 2 swapped. Assert instead that
+    the installed signature is one zoo actually dispatches on; anything else is
+    drift, because anything else is a patch that will not apply."""
+    try:
+        mod = importlib.import_module("transformers.integrations.mxfp4")
+    except Exception as exc:
+        pytest.skip(f"mxfp4 integrations unavailable: {exc}")
+    fn = getattr(mod, "dequantize_convertops", None)
+    if not _TX_IS_5X:
+        if fn is None:
+            pytest.skip(
+                f"transformers {_TX_VERSION} predates the ConversionOps mxfp4 "
+                "loading path; zoo patches mxfp4.dequantize instead"
+            )
+        return
+    if fn is None:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
+            "transformers.integrations.mxfp4.dequantize_convertops but it is "
+            f"missing on transformers {_TX_VERSION}. Without it the loader "
+            "keeps zoo's un-transposed [E, D, G*B*2] layout and GPT-OSS loads "
+            "with dims 1 and 2 swapped."
+        )
+    got = tuple(_param_names(fn))
+    if got not in _CONVERTOPS_HANDLED_SIGNATURES:
+        pytest.fail(
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py replaces "
+            f"transformers.integrations.mxfp4.dequantize_convertops and has arms "
+            f"for {list(_CONVERTOPS_HANDLED_SIGNATURES)}, but transformers "
+            f"{_TX_VERSION} declares {inspect.signature(fn)}. patch_function will "
+            f"refuse a replacement whose parameters do not match exactly, so the "
+            f"transpose(1, 2) that zoo's un-transposed convert_moe_packed_tensors "
+            f"leaves off would never be restored and GPT-OSS would load with dims "
+            f"1 and 2 swapped."
+        )
+    # The class and its call site must both still exist for the patch to reach
+    # the loader.
+    cls = getattr(mod, "Mxfp4Dequantize", None)
+    if cls is None:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py relies on "
+            "transformers.integrations.mxfp4.Mxfp4Dequantize calling "
+            f"dequantize_convertops, but the class is missing on {_TX_VERSION}"
+        )
+    convert = getattr(cls, "convert", None)
+    if convert is None:
+        pytest.fail(
+            "DRIFT DETECTED: transformers.integrations.mxfp4.Mxfp4Dequantize "
+            f"lost its .convert method on {_TX_VERSION}; zoo's "
+            "dequantize_convertops patch has no live caller"
+        )
+    _assert_on_live_path(
+        "dequantize_convertops", convert, "Mxfp4Dequantize.convert", "mxfp4.py",
+    )
+
+
+def test_mxfp4_legacy_dequantize_is_on_the_live_path_on_4x():
+    """On 4.x, ``mxfp4.dequantize`` must still be CALLED by quantizer_mxfp4.
+
+    Zoo patches it there, and a patch on a function nothing calls is a silent no-op,
+    which is what happened on 5.x: the symbol survived to 5.16.0 with an unchanged
+    signature while the loader had already moved to the ConversionOps path.
+
+    Best effort: transformers.quantizers pulls in optional heavy backends (torchao
+    and friends), and a broken one says nothing about drift, so an unimportable
+    caller module skips rather than fails."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: the legacy dequantize hook is not on "
+            "the live path on 5.x; test_mxfp4_dequantize_convertops_signature "
+            "pins the ConversionOps replacement instead"
+        )
+    try:
+        mod = importlib.import_module("transformers.integrations.mxfp4")
+        quantizer = importlib.import_module(
+            "transformers.quantizers.quantizer_mxfp4"
+        )
+    except Exception as exc:
+        pytest.skip(_unimportable("transformers.quantizers.quantizer_mxfp4", exc))
+    if getattr(mod, "dequantize", None) is None:
+        pytest.skip(
+            f"transformers {_TX_VERSION} has no mxfp4.dequantize; covered by "
+            "test_mxfp4_dequantize_signature"
+        )
+    cls = getattr(quantizer, "Mxfp4HfQuantizer", None)
+    if cls is None:
+        pytest.fail(
+            "DRIFT DETECTED: transformers.quantizers.quantizer_mxfp4."
+            f"Mxfp4HfQuantizer is missing on {_TX_VERSION}"
+        )
+    callers = [
+        name for name, fn in vars(cls).items()
+        if isinstance(fn, types.FunctionType)
+        and "dequantize" in _referenced_global_names(fn)
+    ]
+    if not callers:
+        pytest.fail(
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py patches "
+            "transformers.integrations.mxfp4.dequantize, but no method on "
+            f"Mxfp4HfQuantizer calls it on transformers {_TX_VERSION}. The "
+            "patch would apply cleanly and reach nothing."
+        )
+
+
+def test_referenced_global_names_ignores_attribute_accesses():
+    """The live-path detector must not be satisfied by a same-named ATTRIBUTE.
+
+    ``co_names`` carries ``LOAD_ATTR``/``STORE_ATTR`` operands alongside globals, so
+    reading it wholesale made the 4.x gate vacuous: ``Mxfp4HfQuantizer`` reads
+    ``self.quantization_config.dequantize`` in several methods, so the name is
+    present whether or not anything still calls the module-level ``dequantize``. On
+    real 5.x the call site is gone while every config read remains."""
+    def attribute_only(cfg):
+        cfg.dequantize = True
+        return cfg.dequantize
+
+    def real_global_call(x):
+        return dequantize(x)  # noqa: F821
+
+    def real_import_from(x):
+        from transformers.integrations.mxfp4 import dequantize
+        return dequantize(x)
+
+    assert "dequantize" not in _referenced_global_names(attribute_only)
+    assert "dequantize" in _referenced_global_names(real_global_call)
+    assert "dequantize" in _referenced_global_names(real_import_from)
 
 
 def test_mxfp4_fp4_values_constant_present():
@@ -1242,23 +1519,59 @@ def test_mxfp4_fp4_values_constant_present():
 
 
 def test_mxfp4_shard_and_distribute_module_present():
-    """mxfp4.py:181 imports
-    ``transformers.integrations.tensor_parallel.shard_and_distribute_module``;
-    patched dequantize delegates when device_mesh != None. Positional
-    arity must be 8 for zoo's call to land."""
+    """mxfp4.py (4.x gate) and gpt_oss.py (< 5.16.0 gate) import
+    ``transformers.integrations.tensor_parallel.shard_and_distribute_module``
+    and delegate to it when device_mesh != None. Positional arity must be 8
+    for zoo's call to land.
+
+    5.16.0 replaced the function with a ``(*args, **kwargs)`` tombstone that raises
+    RuntimeError, so there is nothing left to pin above that version and zoo gates
+    both call sites off instead. It is a genuine upstream stub, NOT a decorator
+    wrapper: no ``__wrapped__``, so ``follow_wrapped`` recovers nothing.
+
+    An unimportable module is a hard failure on every release EXCEPT the yanked
+    5.10.0, where it is xfail. Not a skip: the consequence is real. gpt_oss.py's
+    import sits under a ``< 5.16.0`` gate inside ``patch_gpt_oss``, so on 5.10.0 it
+    raises and ``return raise_error(...)`` abandons the remainder of that function,
+    losing both ``load_and_swizzle_mxfp4`` and ``replace_with_mxfp4_linear`` --
+    silently, because ``raise_error`` only speaks under UNSLOTH_ENABLE_LOGGING.
+    (Reached only when triton_kernels is installed; without it ``patch_gpt_oss``
+    returns earlier and 5.10.0 costs nothing extra.) xfail keeps that written down
+    and reported, and turns into XPASS if the module ever comes back, whereas a
+    skip would read as "not applicable" and a hard fail would redden a lane no
+    change to zoo can ever green: 5.10.0 is yanked, so the fix is 5.10.1.
+
+    Note that widening the gate to match gpt_oss.py's ``< 5.16.0`` would NOT help:
+    5.10.0 is inside that range, so the test would still fail."""
     try:
         mod = importlib.import_module("transformers.integrations.tensor_parallel")
     except Exception as exc:
+        if _TX_IS_YANKED_5_10_0:
+            pytest.xfail(
+                "transformers 5.10.0 is YANKED upstream (published from a stale "
+                "branch, replaced by 5.10.1 minutes later). It moved "
+                "integrations/tensor_parallel.py to distributed/tensor_parallel.py "
+                "and shipped no shard_and_distribute_module at all, so "
+                "patch_gpt_oss aborts at its gated import and silently drops "
+                "load_and_swizzle_mxfp4 and replace_with_mxfp4_linear on installs "
+                f"that have triton_kernels. Upgrade to 5.10.1 or newer. ({exc})"
+            )
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:181 imports "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py and gpt_oss.py import "
             f"transformers.integrations.tensor_parallel but it is missing: {exc}"
         )
     fn = getattr(mod, "shard_and_distribute_module", None)
     if fn is None:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py:181 expects "
+            "DRIFT DETECTED: zoo temporary_patches/mxfp4.py expects "
             "shard_and_distribute_module but it is missing on transformers "
             f"{_TX_VERSION}"
+        )
+    if _TX_GE_5_16:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: shard_and_distribute_module is a "
+            "deprecation tombstone that raises RuntimeError; zoo gates both "
+            "call sites to < 5.16.0 and uses tp_plan= above it"
         )
     # 8 positionals: model, param_value, empty_param, dq_param_name,
     # casting_dtype, to_contiguous, rank, device_mesh.
@@ -1268,28 +1581,27 @@ def test_mxfp4_shard_and_distribute_module_present():
                       inspect.Parameter.POSITIONAL_ONLY)
     ]
     if len(params) < 8:
+        sig = inspect.signature(fn)
+        # A bare (*args, **kwargs) is a passthrough, not a narrowed signature:
+        # upstream's 5.16.0 tombstone accepts any call and raises RuntimeError.
+        # Reporting "accepts only 0 positionals" would send the reader looking for
+        # a signature change that never happened, so name what it actually is.
+        if _has_var_keyword(fn) and any(
+            p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+        ):
+            detail = (
+                f"accepts any call and forwards nothing: {sig}. That is a "
+                "deprecation tombstone or passthrough, not a narrowed "
+                "signature, so the call site cannot be repaired by dropping "
+                "arguments and must be gated off or ported"
+            )
+        else:
+            detail = f"accepts only {len(params)}: {sig}"
         pytest.fail(
-            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py:196 calls "
-            f"shard_and_distribute_module with 8 positionals but installed "
-            f"signature on transformers {_TX_VERSION} accepts only "
-            f"{len(params)}: {inspect.signature(fn)}"
+            f"DRIFT DETECTED: zoo temporary_patches/mxfp4.py calls "
+            f"shard_and_distribute_module with 8 positionals but the installed "
+            f"signature on transformers {_TX_VERSION} {detail}"
         )
-
-
-def test_mxfp4_shard_and_distribute_set_param_kwarg_or_4x_compat():
-    """mxfp4.py:196 passes ``set_param=False`` (5.x kwarg). 4.x without
-    **kwargs catch-all TypeErrors on the TP path; surface as skip."""
-    mod = importlib.import_module("transformers.integrations.tensor_parallel")
-    fn = mod.shard_and_distribute_module
-    if "set_param" in _param_names(fn):
-        return  # 5.x
-    if _has_var_keyword(fn):
-        return  # **kwargs swallows set_param
-    pytest.skip(
-        f"transformers {_TX_VERSION} predates set_param kwarg on "
-        "shard_and_distribute_module; zoo's TP path (device_mesh != None) "
-        "requires 5.x. Non-TP users unaffected."
-    )
 
 
 def test_mxfp4_mxfp4_config_top_level_class():
@@ -2490,3 +2802,39 @@ def test_temporary_patches_directory_has_expected_files():
             f"DRIFT DETECTED: temporary_patches/ is missing files {missing}; "
             f"either they were renamed or dropped without updating the test"
         )
+
+
+def test_a_broken_dependency_is_not_reported_as_upstream_drift():
+    """A module gone upstream is drift and must still reach the caller as None;
+    a module that raises on its own dependency is not. gemma3n conflated them:
+    configuration_gemma3n imports ImageNetInfo from timm.data, which a newer
+    timm dropped, so eight tests announced "missing on transformers 4.57.6"
+    about classes transformers 4.57.6 ships.
+    """
+    # Absent module: still None, so the callers still judge it.
+    assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
+
+    # Present but raising, on a dependency of its own: skipped, not blamed.
+    module_name = "_zoo_probe_broken_import"
+    module = types.ModuleType(module_name)
+
+    def _explode():
+        raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+
+    module.__getattr__ = lambda name: _explode()
+    real_import = importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == module_name:
+            raise ImportError("cannot import name 'ImageNetInfo' from 'timm.data'")
+        return real_import(name, *args, **kwargs)
+
+    importlib.import_module = fake_import
+    try:
+        # Skipped derives from BaseException: pytest.raises(Exception) would
+        # let it through and silently skip THIS test.
+        with pytest.raises(_pytest_outcomes.Skipped) as caught:
+            _try_get_class(module_name, "Anything")
+        assert "nothing can be said about upstream drift" in str(caught.value)
+    finally:
+        importlib.import_module = real_import
