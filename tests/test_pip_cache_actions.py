@@ -181,3 +181,138 @@ def test_save_runs_on_the_default_branch_only():
         "copy that only that PR can read, which is the whole defect."
     )
     assert "always()" in condition, "a later step failing must not discard a completed install"
+
+
+# --- every cache save, not just the pip pair ------------------------------------------
+#
+# The rule above is enforced on the pip-cache-save action, which is the only thing that
+# was writing PR-scoped entries when it was written. It is not the only thing that CAN.
+# `gemma4-audio-probe.yml` used a bare read-write `actions/cache`, which registers its own
+# post-step and saves on whatever ref the job ran on, exactly like the setup-python form
+# this file exists to keep out. That workflow triggers on a label, so a labelled PR wrote
+# a 3.4 GB checkpoint to refs/pull/N/merge that only that PR's re-runs could restore,
+# seven macOS legs racing the one key.
+#
+# The janitor could not have cleaned it up either: `hf-gemma4-e2b-4bit-v1` carries no
+# trailing dependency hash, so cache-janitor.yml's generation ranking skips it entirely
+# and only closing the PR would ever have freed the bytes.
+#
+# So the check is on the shape, everywhere, rather than on the one action that had the
+# problem first.
+
+_CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
+
+
+def _or_alternatives(expr):
+    """``expr`` split on its TOP-LEVEL ``||``, ignoring ``||`` inside parens or quotes."""
+    parts, depth, quote, buf, i = [], 0, "", [], 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            buf.append(ch)
+        elif ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "|" and depth == 0 and expr[i:i + 2] == "||":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+# A POSITIVE equality, in either quote style. `!=` must not match: a condition restricting
+# a save to everything EXCEPT main is the exact inversion of the rule, and a substring
+# search for "refs/heads/main" accepts it.
+_MAIN_ONLY = re.compile(r"github\.ref\s*==\s*['\"]refs/heads/main['\"]")
+
+
+def _restricted_to_main(expr):
+    """Whether ``expr`` can only be true on the default branch.
+
+    Every alternative of a top-level `||` has to carry the check, because `||` is how a
+    condition GAINS refs: `github.ref == 'refs/heads/main' || github.event_name ==
+    'pull_request'` mentions main and still runs on every PR.
+    """
+    alternatives = _or_alternatives(expr)
+    return bool(expr.strip()) and all(_MAIN_ONLY.search(a) for a in alternatives)
+
+
+@pytest.mark.parametrize(
+    "expr,restricted",
+    [
+        ("always() && github.ref == 'refs/heads/main'", True),
+        ('github.ref == "refs/heads/main" && steps.x.outcome == \'success\'', True),
+        ("github.ref != 'refs/heads/main'", False),
+        ("github.ref == 'refs/heads/main' || github.event_name == 'pull_request'", False),
+        ("", False),
+    ],
+)
+def test_the_main_only_check_reads_the_expression(expr, restricted):
+    # The guard below is only as good as this predicate, so the predicate is tested too.
+    assert _restricted_to_main(expr) is restricted, expr
+
+
+def _cache_writer_steps():
+    """(where, step) for every step that can write a cache entry, workflows and actions."""
+    for path in WORKFLOWS:
+        for name, steps in _jobs(path):
+            for step in steps:
+                yield f"{path.name}:{name}", step
+    for action in sorted((REPO / ".github" / "actions").rglob("action.yml")):
+        doc = yaml.safe_load(action.read_text()) or {}
+        for step in ((doc.get("runs") or {}).get("steps") or []):
+            yield f"action {action.parent.name}", step
+
+
+def test_no_cache_save_reaches_a_pull_request_ref():
+    offenders = []
+    for where, step in _cache_writer_steps():
+        uses = str(step.get("uses", ""))
+        # `actions/cache/restore@` is read-only and correct on every ref.
+        if not any(w in uses for w in _CACHE_WRITERS):
+            continue
+        if not _restricted_to_main(" ".join(str(step.get("if", "")).split())):
+            offenders.append(f"{where}: {step.get('name') or uses}")
+    assert not offenders, (
+        "these steps save a cache without restricting it to the default branch, so a "
+        "pull request writes an entry only its own re-runs can ever restore while "
+        "competing for the 20 GiB budget:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
+    """A save placed where the restore sits stores an empty directory under the key.
+
+    Splitting a read-write `actions/cache` is exactly where this goes wrong: the
+    read-write form saves from a post-step at the END of the job, so moving to
+    restore/save without also moving the save below the step that fills the directory
+    poisons the key for every later job, which then hits it and finds nothing.
+    """
+    offenders = []
+    for path in WORKFLOWS:
+        for name, steps in _jobs(path):
+            saves = [
+                i for i, s in enumerate(steps)
+                if "actions/cache/save@" in str(s.get("uses", ""))
+            ]
+            for i in saves:
+                condition = " ".join(str(steps[i].get("if", "")).split())
+                if "outcome ==" not in condition and ".outputs." not in condition:
+                    offenders.append(
+                        f"{path.name}:{name}: {steps[i].get('name') or 'save'} is not "
+                        f"gated on the outcome of the step that produced its contents"
+                    )
+    assert not offenders, "\n  ".join(offenders)
