@@ -1112,7 +1112,14 @@ def _gguf_export_scaffold(
     monkeypatch.setattr(
         mutils,
         "_prepare_mlx_gguf_export_directory",
-        lambda path, model=None, replay_sanitizers=True: 0,
+        lambda path, model=None, replay_sanitizers=True, norm_offsets=None: 0,
+    )
+    # The MoE pass runs beside the one above on every export, and this scaffold's
+    # directory holds none of the shards it would read.
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_moe_gguf_export_directory",
+        lambda path, model=None, source_norm_offsets=None: 0,
     )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(
