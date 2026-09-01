@@ -722,7 +722,13 @@ _gather_qmm_guarded._unsloth_gather_qmm_guard = True
 def is_gather_qmm_nax_guard_applied() -> bool:
     """True for the guard anywhere in the chain, index-stop wrapper included."""
     current = mx.gather_qmm
-    while current is not None:
+    # Bounded: the real chain is the guard under at most one index-stop wrapper, but
+    # `getattr(..., None)` only terminates for an object that can be missing an
+    # attribute. A permissive stand-in for mx (the mlx test shim, a Mock) answers every
+    # attribute with a fresh object, so an unbounded walk never reaches None and spins.
+    for _ in range(16):
+        if current is None:
+            break
         if getattr(current, "_unsloth_gather_qmm_guard", False):
             return True
         current = getattr(current, "_unsloth_index_original", None)
