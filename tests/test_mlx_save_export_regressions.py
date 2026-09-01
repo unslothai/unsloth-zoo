@@ -1653,15 +1653,19 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
 
     calls = {}
 
-    def fake_prepare(path, model=None, replay_sanitizers=True, norm_offsets=None):
+    def fake_prepare(path, model=None, replay_sanitizers=True, norm_offsets=None,
+                     relaid_out=None):
         calls["path"] = Path(path)
         calls["model"] = model
         calls["replay_sanitizers"] = replay_sanitizers
+        calls["relaid_out"] = relaid_out
         return 0
 
-    def fake_moe_prepare(path, model=None, source_norm_offsets=None):
+    def fake_moe_prepare(path, model=None, source_norm_offsets=None,
+                         source_layouts=()):
         # Raising here, not above, is what makes this test reach the MoE pass.
         calls["moe_model"] = model
+        calls["source_layouts"] = source_layouts
         raise _StopAfterExportPrep
 
     monkeypatch.setattr(mutils, "_is_vlm_model", lambda _model: is_vlm)
@@ -1679,6 +1683,9 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
     assert calls["model"] is model
     assert calls["replay_sanitizers"] is is_vlm
     assert calls["moe_model"] is model
+    # The names the first pass re-laid-out reach the second, or it moves those axes
+    # a second time: an adjacent-axis move is its own inverse, so the replay accepts it.
+    assert calls["relaid_out"] is calls["source_layouts"]
 
 
 def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):

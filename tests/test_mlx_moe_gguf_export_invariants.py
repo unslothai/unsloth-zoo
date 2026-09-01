@@ -355,3 +355,54 @@ def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
 
     assert mutils._prepare_moe_gguf_export_directory(path, model=model) > 0
     assert sorted(_staged(path)) == sorted(model.checkpoint)
+
+
+def test_a_layout_the_vlm_pass_already_inverted_is_not_inverted_again(
+    tmp_path, monkeypatch
+):
+    """The two passes run back to back over one directory, so the second reads what the
+    first wrote. An adjacent-axis move is its own inverse, so a second inversion replays
+    to exactly what is on disk and the confirmation accepts it: the tensor would ship
+    transposed off the HF layout llama.cpp reads. `depthwise_conv1d.weight` is the shape
+    both passes claim (_vlm_gguf_tensor_candidates transposes (0, 2, 1); (2, 1) is in
+    _MOE_TENSOR_LAYOUTS)."""
+    import json
+
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    name = "vision_tower.depthwise_conv1d.weight"
+    hf = mx.reshape(mx.arange(2 * 3 * 4, dtype=mx.float32), (2, 3, 4))
+
+    class Model:
+        @staticmethod
+        def sanitize(weights):
+            return {n: (mx.moveaxis(t, 2, 1) if getattr(t, "ndim", 0) == 3 else t)
+                    for n, t in weights.items()}
+
+        def named_modules(self):
+            yield "", self
+
+    model = Model()
+    path = tmp_path / "merged"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"model_type": "fake_vlm"}))
+    mx.save_safetensors(str(path / "model-00001-of-00001.safetensors"),
+                        {name: Model.sanitize({name: hf})[name]},
+                        metadata={"format": "mlx"})
+    (path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {name: "model-00001-of-00001.safetensors"}}))
+    monkeypatch.setattr(mutils, "_build_mlx_vlm_sanitize_pipelines",
+                        lambda config, model=None: [[(Model, None)]])
+
+    norm_offsets = mutils._mlx_sanitizer_norm_offsets(model)
+    relaid_out = set()
+    assert mutils._prepare_mlx_gguf_export_directory(
+        path, model=model, replay_sanitizers=True, norm_offsets=norm_offsets,
+        relaid_out=relaid_out) == 1
+    assert relaid_out == {name}
+    assert mutils._prepare_moe_gguf_export_directory(
+        path, model=model, source_norm_offsets=norm_offsets,
+        source_layouts=relaid_out) == 0
+
+    assert mutils._mlx_arrays_match(_staged(path)[name], hf)

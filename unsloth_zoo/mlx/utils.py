@@ -14759,12 +14759,14 @@ def _sync_gguf_nextn_layer_config(config, model):
 
 
 def _prepare_mlx_gguf_export_directory(
-    path, model=None, replay_sanitizers=True, norm_offsets=_UNMEASURED
+    path, model=None, replay_sanitizers=True, norm_offsets=_UNMEASURED,
+    relaid_out=None,
 ):
     """Restore HF tensor names, layouts and norm convention in the export dir.
 
     ``replay_sanitizers`` gates the VLM-only name/layout inversion; the norm correction
-    always runs. ``norm_offsets`` is one source measurement shared by every pass."""
+    always runs. ``norm_offsets`` is one source measurement shared by every pass, and
+    ``relaid_out`` collects the names whose axes this pass moved, for the same reason."""
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -14812,6 +14814,14 @@ def _prepare_mlx_gguf_export_directory(
                 raise RuntimeError(
                     f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
+            # A moved axis shows in the shape. The MoE pass reads this directory after
+            # it, and an adjacent-axis move is its own inverse, so replaying the
+            # sanitizer over a second inversion hands back what is on disk and the
+            # confirmation accepts it: the tensor would ship transposed off HF layout.
+            if relaid_out is not None and getattr(
+                tensor, "shape", None
+            ) != getattr(original_tensor, "shape", None):
+                relaid_out.add(new_name)
             updated[new_name] = tensor
             name_map[name] = new_name
             file_rewritten += int(changed)
@@ -16160,7 +16170,8 @@ def _mlx_staged_tensor_stubs(files):
     return staged
 
 
-def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
+def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None,
+                               source_layouts=()):
     staged = _mlx_staged_tensor_stubs(files)
     stacked = _mlx_stacked_expert_tensor_names(model, staged)
     # A block relocation shows as ordinary renames on its router and shared experts.
@@ -16209,6 +16220,9 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
         for name, constant in offsets.items()
         if name not in (source_norm_offsets or {})
     }
+    # Nor move an axis the pass before this one already moved back.
+    layouts = {name: layout for name, layout in layouts.items()
+               if name not in (source_layouts or ())}
     # Never take away a name the converter already reads.
     plan = {name: names for name, names in plan.items()
             if not _kept_for_the_gguf_converter(name)}
@@ -16218,7 +16232,7 @@ def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None):
 
 
 def _prepare_moe_gguf_export_directory(
-    path, model=None, source_norm_offsets=_UNMEASURED
+    path, model=None, source_norm_offsets=_UNMEASURED, source_layouts=()
 ):
     """Restore the MoE tensor names and values llama.cpp converters read."""
     path = Path(path)
@@ -16227,7 +16241,7 @@ def _prepare_moe_gguf_export_directory(
     if source_norm_offsets is _UNMEASURED:
         source_norm_offsets = _mlx_sanitizer_norm_offsets(model)
     plan, offsets, layouts, merges = _plan_mlx_moe_gguf_rewrite(
-        model, files, source_norm_offsets
+        model, files, source_norm_offsets, source_layouts
     )
     if not plan and not merges and not offsets and not layouts:
         return 0
@@ -17130,13 +17144,15 @@ def save_pretrained_gguf(
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
         # Measured once so both passes subtract against the same answer.
         norm_offsets = _mlx_sanitizer_norm_offsets(model)
+        relaid_out = set()
         rewritten = _prepare_mlx_gguf_export_directory(
             tmp_path, model=model, replay_sanitizers=is_vlm_model,
-            norm_offsets=norm_offsets,
+            norm_offsets=norm_offsets, relaid_out=relaid_out,
         )
         # Must run after the norm pass, whose offsets are keyed by the saved names.
         rewritten += _prepare_moe_gguf_export_directory(
             tmp_path, model=model, source_norm_offsets=norm_offsets,
+            source_layouts=relaid_out,
         )
         if rewritten:
             print(
