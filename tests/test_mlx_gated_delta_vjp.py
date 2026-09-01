@@ -33,9 +33,17 @@ import types
 
 import pytest
 
-_HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None
+from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
+
+# `find_spec("mlx")` alone answers "can mlx be imported", which is NOT the same
+# question once any sibling module has installed the torch shim: that registers
+# `mlx` in sys.modules and a finder in sys.meta_path, so the spec exists and this
+# file concludes it is on real MLX. It then runs the `requires_real_mlx` tests
+# against a shim where `mx.argpartition` is a `_Noop`. Whether that happens comes
+# down to collection order, which is why it surfaced only when a new sibling
+# sorting before this one began installing the shim at import.
+_HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
-    from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
 
 import mlx.core as mx  # noqa: E402  (real, or the torch shim on CI)
@@ -738,9 +746,35 @@ def test_disabling_a_fusion_targets_only_fused_modules(disable, flag, extra):
     assert disable(_FakeModel(fused, plain)) == []
 
 
+def _has_glm5_next() -> bool:
+    """Whether mlx_vlm ships glm5_next, without letting the question raise.
+
+    find_spec on a SUBMODULE imports its parent package first, so it raises rather
+    than returning None when mlx_vlm is missing -- and raises whatever the parent
+    raises when it is present but unimportable (a torch/mlx-vlm version skew does
+    exactly that). Either way the exception escapes at MODULE level, so the whole
+    file fails to collect on a real-MLX machine that simply has no mlx-vlm. Only
+    the shim's catch-all finder hid this: it answers for any name.
+    """
+    try:
+        return importlib.util.find_spec("mlx_vlm.models.glm5_next") is not None
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("raised", [ModuleNotFoundError("no mlx_vlm"), ImportError("skew")])
+def test_the_glm5_next_probe_answers_instead_of_raising(monkeypatch, raised):
+    """Non-vacuity for the try/except above: both shapes reach this file at MODULE
+    level, where an exception is a collection error for every test in it."""
+    def _raise(name):
+        raise raised
+
+    monkeypatch.setattr(importlib.util, "find_spec", _raise)
+    assert _has_glm5_next() is False
+
+
 @pytest.mark.skipif(
-    importlib.util.find_spec("mlx_vlm.models.glm5_next") is None
-    or not _HAS_REAL_MLX,
+    not _has_glm5_next() or not _HAS_REAL_MLX,
     reason="needs mlx-vlm with glm5_next on real MLX",
 )
 def test_unfused_projection_matches_the_fused_one():
