@@ -47,6 +47,7 @@ from pathlib import Path
 import random
 import socket
 import time
+import unicodedata
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -592,6 +593,10 @@ from .utils import (
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
+    acquire_mlx_training_patches,
+    pause_mlx_training_patches,
+    release_mlx_training_patches,
+    resume_mlx_training_patches,
     restore_mlx_norm_output_cast_state,
     set_mlx_norm_output_cast_to_input_dtype,
     snapshot_mlx_norm_output_cast_state,
@@ -612,12 +617,14 @@ from .preference import (
     make_dpo_loss_fn,
     make_orpo_loss_fn,
     make_preference_eval_fn,
+    resolve_preference_length_policy,
 )
 from .compile import (
     build_compile_policy,
     explain_compile_support,
     get_compile_qualification,
     model_has_gated_delta_layers,
+    model_has_qwen35_attention_layers,
     normalize_mlx_patch_mode,
     resolve_training_compile,
     trace_compile_application,
@@ -938,8 +945,29 @@ def _build_generation_defaults(args):
         ) from error
 
 
+def _escape_terminal_controls(text):
+    """Show control characters instead of executing them.
+
+    Dataset prompts and model completions are untrusted: str.split() leaves
+    ESC/BEL intact. Escaping all of Cc/Cf also covers U+200D joiners and the
+    Unicode tag block, while leaving CJK and backslashes alone.
+    """
+    return "".join(
+        (
+            character
+            if unicodedata.category(character) not in ("Cc", "Cf")
+            else (
+                f"\\x{ord(character):02x}"
+                if ord(character) <= 0xFF
+                else f"\\u{ord(character):04x}"
+            )
+        )
+        for character in str(text)
+    )
+
+
 def _one_line(text, width):
-    flat = " ".join(str(text).split())
+    flat = _escape_terminal_controls(" ".join(str(text).split()))
     return flat if len(flat) <= width else flat[: width - 1] + "\u2026"
 
 
@@ -1303,6 +1331,10 @@ class MLXTrainingConfig:
             "disable_dropout",
             "reference_free",
             "label_smoothing",
+            "max_length",
+            "max_prompt_length",
+            "max_completion_length",
+            "truncation_mode",
             "generate_during_eval",
             "num_generation_prompts",
             "generation_max_tokens",
@@ -1318,6 +1350,9 @@ class MLXTrainingConfig:
         self._unsloth_mlx_warmup_steps_explicit = (
             "warmup_steps" in provided and not copied_default_warmup_with_ratio
         )
+        # max_length defaults to TRL's 1024, below the usual max_seq_length, so a
+        # run predating these fields silently narrows. Record the caller's intent.
+        self._unsloth_mlx_max_length_explicit = "max_length" in provided
         if self.compile_max_variants is not None:
             resolve_compile_max_variants(self.compile_max_variants)
 
@@ -1362,10 +1397,21 @@ class MLXTrainingConfig:
 
 @dataclass(init=False)
 class MLXORPOConfig(MLXTrainingConfig):
-    """Configuration owned by MLXORPOTrainer."""
+    """Configuration owned by MLXORPOTrainer.
+
+    max_completion_length only applies to encoder-decoder models, so it is inert
+    here. A branch whose capped prompt plus the longer answer still overruns
+    max_length has its answer sliced to max_length minus max_prompt_length
+    instead, which trims the answer's tail when max_prompt_length stands above
+    max_length.
+    """
 
     beta: float = field(default=0.1, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
     # Batched decoding is not batch-invariant, so a prompt can decode
     # differently depending on what shares its batch.
     generate_during_eval: bool = field(default=False, kw_only=True)
@@ -1382,6 +1428,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
     # As MLXORPOConfig; a referenced run also samples the frozen base policy.
     generate_during_eval: bool = field(default=False, kw_only=True)
     num_generation_prompts: int = field(default=8, kw_only=True)
@@ -1942,6 +1992,22 @@ class MLXTrainer:
 
     config_class = MLXTrainingConfig
     preference_kind = None
+
+
+    def _preference_length_policy(self, args):
+        """Resolve the objective's length policy once per run.
+
+        Training and evaluation have to score the same token spans, so both
+        plans take this one immutable policy rather than resolving their own;
+        resolving twice would also repeat its narrowed-budget warnings.
+        """
+        policy = getattr(self, "_resolved_preference_length_policy", None)
+        if policy is None:
+            policy = resolve_preference_length_policy(
+                self.preference_kind, args, max_seq_length=args.max_seq_length,
+            )
+            self._resolved_preference_length_policy = policy
+        return policy
 
     def __init__(
         self,
@@ -4520,6 +4586,9 @@ class MLXTrainer:
         _prev_norm_output_cast_state = snapshot_mlx_norm_output_cast_state(
             iter_mlx_norm_output_cast_classes(model)
         )
+        _training_patches_held = False
+        _unfused_projection_modules = []
+        _unfused_mrope_modules = []
         # Save Qwen3-VL vision-block flag so finally restores it (not just False).
         _prev_qwen3_vision_cast = True
         try:
@@ -4803,27 +4872,33 @@ class MLXTrainer:
                 apply_gradient_checkpointing(model)
                 _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
 
-            # Qwen3.5-specific fixes
+            # Keeps routers, gather-sort and sparse block selection differentiable,
+            # and marks the process as inside a training run.
+            acquire_mlx_training_patches()
+            _training_patches_held = True
+            # Routed by module tree, not model_type: qwen4_exp reuses the Qwen3.5
+            # classes under its own name.
             config = getattr(model, "_config", {})
             model_type = config.get("model_type", "") if isinstance(config, dict) else ""
-            gated_delta_patched = False
-            if "qwen3_5" in model_type:
+            if model_has_gated_delta_layers(model):
+                from unsloth_zoo.gated_delta_vjp import (
+                    patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared)
+                # mlx-vlm's copies first, or patch_gated_delta's sweep warns about them.
+                patch_gated_delta_vlm()
+                patch_gated_delta_vlm_shared()
+                patch_gated_delta()
+            if model_has_qwen35_attention_layers(model):
                 from .loader import _fix_qwen35_attention_cache, _disable_fused_mrope
                 _fix_qwen35_attention_cache(model)
-                _disable_fused_mrope(model)
-                from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm
-                patch_gated_delta()
-                patch_gated_delta_vlm()
-                gated_delta_patched = True
-            # Structural check: qwen3_next / kimi_linear also need the VJP.
-            if not gated_delta_patched and model_has_gated_delta_layers(model):
-                from unsloth_zoo.gated_delta_vjp import patch_gated_delta
-                patch_gated_delta()
+                _unfused_mrope_modules = _disable_fused_mrope(model)
+            # Full fine-tuning updates projections a fusion cached once.
+            from .loader import _disable_fused_input_projections
+            _unfused_projection_modules = _disable_fused_input_projections(model)
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
                 from .loader import _disable_fused_mrope
-                _disable_fused_mrope(model)
+                _unfused_mrope_modules += _disable_fused_mrope(model)
 
             # Register W&B/TensorBoard reporters after arg auto-tuning so the
             # W&B config snapshot reflects the settings actually used (e.g. VLM
@@ -4872,6 +4947,23 @@ class MLXTrainer:
                 restore_mlx_norm_output_cast_state(_prev_norm_output_cast_state)
             except Exception:
                 pass
+            # Each guarded like its neighbours above: a failure restoring an
+            # optional fast path must not replace the exception that ended the run.
+            try:
+                if _training_patches_held:
+                    release_mlx_training_patches()
+            except Exception:
+                pass
+            for _module in _unfused_projection_modules:
+                try:
+                    _module.fuse_in = True
+                except Exception:
+                    pass
+            for _module in _unfused_mrope_modules:
+                try:
+                    _module.fused_apply = True
+                except Exception:
+                    pass
             # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
@@ -5870,10 +5962,29 @@ class MLXTrainer:
                 _generation_budget[split_name] = [
                     0, int(args.num_generation_prompts),
                 ]
+            # The plan builder iterates to exhaustion, so hold the split to the
+            # length it declares: a longer one scores unvalidated rows, an
+            # endless one hangs.
+            try:
+                expected = len(split)
+            except (TypeError, AttributeError):
+                expected = None
+            seen = 0
             for raw in split:
+                if expected is not None and seen >= expected:
+                    raise ValueError(
+                        "Unsloth MLX preference: the eval dataset yielded more "
+                        f"rows than the {expected} it declares."
+                    )
+                seen += 1
                 yield (
                     self.formatting_func(raw)
                     if self.formatting_func is not None else raw
+                )
+            if expected is not None and seen != expected:
+                raise ValueError(
+                    f"Unsloth MLX preference: the eval dataset yielded {seen} "
+                    f"rows but declares {expected}."
                 )
 
         def _capture_generation_prompt(split_name, prompt_text):
@@ -5890,11 +6001,17 @@ class MLXTrainer:
             if budget is None or budget[0] >= budget[1]:
                 return
             budget[0] += 1
-            _generation_source.append((split_name,) + encode_generation_prompt_text(
-                self.tokenizer, prompt_text,
-                max_seq_length=args.max_seq_length,
-                max_new_tokens=args.generation_max_tokens,
-            ))
+            try:
+                encoded = encode_generation_prompt_text(
+                    self.tokenizer, prompt_text,
+                    max_seq_length=args.max_seq_length,
+                    max_new_tokens=args.generation_max_tokens,
+                )
+            except ValueError:
+                # An empty recovery still trains, so free the slot, do not fail.
+                budget[0] -= 1
+                return
+            _generation_source.append((split_name,) + encoded)
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
@@ -5928,7 +6045,7 @@ class MLXTrainer:
                             _format_preference_split(_split_name, eval_dataset),
                             self.tokenizer,
                             batch_size=eval_batch_size,
-                            max_seq_length=args.max_seq_length,
+                            length_policy=self._preference_length_policy(args),
                             num_epochs=1,
                             grad_accum=1,
                             preserve_dataset_order=True,
@@ -6387,9 +6504,44 @@ class MLXTrainer:
 
                 defaults = self._generation_defaults
                 started = time.perf_counter()
-                policy = generate_batch(
-                    model, self.tokenizer, requests, defaults=defaults,
-                )
+                def _decode(label):
+                    """Decode on every rank, or on none of them.
+
+                    A rank that unwinds never reaches the
+                    _distributed_should_stop() collective below and strands its
+                    peers, so join a consensus first and skip together.
+                    """
+                    result = None
+                    local_error = None
+                    try:
+                        result = generate_batch(
+                            model, self.tokenizer, requests, defaults=defaults,
+                        )
+                    except BaseException as error:
+                        local_error = error
+                    failed_any = self._distributed_any_flag(local_error is not None)
+                    if local_error is not None and not isinstance(
+                        local_error, Exception
+                    ):
+                        # Captured only to join the consensus.
+                        raise local_error
+                    if failed_any:
+                        detail = (
+                            f"{local_error}" if local_error is not None
+                            else "a peer rank failed"
+                        )
+                        _main_print(
+                            f"  Gen   {label} generation failed ({detail}); "
+                            "skipping samples for this evaluation."
+                        )
+                        return None
+                    return result
+
+                policy = _decode("policy")
+                if policy is None:
+                    self.last_generation_samples = []
+                    return
+
                 reference = None
                 modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
                 if modules and not self._distributed_should_stop():
@@ -6397,12 +6549,15 @@ class MLXTrainer:
                     try:
                         for module in modules:
                             module.scale = 0.0
-                        reference = generate_batch(
-                            model, self.tokenizer, requests, defaults=defaults,
-                        )
+                        reference = _decode("reference")
                     finally:
                         for module, scale in zip(modules, scales):
                             module.scale = scale
+                    if reference is None:
+                        # The policy half alone is indistinguishable from what an
+                        # unreferenced objective publishes, hiding the failure.
+                        self.last_generation_samples = []
+                        return
             elapsed = time.perf_counter() - started
 
             samples = [
@@ -6423,7 +6578,12 @@ class MLXTrainer:
                 f"{sampled} tokens | {elapsed:.1f}s"
             )
             for index, sample in enumerate(samples):
-                tag = "" if sample["split"] is None else f" [{sample['split']}]"
+                # A caller-supplied dict key, no more trusted than the prompt.
+                tag = (
+                    ""
+                    if sample["split"] is None
+                    else f" [{_one_line(sample['split'], 32)}]"
+                )
                 _main_print(f"    {index + 1}{tag} {_one_line(sample['prompt'], 96)}")
                 _main_print(f"        policy    {_one_line(sample['policy'], 96)}")
                 if sample["reference"] is not None:
@@ -6446,12 +6606,14 @@ class MLXTrainer:
             if _pf is not None:
                 _pf.quiesce()
             _metrics_before_eval = self._last_eval_metrics
+            _paused_window = pause_mlx_training_patches()
             try:
                 val_loss, ppl = self._evaluate(
                     current_eval_batches, preference_eval_fn or loss_fn,
                     is_vlm=is_vlm,
                 )
             finally:
+                resume_mlx_training_patches(_paused_window)
                 if _pf is not None:
                     _pf.resume()
             model.train()
@@ -7788,6 +7950,15 @@ class MLXTrainer:
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
             _sampling_eval = bool(getattr(args, "generate_during_eval", False))
+            # Match the loop's trigger: eval_steps > 0 under eval_strategy "no"
+            # evaluates never, and "epoch" is a cadence without eval_steps.
+            _eval_cadence = (
+                (
+                    _resolve_interval_steps(args.eval_steps, 1) > 0
+                    and self._static_eval_cadence_enabled()
+                )
+                or self._epoch_cadence_enabled("eval_strategy")
+            )
             if self.eval_dataset is None and (
                 args.load_best_model_at_end or args.early_stopping_patience > 0
             ):
@@ -7852,12 +8023,29 @@ class MLXTrainer:
                         "at least 1."
                     )
                 self._generation_defaults = _build_generation_defaults(args)
-                if _resolve_interval_steps(args.eval_steps, 1) <= 0:
+                if not _eval_cadence:
                     print(
                         "Unsloth: generate_during_eval is on but no evaluation "
                         "cadence is set; sampling runs only when a callback "
                         "requests an evaluation."
                     )
+            # Without a cadence _best_step stays None and the restore is
+            # silently skipped. A callback may own the cadence, so only notice.
+            if (
+                self.eval_dataset is not None
+                and not _eval_cadence
+                and (
+                    args.load_best_model_at_end
+                    or args.early_stopping_patience > 0
+                )
+            ):
+                print(
+                    "Unsloth: load_best_model_at_end/early_stopping_patience "
+                    "need evaluations to select between, but no evaluation "
+                    "cadence is set. Set eval_steps > 0 or "
+                    "eval_strategy='epoch', or have a callback request "
+                    "evaluations; otherwise no best model is tracked."
+                )
             if (
                 self._batches is not None
                 or getattr(self, "_eval_batches_labeled", None) is not None
@@ -7907,7 +8095,7 @@ class MLXTrainer:
                 train_dataset,
                 self.tokenizer,
                 batch_size=args.per_device_train_batch_size,
-                max_seq_length=args.max_seq_length,
+                length_policy=self._preference_length_policy(args),
                 num_batches=total_batches_needed,
                 num_epochs=preference_epochs,
                 grad_accum=args.gradient_accumulation_steps,

@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
 
@@ -214,7 +214,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
 
@@ -305,6 +305,12 @@ jobs:
         # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
         # so this job exercises the regressed regime on every pull request.
         #
+        # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
+        # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
+        # at step 0. No job here has an AMD runner, so it stubs device_count to 0 and
+        # runs the dtype decision alone on CPU; left to --collect-only it would prove
+        # only that it imports, which is the failure this comment already lists twice.
+        #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
         # y` binds to whatever `tests` package is importable; unsloth's CI runs
@@ -325,6 +331,7 @@ jobs:
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
             tests/test_mlx_trainer_internals.py \
+            tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -348,12 +355,29 @@ jobs:
             tests/test_disabled_hook_graph_break.py \
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
+            tests/test_hip_bf16_offload_dtype.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
         # Run in a fresh process so its module-scoped MLX simulation does not
         # inherit module state from another MLX test file.
         run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+
+      - name: pytest MLX GGUF export gates (HARD GATE)
+        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
+        # sys.modules["mlx.core"] process-wide, so a file collected after another
+        # inherits its shim.
+        #
+        # These are here because they were in NO job, which is the failure the
+        # comment above already lists four times. The MoE name-restoration work
+        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
+        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
+        # that pull request stayed green, because `pytest tests/ --collect-only`
+        # proves only that a file imports.
+        run: |
+          python -m pytest tests/test_mlx_save_export_regressions.py -v
+          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
@@ -387,7 +411,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
 
@@ -585,7 +609,7 @@ jobs:
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
         with:
           egress-policy: audit
 

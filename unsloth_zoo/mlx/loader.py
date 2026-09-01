@@ -178,13 +178,15 @@ def _keep_norm_parameters_float32(model) -> None:
     if not needs_cast:
         return
 
-    model.update(tree_map_with_path(
+    casted = tree_map_with_path(
         lambda k, v: v.astype(mx.float32)
         if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
         parameters,
-    ))
-    mx.eval(model.parameters())
+    )
+    model.update(casted)
+    # Evaluating the whole tree would page every weight into one command buffer.
+    mx.eval([v for k, v in tree_flatten(casted) if is_mlx_norm_parameter_path(k)])
 
 
 def _seed_mlx_random_state(random_state):
@@ -2562,19 +2564,38 @@ _VLM_MODEL_FIXUPS = (
 
 
 def _disable_fused_mrope(model):
-    """Flip fused_apply off so MRoPE training uses the differentiable
-    cos/sin fallback; the fused Metal kernel has no VJP."""
-    count = 0
+    """The fused MRoPE Metal kernel has no VJP; training needs the cos/sin fallback."""
+    changed = []
     try:
         modules = model.modules()
     except Exception:
-        return
+        return changed
     for module in modules:
         if getattr(module, "fused_apply", False):
             module.fused_apply = False
-            count += 1
-    if count:
-        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {len(changed)} modules for training (no VJP).")
+    return changed
+
+
+def _disable_fused_input_projections(model):
+    """GLM-5.x linear attention concatenates the raw `.weight` of its six input
+    projections once and caches it: a LoRA wrapper has no `.weight` to read, and a
+    full fine-tune would keep the pre-training copy."""
+    changed = []
+    try:
+        modules = model.modules()
+    except Exception:
+        return changed
+    for module in modules:
+        if getattr(module, "fuse_in", False) and hasattr(module, "_fused_ready"):
+            module.fuse_in = False
+            module._fused_ready = False
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused input projections on {len(changed)} modules.")
+    return changed
 
 
 def _safe_getsource(obj) -> str:
@@ -2610,6 +2631,11 @@ def _get_mlx_lm_model_class(model_type: str):
 
 _VLM_TEXT_PATH_MODEL_TYPES = frozenset({
     "muse_glimmer",
+    # Hybrid linear-attention decoders mlx_lm has no class for. Both reproduce a
+    # fresh model bitwise across a width or batch change, so the position tensor
+    # qwen4_exp caches between calls never leaks into the next text batch.
+    "qwen4_exp",
+    "glm5_next",
 })
 
 
@@ -6946,6 +6972,9 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
+        from .utils import apply_gather_qmm_nax_guard
+        apply_gather_qmm_nax_guard()
+
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
         q_bits = kwargs.pop("q_bits", None)
@@ -8222,6 +8251,8 @@ class FastMLXModel:
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
+        # Adapters are invisible to a cached weight fusion.
+        _disable_fused_input_projections(model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):

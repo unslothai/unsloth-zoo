@@ -85,6 +85,9 @@ OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 # device capability
 major = None
 minor = None
+# Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
+# `fuse_lm_head` then read this global and raised NameError.
+OLD_CUDA_ARCH_VERSION = False
 if DEVICE_TYPE == "cuda":
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()

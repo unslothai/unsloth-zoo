@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.8.16"
+__version__ = "2026.8.17"
 
 import os
 import platform
@@ -178,6 +178,13 @@ else:
     # The HF cache redirect above still runs, so the child shares the parent's cache.
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
+    if _SKIP_GPU_INIT:
+        # `compiler.py` does `from . import DEVICE_TYPE` at module scope, so the
+        # constants must still exist when the init that sets them is skipped.
+        DEVICE_TYPE = "cpu"
+        DEVICE_TYPE_TORCH = "cpu"
+        DEVICE_COUNT = 0
+        ALLOW_PREQUANTIZED_MODELS = False
 
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
 # download child), so they resolve to a loud no-op instead of a hard ImportError. On a

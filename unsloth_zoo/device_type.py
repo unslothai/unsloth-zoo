@@ -347,10 +347,30 @@ def get_amd_flash_attn_func():
     return None
 
 
+def _cpu_fallback():
+    """The device name for a host with no accelerator, or None.
+
+    `UNSLOTH_ALLOW_CPU=1` answers "cuda" so callers keep their CUDA branches against a
+    CPU torch. `UNSLOTH_ZOO_DISABLE_GPU_INIT=1` answers "cpu" to match `__init__.py`.
+    """
+    if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
+        return "cuda"
+    if os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1":
+        return "cpu"
+    return None
+
+
+_GPU_INIT_SKIPPED = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
+
+
 @functools.cache
 def get_device_type():
     if _IS_MLX:
         return "mlx"
+    if _GPU_INIT_SKIPPED:
+        # BEFORE the hardware probes: `__init__.py` publishes "cpu" unconditionally, so
+        # checking only in the no-accelerator fallback left a CUDA host with both.
+        return "cpu"
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if is_hip():
             return "hip"
@@ -359,10 +379,10 @@ def get_device_type():
         return "xpu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
-            # Test-only CPU fallback. The env var is read exactly once per
-            # process because get_device_type is @functools.cache'd.
-            if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
-                return "cuda"
+            # Test-only CPU fallback; get_device_type is @functools.cache'd.
+            fallback = _cpu_fallback()
+            if fallback is not None:
+                return fallback
             amd_hint = _amd_installation_hint()
             if amd_hint is not None:
                 raise NotImplementedError(amd_hint)
@@ -374,8 +394,9 @@ def get_device_type():
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
-    if os.environ.get("UNSLOTH_ALLOW_CPU", "0") == "1":
-        return "cuda"
+    fallback = _cpu_fallback()
+    if fallback is not None:
+        return fallback
     amd_hint = _amd_installation_hint()
     if amd_hint is not None:
         raise NotImplementedError(amd_hint)
@@ -389,6 +410,9 @@ elif DEVICE_TYPE_TORCH == "mlx": DEVICE_TYPE_TORCH = "mps"
 
 @functools.cache
 def get_device_count():
+    if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+        # The getter too, not only the constant below: they were handed 1 and 0.
+        return 0
     if DEVICE_TYPE in ("cuda", "hip"):
         return torch.cuda.device_count()
     elif DEVICE_TYPE == "xpu":
@@ -402,6 +426,9 @@ DEVICE_COUNT : int = get_device_count()
 # Check blocksize for 4bit -> 64 for CUDA, 128 for AMD
 # If AMD, we cannot load pre-quantized models for now :(
 ALLOW_PREQUANTIZED_MODELS : bool = True
+if _GPU_INIT_SKIPPED and DEVICE_TYPE == "cpu":
+    # As with DEVICE_COUNT: the two import paths must not disagree.
+    ALLOW_PREQUANTIZED_MODELS = False
 # HSA_STATUS_ERROR_EXCEPTION checks - sometimes AMD fails for BnB
 ALLOW_BITSANDBYTES : bool = True
 if DEVICE_TYPE == "hip":

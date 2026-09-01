@@ -18,15 +18,24 @@ import pytest
 
 try:
     import mlx.core as mx
-    _MLX = True
-    _METAL = mx.metal.is_available()
+    from mlx_simulation import mlx_is_simulated
+
+    # Not `True` on a successful import: another test module installs the
+    # MLX-on-torch shim into sys.modules while being IMPORTED, and collection
+    # imports every module, so `import mlx` here lands on that shim whenever
+    # collection reaches the other file first. These tests need real mlx --
+    # nn.RMSNorm, Module.train/_set_training_mode, a rewindable RNG key -- none
+    # of which the shim implements, so gating on the import alone made the file
+    # pass or fail on collection order (stable serially, not under xdist).
+    _MLX = not mlx_is_simulated()
+    _METAL = _MLX and mx.metal.is_available()
 except Exception:
     _MLX = _METAL = False
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 # Identification, scale resolution and cleanup are pure logic over a synthetic
-# tree: real mlx, no Metal, no downloads, so they gate the Linux job too.
-mlx_only = pytest.mark.skipif(not _MLX, reason="requires the mlx runtime")
+# tree: real mlx, no Metal, no downloads, so they gate any host with mlx installed.
+mlx_only = pytest.mark.skipif(not _MLX, reason="requires the real mlx runtime")
 
 # mlx 0.32 made mx.random.state a sentinel refusing item assignment, so tests
 # rewind through the same reseed pair the production code uses.

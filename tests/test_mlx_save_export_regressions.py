@@ -1653,10 +1653,19 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
 
     calls = {}
 
-    def fake_prepare(path, model=None, replay_sanitizers=True):
+    def fake_prepare(path, model=None, replay_sanitizers=True, norm_offsets=None,
+                     relaid_out=None):
         calls["path"] = Path(path)
         calls["model"] = model
         calls["replay_sanitizers"] = replay_sanitizers
+        calls["relaid_out"] = relaid_out
+        return 0
+
+    def fake_moe_prepare(path, model=None, source_norm_offsets=None,
+                         source_layouts=()):
+        # Raising here, not above, is what makes this test reach the MoE pass.
+        calls["moe_model"] = model
+        calls["source_layouts"] = source_layouts
         raise _StopAfterExportPrep
 
     monkeypatch.setattr(mutils, "_is_vlm_model", lambda _model: is_vlm)
@@ -1664,6 +1673,8 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
         mutils, "save_merged_model", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(mutils, "_prepare_mlx_gguf_export_directory", fake_prepare)
+    monkeypatch.setattr(
+        mutils, "_prepare_moe_gguf_export_directory", fake_moe_prepare)
 
     model = object()
     with pytest.raises(_StopAfterExportPrep):
@@ -1671,6 +1682,10 @@ def test_gguf_save_prepares_the_export_directory_for_every_model(
 
     assert calls["model"] is model
     assert calls["replay_sanitizers"] is is_vlm
+    assert calls["moe_model"] is model
+    # The names the first pass re-laid-out reach the second, or it moves those axes
+    # a second time: an adjacent-axis move is its own inverse, so the replay accepts it.
+    assert calls["relaid_out"] is calls["source_layouts"]
 
 
 def test_vlm_rewrite_handles_same_name_layout_transforms(monkeypatch):
@@ -3513,3 +3528,714 @@ def test_trusted_dir_matches_every_llama_cpp_default_dir_spelling(monkeypatch, t
             folder = value  # exactly what LLAMA_CPP_DEFAULT_DIR would hold
         assert _trusted(monkeypatch, folder, home, env_value=value) is True, \
             f"UNSLOTH_LLAMA_CPP_PATH={value!r} should stay trusted"
+
+def _make_moe_model(container="switch_mlp", group="experts", leaf_alias=None,
+                    wrap_in_lora=False, reverse_experts=False, stacks=True,
+                    with_bias=False, rename_leaves=None, hf_parent="mlp",
+                    num_experts=3, num_layers=2, alters_a_sibling_once_split=False):
+    """A tiny model whose sanitize stacks per-expert tensors, as mlx-lm's do."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    leaf_alias = leaf_alias or {}
+    leaves = ("gate_proj", "up_proj", "down_proj")
+    params = ("weight", "bias") if with_bias else ("weight",)
+
+    def marked(marker, *shape):
+        size = num_experts
+        for dim in shape:
+            size *= dim
+        return marker + mx.reshape(
+            mx.arange(size, dtype=mx.float32), (num_experts, *shape)
+        )
+
+    class SwitchLinear:
+        def __init__(self, marker):
+            self.weight = marked(marker, 4, 2)
+            if with_bias:
+                self.bias = marked(marker, 4)
+
+        @property
+        def num_experts(self):
+            return self.weight.shape[0]
+
+    class LoraWrapper:
+        def __init__(self, linear):
+            self.linear = linear
+
+    class Model:
+        def __init__(self):
+            self.switch_modules = {}
+            self.expected = {}
+            for layer in range(num_layers):
+                for offset, leaf in enumerate(leaves):
+                    path = f"model.layers.{layer}.mlp.{container}.{leaf}"
+                    module = SwitchLinear(10 * layer + offset)
+                    self.switch_modules[path] = module
+                    for param in params:
+                        self.expected[f"{path}.{param}"] = getattr(module, param)
+            if alters_a_sibling_once_split:
+                for layer in range(num_layers):
+                    self.expected[f"model.layers.{layer}.mlp.sibling.weight"] = (
+                        mx.arange(4, dtype=mx.float32) + layer
+                    )
+
+        def named_modules(self):
+            yield "", self
+            for path, module in self.switch_modules.items():
+                if wrap_in_lora:
+                    yield path, LoraWrapper(module)
+                    yield f"{path}.linear", module
+                else:
+                    yield path, module
+
+        def sanitize(self, weights):
+            if not stacks:
+                return weights
+            split = False
+            for legacy, canonical in (rename_leaves or {}).items():
+                for old in [n for n in weights if f".{legacy}." in n]:
+                    new = old.replace(f".{legacy}.", f".{canonical}.")
+                    weights[new] = weights.pop(old)
+            for layer in range(num_layers):
+                prefix = f"model.layers.{layer}.mlp"
+                source_prefix = f"model.layers.{layer}.{hf_parent}"
+                for leaf in leaves:
+                    source = leaf_alias.get(leaf, leaf)
+                    for param in params:
+                        keys = [
+                            f"{source_prefix}.{group}.{expert}.{source}.{param}"
+                            for expert in range(num_experts)
+                        ]
+                        if not all(key in weights for key in keys):
+                            continue
+                        joined = [weights.pop(key) for key in keys]
+                        if reverse_experts:
+                            joined.reverse()
+                        weights[f"{prefix}.{container}.{leaf}.{param}"] = mx.stack(
+                            joined
+                        )
+                        split = True
+            if alters_a_sibling_once_split and split:
+                for layer in range(num_layers):
+                    sibling = f"model.layers.{layer}.mlp.sibling.weight"
+                    if sibling in weights:
+                        weights[sibling] = weights[sibling] * 2.0
+            return weights
+
+    return Model()
+
+
+def _stage_moe_directory(tmp_path, model, shards=1):
+    import unsloth_zoo.mlx.utils as mutils
+
+    path = tmp_path / "merged"
+    path.mkdir(exist_ok=True, parents=True)
+    names = sorted(model.expected)
+    weight_map = {}
+    for shard in range(shards):
+        part = {
+            name: model.expected[name]
+            for index, name in enumerate(names)
+            if index % shards == shard
+        }
+        file = f"model-{shard + 1:05d}-of-{shards:05d}.safetensors"
+        mutils.mx.save_safetensors(str(path / file), part, metadata={"format": "mlx"})
+        weight_map.update({name: file for name in part})
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    return path
+
+
+def _staged_shards(path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    return {f.name: mutils.mx.load(str(f)) for f in sorted(path.glob("*.safetensors"))}
+
+
+def _staged_tensors(path):
+    return {n: t for shard in _staged_shards(path).values() for n, t in shard.items()}
+
+
+def test_moe_gguf_export_splits_stacked_experts_into_hf_tensors(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_moe_model()
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+
+    tensors = _staged_tensors(path)
+    assert not any(".switch_mlp." in name for name in tensors)
+    for stacked_name, stacked in model.expected.items():
+        prefix, leaf = stacked_name.split(".switch_mlp.")
+        leaf = leaf.removesuffix(".weight")
+        for expert in range(stacked.shape[0]):
+            assert mutils._mlx_arrays_match(
+                tensors[f"{prefix}.experts.{expert}.{leaf}.weight"], stacked[expert]
+            )
+
+    index = json.loads((path / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(tensors)
+
+
+def _make_quirky_moe_model(quirk=None, leaves=("mlp.switch_mlp.gate_proj",),
+                           extra=(), width=1, num_layers=2, readable=True):
+    """A model whose sanitize also shifts or moves what it renames."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+    shape = (4,) if width == 1 else (4, width)
+
+    class Model:
+        def __init__(self):
+            self.expected = {
+                f"model.layers.{layer}.{leaf}.weight": mx.reshape(
+                    mx.arange(4 * width, dtype=mx.float32), shape
+                ) + layer
+                for layer in range(num_layers)
+                for leaf in leaves + extra
+            }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            # A literal table, as mlx-lm writes them: the rewrite reads these constants.
+            remappings = (
+                (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
+                (".moe.router_bias.", ".mlp.gate.router_bias."),
+                (".share_expert.down_proj.", ".mlp.share_expert.down_proj."),
+                ("model.mtp.", "model.discarded."),
+            )
+            renamed, vanilla = {}, False
+            for name, tensor in weights.items():
+                for source, target in remappings:
+                    if source in name and target not in name:
+                        name, vanilla = name.replace(source, target), True
+                        break
+                if quirk == "drops" and "discarded" in name:
+                    continue
+                renamed[name] = tensor
+            if quirk == "swaps":
+                first, second = (
+                    f"model.layers.{n}.mlp.switch_mlp.gate_proj.weight"
+                    for n in (0, 1)
+                )
+                if first in renamed and second in renamed:
+                    renamed[first], renamed[second] = renamed[second], renamed[first]
+            elif quirk and (vanilla or quirk == "always_scaled"):
+                for name in [n for n in renamed if "layernorm" in n or "gate.weight" in n]:
+                    tensor = renamed[name]
+                    if quirk in ("constant", "wide"):
+                        tensor = tensor + 1.0
+                    elif quirk in ("scaled", "always_scaled"):
+                        tensor = tensor * 2.0
+                    elif quirk == "stepped":
+                        # Uniform across the first two elements only, so a corner probe reads it as +1.
+                        tensor = tensor + mx.reshape(mx.concatenate(
+                            [mx.ones(2, dtype=tensor.dtype),
+                             mx.full((tensor.size - 2,), 2.0, dtype=tensor.dtype)]
+                        ), tensor.shape)
+                    else:
+                        tensor = tensor + mx.reshape(
+                            mx.arange(tensor.size, dtype=tensor.dtype), tensor.shape
+                        )
+                    renamed[name] = tensor
+            return renamed
+
+    model = Model()
+    if not readable:
+        # A sanitize with no reachable constants must leave the checkpoint alone.
+        model.sanitize = lambda weights: dict(weights)
+        type(model).sanitize = None
+    return model
+
+
+def test_moe_gguf_export_recovers_names_a_sanitizer_only_renamed(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES)
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 6
+
+    tensors = _staged_tensors(path)
+    assert not any(".switch_mlp." in name for name in tensors)
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.moe.gate_proj.weight"],
+        model.expected["model.layers.1.mlp.switch_mlp.gate_proj.weight"],
+    )
+    assert mutils._mlx_arrays_match(
+        tensors["model.layers.1.moe.router_bias.weight"],
+        model.expected["model.layers.1.mlp.gate.router_bias.weight"],
+    )
+    index = json.loads((path / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == set(tensors)
+
+
+def test_moe_gguf_export_leaves_a_sanitizer_with_no_readable_names_alone(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_quirky_moe_model(leaves=RENAMED_LEAVES, readable=False)
+    path = _stage_moe_directory(tmp_path, model)
+    before = (path / "model-00001-of-00001.safetensors").read_bytes()
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 0
+    assert (path / "model-00001-of-00001.safetensors").read_bytes() == before
+
+
+RENAMED_LEAVES = ("mlp.switch_mlp.gate_proj", "mlp.gate.router_bias",
+                  "mlp.share_expert.down_proj")
+
+
+def _make_one_family_moe_model(family):
+    """A checkpoint one family alone can restore, for measuring what a pass costs."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Model:
+        def __init__(self):
+            if family == "merge":
+                # The halves differ, so the rebuilt tensor can disagree about their order.
+                self.expected = {
+                    f"model.layers.0.mlp.{leaf}.weight":
+                        mx.array([[1.0, 2.0], [3.0, 4.0]]) + 10.0 * index
+                    for index, leaf in enumerate(("left", "right"))
+                }
+            else:
+                self.expected = {
+                    "model.layers.0.self_attn.conv.weight":
+                        mx.arange(8, dtype=mx.float32).reshape(2, 2, 2)
+                }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                if family == "layout":
+                    out[name] = mx.moveaxis(tensor, 2, 1)
+                elif "fused" in name:
+                    halves = mx.split(tensor, 2, axis=0)
+                    for leaf, half in zip(("left", "right"), halves):
+                        out[name.replace("fused", leaf)] = half
+                else:
+                    out[name] = tensor
+            return out
+
+    return Model()
+
+
+def test_moe_gguf_export_rebuilds_a_tensor_a_sanitizer_split(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_one_family_moe_model("merge")
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    fused = _staged_tensors(path)["model.layers.0.mlp.fused.weight"]
+    assert fused.tolist() == [[1.0, 2.0], [3.0, 4.0], [11.0, 12.0], [13.0, 14.0]]
+
+
+def test_moe_gguf_export_restores_an_axis_a_sanitizer_moved(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_one_family_moe_model("layout")
+    path = _stage_moe_directory(tmp_path, model)
+
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 1
+    moved = _staged_tensors(path)["model.layers.0.self_attn.conv.weight"]
+    assert moved.tolist() == mutils.mx.moveaxis(
+        model.expected["model.layers.0.self_attn.conv.weight"], 1, 2).tolist()
+
+
+def _make_composed_moe_model():
+    """A model whose expert tensors only the two sanitizers together reproduce.
+
+    The outer relocates the MoE block and splits its fused expert tensor, the inner
+    renames what is left inside it, so neither reproduces a saved name alone. Tensors
+    outside the block, reproduced by both, hold the floor.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Language:
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                parent, found, leaf = name.rpartition(".experts.")
+                if found and "." not in leaf:
+                    name = f"{parent}.switch_mlp.{leaf}.weight"
+                out[name] = tensor
+            return out
+
+    class Model:
+        def __init__(self):
+            self.language_model = Language()
+            self.checkpoint = {
+                "outer.inner.layers.0.mlp.experts.gate_up_proj":
+                    mx.arange(24, dtype=mx.float32).reshape(2, 3, 4),
+                # Untouched by both: otherwise a fragment every name carries would read
+                # as the checkpoint's own shape, which the search will not substitute.
+                "vision.blocks.0.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
+                "vision.blocks.1.attn.proj": mx.arange(4, dtype=mx.float32).reshape(2, 2),
+            }
+            self.expected = self.language_model.sanitize(
+                self.sanitize(dict(self.checkpoint))
+            )
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                # Both under the checkpoint's namespace: the split is how the relocated
+                # block is stored, not something any tensor with the name gets.
+                if "outer.inner" in name:
+                    name = name.replace("outer.inner", "inner.outer")
+                    if "gate_up_proj" in name:
+                        middle = tensor.shape[-1] // 2
+                        for leaf, half in (("gate_proj", tensor[..., :middle]),
+                                           ("up_proj", tensor[..., middle:])):
+                            out[name.replace("gate_up_proj", leaf)] = mx.moveaxis(
+                                half, 1, 2)
+                        continue
+                out[name] = tensor
+            return out
+
+    return Model()
+
+
+def test_moe_gguf_export_replays_the_sanitizers_a_model_composes(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    model = _make_composed_moe_model()
+    assert sorted(model.expected)[0].endswith("switch_mlp.gate_proj.weight")
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    for name, tensor in model.checkpoint.items():
+        assert rewritten[name].tolist() == tensor.tolist()
+
+
+def test_moe_gguf_export_leaves_a_sanitizer_that_writes_to_itself_as_it_found_it(
+        tmp_path):
+    """The export must not change the model it planned against: Gemma 3 ties its head
+    and drops `lm_head` when handed weights without `lm_head.weight`, and the search
+    hands it every spelling of that name."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Language(dict):
+        def __init__(self):
+            super().__init__(lm_head="the head this model was trained with")
+            self.tied = False
+
+        def sanitize(self, weights):
+            if "lm_head.weight" not in weights:
+                self.tied = True
+                self.pop("lm_head", None)
+            return weights
+
+    class Model:
+        def __init__(self):
+            self.language_model = Language()
+            self.expected = {
+                "lm_head.weight": mx.array([[1.0, 2.0]]),
+                "model.layers.0.mlp.switch_mlp.gate_proj.weight":
+                    mx.array([[3.0, 4.0]]),
+            }
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            return self.language_model.sanitize(weights)
+
+    model = Model()
+    path = _stage_moe_directory(tmp_path, model)
+    mutils._prepare_moe_gguf_export_directory(path, model=model)
+    assert model.language_model.tied is False
+    assert model.language_model["lm_head"] == "the head this model was trained with"
+
+
+def _relocated(name):
+    """A rename spelled outside the sanitizer, as mlx-vlm's qwen4_exp spells its own."""
+    if name.startswith("outer.inner."):
+        return "inner.outer." + name[len("outer.inner."):]
+    return name
+
+
+def _relocate_outside(self, weights):
+    return {_relocated(name): tensor for name, tensor in weights.items()}
+
+
+def _relocate_inside(self, weights):
+    return {name.replace("outer.inner.", "inner.outer."): tensor
+            for name, tensor in weights.items()}
+
+
+def _relocating_model(mx, sanitize, others):
+    """A checkpoint one namespace move restores, with `others` names outside it."""
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"outer.inner.layers.{layer}.{leaf}":
+                    mx.arange(8, dtype=mx.float32).reshape(2, 4) + 10 * layer + index
+                for layer in range(2) for index, leaf in enumerate(("mlp.w", "attn.w"))}
+            self.checkpoint.update(
+                (f"vision.layers.{n}.w",
+                 mx.arange(8, dtype=mx.float32).reshape(2, 4) + 100 + n)
+                for n in range(others))
+
+        def named_modules(self):
+            yield "", self
+
+    Model.sanitize = sanitize
+    model = Model()
+    model.expected = model.sanitize(dict(model.checkpoint))
+    return model
+
+
+def test_moe_gguf_export_reads_the_names_a_sanitizer_spells_in_what_it_calls(tmp_path):
+    """A relocation only the helper reaches, kept under the limit to isolate it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    model = _relocating_model(mx, _relocate_outside, others=6)
+    assert not any("outer" in const for const in
+                   type(model).sanitize.__code__.co_consts if isinstance(const, str))
+    assert "outer.inner." in mutils._mlx_sanitizer_vocabulary(
+        mutils._mlx_moe_sanitizers(model))
+    assert sum("outer.inner." in name for name in model.expected) <= int(
+        len(model.expected) * mutils._MOE_VOCABULARY_UBIQUITY)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
+    assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
+
+
+def test_moe_gguf_export_relocates_a_namespace_every_tensor_carries(tmp_path):
+    """A fragment past the ubiquity limit, admitted because every name starts with it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    model = _relocating_model(mx, _relocate_inside, others=0)
+    assert sum("inner.outer." in name for name in model.expected) > int(
+        len(model.expected) * mutils._MOE_VOCABULARY_UBIQUITY)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 4
+    assert sorted(_staged_tensors(path)) == sorted(model.checkpoint)
+
+
+@pytest.mark.parametrize("added,rewrites", (("namespace", 0), ("reordered", 7), ("root", 7), ("container", 2), ("always", 7)))
+def test_moe_gguf_export_keeps_a_namespace_a_sanitizer_adds_back(added, rewrites, tmp_path):
+    """A namespace mlx-vlm's Gemma models add back replays either way, so the tower keeps the checkpoint's own spelling."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
+    prefix = {"namespace": "language_model.model.", "reordered": "model.language_model.",
+              "root": "", "container": "model.", "always": "language_model."}[added]
+
+    class Model:
+        # Names outside the tower keep each fragment under the ubiquity limit, and no
+        # leaf is one the converter already reads (which a rewrite holds back).
+        checkpoint = {f"{prefix}layers.0.self_attn.{leaf}.weight": tensor(i)
+                      for i, leaf in enumerate(("q_norm", "k_norm", "sinks", "gate", "bias"))}
+        checkpoint.update((f"{prefix}layers.0.mlp.experts.{leaf}.weight", tensor(i))
+                          for i, leaf in enumerate(("down_proj", "gate_proj")))
+        checkpoint.update((f"vision_tower.layers.{n}.w", tensor(n)) for n in range(16))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, value in weights.items():
+                # "always" is the sanitizer the staged names do not replay through.
+                if added == "always":
+                    name = name.replace("language_model.", "language_model.model.")
+                elif added == "namespace" and "language_model.model" not in name:
+                    name = name.replace("language_model", "language_model.model")
+                elif added == "reordered":
+                    name = name.replace("model.language_model.", "language_model.model.")
+                elif added == "root" and name.startswith("layers."):
+                    name = "model." + name
+                elif added == "container" and "experts." in name and "switch_glu" not in name:
+                    name = name.replace("mlp.experts.", "mlp.experts.switch_glu.")
+                out[name] = value
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(Model.checkpoint))
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == rewrites
+    assert sorted(_staged_tensors(path)) == sorted(Model.checkpoint)
+
+
+def test_moe_gguf_export_refuses_a_rename_onto_a_name_the_split_rebuilds():
+    """Two names reaching the replay as one hide the loss, so the split's names count too."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+
+    class Model:
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            return {name.replace("old.", "new."): value for name, value in weights.items()}
+
+    staged = {
+        "a.b.new.w": mx.arange(4, dtype=mx.float32).reshape(1, 4),
+        "a.b.experts.w": mx.arange(8, dtype=mx.float32).reshape(2, 4),
+    }
+    # The colliding name is the second the split rebuilds, so reading only the first misses it.
+    split_plan = {"a.b.experts.w": ["a.b.other.w", "a.b.old.w"]}
+    assert mutils._build_mlx_moe_rename_plan(Model(), staged, split_plan)[0] == {}
+
+
+def test_moe_gguf_export_keeps_a_container_drop_when_the_namespace_goes_back(tmp_path):
+    """Reading the namespace back must not bring the container with it."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    tensor = lambda n: mx.arange(8, dtype=mx.float32).reshape(2, 4) + n
+
+    class Model:
+        checkpoint = {f"language_model.model.layers.0.mlp.experts.{leaf}.weight": tensor(i)
+                      for i, leaf in enumerate(("down_proj", "gate_proj"))}
+        checkpoint.update((f"vision_tower.layers.{n}.w", tensor(n)) for n in range(16))
+
+        def named_modules(self):
+            yield "", self
+
+        # Its two literals are the whole vocabulary, so the search reaches the spelling
+        # that drops both and the namespace has to be read back onto it.
+        def sanitize(self, weights):
+            out = {}
+            for name, value in weights.items():
+                if name.startswith("language_model.") and "language_model.model" not in name:
+                    name = name.replace("language_model.", "language_model.model.")
+                if "experts." in name and "switch_glu" not in name:
+                    name = name.replace("mlp.experts.", "mlp.experts.switch_glu.")
+                out[name] = value
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(Model.checkpoint))
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    assert sorted(_staged_tensors(path)) == sorted(Model.checkpoint)
+
+
+def test_moe_gguf_export_reads_a_namespace_back_only_onto_the_names_that_left_it():
+    """One left it, one never left it, one arrived from outside, one left the tower entirely."""
+    import unsloth_zoo.mlx.utils as mutils
+
+    left = {
+        "language_model.model.layers.0.mlp.experts.down_proj.weight":
+            "language_model.layers.0.mlp.experts.down_proj.weight",
+    }
+    stayed = {
+        "language_model.model.norm.weight": "language_model.model.norm.weight",
+        "vision_tower.blocks.0.w": "language_model.visual.blocks.0.w",
+        "language_model.model.aux.weight": "visual.aux.weight",
+    }
+    for name, renamed in left.items():
+        assert mutils._mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)
+    for name, renamed in stayed.items():
+        assert not mutils._mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)
+
+
+def test_moe_gguf_export_stacks_experts_a_sanitizer_split_one_per_expert(tmp_path):
+    """A split into one tensor per expert, which no pair of parts can propose.
+
+    DBRX names parts by index, so no fragment stands for one. Only `w2` is transposed
+    as well as split, so a recipe proved on the first leaf cannot stand for both.
+    """
+    import unsloth_zoo.mlx.utils as mutils
+
+    mx = mutils.mx
+
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"blocks.{layer}.ffn.experts.mlp.{leaf}":
+                    mx.arange(24, dtype=mx.float32).reshape(12, 2) + layer
+                for layer in range(2)
+                for leaf in ("w1", "w2")
+            }
+            self.expected = self.sanitize(dict(self.checkpoint))
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out = {}
+            for name, tensor in weights.items():
+                if "experts.mlp" not in name:
+                    out[name] = tensor
+                    continue
+                for expert, part in enumerate(mx.split(tensor, 3, axis=0)):
+                    out[name.replace(".mlp", f".{expert}") + ".weight"] = (
+                        part.T if name.endswith("w2") else part
+                    )
+            return out
+
+    model = Model()
+    assert len(model.expected) == 12
+    assert all(name.endswith(".weight") for name in model.expected)
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 12
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    for name, tensor in model.checkpoint.items():
+        assert rewritten[name].tolist() == tensor.tolist()
+
+
+def test_moe_gguf_export_splits_a_tensor_a_sanitizer_fused_from_a_named_group(tmp_path):
+    """Parts fused into one staged tensor, named and ordered by the sanitizer's tuple."""
+    import unsloth_zoo.mlx.utils as mutils
+    mx = mutils.mx
+    class Model:
+        def __init__(self):
+            self.checkpoint = {
+                f"model.layers.{layer}.attn.{part}":
+                    mx.arange(6, dtype=mx.float32).reshape(3, 2) + 10 * layer + index
+                for layer in range(2) for index, part in enumerate(
+                    ("q_conv.weight", "k_conv.weight", "v_conv.weight"))}
+
+        def named_modules(self):
+            yield "", self
+
+        def sanitize(self, weights):
+            out, held = {}, {}
+            for name, tensor in weights.items():
+                for part in ("q_conv.weight", "k_conv.weight", "v_conv.weight"):
+                    if name.endswith(part):
+                        held.setdefault(name[: -len(part)], {})[part] = tensor
+                        break
+                else:
+                    out[name] = tensor
+            for head, found in held.items():
+                if len(found) == 3:
+                    out[head + "conv.weight"] = mx.concatenate(
+                        [found["q_conv.weight"], found["k_conv.weight"],
+                         found["v_conv.weight"]], axis=0)
+                else:
+                    out.update((head + part, value) for part, value in found.items())
+            return out
+
+    model = Model()
+    model.expected = model.sanitize(dict(model.checkpoint))
+    assert sorted(model.expected) == ["model.layers.0.attn.conv.weight",
+                                      "model.layers.1.attn.conv.weight"]
+    path = _stage_moe_directory(tmp_path, model)
+    assert mutils._prepare_moe_gguf_export_directory(path, model=model) == 2
+    rewritten = _staged_tensors(path)
+    assert sorted(rewritten) == sorted(model.checkpoint)
+    assert all(rewritten[n].tolist() == v.tolist() for n, v in model.checkpoint.items())
