@@ -991,11 +991,14 @@ def patch_Gemma4TextMLP():
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     try:
         # Left eager on purpose: `fullgraph = None` means do not compile, since
-        # `patch_function` only compiles when `fullgraph` is a bool. Compile mode
-        # can differ between a checkpoint's pack and its recompute, which takes
-        # this function off that surface. See `_fall_back_to_eager_on_recompile_limit`
-        # in `temporary_patches/utils.py`. The fp16 clamp below is pure eager tensor
-        # work, so it installs and behaves identically either way.
+        # `patch_function` only compiles when `fullgraph` is a bool. That drops the
+        # direct `torch.compile` wrapper this call site used to install, so the MLP
+        # is no longer its own compile entry point with its own recompile cache.
+        # It does NOT make this an eager boundary: a compiled caller still inlines
+        # the body into its own graph, exactly as it inlined the wrapped version
+        # before. The fp16 clamp is pure eager tensor work either way, and off the
+        # fp16 path the uncompiled patch is bit exact with upstream where the
+        # compiled one drifted.
         patch_function(
             Gemma4TextMLP, "forward", forward, fullgraph=None,
         )
