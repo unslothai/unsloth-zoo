@@ -618,31 +618,21 @@ def generation_mode(model):
                 pass
 
 
-# mlx-lm and mlx-vlm both run generation on their own thread-local stream, so a
-# no-argument mx.synchronize() -- which waits on the default stream -- drains none of it.
-# Only already-imported modules are inspected: a cleanup path must not import mlx-vlm.
-# mlx_vlm.speculative.common owns a SECOND stream in every 0.6.x, created on import and
-# never routed through wired_limit, so it is listed here but not in _VLM_STREAM_MODULES,
-# which resolves wired_limit and must not grow a module that does not export one.
+# Speculative decoding's stream belongs here but not in _VLM_STREAM_MODULES, which may
+# only hold modules exporting wired_limit.
 def _drain_stream_modules():
-    # A function, not a module constant: _VLM_STREAM_MODULES is defined further down.
+    # A function, not a constant: _VLM_STREAM_MODULES is defined further down.
     return ("mlx_lm.generate",) + _VLM_STREAM_MODULES + ("mlx_vlm.speculative.common",)
 
 
 def _drain_generation_streams(mx):
-    """Best effort: a drain that cannot run must not stop the cache clear.
+    """Drain the generation streams, best effort, before the caller clears the cache.
 
-    Both call sites reached clear_cache() unconditionally before this existed, and
-    draining is a safety margin on top of that, not a precondition for it. The calls
-    below can genuinely fail: at the mlx-vlm pin floor (0.4.4) generation_stream is a
-    plain mx.new_stream, and synchronizing one of those from a thread that did not
-    create it raises "There is no Stream(gpu, N) in current thread". Failing to drain
-    is no worse than the old behaviour; refusing to clear, or killing the burst the
-    entry call sits in front of, is strictly worse.
-
-    Draining a thread-local stream from a foreign thread does not raise, but it does
-    not drain either -- mlx maps it through a thread_local table and creates a fresh
-    stream on miss -- so this is only effective on the thread that generated.
+    A no-argument mx.synchronize() waits on the default stream, not these. Best effort
+    because they can fail: at the mlx-vlm pin floor generation_stream is a plain
+    mx.new_stream, which raises when synchronized off its creating thread, and losing
+    the drain must never cost the caller its clear. Only effective on the generating
+    thread: elsewhere a thread-local stream drains nothing instead of raising.
     """
 
     synchronize = getattr(mx, "synchronize", None)
@@ -651,10 +641,10 @@ def _drain_generation_streams(mx):
     drained = []
     for name in _drain_stream_modules():
         try:
+            # sys.modules only, so cleanup never imports mlx-vlm; a module __getattr__
+            # runs arbitrary code and getattr swallows only AttributeError.
             stream = getattr(sys.modules.get(name), "generation_stream", None)
         except Exception:
-            # Module-level __getattr__ runs arbitrary code; getattr's default only
-            # swallows AttributeError.
             continue
         # 0.6.x aliases one object across every mlx_vlm.generate name.
         if stream is None or any(stream is seen for seen in drained):

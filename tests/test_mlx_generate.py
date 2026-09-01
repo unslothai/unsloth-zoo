@@ -164,8 +164,7 @@ def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
     events = []
     monkeypatch.setattr(
         "mlx.core.synchronize",
-        # `is None`, not truthiness: a falsey stream object is still a stream, and
-        # labelling it "default" would make an over-drain indistinguishable from a hit.
+        # `is None`: a falsey stream labelled "default" would hide an over-drain.
         lambda stream=None: events.append(
             f"synchronize:{'default' if stream is None else stream}"
         ),
@@ -173,11 +172,8 @@ def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
     if has_clear_cache:
         monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
     else:
-        # None, not delattr: under tests/mlx_simulation the attribute cannot be
-        # removed -- the shim synthesises a trampoline for any missing name, so
-        # getattr() still returns something callable and the guard never fires.
-        # A non-callable is what the guard actually tests for, and it reads the
-        # same on real MLX and on the shim.
+        # None, not delattr: tests/mlx_simulation trampolines any missing name, so a
+        # deleted attribute stays callable and the guard never fires.
         monkeypatch.setattr("mlx.core.clear_cache", None, raising=False)
     return events
 
@@ -190,10 +186,7 @@ def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
     ]
 
 def test_the_generation_stream_is_drained_not_just_the_default_one(monkeypatch):
-    # Generation runs on mlx-lm's / mlx-vlm's own thread-local stream, so draining
-    # only the default stream would leave exactly the work we care about in flight.
     events = _record_cache_calls(monkeypatch)
-    # mlx-vlm moves this symbol between release layouts, so every candidate counts.
     for name in ("mlx_lm.generate", "mlx_vlm.generate.dispatch"):
         monkeypatch.setitem(
             sys.modules, name,
@@ -211,8 +204,7 @@ def _fake_stream_module(monkeypatch, name, stream):
     monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(generation_stream=stream))
 
 def test_the_speculative_decoding_stream_is_drained_too(monkeypatch):
-    # mlx_vlm.speculative.common owns its own stream from 0.6.0 on, created on import
-    # and never routed through wired_limit, so nothing else ever drains it.
+    # Created on import and never routed through wired_limit: nothing else drains it.
     events = _record_cache_calls(monkeypatch)
     _fake_stream_module(monkeypatch, "mlx_vlm.speculative.common", "stream<speculative>")
 
@@ -222,8 +214,7 @@ def test_the_speculative_decoding_stream_is_drained_too(monkeypatch):
     assert events.count("synchronize:stream<speculative>") == 2
 
 def test_one_stream_shared_by_several_modules_is_drained_once(monkeypatch):
-    # 0.6.x defines generation_stream in mlx_vlm/generate/common.py and re-exports it
-    # from every candidate name, so identity, not name, decides what is outstanding.
+    # 0.6.x re-exports one stream from every candidate name, so identity decides.
     events = _record_cache_calls(monkeypatch)
     shared = "stream<shared>"
     for name in ("mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar"):
@@ -235,9 +226,7 @@ def test_one_stream_shared_by_several_modules_is_drained_once(monkeypatch):
     assert events.count("synchronize:stream<shared>") == 2
 
 def test_a_stream_that_cannot_be_drained_does_not_stop_the_clear(monkeypatch):
-    # A plain mx.new_stream (mlx-vlm 0.4.4, the pin floor) raises when synchronized
-    # from a thread that did not create it. Not draining is the old behaviour and is
-    # survivable; losing the clear, or the generation burst, is not.
+    # A plain mx.new_stream (the mlx-vlm pin floor) raises off its creating thread.
     events = _record_cache_calls(monkeypatch)
     def synchronize(stream=None):
         if stream == "stream<foreign>":
@@ -269,9 +258,7 @@ def test_a_module_getattr_that_raises_does_not_stop_the_clear(monkeypatch):
     ]
 
 def test_a_runtime_without_synchronize_still_clears(monkeypatch):
-    # mx.synchronize has shipped since mlx 0.12.0, two releases before any clear_cache
-    # shape, so this is about partial test doubles rather than a real runtime -- but a
-    # missing drain must degrade to the pre-drain behaviour, not to an AttributeError.
+    # No real runtime is this shape, but a partial test double is.
     events = _record_cache_calls(monkeypatch)
     monkeypatch.setattr("mlx.core.synchronize", None, raising=False)
     _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<mlx_lm>")
