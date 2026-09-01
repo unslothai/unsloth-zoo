@@ -16,6 +16,12 @@ import threading
 import types
 from pathlib import Path, PureWindowsPath
 
+# `os.geteuid` is POSIX-only and these decorators run at collection time, so a
+# bare call takes the whole module out on Windows (tests/test_llama_cpp_prebuilt.py:30
+# guards the same way).
+IS_POSIX = os.name == "posix"
+
+
 import pytest
 import torch
 
@@ -658,7 +664,8 @@ def test_sidecars_unicode_names_and_spaces_in_paths(tmp_path):
     assert (dst / "tokenizer_配置.json").exists()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_sidecars_unreadable_source_propagates_loudly(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -723,7 +730,8 @@ def test_read_json_file_directory_path_returns_empty(tmp_path):
     assert loader._read_json_file(tmp_path) == {}
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_read_json_file_permission_error_returns_empty(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
@@ -1112,7 +1120,14 @@ def _gguf_export_scaffold(
     monkeypatch.setattr(
         mutils,
         "_prepare_mlx_gguf_export_directory",
-        lambda path, model=None, replay_sanitizers=True: 0,
+        lambda path, model=None, replay_sanitizers=True, norm_offsets=None,
+               relaid_out=None: 0,
+    )
+    # The MoE pass also runs on every export, and this scaffold has no shards for it.
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_moe_gguf_export_directory",
+        lambda path, model=None, source_norm_offsets=None, source_layouts=(): 0,
     )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(

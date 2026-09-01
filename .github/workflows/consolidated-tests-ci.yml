@@ -363,6 +363,22 @@ jobs:
         # inherit module state from another MLX test file.
         run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
 
+      - name: pytest MLX GGUF export gates (HARD GATE)
+        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
+        # sys.modules["mlx.core"] process-wide, so a file collected after another
+        # inherits its shim.
+        #
+        # These are here because they were in NO job, which is the failure the
+        # comment above already lists four times. The MoE name-restoration work
+        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
+        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
+        # that pull request stayed green, because `pytest tests/ --collect-only`
+        # proves only that a file imports.
+        run: |
+          python -m pytest tests/test_mlx_save_export_regressions.py -v
+          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
