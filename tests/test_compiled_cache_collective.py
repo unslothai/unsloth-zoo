@@ -38,6 +38,17 @@ import time
 
 import pytest
 
+# Importing unsloth_zoo injects the bitsandbytes and triton stubs into sys.modules
+# on a host that ships neither, which is every macOS and Windows runner. Do it at
+# collection time: left to the `compiler` fixture, the injection happens inside the
+# first test that uses it, and conftest's sys.modules leak gate attributes it to
+# that test and fails its teardown. Guarded because the static source tests below
+# must still run where the package cannot be imported at all.
+try:
+    import unsloth_zoo  # noqa: F401
+except Exception:
+    pass
+
 
 _COMPILER_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
