@@ -1361,3 +1361,85 @@ def test_direct_recovery_can_still_import_cache_helpers(
     finally:
         for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
             sys.modules.pop(alias, None)
+
+
+def test_recovered_module_keeps_an_importable_module_identity(
+    monkeypatch, compiler, cache_dirs,
+):
+    """Recovery must not stamp a module name nothing can import later.
+
+    Only <name>.py exists in the cache, so a class carrying
+    __module__ == "unsloth_cache_<name>" pickles into an identity a fresh
+    process cannot resolve, while the same class from the normal import path
+    resolves fine. The two paths have to agree.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+
+    name = "pr967_recovered_identity"
+    real_import = compiler.importlib.import_module
+    failed = False
+
+    def fail_once(module_name, package=None):
+        nonlocal failed
+        if module_name == name and not failed:
+            failed = True
+            raise ImportError("force direct-load recovery")
+        return real_import(module_name, package)
+
+    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+
+    try:
+        module = compiler.create_new_function(
+            name,
+            f"class {name}_cls:\n    pass\n\n\ndef {name}_fn(x):\n    return x * 2\n",
+            "pr967",
+            {},
+            overwrite=True,
+        )
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, f"{name}_cls").__module__ == name, (
+            "recovered classes carry a module identity that no fresh process "
+            "can import, so pickling one produces an unloadable artifact."
+        )
+        assert sys.modules[name] is module
+    finally:
+        for alias in (name, f"unsloth_cache_{name}"):
+            sys.modules.pop(alias, None)
+
+
+def test_recovery_drops_a_successful_import_before_it_can_abort(
+    monkeypatch, compiler, cache_dirs,
+):
+    """A rank pulled into recovery must not keep the module it already had.
+
+    Its own import succeeded, so sys.modules still holds the persistent module
+    while recovery runs. If recovery then fails, disable=True swallows the
+    exception and the group splits into ranks with an importable generated
+    module and ranks without one.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
+    # This rank imported fine; a peer did not.
+    monkeypatch.setattr(compiler, "distributed_any", lambda value: True)
+    monkeypatch.setattr(
+        compiler, "_agreed_error",
+        lambda local_error, operation: RuntimeError(f"{operation} failed"),
+    )
+
+    name = "pr967_recovery_aborts"
+    try:
+        with pytest.raises(RuntimeError):
+            compiler.create_new_function(
+                name, f"def {name}_fn(x):\n    return x * 2\n", "pr967", {},
+                overwrite=True,
+            )
+        assert name not in sys.modules, (
+            "a rank whose recovery aborted kept the module it imported before "
+            "recovery, so the group no longer agrees on what is importable."
+        )
+        assert f"unsloth_cache_{name}" not in sys.modules
+    finally:
+        for alias in (name, f"unsloth_cache_{name}"):
+            sys.modules.pop(alias, None)

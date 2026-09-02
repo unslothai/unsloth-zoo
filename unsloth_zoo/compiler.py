@@ -1824,7 +1824,14 @@ def create_new_function(
     pass
 
     def load_module_directly(compile_folder, name, expected_digest):
-        module_name = f"unsloth_cache_{name}"
+        # Load under the plain name, not a synthetic `unsloth_cache_` alias.
+        # Every class and function defined here keeps the spec name in its
+        # __module__, and only the plain name is importable in a fresh process:
+        # the cache file is <name>.py. Pickling a compiled trainer or config on
+        # the recovery path therefore wrote a module identity that could not be
+        # resolved on load, while the same object taken from the normal import
+        # path could. The two paths now agree.
+        module_name = name
         file_location = os.path.join(compile_folder, name) + ".py"
         lock = get_lock(file_location)
         # exec_module() does not make the module's own directory importable, and
@@ -1883,6 +1890,15 @@ def create_new_function(
         # An import can fail on one rank only, but the recovery below is
         # collective, so any failure moves every rank onto it.
         if distributed_any(import_error is not None):
+            # A rank whose own import succeeded is still holding the module it
+            # imported. Recovery below can raise before the direct load replaces
+            # it, and unsloth_compile_transformers(disable=True) catches that and
+            # carries on, which would leave some ranks with an importable
+            # generated module and the rest without one. Drop it up front rather
+            # than only after a direct-load failure.
+            sys.modules.pop(name, None)
+            sys.modules.pop(f"unsloth_cache_{name}", None)
+            new_module = None
             # Try using temp directory instead!
             if not UNSLOTH_COMPILE_USE_TEMP:
                 compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
