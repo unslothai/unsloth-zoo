@@ -1011,6 +1011,28 @@ def test_architecture_neither_backend_ships_is_not_routed_to_mlx_vlm(monkeypatch
     ) is False
 
 
+@pytest.mark.parametrize("alias, target", [("qwen2_5_vl", "qwen2_vl"), ("llava", "mistral3")])
+def test_an_aliased_model_type_loads_like_the_architecture_it_aliases(alias, target):
+    """mlx_lm remaps before it imports, so both spellings must decide alike."""
+    from unsloth_zoo.mlx import loader
+
+    assert loader._get_mlx_lm_model_class(alias) is loader._get_mlx_lm_model_class(target)
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route(alias) == route(target)
+
+
+@pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
+def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
+    """mlx_lm names these modules after the raw config spelling."""
+    from unsloth_zoo.mlx import loader
+
+    assert loader._get_mlx_lm_model_class(model_type) is not None
+
+
 def test_vlm_generate_prefers_the_processor_over_the_published_tokenizer():
     """A text-only multimodal load stays on the vision path but publishes its
     inner tokenizer, which cannot drive mlx-vlm preprocessing."""

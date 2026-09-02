@@ -2619,11 +2619,24 @@ def _has_multimodal_strip_sanitize(model_or_cls) -> bool:
     return any(token in source for token in _MULTIMODAL_STRIP_KEYS)
 
 
-def _get_mlx_lm_model_class(model_type: str):
+def _mlx_lm_module_name(model_type: str) -> str:
+    """The `mlx_lm.models` module mlx_lm itself would import: it remaps the raw
+    config spelling and imports the result verbatim, hyphens included (`lfm2-vl`)."""
     if not model_type:
+        return ""
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+        return str(MODEL_REMAPPING.get(model_type, model_type))
+    except Exception:
+        return str(model_type)
+
+
+def _get_mlx_lm_model_class(model_type: str):
+    module_name = _mlx_lm_module_name(model_type)
+    if not module_name:
         return None
     try:
-        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+        module = importlib.import_module(f"mlx_lm.models.{module_name}")
     except Exception:
         return None
     return getattr(module, "Model", None)
@@ -2687,11 +2700,12 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     one architecture, so any loader with the same assumption is handled.
     """
 
-    if not model_type or model_type in _SAFE_TEXT_SANITIZE_PATCHED:
+    module_name = _mlx_lm_module_name(model_type)
+    if not module_name or module_name in _SAFE_TEXT_SANITIZE_PATCHED:
         return
 
     try:
-        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+        module = importlib.import_module(f"mlx_lm.models.{module_name}")
     except Exception:
         return
 
@@ -2724,7 +2738,7 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
         return dict(tree_flatten(structured))
 
     cls.sanitize = patched_sanitize
-    _SAFE_TEXT_SANITIZE_PATCHED.add(model_type)
+    _SAFE_TEXT_SANITIZE_PATCHED.add(module_name)
 
 
 def _resolve_mlx_vlm_model_class(model_type):
