@@ -488,15 +488,11 @@ def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label)
     """The Gemma4 abort.
 
     Dynamo only discovers a disabled hook while TRACING, so this arm fires on a
-    recompile -- routinely the backward recompute of a region whose forward
-    already packed compiled. It used to set `state["eager"]` and run eager on
-    the spot, with none of the checkpoint question the other give-up arms ask,
-    and torch reported
-
-        CheckpointError: Recomputed values for the following tensors have
-        different metadata than during the forward pass
-
-    with `_LATCHED_EAGER_LABELS` still empty, because this arm recorded nothing.
+    recompile, routinely the backward recompute of a region whose forward already
+    packed compiled. It used to set `state["eager"]` and run eager on the spot,
+    with none of the checkpoint question the other give-up arms ask, and torch
+    raised CheckpointError about recomputed tensors having different metadata,
+    with `_LATCHED_EAGER_LABELS` still empty because this arm recorded nothing.
     """
     calls = {"n": 0}
 
@@ -526,9 +522,8 @@ def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label)
     assert U._RAISED_INSIDE_CHECKPOINT, "the abandoned region must be settled"
     assert fn._unsloth_fallback_state["eager"], "the retry has to be eager"
 
-    # `ei` roots the traceback, which roots the abandoned generator and leaves
-    # its saved-tensor hooks installed for every later test in the process --
-    # the case `_settle_abandoned_checkpoint_generator` documents.
+    # `ei` roots the traceback, hence the abandoned generator and its still
+    # installed hooks -- the case `_settle_abandoned_checkpoint_generator` covers.
     del ei
     U.apply_pending_eager_fallbacks()
     assert U._in_non_reentrant_checkpoint() is False, "the region never closed"
@@ -539,12 +534,9 @@ def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label)
     reason = "torch < 2.8 cannot report whether a checkpoint region is live",
 )
 def test_a_disabled_hook_still_falls_back_when_nothing_packed_compiled(hook_label):
-    """The majority case must not regress.
-
-    A refusal on the FIRST call means nothing compiled was packed by this label,
-    so the eager call packs eagerly and the recompute recomputes eagerly. Those
-    agree, and turning that into a dead step would cost users a working run.
-    """
+    """The majority case must not regress: a refusal on the FIRST call means
+    nothing compiled was packed by this label, so eager pack and eager recompute
+    agree. Turning that into a dead step would cost users a working run."""
     def compiled(*args, **kwargs):
         raise _disabled_hook_error()
 

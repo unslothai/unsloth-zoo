@@ -297,9 +297,8 @@ jobs:
         # nothing else; collect-only would let the packaging config regress.
         #
         # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
-        # eager fallback: that it still falls back for a first-call refusal, that
-        # it ends the step instead when a compiled pack is outstanding, and that
-        # only its own label latches. CPU-pure, no model weights.
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
         #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one

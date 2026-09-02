@@ -1663,16 +1663,14 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def _give_up_at_compile_time(e, args, kwargs, marker_before, warning):
         """The compiler refused this region while TRACING it. Run eager, and stay.
 
-        Shared by both refusals decided before any compiled code runs: Inductor
-        declining to generate code, and Dynamo declining to inline one of
+        Shared by the two refusals decided before any compiled code runs:
+        Inductor declining codegen, and Dynamo declining to inline one of
         Unsloth's own `torch.compiler.disable`d hooks under `fullgraph = True`.
-        Both are deterministic properties of one region's graph, so neither gets
-        a budget retry -- the same graph regenerates the same refusal.
+        Neither gets a budget retry: the same graph regenerates the same refusal.
 
         Only THIS label latches, unlike `_give_up`. Exhaustion is process-wide
-        and takes the other borrowers with it; a compile-time refusal is one
-        region's property, so latching others would cost their compilation for
-        nothing.
+        and takes the other borrowers with it; a compile-time refusal belongs to
+        one region, so latching others would cost their compilation for nothing.
 
         The checkpoint rule from `_give_up` applies, but only when THIS wrapper
         has actually run compiled at some point in this step. That extra
@@ -1682,20 +1680,18 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         including regions that did pack activations compiled. This path latches
         one label, so the only pack/recompute pair that can desynchronise is
         this function's own. Both refuse at compile time, so a first-call
-        refusal means this region packed nothing compiled: the eager call below
-        packs eagerly and the backward recomputes eagerly, which agree.
+        refusal means this region packed nothing compiled: eager pack and eager
+        recompute agree.
 
-        The raise is needed on a LATER compile -- new dynamic shape, newly
-        reachable branch -- after an earlier one already compiled and packed:
-        a compiled pack against an eager recompute either aborts or returns
-        wrong gradients, so end the step instead.
+        The raise is needed on a LATER compile -- new shape, new branch -- after
+        an earlier one already compiled and packed: a compiled pack against an
+        eager recompute aborts or corrupts gradients, so end the step instead.
 
         That later compile can be the RECOMPUTE ITSELF: Dynamo only discovers a
         disabled hook while tracing, and a `dynamic = True` region can first
-        trace a recompute-only path in the backward, after the forward packed
-        compiled. RMSNorm packs 3 tensors compiled and 6 eager, but `early_stop`
-        truncates to the forward's count, so torch reports differing metadata
-        rather than a differing count.
+        trace a recompute-only path after the forward packed compiled. RMSNorm
+        packs 3 tensors compiled and 6 eager, but `early_stop` truncates to the
+        forward's count, so torch reports differing metadata, not a count.
         """
         global _PACKED_COMPILED_IN_CHECKPOINT
         packed = (
@@ -1742,9 +1738,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def _give_up_on_disabled_hook(e, args, kwargs, marker_before):
         """Dynamo refused to inline one of our own `torch.compiler.disable`d hooks.
 
-        Was a bare `state["eager"] = True; return eager_func(...)`: the one arm
-        that flipped compile mode with no checkpoint question, no deferral, and
-        no label record.
+        Was a bare eager flip: no checkpoint question, no deferral, no record.
         """
         return _give_up_at_compile_time(
             e, args, kwargs, marker_before,

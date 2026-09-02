@@ -18,13 +18,12 @@
 
 PR #1145 routes the disabled-hook arm of `_fall_back_to_eager_on_recompile_limit`
 through `_give_up_at_compile_time`, the contract `_give_up_on_backend` already
-had. Before, that arm did `state["eager"] = True; return eager_func(...)` and
-never raised, never touched the global label sets, never restored the marker.
+had. Before, that arm did `state["eager"] = True; return eager_func(...)`: never
+raised, never touched the global label sets, never restored the marker.
 
-That changes shared machinery used by every `fullgraph = True` patch here plus
-14 sites in unsloth core, so the risk is NOT "does the new case work" but "does
-the old case still work", and the tests are weighted accordingly. Each is
-written as a before/after pair so the reason for a branch is readable.
+That is shared machinery (every `fullgraph = True` patch here plus 14 sites in
+unsloth core), so the risk is NOT "does the new case work" but "does the old one
+still work". Each test is a before/after pair, hence the `IS_FIX` branches.
 """
 
 import sys
@@ -57,8 +56,8 @@ OLD_DISABLE_MSG = (
 
 @pytest.fixture(autouse=True)
 def _clean_label_state():
-    """The latch is process-global and keyed by label. Without this the first
-    test to fall back starts every later one already eager."""
+    """The latch is process-global and keyed by label: without this the first
+    fallback starts every later test already eager."""
     sets = (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
             U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS)
     for s in sets:
@@ -99,29 +98,25 @@ def _raiser(msg=DISABLE_MSG):
 # R1: the common case must not change. This is the regression that would hurt.
 
 def test_disabled_hook_outside_any_checkpoint_still_falls_back_to_eager():
-    """The overwhelmingly common case: no checkpoint in sight. Both trees must
-    return eager and must NOT raise."""
+    """The common case: no checkpoint in sight. Both trees return eager, no raise."""
     assert _wrap(_raiser())() == "eager"
 
 
 def test_first_call_refusal_inside_checkpoint_still_falls_back():
-    """Nothing compiled was packed by this label, so eager pack + eager
-    recompute agree. Raising here would break every first-call user of a
-    checkpointed fullgraph region."""
+    """Nothing compiled was packed by this label, so eager pack + eager recompute
+    agree. Raising would break every first-call user of a checkpointed region."""
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # a region is live
     assert LABEL not in U._COMPILED_OK_LABELS  # but WE never compiled ok
     assert _wrap(_raiser())() == "eager"
 
 
 def test_old_torch_message_signature_also_falls_back():
-    """torch < 2.7 phrased the refusal differently. Both spellings must be
-    recognised or the exception escapes as a hard error."""
+    """torch < 2.7 phrased it differently; miss a spelling and it escapes hard."""
     assert _wrap(_raiser(OLD_DISABLE_MSG))() == "eager"
 
 
 def test_an_unrelated_graph_break_still_raises():
-    """The narrow match is the whole safety property of this arm. Over-catching
-    would swallow real bugs."""
+    """The narrow match is this arm's safety property: over-catching hides bugs."""
     with pytest.raises(Exception):
         _wrap(_raiser("Unsupported: something else entirely"))()
 
@@ -145,8 +140,8 @@ def test_refusal_after_compiling_ok_inside_a_live_region():
 
 
 def test_fix_records_the_latch_in_the_global_label_sets():
-    """main records nothing, which is why a captured state can show an empty
-    latched list after this arm fired. fix records it in both sets."""
+    """main records nothing, hence the empty latched list in captures taken after
+    this arm fired. fix records it in both sets."""
     _wrap(_raiser())()
     if IS_FIX:
         assert LABEL in U._LATCHED_EAGER_LABELS
@@ -156,9 +151,8 @@ def test_fix_records_the_latch_in_the_global_label_sets():
 
 
 def test_a_new_wrapper_with_a_latched_label_starts_eager():
-    """Consequence of recording the latch: a rebuilt wrapper inherits it, as it
-    always has for the codegen arm. Intended, but more un-compilation than
-    before, so pinned rather than left implicit."""
+    """Consequence of recording the latch: a rebuilt wrapper inherits it, as for
+    the codegen arm. Intended, but more un-compilation than before, so pinned."""
     _wrap(_raiser())()
     second = _wrap(lambda *a, **k: "compiled-should-not-run")
     if IS_FIX:
@@ -171,8 +165,7 @@ def test_a_new_wrapper_with_a_latched_label_starts_eager():
 
 def test_only_this_label_latches_not_every_borrower():
     """Budget exhaustion is process wide and takes other borrowers with it; a
-    compile-time refusal is one region's property, so unrelated labels keep
-    their compilation."""
+    compile-time refusal is one region's, so unrelated labels keep compiling."""
     other = "SimOther"
     for s in (U._LATCHED_EAGER_LABELS, U._RECENT_EAGER_LABELS):
         s.discard(other)
@@ -190,9 +183,8 @@ def test_only_this_label_latches_not_every_borrower():
 # R4: the marker must be restored, not leaked.
 
 def test_marker_is_restored_to_what_it_was():
-    """The arm captures the marker before the compiled call and puts it back.
-    Left set, a later wrapper believes a compiled pack is outstanding and ends
-    a step that was fine."""
+    """The arm captures the marker before the compiled call and puts it back; left
+    set, a later wrapper reads a compiled pack outstanding and ends a fine step."""
     U._PACKED_COMPILED_IN_CHECKPOINT = False
     _wrap(_raiser())()
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
@@ -208,8 +200,7 @@ def test_marker_true_is_preserved_when_no_raise_happens():
 # R5: the codegen arm this now shares a body with must be unchanged.
 
 def test_backend_refusal_arm_still_behaves():
-    """`_give_up_on_backend` was refactored, not redefined. Its own path must
-    still fall back to eager when nothing compiled was packed."""
+    """`_give_up_on_backend` was refactored, not redefined: still falls back."""
     import torch
 
     class _BackendFail(Exception):
@@ -244,12 +235,10 @@ def test_conservative_when_another_region_packed_compiled_this_step():
     """The one place the fix is deliberately pessimistic.
 
     `_PACKED_COMPILED_IN_CHECKPOINT` is global for the step and
-    `_COMPILED_OK_LABELS` sticky for the process, so if this label ever compiled
-    ok and ANY compiled call packed under a checkpoint this step, the arm raises
-    even though this wrapper may have packed nothing in this region.
-
-    Same trade `_give_up_on_backend` has always made: ending a probably-fine
-    step is cheap, wrong gradients are not. Pinned so the choice is visible.
+    `_COMPILED_OK_LABELS` sticky for the process, so this label compiling ok plus
+    ANY compiled pack under a checkpoint this step makes the arm raise, even if
+    this wrapper packed nothing here. Same trade `_give_up_on_backend` has always
+    made: ending a probably-fine step is cheap, wrong gradients are not.
     """
     U._COMPILED_OK_LABELS.add(LABEL)          # compiled fine earlier
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # some region packed compiled
