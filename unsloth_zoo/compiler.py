@@ -4529,8 +4529,14 @@ def _patch_torch_dtype_modules(
                 )
                 continue
 
+            # Pin the pristine forward before any rewrite. Both branches below
+            # have to mark what they install with it, or a second pass reads
+            # its own output back through inspect.getsource() and rewrites the
+            # rewrite. Callers do run this twice: loader.py prepends "siglip"
+            # to model_types, so every vision load patches torch.nn twice.
+            original_forward = function.forward
             try:
-                source = inspect.getsource(function.forward).rstrip()
+                source = inspect.getsource(original_forward).rstrip()
             except (OSError, TypeError):
                 # A forward built by exec, or one whose file has gone. Unguarded
                 # the OSError propagates out of FastModel.from_pretrained and
@@ -4550,7 +4556,7 @@ def _patch_torch_dtype_modules(
                     model_location,
                     module,
                     _dtype_safe_forward(
-                        function.forward, module in _conv_modules, disable
+                        original_forward, module in _conv_modules, disable
                     ),
                     combined_module,
                 )
@@ -4606,6 +4612,17 @@ def _patch_torch_dtype_modules(
                 overwrite=False,
                 add_torch_compile=False,
             ).forward
+
+            # Same markers _dtype_safe_forward() sets, so the guard above sees
+            # this branch too. Without them a second pass stacks another dtype
+            # prologue on top of this one, and `original_dtype` ends up bound
+            # to the weight dtype rather than the caller's: a bf16 activation
+            # comes back fp32. The marker carries the pristine forward, not
+            # this generated one, so a later compile-mode change rebuilds from
+            # torch's own source instead of from a rewrite.
+            forward.__unsloth_dtype_wrapped__ = True
+            forward.__unsloth_dtype_disable__ = disable
+            forward.__unsloth_dtype_original__ = original_forward
 
             _install_patched_forward(
                 model_location, module, forward, combined_module
