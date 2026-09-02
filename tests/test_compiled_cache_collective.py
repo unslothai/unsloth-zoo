@@ -415,10 +415,19 @@ def test_direct_recovery_invalidates_temp_folder_bytecode(
     assert getattr(updated, f"{name}_fn")(21) == 63
 
 
-def test_undeletable_persistent_bytecode_recovers_to_temp(
+def test_undeletable_bytecode_does_not_abandon_the_persistent_cache(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """Permission errors removing stale pyc must not permit a stale import."""
+    """A pyc we cannot unlink must not cost the persistent cache.
+
+    On Windows `os.remove` raises PermissionError whenever any other handle is
+    open on the file, which a virus scanner, a sync client or a second
+    interpreter all do routinely, and the compiled-cache lock excludes none of
+    them. Treating that as fatal moved the whole group onto tempfile recovery
+    on the first occurrence and aborted the job on the second, so an import
+    that had always worked started failing. The rewritten source is newer than
+    the bytecode, so CPython recompiles regardless.
+    """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     real_remove = compiler.os.remove
@@ -433,8 +442,75 @@ def test_undeletable_persistent_bytecode_recovers_to_temp(
 
     module = probe(name, "return x * 2")
 
-    assert pathlib.Path(module.__file__).parent == temp
+    assert pathlib.Path(module.__file__).parent == primary, (
+        "a pyc that could not be unlinked pushed the cache into tempfile "
+        "recovery, which is how this turned into a hard failure on Windows."
+    )
     assert getattr(module, f"{name}_fn")(21) == 42
+
+
+def test_warm_retained_cache_removes_no_bytecode(
+    monkeypatch, compiler, probe, cache_dirs,
+):
+    """A retained cache is imported as-is, bytecode included.
+
+    Every process start walks this path once per generated module. Deleting
+    the pyc here forced CPython to re-parse and re-compile the whole generated
+    source on every single import, and on Windows it is also the step that can
+    fail. Nothing is stale when nothing was rewritten, so nothing is removed.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    name = "pr967_warm_no_pyc_churn"
+    probe(name, "return x * 2", overwrite=False)
+
+    removed = []
+    real_remove = compiler.os.remove
+
+    def record_removal(path):
+        removed.append(str(path))
+        return real_remove(path)
+
+    monkeypatch.setattr(compiler.os, "remove", record_removal)
+    sys.modules.pop(name, None)
+
+    module = probe(name, "return x * 2", overwrite=False)
+
+    assert getattr(module, f"{name}_fn")(21) == 42
+    assert not [p for p in removed if p.endswith(".pyc")], (
+        f"a warm retained import removed bytecode: {removed}"
+    )
+
+
+def test_rewriting_the_cache_still_removes_stale_bytecode(
+    monkeypatch, compiler, probe, cache_dirs,
+):
+    """The rewrite path keeps the defence the warm path no longer needs.
+
+    Pins that the gate is on "did this call rewrite the file", not on some
+    weaker condition that would let a same-size rewrite import stale bytecode.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    name = "pr967_rewrite_drops_pyc"
+    probe(name, "return x * 2", overwrite=False)
+
+    removed = []
+    real_remove = compiler.os.remove
+
+    def record_removal(path):
+        removed.append(str(path))
+        return real_remove(path)
+
+    monkeypatch.setattr(compiler.os, "remove", record_removal)
+    sys.modules.pop(name, None)
+
+    module = probe(name, "return x * 3", overwrite=True)
+
+    assert getattr(module, f"{name}_fn")(21) == 63
+    assert [p for p in removed if p.endswith(".pyc")], (
+        "a rewrite left stale bytecode in place"
+    )
 
 
 @pytest.mark.parametrize("load_path", ["normal", "direct"])
@@ -1078,3 +1154,74 @@ def test_verify_falls_back_to_existence_when_rank0_digest_unknown(
     location = tmp_path / "mod.py"
     location.write_bytes(b"anything")
     compiler._verify_compiled_cache_file(str(location), None)  # must not raise
+
+
+def _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path):
+    """Run _patch_torch_dtype_modules for two model_locations, as a load does.
+
+    unsloth/models/loader.py prepends "siglip" to model_types and
+    _utils.py loops over them, so every vision load patches the global
+    torch.nn classes more than once in one process.
+    """
+    import torch
+    import transformers
+    import transformers.models.llama.modeling_llama
+    import transformers.models.clip.modeling_clip
+
+    # eval(f"{model_location}.torch") resolves against the compiler globals.
+    monkeypatch.setattr(compiler, "transformers", transformers, raising=False)
+    monkeypatch.setattr(
+        compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path), raising=False)
+    _own_temp_mode(monkeypatch, compiler, False)
+
+    installed = []
+    for model_location in (
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.clip.modeling_clip",
+    ):
+        compiler._patch_torch_dtype_modules(
+            model_location, [], {}, True, False, None,
+        )
+        installed.append(torch.nn.Conv2d.forward)
+    return installed
+
+
+def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
+    monkeypatch, compiler, tmp_path,
+):
+    """A second pass must not rewrite its own rewrite.
+
+    The source-rewrite branch reads inspect.getsource(forward). Left unmarked,
+    a second pass reads back the forward the first pass generated and inserts
+    another dtype prologue, so `original_dtype` binds to the weight dtype
+    instead of the caller's and a bf16 activation returns fp32. Evicting
+    sys.modules before importing is what makes the second rewrite take effect,
+    so this only shows up once the compiled cache is reloaded properly.
+    """
+    import torch
+
+    pristine = torch.nn.Conv2d.forward
+    try:
+        installed = _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path)
+
+        conv = torch.nn.Conv2d(3, 4, 3).to(torch.float32)
+        activation = torch.randn(1, 3, 8, 8, dtype=torch.bfloat16)
+        assert conv(activation).dtype == torch.bfloat16, (
+            "the second dtype rewrite stacked, so the output dtype no longer "
+            "follows the caller's activation."
+        )
+        assert installed[0] is installed[1], (
+            "the second pass regenerated the forward instead of recognising "
+            "its own marker."
+        )
+        assert getattr(installed[0], "__unsloth_dtype_wrapped__", False) is True
+        assert installed[0].__unsloth_dtype_original__ is pristine, (
+            "the marker must carry torch's own forward, so a later "
+            "compile-mode change rebuilds from source rather than a rewrite."
+        )
+        source = pathlib.Path(tmp_path / "Conv2d.py").read_text(encoding="utf-8")
+        assert source.count("original_dtype = input.dtype") == 1, source
+    finally:
+        torch.nn.Conv2d.forward = pristine
+        sys.modules.pop("Conv2d", None)
+        sys.modules.pop("unsloth_cache_Conv2d", None)
