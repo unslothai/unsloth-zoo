@@ -176,6 +176,8 @@ class _StockMLP(torch.nn.Module):
 
 PARENT = "transformers.models.gemma4"
 DOTTED = f"{PARENT}.modeling_gemma4"
+# The import chain itself, and nothing below it.
+_ABSENT_OK = frozenset(("transformers", "transformers.models", PARENT, DOTTED))
 
 
 def _install_mlp_patch(monkeypatch):
@@ -189,9 +191,10 @@ def _install_mlp_patch(monkeypatch):
         modeling = importlib.import_module(DOTTED)
         injected = False
     except ModuleNotFoundError as e:
-        # Only gemma4's own absence may reach the stand-in. A broader except would
-        # let a genuinely broken gemma4 import be masked by the synthetic class.
-        if not (e.name or "").startswith(PARENT) and e.name != "transformers":
+        # Only gemma4's own absence may reach the stand-in, matched on the exact
+        # chain. A prefix match would also swallow a missing dependency *under*
+        # gemma4, masking a real broken import with the synthetic class.
+        if e.name not in _ABSENT_OK:
             raise
         modeling = types.ModuleType(DOTTED)
         injected = True
@@ -277,3 +280,20 @@ def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
         cls.forward = stock
 
 
+
+def test_stand_in_rejects_a_failure_below_gemma4(monkeypatch):
+    """gemma4 being absent is a valid skip; gemma4 being broken is not.
+
+    Both surface as ModuleNotFoundError, so the stand-in matches the exact import
+    chain. A prefix match would substitute the synthetic class for a real broken
+    import and every test here would pass on a module that never loaded.
+    """
+    def boom(name, *a, **k):
+        raise ModuleNotFoundError(
+            "no module named 'transformers.models.gemma4.some_dependency'",
+            name="transformers.models.gemma4.some_dependency",
+        )
+
+    monkeypatch.setattr(importlib, "import_module", boom)
+    with pytest.raises(ModuleNotFoundError):
+        _install_mlp_patch(monkeypatch)
