@@ -169,7 +169,6 @@ class _StockMLP(torch.nn.Module):
 
 PARENT = "transformers.models.gemma4"
 DOTTED = f"{PARENT}.modeling_gemma4"
-# The import chain itself, and nothing below it.
 _ABSENT_OK = frozenset(("transformers", "transformers.models", PARENT, DOTTED))
 
 
@@ -181,9 +180,8 @@ def _install_mlp_patch(monkeypatch):
         modeling = importlib.import_module(DOTTED)
         injected = False
     except ModuleNotFoundError as e:
-        # Only gemma4's own absence may reach the stand-in, matched on the exact
-        # chain. A prefix match would also swallow a missing dependency *under*
-        # gemma4, masking a real broken import with the synthetic class.
+        # Only gemma4's own absence may reach the stand-in, matched on the exact chain.
+        # A prefix match would mask a real broken import *under* gemma4.
         if e.name not in _ABSENT_OK:
             raise
         modeling = types.ModuleType(DOTTED)
@@ -191,8 +189,7 @@ def _install_mlp_patch(monkeypatch):
 
     monkeypatch.setattr(modeling, "Gemma4TextMLP", _StockMLP, raising=False)
     if injected:
-        # `import a.b.c as m` walks the chain, so the parent has to resolve too or
-        # the patch takes its ImportError early return and no-ops.
+        # `import a.b.c as m` walks the chain, so without the parent the patch no-ops.
         package = types.ModuleType(PARENT)
         package.modeling_gemma4 = modeling
         monkeypatch.setitem(sys.modules, PARENT, package)
@@ -266,7 +263,6 @@ def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
         assert "linear" in code, "the MLP body is missing from the caller's graph"
     finally:
         cls.forward = stock
-
 
 
 def test_stand_in_rejects_a_failure_below_gemma4(monkeypatch):
