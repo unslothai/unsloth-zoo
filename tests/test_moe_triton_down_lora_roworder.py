@@ -177,3 +177,74 @@ def test_down_lora_grads_match_reference(monkeypatch):
 
     torch.testing.assert_close(first.grad, first_ref.grad, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(second.grad, second_ref.grad, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_down_lora_matches_reference_on_real_kernels():
+    """Same check on the real Triton grouped GEMM, bf16, on the GPU.
+
+    The fake-kernel tests above assume the documented permute semantics; this
+    one runs the real kernel and the real LoRA delta path. CI has no GPU, so it
+    runs wherever a reviewer runs it.
+    """
+    pytest.importorskip("unsloth.kernels.moe.grouped_gemm.interface")
+    from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
+        KernelConfigBackward_dW,
+        KernelConfigBackward_dX,
+        KernelConfigForward,
+    )
+
+    num_experts, hidden, intermediate, rank = 8, 256, 512, 16
+    num_tokens, top_k = 512, 2
+    device, dtype = "cuda", torch.bfloat16
+    torch.manual_seed(0)
+
+    experts = nn.Module()
+    experts.num_experts = num_experts
+    experts.act_fn = F.silu
+    experts.gate_up_proj = nn.Parameter(
+        (torch.randn(num_experts, 2 * intermediate, hidden, device=device) * 0.2).to(dtype)
+    )
+    experts.down_proj = nn.Parameter(
+        (torch.randn(num_experts, hidden, intermediate, device=device) * 0.2).to(dtype)
+    )
+    # Default configs (TMA off) so the forward skips autotune; the reduction
+    # dims are multiples of the 32-wide K block the kernel asserts on.
+    configs = lambda: (KernelConfigForward(), KernelConfigBackward_dX(), KernelConfigBackward_dW())
+    experts._unsloth_moe_configs = (intermediate, configs(), configs())
+
+    first = (torch.randn(num_experts, intermediate, rank, device=device) * 0.2).to(dtype)
+    second = (torch.randn(num_experts, rank, hidden, device=device) * 0.2).to(dtype)
+    first.requires_grad_(True)
+    second.requires_grad_(True)
+    scaling = 0.5
+    experts._unsloth_lora_down_proj = (first, second, scaling)
+
+    X = torch.randn(num_tokens, hidden, device=device).to(dtype)
+    top_k_index = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
+    top_k_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
+
+    out = forward_triton_grouped_gemm(experts, X, top_k_index, top_k_weights)
+
+    # fp32 reference, one expert at a time.
+    first_ref = first.detach().float().requires_grad_(True)
+    second_ref = second.detach().float().requires_grad_(True)
+    ref = torch.zeros(num_tokens, hidden, device=device)
+    for e in range(num_experts):
+        t, k = (top_k_index == e).nonzero(as_tuple=True)
+        gate, up = (X[t].float() @ experts.gate_up_proj[e].float().T).chunk(2, dim=-1)
+        h = F.silu(gate) * up
+        d = h @ experts.down_proj[e].float().T + (h @ first_ref[e] @ second_ref[e]) * scaling
+        ref.index_add_(0, t, top_k_weights[t, k].unsqueeze(1) * d)
+
+    out.float().sum().backward()
+    ref.sum().backward()
+
+    # bf16 rounds at every stage, so allow 2% of the reference range; the
+    # row-order bug puts the forward off by about half of it.
+    def check(got, want):
+        assert (got.float() - want).abs().max() <= 0.02 * want.abs().max()
+
+    check(out, ref)
+    check(first.grad, first_ref.grad)
+    check(second.grad, second_ref.grad)
