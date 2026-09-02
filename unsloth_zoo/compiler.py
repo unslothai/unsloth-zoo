@@ -1677,10 +1677,16 @@ def create_new_function(
         ok, write_error, changed = write_file_outcome(
             function_location, write_new_source,
         )
-        return _agreed_error(
+        agreed = _agreed_error(
             None if ok else RuntimeError(write_error),
             f"Compiled cache write for {name}",
-        ), changed
+        )
+        # Ranks sharing a node share this file, so only the one that wins the
+        # write lock sees changed=True; the rest find the bytes already correct.
+        # Left rank-local, a False rank can take the import lock first and skip
+        # the bytecode removal, executing a pyc the writer has not dropped yet.
+        # Agree it, conservatively: if any rank rewrote, every rank invalidates.
+        return agreed, distributed_any(changed)
 
     pass
 
@@ -1821,6 +1827,29 @@ def create_new_function(
         module_name = f"unsloth_cache_{name}"
         file_location = os.path.join(compile_folder, name) + ".py"
         lock = get_lock(file_location)
+        # exec_module() does not make the module's own directory importable, and
+        # import_module() has already restored sys.path by the time recovery gets
+        # here. Generated MoE modules carry a bare `try: from moe_utils import ...
+        # except: pass`, and moe_utils.py lives in the compiled cache, so without
+        # this the direct load reports success while every MoE backend name is
+        # quietly undefined and the first MoE forward fails instead. Both folders
+        # are needed: recovery switches compile_folder to node-local temp, while
+        # the helper was installed next to the persistent cache.
+        search_paths = [compile_folder]
+        if UNSLOTH_COMPILE_LOCATION not in search_paths:
+            search_paths.append(UNSLOTH_COMPILE_LOCATION)
+        old_path = list(sys.path)
+        sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
+        try:
+            return _exec_module_under_lock(
+                lock, file_location, module_name, expected_digest,
+            )
+        finally:
+            sys.path[:] = old_path
+
+    pass
+
+    def _exec_module_under_lock(lock, file_location, module_name, expected_digest):
         with lock:
             _verify_cache_digest_under_lock(file_location, expected_digest)
             if rewrote_cache_file:

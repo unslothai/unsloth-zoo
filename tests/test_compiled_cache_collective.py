@@ -1261,6 +1261,19 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
     """
     import torch
 
+    # _patch_torch_dtype_modules rewrites every name in _patch_functions, and with
+    # disable=False patch_torch_functions() also replaces F.layer_norm. Restoring
+    # only Conv2d would leave the rest patched for every later test in the session.
+    patched = {
+        module: getattr(torch.nn, module).forward
+        for module in compiler._patch_functions
+        if hasattr(getattr(torch.nn, module, None), "forward")
+    }
+    functional = {
+        attr: getattr(torch.nn.functional, attr)
+        for attr in ("layer_norm", "rms_norm", "group_norm", "batch_norm")
+        if hasattr(torch.nn.functional, attr)
+    }
     pristine = torch.nn.Conv2d.forward
     try:
         installed = _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path)
@@ -1283,6 +1296,67 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
         source = pathlib.Path(tmp_path / "Conv2d.py").read_text(encoding="utf-8")
         assert source.count("original_dtype = input.dtype") == 1, source
     finally:
-        torch.nn.Conv2d.forward = pristine
-        sys.modules.pop("Conv2d", None)
-        sys.modules.pop("unsloth_cache_Conv2d", None)
+        for module, forward in patched.items():
+            getattr(torch.nn, module).forward = forward
+        for attr, function in functional.items():
+            setattr(torch.nn.functional, attr, function)
+        for module in compiler._patch_functions:
+            sys.modules.pop(module, None)
+            sys.modules.pop(f"unsloth_cache_{module}", None)
+
+
+def test_direct_recovery_can_still_import_cache_helpers(
+    monkeypatch, compiler, cache_dirs,
+):
+    """The recovered module must still resolve helpers next to the cache.
+
+    exec_module() does not put the module's directory on sys.path, and
+    import_module() restores sys.path before recovery runs. Generated MoE
+    modules carry a bare `try: from moe_utils import ... except: pass`, so
+    without the search path the direct load reports success while every MoE
+    backend name is silently undefined and the first MoE forward fails instead.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
+    (primary / "moe_utils.py").write_text(
+        "forward_moe_backend = 'installed'\n", encoding="utf-8",
+    )
+
+    name = "pr967_recovery_helper"
+    real_import = compiler.importlib.import_module
+    failed = False
+
+    def fail_once(module_name, package=None):
+        nonlocal failed
+        if module_name == name and not failed:
+            failed = True
+            raise ImportError("force direct-load recovery")
+        return real_import(module_name, package)
+
+    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+
+    try:
+        module = compiler.create_new_function(
+            name,
+            f"def {name}_fn(x):\n    return x * 2\n",
+            "pr967",
+            {},
+            prepend=(
+                "try:\n"
+                "    from moe_utils import forward_moe_backend\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+            overwrite=True,
+        )
+
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, "forward_moe_backend", None) == "installed", (
+            "the recovered module could not import moe_utils from the compiled "
+            "cache, so a generated MoE module would load with its backend names "
+            "undefined and fail at the first forward."
+        )
+    finally:
+        for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
+            sys.modules.pop(alias, None)
