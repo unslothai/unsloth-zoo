@@ -42,6 +42,30 @@ sys.path.insert(0, str(ROOT))
 
 from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
+
+@pytest.fixture(autouse = True)
+def _clear_latches():
+    """The latch is process-global and keyed by label, so tests must not leak.
+
+    Every `_wrap` below reuses "TestMod", and the disabled-hook arm now records
+    its latch by label the way the codegen arm always has, so without this the
+    first test to fall back starts every later one already eager.
+    """
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    # Process-global and set by any earlier test file that ran a compiled call
+    # under a checkpoint. Left set, the give-up arms here read "a compiled pack
+    # is outstanding" and end the step instead of falling back.
+    _packed = U._PACKED_COMPILED_IN_CHECKPOINT
+    U._PACKED_COMPILED_IN_CHECKPOINT = False
+    yield
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    U._PACKED_COMPILED_IN_CHECKPOINT = _packed
+
+
 DISABLE_MSG = (
     "Skip calling `torch.compiler.disable()`d function\n"
     "  Explanation: Skip calling function "
