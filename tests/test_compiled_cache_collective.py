@@ -38,13 +38,12 @@ import time
 
 import pytest
 
-# Importing the compiler pulls in the bitsandbytes and triton substitutes on a host
-# that ships neither, which is every macOS and Windows runner. Do it at collection
-# time: left to the `compiler` fixture, the substitute for bitsandbytes.nn lands
-# inside the first test that uses it, and conftest's sys.modules leak gate
-# attributes it to that test and fails its teardown. It has to be the submodule --
-# importing the package alone does not reach bitsandbytes.nn. Guarded because the
-# static source tests below must still run where the import cannot succeed.
+# Importing the compiler installs the bitsandbytes and triton substitutes on every
+# macOS and Windows runner. Do it at collection time, or the bitsandbytes.nn
+# substitute lands inside the first test to use the fixture and conftest's
+# sys.modules leak gate fails its teardown. Must be the submodule: the package
+# alone does not reach bitsandbytes.nn. Guarded so the static source tests below
+# still run where the import cannot succeed.
 try:
     import unsloth_zoo.compiler  # noqa: F401
 except Exception:
@@ -1155,10 +1154,9 @@ def test_temp_recovery_loads_by_path_on_every_rank(
 
     monkeypatch.setattr(compiler, "distributed_function", rank0_collectives)
 
-    # Fire on the import guard, identified as the first collective after the
-    # write-path verification where this rank itself saw no failure. Keyed on
-    # that ordering rather than on a call count, so adding or removing a
-    # collective in the write path cannot silently re-target the injection.
+    # Fire on the import guard: the first collective after write-path
+    # verification where this rank saw no failure. Keyed on that ordering, not
+    # a call count, so changing the write path cannot re-target the injection.
     write_phase_done = False
     already_fired = False
     real_cache_verification_error = compiler._cache_verification_error
@@ -1262,9 +1260,8 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
     """
     import torch
 
-    # _patch_torch_dtype_modules rewrites every name in _patch_functions, and with
-    # disable=False patch_torch_functions() also replaces F.layer_norm. Restoring
-    # only Conv2d would leave the rest patched for every later test in the session.
+    # It rewrites every name in _patch_functions, and with disable=False also
+    # replaces F.layer_norm. Restoring only Conv2d would leak into later tests.
     patched = {
         module: getattr(torch.nn, module).forward
         for module in compiler._patch_functions

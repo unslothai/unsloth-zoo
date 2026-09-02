@@ -1194,18 +1194,14 @@ pass
 def _remove_compiled_cache_bytecode(function_location):
     """Remove this rank's pyc before importing source we just rewrote.
 
-    Only called when the bytes on disk actually changed, which is the only time
-    a pyc built from them can be stale.
+    Only called when the bytes changed, the only time the pyc can be stale.
 
     An unlink failure is fatal only when the bytecode would really be used. On
-    Windows `os.remove` raises PermissionError (WinError 32) whenever another
-    process holds the file, which a virus scanner, a sync client or a concurrent
-    interpreter routinely does and the file lock here cannot exclude; raising on
-    that sent the whole group into tempfile recovery on the first occurrence and
-    aborted on the second. But a pyc CPython would still accept is the case this
-    removal exists for: a same-size rewrite inside one timestamp tick, or an
-    unchecked hash pyc, either of which would execute stale bytecode. Those
-    still fail over.
+    Windows `os.remove` raises PermissionError (WinError 32) whenever a scanner,
+    sync client or other interpreter holds the file, which this lock cannot
+    exclude; raising on that forced the group into tempfile recovery. A pyc
+    CPython would still accept, a same-size rewrite inside one timestamp tick or
+    an unchecked hash pyc, is the case this exists for and still fails over.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(function_location)
@@ -1632,9 +1628,8 @@ def create_new_function(
                         file.write(new_write_bytes)
                         file.flush()
                         os.fsync(file.fileno())
-            # Whether the bytes on disk actually changed, which is what decides
-            # if a pyc built from them is now stale. overwrite=True says "you may
-            # rewrite", not "the content differs".
+            # Did the bytes change, which is what makes a pyc stale.
+            # overwrite=True means "you may rewrite", not "the content differs".
             return need_write
         except Exception as e:
             # consider adding logging to main_process only
@@ -1643,9 +1638,9 @@ def create_new_function(
                 logger.error(
                     f"Unsloth: Failed to write file {function_location} because {str(e)}"
                 )
-            # The write may have landed partially before this, so assume the
-            # file changed: over-invalidating costs one recompile, while
-            # under-invalidating runs stale bytecode.
+            # The write may have landed partially, so assume it changed:
+            # over-invalidating costs a recompile, under-invalidating runs
+            # stale bytecode.
             return True
 
     pass
@@ -1681,11 +1676,10 @@ def create_new_function(
             None if ok else RuntimeError(write_error),
             f"Compiled cache write for {name}",
         )
-        # Ranks sharing a node share this file, so only the one that wins the
-        # write lock sees changed=True; the rest find the bytes already correct.
-        # Left rank-local, a False rank can take the import lock first and skip
-        # the bytecode removal, executing a pyc the writer has not dropped yet.
-        # Agree it, conservatively: if any rank rewrote, every rank invalidates.
+        # Ranks sharing a node share this file, so only the lock winner sees
+        # changed=True. Left rank-local, a False rank could import first and
+        # execute a pyc the writer has not dropped yet, so agree it: if any
+        # rank rewrote, every rank invalidates.
         return agreed, distributed_any(changed)
 
     pass
@@ -1714,14 +1708,11 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
-    # Only a call that actually changes the bytes on disk can leave a stale pyc
-    # behind, so only such a call needs to remove one. A warm cache is the common
-    # case and every process start walks it: deleting the pyc there forced CPython
-    # to recompile the whole generated module on every single import.
-    # This tracks the WRITE, not the decision: overwrite=True is the default for
-    # unsloth_compile_transformers and patch_lora_forwards, so the decision is
-    # always true for them even when write_file() finds the content identical and
-    # writes nothing.
+    # Only a call that changes the bytes can leave a stale pyc, so only such a
+    # call removes one. Every process start walks the warm cache, where deleting
+    # the pyc forced a full recompile on each import. Tracks the WRITE, not the
+    # decision: overwrite=True is the default for unsloth_compile_transformers
+    # and patch_lora_forwards even when write_file() writes nothing.
     rewrote_cache_file = False
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
@@ -1824,24 +1815,17 @@ def create_new_function(
     pass
 
     def load_module_directly(compile_folder, name, expected_digest):
-        # Load under the plain name, not a synthetic `unsloth_cache_` alias.
-        # Every class and function defined here keeps the spec name in its
-        # __module__, and only the plain name is importable in a fresh process:
-        # the cache file is <name>.py. Pickling a compiled trainer or config on
-        # the recovery path therefore wrote a module identity that could not be
-        # resolved on load, while the same object taken from the normal import
-        # path could. The two paths now agree.
+        # Plain name, not a synthetic `unsloth_cache_` alias: it goes into every
+        # defined class's __module__, and only <name> is importable in a fresh
+        # process, so an alias made pickled objects from this path unloadable.
         module_name = name
         file_location = os.path.join(compile_folder, name) + ".py"
         lock = get_lock(file_location)
-        # exec_module() does not make the module's own directory importable, and
-        # import_module() has already restored sys.path by the time recovery gets
-        # here. Generated MoE modules carry a bare `try: from moe_utils import ...
-        # except: pass`, and moe_utils.py lives in the compiled cache, so without
-        # this the direct load reports success while every MoE backend name is
-        # quietly undefined and the first MoE forward fails instead. Both folders
-        # are needed: recovery switches compile_folder to node-local temp, while
-        # the helper was installed next to the persistent cache.
+        # exec_module() does not make the module's directory importable, and
+        # sys.path is already restored by now. Generated MoE modules swallow
+        # `from moe_utils import ...`, so without this the load reports success
+        # with every backend name undefined. Both folders: recovery switches to
+        # node-local temp, but the helper sits next to the persistent cache.
         search_paths = [compile_folder]
         if UNSLOTH_COMPILE_LOCATION not in search_paths:
             search_paths.append(UNSLOTH_COMPILE_LOCATION)
@@ -1890,12 +1874,10 @@ def create_new_function(
         # An import can fail on one rank only, but the recovery below is
         # collective, so any failure moves every rank onto it.
         if distributed_any(import_error is not None):
-            # A rank whose own import succeeded is still holding the module it
-            # imported. Recovery below can raise before the direct load replaces
-            # it, and unsloth_compile_transformers(disable=True) catches that and
-            # carries on, which would leave some ranks with an importable
-            # generated module and the rest without one. Drop it up front rather
-            # than only after a direct-load failure.
+            # A rank whose import succeeded still holds its module. Recovery can
+            # raise before the direct load replaces it, and disable=True swallows
+            # that, leaving some ranks with a generated module and some without.
+            # Drop it up front, not just after a direct-load failure.
             sys.modules.pop(name, None)
             sys.modules.pop(f"unsloth_cache_{name}", None)
             new_module = None
@@ -4644,11 +4626,10 @@ def _patch_torch_dtype_modules(
                 )
                 continue
 
-            # Pin the pristine forward before any rewrite. Both branches below
-            # have to mark what they install with it, or a second pass reads
-            # its own output back through inspect.getsource() and rewrites the
-            # rewrite. Callers do run this twice: loader.py prepends "siglip"
-            # to model_types, so every vision load patches torch.nn twice.
+            # Pin the pristine forward before any rewrite, and mark whatever
+            # each branch installs with it, or a second pass reads its own
+            # output back through inspect.getsource(). This does run twice:
+            # loader.py prepends "siglip", so vision loads patch torch.nn twice.
             original_forward = function.forward
             try:
                 source = inspect.getsource(original_forward).rstrip()
@@ -4728,13 +4709,11 @@ def _patch_torch_dtype_modules(
                 add_torch_compile=False,
             ).forward
 
-            # Same markers _dtype_safe_forward() sets, so the guard above sees
-            # this branch too. Without them a second pass stacks another dtype
-            # prologue on top of this one, and `original_dtype` ends up bound
-            # to the weight dtype rather than the caller's: a bf16 activation
-            # comes back fp32. The marker carries the pristine forward, not
-            # this generated one, so a later compile-mode change rebuilds from
-            # torch's own source instead of from a rewrite.
+            # Same markers _dtype_safe_forward() sets, so the guard above covers
+            # this branch. Without them a second pass stacks another dtype
+            # prologue and a bf16 activation comes back fp32. Carries the
+            # pristine forward, so a later mode change rebuilds from torch's
+            # source rather than from a rewrite.
             forward.__unsloth_dtype_wrapped__ = True
             forward.__unsloth_dtype_disable__ = disable
             forward.__unsloth_dtype_original__ = original_forward
