@@ -1152,29 +1152,65 @@ def _retained_cache_source(function_location):
         return None, None, f"{type(error).__name__}: {error}"
 pass
 
-def _remove_compiled_cache_bytecode(function_location):
-    """Remove this rank's timestamp-based pyc before loading rewritten source.
+def _bytecode_would_be_used(function_location, bytecode_location):
+    """Whether CPython would accept this pyc for this source (PEP 552).
 
-    Only called when this invocation actually rewrote the source file, which is
-    the only time the pyc can be stale. CPython already recompiles on the mtime
-    and size it just saw change, so this is a backstop for the narrow case where
-    a same-size rewrite lands inside one timestamp tick.
-
-    A failure to unlink is therefore not fatal. On Windows `os.remove` raises
-    PermissionError (WinError 32) whenever another process holds the file, which
-    a virus scanner, a sync client or a concurrent interpreter routinely does,
-    and the file lock here cannot exclude any of them. Raising sent the whole
-    group into tempfile recovery on the first occurrence and aborted on the
-    second, turning an import that had always worked into a hard failure.
+    Header is magic, flags, then either (mtime, size) or a 64-bit source hash.
+    Bit 0 of flags selects hash-based; bit 1 is check_source, and an unchecked
+    hash pyc is loaded without ever looking at the source.
     """
     try:
-        os.remove(importlib.util.cache_from_source(function_location))
-    except (FileNotFoundError, NotImplementedError):
+        with open(bytecode_location, "rb") as file:
+            header = file.read(16)
+    except OSError:
+        return False
+    if len(header) < 16:
+        return False
+    flags = int.from_bytes(header[4:8], "little")
+    if flags & 0b1:
+        return not (flags & 0b10)
+    try:
+        source = os.stat(function_location)
+    except OSError:
+        return False
+    mtime = int.from_bytes(header[8:12], "little")
+    size = int.from_bytes(header[12:16], "little")
+    return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
+pass
+
+def _remove_compiled_cache_bytecode(function_location):
+    """Remove this rank's pyc before importing source we just rewrote.
+
+    Only called when the bytes on disk actually changed, which is the only time
+    a pyc built from them can be stale.
+
+    An unlink failure is fatal only when the bytecode would really be used. On
+    Windows `os.remove` raises PermissionError (WinError 32) whenever another
+    process holds the file, which a virus scanner, a sync client or a concurrent
+    interpreter routinely does and the file lock here cannot exclude; raising on
+    that sent the whole group into tempfile recovery on the first occurrence and
+    aborted on the second. But a pyc CPython would still accept is the case this
+    removal exists for: a same-size rewrite inside one timestamp tick, or an
+    unchecked hash pyc, either of which would execute stale bytecode. Those
+    still fail over.
+    """
+    try:
+        bytecode_location = importlib.util.cache_from_source(function_location)
+    except NotImplementedError:
+        return
+    try:
+        os.remove(bytecode_location)
+    except FileNotFoundError:
         pass
     except OSError as error:
+        if _bytecode_would_be_used(function_location, bytecode_location):
+            raise RuntimeError(
+                f"Unsloth: Cannot remove stale bytecode for {function_location}: "
+                f"{error}."
+            ) from error
         logger.warning_once(
-            f"Unsloth: Cannot remove stale bytecode for {function_location}: "
-            f"{error}. Continuing, since the rewritten source is newer than it."
+            f"Unsloth: Cannot remove bytecode for {function_location}: {error}. "
+            "Continuing, since the rewritten source no longer matches it."
         )
 pass
 
@@ -1576,7 +1612,10 @@ def create_new_function(
                         file.write(new_write_bytes)
                         file.flush()
                         os.fsync(file.fileno())
-            return None
+            # Whether the bytes on disk actually changed, which is what decides
+            # if a pyc built from them is now stale. overwrite=True says "you may
+            # rewrite", not "the content differs".
+            return need_write
         except Exception as e:
             # consider adding logging to main_process only
             # counterpoint: we may want to see errors on all processes
@@ -1584,7 +1623,10 @@ def create_new_function(
                 logger.error(
                     f"Unsloth: Failed to write file {function_location} because {str(e)}"
                 )
-            return None
+            # The write may have landed partially before this, so assume the
+            # file changed: over-invalidating costs one recompile, while
+            # under-invalidating runs stale bytecode.
+            return True
 
     pass
 
@@ -1595,26 +1637,30 @@ def create_new_function(
         ranks are waiting in. write_file() guards its writes; get_lock() does not.
         """
         try:
-            write_file(function_location, write_new_source)
-            return True, ""
+            changed = write_file(function_location, write_new_source)
+            return True, "", bool(changed)
         except Exception as error:
-            return False, f"{type(error).__name__}: {error}"
+            return False, f"{type(error).__name__}: {error}", True
 
     pass
 
     def write_node_local_file(function_location, write_new_source):
-        """Write this rank's own copy, then agree the outcome. Returns an error or None.
+        """Write this rank's own copy, then agree the outcome.
+
+        Returns (agreed error or None, whether any rank changed its bytes).
 
         The temp cache is `tempfile.gettempdir()`, which is per node, so routing
         it through distributed_function() would write it on rank 0 alone and
         leave every other node without the file. write_file() locks and compares
         before writing, so ranks sharing a node stay idempotent.
         """
-        wrote, write_error = write_file_outcome(function_location, write_new_source)
-        return _agreed_error(
-            None if wrote else RuntimeError(write_error),
-            f"Compiled cache write for {name}",
+        ok, write_error, changed = write_file_outcome(
+            function_location, write_new_source,
         )
+        return _agreed_error(
+            None if ok else RuntimeError(write_error),
+            f"Compiled cache write for {name}",
+        ), changed
 
     pass
 
@@ -1642,21 +1688,25 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
-    # Only a call that rewrites the source can leave a stale pyc behind, so only
-    # such a call needs to remove one. A warm retained cache is the common case
-    # and every process start walks it: deleting the pyc there forced CPython to
-    # recompile the whole generated module on every single import.
-    # The collective decision covers the normal path; the recovery paths below
-    # write a local file without it, so each one sets this too.
-    rewrote_cache_file = should_write_cache_file
+    # Only a call that actually changes the bytes on disk can leave a stale pyc
+    # behind, so only such a call needs to remove one. A warm cache is the common
+    # case and every process start walks it: deleting the pyc there forced CPython
+    # to recompile the whole generated module on every single import.
+    # This tracks the WRITE, not the decision: overwrite=True is the default for
+    # unsloth_compile_transformers and patch_lora_forwards, so the decision is
+    # always true for them even when write_file() finds the content identical and
+    # writes nothing.
+    rewrote_cache_file = False
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
             # The cache is already the per-node temp directory.
             cache_source, cache_file_digest = rank0_generated_source()
-            write_failure = write_node_local_file(function_location, cache_source)
+            write_failure, rewrote_cache_file = write_node_local_file(
+                function_location, cache_source,
+            )
         else:
-            wrote, write_error = distributed_function(
-                2, write_file_outcome, function_location, write_new_source,
+            wrote, write_error, rewrote_cache_file = distributed_function(
+                3, write_file_outcome, function_location, write_new_source,
             )
             write_failure = RuntimeError(write_error) if not wrote else None
         pass
@@ -1677,7 +1727,9 @@ def create_new_function(
             )
             function_location = os.path.join(compile_folder, f"{name}.py")
             cache_source, cache_file_digest = rank0_generated_source()
-            temp_failure = write_node_local_file(function_location, cache_source)
+            temp_failure, rewrote_cache_file = write_node_local_file(
+                function_location, cache_source,
+            )
             if temp_failure is not None:
                 raise temp_failure
             _verify_compiled_cache_file_collectively(
@@ -1702,12 +1754,11 @@ def create_new_function(
                 )
                 function_location = os.path.join(compile_folder, f"{name}.py")
             cache_file_digest = retained_digest
-            temp_failure = write_node_local_file(
+            temp_failure, rewrote_cache_file = write_node_local_file(
                 function_location, cache_source,
             )
             if temp_failure is not None:
                 raise temp_failure
-            rewrote_cache_file = True
             _verify_compiled_cache_file_collectively(
                 function_location, retained_digest, 0,
             )
@@ -1799,12 +1850,11 @@ def create_new_function(
                     )
                 cache_source, generated_digest = rank0_generated_source()
                 cache_file_digest = generated_digest
-                temp_failure = write_node_local_file(
+                temp_failure, rewrote_cache_file = write_node_local_file(
                     function_location, cache_source,
                 )
                 if temp_failure is not None:
                     raise temp_failure
-                rewrote_cache_file = True
                 _verify_compiled_cache_file_collectively(
                     function_location, generated_digest, 0,
                 )

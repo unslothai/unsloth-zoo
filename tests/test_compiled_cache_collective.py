@@ -415,18 +415,18 @@ def test_direct_recovery_invalidates_temp_folder_bytecode(
     assert getattr(updated, f"{name}_fn")(21) == 63
 
 
-def test_undeletable_bytecode_does_not_abandon_the_persistent_cache(
+def test_undeletable_stale_bytecode_does_not_abandon_the_persistent_cache(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """A pyc we cannot unlink must not cost the persistent cache.
+    """A pyc we cannot unlink but CPython would reject must cost nothing.
 
     On Windows `os.remove` raises PermissionError whenever any other handle is
     open on the file, which a virus scanner, a sync client or a second
     interpreter all do routinely, and the compiled-cache lock excludes none of
     them. Treating that as fatal moved the whole group onto tempfile recovery
     on the first occurrence and aborted the job on the second, so an import
-    that had always worked started failing. The rewritten source is newer than
-    the bytecode, so CPython recompiles regardless.
+    that had always worked started failing. Here the rewrite changed the source
+    size, so the pyc is already invalid and continuing is safe.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
@@ -449,20 +449,60 @@ def test_undeletable_bytecode_does_not_abandon_the_persistent_cache(
     assert getattr(module, f"{name}_fn")(21) == 42
 
 
-def test_warm_retained_cache_removes_no_bytecode(
-    monkeypatch, compiler, probe, cache_dirs,
+def test_undeletable_usable_bytecode_still_fails_over(
+    monkeypatch, compiler, probe, cache_dirs, tmp_path,
 ):
-    """A retained cache is imported as-is, bytecode included.
+    """A pyc CPython would still accept is the case the removal exists for.
+
+    Same size, same timestamp second: importlib accepts the old bytecode, so
+    source-digest verification would pass while this rank executes the previous
+    implementation. Tolerating the unlink failure here is the one shape that is
+    not safe, so it must still raise rather than warn.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    name = "pr967_usable_pyc"
+    probe(name, "return x * 2")
+
+    source = primary / f"{name}.py"
+    bytecode = pathlib.Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(str(source), cfile=str(bytecode), doraise=True)
+
+    # Compiled from this exact source, so the header records its mtime and size
+    # and CPython would load it. No stubbing needed to reach the unsafe shape.
+    assert compiler._bytecode_would_be_used(str(source), str(bytecode))
+
+    monkeypatch.setattr(
+        compiler.os, "remove",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            PermissionError("simulated locked pycache")),
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot remove stale bytecode"):
+        compiler._remove_compiled_cache_bytecode(str(source))
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_warm_cache_removes_no_bytecode(
+    monkeypatch, compiler, probe, cache_dirs, overwrite,
+):
+    """An unchanged cache is imported as-is, bytecode included.
 
     Every process start walks this path once per generated module. Deleting
     the pyc here forced CPython to re-parse and re-compile the whole generated
     source on every single import, and on Windows it is also the step that can
-    fail. Nothing is stale when nothing was rewritten, so nothing is removed.
+    fail.
+
+    overwrite=True is parametrised because it is the DEFAULT, and the one both
+    unsloth_compile_transformers and patch_lora_forwards use. It only grants
+    permission to rewrite; when write_file() finds the bytes identical it writes
+    nothing, so there is still no stale bytecode. Gating on the write decision
+    rather than on the write left this case removing the pyc every time.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
-    name = "pr967_warm_no_pyc_churn"
-    probe(name, "return x * 2", overwrite=False)
+    name = f"pr967_warm_no_pyc_churn_{int(overwrite)}"
+    probe(name, "return x * 2", overwrite=overwrite)
 
     removed = []
     real_remove = compiler.os.remove
@@ -474,11 +514,11 @@ def test_warm_retained_cache_removes_no_bytecode(
     monkeypatch.setattr(compiler.os, "remove", record_removal)
     sys.modules.pop(name, None)
 
-    module = probe(name, "return x * 2", overwrite=False)
+    module = probe(name, "return x * 2", overwrite=overwrite)
 
     assert getattr(module, f"{name}_fn")(21) == 42
     assert not [p for p in removed if p.endswith(".pyc")], (
-        f"a warm retained import removed bytecode: {removed}"
+        f"an unchanged import removed bytecode (overwrite={overwrite}): {removed}"
     )
 
 
@@ -746,7 +786,9 @@ def test_write_failure_recovers_to_node_local_temp(
         if getattr(function, "__name__", "") == "write_file_outcome" and (
             write_failure == "rank0-only" or args[0] == str(blocked)
         ):
-            return True, ""
+            # (ok, error, changed): rank 0 claims a clean write that never
+            # reached this rank's disk.
+            return True, "", True
         return real_distributed_function(n, function, *args, **kwargs)
 
     monkeypatch.setattr(
