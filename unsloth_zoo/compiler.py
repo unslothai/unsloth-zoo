@@ -1153,15 +1153,29 @@ def _retained_cache_source(function_location):
 pass
 
 def _remove_compiled_cache_bytecode(function_location):
-    """Remove this rank's timestamp-based pyc before loading verified source."""
+    """Remove this rank's timestamp-based pyc before loading rewritten source.
+
+    Only called when this invocation actually rewrote the source file, which is
+    the only time the pyc can be stale. CPython already recompiles on the mtime
+    and size it just saw change, so this is a backstop for the narrow case where
+    a same-size rewrite lands inside one timestamp tick.
+
+    A failure to unlink is therefore not fatal. On Windows `os.remove` raises
+    PermissionError (WinError 32) whenever another process holds the file, which
+    a virus scanner, a sync client or a concurrent interpreter routinely does,
+    and the file lock here cannot exclude any of them. Raising sent the whole
+    group into tempfile recovery on the first occurrence and aborted on the
+    second, turning an import that had always worked into a hard failure.
+    """
     try:
         os.remove(importlib.util.cache_from_source(function_location))
     except (FileNotFoundError, NotImplementedError):
         pass
     except OSError as error:
-        raise RuntimeError(
-            f"Unsloth: Cannot remove stale bytecode for {function_location}: {error}"
-        ) from error
+        logger.warning_once(
+            f"Unsloth: Cannot remove stale bytecode for {function_location}: "
+            f"{error}. Continuing, since the rewritten source is newer than it."
+        )
 pass
 
 def _verify_cache_digest_under_lock(function_location, expected_digest):
@@ -1628,6 +1642,13 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
+    # Only a call that rewrites the source can leave a stale pyc behind, so only
+    # such a call needs to remove one. A warm retained cache is the common case
+    # and every process start walks it: deleting the pyc there forced CPython to
+    # recompile the whole generated module on every single import.
+    # The collective decision covers the normal path; the recovery paths below
+    # write a local file without it, so each one sets this too.
+    rewrote_cache_file = should_write_cache_file
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
             # The cache is already the per-node temp directory.
@@ -1686,6 +1707,7 @@ def create_new_function(
             )
             if temp_failure is not None:
                 raise temp_failure
+            rewrote_cache_file = True
             _verify_compiled_cache_file_collectively(
                 function_location, retained_digest, 0,
             )
@@ -1708,7 +1730,8 @@ def create_new_function(
             with lock:
                 # Try standard import
                 _verify_cache_digest_under_lock(target_name, expected_digest)
-                _remove_compiled_cache_bytecode(target_name)
+                if rewrote_cache_file:
+                    _remove_compiled_cache_bytecode(target_name)
                 importlib.invalidate_caches()
                 new_module = importlib.import_module(name)
                 return new_module, old_path
@@ -1729,7 +1752,8 @@ def create_new_function(
         lock = get_lock(file_location)
         with lock:
             _verify_cache_digest_under_lock(file_location, expected_digest)
-            _remove_compiled_cache_bytecode(file_location)
+            if rewrote_cache_file:
+                _remove_compiled_cache_bytecode(file_location)
             spec = importlib.util.spec_from_file_location(module_name, file_location)
             new_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = new_module
@@ -1780,6 +1804,7 @@ def create_new_function(
                 )
                 if temp_failure is not None:
                     raise temp_failure
+                rewrote_cache_file = True
                 _verify_compiled_cache_file_collectively(
                     function_location, generated_digest, 0,
                 )
