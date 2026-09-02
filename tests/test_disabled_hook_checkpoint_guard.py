@@ -21,14 +21,10 @@ through `_give_up_at_compile_time`, the contract `_give_up_on_backend` already
 had. Before, that arm did `state["eager"] = True; return eager_func(...)` and
 never raised, never touched the global label sets, never restored the marker.
 
-That is a behaviour change in shared machinery used by every `fullgraph = True`
-patch in the package plus 14 sites in unsloth core, so the risk is NOT "does the
-new case work" but "does the old case still work". These tests are weighted
-accordingly.
-
-Written as a before/after pair and kept in that shape: each test says what the
-old arm did as well as what the new one does, so the reason for a branch is
-readable rather than inferred.
+That changes shared machinery used by every `fullgraph = True` patch here plus
+14 sites in unsloth core, so the risk is NOT "does the new case work" but "does
+the old case still work", and the tests are weighted accordingly. Each is
+written as a before/after pair so the reason for a branch is readable.
 """
 
 import sys
@@ -100,9 +96,7 @@ def _raiser(msg=DISABLE_MSG):
     return compiled
 
 
-# --------------------------------------------------------------------------
 # R1: the common case must not change. This is the regression that would hurt.
-# --------------------------------------------------------------------------
 
 def test_disabled_hook_outside_any_checkpoint_still_falls_back_to_eager():
     """The overwhelmingly common case: no checkpoint in sight. Both trees must
@@ -111,9 +105,9 @@ def test_disabled_hook_outside_any_checkpoint_still_falls_back_to_eager():
 
 
 def test_first_call_refusal_inside_checkpoint_still_falls_back():
-    """Nothing compiled has been packed by this label, so eager pack + eager
-    recompute agree and there is nothing to protect. Must not raise on either
-    tree, or every first-call user of a checkpointed fullgraph region breaks."""
+    """Nothing compiled was packed by this label, so eager pack + eager
+    recompute agree. Raising here would break every first-call user of a
+    checkpointed fullgraph region."""
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # a region is live
     assert LABEL not in U._COMPILED_OK_LABELS  # but WE never compiled ok
     assert _wrap(_raiser())() == "eager"
@@ -132,17 +126,12 @@ def test_an_unrelated_graph_break_still_raises():
         _wrap(_raiser("Unsupported: something else entirely"))()
 
 
-# --------------------------------------------------------------------------
 # R2: the new behaviour, only on the fix tree.
-# --------------------------------------------------------------------------
 
 def test_refusal_after_compiling_ok_inside_a_live_region():
-    """The bug. This label compiled fine, so a compiled pack is outstanding;
-    flipping to eager mid-region desynchronises pack and recompute.
-
-    main: silently returns eager (corruption).
-    fix:  raises, so the step ends honestly.
-    """
+    """The bug. This label compiled fine, so a compiled pack is outstanding and
+    flipping to eager mid-region desynchronises pack and recompute. main returns
+    eager silently (corruption); fix raises, so the step ends honestly."""
     U._COMPILED_OK_LABELS.add(LABEL)
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     w = _wrap(_raiser())
@@ -167,9 +156,9 @@ def test_fix_records_the_latch_in_the_global_label_sets():
 
 
 def test_a_new_wrapper_with_a_latched_label_starts_eager():
-    """Consequence of recording the latch: a rebuilt wrapper inherits it. That
-    is intended (the codegen arm has always behaved this way) but it means more
-    un-compilation than before, so it is pinned rather than left implicit."""
+    """Consequence of recording the latch: a rebuilt wrapper inherits it, as it
+    always has for the codegen arm. Intended, but more un-compilation than
+    before, so pinned rather than left implicit."""
     _wrap(_raiser())()
     second = _wrap(lambda *a, **k: "compiled-should-not-run")
     if IS_FIX:
@@ -178,13 +167,11 @@ def test_a_new_wrapper_with_a_latched_label_starts_eager():
         assert second() == "compiled-should-not-run"
 
 
-# --------------------------------------------------------------------------
 # R3: blast radius. Only THIS label may latch.
-# --------------------------------------------------------------------------
 
 def test_only_this_label_latches_not_every_borrower():
-    """Budget exhaustion is process wide and takes other borrowers with it. A
-    compile-time refusal is one region's property, so unrelated labels must keep
+    """Budget exhaustion is process wide and takes other borrowers with it; a
+    compile-time refusal is one region's property, so unrelated labels keep
     their compilation."""
     other = "SimOther"
     for s in (U._LATCHED_EAGER_LABELS, U._RECENT_EAGER_LABELS):
@@ -200,14 +187,12 @@ def test_only_this_label_latches_not_every_borrower():
             s.discard(other)
 
 
-# --------------------------------------------------------------------------
 # R4: the marker must be restored, not leaked.
-# --------------------------------------------------------------------------
 
 def test_marker_is_restored_to_what_it_was():
     """The arm captures the marker before the compiled call and puts it back.
-    Leaving it set would make a later wrapper believe a compiled pack is
-    outstanding and end a step that was fine."""
+    Left set, a later wrapper believes a compiled pack is outstanding and ends
+    a step that was fine."""
     U._PACKED_COMPILED_IN_CHECKPOINT = False
     _wrap(_raiser())()
     assert U._PACKED_COMPILED_IN_CHECKPOINT is False
@@ -220,9 +205,7 @@ def test_marker_true_is_preserved_when_no_raise_happens():
     assert U._PACKED_COMPILED_IN_CHECKPOINT is True
 
 
-# --------------------------------------------------------------------------
 # R5: the codegen arm this now shares a body with must be unchanged.
-# --------------------------------------------------------------------------
 
 def test_backend_refusal_arm_still_behaves():
     """`_give_up_on_backend` was refactored, not redefined. Its own path must
@@ -244,9 +227,7 @@ def test_backend_refusal_arm_still_behaves():
     assert out == "eager"
 
 
-# --------------------------------------------------------------------------
-# Platform: the changed code has no platform branch. Prove it rather than say it.
-# --------------------------------------------------------------------------
+# Platform: the changed code has no platform branch. Prove it, do not say it.
 
 def test_changed_path_has_no_platform_or_device_branch():
     import inspect
@@ -260,17 +241,15 @@ def test_changed_path_has_no_platform_or_device_branch():
 
 
 def test_conservative_when_another_region_packed_compiled_this_step():
-    """Characterises the one place the fix is deliberately pessimistic.
+    """The one place the fix is deliberately pessimistic.
 
-    `_PACKED_COMPILED_IN_CHECKPOINT` is process-global for the step, and
-    `_COMPILED_OK_LABELS` is sticky for the process. So if this label compiled
-    successfully at ANY earlier point, and ANY compiled call packed under a
-    checkpoint this step, the arm raises even though this particular wrapper may
-    have packed nothing in this region.
+    `_PACKED_COMPILED_IN_CHECKPOINT` is global for the step and
+    `_COMPILED_OK_LABELS` sticky for the process, so if this label ever compiled
+    ok and ANY compiled call packed under a checkpoint this step, the arm raises
+    even though this wrapper may have packed nothing in this region.
 
-    That is the same trade `_give_up_on_backend` has always made, not a new one:
-    ending a step that was probably fine is cheap, returning wrong gradients is
-    not. Pinned so the choice is visible rather than discovered later.
+    Same trade `_give_up_on_backend` has always made: ending a probably-fine
+    step is cheap, wrong gradients are not. Pinned so the choice is visible.
     """
     U._COMPILED_OK_LABELS.add(LABEL)          # compiled fine earlier
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # some region packed compiled
