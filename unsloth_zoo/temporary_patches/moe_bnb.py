@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Any, Tuple
 import os
 import warnings
-from ..log import logger
+from unsloth_zoo.log import logger
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 
@@ -37,7 +37,8 @@ try:
     from bitsandbytes.nn import Params4bit
     from bitsandbytes.functional import dequantize_4bit
     HAS_BNB = True
-except ImportError:
+except Exception:
+    # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
     Params4bit = None
 

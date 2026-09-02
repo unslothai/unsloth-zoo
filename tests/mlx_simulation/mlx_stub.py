@@ -71,7 +71,13 @@ class _PermissiveModule(types.ModuleType):
     def __getattr__(self, name):
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
-        return _Noop(f"{self.__name__}.{name}")
+        # Cached, so a module attribute has stable identity the way a real
+        # module's does. Without this, `getattr(mx, n) is getattr(mx, n)` is
+        # False for anything unimplemented, and code that saves an attribute and
+        # later asserts it was restored can never pass under the shim.
+        value = _Noop(f"{self.__name__}.{name}")
+        setattr(self, name, value)
+        return value
 
 
 class _Noop:
@@ -165,10 +171,18 @@ def __getattr__(name):
 
     This is what makes `mx.some_op_we_havent_implemented_yet` not crash
     at import time but raise with a clear name when actually called.
+
+    The sentinel is cached into the module so repeated lookups return the SAME
+    object, the way a real module's attributes do. Production code that wraps an
+    `mx.*` op and later restores it compares identity to prove the restore
+    happened; with a fresh sentinel per lookup that comparison can never hold and
+    the shim fails such a test no matter how correct the code is.
     """
     if name.startswith("__") and name.endswith("__"):
         raise AttributeError(name)
-    return _Noop(f"mlx.core.{name}")
+    value = _Noop(f"mlx.core.{name}")
+    globals()[name] = value
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +375,11 @@ class array(metaclass=_ArrayMeta):
         if data is None:
             return torch.tensor([])
         if isinstance(data, torch.Tensor):
-            return data.to(dtype) if dtype is not None else data
+            # A copy, as mlx's own constructor is: `mx.array(a)` builds a fresh array,
+            # so a later `a += b` (which reassigns only a's descriptor) cannot write
+            # through it. Aliasing `data` disarmed every defensive copy under test.
+            out = data.to(dtype) if dtype is not None else data
+            return out.clone() if out is data else out
         return torch.tensor(data, dtype=dtype)
 
 

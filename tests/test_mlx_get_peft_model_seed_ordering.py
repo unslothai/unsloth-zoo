@@ -15,8 +15,11 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
-    simulate_mlx_on_torch()
+    try:
+        import mlx  # noqa: F401
+    except ImportError:
+        from mlx_simulation import simulate_mlx_on_torch
+        simulate_mlx_on_torch()
 
 
 def _get_peft_model_source():
@@ -69,7 +72,8 @@ def test_no_other_mlx_op_between_seed_and_linear_to_lora_layers():
     pattern = re.compile(
         r"_seed_mlx_random_state\(random_state\)\s*"
         r"(?:\n\s*#[^\n]*)*"
-        r"\s*\n\s*linear_to_lora_layers\(",
+        r"\s*\n\s*(?:[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*=\s*)?"
+        r"linear_to_lora_layers\(",
     )
     matches = pattern.findall(src)
     assert len(matches) >= 2, (

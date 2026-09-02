@@ -35,12 +35,25 @@ import textwrap
 import pytest
 
 
-# Disable torch.compile so we only exercise the source rewrite + ast.parse.
-os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
-
-
 transformers = pytest.importorskip("transformers")
 compiler = pytest.importorskip("unsloth_zoo.compiler")
+
+
+@pytest.fixture(autouse = True)
+def _compile_disabled(monkeypatch):
+    """Disable torch.compile so we only exercise the source rewrite + ast.parse.
+
+    A fixture rather than the `os.environ.setdefault` this used to do at module
+    scope. That ran during collection, in every xdist worker, and wrote through
+    to the real process environment for the rest of the session: every module
+    collected after this one, and every subprocess any of them spawn, inherited
+    a compile-disabled environment they never asked for. What saved the suite
+    was that `conftest.py` imports unsloth first, so
+    `temporary_patches/common.py` had already latched the variable's real value
+    at import; if that import ever fails, collection order decides the result
+    instead. Scoped and undone here, the setting reaches only this module.
+    """
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
 
 
 # Model types the zoo compiler drives end-to-end (from
@@ -100,6 +113,14 @@ def _load_modeling(model_type: str):
         pytest.skip(
             f"model_type {model_type} not present on installed "
             f"transformers, can't drive compiler"
+        )
+    except ImportError as exc:
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
+        pytest.skip(
+            f"model_type {model_type} raised on import, so the compiler cannot "
+            f"be driven for it: {type(exc).__name__}: {exc}"
         )
 
 
@@ -533,6 +554,14 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
         pytest.skip(
             f"model_type {model_type} not present on installed "
             f"transformers, can't drive compiler"
+        )
+    except ImportError as exc:
+        # Present but raising on the way in: gemma3n's config imports
+        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
+        # drive either way, but say which.
+        pytest.skip(
+            f"model_type {model_type} raised on import, so the compiler cannot "
+            f"be driven for it: {type(exc).__name__}: {exc}"
         )
     if hasattr(mod, "__UNSLOTH_PATCHED__"):
         try:

@@ -26,11 +26,16 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from unsloth_zoo.temporary_patches.common import (
+    torch_compile_options,
+    _maybe_compile,
+)
+
+
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -40,7 +45,7 @@ def selective_log_softmax(logits, index):
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
@@ -67,7 +72,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -77,10 +82,46 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    # Rows per chunk cap. Read HERE, in the default, not in the body: the body
+    # is traced with fullgraph = True, and `os.environ` is an unsupported op
+    # there on torch 2.4 -- Dynamo raises
+    #   torch._dynamo.exc.Unsupported: const method call bytes.decode
+    # from os._Environ.__getitem__, which the eager fallback does not catch
+    # (it only catches recompile-limit and disabled-hook breaks), so the very
+    # first call would die even with the variable unset. A default is evaluated
+    # once when the def runs, which is import time, outside any traced region.
+    # It is also a plain int argument, so Dynamo guards on it instead of
+    # constant-folding an unguarded read (2.7+ never notice a later change).
+    # A non-numeric value is ignored rather than raised on, so a typo cannot
+    # break the import. 0 keeps the previous chunk boundaries exactly.
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
+    # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
+    # cannot have its row count silently rewritten and instead fails at the
+    # matmul below, which prints both operands. Do not swap in a bare
+    # torch._check: it reports only "Expected cond to be True", naming neither
+    # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
+    # the width first -- see `compute_logprobs_chunk`, the packed path and
+    # `_pg_grad_forward`.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
+
+    # Each chunk materialises rows x vocab logits and then a float32 copy of
+    # them, all on the device holding the output head. With a large vocabulary
+    # and a fixed chunk count that grows with the batch, so the peak scales with
+    # the batch rather than staying bounded. max_rows_per_chunk caps the rows
+    # per chunk instead, which is pure loop splitting: more, smaller chunks,
+    # same concatenated result. 0 (the default) keeps the previous chunk
+    # boundaries exactly.
+    if max_rows_per_chunk > 0:
+        n_rows = flat_hidden_states.shape[0]
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
+        chunks = min(chunks, max(n_rows, 1))
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
@@ -88,7 +129,17 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        # When the model is dispatched over several devices, the output head can
+        # sit on a different one from the hidden states, because accelerate
+        # places the tail of the model on the last device it fills. Co-locate on
+        # the head's device before the matmul, otherwise this raises
+        #   Unhandled FakeTensor Device Propagation for aten.mm.default,
+        #   found two different devices cuda:0, cuda:1
+        # On a single device every .to() here is a no-op and the result is
+        # bit-identical to before.
+        chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+        chunk_index = chunk_index.to(lm_head.device)
+        chunk_logits = chunk_hidden_states @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -105,7 +156,9 @@ def chunked_hidden_states_selective_log_softmax(
         selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
         per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
+        # Return to the caller's device so the concatenation below and every
+        # downstream consumer see the device they started on.
+        all_per_token_logps.append(per_token_logps.to(hidden_states.device))
 
     all_per_token_logps = torch.concat(all_per_token_logps)
 
@@ -392,7 +445,10 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    vllm_importance_sampling_mode = kwargs.get("vllm_importance_sampling_mode", "sequence_mask")
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
+    vllm_importance_sampling_clip_min = kwargs.get("vllm_importance_sampling_clip_min", None)
+    vllm_importance_sampling_clip_max = kwargs.get("vllm_importance_sampling_clip_max", 3.0)
     get_sapo_token_loss = kwargs.get("get_sapo_token_loss", None)
     sapo_temperature_pos = kwargs.get("sapo_temperature_pos", 1.0)
     sapo_temperature_neg = kwargs.get("sapo_temperature_neg", 1.05)
@@ -404,6 +460,8 @@ def grpo_compute_loss(
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
     input_ids = input_ids.unsqueeze(-1)
+
+    importance_sampling_ratio = None
 
     # exp(new - old) and exp(ref - new) below are taken before `mask` is applied. A sequence-packed
     # logp path leaves the masked (prompt/pad) columns at 0 while a padded one fills them with a real
@@ -431,10 +489,44 @@ def grpo_compute_loss(
     with torch.no_grad():
         if use_vllm and sampling_per_token_logps is not None:
             # Filter out extra leading prompt tokens after left-padding input_ids.
-            importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
-            importance_sampling_ratio = torch.clamp(
-                importance_sampling_ratio, max=vllm_importance_sampling_cap
-            )
+            # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
+            importance_sampling_ratio = (old - sampling_per_token_logps) * mask
+
+            if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
+                importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
+
+            importance_sampling_ratio = torch.exp(importance_sampling_ratio)
+
+            if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate"]:
+                importance_sampling_ratio = torch.clamp(
+                    importance_sampling_ratio, 
+                    min=vllm_importance_sampling_clip_min,
+                    max=vllm_importance_sampling_clip_max
+                )
+            elif vllm_importance_sampling_mode in ["token_mask", "sequence_mask"]:
+                min_val = (
+                    vllm_importance_sampling_clip_min
+                    if vllm_importance_sampling_clip_min is not None
+                    else -math.inf
+                )
+
+                max_val = (
+                    vllm_importance_sampling_clip_max
+                    if vllm_importance_sampling_clip_max is not None
+                    else math.inf
+                )
+
+                invalid_mis_mask = (importance_sampling_ratio < min_val) | (
+                        importance_sampling_ratio > max_val
+                )
+
+                importance_sampling_ratio = importance_sampling_ratio.masked_fill(
+                        invalid_mis_mask, value=0.0
+                )
+            else:
+                raise ValueError(
+                        f"Unknown vLLM importance sampling mode: {vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                )
     pass
 
     # Must detach when old is None: exp(new - new.detach()) == 1 but keeps grads correct.
@@ -470,7 +562,7 @@ def grpo_compute_loss(
     if loss_type == "cispo":
         clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
         loss_i = -clamped_ratios * advantages * new
-    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+    elif loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
         coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
         if delta is not None:
@@ -481,20 +573,9 @@ def grpo_compute_loss(
         loss_2 = coef_2 * advantages
         loss_i = -torch.min(loss_1, loss_2)
     elif loss_type == "sapo":
-        if get_sapo_token_loss is None:
-            raise Exception(f"sapo is only available in TRL 0.26.0+")
-        loss_i = torch.empty_like(coef_1)
-        positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
-        # With n_chunks some tensors may be empty; guard the indexing.
-        if coef_1[positive_advantages_mask].numel() != 0:
-            loss_i[positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[positive_advantages_mask], sapo_temperature_pos
-            )
-        if coef_1[~positive_advantages_mask].numel() != 0:
-            loss_i[~positive_advantages_mask] = get_sapo_token_loss(
-                coef_1[~positive_advantages_mask], sapo_temperature_neg
-            )
-        loss_i = -loss_i * advantages
+        temperatures = torch.where(advantages > 0, sapo_temperature_pos, sapo_temperature_neg)
+        soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
+        loss_i = -soft_coef_1 * advantages
     elif loss_type == "vespo":
         if get_gamma_weights is None:
             raise Exception("vespo is only available in TRL 0.26.0+")
@@ -502,7 +583,7 @@ def grpo_compute_loss(
             advantages=advantages,
             log_ratio_per_token=log_ratio,
             mask=mask,
-            importance_sampling_ratio=kwargs.get("importance_sampling_ratio"),
+            importance_sampling_ratio=importance_sampling_ratio,
             k_pos=vespo_k_pos,
             lambda_pos=vespo_lambda_pos,
             k_neg=vespo_k_neg,
@@ -516,7 +597,9 @@ def grpo_compute_loss(
         loss_i = loss_i * off_policy_mask
 
     if use_vllm and sampling_per_token_logps is not None:
-        loss_i = loss_i * importance_sampling_ratio
+        # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
+        if loss_type != "vespo":
+            loss_i = loss_i * importance_sampling_ratio
         # delta for the metric.
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
@@ -544,6 +627,10 @@ def grpo_compute_loss(
     elif loss_type in ["cispo", "dapo", "vespo"]:
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
+    elif loss_type == "luspo":
+        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        normalizer = current_gradient_accumulation_steps
+        loss = loss / normalizer
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -561,8 +648,11 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
+    f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -629,13 +719,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
-            accumulate_chunk,
+        from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
+        accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )
+        )(accumulate_chunk)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
@@ -751,7 +841,11 @@ def grpo_accumulated_loss(
 
     # Pop from kwargs to avoid downstream issues.
     _ = kwargs.pop("sampling_per_token_logps", None)
-    kwargs["vllm_importance_sampling_cap"] = trainer.vllm_importance_sampling_cap if sampling_per_token_logps is not None else None
+    kwargs["vllm_importance_sampling_cap"] = getattr(trainer.args, "vllm_importance_sampling_cap", None)
+    # Older TRL lacks this arg; fall back to token_truncate (legacy clamp(max=cap) behavior).
+    kwargs["vllm_importance_sampling_mode"] = getattr(trainer.args, "vllm_importance_sampling_mode", None) or "token_truncate"
+    kwargs["vllm_importance_sampling_clip_min"] = getattr(trainer.args, "vllm_importance_sampling_clip_min", None)
+    kwargs["vllm_importance_sampling_clip_max"] = getattr(trainer.args, "vllm_importance_sampling_clip_max", None)
     kwargs["get_sapo_token_loss"] = trainer.get_sapo_token_loss if hasattr(trainer, "get_sapo_token_loss") else None
     kwargs["sapo_temperature_pos"] = trainer.args.sapo_temperature_pos if hasattr(trainer.args, "sapo_temperature_pos") else None
     kwargs["sapo_temperature_neg"] = trainer.args.sapo_temperature_neg if hasattr(trainer.args, "sapo_temperature_neg") else None
@@ -767,6 +861,10 @@ def grpo_accumulated_loss(
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
     n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+
+    if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
+        kwargs["vllm_importance_sampling_clip_min"] = 0
+        kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
 
     if not hasattr(trainer, '_autocast_dtype'):
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
@@ -1114,11 +1212,23 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
-                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
-                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                    )[0]
+                    # `.logits` carries hidden states only when the forward is the
+                    # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                    # otherwise it is real [T, vocab] logits and the lm_head matmul
+                    # dies. Dispatch on width, as the padded path already does.
+                    _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
+                    _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                    if _pack_h.shape[-1] == lm_head.shape[1]:
+                        _pack_sel = chunked_hidden_states_selective_log_softmax(
+                            _pack_h, lm_head, _pack_tid, _pack_chunks,
+                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                        )[0]
+                    else:
+                        # Raw logits: the forward already applied scale/softcap.
+                        _pack_sel = chunked_selective_log_softmax(
+                            _pack_h, _pack_tid,
+                            temperature = temperature, chunks = _pack_chunks,
+                        )[0]
                 # GPT-OSS offload race guard (matches the padded loop)
                 device_synchronize()
                 # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
@@ -1144,10 +1254,19 @@ def grpo_accumulated_loss(
                             _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                             _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                             _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
-                            _pack_rsel = chunked_hidden_states_selective_log_softmax(
-                                _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
-                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            )[0]
+                            # same width dispatch as the packed call above: this forward
+                            # returns raw logits whenever that one did, and the first
+                            # packed batch always lands here
+                            if _pack_rh.shape[-1] == lm_head.shape[1]:
+                                _pack_rsel = chunked_hidden_states_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                )[0]
+                            else:
+                                _pack_rsel = chunked_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], _pack_real[:, 1:],
+                                    temperature = temperature, chunks = 1,
+                                )[0]
                             _pack_rcols = _pack_rmask.nonzero(as_tuple = False).squeeze(1)[1:] - (_pack_L - _pack_W)
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
@@ -1208,8 +1327,21 @@ def grpo_accumulated_loss(
                 prefix_seg_info = _pg_layout.prefix_seg_info,
                 use_cache = False,
             ).logits
+            # Same width dispatch as the packed path and compute_logprobs_chunk.
+            # `.logits` carries hidden states only when the forward is the Unsloth
+            # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
+            # real [T, vocab] logits. extract_logps always calls its helper as
+            # (hidden, lm_head, ids, chunks, ...), so pass a raw-logits helper with
+            # that same signature, which skips the lm_head matmul and the scale /
+            # softcap the forward already applied.
+            _pg_fn = chunked_hidden_states_selective_log_softmax
+            if _h.shape[-1] != lm_head.shape[1]:
+                def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
+                    return chunked_selective_log_softmax(
+                        _pg_h, _pg_ids, temperature = _pg_t, chunks = _pg_n,
+                    )
             _pg_lp = _pg_layout.extract_logps(
-                _h, lm_head, chunked_hidden_states_selective_log_softmax,
+                _h, lm_head, _pg_fn,
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad
@@ -1304,6 +1436,16 @@ def grpo_accumulated_loss(
         if tensor is None: return None
         return tensor.to(device, non_blocking=non_blocking)
 
+    def _offload_device_module(tensor_or_device):
+        # Stream/Event module for the offload copy. torch.cuda is also the HIP
+        # backend, so ROCm reports is_cuda and needs no branch of its own; XPU has
+        # its own namespace, matching gradient_checkpointing.py. Anything else
+        # (CPU, MPS, ...) returns None and takes the pageable copy.
+        device = getattr(tensor_or_device, "device", tensor_or_device)
+        if device.type == "cuda": return torch.cuda
+        if device.type == "xpu": return getattr(torch, "xpu", None)
+        return None
+
     class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
         """Manual gradient checkpointing / CPU offloading for log softmax."""
         @staticmethod
@@ -1311,9 +1453,46 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             # Detach so we don't keep the graph (and extra memory) on CPU.
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
+            detached_hidden_states = hidden_states.detach().contiguous()
             ctx.device = hidden_states.device
-            ctx.dtype = hidden_states.dtype
+            ctx.copy_event = None
+
+            # Always offload: this path only runs when the caller is already memory bound
+            # (long completions / large batches), so the win is overlapping the copy.
+            saved_hidden_states = None
+            device_module = _offload_device_module(detached_hidden_states)
+            if device_module is not None:
+                # Async D2H on a side stream; backward MUST wait on copy_event before
+                # the H2D reload or it races the copy.
+                try:
+                    pinned_buffer = torch.empty_like(detached_hidden_states, device = "cpu", pin_memory = True)
+                    if pinned_buffer is not None:
+                        current_stream = device_module.current_stream(detached_hidden_states.device)
+                        copy_stream = device_module.Stream(device = detached_hidden_states.device)
+                        copy_stream.wait_stream(current_stream)
+                        with device_module.stream(copy_stream):
+                            pinned_buffer.copy_(detached_hidden_states, non_blocking = True)
+                        # Keeps the GPU storage alive until the side-stream copy finishes.
+                        detached_hidden_states.record_stream(copy_stream)
+                        copy_event = device_module.Event()
+                        copy_event.record(copy_stream)
+                        saved_hidden_states = pinned_buffer
+                        ctx.copy_event = copy_event
+                except (RuntimeError, OSError, AttributeError):
+                    # Any accelerator that cannot do pinned side-stream copies falls
+                    # back below; correctness never depends on this path.
+                    saved_hidden_states = None
+                    ctx.copy_event = None
+            if saved_hidden_states is None:
+                # No accelerator, or the async copy is unavailable: pageable copy.
+                saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
+            ctx.saved_hidden_states = saved_hidden_states
+            # Drop the clone before the log-softmax below. hidden_states is usually a
+            # [:, :-1, :] slice, so .contiguous() allocated a full copy; holding the
+            # reference across the forward would keep it resident alongside the chunk
+            # logits. record_stream still blocks reuse until the D2H lands, so the
+            # allocator reclaims it mid-compute rather than at the end of forward.
+            del detached_hidden_states
 
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad
@@ -1329,17 +1508,20 @@ def grpo_accumulated_loss(
 
         @staticmethod
         def backward(ctx, grad_output):
+            if ctx.copy_event is not None:
+                # The offload copy must land before the H2D reload.
+                device_module = _offload_device_module(ctx.device)
+                ctx.copy_event.wait(device_module.current_stream(ctx.device))
             hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
-            hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
 
             lm_head = ctx.lm_head
-            # #Possibly redundant lines
-            # if ctx.lm_head_requires_grad:
-            #     hidden_states.requires_grad_(True)
-            # else:
-            #     lm_head = lm_head.detach()
-
+            if ctx.lm_head_requires_grad:
+                # Recompute against a private leaf. A Tensor.register_hook on the real
+                # lm_head fires for tensors named in autograd.grad's inputs, so reusing
+                # it here would run a user's grad mask / scaler once on this local
+                # gradient and again when the returned gradient reaches lm_head.
+                lm_head = lm_head.detach().requires_grad_(True)
             index = ctx.index
 
             with torch.enable_grad():
@@ -1347,11 +1529,17 @@ def grpo_accumulated_loss(
                     hidden_states, lm_head, index, *ctx.args
                 )
 
-            torch.autograd.backward(output, grad_output)
+            # autograd.grad, not backward: backward writes into leaf .grad, which the
+            # outer AccumulateGrad would then double-count.
+            grad_inputs = torch.autograd.grad(
+                output,
+                (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
+                grad_output,
+            )
 
             return (
-                hidden_states.grad,
-                lm_head.grad if ctx.lm_head_requires_grad else None,
+                grad_inputs[0],
+                grad_inputs[1] if ctx.lm_head_requires_grad else None,
                 None,
                 None,
                 None,

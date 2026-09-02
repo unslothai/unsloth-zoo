@@ -17,6 +17,9 @@
 __all__ = [
     "convert_to_gguf",
     "quantize_gguf",
+    "resolve_imatrix_file",
+    "quant_requires_imatrix",
+    "IMATRIX_REQUIRED_QUANTS",
     "use_local_gguf",
     "install_llama_cpp",
     "check_llama_cpp",
@@ -121,16 +124,38 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+#
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
@@ -1479,26 +1504,106 @@ def install_llama_cpp(
 pass
 
 
-def _load_module_from_path(filepath, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, filepath)
-    if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
-    module = importlib.util.module_from_spec(spec)
-    script_dir = os.path.dirname(os.path.abspath(filepath))
-    original_path = sys.path[:]
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    # Register module before execution to handle circular imports within the script if any
-    sys.modules[module_name] = module
+def _extract_archs_from_monolith_source(source_bytes):
+    """Read (text_archs, vision_archs) out of a monolithic convert_hf_to_gguf.py.
+
+    Parsed, not imported: the file is downloaded from llama.cpp master at
+    runtime, so importing it would execute whatever the download contained.
+    Mirrors _extract_dict_keys_from_conversion_init for the package layout.
+    """
     try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        # Clean up registry if exec fails
-        del sys.modules[module_name]
-        raise ImportError(f"Failed to execute module {module_name} from {filepath}") from e
-    finally:
-        sys.path[:] = original_path
-    return module
+        tree = ast.parse(source_bytes)
+    except Exception:
+        return set(), set()
+
+    text_archs   = set()
+    vision_archs = set()
+
+    def _is_register_call(node):
+        # Matches ModelBase.register(...) / Model.register(...) / <X>.register(...)
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register"
+            and isinstance(node.func.value, ast.Name)
+        )
+
+    def _base_names(class_node):
+        names = []
+        for base in class_node.bases:
+            if   isinstance(base, ast.Attribute): names.append(base.attr)
+            elif isinstance(base, ast.Name):      names.append(base.id)
+        return names
+
+    # class -> bases, so a class two hops below MmprojModel still counts as vision.
+    class_bases = {
+        node.name : _base_names(node)
+        for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    }
+
+    def _inherits_mmproj(class_name, _seen = None):
+        if _seen is None: _seen = set()
+        if class_name in _seen: return False
+        _seen.add(class_name)
+        for base in class_bases.get(class_name, []):
+            if base.lower() in ("mmprojmodel", "visionmodel"): return True
+            if _inherits_mmproj(base, _seen): return True
+        return False
+
+    def _is_mmproj(class_node, call_node):
+        for keyword in call_node.keywords:
+            if keyword.arg != "model_type": continue
+            value = keyword.value
+            # model_type=ModelType.MMPROJ, or a bare MMPROJ / "mmproj"
+            name = None
+            if isinstance(value, ast.Attribute): name = value.attr
+            elif isinstance(value, ast.Name): name = value.id
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = value.value
+            # An explicit model_type wins over the base classes.
+            if name is not None: return "mmproj" in name.lower()
+        return _inherits_mmproj(class_node.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef): continue
+        for decorator in node.decorator_list:
+            if not _is_register_call(decorator): continue
+            names = [
+                arg.value for arg in decorator.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            ]
+            if not names: continue
+            if _is_mmproj(node, decorator): vision_archs.update(names)
+            else: text_archs.update(names)
+
+    # A converter may seed `_model_classes` literally instead of decorating. The
+    # import path saw those entries, so harvest them rather than report nothing.
+    def _bucket_for(key_node):
+        name = None
+        if   isinstance(key_node, ast.Attribute): name = key_node.attr
+        elif isinstance(key_node, ast.Name):      name = key_node.id
+        elif isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+            name = key_node.value
+        if name is None: return None
+        return vision_archs if "mmproj" in name.lower() else text_archs
+
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else \
+                  [node.target] if isinstance(node, ast.AnnAssign) else []
+        named = any(
+            (isinstance(t, ast.Name) and t.id == "_model_classes") or
+            (isinstance(t, ast.Attribute) and t.attr == "_model_classes")
+            for t in targets
+        )
+        if not named or not isinstance(node.value, ast.Dict): continue
+        for key, value in zip(node.value.keys, node.value.values):
+            bucket = _bucket_for(key)
+            if bucket is None or not isinstance(value, ast.Dict): continue
+            bucket.update(
+                k.value for k in value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            )
+    return text_archs, vision_archs
 pass
 
 
@@ -1674,8 +1779,6 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     supported_types = set()
     text_archs = set()
     vision_archs = set()
-    temp_original_file_path = None # for the finally block
-    original_module_name = None    # Only set on the monolith branch
     # Default to 'monolith' so a failed introspection still drives the legacy
     # patches; set by introspection and read by Patch 2 + Patch 3 below.
     _layout = "monolith"
@@ -1737,63 +1840,15 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     "allowlist will be empty; conversion will still attempt to run."
                 )
         else:
-            # Monolith layout: original behaviour. Write the entrypoint to a
-            # temp file under LLAMA_CPP_DEFAULT_DIR and import it to read
-            # ModelBase._model_classes.
-            with tempfile.NamedTemporaryFile(
-                mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
-            ) as temp_file:
-                temp_original_file_path = temp_file.name
-                temp_file.write(original_content)
-                temp_file.flush()
-
-            logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
-            original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
-
-            # Set NO_LOCAL_GGUF to prevent the script from adding path again
-            old_env = os.environ.get('NO_LOCAL_GGUF')
-            os.environ['NO_LOCAL_GGUF'] = '1'
-
-            try:
-                module = _load_module_from_path(temp_original_file_path, original_module_name)
-            finally:
-                if old_env is None:
-                    os.environ.pop('NO_LOCAL_GGUF', None)
-                else:
-                    os.environ['NO_LOCAL_GGUF'] = old_env
-            ModelBase = getattr(module, 'ModelBase', None)
-            ModelType = getattr(module, 'ModelType', None)
-
-            if ModelBase is None or ModelType is None:
-                logger.warning(
-                    f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
-                    f"Structure might have changed. Cannot determine supported architectures."
-                )
-            elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
-                 logger.warning(
-                    f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
-                     " Cannot determine supported architectures."
-                )
-            else:
-                # Check for TEXT models
-                if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
-                        text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
-                        supported_types.update(text_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
-                else:
-                    logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
-
-                # Check for VISION models
-                if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
-                        vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
-                        supported_types.update(vision_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
-                else:
-                     logger.info("Unsloth: No VISION model architectures found registered in the original script.")
+            # Monolith layout: read the registrations out of the entrypoint. It is
+            # downloaded from llama.cpp master at runtime, so parse, never import.
+            text_archs, vision_archs = _extract_archs_from_monolith_source(original_content)
+            supported_types.update(text_archs)
+            supported_types.update(vision_archs)
+            if not text_archs:
+                logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+            if not vision_archs:
+                logger.info("Unsloth: No VISION model architectures found registered in the original script.")
         # --- End Architecture Extraction ---
 
         # Convert final set to frozenset for immutability (good practice for cache keys/return values)
@@ -1806,23 +1861,9 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
-        # Cleanup module reference (only set on the monolith branch)
-        if original_module_name is not None and original_module_name in sys.modules:
-             del sys.modules[original_module_name]
-
     except Exception as e:
          logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
-         if temp_original_file_path and os.path.exists(temp_original_file_path):
-             try: os.remove(temp_original_file_path)
-             except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
          raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
-    finally:
-        if temp_original_file_path and os.path.exists(temp_original_file_path):
-            try:
-                os.remove(temp_original_file_path)
-                logger.debug(f"Cleaned up temporary file: {temp_original_file_path}")
-            except OSError as remove_error:
-                logger.warning(f"Could not remove temporary file {temp_original_file_path}: {remove_error}")
 
 
     # --- Proceed with patching and saving ---
@@ -2244,6 +2285,238 @@ def _reinstall_converter_deps(python_exe, print_output = False):
     return result
 
 
+def _has_mtp_weight_tensors(input_folder, num_layers):
+    """Return whether the checkpoint's tensor names include an MTP layer."""
+    input_folder = Path(input_folder)
+    _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+
+    def _is_mtp(name):
+        # Match the converter's TextModel.filter_tensors normalization.
+        name = name.replace("language_model.", "")
+        if name.startswith(("mtp.", "model.mtp.")):
+            return True
+        m = _layer_re.match(name)
+        return m is not None and int(m.group(1)) >= num_layers
+
+    def _inspection_error(path):
+        return RuntimeError(
+            f"Unsloth: Could not inspect `{path.name}` for MTP tensors; "
+            "`config.json` was not changed."
+        )
+
+    def _names_from_index(index_path):
+        try:
+            with index_path.open("r", encoding = "utf-8") as f:
+                index = json.load(f)
+        except Exception as error:
+            raise _inspection_error(index_path) from error
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise _inspection_error(index_path)
+        return weight_map.keys()
+
+    parts = sorted(input_folder.glob("model*.safetensors"))
+    if parts:
+        index_path = input_folder / "model.safetensors.index.json"
+        # llama.cpp gives the canonical index precedence whenever any
+        # safetensors part exists, including alongside model.safetensors.
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        from safetensors import safe_open
+
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    if any(_is_mtp(name) for name in f.keys()):
+                        return True
+            except Exception as error:
+                raise _inspection_error(part) from error
+        return False
+
+    parts = sorted(input_folder.glob("pytorch_model*.bin"))
+    if parts:
+        index_path = input_folder / "pytorch_model.bin.index.json"
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        if torch is None:
+            raise RuntimeError("Unsloth: PyTorch is required to inspect `.bin` model weights.")
+        for part in parts:
+            try:
+                state_dict = torch.load(
+                    part,
+                    map_location = "cpu",
+                    mmap = True,
+                    weights_only = True,
+                )
+            except Exception as error:
+                raise _inspection_error(part) from error
+            if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+                state_dict = state_dict["state_dict"]
+            if not isinstance(state_dict, dict):
+                raise _inspection_error(part)
+            if any(_is_mtp(name) for name in state_dict):
+                return True
+    return False
+
+
+def _converter_supports_no_mtp(converter_location):
+    """Return whether the selected converter declares the `--no-mtp` option."""
+    try:
+        source = Path(converter_location).read_bytes()
+    # Missing/unreadable path, or None and NUL-bearing ones: all mean "cannot
+    # prove support", and omitting --no-mtp just restores the old behaviour.
+    except (OSError, TypeError, ValueError):
+        return False
+    return re.search(
+        rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
+        source,
+        flags = re.DOTALL,
+    ) is not None
+
+
+def _find_bitsandbytes_quantization(config, _path = "config.json"):
+    """Where a bitsandbytes `quantization_config` sits, or None.
+
+    Recursive: VLMs keep theirs under a sub-config like `text_config`.
+    """
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+        # Older checkpoints omit quant_method and only carry the bnb flags.
+        if method == "bitsandbytes" or (
+            method is None
+            and ("load_in_4bit" in quant or "load_in_8bit" in quant)
+        ):
+            return _path
+    for key, value in config.items():
+        if key == "quantization_config" or not isinstance(value, dict):
+            continue
+        found = _find_bitsandbytes_quantization(value, f"{_path}[{key!r}]")
+        if found is not None:
+            return found
+    return None
+
+
+def _converter_was_oom_killed(exc):
+    """Was the converter OOM-killed (SIGKILL), rather than failing on its own?"""
+    if getattr(exc, "returncode", None) in (-9, 137):
+        return True
+    return "sigkill" in f"{exc}".lower()
+
+
+# One line only: a failure that merely names the counter must not match, and
+# `[^\S\r\n]` (not `\s`, which spans newlines) keeps the comparison off the
+# stderr/stdout join.
+_MTP_INFERENCE_ASSERTION = re.compile(
+    r"\bassert\b[^\r\n]*\bopt_num_mtp_layers[^\S\r\n]*!=[^\S\r\n]*0"
+)
+
+
+def _converter_needs_no_mtp(text):
+    """Did the converter abort while inferring an MTP head it could not find?"""
+    if not text: return False
+    return _MTP_INFERENCE_ASSERTION.search(text) is not None
+
+
+def _converter_rejected_no_mtp(text):
+    """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
+    if not text: return False
+    for line in text.splitlines():
+        low = line.lower()
+        if "--mtp" not in low and "--no-mtp" not in low and "--no-nextn" not in low:
+            continue
+        if "not supported" in low or "only supported" in low:
+            return True
+    return False
+
+
+def _drop_no_mtp(command):
+    """The same command without `--no-mtp`, or None when it has none to drop."""
+    if "--no-mtp" not in command: return None
+    return [token for token in command if token != "--no-mtp"]
+
+
+def _add_no_mtp(command):
+    """The same command with `--no-mtp`, or None when it already has it."""
+    if "--no-mtp" in command: return None
+    # The positional model directory must stay last.
+    return command[:-1] + ["--no-mtp", command[-1]]
+
+
+def _checkpoint_has_mtp_tensors(input_folder, num_layers):
+    """Does the checkpoint carry an MTP head, whatever it declares?
+
+    Unlike `_keep_mtp` this ignores the declaration, since the checkpoints that
+    reach the assertion declare nothing. Only consulted after a failure, so an
+    unreadable index answers "no evidence" and lets the retry proceed.
+    """
+    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+        return False
+    try:
+        return _has_mtp_weight_tensors(input_folder, num_layers)
+    except Exception:
+        return False
+
+
+def _retry_with_temp_file(command):
+    """The same command spooling tensors to disk instead of holding them in RAM.
+
+    llama.cpp refuses `--use-temp-file` alongside splitting ("Cannot use temp
+    file when splitting"), so the split options are dropped. None when the
+    command already has the flag, so the retry cannot loop.
+    """
+    if "--use-temp-file" in command:
+        return None
+    out = []
+    drop_value = False
+    for token in command:
+        if drop_value:
+            drop_value = False
+            # Only its value: a flag here means the previous one had none.
+            if not str(token).startswith("--"):
+                continue
+        if token in ("--split-max-size", "--split-max-tensors"):
+            drop_value = True
+            continue
+        out.append(token)
+    # The trailing model path must stay last.
+    return out[:-1] + ["--use-temp-file"] + out[-1:]
+
+
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
+    basename_without_gguf = os.path.splitext(output_file)[0]
+    shard_pattern = re.compile(
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
+    )
+    parent_dir = os.path.dirname(output_file) or '.'
+    paths = [output_file]
+    try:
+        # fullmatch, not search: these get os.remove'd, and an unanchored match
+        # would take a neighbour like "old-model.BF16-00001-of-00002".
+        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                        if shard_pattern.fullmatch(f))
+    except OSError:
+        pass
+    return paths
+
+
+def _remove_gguf_outputs(output_file):
+    """Delete what a failed or abandoned conversion left at `output_file`.
+
+    The writer opens every shard with "wb" before any tensor byte and cleans up
+    nothing on failure, and callers upload every save_directory/*.gguf, so a
+    truncated leftover gets published as a valid artifact.
+    """
+    for path in _gguf_output_paths(output_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2276,15 +2549,63 @@ def convert_to_gguf(
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
 
-    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
-    # doesn't inflate block_count / inject nextn_predict_layers.
+    _bnb_where = _find_bitsandbytes_quantization(config_file)
+    if _bnb_where is not None:
+        # llama.cpp has no bitsandbytes dequantizer and only refuses after
+        # reading the whole model, so fail here instead of after a multi-GB
+        # download. Both flags are named: 8bit checkpoints hit this too.
+        raise RuntimeError(
+            f"Unsloth: `{input_folder}` still holds bitsandbytes quantized "
+            f"weights (`quantization_config` at {_bnb_where}), and llama.cpp "
+            f"cannot convert those to GGUF.\n"
+            f"GGUF export needs dequantized 16bit weights. Either load the "
+            f"model with `load_in_4bit = False` and `load_in_8bit = False` "
+            f"before saving, or merge a LoRA adapter with "
+            f"`save_method = \"merged_16bit\"`, which downloads the original "
+            f"16bit weights. Saving a quantized model that has no adapter does "
+            f"not dequantize it."
+        )
+
+    # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
+    # only when the weights still carry the MTP layer (else it crashes on the extra
+    # tensor), and strip it when they don't (else it errors on the missing one).
+    # `unsloth_fixed_mtp` is an internal marker, always dropped. Only Qwen3.5/3.6 set
+    # these keys, so other arches are untouched.
+    _tc = config_file.get("text_config")
+    if not isinstance(_tc, dict):
+        _tc = {}
+    _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
+    _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
+    if _mtp_declared and (
+        not isinstance(_num_layers, int)
+        or isinstance(_num_layers, bool)
+        or _num_layers <= 0
+    ):
+        raise ValueError(
+            "Unsloth: `num_hidden_layers` must be a positive integer to reconcile MTP tensors; "
+            "`config.json` was not changed."
+        )
+    _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _no_mtp = (
+        _mtp_declared
+        and not _keep_mtp
+        and _converter_supports_no_mtp(converter_location)
+    )
+    # Keep the declaration when `--no-mtp` carries the intent: deleting it made
+    # a retry or second export read none, omit the flag, and hit the assertion.
+    _strip_keys = (
+        ("unsloth_fixed_mtp",)
+        if _keep_mtp or _no_mtp
+        else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
+    )
     _changed = False
-    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
-        if config_file.pop(_key, None) is not None:
-            _changed = True
-        _tc = config_file.get("text_config")
-        if _tc and _tc.pop(_key, None) is not None:
-            _changed = True
+    for _cfg in (config_file, _tc):
+        if not _cfg:
+            continue
+        for _key in _strip_keys:
+            if _key in _cfg:
+                _cfg.pop(_key)
+                _changed = True
     if _changed:
         with open(config_path, "w", encoding = "utf-8") as f:
             json.dump(config_file, f, indent = 2)
@@ -2342,7 +2663,9 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((text_args, text_output, "text model"))
+        if _no_mtp:
+            text_args["--no-mtp"] = ""
+        runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
         mmproj_args = {
@@ -2351,7 +2674,8 @@ def convert_to_gguf(
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
-        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+        # Optional: a projector failure must not discard the text GGUF above.
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector", False))
 
     else:
         if is_gpt_oss:
@@ -2377,10 +2701,37 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((args, final_output, "model"))
+        if _no_mtp:
+            args["--no-mtp"] = ""
+        runs_to_do.append((args, final_output, "model", True))
+
+    # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
+    # (app launched from a protected dir), so the final write failed with PermissionError
+    # [Errno 13] even though conversion succeeded. Only then redirect the bare name into
+    # input_folder; a writable CWD (Linux/Mac/Colab) is left unchanged.
+    def _dir_is_writable(d):
+        # mkstemp is exclusive: never truncates an existing file or follows a symlink.
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
+            os.close(fd)
+            os.remove(probe)
+            return True
+        except Exception:
+            return False
+    _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
-    for args, output_file, description in runs_to_do:
+    for args, output_file, description, required in runs_to_do:
+        # Redirect only a bare filename under an unwritable CWD. Absolute paths and
+        # relative paths with a directory are the caller's choice; input_folder is probed
+        # too since it may be a read-only model source.
+        if (not _cwd_writable
+                and not os.path.isabs(output_file)
+                and os.path.dirname(output_file) == ""):
+            _dst = os.path.abspath(input_folder)
+            if _dir_is_writable(_dst):
+                output_file = os.path.join(_dst, output_file)
+                args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
@@ -2394,7 +2745,12 @@ def convert_to_gguf(
         # Run the converter; self-heal and retry once if the env (not the model)
         # is broken. No cost on the happy path.
         attempted_repair = False
+        attempted_temp_file = False
+        attempted_no_mtp_drop = False
+        attempted_no_mtp_add = False
         repair_note = ""
+        no_mtp_note = ""
+        optional_failed = False
         while True:
             try:
                 # encoding/errors pinned so non-UTF8 output never crashes decoding.
@@ -2410,10 +2766,15 @@ def convert_to_gguf(
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 break
             except subprocess.CalledProcessError as e:
-                captured = ""
+                # Joined, never concatenated: an unterminated stderr line glued
+                # to stdout's first splices two harmless fragments into a line
+                # that matches a self-heal signature.
+                captured_streams = []
                 for stream in (getattr(e, "stderr", None), getattr(e, "stdout", None)):
                     if stream:
-                        captured += stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+                        captured_streams.append(
+                            stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace"))
+                captured = "\n".join(captured_streams)
 
                 # Self-heal: reinstall the converter deps (command[0] = its
                 # interpreter) and retry once instead of failing.
@@ -2427,6 +2788,72 @@ def convert_to_gguf(
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
 
+                # `--no-mtp` is architecture-gated, so a config key alone cannot
+                # prove it is accepted. Retry once without it: the pre-existing
+                # behaviour, and correct for an arch with no MTP block to strip.
+                if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
+                    retry = _drop_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_drop = True
+                        command = retry
+                        continue
+
+                # Text runs only: `--no-mtp` never belonged on the projector
+                # command, and a projector failure is degraded, not repaired.
+                if not attempted_no_mtp_add and required and _converter_needs_no_mtp(captured):
+                    retry = _add_no_mtp(command)
+                    if retry is not None and _checkpoint_has_mtp_tensors(input_folder, _num_layers):
+                        # `--no-mtp` would discard the `mtp.*` tensors that are
+                        # here and call the lossy export a success.
+                        no_mtp_note = (
+                            "\n--- unsloth ---\nThe converter could not infer this "
+                            "checkpoint's multi-token prediction (MTP) head, but the "
+                            "checkpoint does contain MTP tensors, so retrying with "
+                            "--no-mtp would silently drop them. Convert with an "
+                            "explicit `mtp_num_hidden_layers` in config.json, or "
+                            "remove the MTP tensors, and try again."
+                        )
+                        attempted_no_mtp_add = True
+                    elif retry is not None:
+                        attempted_no_mtp_add = True
+                        # The one self-heal that changes what the GGUF contains.
+                        print(
+                            "Unsloth: The GGUF converter recognised no multi-token "
+                            "prediction (MTP) head in this checkpoint. Retrying with "
+                            "--no-mtp; if it succeeds the GGUF will have no MTP head."
+                        )
+                        # The failed attempt leaves a truncated --outfile and,
+                        # when splitting, shards beside it. Callers scan the
+                        # output directory for *.gguf and would ship them.
+                        _remove_gguf_outputs(output_file)
+                        # Else a retry that fails for its own reason discards
+                        # the assertion that caused it.
+                        no_mtp_note = (
+                            f"\n--- first attempt, before retrying with --no-mtp ---\n"
+                            f"{captured.strip()}"
+                        )
+                        command = retry
+                        continue
+
+                # OOM-killed: retry once spooling to disk, the one resource
+                # these machines have. Only for a kill, so a converter that
+                # failed on its own is not quietly run twice.
+                if not attempted_temp_file and _converter_was_oom_killed(e):
+                    retry = _retry_with_temp_file(command)
+                    if retry is not None:
+                        attempted_temp_file = True
+                        print(
+                            "Unsloth: The GGUF converter ran out of host RAM "
+                            "and was killed. Retrying with --use-temp-file, "
+                            "which spools tensors to disk instead."
+                        )
+                        # The retry drops --split-max-size, so the killed
+                        # run's shards would linger beside the good file and
+                        # be uploaded with it.
+                        _remove_gguf_outputs(output_file)
+                        command = retry
+                        continue
+
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
                 cmd = " ".join(str(x) for x in command)
@@ -2439,7 +2866,33 @@ def convert_to_gguf(
                     text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
                     text = text.strip()
                     if text: details += f"\n--- converter {label} ---\n{text}"
-                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+                if not required:
+                    # Degrade like the "Converting as text-only model" path,
+                    # but for listed archs whose projector conversion fails.
+                    reason = ""
+                    for line in reversed((details or "").splitlines()):
+                        line = line.strip()
+                        if line and ("Error" in line or "Exception" in line):
+                            reason = line
+                            break
+                    # The converter truncates its --outfile at header time,
+                    # so the failed run leaves a partial projector that callers
+                    # would upload as if it were valid.
+                    _remove_gguf_outputs(output_file)
+                    is_vlm = False
+                    optional_failed = True
+                    print(
+                        f"Unsloth: Could not convert the {description} to GGUF "
+                        f"({reason or e}). The text model was converted "
+                        f"successfully and is usable; only multimodal "
+                        f"(image/audio) input is unavailable in this GGUF."
+                    )
+                    break
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}{no_mtp_note}")
+
+        # Its partial output was just removed, so validation would fail for nothing.
+        if optional_failed:
+            continue
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
@@ -2501,6 +2954,95 @@ def convert_to_gguf(
 pass
 
 
+# Quants tensor_requires_imatrix rejects for any transformer, measured with
+# `llama-quantize --dry-run`, not read off the ftype defaults. iq3_xs is here despite defaulting
+# to IQ3_S: the attention Q/K overrides promote to IQ3_XXS unconditionally, failing on blk.0.
+# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s and tq*_0 all quantize fine without one.
+IMATRIX_REQUIRED_QUANTS = frozenset((
+    "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+    "iq3_xxs", "iq3_xs",
+    "q2_k_s",
+))
+
+# All three are in live use across unsloth/*-GGUF, and --imatrix reads any of them. .gguf_file is
+# a GGUF imatrix named so the Hub does not list it as a model; plain .gguf skips that guard.
+IMATRIX_UPSTREAM_NAMES = (
+    "imatrix_unsloth.dat", "imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf",
+)
+
+
+def quant_requires_imatrix(quant_type):
+    return str(quant_type).strip().lower() in IMATRIX_REQUIRED_QUANTS
+
+
+def _materialize_imatrix(path, dest_dir):
+    """Copy into dest_dir (never mutate the HF cache), renaming *.gguf_file -> *.gguf."""
+    os.makedirs(dest_dir, exist_ok = True)
+    base = os.path.basename(path)
+    if base.endswith(".gguf_file"):
+        base = base[: -len(".gguf_file")] + ".gguf"
+    local = os.path.join(dest_dir, base)
+    # dest_dir can be the file's own directory: the helper is public and Studio calls it directly.
+    if os.path.exists(local) and os.path.samefile(path, local):
+        return local
+    shutil.copyfile(path, local)
+    return local
+
+
+def resolve_imatrix_file(imatrix_file, dest_dir, repo_candidates = (), token = None):
+    """Resolve imatrix_file to a local path, or None.
+
+    None/False -> None; a path -> a copy in dest_dir (*.gguf_file renamed to .gguf); True -> the
+    first upstream imatrix across repo_candidates, or a RuntimeError naming what was searched.
+    """
+    if imatrix_file is None or imatrix_file is False:
+        return None
+
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        path = os.path.expanduser(os.fspath(imatrix_file))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Unsloth: imatrix_file '{path}' does not exist.")
+        # Copy even when it is already local: an imatrix under save_directory would be uploaded
+        # and reported as an exported model, since both paths glob save_directory/*.gguf.
+        return _materialize_imatrix(path, dest_dir)
+
+    if imatrix_file is not True:
+        raise TypeError(
+            "Unsloth: imatrix_file must be None, a path string, or True "
+            f"(got {type(imatrix_file).__name__})."
+        )
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repos = []
+    for repo in repo_candidates:
+        if repo and repo not in repos: repos.append(repo)
+    api = HfApi(token = token)
+    lookup_error = None
+    for repo in repos:
+        try:
+            files = set(api.list_repo_files(repo))
+        except Exception as error:
+            # Keep the first cause, reported only if no candidate hits: otherwise a bad token
+            # or an outage reads as "no imatrix exists".
+            if lookup_error is None: lookup_error = f"{repo}: {type(error).__name__}: {error}"
+            continue
+        for name in IMATRIX_UPSTREAM_NAMES:
+            if name not in files: continue
+            downloaded = hf_hub_download(repo_id = repo, filename = name, token = token)
+            local = _materialize_imatrix(downloaded, dest_dir)
+            print(f"Unsloth: Using imatrix '{name}' from '{repo}' -> '{local}'")
+            return local
+    raise RuntimeError(
+        "Unsloth: imatrix_file=True but no upstream Unsloth imatrix was found.\n"
+        f"  Searched repos: {repos or '(none derived from the base model)'}\n"
+        f"  Searched files: {list(IMATRIX_UPSTREAM_NAMES)}\n"
+        + (f"  First lookup failure: {lookup_error}\n" if lookup_error else "")
+        + "Pass imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+    )
+
+
 def quantize_gguf(
     input_gguf,
     output_gguf,
@@ -2512,6 +3054,16 @@ def quantize_gguf(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
+
+    # quant_type reaches the shell command below straight from the user facing
+    # quantization_method, and every real value is a bare token, so require one.
+    if not isinstance(quant_type, str) or \
+        re.fullmatch(r"[A-Za-z0-9_.\-]+", quant_type.strip()) is None:
+        raise ValueError(
+            f"Unsloth: Invalid quantization type `{quant_type}`. Quantization types are "
+            f"single tokens like `q4_k_m`, `q8_0`, `iq4_xs`, `bf16`."
+        )
+    quant_type = quant_type.strip()
 
     # Fix default path on Windows: binaries are in build/bin/Release/
     default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
@@ -2526,6 +3078,7 @@ def quantize_gguf(
         if n_threads is None:
             n_threads = 1
         n_threads *= 2
+    n_threads = int(n_threads)
 
     def _quote(s):
         """Quote a path for shell usage (the command runs under shell=True)."""
@@ -2565,6 +3118,8 @@ def quantize_gguf(
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
+        # Validated above as a bare token, so quoting would only add a pair of
+        # quotes that cmd.exe did not see in previous releases.
         f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
     )
 

@@ -32,7 +32,8 @@ try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
     HAS_BNB = True
-except ImportError:
+except Exception:
+    # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
     Params4bit = None
 
@@ -126,10 +127,17 @@ def _grouped_mm_with_backward_fix(
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
     but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
     copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul on the 16-byte stride error. Bit-exact
-    vs the always-contiguous path in forward and backward.
+    always-correct copy. Falls back to a per-group matmul when the device has no
+    torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
+    path in forward and backward.
     """
     inputs = inputs.contiguous()
+    # The Triton backend is picked precisely when the probe says no, yet its separated
+    # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
+    # (Blas.cpp, sm90_only) and 2.6/2.7 have no `_grouped_mm`, so a LoRA MoE died on
+    # every card but an H100; 2.9 falls back internally. Probe is cached: one read.
+    if not _check_torch_grouped_mm_supported():
+        return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
         weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
     try:
@@ -146,19 +154,229 @@ def _grouped_mm_with_backward_fix(
         return _manual_grouped_mm(inputs, weight, offsets)
 
 
-def _manual_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps."""
+def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
+    """out[s:e] = inputs[s:e] @ weight[g], group by group. No autograd.
+
+    `bounds` is the already-decoded group ends: the signature packs the offsets into
+    its own transfer, so re-reading them here was a second stream synchronization per
+    grouped matmul, over every layer's base and LoRA projections.
+    """
     outputs = []
     start = 0
-    for expert_idx, end in enumerate(offsets.detach().cpu().tolist()):
+    if bounds is None: bounds = offsets.detach().cpu().tolist()
+    for expert_idx, end in enumerate(bounds):
         if start < end:
             outputs.append(torch.matmul(inputs[start:end], weight[expert_idx]))
         start = end
     if outputs:
         return torch.cat(outputs, dim=0)
     return inputs.new_empty((0, weight.shape[-1]))
+
+
+# Projection strides for the routing signature. A CHECKSUM, not an identity: four
+# projections leave a `hidden - 4` null space, so rows differing within it project
+# alike; an exact identity means copying the whole `[T, hidden]` input, the 512MB
+# transient this file avoids. A swap escapes only by matching ALL of these AND the
+# norm below, each term weighted by the row index.
+_SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
+
+# Row 2-norm, carried beside the projections. Not linear in the row, so that null
+# space does not reach it: rows differing within it must also match norms to swap unseen.
+_SIGNATURE_EXTRA = 1
+
+# Trailing checksum entries of a packed signature, not group boundaries. Named because
+# offsets are read back by slicing it off, and a bare `[:-1]` read checksums as experts.
+_SIGNATURE_WIDTH = len(_SIGNATURE_STRIDES) + _SIGNATURE_EXTRA
+
+
+def _routing_signature(inputs, offsets):
+    """Offsets plus an order-sensitive checksum of the expert-sorted rows.
+
+    Offsets are only the routing histogram, so a replay swapping two tokens between
+    equal-sized experts leaves them identical while `inputs` holds a different
+    sequence; the checksum moves with the rows, so the swap is visible. Bit-cast into
+    the offsets vector so the whole thing is one device sync, the one the group loop
+    already pays.
+
+    Rows reduce through a fixed pseudo-random projection, not a sum: a sum ignores
+    WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike and a swap across
+    an expert boundary went unseen, letting the guard accept gradients from a different
+    routing. The projection derives from the hidden size alone, so forward and
+    recompute build the same one without carrying state.
+
+    The matvec runs in the input's own dtype, not an FP32 copy: upcasting on the way in
+    materialised a whole `[routed_tokens, hidden]` transient, 512MB at 32K by 4096, to
+    produce one number per row -- an OOM risk on exactly the memory-constrained runs
+    this fallback exists for. cuBLAS accumulates a half-precision gemv in FP32 anyway.
+    """
+    inputs = inputs.detach()
+    hidden = inputs.shape[-1]
+    # Autocast off, explicitly: `mv`/`mm` are on the autocast lower-precision list and
+    # only ONE of the two calls sees it (forward with the caller's autocast live,
+    # backward with it disabled), so FP32 inputs hashed bf16 one side and fp32 the
+    # other and every backward raised the routing error below on unchanged routing.
+    with torch.autocast(device_type = inputs.device.type, enabled = False):
+        weights = torch.linspace(
+            1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
+        # Irrational stride: a linear ramp alone sums the same under a reversal.
+        strides = torch.tensor(
+            _SIGNATURE_STRIDES, device = inputs.device, dtype = torch.float32)
+        weights = torch.sin(
+            weights.unsqueeze(1) * strides).to(inputs.dtype)
+        # Several projections, not one: a single dot maps each row to one scalar, so
+        # rows orthogonal to it hash like the zero row (`[p[1], -p[0], 0, ...]` and
+        # zeros both give exactly 0) and swapping that pair across an expert boundary
+        # survived the check.
+        rows = (inputs @ weights).float()
+        # Plus the norm, not linear in the row, so the projections' shared null space
+        # does not reach it. `vector_norm` accumulates in fp32 from the input's own
+        # dtype; `(x.float() * x.float()).sum(...)` held three concurrent 512MB
+        # temporaries at the 32K-by-4096 shape this fallback targets. Promoted, not
+        # pinned to fp32: `vector_norm` refuses a dtype that narrows its input.
+        norm = torch.linalg.vector_norm(
+            inputs, dim = -1, keepdim = True,
+            dtype = torch.promote_types(inputs.dtype, torch.float32))
+        rows = torch.cat((rows, norm.to(rows.dtype)), -1)
+        ramp = torch.arange(
+            1, rows.shape[0] + 1, device = rows.device, dtype = rows.dtype)
+        checksum = (rows * ramp.unsqueeze(1)).sum(0)
+    packed = torch.cat((
+        offsets.detach().reshape(-1).to(torch.int64),
+        checksum.view(torch.int32).to(torch.int64),
+    ))
+    return packed.cpu().tolist()
+
+
+class _ManualGroupedMM(torch.autograd.Function):
+    """The loop above, saving what torch._grouped_mm saves and nothing else.
+
+    A Function rather than plain autograd because the naive loop tapes every per-group
+    SLICE, whose shape is the group size the router decides. Non-reentrant checkpointing
+    replays the forward and compares saved metadata, so any routing difference between
+    the two passes surfaces as
+
+        CheckpointError: Recomputed values ... have different metadata
+        saved: torch.Size([38, 8])  recomputed: torch.Size([39, 8])
+
+    one row apart, in a hundred groups at once. `torch._grouped_mm` never shows that:
+    it is one op saving the whole `[T, K]` input, so a drop-in has to save the same
+    shape-stable set (inputs, weight, offsets) and rebuild the slices in backward.
+
+    This does not make routing deterministic, and does not pretend to: it restores the
+    numerics the fused path already has on an H100.
+    """
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        # A plain list, NOT a tensor: non-reentrant checkpointing swaps the saved
+        # TENSORS for the replay's, so a saved `offsets` reports the replay's routing,
+        # never the forward's. This copy survives, and backward compares the two.
+        ctx.forward_routing = routing = _routing_signature(inputs, offsets)
+        ctx.save_for_backward(inputs, weight, offsets)
+        with torch.no_grad():
+            return _grouped_matmul_loop(
+                inputs, weight, offsets, routing[:-_SIGNATURE_WIDTH])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weight, offsets = ctx.saved_tensors
+        routing = _routing_signature(inputs, offsets)
+        if routing != ctx.forward_routing:
+            # Shape-stable saves would let this through silently, and pairing the
+            # original `grad_output` with the replay's partition is a gradient for a
+            # routing that never produced the loss. Louder than CheckpointError.
+            were = ctx.forward_routing[:-_SIGNATURE_WIDTH]
+            now = routing[:-_SIGNATURE_WIDTH]
+            how = ("the same experts in a different order"
+                   if were == now else f"expert ends {were} then {now}")
+            raise RuntimeError(
+                "Unsloth: the MoE router assigned tokens differently in the "
+                f"activation-checkpoint replay than in the forward ({how}), so "
+                "the gradients would belong to a routing that never produced "
+                "the loss. Turn gradient checkpointing off for this run, or "
+                "make the router deterministic."
+            )
+        bounds = routing[:-_SIGNATURE_WIDTH]
+        need_x, need_w, _ = ctx.needs_input_grad
+        grad_output = grad_output.contiguous()
+        # `backward` runs OUTSIDE the forward's autocast, so `grad_output` can be bf16
+        # while the saved tensors are still fp32 and the first matmul raises. Aligned
+        # by hand, not with `torch.amp.custom_fwd/custom_bwd`, whose `device_type` is
+        # fixed at class definition: this fallback also runs on CPU and XPU.
+        compute_dtype = grad_output.dtype
+        grad_inputs = torch.zeros_like(inputs) if need_x else None
+        grad_weight = torch.zeros_like(weight) if need_w else None
+        # Write each group straight into its slice when no cast is due. The assignment
+        # below allocates a temporary and copies it in; `out=` does neither, and there
+        # are two per group -- 256 on a 128-expert layer, 37% of this loop measured.
+        # A cast needs the temporary anyway, and a non-contiguous destination would put
+        # the copy back, so both keep the plain path.
+        # Grad mode first: it is off for an ordinary backward and ON only under
+        # `create_graph = True`, where `out=` raises "functions with out=... arguments
+        # don't support automatic differentiation". The fused path double-backwards
+        # fine, so the fallback has to as well; the plain branch is differentiable.
+        direct = (
+            not torch.is_grad_enabled()
+            and inputs.dtype == weight.dtype == compute_dtype
+            and (grad_inputs is None or grad_inputs.is_contiguous())
+            and (grad_weight is None or grad_weight.is_contiguous())
+        )
+        start = 0
+        for expert_idx, end in enumerate(bounds):
+            if start < end:
+                g = grad_output[start:end]
+                if need_x:
+                    w = weight[expert_idx]
+                    if direct:
+                        torch.matmul(g, w.transpose(-2, -1),
+                                     out = grad_inputs[start:end])
+                    else:
+                        grad_inputs[start:end] = (
+                            g @ w.to(compute_dtype).transpose(-2, -1)
+                        ).to(inputs.dtype)
+                if need_w:
+                    if direct:
+                        torch.matmul(inputs[start:end].transpose(-2, -1), g,
+                                     out = grad_weight[expert_idx])
+                    else:
+                        x = inputs[start:end].to(compute_dtype)
+                        grad_weight[expert_idx] = (
+                            x.transpose(-2, -1) @ g).to(weight.dtype)
+            start = end
+        return grad_inputs, grad_weight, None
+
+
+def _manual_grouped_mm(
+    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable grouped matmul fallback for torch._grouped_mm alignment gaps.
+
+    Not compilable, and marked so: group boundaries come off a tensor, so `start < end`
+    is a data-dependent branch Dynamo cannot guard, and a tensorized rewrite is worse
+    (gathering `weight[expert_id]` per row materializes `[T, K, N]`; masking runs every
+    expert over every row). `torch.compiler.disable` makes a compiled caller break
+    cleanly here rather than abort mid-trace; under `fullgraph = True` a break is still
+    fatal, which is what the eager fallback in `temporary_patches/utils.py` is for.
+    """
+    # Grad off means `apply` builds no autograd node, so nothing will ever read the
+    # signature: skip the Function rather than pay a `[T, hidden]` projection per call.
+    # Covers `inference_mode` and `no_grad` alike.
+    #
+    # KNOWN GAP, deliberately not closed here. A REENTRANT checkpoint also runs its
+    # loss-producing forward with grad off and its replay with grad ON, so the replay
+    # compares its own routing against itself and a reroute passes silently. Not
+    # fixable from inside this function: `ctx` cannot cross a reentrant boundary, and a
+    # side channel keyed on the weight fails too because
+    # `_canonical_lora_weights_for_grouped_mm` rebuilds a contiguous tensor per call.
+    # It needs `unsloth_checkpoint` to announce its region and call order. The
+    # non-reentrant path is unaffected: its forward runs with grad on, so the forward
+    # ctx survives and only its SAVED TENSORS are swapped.
+    if not torch.is_grad_enabled():
+        return _grouped_matmul_loop(inputs, weight, offsets)
+    return _ManualGroupedMM.apply(inputs, weight, offsets)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _manual_grouped_mm = torch.compiler.disable(_manual_grouped_mm)
 
 
 # Recompute-in-backward for the frozen base expert GEMM: the dequantized bf16 stack
@@ -299,14 +517,18 @@ def _check_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
-    if not torch.cuda.is_available():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu", torch.xpu.current_device())
+    else:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
-        device = torch.cuda.current_device()
-        dtype = torch.bfloat16  # torch._grouped_mm is bf16-only; an fp16 probe always raises and disables the backend
+        dtype = torch.float16
 
         # 1 expert, 1 token, dim 8 (safe alignment).
         x = torch.ones((1, 8), device=device, dtype=dtype)
@@ -335,8 +557,13 @@ def _transposed_view_grouped_mm_is_safe():
 
     safe = False
     try:
-        if _TORCH_GROUPED_MM_AVAILABLE and torch.cuda.is_available():
-            device = torch.cuda.current_device()
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = torch.device("xpu", torch.xpu.current_device())
+        else:
+            device = None
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)
@@ -881,45 +1108,162 @@ def _should_use_separated_lora() -> bool:
 
 # Model-specific weight preprocessing hooks: each model registers a transposition
 # function so the generic backend works across weight layouts.
+#
+# unsloth_compiled_cache holds copies of this file, loaded as their own module objects
+# (unsloth_cached_moe_utils, whose forward get_forward_moe_backend() prefers, and the
+# bare `moe_utils` compiled modules import), each with its own empty dict. Resolving
+# through the package keeps registration and lookup on one dict whichever copy runs,
+# so a registration is not dropped and left to layout inference (#849).
 
 _WEIGHT_PREPROCESSORS = {}
 
 
+def _weight_preprocessor_registry():
+    """The registry shared by every loaded copy of this module (see above)."""
+    package_module = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    if package_module is None:
+        return _WEIGHT_PREPROCESSORS  # package copy not loaded, so nothing registered
+    return getattr(package_module, "_WEIGHT_PREPROCESSORS", _WEIGHT_PREPROCESSORS)
+
+
 def register_weight_preprocessor(model_type: str, preprocessor_fn):
     """Register a weight preprocessor (weight, proj_type, hidden_dim) -> weight for a model type."""
-    _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
+    _weight_preprocessor_registry()[model_type] = preprocessor_fn
 
 
 def get_weight_preprocessor(model_type: str):
     """Get registered weight preprocessor for model type."""
-    return _WEIGHT_PREPROCESSORS.get(model_type)
+    return _weight_preprocessor_registry().get(model_type)
 
 
-def preprocess_weight(
-    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None
-):
-    """Preprocess a weight into (E, in_dim, out_dim) for grouped_mm.
+def _logical_expert_shape(param):
+    """Return the logical expert shape without dequantizing or materializing.
 
-    Uses a registered model-specific preprocessor if present, else transposes
-    by shape. proj_type is "gate_up" or "down".
+    Resolve PEFT parameters before module wrappers. A recorded logical shape (bnb
+    Params4bit _original_shape, ParameterModule shape_3d) is read directly so a
+    get_param provider is never materialized just to read its shape.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if model_type and model_type in _WEIGHT_PREPROCESSORS:
-        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
+    seen = set()
+    while param is not None and id(param) not in seen:
+        seen.add(id(param))
 
+        # Recorded logical shape avoids materializing a get_param provider.
+        recorded = getattr(param, "_original_shape", None)
+        if recorded is None:
+            recorded = getattr(param, "shape_3d", None)
+        if recorded is not None:
+            return tuple(int(x) for x in recorded)
+
+        get_param = getattr(param, "get_param", None)
+        if callable(get_param):
+            try:
+                inner = get_param()
+            except Exception:
+                inner = None
+            if inner is not None and inner is not param:
+                param = inner
+                continue
+
+        base_layer = getattr(param, "base_layer", None)
+        if base_layer is not None and base_layer is not param:
+            param = base_layer
+            continue
+
+        # Linear modules store parameters on .weight.
+        weight = getattr(param, "weight", None)
+        if weight is not None and weight is not param:
+            param = weight
+            continue
+
+        break
+
+    shape = getattr(param, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(x) for x in shape)
+    except TypeError:
+        return None
+
+
+def _orientation_needs_transpose(shape, proj_type, hidden_dim):
+    """Return whether a weight needs transposition, or None when ambiguous."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if shape is None or len(shape) < 3:
+        return None
+    d1, d2 = int(shape[1]), int(shape[2])
+    if d1 == d2:
+        return None
     if proj_type == "gate_up":
-        # Want (E, hidden_dim, 2*intermediate).
-        if weight.shape[1] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
-    else:  # down
-        # Want (E, intermediate, hidden_dim).
-        if weight.shape[2] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
+        # grouped_mm uses (E, hidden, 2I).
+        return d1 != hidden_dim
+    # grouped_mm down uses (E, I, hidden).
+    return d2 != hidden_dim
+
+
+_WARNED_AMBIGUOUS_LAYOUTS = set()
+
+
+def _warn_ambiguous_layout_once(proj_type, shape, hidden_dim):
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    key = (proj_type, tuple(shape), hidden_dim)
+    if key in _WARNED_AMBIGUOUS_LAYOUTS:
+        return
+    _WARNED_AMBIGUOUS_LAYOUTS.add(key)
+    # Always warn because a wrong guess corrupts training (#849).
+    print(
+        f"Unsloth: MoE '{proj_type}' expert weight of shape {tuple(shape)} has equal matmul "
+        f"dims (hidden_dim={hidden_dim}), so its layout is ambiguous, and no unambiguous "
+        f"sibling projection was reachable to disambiguate it. Assuming the transformers "
+        f"F.linear layout and transposing to grouped_mm layout. If these experts were "
+        f"already in grouped_mm layout this transpose is WRONG and trains on transposed "
+        f"weights (see unslothai/unsloth-zoo#849). Register an explicit preprocessor via "
+        f"register_weight_preprocessor('<model_type>', ...) to remove the guess.",
+        file=sys.stderr,
+    )
+
+
+def preprocess_weight(
+    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None,
+    experts_module=None,
+):
+    """Convert an expert weight to grouped_mm layout.
+
+    Registered preprocessors take precedence. Square weights use the non-square sibling.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    # Guarded: this runs per projection per MoE forward and again in recompute
+    # backward, and the shipped models pass model_type=None.
+    if model_type:
+        registry = _weight_preprocessor_registry()
+        if model_type in registry:
+            return registry[model_type](weight, proj_type, hidden_dim)
+
+    # Non-square shapes reveal layout directly.
+    needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)
+    if needs_transpose is not None:
+        return weight.transpose(-2, -1) if needs_transpose else weight
+
+    # One sibling is always non-square and reveals the shared layout.
+    if experts_module is not None:
+        sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
+        sibling_type = "down" if proj_type == "gate_up" else "gate_up"
+        sibling = getattr(experts_module, sibling_name, None)
+        if sibling is not None:
+            sibling_transpose = _orientation_needs_transpose(
+                _logical_expert_shape(sibling), sibling_type, hidden_dim,
+            )
+            if sibling_transpose is not None:
+                return weight.transpose(-2, -1) if sibling_transpose else weight
+
+    # Default to F.linear when no sibling is readable.
+    _warn_ambiguous_layout_once(proj_type, weight.shape, hidden_dim)
+    return weight.transpose(-2, -1)
 
 
 # Generic MoE detection and ParamWrapper patching.
@@ -1271,9 +1615,14 @@ def forward_native_grouped_mm(
 
     # Runtime safety check (defense in depth).
     if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        # Compute Capability is CUDA-only; on XPU it would mask this message.
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            where = f"this device (Compute Capability {major}.{minor})"
+        else:
+            where = "this device"
         raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
+            f"torch._grouped_mm is not supported on {where}. "
             f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
         )
 
@@ -1316,8 +1665,8 @@ def forward_native_grouped_mm(
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
-            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt)
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
             permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
         )
@@ -1486,8 +1835,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype):
-            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt)
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
+            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
             inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
         )

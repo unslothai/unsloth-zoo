@@ -138,7 +138,29 @@ def _bundled_cuda_lib_dirs():
     return dirs
 
 
-def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os_name = None):
+DEFAULT_NGL = 99
+
+
+def _resolve_ngl(ngl = None, base_env = None):
+    """Layers the child offloads to GPU (its ``NGL`` knob -> llama.cpp ``n_gpu_layers``).
+
+    Explicit caller value wins, then an ``NGL`` already in the environment, else all layers.
+    Both overrides used to be impossible: the value was hardcoded to 99, so a GGUF larger than
+    VRAM died in ``cudaMalloc`` with no way to split it across GPU and RAM, even with studio's
+    GPU-layers set to 0 (unsloth#7574). The server itself defaults to 0 and handles partial
+    offload normally."""
+    if ngl is not None:
+        return max(0, int(ngl))
+    raw = (os.environ if base_env is None else base_env).get("NGL")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_NGL
+
+
+def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, ngl = None, base_env = None, os_name = None):
     """Build the visual-server child env so it loads the CUDA backend, not CPU.
 
     Binary dir first, then bundled CUDA runtime, then the inherited path. Windows: torch/lib
@@ -148,7 +170,7 @@ def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    env["NGL"] = "99"
+    env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 
     bin_dir = os.path.dirname(server_bin)
@@ -180,13 +202,14 @@ def _canvas_maxtok(maxtok):
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
-    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None):
+    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None, ngl=None):
         self.gguf = gguf
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok))
+        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
+        self.ngl = int(self.env["NGL"])
         self.p = None
         self._spawn()
 
@@ -216,14 +239,18 @@ class VisualServer:
             pass
         self._spawn()
 
-    def _send(self, messages, n_blocks, seed):
+    def _send(self, messages, n_blocks, seed, tools=None):
         # A previous turn may have crashed the decoder; respawn before writing so a dead child does not
         # strand this and every later turn with a broken pipe.
         if self.p is None or self.p.poll() is not None:
             self.restart()
-        with open(self.req, "w") as f:
-            json.dump({"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}, f,
-                      ensure_ascii=False)
+        req = {"seed": int(seed), "n_blocks": int(n_blocks), "messages": messages}
+        # Forward tools so the server renders them into the chat template (inputs.tools)
+        # for schema-correct <|tool_call> args.
+        if tools:
+            req["tools"] = tools
+        with open(self.req, "w", encoding="utf-8") as f:
+            json.dump(req, f, ensure_ascii=False)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
@@ -256,7 +283,7 @@ def _parse_stats(line):
     return stats
 
 
-def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None):
+def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None, tools=None):
     """Stream one turn through the optimized visual server.
 
     on_frame(block, step, total, text): a denoising frame (the current argmax canvas, already decoded).
@@ -282,7 +309,7 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
 
     for attempt in (0, 1):
         try:
-            return _generate_visual_once(server, messages, seed, max_blocks, _frame, _commit, on_stats)
+            return _generate_visual_once(server, messages, seed, max_blocks, _frame, _commit, on_stats, tools)
         except VisualServerCrashed:
             server.restart()  # always bring a fresh server up so the next turn works regardless
             if attempt == 1 or progressed["emitted"]:
@@ -290,8 +317,8 @@ def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on
             # nothing emitted yet -> safe to transparently resend on the fresh server
 
 
-def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commit, on_stats):
-    server._send(messages, max_blocks, seed)
+def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commit, on_stats, tools=None):
+    server._send(messages, max_blocks, seed, tools)
 
     full_text = ""
     while True:

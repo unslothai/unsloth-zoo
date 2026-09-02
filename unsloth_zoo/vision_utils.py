@@ -28,6 +28,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PEP 604 annotations below would evaluate at def time and raise on Python 3.9.
+from __future__ import annotations
+
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
@@ -47,6 +50,7 @@ import time
 import warnings
 import os
 from functools import lru_cache
+from collections.abc import Mapping
 
 
 import requests
@@ -115,6 +119,233 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
+# Dataset rows carry arbitrary http(s) URLs and the collators fetch them server
+# side, so without a destination check a row can reach 127.0.0.1, the LAN or the
+# metadata endpoint. Public URLs and local files are unaffected; serving media
+# from a private host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
+UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
+UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
+_MAX_MEDIA_REDIRECTS = 5
+
+# Spelled out, not left to ipaddress alone: is_private is documented False for
+# the RFC 6598 range 100.64.0.0/10, and only a list answers the same everywhere.
+_BLOCKED_CIDRS = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15",
+    "224.0.0.0/4", "240.0.0.0/4",
+    # fec0::/10 is deprecated but still routed, and only is_site_local sees it.
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+)
+
+# Metadata services answer on a fixed name too, which is what a configured HTTP
+# proxy resolves instead of us.
+_BLOCKED_HOSTNAMES = frozenset((
+    "metadata.google.internal", "metadata.goog", "metadata",
+    "instance-data", "instance-data.ec2.internal",
+))
+
+
+def _allow_private_url_fetch() -> bool:
+    # Read per call: notebooks set the env var after `import unsloth`.
+    return os.environ.get(UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR, "0") == "1"
+
+
+def _max_media_download_bytes() -> int:
+    try:
+        megabytes = float(os.environ.get(UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR, 256))
+    except ValueError:
+        megabytes = 256.0
+    # float() accepts inf and nan, int() then refuses them; inf means no cap.
+    if not math.isfinite(megabytes): megabytes = 0.0
+    if megabytes <= 0: return 0  # 0 disables the cap
+    return int(megabytes * 1024 * 1024)
+
+
+@lru_cache(maxsize = 1)
+def _blocked_networks():
+    import ipaddress
+    return tuple(ipaddress.ip_network(cidr) for cidr in _BLOCKED_CIDRS)
+
+
+def _is_blocked_ip(ip) -> bool:
+    if (
+        ip.is_loopback or ip.is_private or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        or getattr(ip, "is_site_local", False)
+    ):
+        return True
+    for network in _blocked_networks():
+        if ip.version == network.version and ip in network: return True
+    # IPv4-mapped / 6to4 wrappers around an internal v4 address
+    mapped = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None)
+    if mapped is not None and _is_blocked_ip(mapped): return True
+    return False
+
+
+def _resolve_host(host: str):
+    """Addresses for `host`, or None when this machine cannot resolve it.
+
+    Deliberately uncached: a remembered answer would outlive its DNS record, so
+    a host that resolved publicly once would keep passing while the connection
+    resolved elsewhere. The OS resolver absorbs the repeat cost.
+    """
+    import ipaddress
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None
+    addresses = []
+    for info in infos:
+        try:
+            addresses.append(ipaddress.ip_address(info[4][0].split("%", 1)[0]))
+        except ValueError:
+            continue
+    return tuple(addresses)
+
+
+def _proxy_applies(url: str) -> bool:
+    """True when requests would send `url` through an environment proxy."""
+    try:
+        from requests.utils import get_environ_proxies
+        from urllib.parse import urlparse
+
+        proxies = get_environ_proxies(url, no_proxy = None)
+        return bool(proxies.get(urlparse(url).scheme) or proxies.get("all"))
+    except Exception:
+        return False
+
+
+def _is_blocked_address(host: str) -> bool:
+    if host.lower().rstrip(".") in _BLOCKED_HOSTNAMES: return True
+    addresses = _resolve_host(host)
+    if addresses is None: return False  # unresolvable, see assert_fetchable_url
+    return any(_is_blocked_ip(ip) for ip in addresses)
+
+
+def assert_fetchable_url(url: str) -> str:
+    """Reject non-http(s) URLs and URLs pointing at loopback/private hosts."""
+    if _allow_private_url_fetch(): return url
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media over the `{parsed.scheme}` scheme. "
+            f"Only http and https URLs are fetched; use a local path for local files."
+        )
+    # Parser differential: urlparse reads `http://127.0.0.1\@example.com/` as
+    # userinfo plus host example.com, the client makes the backslash a path
+    # separator and connects to 127.0.0.1. Not legal in an authority anyway.
+    if "\\" in parsed.netloc:
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{url}` since its authority contains "
+            f"a backslash, which HTTP clients and URL parsers disagree about."
+        )
+    # Same story for an encoded host (`http://%31%32%37.0.0.1/` checks as
+    # unresolvable then fetches 127.0.0.1), but userinfo may legitimately carry
+    # escapes, so screen only the host.
+    if "%" in parsed.netloc.rpartition("@")[2]:
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{url}` since its host is "
+            f"percent-encoded, which HTTP clients and URL parsers disagree about."
+        )
+    host = parsed.hostname
+    if host is None:
+        raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
+    if _is_blocked_address(host):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
+            f"loopback, private, link-local or otherwise internal address. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
+        )
+    # Unresolvable is harmless on its own, since the request goes nowhere either.
+    # Behind a proxy it is not: the proxy resolves the name, so nothing was checked.
+    if _resolve_host(host) is None and _proxy_applies(url):
+        raise ValueError(
+            f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
+            f"resolve it and a proxy is configured, so its address is never checked. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 if the proxy is trusted."
+        )
+    return url
+
+
+def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
+    """Write an http(s) body into `sink`, checking every redirect hop.
+
+    Single implementation of the fetch policy: scheme and destination checked on
+    the original URL and on each hop, size capped, response always closed.
+    """
+    from urllib.parse import urljoin
+
+    max_bytes = _max_media_download_bytes()
+    written = 0
+    current = url
+    # One session for the chain: requests used to carry the cookie jar across
+    # hops itself, and signed-cookie CDNs rely on it.
+    with requests.Session() as session:
+        for _ in range(_MAX_MEDIA_REDIRECTS + 1):
+            assert_fetchable_url(current)
+            response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
+            try:
+                if response.is_redirect or response.is_permanent_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size = 1024 * 1024):
+                    if not chunk: continue
+                    sink.write(chunk)
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise ValueError(
+                            f"Unsloth: Media at `{url}` is larger than the "
+                            f"{max_bytes} byte limit. Raise "
+                            f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
+                        )
+                return written
+            finally:
+                # Close every hop; a leaked streaming response holds its connection.
+                response.close()
+    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
+
+
+def fetch_remote_media_bytes(url: str, timeout: int = 30) -> BytesIO:
+    """Fetch an http(s) URL into memory, checking every redirect hop."""
+    data = BytesIO()
+    _stream_guarded_media(url, data, timeout = timeout)
+    data.seek(0)
+    return data
+
+
+def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
+    """Download an http(s) URL through the guard and return a temp file path.
+
+    Handing over the URL is not enough even after resolving redirects: the
+    decoder makes its own request, and a server that answered ours cleanly can
+    redirect that one inward. ffmpeg follows redirects with no way to refuse, so
+    fetching the bytes ourselves is the only way to bind it to a checked source.
+    """
+    import tempfile
+    from urllib.parse import urlparse
+
+    # Keep the extension: ffmpeg and torchvision sniff the container from it.
+    suffix = os.path.splitext(urlparse(url).path)[1][:16] or ".bin"
+    handle = tempfile.NamedTemporaryFile(prefix = "unsloth_media_", suffix = suffix, delete = False)
+    try:
+        with handle as sink:
+            _stream_guarded_media(url, sink, timeout = timeout)
+    except BaseException:
+        try: os.unlink(handle.name)
+        except OSError: pass
+        raise
+    return handle.name
+    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
+
+
 def round_by_factor(number: int, factor: int) -> int:
     """Returns the closest integer to 'number' that is divisible by 'factor'."""
     return round(number / factor) * factor
@@ -171,7 +402,7 @@ def fetch_image(
         image_obj = image
     elif isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            image_obj = Image.open(requests.get(image, stream=True, timeout=30).raw)
+            image_obj = Image.open(fetch_remote_media_bytes(image))
         elif image.startswith("file://"):
             image_obj = Image.open(resolve_file_uri_to_path(image))
         elif image.startswith("data:image"):
@@ -189,7 +420,7 @@ def fetch_image(
         elif "path" in image and image["path"]:
             image_obj = Image.open(image["path"])
         elif "url" in image and image["url"]:
-            image_obj = Image.open(requests.get(image["url"], stream=True, timeout=30).raw)
+            image_obj = Image.open(fetch_remote_media_bytes(image["url"]))
 
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
@@ -442,13 +673,26 @@ def get_video_reader_backend() -> str:
 
 def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample_fps: bool = False) -> Union[torch.Tensor, list[Image.Image]]:
     if isinstance(ele["video"], str):
+        # Pick the decoder first: if none is installed, a temp file would strand.
         video_reader_backend = get_video_reader_backend()
+        # The decoders fetch remote URLs themselves and follow redirects with no
+        # way to refuse, so download through the guard and decode a local file.
+        downloaded = None
+        if ele["video"].startswith("http://") or ele["video"].startswith("https://"):
+            downloaded = fetch_remote_media_to_file(ele["video"])
+            ele = dict(ele)
+            ele["video"] = downloaded
         try:
-            video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
-            video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+            try:
+                video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
+                video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
+        finally:
+            if downloaded is not None:
+                try: os.unlink(downloaded)
+                except OSError: pass
 
         nframes, _, height, width = video.shape
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
@@ -551,13 +795,53 @@ def _fix_audio_feature_extractor_padding_side(processor):
         feature_extractor.padding_side = "right"
 
 
+@lru_cache(maxsize=1)
+def _audio_decoder_types():
+    # torchcodec AudioDecoder type (datasets >= 4 Audio() columns), matched
+    # directly so an unpatched decoder (only __getitem__) is still recognized.
+    # Returns () when datasets < 4 / the dep is unavailable. See #7226.
+    try:
+        from datasets.features._torchcodec import AudioDecoder
+    except (ImportError, AttributeError, RuntimeError):
+        return ()
+    return (AudioDecoder,)
+
+
+def _is_audio_mapping(audio):
+    # True for anything _resolve_audio_dict can read "array"/"sampling_rate" from:
+    # a Mapping, a torchcodec AudioDecoder, or a duck-typed mapping. isinstance(dict)
+    # alone drops decoders into the raw-waveform catch-all (#7226). callable() (not
+    # hasattr) rejects objects with a non-callable get/keys.
+    if isinstance(audio, Mapping):
+        return True
+    if isinstance(audio, _audio_decoder_types()):
+        return True
+    return (
+        callable(getattr(audio, "get", None)) and
+        callable(getattr(audio, "keys", None)) and
+        callable(getattr(audio, "__contains__", None))
+    )
+
+
+def _audio_get(audio, key, default=None):
+    # Mapping-style lookup that falls back to subscripting for an unpatched
+    # AudioDecoder (only __getitem__, no .get).
+    getter = getattr(audio, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return audio[key]
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
 def _resolve_audio_dict(audio, sampling_rate=None):
     # HuggingFace Audio feature dict -> waveform array, else a path / url string
     # (covers Audio(decode=False) payloads like {"bytes": None, "path": ...})
-    _check_audio_sampling_rate(audio.get("sampling_rate"), sampling_rate)
-    value = audio.get("array")
+    _check_audio_sampling_rate(_audio_get(audio, "sampling_rate"), sampling_rate)
+    value = _audio_get(audio, "array")
     if value is None:
-        value = audio.get("path") or audio.get("url")
+        value = _audio_get(audio, "path") or _audio_get(audio, "url")
     return value
 
 
@@ -581,7 +865,7 @@ def extract_audio_info(
                     # Feature extractors also accept local paths and URLs as strings
                     if audio is None:
                         audio = ele.get("url") or ele.get("path")
-                    if isinstance(audio, dict):
+                    if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
@@ -1049,7 +1333,7 @@ class UnslothVisionDataCollator:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
         # HuggingFace Audio feature: {"array": np.ndarray, "sampling_rate": int, ...}
-        elif isinstance(audio_val, dict):
+        elif _is_audio_mapping(audio_val):
             clip = _resolve_audio_dict(audio_val, target_sr)
             if clip is None:
                 raise ValueError(
@@ -1062,12 +1346,16 @@ class UnslothVisionDataCollator:
                 clips = []
             # A flat list of samples is one clip, not a list of clips
             # (strings are path/url clips, so they stay in the list-of-clips branch)
-            elif not isinstance(audio_val[0], (dict, list, tuple, str)) and getattr(audio_val[0], "ndim", 0) == 0:
+            elif (
+                not _is_audio_mapping(audio_val[0])
+                and not isinstance(audio_val[0], (list, tuple, str))
+                and getattr(audio_val[0], "ndim", 0) == 0
+            ):
                 clips = [audio_val]
             else:
                 clips = []
                 for clip in audio_val:
-                    if isinstance(clip, dict):
+                    if _is_audio_mapping(clip):
                         clip = _resolve_audio_dict(clip, target_sr)
                         if clip is None:
                             raise ValueError(
