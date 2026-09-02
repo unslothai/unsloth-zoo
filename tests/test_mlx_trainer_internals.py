@@ -35,29 +35,39 @@ import torch
 def _install_shim():
     import sys
     shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
-    real_mlx_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-    }
-    from mlx_simulation import simulate_mlx_on_torch
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
+    # this fixture drops them and the next importer therefore builds a NEW module
+    # object. Anything that ran earlier in this process and did
+    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
+    # it and the code under test end up on two copies of the same module globals:
+    # the training window one opens is invisible to the other, and a gated-delta
+    # op quietly takes the cached path instead of the VJP. Serially that never
+    # happens (alphabetical order puts this file after the pair it would break);
+    # under `-n N --dist loadfile` it depends on which worker draws which file.
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
     from mlx_simulation.mlx_stub import _MLXFinder
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
     for name in list(sys.modules):
         if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
             sys.modules.pop(name, None)
     yield
-    for name in list(sys.modules):
-        if (
-            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
-            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-        ):
-            sys.modules.pop(name, None)
     sys.meta_path[:] = [
         finder for finder in sys.meta_path
         if not isinstance(finder, _MLXFinder)
     ]
-    sys.modules.update(real_mlx_modules)
+    restore_modules(real_mlx_modules, _owned)
 
 
 def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
@@ -2638,6 +2648,69 @@ def test_resolved_best_metric_name_mirrors_hf_lookup():
     ]:
         trainer.args.metric_for_best_model = value
         assert trainer._resolved_best_metric_name() == expected
+
+
+def test_best_metric_direction_is_inferred_when_it_is_not_set():
+    # A preference run selects on rewards/accuracies, where "better" is upward.
+    # An unset direction defaulting to False would keep the worst checkpoint.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric, expected in [
+        ("eval_loss", False),
+        ("eval_nll_loss", False),
+        ("eval_rewards/accuracies", True),
+        (None, False),
+    ]:
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is expected
+
+    args.metric_for_best_model = "eval_rewards/accuracies"
+    for explicit in (True, False):
+        args.greater_is_better = explicit
+        assert _resolve_greater_is_better(args) is explicit
+
+
+def test_perplexity_is_inferred_as_lower_is_better():
+    # HF's rule is a bare "loss" suffix, because HF never emits perplexity. This
+    # trainer emits it for every token objective, and the field defaulted to
+    # False before the direction was inferred at all -- so reading it upward
+    # would invert best-checkpoint selection for runs that predate inference.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric in ("eval_perplexity", "eval_val_perplexity"):
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is False
+
+
+def test_the_resolved_direction_is_not_written_to_the_callers_config():
+    # The direction has to be a real boolean on the arguments before any
+    # callback reads it, but `args` belongs to the caller: a config handed to
+    # two trainers, or inspected afterwards, must come back as it went in.
+    import dataclasses
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        def trainable_parameters(self): return {}
+
+    args = MLXTrainingConfig(metric_for_best_model="eval_accuracy")
+    before = dataclasses.asdict(args)
+
+    first = MLXTrainer(Model(), None, [], args=args)
+    second = MLXTrainer(Model(), None, [], args=args)
+
+    assert dataclasses.asdict(args) == before
+    assert args.greater_is_better is None
+    assert first.args is not second.args
+    assert first.args.greater_is_better is True
+    assert second.args.greater_is_better is True
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():

@@ -32,11 +32,24 @@ dependencies = [
     "peft>=0.18.0,!=0.11.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "cut_cross_entropy ; python_version >= '3.10' and (sys_platform != 'darwin' or platform_machine != 'arm64')",
     # --- MLX-only deps (macOS arm64) ---
-    "mlx>=0.22.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # Pinned, not floored. mlx ships breaking changes in PATCH releases: 0.32.1
+    # replaced mx.random.state with a sentinel that refuses item assignment and
+    # broke three separate call sites here and in Studio (unsloth-zoo #1078,
+    # #1081, unsloth #9478), and it reached users through an unattended upgrade
+    # because nothing bounded it. Bump these deliberately, after the Apple
+    # Silicon lane is green on the new release.
+    "mlx==0.32.1 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
     # generation drives, first ship in mlx-lm 0.31.2.
-    "mlx-lm>=0.31.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    "mlx-vlm>=0.4.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # A ceiling rather than an exact pin, because the two consumers resolve
+    # different patches and both are correct. Under the transformers<=5.5.0 cap
+    # below, the newest mlx-vlm that fits is 0.6.4 (0.6.9+ requires
+    # transformers>=5.14). Studio's installer overrides that requirement, so it
+    # gets 0.6.15 -- which matters: the UnicodeDecodeError during generation in
+    # unsloth #9466 is fixed in 0.6.9. Pinning either patch exactly would make
+    # one of those two environments unresolvable or reintroduce a fixed bug.
+    "mlx-vlm>=0.4.4,<0.7.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
@@ -75,10 +88,11 @@ exclude = ["images*", "tests*", "scripts*"]
 
 [project.optional-dependencies]
 mlx = [
-    "mlx>=0.22.0",
-    # Keep in sync with the MLX-only dependency pin above.
-    "mlx-lm>=0.31.2",
-    "mlx-vlm>=0.4.4",
+    # Keep in sync with the MLX-only dependency pins above, including the reason
+    # they are pins.
+    "mlx==0.32.1",
+    "mlx-lm==0.31.3",
+    "mlx-vlm>=0.4.4,<0.7.0",
 ]
 core = [
     "packaging>=24.1",

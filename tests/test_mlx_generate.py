@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import inspect
 import pathlib
+import sys
 import types
 from dataclasses import make_dataclass
 import pytest
@@ -158,6 +159,136 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.warns(RuntimeWarning, match="clear_cache"), pytest.raises(ValueError, match="body"):
         with _generation_cache_hygiene():
             raise ValueError("body")
+
+def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+    events = []
+    monkeypatch.setattr(
+        "mlx.core.synchronize",
+        # `is None`: a falsey stream labelled "default" would hide an over-drain.
+        lambda stream=None: events.append(
+            f"synchronize:{'default' if stream is None else stream}"
+        ),
+    )
+    if has_clear_cache:
+        monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
+    else:
+        # None, not delattr: tests/mlx_simulation trampolines any missing name, so a
+        # deleted attribute stays callable and the guard never fires.
+        monkeypatch.setattr("mlx.core.clear_cache", None, raising=False)
+    return events
+
+def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with _generation_cache_hygiene():
+        events.append("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_the_generation_stream_is_drained_not_just_the_default_one(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    for name in ("mlx_lm.generate", "mlx_vlm.generate.dispatch"):
+        monkeypatch.setitem(
+            sys.modules, name,
+            types.SimpleNamespace(generation_stream=f"stream<{name}>"),
+        )
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<mlx_lm.generate>") == 2
+    assert events.count("synchronize:stream<mlx_vlm.generate.dispatch>") == 2
+    assert events.index("synchronize:stream<mlx_lm.generate>") < events.index("clear_cache")
+
+def _fake_stream_module(monkeypatch, name, stream):
+    monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(generation_stream=stream))
+
+def test_the_speculative_decoding_stream_is_drained_too(monkeypatch):
+    # Created on import and never routed through wired_limit: nothing else drains it.
+    events = _record_cache_calls(monkeypatch)
+    _fake_stream_module(monkeypatch, "mlx_vlm.speculative.common", "stream<speculative>")
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<speculative>") == 2
+
+def test_one_stream_shared_by_several_modules_is_drained_once(monkeypatch):
+    # 0.6.x re-exports one stream from every candidate name, so identity decides.
+    events = _record_cache_calls(monkeypatch)
+    shared = "stream<shared>"
+    for name in ("mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar"):
+        _fake_stream_module(monkeypatch, name, shared)
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<shared>") == 2
+
+def test_a_stream_that_cannot_be_drained_does_not_stop_the_clear(monkeypatch):
+    # A plain mx.new_stream (the mlx-vlm pin floor) raises off its creating thread.
+    events = _record_cache_calls(monkeypatch)
+    def synchronize(stream=None):
+        if stream == "stream<foreign>":
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+        events.append(f"synchronize:{'default' if stream is None else stream}")
+    monkeypatch.setattr("mlx.core.synchronize", synchronize)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<foreign>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_module_getattr_that_raises_does_not_stop_the_clear(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    module = types.ModuleType("mlx_vlm.generate")
+    def module_getattr(name):
+        raise RuntimeError(f"lazy attribute {name} exploded")
+    module.__getattr__ = module_getattr
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", module)
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_runtime_without_synchronize_still_clears(monkeypatch):
+    # No real runtime is this shape, but a partial test double is.
+    events = _record_cache_calls(monkeypatch)
+    monkeypatch.setattr("mlx.core.synchronize", None, raising=False)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<mlx_lm>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == ["clear_cache", "body", "clear_cache"]
+
+def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with pytest.raises(ValueError, match="body"):
+        with _generation_cache_hygiene():
+            raise ValueError("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "synchronize:default", "clear_cache",
+    ]
+
+@pytest.mark.parametrize("metal", [
+    types.SimpleNamespace(),
+    # Refused even when the pre-0.22 shape is present: this path never accepted it.
+    types.SimpleNamespace(clear_cache=lambda: None),
+])
+def test_missing_clear_cache_is_rejected_before_any_work(monkeypatch, metal):
+    events = _record_cache_calls(monkeypatch, has_clear_cache=False)
+    monkeypatch.setattr("mlx.core.metal", metal, raising=False)
+    with pytest.raises(RuntimeError, match="clear_cache missing"):
+        with _generation_cache_hygiene():
+            pytest.fail("body must not run when the runtime cannot clear its cache")
+    assert events == []
 
 def test_training_flag_restore_attempts_every_module():
     class Module:
