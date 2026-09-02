@@ -38,14 +38,15 @@ import time
 
 import pytest
 
-# Importing unsloth_zoo injects the bitsandbytes and triton stubs into sys.modules
-# on a host that ships neither, which is every macOS and Windows runner. Do it at
-# collection time: left to the `compiler` fixture, the injection happens inside the
-# first test that uses it, and conftest's sys.modules leak gate attributes it to
-# that test and fails its teardown. Guarded because the static source tests below
-# must still run where the package cannot be imported at all.
+# Importing the compiler pulls in the bitsandbytes and triton substitutes on a host
+# that ships neither, which is every macOS and Windows runner. Do it at collection
+# time: left to the `compiler` fixture, the substitute for bitsandbytes.nn lands
+# inside the first test that uses it, and conftest's sys.modules leak gate
+# attributes it to that test and fails its teardown. It has to be the submodule --
+# importing the package alone does not reach bitsandbytes.nn. Guarded because the
+# static source tests below must still run where the import cannot succeed.
 try:
-    import unsloth_zoo  # noqa: F401
+    import unsloth_zoo.compiler  # noqa: F401
 except Exception:
     pass
 
