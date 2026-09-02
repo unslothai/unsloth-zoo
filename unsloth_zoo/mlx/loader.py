@@ -59,6 +59,7 @@ _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
 _SAFE_TEXT_SANITIZE_PATCHED: set[str] = set()
 _AUDIO_CONV_SANITIZE_PATCHED: set[str] = set()
+_TEXT_ONLY_CALL_PATCHED: set = set()
 _MULTIMODAL_STRIP_KEYS = (
     "vision_tower",
     "audio_tower",
@@ -2642,32 +2643,6 @@ def _get_mlx_lm_model_class(model_type: str):
     return getattr(module, "Model", None)
 
 
-_VLM_TEXT_PATH_MODEL_TYPES = frozenset({
-    "muse_glimmer",
-    # Hybrid linear-attention decoders mlx_lm has no class for. Both reproduce a
-    # fresh model bitwise across a width or batch change, so the position tensor
-    # qwen4_exp caches between calls never leaks into the next text batch.
-    "qwen4_exp",
-    "glm5_next",
-})
-
-
-def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
-    """Whether mlx-vlm's text path for this architecture is known to train.
-
-    Listed rather than inferred, because nothing readable before loading proves
-    it: mlx-vlm's encoder-decoder and masked-diffusion families declare the same
-    token-logit output as the causal ones, and the Qwen, GLM and Paddle towers
-    holding `_position_ids` across calls declare nothing about it. An unlisted
-    architecture keeps the mlx_lm "Model type ... not supported" it had before.
-    """
-    if not model_type:
-        return False
-    # Shared with utils' vision-grid family set so the two cannot disagree on spelling.
-    from .utils import _mlx_vlm_canonical_model_type
-    return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
-
-
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     """Whether a multimodal wrapper should stay on the VLM load path.
 
@@ -2677,9 +2652,10 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     robust than a per-family sanitizer workaround.
 
     Multimodal architectures also land in mlx-vlm before mlx_lm has them, or
-    without mlx_lm ever gaining them. mlx_lm cannot construct those at all, so
-    a text-only request loads the wrapper and trains its text tower rather than
-    failing with "Model type ... not supported".
+    without mlx_lm ever gaining them. mlx_lm cannot construct those at all, so a
+    text-only request loads the wrapper and trains its text tower rather than
+    failing with "Model type ... not supported". Whether the wrapper answers a
+    text batch is settled after loading, by asking it.
     """
 
     if not _is_vlm(config):
@@ -2687,7 +2663,7 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 
     cls = _get_mlx_lm_model_class(model_type)
     if cls is None:
-        return _mlx_vlm_text_path_is_verified(model_type)
+        return _resolve_mlx_vlm_model_class(model_type) is not None
 
     return _has_multimodal_strip_sanitize(cls)
 
@@ -2741,18 +2717,152 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
     _SAFE_TEXT_SANITIZE_PATCHED.add(module_name)
 
 
+# No installed mlx-vlm wrapper demands more than two.
+_MODALITY_ARGUMENT_LIMIT = 3
+
+# Token pairs differing only in their last position. Two ids sharing an embedding
+# row answer identically, so the next pair is tried; low ids first, because mlx
+# reads past a short table as zeros and ties the pair rather than raising.
+_PROBE_TOKEN_PAIRS = (
+    ((2, 3, 2), (2, 3, 3)),
+    ((0, 1, 0), (0, 1, 1)),
+    ((5, 7, 5), (5, 7, 7)),
+    ((11, 13, 11), (11, 13, 13)),
+)
+
+
+def _call_restoring_module_state(model, call):
+    """Run `call` and put back the state it left on the model's modules: qwen2_vl
+    reuses a cached `_position_ids` without checking it still fits."""
+
+    from .utils import _mlx_module_state_restored
+
+    try:
+        modules = list(model.modules())
+    except Exception:
+        return call()
+
+    with _mlx_module_state_restored(modules):
+        return call()
+
+
+def _bind_text_only_modality_arguments(model, extra: int) -> None:
+    cls = type(model)
+    if extra <= 0 or cls in _TEXT_ONLY_CALL_PATCHED:
+        return
+
+    call = cls.__call__
+
+    def patched_call(self, input_ids, *args, **kwargs):
+        if args:
+            return call(self, input_ids, *args, **kwargs)
+        try:
+            return call(self, input_ids, *(None,) * extra, **kwargs)
+        except TypeError as exc:
+            # The image path names `pixel_values`, so yield to a caller that did.
+            if "multiple values for" not in str(exc):
+                raise
+            return call(self, input_ids, **kwargs)
+
+    cls.__call__ = patched_call
+    _TEXT_ONLY_CALL_PATCHED.add(cls)
+    print(
+        f"Unsloth: Passing {extra} empty modality argument(s) to {cls.__name__} "
+        "so the text-only path can call it."
+    )
+
+
+def _verify_text_only_wrapper(model, model_type: str) -> int:
+    """Establish, by asking, that the wrapper is a causal LM over token ids, and
+    return how many empty modality arguments its call needs. Nothing about the class
+    settles it: these wrappers take token ids and then demand pixels, answer a
+    different length, return no logits, or answer bidirectionally — and
+    `_install_paligemma_causal_mask` rewrites `__call__` as `(*args, **kwargs)`, so
+    even a signature depends on what the process has already loaded."""
+
+    import mlx.core as mx
+    from .utils import _model_logits
+
+    def forward(tokens, extra=0):
+        ids = mx.array([list(tokens)])
+        return _model_logits(model(ids, *((None,) * extra)))
+
+    def refuse(exc):
+        return ValueError(
+            f"Unsloth: mlx-vlm's `{model_type}` cannot be fine-tuned on text alone "
+            f"({type(exc).__name__}: {exc}). Train it with a dataset carrying its "
+            "own modality, or pick a checkpoint whose text tower stands on its own."
+        )
+
+    def discover_arity():
+        for extra in range(_MODALITY_ARGUMENT_LIMIT + 1):
+            try:
+                forward(_PROBE_TOKEN_PAIRS[0][0], extra)
+            except TypeError as exc:
+                if "positional argument" not in str(exc):
+                    raise
+                continue
+            return extra
+        raise TypeError(
+            f"needs more than {_MODALITY_ARGUMENT_LIMIT} modality arguments"
+        )
+
+    try:
+        extra = _call_restoring_module_state(model, discover_arity)
+    except Exception as exc:
+        raise refuse(exc) from exc
+
+    for tokens, perturbed_tokens in _PROBE_TOKEN_PAIRS:
+        try:
+            baseline = _call_restoring_module_state(model, lambda: forward(tokens, extra))
+            perturbed = _call_restoring_module_state(model, lambda: forward(perturbed_tokens, extra))
+            mx.eval(baseline, perturbed)
+            shape = tuple(baseline.shape)
+        except Exception as exc:
+            raise refuse(exc) from exc
+
+        if len(shape) != 3 or shape[:2] != (1, len(tokens)):
+            raise ValueError(
+                f"Unsloth: mlx-vlm's `{model_type}` answered {len(tokens)} tokens with "
+                f"logits shaped {shape}, so it is not a causal language model the text "
+                "path can train."
+            )
+
+        # Nothing moved where the input changed, so this pair says nothing.
+        if mx.array_equal(baseline[:, -1], perturbed[:, -1]).item():
+            continue
+
+        if not mx.array_equal(baseline[:, :-1], perturbed[:, :-1]).item():
+            raise ValueError(
+                f"Unsloth: mlx-vlm's `{model_type}` attends bidirectionally — changing "
+                "the last token moved the logits before it — so a shifted causal "
+                "objective would train it to predict tokens it can already see."
+            )
+        return extra
+
+    raise ValueError(
+        f"Unsloth: mlx-vlm's `{model_type}` answered every probe identically, so "
+        "whether it attends causally could not be established and a text-only "
+        "fine-tune cannot be trusted."
+    )
+
+
+def _mark_text_only_vlm(model, model_type: str) -> None:
+    # A refused load must leave the class unpatched and the model unflagged.
+    extra = _verify_text_only_wrapper(model, model_type)
+    _bind_text_only_modality_arguments(model, extra)
+    model._unsloth_text_only_vlm = True
+
+
 def _resolve_mlx_vlm_model_class(model_type):
     """Resolve the mlx_vlm ``Model`` class for a model_type (honoring remaps)."""
     if not model_type:
         return None
-    module_type = str(model_type).replace("-", "_")
-    try:
-        from mlx_vlm.utils import MODEL_REMAPPING
-        remapped = MODEL_REMAPPING.get(model_type, MODEL_REMAPPING.get(module_type))
-        if remapped:
-            module_type = str(remapped).replace("-", "_")
-    except Exception:
-        pass
+    # Shared with utils' vision-grid resolution: mlx-vlm lower-cases before it remaps.
+    from .utils import _mlx_vlm_canonical_model_type
+    module_type = _mlx_vlm_canonical_model_type(model_type)
+    if not module_type:
+        return None
     for candidate in (
         f"mlx_vlm.models.{module_type}.{module_type}",
         f"mlx_vlm.models.{module_type}",
@@ -7777,7 +7887,7 @@ class FastMLXModel:
                     "Unsloth: text_only=True requested for a multimodal wrapper; "
                     "keeping the model on the mlx-vlm path and returning its tokenizer."
                 )
-                model._unsloth_text_only_vlm = True
+                _mark_text_only_vlm(model, model_type)
             model._is_vlm_model = True
             model._processor = processor
             for fixup in _VLM_MODEL_FIXUPS:

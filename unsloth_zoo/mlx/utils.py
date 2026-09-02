@@ -15165,6 +15165,25 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
     return stacked
 
 
+@contextlib.contextmanager
+def _mlx_module_state_restored(modules):
+    """Leave these modules as they were found: an mlx `Module` is a dict of
+    parameters and children plus plain attributes, and both halves are put back.
+    State inside plain objects a module merely references is not reached."""
+    state = [(module, dict(module) if isinstance(module, dict) else None,
+              dict(vars(module))) for module in modules]
+    try:
+        yield
+    finally:
+        for module, items, attributes in state:
+            if items is not None:
+                # Through `dict`: `Module.update` reads a nested parameter tree.
+                dict.clear(module)
+                dict.update(module, items)
+            vars(module).clear()
+            vars(module).update(attributes)
+
+
 class _MlxReplayedSanitizers:
     """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
     ties its head and drops `lm_head` if handed no `lm_head.weight`."""
@@ -15174,24 +15193,13 @@ class _MlxReplayedSanitizers:
         self.held = tuple(held)
 
     def sanitize(self, weights):
-        # An mlx `Module` is a dict of parameters/children plus plain attributes.
-        state = [(module, dict(module) if isinstance(module, dict) else None,
-                  dict(vars(module))) for module in self.held]
-        try:
+        with _mlx_module_state_restored(self.held):
             for owner in self.owners:
                 weights = owner.sanitize(weights)
                 # A failed replay writes nothing: the export is then what it was without this pass.
                 if not isinstance(weights, Mapping):
                     raise TypeError("sanitize did not return a mapping")
             return weights
-        finally:
-            for module, items, attributes in state:
-                if items is not None:
-                    # Through `dict`: `Module.update` reads a nested parameter tree.
-                    dict.clear(module)
-                    dict.update(module, items)
-                vars(module).clear()
-                vars(module).update(attributes)
 
 
 def _mlx_moe_sanitizers(model):

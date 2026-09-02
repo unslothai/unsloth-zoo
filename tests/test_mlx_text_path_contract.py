@@ -128,15 +128,6 @@ def test_a_broken_remapping_falls_back_to_the_raw_name(mutils, remapping, hostil
     assert _is_array(out["image_grid_thw"])
 
 
-def test_the_loader_and_the_grid_agree_on_the_same_alias(remapping):
-    """One helper, so the two ends cannot drift apart again."""
-    import unsloth_zoo.mlx.loader as loader
-    import unsloth_zoo.mlx.utils as mutils
-    remapping({"muse-glimmer": "muse_glimmer"})
-    assert loader._mlx_vlm_text_path_is_verified("muse-glimmer") is True
-    assert mutils._mlx_vlm_canonical_model_type("muse-glimmer") == "muse_glimmer"
-
-
 def test_an_empty_model_type_resolves_to_nothing(mutils):
     assert mutils._mlx_vlm_canonical_model_type("") == ""
     assert mutils._mlx_vlm_canonical_model_type(None) == ""

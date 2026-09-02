@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 
 import numpy as np
@@ -9,6 +10,7 @@ from unittest import mock
 
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
     pytest.skip("requires real MLX runtime", allow_module_level=True)
 
@@ -966,15 +968,26 @@ def test_text_only_vlm_wrapper_uses_text_training_path():
 _VLM_CONFIG = {"model_type": "fake_vlm", "vision_config": {"hidden_size": 8}}
 
 
-def _route_text_only(
-    monkeypatch, *, mlx_lm_class, vlm_text_path_verified, config=_VLM_CONFIG,
-):
+def _skip_unless_mlx_vlm_ships(model_type):
+    """Asking the resolver would turn its own regressions into skips."""
+    import pkgutil
+
+    import mlx_vlm.models
+
+    shipped = {module.name for module in pkgutil.iter_modules(mlx_vlm.models.__path__)}
+    if model_type not in shipped:
+        pytest.skip(f"installed mlx-vlm does not ship {model_type}")
+
+
+class _VLMOnlyClass:
+    """Stands in for a class only mlx-vlm ships; routing never calls it."""
+
+
+def _route_text_only(monkeypatch, *, mlx_lm_class, vlm_class, config=_VLM_CONFIG):
     from unsloth_zoo.mlx import loader
 
     monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _t: mlx_lm_class)
-    monkeypatch.setattr(
-        loader, "_mlx_vlm_text_path_is_verified", lambda _t: vlm_text_path_verified,
-    )
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _t: vlm_class)
     return loader._prefer_vlm_loader_for_text(config, config["model_type"])
 
 
@@ -988,27 +1001,31 @@ class _PlainModel:
         return weights
 
 
-def test_vlm_only_architecture_routes_text_only_loads_to_mlx_vlm(monkeypatch):
-    """mlx_lm cannot build it, mlx-vlm can: load the wrapper's text tower."""
-    assert _route_text_only(
-        monkeypatch, mlx_lm_class=None, vlm_text_path_verified=True
-    ) is True
-
-
-@pytest.mark.parametrize("model_type", ["muse_glimmer", "qwen4_exp", "glm5_next"])
-def test_verified_vlm_text_paths_stay_verified(model_type):
-    """Dropping one silently restores the mlx_lm "not supported" load error."""
+@pytest.mark.parametrize(
+    "model_type",
+    ["muse_glimmer", "qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl", "kimi_k3"],
+)
+def test_vlm_only_families_reach_the_text_path_without_being_listed(model_type):
+    """Against the installed packages rather than a monkeypatched resolver."""
     from unsloth_zoo.mlx import loader
 
-    assert loader._mlx_vlm_text_path_is_verified(model_type) is True
-    assert loader._mlx_vlm_text_path_is_verified("qwen3_5") is False
-    assert loader._mlx_vlm_text_path_is_verified("") is False
+    _skip_unless_mlx_vlm_ships(model_type)
+    config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+    assert loader._get_mlx_lm_model_class(model_type) is None
+    assert loader._prefer_vlm_loader_for_text(config, model_type) is True
 
 
-def test_architecture_neither_backend_ships_is_not_routed_to_mlx_vlm(monkeypatch):
-    assert _route_text_only(
-        monkeypatch, mlx_lm_class=None, vlm_text_path_verified=False
-    ) is False
+def test_a_capitalised_model_type_routes_like_its_lowercase_spelling():
+    """mlx-vlm lower-cases before it remaps, so a `Muse_Glimmer` config loads."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships("muse_glimmer")
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route("Muse_Glimmer") is route("muse_glimmer") is True
 
 
 @pytest.mark.parametrize("alias, target", [("qwen2_5_vl", "qwen2_vl"), ("llava", "mistral3")])
@@ -1023,6 +1040,209 @@ def test_an_aliased_model_type_loads_like_the_architecture_it_aliases(alias, tar
         return loader._prefer_vlm_loader_for_text(config, model_type)
 
     assert route(alias) == route(target)
+
+
+def _causal_logits(input_ids, vocab=7):
+    running = mx.cumsum(input_ids.astype(mx.float32), axis=1)
+    return mx.repeat(running[:, :, None], vocab, axis=2)
+
+
+def _sees_everything(values):
+    """What bidirectional attention looks like from outside."""
+    everything = values.astype(mx.float32).sum(axis=1, keepdims=True)
+    return mx.repeat(mx.broadcast_to(everything, values.shape)[:, :, None], 5, axis=2)
+
+
+class _PooledOutput:
+    """Shaped like mlx-vlm's pooled wrappers: no `logits` at all."""
+    text_embeds = "embeddings"
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        pytest.param(
+            lambda self, ids: (_ for _ in ()).throw(ValueError("You have to specify pixel_values")),
+            "cannot be fine-tuned on text alone",
+            id="demands pixels it was not given",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((1, ids.shape[1] + 3, 7)),
+            "not a causal language model",
+            id="answers a different sequence length",
+        ),
+        pytest.param(
+            lambda self, ids: _PooledOutput(),
+            "cannot be fine-tuned on text alone",
+            id="returns pooled embeddings",
+        ),
+        pytest.param(
+            lambda self, ids, a, b, c, d: _causal_logits(ids),
+            "cannot be fine-tuned on text alone",
+            id="demands more modalities than the path can invent",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(ids),
+            "attends bidirectionally",
+            id="sees the whole sequence",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(mx.maximum(ids, 4)),
+            "attends bidirectionally",
+            id="sees it only above the ids that share an embedding row",
+        ),
+        pytest.param(
+            lambda self, ids: mx.repeat(
+                mx.broadcast_to(1.0 + ids[:, -1:].astype(mx.float32) * 1e-6, ids.shape)[:, :, None], 5, axis=2),
+            "attends bidirectionally",
+            id="leaks far below any numerical tolerance",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((*ids.shape, 5)),
+            "answered every probe identically",
+            id="no probe can move it",
+        ),
+    ],
+)
+def test_a_wrapper_that_cannot_be_trained_on_text_is_refused_by_name(call, expected):
+    """Only running one tells these apart, and the refusal has to name it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    try:
+        with pytest.raises(ValueError, match=expected) as raised:
+            loader._verify_text_only_wrapper(cls(), "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(cls)
+    assert "fake_vlm" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda self, ids: _causal_logits(ids), id="plain causal"),
+        pytest.param(
+            lambda self, ids: _causal_logits(mx.where(ids < 4, ids // 2, ids)),
+            id="two probe pairs cannot move it",
+        ),
+    ],
+)
+def test_a_causal_wrapper_is_accepted_and_left_unpatched(call):
+    """The second ties ids 0/1 and 2/3, so only the wider pairs settle it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    original, model = cls.__call__, cls()
+    loader._mark_text_only_vlm(model, "fake_vlm")
+    assert model._unsloth_text_only_vlm is True
+    assert cls.__call__ is original
+
+
+def test_the_text_only_path_flags_the_model_makes_it_callable_and_checks_it():
+    """Checked but not bound, or bound but not flagged, fails on the first step."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask):
+            return _causal_logits(input_ids)
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model._unsloth_text_only_vlm is True
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_refused_wrapper_leaves_the_process_as_it_found_it():
+    """A class patch would outlive the refusal and reach the next load."""
+    from unsloth_zoo.mlx import loader
+
+    class Bidirectional:
+        def __call__(self, input_ids, pixel_values):
+            return _sees_everything(input_ids)
+
+    original, model = Bidirectional.__call__, Bidirectional()
+    try:
+        with pytest.raises(ValueError, match="attends bidirectionally"):
+            loader._mark_text_only_vlm(model, "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Bidirectional)
+
+    assert Bidirectional.__call__ is original
+    assert not hasattr(model, "_unsloth_text_only_vlm")
+
+
+def test_a_wrapper_bound_for_text_still_takes_its_modalities_by_name():
+    """The image path names `pixel_values`; that must not become a duplicate."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask=None):
+            if pixel_values is None:
+                return _causal_logits(input_ids)
+            return pixel_values, mask
+
+    model = Wrapper()
+    ids = mx.ones((1, 2), dtype=mx.int32)
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(ids).shape == (1, 2, 7)
+        assert model(ids, pixel_values="pixels", mask="mask") == ("pixels", "mask")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_wrapper_whose_signature_hides_what_it_demands_is_still_called():
+    """`_install_paligemma_causal_mask` rewrites `__call__` as `(*args, **kwargs)`."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def _forward(self, input_ids, pixel_values, mask=None):
+            return _causal_logits(input_ids)
+
+        def __call__(self, *args, **kwargs):
+            return self._forward(*args, **kwargs)
+
+    assert str(inspect.signature(Wrapper.__call__)) == "(self, *args, **kwargs)"
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
+    """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
+    from unsloth_zoo.mlx import loader
+
+    class Cacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.ones((4, 5))
+            self._position_ids = None
+
+        def __call__(self, input_ids):
+            self._position_ids = mx.arange(input_ids.shape[1])
+            return _causal_logits(input_ids, vocab=5)
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = Cacher()
+
+        def __call__(self, input_ids):
+            return self.language_model(input_ids)
+
+    model = Wrapper()
+    weight = model.language_model.weight
+    loader._verify_text_only_wrapper(model, "fake_vlm")
+
+    assert model.language_model._position_ids is None
+    assert model.language_model.weight is weight
 
 
 @pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
@@ -1067,10 +1287,10 @@ def test_vlm_generate_prefers_the_processor_over_the_published_tokenizer():
 def test_text_capable_mlx_lm_architecture_still_decides_by_its_sanitize(monkeypatch):
     """An mlx_lm class keeps deciding on whether its sanitize strips towers."""
     assert _route_text_only(
-        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_text_path_verified=True
+        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_class=_VLMOnlyClass
     ) is True
     assert _route_text_only(
-        monkeypatch, mlx_lm_class=_PlainModel, vlm_text_path_verified=True
+        monkeypatch, mlx_lm_class=_PlainModel, vlm_class=_VLMOnlyClass
     ) is False
 
 
@@ -1078,51 +1298,24 @@ def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
     assert _route_text_only(
         monkeypatch,
         mlx_lm_class=None,
-        vlm_text_path_verified=True,
+        vlm_class=_VLMOnlyClass,
         config={"model_type": "fake_text"},
     ) is False
 
 
-def test_text_path_fallback_is_limited_to_validated_architectures():
-    """The fallback claims the whole text path works, and nothing readable
-    before loading establishes that: mlx-vlm's encoder-decoder and diffusion
-    families declare the same output type as the causal ones, and the towers
-    holding `_position_ids` across calls declare nothing about it."""
-    from unsloth_zoo.mlx.loader import _mlx_vlm_text_path_is_verified
-
-    assert _mlx_vlm_text_path_is_verified("muse_glimmer") is True
-
-    unverified = (
-        # Encoder-decoder and masked-diffusion: same declared output type,
-        # bidirectional semantics, so a text run would optimize the wrong thing.
-        "florence2", "diffusion_gemma",
-        # Towers that keep per-call position state a later, wider batch reuses.
-        "qwen2_5_vl", "qwen2_vl", "glm4v", "paddleocr_vl",
-        # Wrappers whose own call requires pixel_values positionally.
-        "aya_vision", "fastvlm", "granite_vision",
-        # Retrieval, encoder, embedding and detector families.
-        "colqwen2_5", "siglip", "bert", "rfdetr", "sam3",
-        # Causal, but never validated on this path.
-        "llava", "gemma3", "qwen3_vl", "phi3_v",
-    )
-    for model_type in unverified:
-        assert _mlx_vlm_text_path_is_verified(model_type) is False, model_type
-
-    assert _mlx_vlm_text_path_is_verified("not_a_real_architecture") is False
-    assert _mlx_vlm_text_path_is_verified("") is False
-
-
 def test_text_path_fallback_resolves_mlx_vlm_model_type_aliases():
-    """mlx-vlm maps several config spellings onto one module, so a validated
-    module name has to match every spelling that reaches it."""
+    """mlx-vlm maps several config spellings onto one module."""
     from unsloth_zoo.mlx import loader
 
-    remapping = {"muse-glimmer": "muse_glimmer", "llava_qwen2": "fastvlm"}
+    _skip_unless_mlx_vlm_ships("fastvlm")
     with mock.patch.dict(
-        "mlx_vlm.utils.MODEL_REMAPPING", remapping, clear = False,
+        "mlx_vlm.utils.MODEL_REMAPPING", {"llava_qwen2": "fastvlm"}, clear = False,
     ):
-        assert loader._mlx_vlm_text_path_is_verified("muse-glimmer") is True
-        assert loader._mlx_vlm_text_path_is_verified("llava_qwen2") is False
+        # Only the remap reaches fastvlm, and only from the lower-cased spelling.
+        fastvlm = loader._resolve_mlx_vlm_model_class("fastvlm")
+        assert loader._resolve_mlx_vlm_model_class("llava_qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("LLaVA_Qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("not_a_real_arch") is None
 
 
 def test_gemma3_vlm_cce_does_not_forward_outer_product_attention_mask():
