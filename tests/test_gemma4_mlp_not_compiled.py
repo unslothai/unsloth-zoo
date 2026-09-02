@@ -16,14 +16,12 @@
 
 """CPU tests pinning Gemma4TextMLP.forward to the NON-compiled patch path.
 
-``fullgraph = None`` reads as "do not compile" in `patch_function`, which only
-compiles on a bool. It is a sentinel, so it can regress from either side: the call
-site flipping to a bool, or `patch_function` redefining None. A test for each, plus
-the fp16 clamp the patch exists for.
-
-Not an eager boundary: a compiled caller still inlines this body, exactly as it
-inlined the wrapped version. `test_compiled_caller_still_inlines_the_mlp` pins that
-so it is not misread the other way.
+``fullgraph = None`` reads as "do not compile" in `patch_function`, which compiles
+only on a bool. Being a sentinel it can regress from either side -- the call site
+flipping to a bool, or `patch_function` redefining None -- so there is a test for
+each, plus the fp16 clamp the patch exists for. Not an eager boundary either: a
+compiled caller still inlines this body, exactly as it inlined the wrapped version,
+which `test_compiled_caller_still_inlines_the_mlp` pins so it is not misread.
 
 Synthetic classes throughout, so this runs on any transformers, including 4.57.6
 which has no gemma4 at all.
@@ -54,7 +52,6 @@ def _is_dynamo_artifact(fn):
 
 def _mlp_patch_call():
     """The ``patch_function(Gemma4TextMLP, "forward", forward, ...)`` call node.
-
     All three operands are matched, so a second Gemma4TextMLP patch call cannot
     satisfy this while the forward call site it guards has changed.
     """
@@ -97,11 +94,9 @@ def test_call_site_passes_fullgraph_none():
 
 
 def test_patch_function_treats_none_as_do_not_compile(monkeypatch):
-    """`None` must keep meaning "leave it eager".
-
-    Watches the call, not the result: `_is_dynamo_artifact` reports what an object
-    looks like, not whether torch.compile ran.
-    """
+    """`None` must keep meaning "leave it eager". Watches the call, not the result:
+    `_is_dynamo_artifact` reports what an object looks like, not whether
+    torch.compile ran."""
 
     class Target:
         def forward(self, x: torch.Tensor):
@@ -124,10 +119,8 @@ def test_patch_function_treats_none_as_do_not_compile(monkeypatch):
 
 def test_patch_function_bool_still_compiles():
     """Guards the test above from passing because compilation broke everywhere.
-
-    Asserts rather than skips: a skip here would go green on exactly the machine
-    where the sentinel test proves nothing.
-    """
+    Asserts rather than skips: a skip would go green on exactly the machine where
+    the sentinel test proves nothing."""
 
     class Target:
         def forward(self, x: torch.Tensor):
@@ -182,11 +175,8 @@ _ABSENT_OK = frozenset(("transformers", "transformers.models", PARENT, DOTTED))
 
 def _install_mlp_patch(monkeypatch):
     """Run patch_Gemma4TextMLP against a synthetic MLP and return the class.
-
-    Where gemma4 exists the synthetic class is swapped into the real module, since
-    the patch imports that module by name. Where it does not (4.57.6), a stand-in
-    module is registered instead.
-    """
+    The patch imports the module by name, so the synthetic class is swapped into the
+    real gemma4 module, or into a stand-in module where gemma4 is absent (4.57.6)."""
     try:
         modeling = importlib.import_module(DOTTED)
         injected = False
@@ -250,12 +240,10 @@ def test_mlp_patch_is_bit_exact_off_the_fp16_path(monkeypatch):
 
 
 def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
-    """Not compiling this function is not the same as excluding it from compilation.
-
-    Dynamo inlines an undecorated callee, so under a compiled parent the MLP still
-    runs compiled, as it did when wrapped. Also fails if anyone adds an explicit
-    `torch.compiler.disable` here, which would break the graph in every layer.
-    """
+    """Not compiling this function is not excluding it from compilation: Dynamo
+    inlines an undecorated callee, so under a compiled parent the MLP still runs
+    compiled, as it did when wrapped. Also fails if anyone adds an explicit
+    `torch.compiler.disable` here, which would break the graph in every layer."""
     cls, stock = _install_mlp_patch(monkeypatch)
     try:
         model = cls()
@@ -282,12 +270,10 @@ def test_compiled_caller_still_inlines_the_mlp(monkeypatch):
 
 
 def test_stand_in_rejects_a_failure_below_gemma4(monkeypatch):
-    """gemma4 being absent is a valid skip; gemma4 being broken is not.
-
-    Both surface as ModuleNotFoundError, so the stand-in matches the exact import
-    chain. A prefix match would substitute the synthetic class for a real broken
-    import and every test here would pass on a module that never loaded.
-    """
+    """gemma4 being absent is a valid skip; gemma4 being broken is not. Both surface
+    as ModuleNotFoundError, so the stand-in matches the exact import chain; a prefix
+    match would substitute the synthetic class for a real broken import and every
+    test here would pass on a module that never loaded."""
     def boom(name, *a, **k):
         raise ModuleNotFoundError(
             "no module named 'transformers.models.gemma4.some_dependency'",
