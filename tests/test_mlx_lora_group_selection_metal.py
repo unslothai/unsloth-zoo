@@ -55,6 +55,7 @@ _KIMI_BLOCK = {"wqkv": (VISION, VISION * 3), "wo": (VISION, VISION),
                "mlp": {"fc0": (VISION, VISION), "fc1": (VISION, VISION)}}
 _GLM_MERGER = {"proj": (VISION, VISION), "gate_proj": (VISION, HIDDEN),
                "down_proj": (HIDDEN, HIDDEN)}
+_MIXER = {"token_mixer": {"qkv": (VISION, VISION * 3), "proj": (VISION, VISION)}}
 _TEXT_BLOCK = {"self_attn": {"q_proj": (HIDDEN, HIDDEN), "o_proj": (HIDDEN, HIDDEN)},
                "mlp": {"gate_proj": (HIDDEN, HIDDEN), "down_proj": (HIDDEN, HIDDEN)}}
 def _tower(block=_KIMI_BLOCK, merger=None):
@@ -97,8 +98,33 @@ def _adapters(model, prefix=""):
                   if hasattr(module, "lora_a") and name.startswith(prefix))
 
 
-# What each path reads as. The enclosing block outranks the leaf below it, a bare
-# projection names no role, and a `gate` naming what it projects into is an MLP.
+# What each path reads as: the enclosing block outranks the leaf below it.
+_ROLE_CASES = {
+    "attn_pool.mlp.fc1": "mlp", "mlp.dense_h_to_4h": "mlp",
+    "self_attn.gate_proj": "attention", "linear_attn.in_proj_qkv": "attention",
+    "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
+}
+
+
+@pytest.mark.parametrize("path,role", _ROLE_CASES.items(), ids=list(_ROLE_CASES))
+def test_what_a_linear_name_reads_as(path, role):
+    from unsloth_zoo.mlx.loader import _linear_role
+    assert _linear_role(path) == role
+
+
+_LOAN_CASES = {
+    "attention, from the one linear beside it": (
+        _MIXER, True, True, ["token_mixer.proj", "token_mixer.qkv"]),
+    "and not when the attention flag is off": (_MIXER, False, True, []),
+}
+
+
+@pytest.mark.parametrize("spec,attention,mlp,expected", _LOAN_CASES.values(),
+                         ids=list(_LOAN_CASES))
+def test_role_selection_borrows_beside_and_excludes_what_decides(
+        spec, attention, mlp, expected):
+    from unsloth_zoo.mlx.loader import _role_selected_paths
+    assert sorted(_role_selected_paths(_build(spec), attention, mlp)) == expected
 
 
 # Selecting nothing must raise, naming the flag and enough of the tree to act on.
@@ -107,6 +133,12 @@ _EMPTY_GROUP_CASES = {
     "unresolved tower": (
         lambda: _vlm(tower_attr="itok_upsampler"), {"train_vision": True},
         ["train_vision=True", "'itok_upsampler'"]),
+    # Refuses after the tower walk matched, so an adapting pass would leave
+    # those adapters behind.
+    "a connector with no linear, beside an adaptable tower": (
+        lambda: _vlm(extra=("mm_projector", _build({}))),
+        {"finetune_vision_layers": True, "train_projector": True},
+        ["holds no linear layer to adapt"]),
     # An explicit vocabulary is the caller's, so a tower it misses is theirs.
     "tower matches no requested target": (
         lambda: _vlm(tower=_tower(merger=_GLM_MERGER)),

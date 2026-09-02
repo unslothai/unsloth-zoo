@@ -6672,8 +6672,48 @@ def _raise_projector_unresolved(model, vision_path, vision_module):
     )
 
 
+# The enclosing block names the role even where the leaf does not.
+_ATTENTION_PATH_TOKENS = frozenset(("attn", "attention"))
+_MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu"))
+_ATTENTION_LEAVES = frozenset((
+    "q", "k", "v", "o", "kv", "qkv", "wq", "wk", "wv", "wo", "wkv", "wqkv",
+    "query", "key", "value", "out", "dense", "proj",
+))
+_MLP_LEAVES = frozenset((
+    "fc", "fc0", "fc1", "fc2", "fc3", "w1", "w2", "w3", "gate", "up", "down",
+    "c_fc", "linear1", "linear2",
+))
+
+
+def _linear_role(path):
+    """``"attention"``, ``"mlp"`` or ``None`` for a linear at ``path``."""
+    segments = str(path).lower().split(".")
+    for segment in reversed(segments):
+        tokens = _role_tokens(segment)
+        if tokens & _ATTENTION_PATH_TOKENS:
+            return "attention"
+        if tokens & _MLP_PATH_TOKENS:
+            return "mlp"
+    leaf = segments[-1] if segments else ""
+    if leaf in _ATTENTION_LEAVES:
+        return "attention"
+    if leaf in _MLP_LEAVES:
+        return "mlp"
+    return None
+
+
 def _under_any(path, prefixes):
     return any(path == p or path.startswith(f"{p}.") for p in prefixes)
+
+
+def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
+    """``module``'s linears by role, one whose role cannot be read left alone."""
+    wanted = {"attention": attention, "mlp": mlp}
+    return [
+        path for path, _ in _subtree_linears(module)
+        if wanted.get(_linear_role(path), False)
+        and not _under_any(path, skip_subtrees)
+    ]
 
 
 def _raise_empty_target_modules():
@@ -6703,7 +6743,9 @@ def _raise_group_empty(flag, role, module_path, module, target_modules=None):
 
 
 def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
-                    train_vision, train_projector, dry_run):
+                    train_vision, train_projector, targets_defaulted,
+                    finetune_attention_modules, finetune_mlp_modules,
+                    dry_run):
     """Adapt the vision tower and connector, returning what each flag selected.
 
     The ``dry_run`` pass is the only source of refusals and warnings: raising
@@ -6757,6 +6799,39 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
             tower_owner, vision_attr, lora_config, target_modules,
             skip_subtrees=nested_projectors, dry_run=dry_run,
         )
+        # The canonical target names are a decoder vocabulary this code
+        # chose, not one the caller asked for, so when a tower speaks a
+        # different one, select its linears by role instead. Only ever
+        # reached where the walk above found nothing, so no tree that
+        # matches today changes, nor the order LoRA init draws randomness.
+        if vision_lora_count == 0 and targets_defaulted:
+            role_paths = _role_selected_paths(
+                vision_module, finetune_attention_modules,
+                finetune_mlp_modules, skip_subtrees=nested_projectors,
+            )
+            if role_paths:
+                vision_lora_count = _lora_walk_module(
+                    tower_owner, vision_attr, lora_config, None,
+                    match_paths=set(role_paths), dry_run=dry_run,
+                )
+                roles = " and ".join(
+                    role for role, wanted in (
+                        ("attention", finetune_attention_modules),
+                        ("MLP", finetune_mlp_modules),
+                    ) if wanted
+                )
+                if dry_run:
+                    warnings.warn(
+                        f"Unsloth: the vision tower at {vision_path!r} has no "
+                        "module named in the default target_modules, so "
+                        f"{vision_flag}=True will adapt its {roles} linears "
+                        "by position instead: "
+                        f"{sorted({_leaf_name(p) for p in role_paths})!r}. "
+                        "Pass target_modules explicitly to choose them yourself.",
+                        # One frame deeper than `get_peft_model`, which is the
+                        # caller worth naming.
+                        stacklevel=3,
+                    )
     projector_lora_count = 0
     for p_owner, p_attr, _, _ in projector_entries:
         projector_lora_count += _lora_walk_module(
@@ -6788,16 +6863,11 @@ def _lora_walk_module(
     *,
     match_all_linear=False,
     skip_subtrees=(),
+    match_paths=None,
     dry_run=False,
 ):
-    """Replace matching Linear/QuantizedLinear under ``owner.attr_name`` with LoRA.
-
-    Used for vision encoders and connectors that don't have the flat `.layers`
-    structure expected by mlx-lm's `linear_to_lora_layers`. ``skip_subtrees``
-    names children left untouched, so a connector nested in the tower is adapted
-    once, by its own pass, rather than wrapped again on top of the tower's.
-    ``dry_run`` counts what would be replaced without replacing it.
-    """
+    """LoRA for encoders and connectors, which lack the flat `.layers` structure
+    mlx-lm's `linear_to_lora_layers` expects."""
     import mlx.nn as nn
     try:
         from mlx_lm.tuner.lora import LoRALinear
@@ -6820,7 +6890,10 @@ def _lora_walk_module(
     for name, child in list(root.named_modules()):
         if _under_any(name, skip_subtrees):
             continue
-        if not match_all_linear and not _lora_name_matches_target(name, target_modules):
+        if match_paths is not None:
+            if name not in match_paths:
+                continue
+        elif not match_all_linear and not _lora_name_matches_target(name, target_modules):
             continue
         if not isinstance(child, (nn.Linear, nn.QuantizedLinear)):
             continue
@@ -8379,6 +8452,8 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
+        targets_defaulted = target_modules is None
+
         # finetune_vision_layers (None = use train_vision arg; bool overrides it)
         vision_flag = "train_vision"
         if finetune_vision_layers is not None:
@@ -8481,7 +8556,9 @@ class FastMLXModel:
             _vlm_group_lora(
                 model, lora_config, target_modules, vision_flag=vision_flag,
                 train_vision=train_vision, train_projector=train_projector,
-                dry_run=True,
+                targets_defaulted=targets_defaulted,
+                finetune_attention_modules=finetune_attention_modules,
+                finetune_mlp_modules=finetune_mlp_modules, dry_run=True,
             )
 
             # Scopes embedding_learning_rate to exactly these tensors.
@@ -8535,7 +8612,9 @@ class FastMLXModel:
             (vision_lora_count, projector_lora_count) = _vlm_group_lora(
                 model, lora_config, target_modules, vision_flag=vision_flag,
                 train_vision=train_vision, train_projector=train_projector,
-                dry_run=False,
+                targets_defaulted=targets_defaulted,
+                finetune_attention_modules=finetune_attention_modules,
+                finetune_mlp_modules=finetune_mlp_modules, dry_run=False,
             )
 
             if (
