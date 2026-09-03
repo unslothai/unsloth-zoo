@@ -137,6 +137,13 @@ jobs:
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
+              # Per-lane generated-source directory, for the reason spelled out
+              # on the core-drift job below: four lanes, one checkout, and a
+              # default that is the relative `unsloth_compiled_cache`. Here the
+              # lanes are four INTERPRETERS, so sharing it would also mean
+              # 3.10 importing a cache 3.13 wrote.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
@@ -703,6 +710,25 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
+              # One generated-source directory per lane. The three lanes run
+              # concurrently out of ONE checkout, and unsloth_zoo defaults this
+              # to the RELATIVE `unsloth_compiled_cache`, so by default all
+              # three resolve it to the same directory and write each other's
+              # files: unsloth_compiled_module_<model>.py, and the torch.nn
+              # forwards (LayerNorm.py, Conv1d.py, ...) that compiler.py
+              # installs and then reads back with inspect.getsource. The
+              # contents genuinely differ per lane -- that is the point of the
+              # job, three different transformers/TRL pins -- so every lane
+              # rewrites what the others just wrote, and a getsource that lands
+              # between a truncate and its write reads a prefix and dies in
+              # tokenize. That is what made test_compiler_dynamic_exec pass in
+              # two lanes and fail in the third on the same commit.
+              #
+              # Absolute, not relative like the venv paths above: compiler.py
+              # puts this value straight on sys.path, where a relative entry is
+              # re-resolved against whatever the cwd happens to be.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 set -x &&

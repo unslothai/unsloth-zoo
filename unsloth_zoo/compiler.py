@@ -4183,12 +4183,27 @@ def _patch_torch_dtype_modules(
 
             try:
                 source = inspect.getsource(function.forward).rstrip()
-            except (OSError, TypeError):
+            except (OSError, TypeError, tokenize.TokenError):
                 # A forward built by exec, or one whose file has gone. Unguarded
                 # the OSError propagates out of FastModel.from_pretrained and
                 # the model does not load, over source we only wanted in order
                 # to patch a dtype cast. `get_compiler_config` above only covers
                 # torch.compile wrappers.
+                #
+                # tokenize.TokenError is in the tuple because by this point
+                # `function.forward` is usually OUR generated forward, not
+                # torch's: the create_new_function() call at the bottom of this
+                # loop installs it, so its co_filename is a file under the
+                # compile folder that we rewrite at runtime. inspect.getsource
+                # reads that file through linecache, and a read that lands while
+                # another process is between the truncate and the write of the
+                # same path returns a prefix -- valid so far, but ending inside
+                # a docstring or a bracket, which is a TokenError out of
+                # inspect.getblock. It subclasses Exception directly, so neither
+                # OSError nor TypeError covered it and it escaped all the way
+                # out of unsloth_compile_transformers. Truncated source is
+                # exactly the "no usable source" case this handler already
+                # degrades for.
                 #
                 # The precondition is not fully characterised: two plain Qwen
                 # loads do not trigger it, and after such a load no torch.nn
@@ -4479,11 +4494,20 @@ def unsloth_compile_transformers(
     functions = dir(modeling_file)
     try:
         full_source = inspect.getsource(modeling_file)
-    except (OSError, TypeError) as exception:
+    except (OSError, TypeError, tokenize.TokenError) as exception:
         # Everything below is source-level feature detection, so with no source
         # there is nothing to do. Unguarded the OSError propagates out of
         # FastModel.from_pretrained and the model fails to LOAD, over a file we
         # only wanted in order to make it faster.
+        #
+        # tokenize.TokenError is in the tuple for symmetry with the getsource in
+        # _patch_torch_dtype_modules, which is the one that provably needed it.
+        # It cannot fire HERE today: the argument is a module, and for a module
+        # inspect.getsourcelines returns every line without going through
+        # getblock, so the tokenizer never runs and only OSError is reachable.
+        # It is listed anyway because the two handlers answer the same question
+        # -- can this source be read -- and a reader who widens one and not the
+        # other has to rediscover that asymmetry to find out why.
         #
         # Return rather than continue with an empty string: checks of the form
         # `"_supports_sdpa = False" not in full_source` are TRUE on empty and
