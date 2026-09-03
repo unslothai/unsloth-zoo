@@ -6675,18 +6675,26 @@ def _raise_projector_unresolved(model, vision_path, vision_module):
 # The enclosing block names the role even where the leaf does not.
 _ATTENTION_PATH_TOKENS = frozenset(("attn", "attention"))
 _MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu"))
+# Neither table lists `proj` or `dense`, which say that a linear projects
+# without saying what it projects.
 _ATTENTION_LEAVES = frozenset((
     "q", "k", "v", "o", "kv", "qkv", "wq", "wk", "wv", "wo", "wkv", "wqkv",
-    "query", "key", "value", "out", "dense", "proj",
+    "query", "key", "value", "out",
 ))
 _MLP_LEAVES = frozenset((
     "fc", "fc0", "fc1", "fc2", "fc3", "w1", "w2", "w3", "gate", "up", "down",
     "c_fc", "linear1", "linear2",
 ))
 
-
 def _linear_role(path):
-    """``"attention"``, ``"mlp"`` or ``None`` for a linear at ``path``."""
+    """``"attention"``, ``"mlp"`` or ``None`` for a linear at ``path``.
+
+    An enclosing block outranks every name below it: afmoe's attention holds a
+    `gate_proj`, which names the MLP anywhere else. Only where nothing encloses
+    the linear does its own name decide, read outwards — a fused
+    `query_key_value` says its role itself, while a clipped `q_proj.linear`
+    leaves it to the module wrapping it.
+    """
     segments = str(path).lower().split(".")
     for segment in reversed(segments):
         tokens = _role_tokens(segment)
@@ -6694,11 +6702,12 @@ def _linear_role(path):
             return "attention"
         if tokens & _MLP_PATH_TOKENS:
             return "mlp"
-    leaf = segments[-1] if segments else ""
-    if leaf in _ATTENTION_LEAVES:
-        return "attention"
-    if leaf in _MLP_LEAVES:
-        return "mlp"
+    for segment in reversed(segments):
+        names = _role_tokens(segment)
+        if names & _ATTENTION_LEAVES:
+            return "attention"
+        if names & _MLP_LEAVES:
+            return "mlp"
     return None
 
 
@@ -6709,11 +6718,21 @@ def _under_any(path, prefixes):
 def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     """``module``'s linears by role, one whose role cannot be read left alone."""
     wanted = {"attention": attention, "mlp": mlp}
-    return [
-        path for path, _ in _subtree_linears(module)
-        if wanted.get(_linear_role(path), False)
-        and not _under_any(path, skip_subtrees)
-    ]
+    paths = [path for path, _ in _subtree_linears(module)
+             if not _under_any(path, skip_subtrees)]
+    roles = {path: _linear_role(path) for path in paths}
+    # A projection naming no role takes the role of the linears beside it, where
+    # those agree; a patch embedding sits alone, so nothing lends it one.
+    for path, role in list(roles.items()):
+        if role:
+            continue
+        parent = path.rpartition(".")[0]
+        beside = {roles[other] for other in paths
+                  if other != path and other.rpartition(".")[0] == parent}
+        beside.discard(None)
+        if len(beside) == 1:
+            roles[path] = beside.pop()
+    return [path for path in paths if wanted.get(roles[path], False)]
 
 
 def _raise_empty_target_modules():
@@ -6770,41 +6789,33 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
                 )
     (vision_owner, vision_attr, vision_path,
      vision_module) = _resolve_vision_group(model)
-    projector_entries = []
     projector_path = None
     if train_vision and vision_module is None:
         _raise_vision_unresolved(vision_flag, model)
+    # Also resolved when nothing will adapt it, so the tower pass can skip it.
+    projector_entries = (
+        _resolve_projector_group(model, vision_owner, vision_module, vision_path)
+        if train_projector or (train_vision and targets_defaulted) else []
+    )
     if train_projector:
-        projector_entries = _resolve_projector_group(
-            model, vision_owner, vision_module, vision_path,
-        )
         if not projector_entries:
             _raise_projector_unresolved(model, vision_path, vision_module)
         projector_path = projector_entries[0][2]
         if len(projector_entries) > 1:
             projector_path = projector_path.rpartition(".")[0]
 
-    # A connector nested in the tower belongs to whichever pass will
-    # claim it, never to both: adapting it twice would stack a second
-    # adapter on the first one's base.
+    # Adapting a nested connector here would stack on the projector pass's base.
     nested_projectors = [
         attr for owner, attr, _, _ in projector_entries
-        if train_vision and owner is vision_module
+        if owner is vision_module
     ]
 
     vision_lora_count = 0
     if train_vision:
         tower_owner = model if vision_owner is None else vision_owner
-        vision_lora_count = _lora_walk_module(
-            tower_owner, vision_attr, lora_config, target_modules,
-            skip_subtrees=nested_projectors, dry_run=dry_run,
-        )
-        # The canonical target names are a decoder vocabulary this code
-        # chose, not one the caller asked for, so when a tower speaks a
-        # different one, select its linears by role instead. Only ever
-        # reached where the walk above found nothing, so no tree that
-        # matches today changes, nor the order LoRA init draws randomness.
-        if vision_lora_count == 0 and targets_defaulted:
+        if targets_defaulted:
+            # The canonical names are a decoder vocabulary this code chose
+            # rather than one the caller asked for, and a tower rarely speaks it.
             role_paths = _role_selected_paths(
                 vision_module, finetune_attention_modules,
                 finetune_mlp_modules, skip_subtrees=nested_projectors,
@@ -6814,30 +6825,20 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
                     tower_owner, vision_attr, lora_config, None,
                     match_paths=set(role_paths), dry_run=dry_run,
                 )
-                roles = " and ".join(
-                    role for role, wanted in (
-                        ("attention", finetune_attention_modules),
-                        ("MLP", finetune_mlp_modules),
-                    ) if wanted
-                )
-                if dry_run:
-                    warnings.warn(
-                        f"Unsloth: the vision tower at {vision_path!r} has no "
-                        "module named in the default target_modules, so "
-                        f"{vision_flag}=True will adapt its {roles} linears "
-                        "by position instead: "
-                        f"{sorted({_leaf_name(p) for p in role_paths})!r}. "
-                        "Pass target_modules explicitly to choose them yourself.",
-                        # One frame deeper than `get_peft_model`, which is the
-                        # caller worth naming.
-                        stacklevel=3,
-                    )
+        else:
+            # The caller named these, so they decide inside a nested connector
+            # too, unless the projector pass is the one adapting it.
+            vision_lora_count = _lora_walk_module(
+                tower_owner, vision_attr, lora_config, target_modules,
+                skip_subtrees=nested_projectors, dry_run=dry_run,
+            )
     projector_lora_count = 0
-    for p_owner, p_attr, _, _ in projector_entries:
-        projector_lora_count += _lora_walk_module(
-            p_owner, p_attr, lora_config,
-            target_modules=(), match_all_linear=True, dry_run=dry_run,
-        )
+    if train_projector:
+        for p_owner, p_attr, _, _ in projector_entries:
+            projector_lora_count += _lora_walk_module(
+                p_owner, p_attr, lora_config,
+                target_modules=(), match_all_linear=True, dry_run=dry_run,
+            )
 
     # Not a no-op: the run looks healthy while the decoder trains alone.
     if train_vision and vision_lora_count == 0:
