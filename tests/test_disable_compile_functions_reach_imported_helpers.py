@@ -188,6 +188,12 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
     env["PYTHONPATH"] = os.pathsep.join(
         [repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
+    # The core-drift job sets UNSLOTH_COMPILE_DISABLE=1 at job level, and this
+    # copies the whole environment. Inheriting it makes unsloth_compile_transformers
+    # force disable=True, so the forward is emitted @torch.compiler.disable instead
+    # of the torch_compile_with_fallback this test is about, and the assertion below
+    # fails for a reason unrelated to the regression. Drop it for the child.
+    env.pop("UNSLOTH_COMPILE_DISABLE", None)
     result = subprocess.run(
         [sys.executable, "-c", _CHILD],
         cwd = str(tmp_path),
