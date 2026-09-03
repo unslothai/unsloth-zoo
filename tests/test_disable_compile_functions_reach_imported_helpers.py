@@ -147,19 +147,22 @@ generated = open(
 ).read()
 
 error = None
+error_type = None
+shapes = None
 try:
     rope = mf.MiniMaxM3VL3DRotaryEmbedding(head_dim = 80, spatial_merge_size = 2)
     cos, sin = rope(torch.tensor([[1, 24, 32]], dtype = torch.long),
                     torch.device("cpu"), torch.float32)
     shapes = [tuple(cos.shape), tuple(sin.shape)]
 except Exception as exception:
-    error = f"{type(exception).__name__}: {str(exception).strip().splitlines()[0]}"
-    shapes = None
+    error_type = type(exception).__name__
+    error = f"{error_type}: {str(exception).strip().splitlines()[0]}"
 
 print("@@@" + json.dumps({
-    "generated" : generated,
-    "error"     : error,
-    "shapes"    : shapes,
+    "generated"   : generated,
+    "error"       : error,
+    "error_type"  : error_type,
+    "shapes"      : shapes,
 }))
 '''
 
@@ -228,5 +231,15 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
         + decorators[-400:]
     )
 
+    # The decorator asserted above IS the regression guard: emitting this forward
+    # fullgraph = True is precisely the bug, and that check is deterministic and
+    # runs everywhere. Actually calling the forward is a bonus end-to-end check
+    # that additionally needs a working inductor toolchain. A bare CI runner has
+    # no Triton and its inductor CPU backend can fail outright, which says nothing
+    # about this change, so tolerate exactly that and nothing else. The regression
+    # this test exists for surfaces as torch._dynamo.exc.Unsupported, a different
+    # type, so it is still caught here.
+    if payload.get("error_type") == "BackendCompilerFailed":
+        pytest.skip(f"inductor cannot compile here ({payload['error']}); decorator asserted above")
     assert payload["error"] is None, payload["error"]
     assert payload["shapes"] == [[768, 78], [768, 78]], payload["shapes"]
