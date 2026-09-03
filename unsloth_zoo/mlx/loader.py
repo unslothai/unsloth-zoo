@@ -6490,11 +6490,10 @@ def _set_child(parent, leaf, value):
 
 
 def _subtree_linears(module):
-    """``(path, module)`` for every Linear-like leaf in ``module``."""
-    import mlx.nn as nn
+    types = _mlx_lora_base_types()
     return [
         (name, child) for name, child in module.named_modules()
-        if isinstance(child, (nn.Linear, nn.QuantizedLinear))
+        if isinstance(child, types)
     ]
 
 
@@ -6673,8 +6672,8 @@ def _raise_projector_unresolved(model, vision_path, vision_module):
 
 
 # The enclosing block names the role even where the leaf does not.
-_ATTENTION_PATH_TOKENS = frozenset(("attn", "attention"))
-_MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu"))
+_ATTENTION_PATH_TOKENS = frozenset(("attn", "attention", "att"))
+_MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu", "ff"))
 # Neither table lists `proj` or `dense`, which say that a linear projects
 # without saying what it projects.
 _ATTENTION_LEAVES = frozenset((
@@ -6686,16 +6685,28 @@ _MLP_LEAVES = frozenset((
     "c_fc", "linear1", "linear2",
 ))
 
-def _linear_role(path):
-    """``"attention"``, ``"mlp"`` or ``None`` for a linear at ``path``.
+def _decides(segment):
+    """Whether ``segment`` names a gate or a router rather than a projection.
 
-    An enclosing block outranks every name below it: afmoe's attention holds a
-    `gate_proj`, which names the MLP anywhere else. Only where nothing encloses
-    the linear does its own name decide, read outwards — a fused
-    `query_key_value` says its role itself, while a clipped `q_proj.linear`
-    leaves it to the module wrapping it.
+    `gate_proj` says what it projects into; `shared_expert_gate` does not.
+    """
+    tokens = _role_tokens(segment)
+    if not tokens & {"gate", "router"}:
+        return False
+    return not (tokens - {"gate", "router"}) & (_MLP_LEAVES | {"proj"})
+
+
+def _linear_role(path):
+    """``"attention"``, ``"mlp"``, ``"gate"`` or ``None`` for ``path``.
+
+    An enclosing block outranks the names below it — afmoe's attention holds a
+    `gate_proj` — and a gate outranks the block.
     """
     segments = str(path).lower().split(".")
+    # A gate outranks its enclosing block and reaches the subtree below it:
+    # ZAYA's router is a small MLP, and adapting it trains the routing decision.
+    if any(_decides(segment) for segment in segments):
+        return "gate"
     for segment in reversed(segments):
         tokens = _role_tokens(segment)
         if tokens & _ATTENTION_PATH_TOKENS:
@@ -6715,11 +6726,22 @@ def _under_any(path, prefixes):
     return any(path == p or path.startswith(f"{p}.") for p in prefixes)
 
 
+def _projects(linear):
+    """Whether ``linear`` emits more than one number per token.
+
+    A single unit is a scale, a gate or a head rather than a projection, and Kimi
+    K3 reads that weight directly rather than calling the layer. The output axis
+    is second from last for a plain linear and for a fused expert stack alike,
+    the stack counting its experts along the first.
+    """
+    return int(linear.weight.shape[-2]) > 1
+
+
 def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     """``module``'s linears by role, one whose role cannot be read left alone."""
     wanted = {"attention": attention, "mlp": mlp}
-    paths = [path for path, _ in _subtree_linears(module)
-             if not _under_any(path, skip_subtrees)]
+    paths = [path for path, linear in _subtree_linears(module)
+             if not _under_any(path, skip_subtrees) and _projects(linear)]
     roles = {path: _linear_role(path) for path in paths}
     # A projection naming no role takes the role of the linears beside it, where
     # those agree; a patch embedding sits alone, so nothing lends it one.
@@ -6729,7 +6751,7 @@ def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
         parent = path.rpartition(".")[0]
         beside = {roles[other] for other in paths
                   if other != path and other.rpartition(".")[0] == parent}
-        beside.discard(None)
+        beside &= wanted.keys()
         if len(beside) == 1:
             roles[path] = beside.pop()
     return [path for path in paths if wanted.get(roles[path], False)]
@@ -6935,6 +6957,20 @@ def _resolve_lora_keys(model, target_modules):
                 keys.add(name)
 
     return keys
+
+
+def _language_lora_keys(model, target_modules, targets_defaulted,
+                        attention, mlp):
+    """Layer-local mlx-lm LoRA keys for the decoder.
+
+    Read the way the tower is, where the names are this code's own.
+    """
+    if targets_defaulted:
+        keys = set()
+        for root in _mlx_language_layers(model):
+            keys.update(_role_selected_paths(root, attention, mlp))
+        return keys
+    return _resolve_lora_keys(model, target_modules)
 
 
 def _raise_no_lora_targets(target_modules):
@@ -8589,7 +8625,9 @@ class FastMLXModel:
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = (
-                    _resolve_lora_keys(lm, target_modules)
+                    _language_lora_keys(
+                        lm, target_modules, targets_defaulted,
+                        finetune_attention_modules, finetune_mlp_modules)
                     if finetune_language_layers else None
                 )
                 language_lora_keys = set(language_lora_keys or set()) | _vlm_lm_head_keys
@@ -8670,7 +8708,9 @@ class FastMLXModel:
                 num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
             # Layer LoRA keys plus the lm_head key (a root module, not a layer).
             language_lora_keys = (
-                _resolve_lora_keys(model, target_modules)
+                _language_lora_keys(
+                    model, target_modules, targets_defaulted,
+                    finetune_attention_modules, finetune_mlp_modules)
                 if finetune_language_layers else None
             )
             if _cpt_lm_head_keys or _cpt_full_specs:

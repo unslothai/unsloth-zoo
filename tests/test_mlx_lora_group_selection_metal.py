@@ -58,6 +58,8 @@ _GLM_MERGER = {"proj": (VISION, VISION), "gate_proj": (VISION, HIDDEN),
 _MIXER = {"token_mixer": {"qkv": (VISION, VISION * 3), "proj": (VISION, VISION)}}
 _TEXT_BLOCK = {"self_attn": {"q_proj": (HIDDEN, HIDDEN), "o_proj": (HIDDEN, HIDDEN)},
                "mlp": {"gate_proj": (HIDDEN, HIDDEN), "down_proj": (HIDDEN, HIDDEN)}}
+_MOLMO_BLOCK = {"att_proj": (HIDDEN, HIDDEN), "attn_out": (HIDDEN, HIDDEN),
+                "ff_proj": (HIDDEN, HIDDEN), "ff_out": (HIDDEN, HIDDEN)}
 def _tower(block=_KIMI_BLOCK, merger=None):
     spec = {"blocks": [block], "patch_embed": {}}
     if merger is not None:
@@ -98,13 +100,15 @@ def _adapters(model, prefix=""):
                   if hasattr(module, "lora_a") and name.startswith(prefix))
 
 
-# What each path reads as. The enclosing block outranks the leaf below it,
-# and a bare projection names no role.
+# What each path reads as. The enclosing block outranks the leaf below it, a bare
+# projection names no role, and a `gate` naming what it projects into is an MLP.
 _ROLE_CASES = {
-    "query_key_value": "attention", "dense": None, "attn_pool.mlp.fc1": "mlp",
-    "mlp.dense_h_to_4h": "mlp", "self_attn.gate_proj": "attention",
-    "q_proj.linear": "attention", "linear_attn.in_proj_qkv": "attention",
+    "query_key_value": "attention", "dense": None, "mlp.gate": "gate",
+    "attn_pool.mlp.fc1": "mlp", "mlp.dense_h_to_4h": "mlp", "mlp.gate_1": "gate",
+    "self_attn.gate_proj": "attention", "q_proj.linear": "attention",
+    "linear_attn.in_proj_qkv": "attention", "per_layer_input_gate": "gate",
     "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
+    "mlp.zaya_block.router.down_proj": "gate",
 }
 
 
@@ -121,6 +125,11 @@ _LOAN_CASES = {
     "attention, from the one linear beside it": (
         _MIXER, True, True, ["token_mixer.proj", "token_mixer.qkv"]),
     "and not when the attention flag is off": (_MIXER, False, True, []),
+    # Exclusion, not borrowing: a gate decides, and one unit is a scale.
+    "and a gate or a one-unit scale is selected by neither flag": (
+        {"mlp": {"up": (HIDDEN, HIDDEN), "gate": (HIDDEN, 4),
+                 "shared_expert_gate": (HIDDEN, 1)},
+         "mlp_res_proj": (HIDDEN, 1)}, True, True, ["mlp.up"]),
 }
 
 
@@ -142,10 +151,22 @@ _SELECTION_CASES = {
         lambda: _vlm(tower=_tower(merger=_GLM_MERGER)),
         {"finetune_vision_layers": True, "train_projector": True},
         "vision_tower.merger", ["down_proj", "gate_proj", "proj"]),
-    # Each call site must pass the flags on, not merely honour them.
+    # Qwen3.5 alternates attention kinds, so reading one layer misses half.
+    "a decoder spelled unlike a canonical one, layer by layer": (
+        lambda: _text_model([_MOLMO_BLOCK, _TEXT_BLOCK]), {}, "model.layers",
+        ["0.att_proj", "0.attn_out", "0.ff_out", "0.ff_proj", "1.mlp.down_proj",
+         "1.mlp.gate_proj", "1.self_attn.o_proj", "1.self_attn.q_proj"]),
+    # Each call site must pass the flags on, and the decoder has two of them.
     "a tower with attention off": (
         lambda: _vlm(tower_attr="visual"), {"finetune_vision_layers": True,
         "finetune_attention_modules": False}, "visual.blocks.0", ["mlp.fc0", "mlp.fc1"]),
+    "a decoder with attention off": (
+        lambda: _text_model([_MOLMO_BLOCK]), {"finetune_attention_modules": False},
+        "model.layers.0", ["ff_out", "ff_proj"]),
+    "a vlm decoder with mlp off": (
+        lambda: _vlm(decoder=[_MOLMO_BLOCK]), {"finetune_vision_layers": False,
+        "finetune_mlp_modules": False}, "language_model.model.layers.0",
+        ["att_proj", "attn_out"]),
 }
 
 
