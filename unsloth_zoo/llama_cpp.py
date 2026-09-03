@@ -351,7 +351,14 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         # the install. Opt out via UNSLOTH_AUTO_INSTALL=0.
         try:
             acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
-        except EOFError:
+        except (EOFError, RuntimeError) as exception:
+            # Two exceptions mean "nobody is there to ask": EOFError when stdin
+            # exists but is at EOF, and RuntimeError("lost sys.stdin") when it is
+            # None, which is what a detached kernel or a process started with fd 0
+            # closed gets. input() raises the same RuntimeError for a lost stdout
+            # or stderr, so re-raise unless stdin really is gone.
+            if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
             # Only a stdin that is not a terminal is implicit consent. An
             # interactive terminal also raises EOFError, on Ctrl-D, and there
             # it means the user backed out of the prompt, so it has to keep

@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import os
+import subprocess
+import sys
 import types
 
 import pytest
@@ -121,9 +124,9 @@ def test_enter_accepts(installer):
     assert calls == ["apt-get install cmake -y"]
 
 
-def test_a_stdin_without_isatty_is_not_treated_as_a_terminal(installer, monkeypatch):
-    # pythonw / a detached kernel can leave sys.stdin as None or as an object
-    # whose isatty() raises; neither may crash out of the EOF handler.
+def test_a_stdin_whose_isatty_raises_is_not_treated_as_a_terminal(installer, monkeypatch):
+    # A detached kernel can leave an object whose isatty() raises; that must
+    # not crash out of the EOF handler.
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(EOFError()))
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -133,8 +136,87 @@ def test_a_stdin_without_isatty_is_not_treated_as_a_terminal(installer, monkeypa
     def _raises():
         raise OSError("detached")
 
-    for stdin in (None, types.SimpleNamespace(isatty = _raises)):
-        installer.calls.clear()
-        monkeypatch.setattr(llama_cpp.sys, "stdin", stdin)
+    monkeypatch.setattr(llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = _raises))
+    llama_cpp.install_package("cmake", system_type = "debian")
+    assert installer.calls == ["apt-get install cmake -y"]
+
+
+def test_the_real_builtin_input_raises_RuntimeError_when_stdin_is_None(monkeypatch):
+    """Pin the CPython behaviour the handler is written against.
+
+    `builtin_input_impl` null-checks `sys.stdin` before reading and raises
+    RuntimeError("input(): lost sys.stdin"), NOT EOFError. A test that stubs
+    `input()` to raise EOFError while setting `sys.stdin = None` asserts a
+    combination that cannot occur, so the real path has to be pinned here.
+    """
+    monkeypatch.setattr(llama_cpp.sys, "stdin", None)
+    with pytest.raises(RuntimeError, match = "lost sys.stdin"):
+        input("prompt")
+
+
+def test_stdin_None_accepts_via_the_real_input(monkeypatch):
+    # No `input()` stub: `sys.stdin = None` makes the genuine builtin raise
+    # RuntimeError, which is exactly what a process launched with fd 0 closed
+    # hits. The installer must still run rather than abort.
+    calls = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", _RecordedPopen(calls))
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    monkeypatch.setattr(llama_cpp.sys, "stdin", None)
+
+    llama_cpp.install_package("cmake", system_type = "debian")
+    assert calls == ["apt-get install cmake -y"]
+
+
+def test_stdin_None_respects_the_opt_out(monkeypatch):
+    calls = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", _RecordedPopen(calls))
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    monkeypatch.setattr(llama_cpp.sys, "stdin", None)
+
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
         llama_cpp.install_package("cmake", system_type = "debian")
-        assert installer.calls == ["apt-get install cmake -y"]
+    assert calls == []
+
+
+def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch):
+    # `input()` raises RuntimeError for a lost sys.stdout/sys.stderr too. With
+    # a live stdin that is not a missing prompt, so it must propagate rather
+    # than authorise a package manager command.
+    with pytest.raises(RuntimeError, match = "lost sys.stdout"):
+        installer(RuntimeError("input(): lost sys.stdout"), isatty = False)
+    assert installer.calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason = "fd 0 is closed with a POSIX shell redirect")
+def test_a_closed_fd0_really_produces_a_None_stdin():
+    """The environmental precondition behind the tests above, unstubbed.
+
+    A process started with fd 0 closed gets `sys.stdin is None`, and the real
+    builtin `input()` then raises RuntimeError rather than EOFError. The child
+    is pinned to THIS checkout via PYTHONPATH so it cannot answer from an
+    installed copy of unsloth_zoo (it imports nothing from it here, but the
+    pin keeps that true if the probe ever grows).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+
+    probe = (
+        "import sys\n"
+        "print(sys.stdin is None)\n"
+        "try:\n"
+        "    input('p')\n"
+        "except BaseException as e:\n"
+        "    print(type(e).__name__)\n"
+    )
+    r = subprocess.run(
+        ["/bin/sh", "-c", 'exec "$0" -c "$1" 0<&-', sys.executable, probe],
+        capture_output = True, text = True, env = env, timeout = 120,
+    )
+    assert r.stdout.split() == ["True", "RuntimeError"], r.stdout + r.stderr
