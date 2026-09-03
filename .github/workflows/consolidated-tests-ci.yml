@@ -137,9 +137,7 @@ jobs:
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
-              # Per-lane generated-source directory, as on the core-drift job
-              # below. Here the lanes are four interpreters, so sharing the
-              # default would also mean 3.10 importing a cache 3.13 wrote.
+              # Per-lane generated-source dir: else 3.10 imports a cache 3.13 wrote.
               export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
               mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
@@ -708,16 +706,8 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
-              # One generated-source directory per lane. The three lanes run
-              # concurrently out of ONE checkout and unsloth_zoo defaults to the
-              # relative `unsloth_compiled_cache`, so they would share it and
-              # rewrite each other's generated files, whose contents differ per
-              # lane (three transformers/TRL pins). A getsource landing
-              # mid-rewrite then dies in tokenize, which is what made
-              # test_compiler_dynamic_exec fail in only one of the three lanes.
-              #
-              # Absolute, not relative: compiler.py puts this straight on
-              # sys.path, where a relative entry follows the cwd.
+              # Per-lane generated-source dir, absolute (compiler.py puts it on sys.path):
+              # concurrent lanes sharing one checkout rewrite the default cache under a reader.
               export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
               mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0

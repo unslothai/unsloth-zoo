@@ -14,23 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`inspect.getsource` raising `tokenize.TokenError` must not fail a load.
-
-`unsloth_compile_transformers` reads source in two places that already degrade
-on `OSError`/`TypeError`: the whole-module `full_source` read, and the torch.nn
-forward `_patch_torch_dtype_modules` adds a dtype cast to. `TokenError` means
-the same thing but subclasses `Exception` directly, so it used to escape both
-and fail `FastModel.from_pretrained` over source only wanted for speed.
-
-It is real: after the first model type, `torch.nn.LayerNorm.forward` and its
-siblings live in generated compile-folder files that later runs rewrite, and a
-read landing mid-rewrite gets a prefix that `inspect.getblock` rejects. Two
-processes sharing one compile folder is all it takes, which is what three CI
-lanes out of one checkout were doing.
-
-Subprocesses because `unsloth_compile_transformers` mutates `torch.nn`
-process-wide, and because `UNSLOTH_COMPILE_LOCATION` is read once at compiler
-import, so a later `monkeypatch.setenv` would leave the probe on the default.
+"""`inspect.getsource` raising `tokenize.TokenError` must not fail a model load.
+TokenError subclasses Exception directly, so it escaped the OSError/TypeError catches;
+it fires when a generated compile-folder file is read mid-rewrite. Subprocesses: the
+compiler mutates torch.nn process-wide and reads UNSLOTH_COMPILE_LOCATION at import.
 """
 
 from __future__ import annotations
@@ -104,14 +91,13 @@ def _result(proc, what: str):
 
 
 def test_tokenerror_is_not_an_oserror_or_typeerror():
-    """Why `except (OSError, TypeError)` was not enough."""
+    """The catch must name TokenError explicitly: it subclasses neither."""
     assert not issubclass(tokenize.TokenError, OSError)
     assert not issubclass(tokenize.TokenError, TypeError)
 
 
 def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
-    """Every `inspect.getsource` raises `TokenError`. The pipeline must return
-    anyway, exactly as it does when the source is missing outright."""
+    """Every getsource raises; the pipeline must still return."""
     proc = _run(
         """
         calls = []
@@ -134,12 +120,10 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
     )
     out = _result(proc, "all-getsource-raises")
 
-    # Guard against a vacuous pass: an early return would also "not raise".
     assert out["calls"] > 0, (
         "inspect.getsource was never called, so the probe proved nothing "
         "about the TokenError handlers"
     )
-    # Must not leave SDPA selected for a model that never claimed it.
     assert out["supports_sdpa"] is False, (
         f"the unreadable-source branch must set __UNSLOTH_SUPPORTS_SDPA__ "
         f"False, got {out['supports_sdpa']!r}"
@@ -147,9 +131,7 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
 
 
 def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
-    """Only the site that reads a generated-then-rewritten file raises: the
-    torch.nn forward in the dtype patcher. The whole-module read is left
-    working so the pipeline gets there normally, not via the early return."""
+    """Raises only on the generated forward, so the pipeline reaches the dtype patcher."""
     proc = _run(
         """
         import torch

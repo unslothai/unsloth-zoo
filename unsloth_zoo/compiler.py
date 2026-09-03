@@ -4190,12 +4190,8 @@ def _patch_torch_dtype_modules(
                 # to patch a dtype cast. `get_compiler_config` above only covers
                 # torch.compile wrappers.
                 #
-                # TokenError: by now `function.forward` is usually OUR generated
-                # forward, living in a compile-folder file we rewrite at runtime.
-                # A getsource landing mid-rewrite reads a truncated prefix, which
-                # inspect.getblock turns into TokenError. It subclasses Exception
-                # directly, so OSError/TypeError did not catch it. Truncated
-                # source is the same "no usable source" case handled here.
+                # TokenError subclasses Exception directly, so neither catch above sees it: getsource
+                # can read our generated forward mid-rewrite. linecache.checkcache() is NOT the fix (findsource calls it).
                 #
                 # The precondition is not fully characterised: two plain Qwen
                 # loads do not trigger it, and after such a load no torch.nn
@@ -4492,9 +4488,7 @@ def unsloth_compile_transformers(
         # FastModel.from_pretrained and the model fails to LOAD, over a file we
         # only wanted in order to make it faster.
         #
-        # TokenError is listed for symmetry with _patch_torch_dtype_modules,
-        # which provably needed it. It cannot fire here today: for a module
-        # inspect.getsourcelines skips getblock, so nothing tokenizes.
+        # TokenError is dead here (module: getsourcelines never calls getblock), kept for symmetry.
         #
         # Return rather than continue with an empty string: checks of the form
         # `"_supports_sdpa = False" not in full_source` are TRUE on empty and
