@@ -157,6 +157,43 @@ def test_explicit_truncation_preserved(processor):
     assert row_lengths(out) == [31, 31], row_lengths(out)
 
 
+@pytest.fixture(scope = "module")
+def processor_tokenizer_padded():
+    """Same stub, but the TOKENIZER was initialized with padding="max_length", max_length=40.
+
+    ProcessorMixin._merge_kwargs copies tokenizer init kwargs over the ProcessingKwargs _defaults,
+    so this policy reaches output_kwargs["text_kwargs"] with an empty per-call kwargs dict. The
+    override must not overwrite it.
+    """
+    original_call = Gemma3Processor.__call__
+    patch_Gemma3Processor()
+    if "unsloth_zoo" not in getattr(Gemma3Processor.__call__, "__code__", original_call.__code__).co_filename:
+        Gemma3Processor.__call__ = original_call
+        pytest.skip("Gemma3Processor.__call__ was not patched by this transformers version")
+    stub = Gemma3Processor.__new__(Gemma3Processor)
+    stub.tokenizer = _StubTokenizer()
+    stub.tokenizer.init_kwargs = {"padding": "max_length", "max_length": 40}
+    stub.image_processor = None
+    stub.boi_token = "<start_of_image>"
+    stub.image_token_id = 99
+    stub.full_image_sequence = "<img>"
+    yield stub
+    Gemma3Processor.__call__ = original_call
+
+
+def test_tokenizer_init_padding_is_not_overridden(processor_tokenizer_padded):
+    # padding="max_length" configured on the tokenizer, no padding= at the call site.
+    # _merge_kwargs puts it in text_kwargs, so the automatic "longest" must stand down.
+    out = processor_tokenizer_padded(text = [SHORT, LONG], return_tensors = None)
+    assert row_lengths(out) == [40, 40], row_lengths(out)
+
+
+def test_tokenizer_init_padding_still_overridable_at_call_site(processor_tokenizer_padded):
+    # An explicit per-call padding still wins over the tokenizer's init value, as upstream.
+    out = processor_tokenizer_padded(text = [SHORT, LONG], padding = False, return_tensors = None)
+    assert row_lengths(out) == [3, 31], row_lengths(out)
+
+
 def test_non_dict_text_kwargs_still_raises(processor):
     # A None/non-dict text_kwargs must keep raising inside _merge_kwargs, as it does upstream.
     with pytest.raises(AttributeError):

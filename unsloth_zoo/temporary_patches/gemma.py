@@ -430,8 +430,14 @@ def patch_Gemma3Processor():
         # implicit "longest_first" truncation from padding is False plus max_length, so
         # deciding truncation from the forced "longest" would silently drop the caller's
         # max_length and let overlong rows through.
+        # _merge_kwargs also folds the TOKENIZER's init kwargs over the ProcessingKwargs
+        # defaults, so a tokenizer built with padding="max_length" arrives here configured
+        # even though `kwargs` is empty. Only substitute "longest" when the merged padding
+        # is still disabled: a positive policy already pads every row to one width, which
+        # is all this override exists to guarantee.
         _padding_before_override = output_kwargs["text_kwargs"].get("padding", False)
-        if not _user_set_padding and isinstance(text, (list, tuple)) and len(text) > 1:
+        _padding_is_disabled = _padding_before_override in (False, None, "do_not_pad")
+        if not _user_set_padding and _padding_is_disabled and isinstance(text, (list, tuple)) and len(text) > 1:
             output_kwargs["text_kwargs"]["padding"] = "longest"
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
