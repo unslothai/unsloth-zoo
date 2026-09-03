@@ -37,7 +37,10 @@ import site
 import subprocess
 import sys
 
-from ..log import logger
+# Absolute on purpose: transformers' custom_object_save walks relative imports
+# with a regex that pastes the raw capture onto the directory, so `from ..log`
+# becomes temporary_patches/.log.py and crashes the save. See PR #1045.
+from unsloth_zoo.log import logger
 from .common import TEMPORARY_PATCHES
 
 # pypi-name -> import-name (None means same).

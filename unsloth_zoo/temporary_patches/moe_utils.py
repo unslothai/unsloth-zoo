@@ -1099,18 +1099,32 @@ def _should_use_separated_lora() -> bool:
 
 # Model-specific weight preprocessing hooks: each model registers a transposition
 # function so the generic backend works across weight layouts.
+#
+# unsloth_compiled_cache holds copies of this file, loaded as their own module objects
+# (unsloth_cached_moe_utils, whose forward get_forward_moe_backend() prefers, and the
+# bare `moe_utils` compiled modules import), each with its own empty dict. Resolving
+# through the package keeps registration and lookup on one dict whichever copy runs,
+# so a registration is not dropped and left to layout inference (#849).
 
 _WEIGHT_PREPROCESSORS = {}
 
 
+def _weight_preprocessor_registry():
+    """The registry shared by every loaded copy of this module (see above)."""
+    package_module = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    if package_module is None:
+        return _WEIGHT_PREPROCESSORS  # package copy not loaded, so nothing registered
+    return getattr(package_module, "_WEIGHT_PREPROCESSORS", _WEIGHT_PREPROCESSORS)
+
+
 def register_weight_preprocessor(model_type: str, preprocessor_fn):
     """Register a weight preprocessor (weight, proj_type, hidden_dim) -> weight for a model type."""
-    _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
+    _weight_preprocessor_registry()[model_type] = preprocessor_fn
 
 
 def get_weight_preprocessor(model_type: str):
     """Get registered weight preprocessor for model type."""
-    return _WEIGHT_PREPROCESSORS.get(model_type)
+    return _weight_preprocessor_registry().get(model_type)
 
 
 def _logical_expert_shape(param):
@@ -1214,8 +1228,12 @@ def preprocess_weight(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if model_type and model_type in _WEIGHT_PREPROCESSORS:
-        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
+    # Guarded: this runs per projection per MoE forward and again in recompute
+    # backward, and the shipped models pass model_type=None.
+    if model_type:
+        registry = _weight_preprocessor_registry()
+        if model_type in registry:
+            return registry[model_type](weight, proj_type, hidden_dim)
 
     # Non-square shapes reveal layout directly.
     needs_transpose = _orientation_needs_transpose(tuple(weight.shape), proj_type, hidden_dim)

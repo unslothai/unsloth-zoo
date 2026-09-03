@@ -180,12 +180,10 @@ def _fake_trainer(model, accepts, compute_loss_func = None):
     t.accelerator = Accelerator()
     t.model_accepts_loss_kwargs = accepts
     t.compute_loss_func = compute_loss_func
-    # transformers 5.x reads this INSIDE the try that counts labels, and the except
-    # swallows AttributeError. A stand-in without it therefore does not measure stock's
-    # decision at all: stock raises on the first list comprehension, returns None, and a
-    # differential test reads that as "stock declined to count". Every real Trainer sets
-    # it in __init__. True is the value for this fixture's model, which shifts labels
-    # internally like any causal LM, which is exactly the case the flag selects.
+    # transformers 5.x reads this inside the try that counts labels, and the except
+    # swallows the AttributeError, so a stand-in without it makes stock look like it
+    # declined to count. Every real Trainer sets it; True matches this fixture's model,
+    # which shifts labels internally like any causal LM.
     t._loss_shifts_labels = True
     return t
 
@@ -259,6 +257,459 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
 
 
 
+# Packed / padding-free boundary counting.
+#
+# The N-1 internal boundaries of a packed row are not training positions, but
+# subtracting N-1 double counts every boundary a collator already masked with
+# -100 (TRL >= 0.23.1 labels[position_ids == 0] = -100, completion_only_loss /
+# assistant_masks on every version), under-counting num_items_in_batch and
+# inflating loss and grads. So the arithmetic must be idempotent, not version
+# detected. unsloth attaches packed_seq_lengths even when packing is off, so
+# this reaches ordinary LoRA runs with per_device_train_batch_size > 1.
+
+
+def _padding_free_batch(lengths, premask_starts = False, completion_only = 0):
+    """One flattened padding-free row holding len(lengths) documents.
+
+    premask_starts reproduces TRL >= 0.23.1, which writes -100 at every
+    position_ids == 0 slot. completion_only masks the first N tokens of each
+    document, which is what completion_only_loss and assistant_masks do on every
+    TRL version, and which also lands -100 on the document starts. Synthesising
+    both regimes here is what lets one installed TRL stand in for all of them.
+    """
+    torch = pytest.importorskip("torch")
+    total = int(sum(int(x) for x in lengths))
+    g = torch.Generator().manual_seed(11)
+    ids = torch.randint(1, 11, (1, total), generator = g)
+    labels = ids.clone()
+    offset = 0
+    for length in lengths:
+        length = int(length)
+        if length <= 0: continue
+        if premask_starts:
+            labels[0, offset] = -100
+        for i in range(min(completion_only, length)):
+            labels[0, offset + i] = -100
+        offset += length
+    # Padding-free batches carry no attention_mask; unsloth's collator pops it.
+    return {
+        "input_ids": ids,
+        "labels": labels,
+        "packed_seq_lengths": torch.tensor([int(x) for x in lengths], dtype = torch.int32),
+    }
+
+
+def _true_target_count(labels, lengths):
+    """Truth by an independent method, so a bug cannot hide in the oracle.
+
+    Walks the batch in Python lists rather than reusing any of the tensor
+    arithmetic under test. A shifted slot is a target when its label is not -100
+    and the token it predicts is not the first token of a document (which
+    includes the first token of a row, dropped by the labels[..., 1:] slice).
+    """
+    rows = labels.tolist()
+    if not isinstance(rows[0], list): rows = [rows]
+    width = len(rows[0])
+    starts = set()
+    offset = 0
+    for length in lengths:
+        length = int(length)
+        if length <= 0: continue
+        starts.add(offset)
+        offset += length
+    count = 0
+    for r, row in enumerate(rows):
+        for col in range(1, width):
+            if (r * width + col) in starts: continue
+            if row[col] == -100: continue
+            count += 1
+    return count
+
+
+def _counted(batch, model = None):
+    """num_items_in_batch as _unsloth_get_batch_samples reports it for one batch.
+
+    ALLOWED_NUM_ITEMS_IN_BATCH is keyed on the model class name and a stale entry
+    makes the counting branch not run at all, so every test clears it first or
+    passes vacuously.
+    """
+    mod = _loss_utils()
+    fn = getattr(mod, "_unsloth_get_batch_samples", None)
+    if fn is None: pytest.skip("_unsloth_get_batch_samples not present")
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = fn(_fake_trainer(model if model is not None else _tiny_model(), True), iter([batch]), 1)
+    return None if count is None else int(count)
+
+
+def _normalizer():
+    mod = _loss_utils()
+    fn = getattr(mod, "_normalize_packed_seq_lengths", None)
+    if fn is None: pytest.fail("_normalize_packed_seq_lengths is gone; the counting path relies on it")
+    return fn
+
+
+def test_normalize_accepts_every_shape_a_collator_can_emit():
+    torch = pytest.importorskip("torch")
+    normalize = _normalizer()
+    expected = [4, 3, 3]
+    candidates = [
+        torch.tensor(expected, dtype = torch.int32),
+        torch.tensor(expected, dtype = torch.int64),
+        list(expected),
+        tuple(expected),
+    ]
+    numpy = pytest.importorskip("numpy")
+    candidates.append(numpy.array(expected, dtype = "int32"))
+    for candidate in candidates:
+        out = normalize(candidate)
+        assert out is not None, f"{type(candidate).__name__} was rejected"
+        assert out.dtype == torch.int64 and out.device.type == "cpu"
+        assert out.tolist() == expected
+
+
+def test_normalize_treats_unusable_metadata_as_absent():
+    """It must degrade, never raise: the caller counts inside a try that re-raises
+    as RuntimeError, which turns a bad batch into a dead training run."""
+    normalize = _normalizer()
+    for junk in (None, "not lengths", object(), [[1, 2], [3]], {"a": 1}):
+        assert normalize(junk) is None, f"{junk!r} should have been treated as absent"
+
+
+def test_normalize_drops_nonpositive_and_short_circuits_one_document():
+    torch = pytest.importorskip("torch")
+    normalize = _normalizer()
+    assert normalize(torch.tensor([4, 0, 3, 0, 3])).tolist() == [4, 3, 3]
+    # One document has no internal boundary, so there is nothing to drop.
+    assert normalize(torch.tensor([7])) is None
+    assert normalize(torch.tensor([7, 0, 0])) is None
+    assert normalize(torch.tensor([], dtype = torch.int64)) is None
+    assert normalize(torch.tensor(7)) is None
+
+
+def test_count_is_identical_whether_or_not_the_collator_premasked():
+    """The headline property. TRL >= 0.23.1 masks the document starts and earlier
+    versions do not, and completion-only masking does it on every version. The
+    count must not depend on which of those produced the batch."""
+    lengths = [4, 3, 3]
+    plain = _counted(_padding_free_batch(lengths))
+    masked = _counted(_padding_free_batch(lengths, premask_starts = True))
+    assert plain == masked == 7, (
+        f"pre-masked batch counted {masked} against {plain} unmasked; the boundary "
+        "slots are being removed twice on whichever collator already masked them"
+    )
+
+
+def test_count_equals_total_tokens_minus_document_count():
+    for lengths in ([4, 3, 3], [8] * 4, [256, 256], [5, 1, 9, 2]):
+        total = sum(lengths)
+        for premask in (False, True):
+            batch = _padding_free_batch(lengths, premask_starts = premask)
+            counted = _counted(batch)
+            assert counted == _true_target_count(batch["labels"], lengths)
+            assert counted == total - len(lengths), (
+                f"lengths={lengths} premask={premask}: counted {counted}, "
+                f"expected {total - len(lengths)}"
+            )
+
+
+def test_completion_only_masking_is_not_double_subtracted():
+    """completion_only_loss puts -100 on the document starts on every TRL version,
+    which is why a version gate would leave the commonest SFT config broken."""
+    lengths = [5, 5, 5, 5]
+    batch = _padding_free_batch(lengths, completion_only = 3)
+    counted = _counted(batch)
+    assert counted == _true_target_count(batch["labels"], lengths)
+    # 4 documents x 5 tokens, first 3 of each masked; the boundary targets are
+    # already inside those masked prefixes.
+    assert counted == 8, f"counted {counted}, expected 8"
+
+
+def test_single_document_batch_is_untouched():
+    """N = 1 has no internal boundary. Provable no-op, not an approximate one."""
+    lengths = [12]
+    batch = _padding_free_batch(lengths)
+    counted = _counted(batch)
+    assert counted == _true_target_count(batch["labels"], lengths) == 11
+
+
+def test_zero_length_entries_are_ignored():
+    torch = pytest.importorskip("torch")
+    lengths = [4, 0, 3, 0, 3]
+    batch = _padding_free_batch(lengths)
+    assert batch["input_ids"].shape[-1] == 10
+    counted = _counted(batch)
+    assert counted == _true_target_count(batch["labels"], lengths) == 7
+
+
+def test_lengths_overrunning_the_batch_do_not_kill_live_targets():
+    """Metadata is trusted to describe the row, so guard the case where it does
+    not. Boundaries past the end of the batch must be dropped, not wrapped onto a
+    row that is really there."""
+    torch = pytest.importorskip("torch")
+    # 5 puts a boundary at flat 15: past a 10 token batch and not on a row start,
+    # so only the rows < n_rows filter catches it. Without it, IndexError inside
+    # the try that re-raises as RuntimeError.
+    for overrun in ([4, 3, 3, 5, 50], [4, 3, 3, 50, 50], [4, 3, 3, 1]):
+        batch = _padding_free_batch([4, 3, 3])
+        batch["packed_seq_lengths"] = torch.tensor(overrun, dtype = torch.int32)
+        counted = _counted(batch)
+        assert counted == 7, f"lengths={overrun}: counted {counted}, expected 7"
+
+
+def test_metadata_shorter_than_the_batch_never_targets_the_trailing_boundary():
+    """cumsum(...)[:-1] rather than the full cumsum: the trailing boundary of a
+    truncated description is a live target, and truncated metadata must not eat
+    it."""
+    torch = pytest.importorskip("torch")
+    batch = _padding_free_batch([4, 3, 3])
+    batch["packed_seq_lengths"] = torch.tensor([4, 3], dtype = torch.int32)
+    counted = _counted(batch)
+    assert counted == 8, f"counted {counted}, expected 8 (10 tokens, 1 row start, 1 boundary)"
+
+
+def test_a_document_starting_at_a_row_boundary_is_not_dropped_twice():
+    """A document that begins exactly at a row start was already dropped by the
+    labels[..., 1:] slice, so it must not be zeroed again."""
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(3)
+    ids = torch.randint(1, 11, (2, 6), generator = g)
+    lengths = [6, 6]
+    batch = {
+        "input_ids": ids,
+        "labels": ids.clone(),
+        "packed_seq_lengths": torch.tensor(lengths, dtype = torch.int32),
+    }
+    counted = _counted(batch)
+    assert counted == _true_target_count(batch["labels"], lengths) == 10, (
+        f"counted {counted}, expected 10: both rows keep all 5 shifted targets"
+    )
+
+
+def test_multi_row_boundaries_map_row_major():
+    """Documents tile the flattened batch row-major, so a boundary at flat index s
+    lands at row s // width, column s % width."""
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(5)
+    ids = torch.randint(1, 11, (3, 4), generator = g)
+    lengths = [3, 5, 4]
+    batch = {
+        "input_ids": ids,
+        "labels": ids.clone(),
+        "packed_seq_lengths": torch.tensor(lengths, dtype = torch.int32),
+    }
+    counted = _counted(batch)
+    # 12 tokens, 3 row starts dropped by the slice, boundaries at flat 3 and 8.
+    # Flat 8 is a row start and already gone, so only flat 3 is live.
+    assert counted == _true_target_count(batch["labels"], lengths) == 8, (
+        f"counted {counted}, expected 8"
+    )
+
+
+def test_applying_the_boundary_removal_twice_is_idempotent():
+    """The property that makes a version check unnecessary, asserted directly on
+    the counting path rather than inferred from the two-collator comparison."""
+    torch = pytest.importorskip("torch")
+    lengths = [4, 3, 3]
+    # Pre-masked, so the boundary slots are already gone before the counting path
+    # touches them: removing them a second time is exactly the bug.
+    batch = _padding_free_batch(lengths, premask_starts = True)
+    first = _counted(batch)
+    second = _counted(batch)
+    assert first == second == 7, f"first {first}, second {second}"
+    # And the caller's batch must come back unharmed.
+    assert int((batch["labels"] != -100).sum()) == 7, (
+        "the counting path mutated the caller's labels"
+    )
+
+
+def test_batch_without_packed_seq_lengths_is_unchanged():
+    """The no-metadata path must be bit identical to before the fix."""
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(9)
+    ids = torch.randint(1, 11, (4, 7), generator = g)
+    labels = ids.clone()
+    labels[0, 3] = -100
+    counted = _counted({"input_ids": ids, "labels": labels})
+    assert counted == int((labels[..., 1:] != -100).sum()) == 23
+
+
+def test_a_plain_list_of_lengths_does_not_kill_the_run():
+    """`seq_lengths > 0` raises on a list, and the enclosing except re-raises as
+    RuntimeError, so this used to be a dead training run rather than a bad count."""
+    lengths = [4, 3, 3]
+    batch = _padding_free_batch(lengths)
+    batch["packed_seq_lengths"] = list(lengths)
+    assert _counted(batch) == 7
+
+
+def test_int32_metadata_counts_like_int64():
+    torch = pytest.importorskip("torch")
+    lengths = [4, 3, 3]
+    counted = []
+    for dtype in (torch.int32, torch.int64):
+        batch = _padding_free_batch(lengths)
+        batch["packed_seq_lengths"] = torch.tensor(lengths, dtype = dtype)
+        counted.append(_counted(batch))
+    assert counted == [7, 7], f"int32 and int64 metadata disagreed: {counted}"
+
+
+def test_unusable_metadata_degrades_instead_of_raising():
+    batch = _padding_free_batch([4, 3, 3])
+    batch["packed_seq_lengths"] = "garbage"
+    # Falls back to the plain shifted count rather than raising RuntimeError.
+    assert _counted(batch) == 9
+
+
+def test_normalize_does_not_raise_when_the_length_filter_cannot_run():
+    """Dropping the non-positive lengths is a boolean mask, so it lowers to
+    aten.nonzero, whose output shape is data dependent. Under FakeTensorMode that
+    raises DynamicOutputShapeException. The whole body therefore has to sit inside
+    the try: the caller counts inside `except Exception: raise RuntimeError(...)`,
+    so an escape here is a dead training run, not the missing correction this
+    helper exists to degrade to."""
+    torch = pytest.importorskip("torch")
+    fake = pytest.importorskip("torch._subclasses.fake_tensor")
+    normalize = _normalizer()
+    with fake.FakeTensorMode():
+        # Positive lengths only, so this is metadata the helper would normally
+        # accept: the raise comes from the filter, not from rejecting the input.
+        assert normalize(torch.tensor([4, 3, 3])) is None
+
+
+def test_the_counting_path_does_not_raise_on_a_traced_tensor():
+    """The same escape, observed where it actually hurts: through the public
+    counting entry point, whose except clause converts anything that gets out into
+    a RuntimeError that ends the run."""
+    torch = pytest.importorskip("torch")
+    fake = pytest.importorskip("torch._subclasses.fake_tensor")
+    mod = _loss_utils()
+    fn = getattr(mod, "_unsloth_get_batch_samples", None)
+    if fn is None: pytest.skip("_unsloth_get_batch_samples not present")
+    with fake.FakeTensorMode():
+        ids = torch.randint(1, 11, (1, 10))
+        batch = {
+            "input_ids": ids,
+            "labels": ids.clone(),
+            "packed_seq_lengths": torch.tensor([4, 3, 3], dtype = torch.int32),
+        }
+        mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+        # Called directly, not through _counted: its int(count) is a .item() that
+        # raises on a fake tensor by itself. No number exists under a fake tensor
+        # either, so the only contract here is that it does not end the run.
+        fn(_fake_trainer(_tiny_model(), True), iter([batch]), 1)
+
+
+def test_the_count_can_never_go_negative():
+    """Subtracting N-1 had no lower bound. On a batch whose live targets number
+    fewer than N, the old arithmetic returned zero or a negative num_items_in_batch,
+    so the loss divided by zero or changed sign and the gradients ascended. Zeroing
+    slots that may already be False is bounded below by construction, and this
+    pins that.
+
+    Every case here has real trainable targets, so declining to count is not an
+    acceptable answer either.
+    """
+    torch = pytest.importorskip("torch")
+    # (lengths, completion_only, premask, true target count)
+    cases = [
+        ([4, 3, 3],       3, False, 1),
+        ([1, 1, 2],       1, True,  1),
+        ([5, 3],          4, False, 1),
+        ([2, 5, 2],       4, False, 1),
+        ([1, 5, 6, 3, 3], 4, True,  3),
+        ([5, 3, 4, 2],    3, False, 3),
+    ]
+    for lengths, completion_only, premask, expected in cases:
+        batch = _padding_free_batch(
+            lengths, premask_starts = premask, completion_only = completion_only,
+        )
+        counted = _counted(batch)
+        # The bound first: after the equality below it would be dead, since every
+        # expected value here is >= 1 and no negative count could ever reach it.
+        assert counted is not None and counted > 0, (
+            f"lengths={lengths} completion_only={completion_only}: num_items_in_batch "
+            f"came back {counted}. A non-positive count makes the loss divide by zero "
+            "or flip sign, which is what subtracting an unbounded N-1 allowed"
+        )
+        assert counted == _true_target_count(batch["labels"], lengths)
+        assert counted == expected, (
+            f"lengths={lengths} completion_only={completion_only}: "
+            f"counted {counted}, expected {expected}"
+        )
+
+
+def test_the_real_installed_trl_collator_is_counted_correctly():
+    """One end-to-end pass through whatever TRL is installed, so the synthesised
+    regimes above cannot drift away from a real collator's output."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("trl")
+    # Moved between trl.trainer.utils and trl.trainer.sft_trainer across releases.
+    cls = None
+    for module in ("trl.trainer.sft_trainer", "trl.trainer.utils"):
+        try: candidate = __import__(module, fromlist = ["DataCollatorForLanguageModeling"])
+        except Exception: continue
+        cls = getattr(candidate, "DataCollatorForLanguageModeling", None)
+        if cls is not None: break
+    if cls is None: pytest.skip("this TRL has no DataCollatorForLanguageModeling")
+    # return_position_ids only exists on some releases; padding_free implies it elsewhere.
+    collator = None
+    for kwargs in ({"return_position_ids": True}, {}):
+        try:
+            collator = cls(pad_token_id = 0, padding_free = True, **kwargs)
+            break
+        except TypeError:
+            continue
+    if collator is None: pytest.skip("this TRL's collator does not take padding_free")
+
+    lengths = [4, 3, 3]
+    examples = [{"input_ids": list(range(1, n + 1))} for n in lengths]
+    batch = collator(examples)
+    if "position_ids" not in batch: pytest.skip("collator returned no position_ids")
+    if batch["labels"].shape[-1] != sum(lengths): pytest.skip("collator did not flatten the batch")
+    batch = dict(batch)
+    batch.pop("attention_mask", None)
+    batch["packed_seq_lengths"] = torch.tensor(lengths, dtype = torch.int32)
+
+    counted = _counted(batch)
+    assert counted == _true_target_count(batch["labels"], lengths), (
+        f"counted {counted} against an independently computed "
+        f"{_true_target_count(batch['labels'], lengths)} on the real collator"
+    )
+    assert counted == 7, (
+        f"counted {counted}, expected 10 tokens minus 3 document starts"
+    )
+
+
+def test_the_counting_path_never_branches_on_the_trl_version():
+    """Locks in the architectural decision. Feature detection answers the wrong
+    question (what matters is whether these exact slots are already -100, which
+    completion-only masking also decides), inspects a class the batch may never
+    have come from, and inspect.getsource raises on frozen, zipped, -OO or wrapped
+    installs, inside the try that turns it into a hard crash."""
+    import ast
+
+    mod = _loss_utils()
+    src = inspect.getsource(mod)
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.split(".")[0] == "trl", "loss_utils must not import trl"
+        elif isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").split(".")[0] == "trl", "loss_utils must not import trl"
+
+    counting = inspect.getsource(mod._unsloth_get_batch_samples)
+    counting += inspect.getsource(mod._normalize_packed_seq_lengths)
+    # Strip comments: the rationale above is allowed to name versions, the code is not.
+    code = "\n".join(line.split("#", 1)[0] for line in counting.splitlines())
+    for banned in ("__version__", "Version(", "getsource", "trl"):
+        assert banned not in code, (
+            f"the packed-boundary count branches on {banned!r}; it must be "
+            "idempotent instead, because completion-only masking regresses the "
+            "same slots on every TRL version"
+        )
+
+
 def _stock_counts_shifted_labels(stock):
     """Does the installed transformers count over `labels[..., 1:]` rather than `labels`?
 
@@ -299,11 +750,10 @@ def test_guard_returns_a_count_exactly_when_stock_transformers_would():
                 f"accepts={accepts} compute_loss_func={loss_func is not None}: "
                 f"we returned {ours!r} where stock returned {theirs!r}"
             )
-            # Where stock counts over labels[..., 1:] the COUNT has to agree too, not
-            # just whether one was produced. transformers adopted that rule in 5.x
-            # (position 0 of a row is never a prediction target for a causal LM); zoo
-            # has always counted that way, so before 5.x the two legitimately differ by
-            # one token per row and only the nullity above is a shared contract.
+            # Where stock counts over labels[..., 1:] the count must agree too, not
+            # just whether one was produced. transformers adopted that rule in 5.x;
+            # zoo always counted that way, so before 5.x the two legitimately differ
+            # by one token per row and only the nullity above is shared.
             if _stock_counts_shifted_labels(stock) and ours is not None:
                 assert int(ours) == int(theirs), (
                     f"accepts={accepts} compute_loss_func={loss_func is not None}: "

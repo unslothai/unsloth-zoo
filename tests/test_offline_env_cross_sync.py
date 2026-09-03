@@ -21,6 +21,19 @@ import sys
 import pytest
 
 
+# The package the fixture reloads, plus what that reload drags in with it. A
+# prefix match, so submodules (`unsloth_zoo.vision_utils`,
+# `bitsandbytes.functional`) travel with their parent.
+_RELOAD_DISTURBS = ("unsloth_zoo", "bitsandbytes")
+
+
+def _is_guarded(name: str) -> bool:
+    return any(
+        name == root or name.startswith(root + ".")
+        for root in _RELOAD_DISTURBS
+    )
+
+
 @pytest.fixture
 def reload_zoo(monkeypatch):
     """Strip the three offline env vars, then reload ``unsloth_zoo`` so its
@@ -33,6 +46,19 @@ def reload_zoo(monkeypatch):
     teardown so the reload does not leak that shell into the rest of the
     session and break later tests that resolve submodules via string paths
     (e.g. ``monkeypatch.setattr("unsloth_zoo.vision_utils.<attr>", ...)``).
+
+    ``bitsandbytes*`` is snapshotted for the same reason and was missed the
+    first time: importing ``unsloth_zoo`` pulls bitsandbytes in, so a reload
+    can swap whatever was already in ``sys.modules`` under that name -- a stub
+    an earlier test installed, or the real package -- for the other one. The
+    conftest teardown guard catches exactly this and named this fixture:
+
+        test_unset_stays_unset replaced ['bitsandbytes'] in sys.modules and
+        did not put it back, so every later test in this process imports the
+        substitute
+
+    Restoring means "leave sys.modules as this fixture found it", which is the
+    fixture's contract for unsloth_zoo already; bitsandbytes is not special.
     """
     for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(v, raising = False)
@@ -40,7 +66,7 @@ def reload_zoo(monkeypatch):
     saved = {
         name: module
         for name, module in sys.modules.items()
-        if name == "unsloth_zoo" or name.startswith("unsloth_zoo.")
+        if _is_guarded(name)
     }
 
     def _reload():
@@ -49,10 +75,7 @@ def reload_zoo(monkeypatch):
 
     yield _reload
 
-    for name in [
-        name for name in sys.modules
-        if name == "unsloth_zoo" or name.startswith("unsloth_zoo.")
-    ]:
+    for name in [name for name in sys.modules if _is_guarded(name)]:
         if name not in saved:
             del sys.modules[name]
     sys.modules.update(saved)

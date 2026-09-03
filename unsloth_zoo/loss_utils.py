@@ -243,6 +243,45 @@ from transformers.training_args import ParallelMode
 mark_static  = torch._dynamo.mark_static
 mark_dynamic = torch._dynamo.mark_dynamic
 
+
+def _normalize_packed_seq_lengths(seq_lengths):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Coerce collator supplied packed sequence lengths to a 1D int64 CPU tensor.
+
+    Returns None when the metadata is missing, unusable, describes a single
+    document (one document has no internal boundary to drop), or when the running
+    execution mode cannot evaluate the filter below. Kept on CPU:
+    these are tens of elements, it avoids MPS / XPU integer op gaps, and it keeps
+    the counting path free of a device sync.
+
+    Deliberately duplicated from unsloth/utils/packing.py rather than imported.
+    The dependency arrow runs unsloth -> unsloth_zoo and must never run back.
+
+    Anything unconvertible is treated as absent rather than raised: the caller
+    counts inside a try that re-raises as RuntimeError, so a plain list of ints
+    used to end the run outright.
+    """
+    if seq_lengths is None: return None
+    try:
+        if isinstance(seq_lengths, torch.Tensor):
+            lengths = seq_lengths.detach().to(device = "cpu", dtype = torch.long)
+        else:
+            lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
+        if lengths.ndim != 1:
+            lengths = lengths.reshape(-1)
+        # Filtering is mandatory (a 0 length duplicates a start, a negative one
+        # corrupts every later cumsum) and must stay inside the try: the mask
+        # lowers to aten.nonzero, which raises DynamicOutputShapeException under
+        # FakeTensorMode and raises under vmap. Escaping into the caller's
+        # `except Exception: raise RuntimeError(...)` kills the run.
+        lengths = lengths[lengths > 0]
+        if lengths.numel() <= 1: return None
+    except Exception:
+        return None
+    return lengths
+pass
+
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
@@ -320,12 +359,45 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
+                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
+                if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
+                    # Packing N documents leaves N-1 internal boundaries that are
+                    # not valid training positions. Zero those exact slots rather
+                    # than subtract N-1: many collators already mask them (TRL
+                    # >= 0.23.1 labels[position_ids == 0] = -100, transformers'
+                    # DataCollatorWithFlattening, completion_only_loss /
+                    # assistant_masks), so subtracting double counts them and
+                    # inflates loss and grads. Zeroing is idempotent and cannot
+                    # go below zero; subtracting had no lower bound and drove the
+                    # count to zero or negative on small batches.
+                    #
+                    # labels[..., 1:] already dropped column 0 of every row, so a
+                    # document starting at flat index s sits at column s - 1, and
+                    # one starting at a row boundary is already gone. cumsum[:-1]
+                    # drops the trailing boundary, making a single document a
+                    # provable no-op and keeping truncated metadata harmless.
+                    #
+                    # The data-dependent reads below (rows[keep], rows.numel())
+                    # are unprotected, and safe only because
+                    # _normalize_packed_seq_lengths already returned None under
+                    # any mode that cannot evaluate them. Keep that ordering.
+                    n_shift = token_count.shape[-1]
+                    n_rows  = token_count.numel() // n_shift
+                    starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]
+                    rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
+                    cols    = starts - rows * (n_shift + 1)
+                    keep    = (cols > 0) & (rows < n_rows)
+                    rows, cols = rows[keep], cols[keep]
+                    if rows.numel() != 0:
+                        if rows.device != token_count.device:
+                            rows = rows.to(token_count.device)
+                            cols = cols.to(token_count.device)
+                        # Reassign: reshape can copy on a non contiguous input.
+                        token_count = token_count.reshape(n_rows, n_shift)
+                        token_count[rows, cols - 1] = False
+                    pass
+                pass
                 count = token_count.sum()
-                seq_lengths = x.get("packed_seq_lengths")
-                if seq_lengths is not None:
-                    # Packing N sequences has N-1 internal boundaries that
-                    # aren't valid training positions.
-                    count -= torch.count_nonzero(seq_lengths > 0).item() - 1
                 token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)
