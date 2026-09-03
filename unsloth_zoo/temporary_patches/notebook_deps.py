@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Auto-install missing notebook-only Python deps on first use.
-#
-# Four notebooks failed in the Blackwell docker validation because the slim
-# venv shipped without timm / traitlets / addict / matplotlib, and the
-# raising frame is buried inside HF code (`transformers.utils.import_utils.
-# requires_backends` for TimmWrapper, `transformers.dynamic_module_utils.
-# check_imports` for the Deepseek-OCR trust_remote_code modeling file, and
-# a bare ModuleNotFoundError for traitlets from the IPython chain). Wrap
-# all three call sites with a thin retry that pip-installs the offending
-# package (allow-list only) and re-tries the original import. Honours the
-# existing `UNSLOTH_AUTO_INSTALL=0` opt-out (used by `llama_cpp.py`) and
-# the standard offline flags so air-gapped envs keep emitting the
-# upstream ImportError verbatim.
+# Auto-install missing notebook-only deps: three call sites raise (requires_backends,
+# check_imports, and a bare ModuleNotFoundError from the IPython chain), so all three
+# are wrapped with an allow-listed pip retry.
 
 import ast
 import importlib
@@ -38,41 +28,37 @@ import site
 import subprocess
 import sys
 
-# Absolute on purpose: transformers' custom_object_save walks relative imports
-# with a regex that pastes the raw capture onto the directory, so `from ..log`
-# becomes temporary_patches/.log.py and crashes the save. See PR #1045.
+# Absolute on purpose: `from ..log` makes transformers' custom_object_save write
+# temporary_patches/.log.py and crash. See PR #1045.
 from unsloth_zoo.log import logger
 from .common import TEMPORARY_PATCHES
 
 # pypi-name -> import-name (None means same).
 _ALLOW_LIST = {
-    "timm":          None,           # vision backbones (TimmWrapperModel)
-    "addict":        None,           # Deepseek-OCR config dicts
-    "einops":        None,           # Deepseek-OCR deepencoder + many other vision models
-    "easydict":      None,           # Deepseek-OCR deepencoder.py:12 `from easydict import EasyDict`
-    "snac":          None,           # Orpheus TTS neural audio codec
-    "torchcodec":    None,           # HF datasets audio Feature decoder (>= datasets 4.x)
-    "matplotlib":    None,           # Deepseek-OCR + a few HF image utils
-    "traitlets":     None,           # Jupyter/IPython widget chain
-    "soundfile":     None,           # audio processors
-    "librosa":       None,           # audio processors
-    "scipy":         None,           # several processors
-    "pyctcdecode":   None,           # ASR
-    "tiktoken":      None,           # tokenizer remote-code paths
-    "blobfile":      None,           # tiktoken backing store
-    "pillow_heif":   "pillow_heif",  # HEIF images
-    "decord":        None,           # video processors
-    "av":            "av",           # pyav (video processors)
-    "num2words":     None,           # speech text norm
-    "jieba":         None,           # zh tokenizer
-    "sentencepiece": None,           # tokenizers
+    "timm":          None,
+    "addict":        None,
+    "einops":        None,
+    "easydict":      None,
+    "snac":          None,
+    "torchcodec":    None,
+    "matplotlib":    None,
+    "traitlets":     None,
+    "soundfile":     None,
+    "librosa":       None,
+    "scipy":         None,
+    "pyctcdecode":   None,
+    "tiktoken":      None,
+    "blobfile":      None,
+    "pillow_heif":   "pillow_heif",
+    "decord":        None,
+    "av":            "av",
+    "num2words":     None,
+    "jieba":         None,
+    "sentencepiece": None,
 }
 
-# huggingface_hub.constants.ENV_VARS_TRUE_VALUES, matched exactly. HF_HUB_OFFLINE
-# and TRANSFORMERS_OFFLINE are read by the hub as `value.upper() in {"1", "ON",
-# "TRUE", "YES"}`, so HF_HUB_OFFLINE=true really does put the process offline. A
-# check that accepted only the literal "1" disagreed with the library that owns
-# the variable and ran pip against an explicit offline request.
+# huggingface_hub.constants.ENV_VARS_TRUE_VALUES: the hub owns HF_HUB_OFFLINE and
+# TRANSFORMERS_OFFLINE, so accepting only "1" would run pip against `=true`.
 _TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
 
 
@@ -81,22 +67,15 @@ def _env_is_true(name: str, default: str = "0") -> bool:
 
 
 def _auto_install_enabled() -> bool:
-    # Read at the attempt, not at import. `import unsloth` imports this module,
-    # so a caller following the warning in _run_install sets the variable after
-    # that; a module level constant would still say enabled and pip would run
-    # against an explicit opt-out. llama_cpp.py reads it at call time too.
-    #
-    # Anything not recognised as true disables, so an unparseable value keeps
-    # today's conservative behaviour of not installing, while the spellings a
-    # user reasonably reaches for (true / yes / on) now enable it instead of
-    # silently turning the feature off.
+    # Read at the attempt, not at import: `import unsloth` imports this module, so a
+    # user acting on the _run_install warning sets the variable after a constant froze.
     return _env_is_true("UNSLOTH_AUTO_INSTALL", "1")
 
 
 def _no_network() -> bool:
-    # Read at the attempt, for the same reason as _auto_install_enabled above: a
-    # notebook that goes offline after importing unsloth would otherwise still
-    # have pip invoked and wait out the installer timeout before failing.
+    # Read at the attempt (a notebook can go offline after importing unsloth). Only the
+    # two flags huggingface_hub itself honours; HF_DATASETS_OFFLINE is deliberately
+    # absent because unsloth_zoo/__init__.py cross-syncs it into these two.
     return (
         _env_is_true("UNSLOTH_OFFLINE")
         or _env_is_true("HF_HUB_OFFLINE")
@@ -106,10 +85,8 @@ _attempted: set = set()
 
 
 def _is_running_prefix(root: str) -> bool:
-    # Does `root` name the environment the running interpreter actually lives in?
-    # `samefile` resolves symlinks and differing spellings of the same directory,
-    # and raises when either side does not exist, which is the answer we want for
-    # a variable left over from an environment that has since been deleted.
+    # samefile, not string compare: symlinks, and raise-on-missing is the right
+    # answer for a variable left over from a deleted environment.
     try:
         return os.path.samefile(root, sys.prefix)
     except Exception:
@@ -117,21 +94,13 @@ def _is_running_prefix(root: str) -> bool:
 
 
 def _in_venv() -> bool:
-    # Decided from the RUNNING interpreter, never from an inherited activation
-    # variable on its own. A notebook kernel routinely runs interpreter A while
-    # the process inherited VIRTUAL_ENV / CONDA_PREFIX from a different
-    # environment B, which is the exact mismatch `_uv_command` pins `--python`
-    # for. Counting B as "in a venv" made `_pip_install` hand the install to uv
-    # and `_pip_command` skip both the write probe and `--user`, while every
-    # installer still targeted A's site-packages: on a system A a non-root
-    # kernel then failed outright, even though plain pip would have installed
-    # into the user site.
+    # From the RUNNING interpreter, never an inherited activation variable alone: a
+    # kernel runs A with VIRTUAL_ENV from B, and trusting B skips the --user fallback.
     if hasattr(sys, "real_prefix"):
         return True
     if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
         return True
-    # conda environments report `base_prefix == prefix`, so the variable is the
-    # only marker they have. Trust it only when it names the prefix we run in.
+    # conda reports `base_prefix == prefix`, so the variable is its only marker.
     return any(
         bool(root) and _is_running_prefix(root)
         for root in (os.environ.get("VIRTUAL_ENV"), os.environ.get("CONDA_PREFIX"))
@@ -139,14 +108,7 @@ def _in_venv() -> bool:
 
 
 def _uv_command(pkg: str) -> list:
-    # `--python` pins the install to the interpreter that is actually running
-    # Unsloth. Without it `uv pip install` picks its target from VIRTUAL_ENV /
-    # CONDA_PREFIX / a discovered `.venv`, and a notebook kernel frequently
-    # runs a different interpreter than the environment its process inherited.
-    # In that case the package lands in the activated environment, the
-    # follow-up `find_spec` still fails, and an unrelated environment has been
-    # modified for nothing. This mirrors what the pip fallback below already
-    # does implicitly by invoking `sys.executable -m pip`.
+    # `--python` is required: uv otherwise targets VIRTUAL_ENV/CONDA_PREFIX/a .venv.
     return ["uv", "pip", "install", "--quiet", "--python", sys.executable, pkg]
 
 
@@ -155,9 +117,6 @@ def _pip_command(pkg: str) -> list:
         sys.executable, "-m", "pip", "install", "--quiet",
         "--disable-pip-version-check", "--no-input", pkg,
     ]
-    # Outside a venv on Linux/Mac as non-root: probe write access to
-    # site-packages and fall back to --user. Windows has no geteuid;
-    # site-packages there is usually writable inside the venv anyway.
     if not _in_venv() and hasattr(os, "geteuid") and os.geteuid() != 0:
         try:
             sp = site.getsitepackages()[0]
@@ -189,14 +148,8 @@ def _run_install(pkg: str, cmd: list) -> tuple:
         return True, False
     stderr = r.stderr or ""
     logger.warning(f"Unsloth: auto-install of `{pkg}` failed:\n{stderr[-500:]}")
-    # Retry through pip only when uv could not be aimed at this interpreter at
-    # all: a uv predating `--python` exits with an argument-parser error
-    # ("unexpected argument '--python' found"), and a uv that cannot resolve
-    # the given path exits with a discovery error. Both happen before any
-    # network access, and `sys.executable -m pip` targets the right interpreter
-    # by construction, so falling back there is strictly better than giving up.
-    # A genuine resolution or build failure is NOT retried, otherwise every
-    # real failure would cost two installs.
+    # Retry via pip only when uv could not be aimed at this interpreter at all; a real
+    # resolution or build failure must NOT be, or every failure costs two installs.
     lowered = stderr.lower()
     retry_with_pip = (
         "unexpected argument" in lowered
@@ -220,18 +173,8 @@ def _pip_install(pkg: str) -> bool:
 
 
 def _importable(import_name: str) -> bool:
-    """
-    Whether ``import_name`` actually imports, not merely whether it resolves.
-
-    ``find_spec`` proves only that a module is DISCOVERABLE. A package whose
-    native extension will not load, or whose own imports are unsatisfiable
-    against the versions installed beside it, passes ``find_spec`` and then
-    raises at the moment transformers needs it. Reporting that as a successful
-    install is worse than reporting failure: the caller refreshes the
-    availability cache, ``requires_backends`` stops raising, and the model dies
-    further in on a ``NameError`` instead of the ImportError that named the
-    package. Cheap in practice, since the caller is about to import it anyway.
-    """
+    """Whether ``import_name`` imports, not merely resolves: find_spec passes a broken
+    native extension, and calling that a success downgrades ImportError to NameError."""
     try:
         importlib.import_module(import_name)
     except Exception:
@@ -253,23 +196,10 @@ def _try_install_and_import(pkg: str) -> bool:
 
 
 def _rebind_requires_backends(wrapper, original) -> None:
-    """
-    ``transformers/utils/__init__.py`` re-exports ``requires_backends``, and
-    modeling files import it from there rather than from ``import_utils``
-    (``models/timm_wrapper/modeling_timm_wrapper.py`` does ``from ...utils
-    import auto_docstring, is_timm_available, requires_backends``). Both of
-    those bind their own name to the function object, so rebinding only
-    ``transformers.utils.import_utils`` leaves the public alias and every
-    already-imported copy on the unwrapped original -- the TimmWrapper path
-    then raises for a missing `timm` without the installer ever running.
-    Point every such alias at the wrapper instead.
-
-    ``vars(module)`` is used rather than ``getattr``: lazy module shims resolve
-    unknown attributes by importing submodules, and this must not trigger
-    imports as a side effect. The ``is original`` identity test means only
-    aliases of the exact function we wrapped are touched, so an unrelated
-    ``requires_backends`` in some other package is left alone.
-    """
+    """Point every alias of ``requires_backends`` at the wrapper: modeling files do
+    ``from ...utils import requires_backends``, binding their own name, so patching
+    only ``import_utils`` leaves the installer unreachable. ``vars()`` not
+    ``getattr``, or lazy module shims import submodules as a side effect."""
     if original is None or wrapper is None:
         return
     for module in list(sys.modules.values()):
@@ -282,18 +212,9 @@ def _rebind_requires_backends(wrapper, original) -> None:
 
 
 def _refresh_backend_availability(iu, backend) -> None:
-    """
-    Make transformers re-evaluate whether ``backend`` is importable.
-
-    The retry re-enters the original ``requires_backends``, which decides from
-    ``BACKENDS_MAPPING[backend][0]()``. On transformers 5.x that entry is an
-    ``functools.lru_cache`` wrapper around ``is_<backend>_available`` which has
-    already cached ``False``, so without clearing it the freshly installed
-    package is still reported missing and the retry raises the very ImportError
-    the install was meant to remove. transformers 4.x instead kept a module
-    level ``_<backend>_available`` flag, which no longer exists in 5.x, so both
-    are handled and neither is required to be present.
-    """
+    """Make transformers re-evaluate ``backend``: 5.x caches the probe behind
+    ``lru_cache`` (already ``False``), 4.x used a ``_<backend>_available`` flag.
+    Both are handled and neither is required to be present."""
     flag = f"_{backend.replace('-', '_')}_available"
     if hasattr(iu, flag):
         setattr(iu, flag, True)
@@ -311,23 +232,14 @@ def _refresh_backend_availability(iu, backend) -> None:
 
 
 def _names_bound_by(statement) -> list:
-    """The module-level names an ``import`` / ``from ... import`` statement binds."""
     if isinstance(statement, ast.Import):
-        # `import a.b` binds `a`; `import a.b as c` binds `c`.
         return [alias.asname or alias.name.split(".")[0] for alias in statement.names]
     return [alias.asname or alias.name for alias in statement.names]
 
 
 def _perform_import(statement, module) -> None:
-    """
-    Carry out one parsed import statement in ``module``'s namespace.
-
-    Driven through importlib rather than ``exec(compile(...))`` deliberately.
-    Nothing here is evaluated as code: only the module names the statement
-    literally names are imported, and only the names it binds are bound, so the
-    replay cannot run anything else that happens to sit in the file. It also
-    keeps scripts/lint_exec_literals.py satisfied without a baseline entry.
-    """
+    """Carry out one parsed import statement in ``module``'s namespace. importlib, not
+    ``exec(compile(...))``, so the replay cannot run anything else in the file."""
     namespace = vars(module)
     if isinstance(statement, ast.Import):
         for alias in statement.names:
@@ -335,12 +247,9 @@ def _perform_import(statement, module) -> None:
             if alias.asname:
                 namespace[alias.asname] = sys.modules[alias.name]
             else:
-                # `import a.b` binds the TOP package, exactly as Python does.
                 top = alias.name.split(".")[0]
                 namespace[top] = sys.modules[top]
         return
-    # `from . import x` / `from ..y import z`: resolve against the module's own
-    # package, which is what the statement meant where it was written.
     name = "." * statement.level + (statement.module or "")
     source = importlib.import_module(
         name, package = getattr(module, "__package__", None)
@@ -349,11 +258,8 @@ def _perform_import(statement, module) -> None:
         try:
             value = getattr(source, alias.name)
         except AttributeError:
-            # `from a import b` where b is a submodule not yet imported. When it
-            # is not that either, report the name that is actually missing:
-            # letting the submodule attempt surface instead turns "cannot import
-            # name 'ImageNetInfo' from 'timm.data'", which says what is wrong,
-            # into "No module named 'timm.data.ImageNetInfo'", which does not.
+            # Re-raise the attribute error, not the submodule one: "cannot import name
+            # 'X' from 'timm.data'" beats "No module named 'timm.data.X'".
             try:
                 value = importlib.import_module(f"{source.__name__}.{alias.name}")
             except ImportError:
@@ -364,7 +270,7 @@ def _perform_import(statement, module) -> None:
 
 
 def _statement_imports(statement, import_name) -> bool:
-    """Whether `statement` imports `import_name` (the package, not a sibling)."""
+    """Whether `statement` imports `import_name` itself, not a sibling."""
     if isinstance(statement, ast.Import):
         return any(
             alias.name == import_name or alias.name.startswith(import_name + ".")
@@ -374,23 +280,10 @@ def _statement_imports(statement, import_name) -> bool:
 
 
 def _skipped_import_statements(tree, guard, import_name) -> list:
-    """
-    Top-level import statements that were conditional on this backend.
-
-    Two shapes, both of which transformers uses:
-
-      * ``if is_<backend>_available(): import <backend>`` -- when the guard was
-        False nothing ran and the name is simply absent.
-      * ``try: import <backend> as spm`` / ``except ImportError: spm = None`` --
-        this one BINDS the name, so a plain hasattr test reports it as present
-        while every use of it raises AttributeError on None. transformers 5.5's
-        tokenization_utils_sentencepiece is exactly this, and it calls
-        requires_backends("sentencepiece") in the constructor that then reaches
-        ``spm.SentencePieceProcessor``.
-
-    Negated and compound `if` guards are skipped rather than guessed at, and a
-    try block only contributes the statements that name this backend.
-    """
+    """Top-level import statements conditional on this backend. Two shapes: the ``if
+    is_<backend>_available():`` guard leaves the name absent, while ``try: import x /
+    except ImportError: x = None`` BINDS it to None (see ``_needs_rebinding``). Negated
+    and compound guards are skipped rather than guessed at."""
     out = []
     for node in tree.body:
         if isinstance(node, ast.If):
@@ -408,8 +301,7 @@ def _skipped_import_statements(tree, guard, import_name) -> list:
                 if isinstance(statement, (ast.Import, ast.ImportFrom))
             )
         elif isinstance(node, ast.Try):
-            # Only an import-guard try: a body with real logic in it is not
-            # something to re-run.
+            # Only an import-guard try; a body with real logic must not be re-run.
             if not node.body or not all(
                 isinstance(statement, (ast.Import, ast.ImportFrom))
                 for statement in node.body
@@ -423,36 +315,17 @@ def _skipped_import_statements(tree, guard, import_name) -> list:
 
 
 def _needs_rebinding(module, names) -> bool:
-    # None counts as missing: `except ImportError: spm = None` binds the name,
-    # so hasattr says present while the value cannot be used for anything.
+    # None counts as missing: `except ImportError: spm = None` binds the name, so
+    # hasattr says present and the caller gets AttributeError on None, not NameError.
     return any(getattr(module, each, None) is None for each in names)
 
 
 def _replay_skipped_guarded_imports(iu, backend) -> bool:
-    """
-    Run the ``if is_<backend>_available(): import <backend>`` blocks that were
-    skipped when the module was first imported. False if any of them raised.
+    """Run the guarded import blocks skipped at first import; False if any raised.
 
-    Refreshing the availability flag is not enough on its own. A transformers
-    modeling file guards its dependency import at module scope, so a module
-    imported while the package was missing simply never binds the name, and no
-    later re-check revisits that. Once ``requires_backends`` starts succeeding,
-    the constructor runs on into the body and dies with a bare ``NameError``,
-    which is a strictly worse outcome than the ImportError the install replaced
-    (reproduced against transformers' own timm_wrapper: the wrapper installs
-    timm, the retry passes, and ``timm.create_model`` raises "name 'timm' is
-    not defined").
-
-    Only statements the module itself carries under its own single-call
-    availability guard are executed, and only when the name they would bind is
-    still missing, so this cannot introduce an import the module did not
-    already ask for. Anything unrecognised is left alone.
-
-    A replay that raises is reported rather than swallowed. The statement comes
-    from a module that guards this exact backend, so a failure there means the
-    consumer still has no binding, and letting ``requires_backends`` through in
-    that state is the NameError this function exists to prevent.
-    """
+    Refreshing the availability flag alone is not enough: the module scope import never
+    ran, so ``requires_backends`` starts succeeding and the body dies on a bare
+    ``NameError`` instead of the ImportError the install replaced."""
     guard = f"is_{backend.replace('-', '_')}_available"
     import_name = _ALLOW_LIST.get(backend) or backend.replace("-", "_")
     try:
@@ -482,8 +355,7 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
             continue
         for statement in _skipped_import_statements(tree, guard, import_name):
             if any(alias.name == "*" for alias in statement.names):
-                # A star import binds whatever the target exports; there is no
-                # name to check against, so it is left alone.
+                # No name to check a star import against.
                 continue
             bound = _names_bound_by(statement)
             if not bound or not _needs_rebinding(module, bound):
@@ -501,26 +373,19 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
 
 
 def patch_requires_backends_autoinstall():
-    """
-    Wrap ``transformers.utils.import_utils.requires_backends`` so that an
-    allow-listed missing backend triggers a one-shot pip install and a
-    second attempt. Preserves the original ImportError when the install
-    fails or the dep isn't on the allow-list, so user-facing error bytes
-    stay identical to upstream when ``UNSLOTH_AUTO_INSTALL=0``.
-    """
+    """Wrap ``requires_backends`` so an allow-listed missing backend triggers a one-shot
+    pip install and a retry. The original ImportError is preserved on failure, so error
+    bytes stay identical to upstream under ``UNSLOTH_AUTO_INSTALL=0``."""
     try:
         from transformers.utils import import_utils as iu
     except Exception:
-        return  # transformers absent (MLX-only path) -- nothing to patch.
+        return
     current = getattr(iu, "requires_backends", None)
     if current is None:
-        return  # transformers version without this helper -- nothing to patch.
+        return
     if getattr(current, "_unsloth_patched", False):
-        # Already wrapped. Re-broadcast rather than returning early, because a
-        # transformers module imported since the previous pass holds its own
-        # copy of the original. The wrapper object is the same everywhere, so
-        # `_unsloth_patched` stays a single sentinel rather than becoming one
-        # sentinel per location.
+        # Re-broadcast rather than return early: a transformers module imported since
+        # the previous pass still holds its own copy of the original.
         _rebind_requires_backends(current, getattr(current, "_unsloth_original", None))
         return
     _orig = current
@@ -535,24 +400,15 @@ def patch_requires_backends_autoinstall():
             wanted = [b for b in wanted_iter if isinstance(b, str) and b in _ALLOW_LIST]
             if not wanted:
                 raise
-            # Refresh only the backends that are genuinely importable now.
-            # On transformers 4.x `_refresh_backend_availability` flips the
-            # module level `_<backend>_available` flag that
-            # `is_<backend>_available` returns, so refreshing a backend whose
-            # install failed makes the retry below report it as present. The
-            # caller then proceeds into an import of a package that is still
-            # missing and fails later with a much less actionable error.
+            # Only genuinely importable backends: on 4.x the refresh flips
+            # `_<backend>_available` unconditionally and would wave the retry through.
             installed = [b for b in wanted if _try_install_and_import(b)]
             if not installed:
                 raise
             for b in installed:
                 _refresh_backend_availability(iu, b)
-                # A modeling file imported before the install skipped its own
-                # guarded `import <b>`, so letting the retry succeed without
-                # this turns an ImportError into a NameError deeper in. If the
-                # replay itself fails the consumer is still unbound, so the
-                # original ImportError, which at least names the package, is
-                # the better error to leave the caller with.
+                # On replay failure the consumer is still unbound; the original
+                # ImportError at least names the package.
                 if not _replay_skipped_guarded_imports(iu, b):
                     raise
             return _orig(obj, backends)
@@ -564,13 +420,8 @@ def patch_requires_backends_autoinstall():
 
 
 def patch_check_imports_autoinstall():
-    """
-    trust_remote_code modeling files (e.g. Deepseek-OCR's modeling_deepseekocr.py)
-    declare their import requirements at the top of the file and raise via
-    ``dynamic_module_utils.check_imports`` (ImportError "This modeling file
-    requires the following packages..."). That call site never reaches
-    ``requires_backends``, so wrap it too.
-    """
+    """trust_remote_code modeling files raise via ``dynamic_module_utils.check_imports``,
+    which never reaches ``requires_backends``, so wrap it too."""
     try:
         from transformers import dynamic_module_utils as dmu
     except Exception:
@@ -607,17 +458,9 @@ def patch_check_imports_autoinstall():
 
 
 def _ipython_chain_is_broken() -> bool:
-    """
-    True only when IPython is installed but its hard dependency ``traitlets``
-    is missing, i.e. the environment is already broken and the very next
-    ``from IPython...`` import will die with a bare ModuleNotFoundError.
-
-    This is deliberately narrow. A plain ``import unsloth`` in a script,
-    container or CI job that never had IPython in the first place must not
-    reach the package manager at all. ``find_spec`` only inspects the local
-    metadata, so the probe itself is offline and cannot import IPython (which
-    would need the very traitlets we are checking for).
-    """
+    """True only when IPython is installed but ``traitlets`` is missing: a plain
+    ``import unsloth`` in a container that never had IPython must not reach the package
+    manager. ``find_spec`` keeps the probe offline and avoids importing IPython."""
     return (
         importlib.util.find_spec("IPython") is not None
         and importlib.util.find_spec("traitlets") is None
@@ -625,12 +468,8 @@ def _ipython_chain_is_broken() -> bool:
 
 
 def _ensure_notebook_chain():
-    """
-    Repair deps that raise a bare ModuleNotFoundError outside transformers
-    (the Jupyter/IPython chain), so no wrapper hook can catch them. Kept tiny:
-    only ``traitlets`` is touched today; expand only when a new failure mode
-    appears.
-    """
+    """Repair deps that raise a bare ModuleNotFoundError outside transformers, where no
+    wrapper hook can catch them."""
     if not _auto_install_enabled() or _no_network():
         return
     if not _ipython_chain_is_broken():
@@ -641,8 +480,6 @@ def _ensure_notebook_chain():
 
 
 def patch_notebook_deps_autoinstall():
-    """Install all three hooks. Idempotent, so it is safe to run at import time
-    and again from the ``TEMPORARY_PATCHES`` pass."""
     patch_requires_backends_autoinstall()
     patch_check_imports_autoinstall()
     _ensure_notebook_chain()
@@ -650,13 +487,8 @@ def patch_notebook_deps_autoinstall():
 
 TEMPORARY_PATCHES.append(patch_notebook_deps_autoinstall)
 
-# Install the two wrappers at import time as well, since a trust_remote_code
-# modeling file can be loaded before the TEMPORARY_PATCHES pass runs. Both are
-# pure monkeypatches with no network or package-manager side effects; the only
-# hook that can reach pip is `_ensure_notebook_chain`, and it no-ops unless the
-# IPython chain is already broken. Set UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN=1 to
-# suppress just this import-time run (the TEMPORARY_PATCHES pass still applies),
-# mirroring UNSLOTH_VENDORED_FLA_NO_AUTORUN in fla_vendor.py.
+# Also run at import time: a trust_remote_code modeling file can load before the
+# TEMPORARY_PATCHES pass. UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN=1 suppresses only this run.
 if os.environ.get("UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN", "0") != "1":
     try:
         patch_notebook_deps_autoinstall()

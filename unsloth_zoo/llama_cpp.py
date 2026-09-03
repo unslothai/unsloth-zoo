@@ -284,12 +284,8 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
-# Same value set as huggingface_hub.constants.ENV_VARS_TRUE_VALUES, and the same
-# rule temporary_patches/notebook_deps.py applies to the identically named flag.
-# Duplicated rather than imported: notebook_deps pulls in the temporary-patches
-# package, which this module must not depend on. Anything not recognised as true
-# disables, so an unparseable value keeps the conservative do-not-install
-# behaviour while true / yes / on enable rather than silently opting out.
+# Duplicated from notebook_deps._TRUE_VALUES rather than imported: importing it would
+# make this module depend on the temporary-patches package.
 _AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
 
 
@@ -301,10 +297,8 @@ def _auto_install_enabled() -> bool:
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    # Before the platform branch, not after it: the Windows arm returns from
-    # inside its own loop, so an opt-out placed below it never covered winget,
-    # which installs with --accept-package-agreements. The point of the flag is
-    # that nothing is installed without consent, on every platform.
+    # Before the platform branch: the Windows arm returns from inside its own loop, so
+    # an opt-out placed below it would never cover winget.
     if not _auto_install_enabled():
         raise RuntimeError(
             f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
@@ -370,23 +364,15 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        # Non-interactive contexts (Docker w/o TTY, headless CI) raise
-        # EOFError on input(). Treat that like an implicit ENTER ie accept
-        # the install. Opt out via UNSLOTH_AUTO_INSTALL=0.
+        # Non-interactive contexts (Docker without a TTY, headless CI) raise on
+        # input(); treat that as an implicit ENTER.
         try:
             acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
         except (EOFError, RuntimeError) as exception:
-            # Two exceptions mean "nobody is there to ask": EOFError when stdin
-            # exists but is at EOF, and RuntimeError("lost sys.stdin") when it is
-            # None, which is what a detached kernel or a process started with fd 0
-            # closed gets. input() raises the same RuntimeError for a lost stdout
-            # or stderr, so re-raise unless stdin really is gone.
+            # Same RuntimeError for a lost stdout/stderr, so re-raise unless stdin is gone.
             if isinstance(exception, RuntimeError) and sys.stdin is not None:
                 raise
-            # Only a stdin that is not a terminal is implicit consent. An
-            # interactive terminal also raises EOFError, on Ctrl-D, and there
-            # it means the user backed out of the prompt, so it has to keep
-            # cancelling rather than authorise a package manager command.
+            # Only a non-terminal stdin is consent: on a TTY, EOFError is Ctrl-D.
             try:
                 _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
             except Exception:

@@ -334,14 +334,8 @@ def patch_Gemma3Processor():
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
 
-        # Did the caller pin `padding=` themselves? Probe the caller's raw kwargs BEFORE
-        # _merge_kwargs, which folds the Gemma3ProcessorKwargs default padding=False into
-        # text_kwargs so an explicit padding= is indistinguishable from the default after
-        # the merge. Track key PRESENCE, not the value: padding=None is a real caller
-        # choice here (_fix_double_bos_and_pad treats None as do-not-pad), so testing the
-        # value would read an explicit padding=None as an omitted argument and pad anyway.
-        # `text_kwargs` is guarded with isinstance because a None/non-dict value must
-        # keep raising inside _merge_kwargs (as it does upstream) rather than here.
+        # Probed BEFORE _merge_kwargs, which folds in the padding=False default. Key
+        # PRESENCE, not value: padding=None is a real caller choice (do-not-pad).
         _user_set_padding = "padding" in kwargs
         if not _user_set_padding:
             _text_kwargs = kwargs.get("text_kwargs", None)
@@ -417,24 +411,11 @@ def patch_Gemma3Processor():
             # Expand placeholder image tokens to the full image token sequence
             text = [prompt.replace(self.boi_token, self.full_image_sequence) for prompt in text]
 
-        # TRL GRPO paged + reward paths call Gemma3Processor(text=[...]) with no
-        # padding= kwarg; upstream Gemma3ProcessorKwargs default is padding=False,
-        # so ragged completions blow up the BatchFeature tensor stacking below.
-        # Force longest-padding only when the caller did not pin padding AND we
-        # ended up with more than one text row (single-row inference, including
-        # single-image inference, is byte-identical). This sits after the image
-        # token expansion so `text` is final: it counts the rows the tokenizer
-        # will actually see, including rows synthesised above from `images` when
-        # the caller passed no text at all.
-        # Keep the caller's pre-override padding for _resolve_truncation below: HF derives
-        # implicit "longest_first" truncation from padding is False plus max_length, so
-        # deciding truncation from the forced "longest" would silently drop the caller's
-        # max_length and let overlong rows through.
-        # _merge_kwargs also folds the TOKENIZER's init kwargs over the ProcessingKwargs
-        # defaults, so a tokenizer built with padding="max_length" arrives here configured
-        # even though `kwargs` is empty. Only substitute "longest" when the merged padding
-        # is still disabled: a positive policy already pads every row to one width, which
-        # is all this override exists to guarantee.
+        # TRL GRPO passes no padding=, and the upstream padding=False default makes
+        # ragged completions blow up the stacking below. After the image token expansion
+        # so `text` is final, and only when the merged padding is still disabled.
+        # _padding_before_override feeds _resolve_truncation, which derives implicit
+        # truncation from padding + max_length and would drop max_length if fed "longest".
         _padding_before_override = output_kwargs["text_kwargs"].get("padding", False)
         _padding_is_disabled = _padding_before_override in (False, None, "do_not_pad")
         if not _user_set_padding and _padding_is_disabled and isinstance(text, (list, tuple)) and len(text) > 1:
@@ -450,8 +431,7 @@ def patch_Gemma3Processor():
             getattr(self.tokenizer, "padding_side", "left")
         # HF derives truncation from padding + max_length (max_length with padding=False and no explicit
         # truncation truncates). We drop padding to pad manually, so pin the truncation the tokenizer would
-        # have used from the caller's padding, taken before the automatic longest-padding override above,
-        # keeping truncation behaviour identical.
+        # have used from the caller's padding, taken before the longest-padding override above.
         max_length = output_kwargs["text_kwargs"].get("max_length", None)
         output_kwargs["text_kwargs"]["truncation"] = _resolve_truncation(
             _padding_before_override, output_kwargs["text_kwargs"].get("truncation", None), max_length)

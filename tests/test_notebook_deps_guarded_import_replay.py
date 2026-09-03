@@ -16,22 +16,9 @@
 
 """Installing the backend is not enough: the guarded import has to be replayed.
 
-A transformers modeling file guards its dependency at module scope::
-
-    from ...utils import is_timm_available, requires_backends
-    if is_timm_available():
-        import timm
-
-A module imported while timm was missing therefore never binds the name, and
-nothing revisits that later. Once the auto-installer makes `requires_backends`
-succeed, the constructor runs on into `timm.create_model` and dies with a bare
-`NameError` -- strictly worse than the ImportError the install replaced.
-
-Reproduced against the real transformers timm_wrapper before this was fixed
-(`REPRO NameError: name 'timm' is not defined`). The tests here use synthetic
-modules on disk with the same shape so they need neither transformers nor a
-missing package, and the "backend" is `json`, which is always importable, so
-nothing can reach pip or the network.
+A module imported while it was missing never binds the name under its
+`if is_<backend>_available():` guard, so once `requires_backends` starts succeeding the
+body dies on a bare `NameError` instead of the ImportError the install replaced.
 """
 
 from __future__ import annotations
@@ -52,14 +39,12 @@ GUARD = "is_json_available"
 
 @pytest.fixture
 def iu():
-    """Stand-in for transformers.utils.import_utils, backend unavailable."""
     module = types.SimpleNamespace(available = False)
     module.is_json_available = lambda: module.available
     return module
 
 
 def _load(tmp_path, monkeypatch, name, source, guard_result):
-    """Import `source` as `name` the way Python did when the guard was False."""
     path = tmp_path / (name.replace(".", "_") + ".py")
     path.write_text(source, encoding = "utf-8")
     module = types.ModuleType(name)
@@ -108,8 +93,7 @@ def test_a_module_that_skipped_the_guard_gets_the_import_replayed(tmp_path, monk
 
 
 def test_the_from_import_form_is_replayed_too(tmp_path, monkeypatch, iu):
-    # configuration_timm_wrapper guards `from timm.data import ImageNetInfo,
-    # infer_imagenet_subset`, so binding the package name alone would not do.
+    # configuration_timm_wrapper guards a from-import; the package name is not enough.
     module = _load(
         tmp_path, monkeypatch, "transformers.models.fake.configuration_fake", FROM_IMPORT, False
     )
@@ -122,8 +106,7 @@ def test_the_from_import_form_is_replayed_too(tmp_path, monkeypatch, iu):
 
 
 def test_a_negated_guard_is_not_executed(tmp_path, monkeypatch, iu):
-    # `if not is_x_available():` is the fallback branch. Running it once the
-    # package IS available would install a stub over the real thing.
+    # The fallback branch: running it once available installs a stub over the real thing.
     module = _load(
         tmp_path, monkeypatch, "transformers.models.fake.negated_fake", NEGATED, True
     )
@@ -161,8 +144,7 @@ def test_a_non_transformers_module_is_never_touched(tmp_path, monkeypatch, iu):
 
 
 def test_nothing_runs_while_the_backend_is_still_unavailable(tmp_path, monkeypatch, iu):
-    # The install can fail. Replaying then would bind a name whose import is
-    # still going to fail, or mask the failure entirely.
+    # The install can fail; replaying then binds a name whose import still fails.
     module = _load(
         tmp_path, monkeypatch, "transformers.models.fake.still_missing", PLAIN, False
     )
@@ -177,15 +159,8 @@ if {GUARD}():
     from {BACKEND} import this_name_does_not_exist
 """
 
-# --- try/except ImportError, the shape that BINDS the name to None ----------
-# transformers 5.5's tokenization_utils_sentencepiece, verbatim:
-#     try:
-#         import sentencepiece as spm
-#     except ImportError:
-#         spm = None
-# and TokenizerBase.__init__ calls requires_backends("sentencepiece") before
-# reaching spm.SentencePieceProcessor. hasattr reports the name as present, so
-# an "is it missing" test based on hasattr never rebinds it.
+# The try/except shape BINDS the name to None (transformers 5.5's
+# tokenization_utils_sentencepiece), so a hasattr-based missing test never rebinds.
 
 FAKE_BACKEND = "unsloth_replay_probe_pkg"
 
@@ -219,27 +194,20 @@ except ImportError:
 
 @pytest.fixture
 def fake_backend(tmp_path, monkeypatch):
-    """A package that is genuinely absent at import time and present later.
-
-    No simulation: the consumer below really does take its except branch,
-    because the directory holding the package only joins sys.path afterwards,
-    which is what pip installing it amounts to.
-    """
+    """Genuinely absent at import and present later: the directory joins sys.path only
+    afterwards, so the consumer really does take its except branch."""
     site = tmp_path / "site"
     site.mkdir()
     (site / f"{FAKE_BACKEND}.py").write_text("VALUE = 42\n", encoding = "utf-8")
     sys.modules.pop(FAKE_BACKEND, None)
 
     def install():
-        # syspath_prepend only, never a bare sys.path.insert: the bare form is
-        # not undone at teardown, so a later test's consumer would import the
-        # package successfully at load time and never take its except branch,
-        # which silently turns this whole file green for the wrong reason.
+        # syspath_prepend, never a bare sys.path.insert: the bare form is not undone at
+        # teardown, so a later consumer never takes its except branch.
         monkeypatch.syspath_prepend(str(site))
 
     yield install
-    # The module object caches the path it came from, so leaving it behind lets
-    # the next test resolve it out of sys.modules from a tmp_path that is gone.
+    # Leaving it behind lets the next test resolve it from a tmp_path that is gone.
     sys.modules.pop(FAKE_BACKEND, None)
 
 
@@ -287,8 +255,7 @@ def test_a_try_except_import_that_bound_none_is_replayed(
 def test_a_try_except_for_a_different_package_is_left_alone(
     tmp_path, monkeypatch, fake_backend, backend_iu
 ):
-    # Only statements naming the backend just installed are replayed; another
-    # optional import in the same module must not be re-attempted.
+    # Only statements naming the backend just installed are replayed.
     module = _load_consumer(
         tmp_path, monkeypatch, "transformers.unrelated_fake", UNRELATED_CONSUMER
     )
@@ -303,8 +270,7 @@ def test_a_try_except_for_a_different_package_is_left_alone(
 def test_a_try_block_with_real_logic_is_not_re_run(
     tmp_path, monkeypatch, fake_backend, backend_iu
 ):
-    # A try whose body is not purely imports is program logic, not an import
-    # guard, and re-running it would repeat whatever else is in there.
+    # A try whose body is not purely imports is logic, and re-running repeats it.
     module = _load_consumer(tmp_path, monkeypatch, "transformers.logic_fake", LOGIC_CONSUMER)
     assert module.alias is None and module.SIDE_EFFECTS == []
 
@@ -317,9 +283,7 @@ def test_a_try_block_with_real_logic_is_not_re_run(
 
 
 def test_a_replay_that_fails_is_reported_not_swallowed(tmp_path, monkeypatch, iu):
-    # A statement that cannot be replayed leaves the consumer unbound, so
-    # swallowing it hands the caller the NameError this function exists to
-    # prevent. It has to be visible and it has to be reported as a failure.
+    # A failed replay leaves the consumer unbound: the NameError this prevents.
     _load(
         tmp_path, monkeypatch, "transformers.models.fake.modeling_broken", BROKEN, False
     )
@@ -329,10 +293,7 @@ def test_a_replay_that_fails_is_reported_not_swallowed(tmp_path, monkeypatch, iu
 
 
 def test_a_missing_name_is_reported_as_a_missing_name(tmp_path, monkeypatch, iu):
-    # `from a import b` falls back to importing b as a submodule. When that is
-    # not it either, the useful error names the attribute, not a module path
-    # nobody wrote: "cannot import name 'ImageNetInfo' from 'timm.data'" rather
-    # than "No module named 'timm.data.ImageNetInfo'".
+    # The useful error names the attribute, not a module path nobody wrote.
     module = _load(
         tmp_path, monkeypatch, "transformers.models.fake.modeling_msg", BROKEN, False
     )

@@ -16,13 +16,8 @@
 
 """`install_package` must not read EOF on a terminal as consent.
 
-`input()` raises EOFError both for a headless stdin (Docker without a TTY,
-a CI job) and for a user pressing Ctrl-D at a live prompt. Only the first is
-an implicit ENTER; the second is the documented way to back out, so it has to
-keep cancelling instead of authorising `apt-get` / `yum` / `pacman`.
-
-Nothing here can reach a package manager: `subprocess.Popen` is replaced for
-every test, and the accept path asserts against the recorded command only.
+`input()` raises EOFError both for a headless stdin and for Ctrl-D at a live prompt.
+Only the first is an implicit ENTER; the second must keep cancelling.
 """
 
 from __future__ import annotations
@@ -41,7 +36,6 @@ llama_cpp = importlib.import_module("unsloth_zoo.llama_cpp")
 
 
 class _RecordedPopen:
-    """Stand-in for the installer subprocess: records, runs nothing."""
 
     def __init__(self, calls):
         self.calls = calls
@@ -66,7 +60,6 @@ class _ContextProc:
 
 @pytest.fixture
 def installer(monkeypatch):
-    """Call install_package with a stubbed prompt, stdin and subprocess."""
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -95,14 +88,12 @@ def installer(monkeypatch):
 
 
 def test_eof_on_a_terminal_cancels(installer):
-    # Ctrl-D at a live prompt. Anything but a cancel authorises apt-get.
     with pytest.raises(RuntimeError, match = "was cancelled"):
         installer(EOFError(), isatty = True)
     assert installer.calls == [], "an interactive cancel still ran the installer"
 
 
 def test_eof_without_a_terminal_accepts(installer):
-    # Docker without a TTY / headless CI: the implicit ENTER this is for.
     calls = installer(EOFError(), isatty = False)
     assert calls == ["apt-get install cmake -y"]
 
@@ -125,8 +116,7 @@ def test_enter_accepts(installer):
 
 
 def test_a_stdin_whose_isatty_raises_is_not_treated_as_a_terminal(installer, monkeypatch):
-    # A detached kernel can leave an object whose isatty() raises; that must
-    # not crash out of the EOF handler.
+    # An isatty() that raises must not crash out of the EOF handler.
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(EOFError()))
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -142,22 +132,15 @@ def test_a_stdin_whose_isatty_raises_is_not_treated_as_a_terminal(installer, mon
 
 
 def test_the_real_builtin_input_raises_RuntimeError_when_stdin_is_None(monkeypatch):
-    """Pin the CPython behaviour the handler is written against.
-
-    `builtin_input_impl` null-checks `sys.stdin` before reading and raises
-    RuntimeError("input(): lost sys.stdin"), NOT EOFError. A test that stubs
-    `input()` to raise EOFError while setting `sys.stdin = None` asserts a
-    combination that cannot occur, so the real path has to be pinned here.
-    """
+    """Pin CPython's real behaviour: `sys.stdin = None` raises RuntimeError, NOT
+    EOFError, so a test stubbing the pair asserts a combination that cannot occur."""
     monkeypatch.setattr(llama_cpp.sys, "stdin", None)
     with pytest.raises(RuntimeError, match = "lost sys.stdin"):
         input("prompt")
 
 
 def test_stdin_None_accepts_via_the_real_input(monkeypatch):
-    # No `input()` stub: `sys.stdin = None` makes the genuine builtin raise
-    # RuntimeError, which is exactly what a process launched with fd 0 closed
-    # hits. The installer must still run rather than abort.
+    # No `input()` stub: `sys.stdin = None` makes the real builtin raise RuntimeError.
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -185,13 +168,8 @@ def test_stdin_None_respects_the_opt_out(monkeypatch):
 
 
 def test_a_non_interactive_stdin_that_answers_still_respects_the_opt_out(installer):
-    """The opt-out has to be checked before the prompt, not inside its handler.
-
-    A headless stdin is not always a closed one: `docker run -i` without `-t`,
-    a `yes ""` pipe or a here-doc all feed a newline, so `input()` RETURNS and
-    never raises. Checked only from the EOF/RuntimeError handler, the opt-out
-    was then skipped and the package manager ran anyway.
-    """
+    """The opt-out must be checked before the prompt: a headless stdin is not always a
+    closed one (`docker run -i` feeds a newline), so input() returns and never raises."""
     with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
         installer("", isatty = False, auto_install = "0")
     assert installer.calls == [], "UNSLOTH_AUTO_INSTALL=0 still ran the installer"
@@ -199,8 +177,7 @@ def test_a_non_interactive_stdin_that_answers_still_respects_the_opt_out(install
 
 @pytest.mark.parametrize("hosted", ["IS_COLAB_ENVIRONMENT", "IS_KAGGLE_ENVIRONMENT"])
 def test_the_opt_out_applies_on_colab_and_kaggle(monkeypatch, hosted):
-    # Colab and Kaggle skip the prompt block entirely, so an opt-out nested
-    # inside it never applied on the two platforms these notebooks run on.
+    # Colab and Kaggle skip the prompt block, so an opt-out nested inside never applied.
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", hosted == "IS_COLAB_ENVIRONMENT")
@@ -215,8 +192,7 @@ def test_the_opt_out_applies_on_colab_and_kaggle(monkeypatch, hosted):
 
 @pytest.mark.parametrize("hosted", ["IS_COLAB_ENVIRONMENT", "IS_KAGGLE_ENVIRONMENT"])
 def test_colab_and_kaggle_still_install_without_the_opt_out(monkeypatch, hosted):
-    # Control for the pair above: hoisting the check must not turn the hosted
-    # no-prompt path into a refusal for everyone else.
+    # Control: hoisting the check must not turn the hosted no-prompt path into refusal.
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", hosted == "IS_COLAB_ENVIRONMENT")
@@ -229,9 +205,8 @@ def test_colab_and_kaggle_still_install_without_the_opt_out(monkeypatch, hosted)
 
 
 def test_the_opt_out_covers_the_windows_branch(monkeypatch):
-    # The Windows arm returns from inside its own loop, so an opt-out placed
-    # after the platform branch never reached it and winget still ran with
-    # --accept-package-agreements against an explicit cancellation.
+    # The Windows arm returns from inside its own loop, so an opt-out placed after the
+    # platform branch never reached winget.
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -268,9 +243,7 @@ def test_windows_still_installs_without_the_opt_out(monkeypatch):
 
 
 def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch):
-    # `input()` raises RuntimeError for a lost sys.stdout/sys.stderr too. With
-    # a live stdin that is not a missing prompt, so it must propagate rather
-    # than authorise a package manager command.
+    # RuntimeError for a lost stdout/stderr with a live stdin is not a missing prompt.
     with pytest.raises(RuntimeError, match = "lost sys.stdout"):
         installer(RuntimeError("input(): lost sys.stdout"), isatty = False)
     assert installer.calls == []
@@ -278,14 +251,8 @@ def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch
 
 @pytest.mark.skipif(os.name != "posix", reason = "fd 0 is closed with a POSIX shell redirect")
 def test_a_closed_fd0_really_produces_a_None_stdin():
-    """The environmental precondition behind the tests above, unstubbed.
-
-    A process started with fd 0 closed gets `sys.stdin is None`, and the real
-    builtin `input()` then raises RuntimeError rather than EOFError. The child
-    is pinned to THIS checkout via PYTHONPATH so it cannot answer from an
-    installed copy of unsloth_zoo (it imports nothing from it here, but the
-    pin keeps that true if the probe ever grows).
-    """
+    """The unstubbed precondition: fd 0 closed gives `sys.stdin is None`, and the real
+    `input()` then raises RuntimeError, not EOFError."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ)
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")

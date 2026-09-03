@@ -16,16 +16,8 @@
 
 """Blocking `import flashinfer` for vLLM must not be a one-way door.
 
-`load_vllm` blocks the import when FlashInfer is installed but nvcc/ninja are
-not, so vLLM cannot pick a backend it would have to JIT-compile. The block is
-process wide: `sys.modules["flashinfer"] = None` makes every later
-`import flashinfer` raise and makes `importlib.util.find_spec("flashinfer")`
-report the package as absent, for unrelated code as much as for vLLM. Left
-permanent, a long-lived session that installs the missing tool afterwards can
-never get FlashInfer back.
-
-These tests use a synthetic `flashinfer` package, so nothing here imports the
-real one or needs a GPU.
+`sys.modules["flashinfer"] = None` is process wide, so left permanent a session that
+installs nvcc/ninja afterwards could never get FlashInfer back.
 """
 
 from __future__ import annotations
@@ -43,7 +35,6 @@ vllm_utils = importlib.import_module("unsloth_zoo.vllm_utils")
 
 @pytest.fixture
 def fake_flashinfer(monkeypatch):
-    """Install a synthetic `flashinfer` package plus one submodule."""
     root = types.ModuleType("flashinfer")
     root.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader = None)
     root.__path__ = []
@@ -104,8 +95,6 @@ def test_repeated_blocks_keep_the_original_modules(fake_flashinfer):
 
 
 def test_load_vllm_lifts_the_block_when_the_opt_out_is_cleared(fake_flashinfer):
-    """The reachable path: a second `load_vllm()` after the caller re-enabled
-    FlashInfer must re-probe, which it cannot do while find_spec answers None."""
     import inspect
 
     source = inspect.getsource(vllm_utils.load_vllm)
@@ -117,8 +106,8 @@ def test_load_vllm_lifts_the_block_when_the_opt_out_is_cleared(fake_flashinfer):
 
 
 def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfer):
-    """vLLM's `has_flashinfer()` is `importlib.util.find_spec("flashinfer") is None`,
-    so blocking the import is what actually stops it selecting the backend."""
+    """vLLM's `has_flashinfer()` is a `find_spec` call, so blocking the import is what
+    actually stops it selecting the backend."""
     assert importlib.util.find_spec("flashinfer") is not None
     vllm_utils._block_flashinfer_import()
     assert importlib.util.find_spec("flashinfer") is None
@@ -126,10 +115,8 @@ def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfe
 
 
 def test_a_preset_opt_out_still_blocks_flashinfer():
-    """`UNSLOTH_VLLM_NO_FLASHINFER=1` set BEFORE load_vllm is the workaround this
-    module prints on a JIT failure. Skipping our own setup is not enough: an
-    installed FlashInfer would stay importable and vLLM would select it anyway,
-    so the opt-out path has to reach _block_flashinfer_import() too."""
+    """A pre-set opt-out must still block: an installed FlashInfer stays importable
+    and vLLM selects it anyway."""
     import inspect
 
     source = inspect.getsource(vllm_utils.load_vllm)
@@ -146,7 +133,6 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
 
 
 def test_the_opt_out_branch_is_guarded_on_flashinfer_being_installed():
-    """Nothing to block when the package is absent; do not invent state."""
     import inspect
 
     source = inspect.getsource(vllm_utils.load_vllm)
