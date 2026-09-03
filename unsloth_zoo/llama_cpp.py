@@ -301,6 +301,16 @@ def _auto_install_enabled() -> bool:
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
+    # Before the platform branch, not after it: the Windows arm returns from
+    # inside its own loop, so an opt-out placed below it never covered winget,
+    # which installs with --accept-package-agreements. The point of the flag is
+    # that nothing is installed without consent, on every platform.
+    if not _auto_install_enabled():
+        raise RuntimeError(
+            f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
+
     if IS_WINDOWS:
         # Per-package winget config aligned with setup.ps1
         # Each entry: (winget_id, extra_args_list)
@@ -359,15 +369,6 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
-    # Check the opt-out BEFORE any prompt. Nested inside the EOF handler it was
-    # reachable only when input() raised, so a non-interactive stdin that feeds a
-    # newline returned normally and installed anyway, and Colab/Kaggle skip the
-    # prompt block entirely so it never applied there at all.
-    if not _auto_install_enabled():
-        raise RuntimeError(
-            f"Unsloth: Execution of `{install_cmd}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
-            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-        )
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
         # Non-interactive contexts (Docker w/o TTY, headless CI) raise
         # EOFError on input(). Treat that like an implicit ENTER ie accept

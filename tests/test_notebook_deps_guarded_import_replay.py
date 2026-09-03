@@ -177,6 +177,144 @@ if {GUARD}():
     from {BACKEND} import this_name_does_not_exist
 """
 
+# --- try/except ImportError, the shape that BINDS the name to None ----------
+# transformers 5.5's tokenization_utils_sentencepiece, verbatim:
+#     try:
+#         import sentencepiece as spm
+#     except ImportError:
+#         spm = None
+# and TokenizerBase.__init__ calls requires_backends("sentencepiece") before
+# reaching spm.SentencePieceProcessor. hasattr reports the name as present, so
+# an "is it missing" test based on hasattr never rebinds it.
+
+FAKE_BACKEND = "unsloth_replay_probe_pkg"
+
+CONSUMER = f"""
+try:
+    import {FAKE_BACKEND} as alias
+except ImportError:
+    alias = None
+
+
+def use():
+    return alias.VALUE
+"""
+
+UNRELATED_CONSUMER = """
+try:
+    import unsloth_replay_probe_absent as other
+except ImportError:
+    other = None
+"""
+
+LOGIC_CONSUMER = f"""
+SIDE_EFFECTS = []
+try:
+    import {FAKE_BACKEND} as alias
+    SIDE_EFFECTS.append(1)
+except ImportError:
+    alias = None
+"""
+
+
+@pytest.fixture
+def fake_backend(tmp_path, monkeypatch):
+    """A package that is genuinely absent at import time and present later.
+
+    No simulation: the consumer below really does take its except branch,
+    because the directory holding the package only joins sys.path afterwards,
+    which is what pip installing it amounts to.
+    """
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / f"{FAKE_BACKEND}.py").write_text("VALUE = 42\n", encoding = "utf-8")
+    sys.modules.pop(FAKE_BACKEND, None)
+
+    def install():
+        # syspath_prepend only, never a bare sys.path.insert: the bare form is
+        # not undone at teardown, so a later test's consumer would import the
+        # package successfully at load time and never take its except branch,
+        # which silently turns this whole file green for the wrong reason.
+        monkeypatch.syspath_prepend(str(site))
+
+    yield install
+    # The module object caches the path it came from, so leaving it behind lets
+    # the next test resolve it out of sys.modules from a tmp_path that is gone.
+    sys.modules.pop(FAKE_BACKEND, None)
+
+
+@pytest.fixture
+def backend_iu():
+    module = types.SimpleNamespace(available = False)
+    setattr(
+        module,
+        f"is_{FAKE_BACKEND}_available",
+        lambda: module.available,
+    )
+    return module
+
+
+def _load_consumer(tmp_path, monkeypatch, name, source):
+    path = tmp_path / (name.replace(".", "_") + ".py")
+    path.write_text(source, encoding = "utf-8")
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(source, str(path), "exec"), vars(module))
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def test_a_try_except_import_that_bound_none_is_replayed(
+    tmp_path, monkeypatch, fake_backend, backend_iu
+):
+    module = _load_consumer(
+        tmp_path, monkeypatch, "transformers.tokenization_fake", CONSUMER
+    )
+    assert hasattr(module, "alias"), "precondition: the handler BOUND the name"
+    assert module.alias is None, "precondition: it bound it to None"
+
+    fake_backend()
+    backend_iu.available = True
+    assert notebook_deps._replay_skipped_guarded_imports(backend_iu, FAKE_BACKEND) is True
+
+    assert module.alias is not None, (
+        "the name is still None, so the caller that requires_backends now waves "
+        "through raises AttributeError on NoneType instead of using the package"
+    )
+    assert module.use() == 42
+
+
+def test_a_try_except_for_a_different_package_is_left_alone(
+    tmp_path, monkeypatch, fake_backend, backend_iu
+):
+    # Only statements naming the backend just installed are replayed; another
+    # optional import in the same module must not be re-attempted.
+    module = _load_consumer(
+        tmp_path, monkeypatch, "transformers.unrelated_fake", UNRELATED_CONSUMER
+    )
+    assert module.other is None
+
+    fake_backend()
+    backend_iu.available = True
+    assert notebook_deps._replay_skipped_guarded_imports(backend_iu, FAKE_BACKEND) is True
+    assert module.other is None
+
+
+def test_a_try_block_with_real_logic_is_not_re_run(
+    tmp_path, monkeypatch, fake_backend, backend_iu
+):
+    # A try whose body is not purely imports is program logic, not an import
+    # guard, and re-running it would repeat whatever else is in there.
+    module = _load_consumer(tmp_path, monkeypatch, "transformers.logic_fake", LOGIC_CONSUMER)
+    assert module.alias is None and module.SIDE_EFFECTS == []
+
+    fake_backend()
+    backend_iu.available = True
+    notebook_deps._replay_skipped_guarded_imports(backend_iu, FAKE_BACKEND)
+
+    assert module.alias is None
+    assert module.SIDE_EFFECTS == []
+
 
 def test_a_replay_that_fails_is_reported_not_swallowed(tmp_path, monkeypatch, iu):
     # A statement that cannot be replayed leaves the consumer unbound, so

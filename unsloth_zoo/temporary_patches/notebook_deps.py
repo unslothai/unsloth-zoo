@@ -363,6 +363,71 @@ def _perform_import(statement, module) -> None:
         namespace[alias.asname or alias.name] = value
 
 
+def _statement_imports(statement, import_name) -> bool:
+    """Whether `statement` imports `import_name` (the package, not a sibling)."""
+    if isinstance(statement, ast.Import):
+        return any(
+            alias.name == import_name or alias.name.startswith(import_name + ".")
+            for alias in statement.names
+        )
+    return statement.level == 0 and (statement.module or "").split(".")[0] == import_name
+
+
+def _skipped_import_statements(tree, guard, import_name) -> list:
+    """
+    Top-level import statements that were conditional on this backend.
+
+    Two shapes, both of which transformers uses:
+
+      * ``if is_<backend>_available(): import <backend>`` -- when the guard was
+        False nothing ran and the name is simply absent.
+      * ``try: import <backend> as spm`` / ``except ImportError: spm = None`` --
+        this one BINDS the name, so a plain hasattr test reports it as present
+        while every use of it raises AttributeError on None. transformers 5.5's
+        tokenization_utils_sentencepiece is exactly this, and it calls
+        requires_backends("sentencepiece") in the constructor that then reaches
+        ``spm.SentencePieceProcessor``.
+
+    Negated and compound `if` guards are skipped rather than guessed at, and a
+    try block only contributes the statements that name this backend.
+    """
+    out = []
+    for node in tree.body:
+        if isinstance(node, ast.If):
+            test = node.test
+            if not (
+                isinstance(test, ast.Call)
+                and isinstance(test.func, ast.Name)
+                and test.func.id == guard
+                and not test.args
+                and not test.keywords
+            ):
+                continue
+            out.extend(
+                statement for statement in node.body
+                if isinstance(statement, (ast.Import, ast.ImportFrom))
+            )
+        elif isinstance(node, ast.Try):
+            # Only an import-guard try: a body with real logic in it is not
+            # something to re-run.
+            if not node.body or not all(
+                isinstance(statement, (ast.Import, ast.ImportFrom))
+                for statement in node.body
+            ):
+                continue
+            out.extend(
+                statement for statement in node.body
+                if _statement_imports(statement, import_name)
+            )
+    return out
+
+
+def _needs_rebinding(module, names) -> bool:
+    # None counts as missing: `except ImportError: spm = None` binds the name,
+    # so hasattr says present while the value cannot be used for anything.
+    return any(getattr(module, each, None) is None for each in names)
+
+
 def _replay_skipped_guarded_imports(iu, backend) -> bool:
     """
     Run the ``if is_<backend>_available(): import <backend>`` blocks that were
@@ -389,6 +454,7 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
     that state is the NameError this function exists to prevent.
     """
     guard = f"is_{backend.replace('-', '_')}_available"
+    import_name = _ALLOW_LIST.get(backend) or backend.replace("-", "_")
     try:
         passes = bool(getattr(iu, guard)())
     except Exception:
@@ -408,46 +474,29 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
                 source = handle.read()
         except OSError:
             continue
-        if guard not in source:
+        if guard not in source and import_name not in source:
             continue
         try:
             tree = ast.parse(source)
         except SyntaxError:
             continue
-        for node in tree.body:
-            if not isinstance(node, ast.If):
+        for statement in _skipped_import_statements(tree, guard, import_name):
+            if any(alias.name == "*" for alias in statement.names):
+                # A star import binds whatever the target exports; there is no
+                # name to check against, so it is left alone.
                 continue
-            test = node.test
-            # Exactly `if is_<backend>_available():`. A negated or compound
-            # guard is not necessarily satisfied by this one install, so it is
-            # skipped rather than guessed at.
-            if not (
-                isinstance(test, ast.Call)
-                and isinstance(test.func, ast.Name)
-                and test.func.id == guard
-                and not test.args
-                and not test.keywords
-            ):
+            bound = _names_bound_by(statement)
+            if not bound or not _needs_rebinding(module, bound):
                 continue
-            for statement in node.body:
-                if not isinstance(statement, (ast.Import, ast.ImportFrom)):
-                    continue
-                if any(alias.name == "*" for alias in statement.names):
-                    # A star import binds whatever the target exports; there is
-                    # no name to check against, so it is left alone.
-                    continue
-                bound = _names_bound_by(statement)
-                if not bound or all(hasattr(module, each) for each in bound):
-                    continue
-                try:
-                    _perform_import(statement, module)
-                except Exception as exception:
-                    ok = False
-                    logger.warning(
-                        f"Unsloth: {backend} installed, but replaying "
-                        f"`{ast.unparse(statement)}` in {module.__name__} failed: "
-                        f"{type(exception).__name__}: {exception}"
-                    )
+            try:
+                _perform_import(statement, module)
+            except Exception as exception:
+                ok = False
+                logger.warning(
+                    f"Unsloth: {backend} installed, but replaying "
+                    f"`{ast.unparse(statement)}` in {module.__name__} failed: "
+                    f"{type(exception).__name__}: {exception}"
+                )
     return ok
 
 

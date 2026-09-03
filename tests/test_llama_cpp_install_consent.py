@@ -228,6 +228,45 @@ def test_colab_and_kaggle_still_install_without_the_opt_out(monkeypatch, hosted)
     assert calls == ["apt-get install cmake -y"]
 
 
+def test_the_opt_out_covers_the_windows_branch(monkeypatch):
+    # The Windows arm returns from inside its own loop, so an opt-out placed
+    # after the platform branch never reached it and winget still ran with
+    # --accept-package-agreements against an explicit cancellation.
+    calls = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(
+        llama_cpp.subprocess, "run", lambda *a, **k: calls.append(a) or None
+    )
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda name: "C:\\winget.exe")
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        llama_cpp.install_package("cmake")
+    assert calls == [], "winget ran with the opt-out set"
+
+
+def test_windows_still_installs_without_the_opt_out(monkeypatch):
+    # Control: hoisting the check must not turn Windows into a refusal.
+    calls = []
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", False)
+    monkeypatch.setattr(
+        llama_cpp.subprocess, "run", lambda cmd, **k: calls.append(cmd) or _Result()
+    )
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda name: "C:\\winget.exe")
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+
+    llama_cpp.install_package("cmake")
+    assert calls and calls[0][:2] == ["winget", "install"]
+
+
 def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch):
     # `input()` raises RuntimeError for a lost sys.stdout/sys.stderr too. With
     # a live stdin that is not a missing prompt, so it must propagate rather
