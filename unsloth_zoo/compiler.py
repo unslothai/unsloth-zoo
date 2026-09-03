@@ -4190,20 +4190,12 @@ def _patch_torch_dtype_modules(
                 # to patch a dtype cast. `get_compiler_config` above only covers
                 # torch.compile wrappers.
                 #
-                # tokenize.TokenError is in the tuple because by this point
-                # `function.forward` is usually OUR generated forward, not
-                # torch's: the create_new_function() call at the bottom of this
-                # loop installs it, so its co_filename is a file under the
-                # compile folder that we rewrite at runtime. inspect.getsource
-                # reads that file through linecache, and a read that lands while
-                # another process is between the truncate and the write of the
-                # same path returns a prefix -- valid so far, but ending inside
-                # a docstring or a bracket, which is a TokenError out of
-                # inspect.getblock. It subclasses Exception directly, so neither
-                # OSError nor TypeError covered it and it escaped all the way
-                # out of unsloth_compile_transformers. Truncated source is
-                # exactly the "no usable source" case this handler already
-                # degrades for.
+                # TokenError: by now `function.forward` is usually OUR generated
+                # forward, living in a compile-folder file we rewrite at runtime.
+                # A getsource landing mid-rewrite reads a truncated prefix, which
+                # inspect.getblock turns into TokenError. It subclasses Exception
+                # directly, so OSError/TypeError did not catch it. Truncated
+                # source is the same "no usable source" case handled here.
                 #
                 # The precondition is not fully characterised: two plain Qwen
                 # loads do not trigger it, and after such a load no torch.nn
@@ -4500,14 +4492,9 @@ def unsloth_compile_transformers(
         # FastModel.from_pretrained and the model fails to LOAD, over a file we
         # only wanted in order to make it faster.
         #
-        # tokenize.TokenError is in the tuple for symmetry with the getsource in
-        # _patch_torch_dtype_modules, which is the one that provably needed it.
-        # It cannot fire HERE today: the argument is a module, and for a module
-        # inspect.getsourcelines returns every line without going through
-        # getblock, so the tokenizer never runs and only OSError is reachable.
-        # It is listed anyway because the two handlers answer the same question
-        # -- can this source be read -- and a reader who widens one and not the
-        # other has to rediscover that asymmetry to find out why.
+        # TokenError is listed for symmetry with _patch_torch_dtype_modules,
+        # which provably needed it. It cannot fire here today: for a module
+        # inspect.getsourcelines skips getblock, so nothing tokenizes.
         #
         # Return rather than continue with an empty string: checks of the form
         # `"_supports_sdpa = False" not in full_source` are TRUE on empty and

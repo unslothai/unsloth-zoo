@@ -16,30 +16,21 @@
 
 """`inspect.getsource` raising `tokenize.TokenError` must not fail a load.
 
-`unsloth_compile_transformers` reads source in two places that already accept
-not getting any: the whole-module read that drives source-level feature
-detection (`unsloth_zoo/compiler.py`, the `full_source` read), and the torch.nn
-forward that `_patch_torch_dtype_modules` is about to add a dtype cast to. Both
-degrade gracefully on `OSError`/`TypeError`.
+`unsloth_compile_transformers` reads source in two places that already degrade
+on `OSError`/`TypeError`: the whole-module `full_source` read, and the torch.nn
+forward `_patch_torch_dtype_modules` adds a dtype cast to. `TokenError` means
+the same thing but subclasses `Exception` directly, so it used to escape both
+and fail `FastModel.from_pretrained` over source only wanted for speed.
 
-`tokenize.TokenError` reaches the same two calls and means the same thing, but
-subclasses `Exception` directly, so it used to escape both handlers and
-propagate out of `FastModel.from_pretrained` -- failing the LOAD over source
-that was only wanted in order to make the model faster.
+It is real: after the first model type, `torch.nn.LayerNorm.forward` and its
+siblings live in generated compile-folder files that later runs rewrite, and a
+read landing mid-rewrite gets a prefix that `inspect.getblock` rejects. Two
+processes sharing one compile folder is all it takes, which is what three CI
+lanes out of one checkout were doing.
 
-It is not hypothetical. After the first model type, `torch.nn.LayerNorm.forward`
-and its siblings are functions this package GENERATED: their `co_filename` is a
-file under the compile folder, and later runs truncate and rewrite that same
-path. A `getsource` that reads one between the truncate and the write gets a
-valid prefix that stops inside a docstring or a bracket, and `inspect.getblock`
-turns that into a `TokenError`. Two processes sharing one compile folder is all
-it takes, which is what three CI lanes running out of one checkout were doing.
-
-Subprocesses, for two reasons. `unsloth_compile_transformers` mutates
-`torch.nn` process-wide, so an in-process version would depend on which tests
-ran before it. And `UNSLOTH_COMPILE_LOCATION` is read once, at compiler import,
-into a module global -- `monkeypatch.setenv` after that point does nothing, and
-the probe would silently write to the shared default instead of its own folder.
+Subprocesses because `unsloth_compile_transformers` mutates `torch.nn`
+process-wide, and because `UNSLOTH_COMPILE_LOCATION` is read once at compiler
+import, so a later `monkeypatch.setenv` would leave the probe on the default.
 """
 
 from __future__ import annotations
@@ -113,8 +104,7 @@ def _result(proc, what: str):
 
 
 def test_tokenerror_is_not_an_oserror_or_typeerror():
-    """Why `except (OSError, TypeError)` was not enough. If this ever stops
-    holding, the widened handlers become redundant rather than wrong."""
+    """Why `except (OSError, TypeError)` was not enough."""
     assert not issubclass(tokenize.TokenError, OSError)
     assert not issubclass(tokenize.TokenError, TypeError)
 
@@ -144,14 +134,12 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
     )
     out = _result(proc, "all-getsource-raises")
 
-    # Guard against a vacuous pass: an early return that never reads source
-    # would also "not raise".
+    # Guard against a vacuous pass: an early return would also "not raise".
     assert out["calls"] > 0, (
         "inspect.getsource was never called, so the probe proved nothing "
         "about the TokenError handlers"
     )
-    # The unreadable-source branch must say so rather than leave SDPA selected
-    # for a model that never claimed it.
+    # Must not leave SDPA selected for a model that never claimed it.
     assert out["supports_sdpa"] is False, (
         f"the unreadable-source branch must set __UNSLOTH_SUPPORTS_SDPA__ "
         f"False, got {out['supports_sdpa']!r}"
@@ -159,12 +147,9 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
 
 
 def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
-    """Narrowed to the site that actually reads a file this package generated
-    and later rewrites: the torch.nn forward in the dtype patcher.
-
-    The whole-module read is left working, so the pipeline reaches the dtype
-    patcher down its normal path rather than down the early return.
-    """
+    """Only the site that reads a generated-then-rewritten file raises: the
+    torch.nn forward in the dtype patcher. The whole-module read is left
+    working so the pipeline gets there normally, not via the early return."""
     proc = _run(
         """
         import torch
