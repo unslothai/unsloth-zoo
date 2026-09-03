@@ -138,7 +138,8 @@ def record_installs(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
     return calls
 
 
@@ -394,7 +395,8 @@ def test_successful_install_invalidates_the_cached_availability_probe(monkeypatc
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
 
     notebook_deps.patch_requires_backends_autoinstall()
 
@@ -485,7 +487,8 @@ def test_a_failed_install_is_not_marked_available(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
 
     notebook_deps.patch_requires_backends_autoinstall()
 
@@ -647,7 +650,8 @@ def package_manager_spy(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
     monkeypatch.setattr(notebook_deps, "_attempted", set())
-    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
     return commands
 
 
@@ -740,7 +744,8 @@ def test_clearing_the_opt_out_at_runtime_re_enables_the_installer(
         notebook_deps, "_try_install_and_import",
         lambda pkg: reached.append(pkg) or False,
     )
-    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
     notebook_deps.patch_requires_backends_autoinstall()
 
@@ -752,3 +757,22 @@ def test_clearing_the_opt_out_at_runtime_re_enables_the_installer(
     with pytest.raises(ImportError):
         fake_transformers.utils.requires_backends(_Consumer, [_BACKEND])
     assert reached == [_BACKEND]
+
+
+def test_going_offline_after_import_stops_the_installer(monkeypatch):
+    """The offline flags must be read at the attempt, like the auto-install
+    opt-out beside them. Captured at import they left pip running against an
+    explicit offline request, burning the installer timeout first."""
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(off, raising = False)
+    assert notebook_deps._no_network() is False
+
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.setenv(off, "1")
+        assert notebook_deps._no_network() is True, off
+        calls = []
+        monkeypatch.setattr(notebook_deps, "_pip_install", lambda p: calls.append(p) or True)
+        assert notebook_deps._try_install_and_import("timm") is False
+        assert calls == [], f"{off}=1 still reached the installer"
+        monkeypatch.delenv(off, raising = False)

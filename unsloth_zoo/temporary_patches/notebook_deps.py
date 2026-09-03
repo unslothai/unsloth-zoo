@@ -75,11 +75,15 @@ def _auto_install_enabled() -> bool:
     return os.environ.get("UNSLOTH_AUTO_INSTALL", "1") == "1"
 
 
-_NO_NETWORK = (
-    os.environ.get("UNSLOTH_OFFLINE", "0") == "1"
-    or os.environ.get("HF_HUB_OFFLINE", "0") == "1"
-    or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
-)
+def _no_network() -> bool:
+    # Read at the attempt, for the same reason as _auto_install_enabled above: a
+    # notebook that goes offline after importing unsloth would otherwise still
+    # have pip invoked and wait out the installer timeout before failing.
+    return (
+        os.environ.get("UNSLOTH_OFFLINE", "0") == "1"
+        or os.environ.get("HF_HUB_OFFLINE", "0") == "1"
+        or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+    )
 _attempted: set = set()
 
 
@@ -200,7 +204,7 @@ def _pip_install(pkg: str) -> bool:
 def _try_install_and_import(pkg: str) -> bool:
     if pkg not in _ALLOW_LIST:
         return False
-    if not _auto_install_enabled() or _NO_NETWORK:
+    if not _auto_install_enabled() or _no_network():
         return False
     import_name = _ALLOW_LIST[pkg] or pkg.replace("-", "_")
     if importlib.util.find_spec(import_name) is not None:
@@ -297,7 +301,7 @@ def patch_requires_backends_autoinstall():
         try:
             return _orig(obj, backends)
         except ImportError:
-            if not _auto_install_enabled() or _NO_NETWORK:
+            if not _auto_install_enabled() or _no_network():
                 raise
             wanted_iter = backends if isinstance(backends, (list, tuple)) else [backends]
             wanted = [b for b in wanted_iter if isinstance(b, str) and b in _ALLOW_LIST]
@@ -343,7 +347,7 @@ def patch_check_imports_autoinstall():
         try:
             return _orig(filename)
         except ImportError as e:
-            if not _auto_install_enabled() or _NO_NETWORK:
+            if not _auto_install_enabled() or _no_network():
                 raise
             msg = str(e)
             if "This modeling file requires" not in msg:
@@ -391,7 +395,7 @@ def _ensure_notebook_chain():
     only ``traitlets`` is touched today; expand only when a new failure mode
     appears.
     """
-    if not _auto_install_enabled() or _NO_NETWORK:
+    if not _auto_install_enabled() or _no_network():
         return
     if not _ipython_chain_is_broken():
         return

@@ -345,6 +345,15 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
     print(f"Unsloth: Installing packages: {package}")
+    # Check the opt-out BEFORE any prompt. Nested inside the EOF handler it was
+    # reachable only when input() raised, so a non-interactive stdin that feeds a
+    # newline returned normally and installed anyway, and Colab/Kaggle skip the
+    # prompt block entirely so it never applied there at all.
+    if os.environ.get("UNSLOTH_AUTO_INSTALL", "1") != "1":
+        raise RuntimeError(
+            f"Unsloth: Execution of `{install_cmd}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
         # Non-interactive contexts (Docker w/o TTY, headless CI) raise
         # EOFError on input(). Treat that like an implicit ENTER ie accept
@@ -370,11 +379,6 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
             if _stdin_is_a_tty:
                 raise RuntimeError(
                     f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
-                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
-                )
-            if os.environ.get("UNSLOTH_AUTO_INSTALL", "1") != "1":
-                raise RuntimeError(
-                    f"Unsloth: Execution of `{install_cmd}` was cancelled (no TTY and UNSLOTH_AUTO_INSTALL=0)!\n"\
                     "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
                 )
             acceptance = ""

@@ -184,6 +184,50 @@ def test_stdin_None_respects_the_opt_out(monkeypatch):
     assert calls == []
 
 
+def test_a_non_interactive_stdin_that_answers_still_respects_the_opt_out(installer):
+    """The opt-out has to be checked before the prompt, not inside its handler.
+
+    A headless stdin is not always a closed one: `docker run -i` without `-t`,
+    a `yes ""` pipe or a here-doc all feed a newline, so `input()` RETURNS and
+    never raises. Checked only from the EOF/RuntimeError handler, the opt-out
+    was then skipped and the package manager ran anyway.
+    """
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        installer("", isatty = False, auto_install = "0")
+    assert installer.calls == [], "UNSLOTH_AUTO_INSTALL=0 still ran the installer"
+
+
+@pytest.mark.parametrize("hosted", ["IS_COLAB_ENVIRONMENT", "IS_KAGGLE_ENVIRONMENT"])
+def test_the_opt_out_applies_on_colab_and_kaggle(monkeypatch, hosted):
+    # Colab and Kaggle skip the prompt block entirely, so an opt-out nested
+    # inside it never applied on the two platforms these notebooks run on.
+    calls = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", hosted == "IS_COLAB_ENVIRONMENT")
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", hosted == "IS_KAGGLE_ENVIRONMENT")
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", _RecordedPopen(calls))
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert calls == []
+
+
+@pytest.mark.parametrize("hosted", ["IS_COLAB_ENVIRONMENT", "IS_KAGGLE_ENVIRONMENT"])
+def test_colab_and_kaggle_still_install_without_the_opt_out(monkeypatch, hosted):
+    # Control for the pair above: hoisting the check must not turn the hosted
+    # no-prompt path into a refusal for everyone else.
+    calls = []
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", hosted == "IS_COLAB_ENVIRONMENT")
+    monkeypatch.setattr(llama_cpp, "IS_KAGGLE_ENVIRONMENT", hosted == "IS_KAGGLE_ENVIRONMENT")
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", _RecordedPopen(calls))
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+
+    llama_cpp.install_package("cmake", system_type = "debian")
+    assert calls == ["apt-get install cmake -y"]
+
+
 def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch):
     # `input()` raises RuntimeError for a lost sys.stdout/sys.stderr too. With
     # a live stdin that is not a missing prompt, so it must propagate rather
