@@ -98,10 +98,12 @@ def _adapters(model, prefix=""):
                   if hasattr(module, "lora_a") and name.startswith(prefix))
 
 
-# What each path reads as: the enclosing block outranks the leaf below it.
+# What each path reads as. The enclosing block outranks the leaf below it,
+# and a bare projection names no role.
 _ROLE_CASES = {
-    "attn_pool.mlp.fc1": "mlp", "mlp.dense_h_to_4h": "mlp",
-    "self_attn.gate_proj": "attention", "linear_attn.in_proj_qkv": "attention",
+    "query_key_value": "attention", "dense": None, "attn_pool.mlp.fc1": "mlp",
+    "mlp.dense_h_to_4h": "mlp", "self_attn.gate_proj": "attention",
+    "q_proj.linear": "attention", "linear_attn.in_proj_qkv": "attention",
     "block_sparse_moe.switch_mlp.gate_up_proj": "mlp",
 }
 
@@ -113,6 +115,9 @@ def test_what_a_linear_name_reads_as(path, role):
 
 
 _LOAN_CASES = {
+    "mlp, from three agreeing siblings": (
+        _GLM_MERGER, True, True, ["down_proj", "gate_proj", "proj"]),
+    "and not when the mlp flag is off": (_GLM_MERGER, True, False, []),
     "attention, from the one linear beside it": (
         _MIXER, True, True, ["token_mixer.proj", "token_mixer.qkv"]),
     "and not when the attention flag is off": (_MIXER, False, True, []),
@@ -125,6 +130,34 @@ def test_role_selection_borrows_beside_and_excludes_what_decides(
         spec, attention, mlp, expected):
     from unsloth_zoo.mlx.loader import _role_selected_paths
     assert sorted(_role_selected_paths(_build(spec), attention, mlp)) == expected
+
+
+_SELECTION_CASES = {
+    "a tower under an unlisted name, by role and by flag": (
+        lambda: _vlm(tower_attr="visual"),
+        {"finetune_vision_layers": True, "finetune_mlp_modules": False},
+        "visual.blocks.0", ["wo", "wqkv"]),
+    # A nested connector reads as MLP, so the tower pass must leave it alone.
+    "a nested connector is adapted once, by its own pass": (
+        lambda: _vlm(tower=_tower(merger=_GLM_MERGER)),
+        {"finetune_vision_layers": True, "train_projector": True},
+        "vision_tower.merger", ["down_proj", "gate_proj", "proj"]),
+    # Each call site must pass the flags on, not merely honour them.
+    "a tower with attention off": (
+        lambda: _vlm(tower_attr="visual"), {"finetune_vision_layers": True,
+        "finetune_attention_modules": False}, "visual.blocks.0", ["mlp.fc0", "mlp.fc1"]),
+}
+
+
+@pytest.mark.parametrize("build,kwargs,prefix,expected", _SELECTION_CASES.values(),
+                         ids=list(_SELECTION_CASES))
+def test_a_group_flag_adapts_exactly_its_own_linears(build, kwargs, prefix,
+                                                     expected):
+    model = build()
+    with warnings.catch_warnings():   # role selection announces nothing
+        warnings.simplefilter("error", UserWarning)
+        _peft(model, **kwargs)
+    assert _adapters(model, prefix) == expected
 
 
 # Selecting nothing must raise, naming the flag and enough of the tree to act on.
