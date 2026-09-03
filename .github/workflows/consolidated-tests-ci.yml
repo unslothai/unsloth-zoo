@@ -786,6 +786,7 @@ jobs:
                   tests/test_upstream_source_patterns.py \
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
+                  tests/test_compiler_getsource_tokenerror.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
