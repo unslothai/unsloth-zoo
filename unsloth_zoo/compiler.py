@@ -152,6 +152,33 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+
+    # transformers 5.9 moved the vision grid helpers every VL tower calls into the
+    # shared transformers/vision_utils.py, and the modeling files now import them by
+    # name, so the rewriter picks them up as called functions and stamps
+    # fullgraph = True on them. Every one of them starts by reading the image grid
+    # off the GPU with `grid_thw.tolist()`, which Dynamo turns into unbacked
+    # SymInts, and the shapes built from those ints are then unguardable:
+    #   get_vision_position_ids               reshape((h//m, m, w//m, m))
+    #                                         -> Eq((u2//u3), 0)
+    #   get_vision_window_index               -> Eq(((u1//2) - PythonMod(...))//4 + 1, 0)
+    #   get_vision_bilinear_indices_and_weights
+    #                                         -> could not extract specialized integer u1
+    #   get_vision_cu_seqlens                 repeat_interleave -> Dynamic shape operator
+    # fullgraph = True turns those into a hard UserError, so Qwen3.5 / Qwen3-VL /
+    # GLM-4V / PaddleOCR-VL and friends died at the first vision forward. There is
+    # nothing to win by compiling them anyway: the `.tolist()` is a mandatory D2H
+    # sync on the first line, so a graph break lands there and the "compiled"
+    # region is only the item() prologue. Measured on a single 24x32 grid these run
+    # 125 us eager against 133 us under torch.compile, so eager is the faster half
+    # as well as the working one.
+    # Matching is by name, so on transformers < 5.9, where these names are not in
+    # the modeling source, none of these entries match and the generated module is
+    # unchanged.
+    "get_vision_position_ids",
+    "get_vision_cu_seqlens",
+    "get_vision_window_index",
+    "get_vision_bilinear_indices_and_weights",
 ]
 
 # Re-exported from .model_lists so callers can keep using
