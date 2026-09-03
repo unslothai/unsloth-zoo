@@ -188,6 +188,30 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_bilinear_indices_and_weights",
 ]
 
+
+def calls_disable_compile_function(source, disable_compile_functions):
+    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS.
+
+    Listing a name only helps where the rewriter re-emits its `def`, which needs
+    `def <name>` in the modeling file's own source. A modeling file that merely
+    imports the helper (every transformers >= 5.9 VL tower, since the vision grid
+    helpers moved to transformers/vision_utils.py) keeps calling the raw upstream
+    function, so the caller must not be compiled `fullgraph = True` or Dynamo
+    inlines the `.tolist()` and the region dies. Answering that question is what
+    this is for; it is a deliberate superset of the `called_functions` membership
+    test one level up.
+
+    `[^\\w.]` excludes attribute calls: qwen3_vl, glm4v and qwen2_5_vl all define
+    a METHOD named `get_vision_position_ids`, and `self.get_vision_position_ids(...)`
+    is not the module-level helper.
+    """
+    return sorted(
+        name
+        for name in disable_compile_functions
+        if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
+    )
+
+
 # Re-exported from .model_lists so callers can keep using
 # `from unsloth_zoo.compiler import FORCE_FLOAT32`.
 from .model_lists import FORCE_FLOAT32  # noqa: E402,F401
@@ -4957,6 +4981,39 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
+        # Tier 3: the data-dependent op is one call level down, inside a helper
+        # this file only IMPORTS. `called_functions` below needs `def <name>` in
+        # the modeling file's own source, so a DISABLE_COMPILE_FUNCTIONS entry
+        # for an imported-only helper never reaches either disable branch and
+        # `create_new_function` imports the raw upstream function into the
+        # generated module, where Dynamo inlines it. transformers >= 5.9 moved
+        # the vision grid helpers into transformers/vision_utils.py, and 47 of
+        # the 61 (modeling file, helper) import pairs in 5.16.1 are
+        # imported-only. Two of them land in a fullgraph = True region:
+        #   MiniMaxM3VL3DRotaryEmbedding.forward  -> get_vision_position_ids
+        #   Kimi_K25VisionPositionEmbeddings.forward
+        #                        -> get_vision_interpolation_indices_and_weights
+        # and both died on the first vision forward with
+        #   torch._dynamo.exc.Unsupported: Backend compiler exception
+        #   Backend compiler `inductor` failed with aten._local_scalar_dense.default
+        #   ... in get_vision_position_ids: grid_thw.tolist()
+        # fullgraph = False rather than bad_torch_modules: the break lands at the
+        # helper's `.tolist()` and the rest of the forward still compiles. Making
+        # the helper itself `@torch.compiler.disable` is NOT an alternative here,
+        # it is the same crash with a different message - a disabled callee is
+        # a graph break, and a graph break under fullgraph = True raises
+        # `Unsupported: Skip inlining torch.compiler.disable()d function`.
+        called_disabled = calls_disable_compile_function(
+            source, disable_compile_functions
+        )
+        if fullgraph and len(called_disabled) != 0:
+            print(
+                f"Unsloth: Will compile {module} without fullgraph since it calls "
+                f"{', '.join(called_disabled)}, which cannot be traced."
+            )
+            no_fullgraph_modules.add(module)
+        pass
+
         if (
             fullgraph
             and len(output_capture_target_names) > 0
@@ -5492,7 +5549,13 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                # Same reason as the `no_fullgraph_modules` demotion above: a
+                # helper we have declared untraceable is untraceable from here
+                # too, whether it is re-emitted or imported raw.
+                _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
+                    parameters, disable_compile_functions
+                )
+                parameters = f"@torch_compile_with_fallback(fullgraph = {_fullgraph}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -5556,7 +5619,10 @@ def unsloth_compile_transformers(
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
+                        source, disable_compile_functions
+                    )
+                    source = f"@torch_compile_with_fallback(fullgraph = {_fullgraph}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
