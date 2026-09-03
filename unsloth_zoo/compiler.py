@@ -153,20 +153,12 @@ DISABLE_COMPILE_FUNCTIONS = [
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
 
-    # transformers 5.9 moved the vision grid helpers every VL tower calls into the
-    # shared transformers/vision_utils.py. Each reads the grid off the GPU with
-    # `grid_thw.tolist()` / `repeat_interleave`, so Dynamo builds shapes out of
-    # unbacked SymInts and cannot guard them, e.g. get_vision_position_ids'
-    # reshape((h//m, m, w//m, m)) -> Eq((u2//u3), 0). Under fullgraph = True that is
-    # a hard UserError rather than a graph break, killing Qwen3.5 / Qwen3-VL /
-    # GLM-4V / PaddleOCR-VL on the first vision forward. torch >= 2.10
-    # (pytorch#162354) makes some trace again, but window_index and
-    # bilinear_indices still fail there, and we support torch well below 2.10, so
-    # all of them stay listed. Compiling them wins nothing anyway: the `.tolist()`
-    # is a mandatory D2H sync on line 1, so the break lands there and a 24x32 grid
-    # measures 125 us eager against 133 us compiled. Matching is by name, so on
-    # transformers < 5.9, and for names nothing imports today (bilinear_indices,
-    # deprecated at 5.16), no entry matches and the generated module is unchanged.
+    # transformers 5.9+ VL files import these; their `grid_thw.tolist()` builds shapes
+    # from unbacked SymInts, so fullgraph = True is a hard UserError on the first vision
+    # forward. Needs transformers >= 5.9 AND torch < 2.10 (pytorch 48dbd60df48,
+    # pytorch#162354, swapped guard_size_oblivious for guard_or_true), and we support
+    # torch well below 2.10. bilinear_indices, deprecated at 5.16 and imported by no
+    # modeling file today, is listed so a model going back to it stays uncompiled.
     "get_vision_position_ids",
     "get_vision_cu_seqlens",
     "get_vision_attention_seqlens",
@@ -177,17 +169,10 @@ DISABLE_COMPILE_FUNCTIONS = [
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
-    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS.
-
-    A modeling file that only imports a helper (every transformers >= 5.9 VL
-    tower) keeps calling the raw upstream function, so the caller must not be
-    compiled `fullgraph = True` or Dynamo inlines the `.tolist()` and the region
-    dies. Deliberately a superset of the `called_functions` test one level up,
-    which also requires `def <name>` in the modeling file's own source.
-
-    `[^\\w.]` excludes attribute calls: qwen3_vl, glm4v and qwen2_5_vl all define
-    a METHOD named `get_vision_position_ids`, which is not this helper.
-    """
+    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: deliberately a
+    superset of the `called_functions` test one level up, which also requires
+    `def <name>` locally and so misses every imported-only helper. `[^\\w.]` excludes
+    attribute calls; qwen3_vl, glm4v and qwen2_5_vl define a METHOD of the same name."""
     return sorted(
         name
         for name in disable_compile_functions
@@ -4964,21 +4949,10 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Tier 3: the data-dependent op is one call level down, inside a helper
-        # this file only IMPORTS. `called_functions` below needs `def <name>` in
-        # the modeling file's own source, so a DISABLE_COMPILE_FUNCTIONS entry for
-        # an imported-only helper reaches neither disable branch and
-        # `create_new_function` imports the raw upstream function for Dynamo to
-        # inline. At transformers 5.16.1 47 of the 61 (modeling file, helper)
-        # import pairs are imported-only, and two sit in a fullgraph = True region
-        # (MiniMaxM3VL3DRotaryEmbedding.forward -> get_vision_position_ids,
-        # Kimi_K25VisionPositionEmbeddings.forward -> ..._interpolation_indices...),
-        # both dying on the first vision forward with `inductor failed with
-        # aten._local_scalar_dense.default ... grid_thw.tolist()`. Demote to
-        # fullgraph = False rather than bad_torch_modules so only the `.tolist()`
-        # breaks and the rest of the forward still compiles. Marking the helper
-        # `@torch.compiler.disable` is not an alternative: a disabled callee is a
-        # graph break, which under fullgraph = True is the same hard error.
+        # Tier 3: an imported-only callee is never in `called_functions`, so the raw
+        # upstream helper is imported for Dynamo to inline. Demote the CALLER; marking
+        # the helper `@torch.compiler.disable` is not an alternative, a disabled callee
+        # is itself a graph break and that is the same hard error under fullgraph.
         called_disabled = calls_disable_compile_function(
             source, disable_compile_functions
         )
@@ -5525,8 +5499,6 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                # As with the `no_fullgraph_modules` demotion above: a helper we
-                # declared untraceable is untraceable from here too.
                 _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
                     parameters, disable_compile_functions
                 )
