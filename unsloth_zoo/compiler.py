@@ -156,28 +156,35 @@ DISABLE_COMPILE_FUNCTIONS = [
     # transformers 5.9 moved the vision grid helpers every VL tower calls into the
     # shared transformers/vision_utils.py, and the modeling files now import them by
     # name, so the rewriter picks them up as called functions and stamps
-    # fullgraph = True on them. Every one of them starts by reading the image grid
-    # off the GPU with `grid_thw.tolist()`, which Dynamo turns into unbacked
-    # SymInts, and the shapes built from those ints are then unguardable:
-    #   get_vision_position_ids               reshape((h//m, m, w//m, m))
-    #                                         -> Eq((u2//u3), 0)
-    #   get_vision_window_index               -> Eq(((u1//2) - PythonMod(...))//4 + 1, 0)
-    #   get_vision_bilinear_indices_and_weights
-    #                                         -> could not extract specialized integer u1
-    #   get_vision_cu_seqlens                 repeat_interleave -> Dynamic shape operator
-    # fullgraph = True turns those into a hard UserError, so Qwen3.5 / Qwen3-VL /
-    # GLM-4V / PaddleOCR-VL and friends died at the first vision forward. There is
-    # nothing to win by compiling them anyway: the `.tolist()` is a mandatory D2H
-    # sync on the first line, so a graph break lands there and the "compiled"
-    # region is only the item() prologue. Measured on a single 24x32 grid these run
-    # 125 us eager against 133 us under torch.compile, so eager is the faster half
-    # as well as the working one.
+    # fullgraph = True on them. They read the image grid off the GPU with
+    # `grid_thw.tolist()` / `repeat_interleave`, which Dynamo turns into unbacked
+    # SymInts, and the shapes built from those are then unguardable, e.g.
+    # get_vision_position_ids' reshape((h//m, m, w//m, m)) -> Eq((u2//u3), 0).
+    # fullgraph = True makes that a hard UserError rather than a graph break, so
+    # Qwen3.5 / Qwen3-VL / GLM-4V / PaddleOCR-VL died at the first vision forward.
+    #
+    # The trigger is transformers >= 5.9 AND torch < 2.10, not transformers alone.
+    # pytorch 48dbd60df482 (pytorch#162354, in v2.10.0, not in v2.9.x) rewrote the
+    # guard_size_oblivious calls in are_strides_like_channels_last as guard_or_true,
+    # which never raises. Probed at transformers 5.16.1 on torch 2.9.1 vs 2.10.0:
+    # position_ids, cu_seqlens, attention_seqlens and interpolation_indices fail on
+    # 2.9.1 and trace fine on 2.10.0, while window_index (data-dependent guard) and
+    # bilinear_indices (logger.warning_once) still fail on both. We support torch
+    # well below 2.10, so every one of them stays listed.
+    #
+    # Nothing is won by compiling them anyway: the `.tolist()` is a mandatory D2H
+    # sync on the first line, so a graph break lands there and the "compiled" region
+    # is only the item() prologue. Measured on a single 24x32 grid these run 125 us
+    # eager against 133 us under torch.compile.
     # Matching is by name, so on transformers < 5.9, where these names are not in
     # the modeling source, none of these entries match and the generated module is
-    # unchanged.
+    # unchanged. Names no modeling file imports today (bilinear_indices, deprecated
+    # at 5.16 in favour of interpolation_indices) are kept for the same reason.
     "get_vision_position_ids",
     "get_vision_cu_seqlens",
+    "get_vision_attention_seqlens",
     "get_vision_window_index",
+    "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
 ]
 

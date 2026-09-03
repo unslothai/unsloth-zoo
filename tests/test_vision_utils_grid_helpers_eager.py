@@ -38,10 +38,19 @@ mandatory device-to-host sync on the first line, so the break lands there and th
 compiled region is only the item() prologue. The helpers are listed in
 `DISABLE_COMPILE_FUNCTIONS` so they are emitted eager instead.
 
+Which helpers actually trip is torch dependent: pytorch 48dbd60df482
+(pytorch#162354, in v2.10.0 but not v2.9.x) made the guards in
+`are_strides_like_channels_last` non-throwing, so on torch >= 2.10 several of these
+trace cleanly again. That is precisely why the test below is written as an
+implication rather than a fixed list of names, and why it passes on both sides of
+that boundary.
+
 The interesting test here is `test_uncompilable_grid_helpers_are_listed`: it probes
-upstream directly rather than hard-coding today's four names, so a helper added to
+upstream directly rather than hard-coding today's names, so a helper added to
 `vision_utils.py` by a later transformers, or one of these becoming compilable
-upstream, is picked up without editing this file.
+upstream, is picked up without editing this file. That is not hypothetical:
+transformers 5.16 deprecated `get_vision_bilinear_indices_and_weights` in favour of
+`get_vision_interpolation_indices_and_weights`, and the probe caught the new name.
 
 Runs on CPU. The failure is in the meta/shape layer, so no GPU is needed.
 """
@@ -50,6 +59,7 @@ import inspect
 
 import pytest
 import torch
+import transformers
 
 from unsloth_zoo.compiler import DISABLE_COMPILE_FUNCTIONS
 
@@ -65,12 +75,16 @@ GRID_THW = torch.tensor([[1, 24, 32]], dtype=torch.long)
 
 # Filled in by name so a signature reordering upstream (5.16 inserts `include_temporal`
 # into get_vision_position_ids, for instance) does not silently pass the wrong value.
+# `config` is only read to decide whether flash attention is requested; a default
+# PreTrainedConfig answers no, which is the path get_vision_attention_seqlens takes for
+# every non-flash run. Without it that helper would be skipped by the probe below.
 _ARGS = {
     "grid_thw": GRID_THW,
     "spatial_merge_size": 2,
     "window_size": 112,
     "patch_size": 14,
     "num_grid_per_side": 32,
+    "config": transformers.PreTrainedConfig(),
 }
 
 
@@ -142,9 +156,14 @@ def test_uncompilable_grid_helpers_are_listed(name):
         torch._dynamo.reset()
 
     # Whether or not it compiles, eager has to produce something usable, otherwise
-    # the probe above proved nothing about the real call path.
+    # the probe above proved nothing about the real call path. `None` is allowed:
+    # get_vision_attention_seqlens documents a None max_seqlen when flash attention
+    # is not requested, which is exactly the config this test builds.
     outputs = eager if isinstance(eager, tuple) else (eager,)
-    assert all(isinstance(o, torch.Tensor) and o.numel() > 0 for o in outputs)
+    assert any(o is not None for o in outputs)
+    assert all(
+        isinstance(o, torch.Tensor) and o.numel() > 0 for o in outputs if o is not None
+    )
 
 
 def test_get_vision_position_ids_eager_result_is_the_block_major_layout():
@@ -199,7 +218,9 @@ def test_disable_compile_functions_selects_the_disable_decorator():
     for name in (
         "get_vision_position_ids",
         "get_vision_cu_seqlens",
+        "get_vision_attention_seqlens",
         "get_vision_window_index",
+        "get_vision_interpolation_indices_and_weights",
         "get_vision_bilinear_indices_and_weights",
     ):
         assert f'"{name}"' in source, (
