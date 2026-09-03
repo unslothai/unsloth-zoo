@@ -68,12 +68,29 @@ _ALLOW_LIST = {
     "sentencepiece": None,           # tokenizers
 }
 
+# huggingface_hub.constants.ENV_VARS_TRUE_VALUES, matched exactly. HF_HUB_OFFLINE
+# and TRANSFORMERS_OFFLINE are read by the hub as `value.upper() in {"1", "ON",
+# "TRUE", "YES"}`, so HF_HUB_OFFLINE=true really does put the process offline. A
+# check that accepted only the literal "1" disagreed with the library that owns
+# the variable and ran pip against an explicit offline request.
+_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _env_is_true(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().upper() in _TRUE_VALUES
+
+
 def _auto_install_enabled() -> bool:
     # Read at the attempt, not at import. `import unsloth` imports this module,
     # so a caller following the warning in _run_install sets the variable after
     # that; a module level constant would still say enabled and pip would run
     # against an explicit opt-out. llama_cpp.py reads it at call time too.
-    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1") == "1"
+    #
+    # Anything not recognised as true disables, so an unparseable value keeps
+    # today's conservative behaviour of not installing, while the spellings a
+    # user reasonably reaches for (true / yes / on) now enable it instead of
+    # silently turning the feature off.
+    return _env_is_true("UNSLOTH_AUTO_INSTALL", "1")
 
 
 def _no_network() -> bool:
@@ -81,9 +98,9 @@ def _no_network() -> bool:
     # notebook that goes offline after importing unsloth would otherwise still
     # have pip invoked and wait out the installer timeout before failing.
     return (
-        os.environ.get("UNSLOTH_OFFLINE", "0") == "1"
-        or os.environ.get("HF_HUB_OFFLINE", "0") == "1"
-        or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+        _env_is_true("UNSLOTH_OFFLINE")
+        or _env_is_true("HF_HUB_OFFLINE")
+        or _env_is_true("TRANSFORMERS_OFFLINE")
     )
 _attempted: set = set()
 
@@ -202,17 +219,37 @@ def _pip_install(pkg: str) -> bool:
     return _run_install(pkg, _pip_command(pkg))[0]
 
 
+def _importable(import_name: str) -> bool:
+    """
+    Whether ``import_name`` actually imports, not merely whether it resolves.
+
+    ``find_spec`` proves only that a module is DISCOVERABLE. A package whose
+    native extension will not load, or whose own imports are unsatisfiable
+    against the versions installed beside it, passes ``find_spec`` and then
+    raises at the moment transformers needs it. Reporting that as a successful
+    install is worse than reporting failure: the caller refreshes the
+    availability cache, ``requires_backends`` stops raising, and the model dies
+    further in on a ``NameError`` instead of the ImportError that named the
+    package. Cheap in practice, since the caller is about to import it anyway.
+    """
+    try:
+        importlib.import_module(import_name)
+    except Exception:
+        return False
+    return True
+
+
 def _try_install_and_import(pkg: str) -> bool:
     if pkg not in _ALLOW_LIST:
         return False
     if not _auto_install_enabled() or _no_network():
         return False
     import_name = _ALLOW_LIST[pkg] or pkg.replace("-", "_")
-    if importlib.util.find_spec(import_name) is not None:
+    if importlib.util.find_spec(import_name) is not None and _importable(import_name):
         return True
     if not _pip_install(pkg):
         return False
-    return importlib.util.find_spec(import_name) is not None
+    return _importable(import_name)
 
 
 def _rebind_requires_backends(wrapper, original) -> None:
@@ -281,10 +318,55 @@ def _names_bound_by(statement) -> list:
     return [alias.asname or alias.name for alias in statement.names]
 
 
-def _replay_skipped_guarded_imports(iu, backend) -> None:
+def _perform_import(statement, module) -> None:
+    """
+    Carry out one parsed import statement in ``module``'s namespace.
+
+    Driven through importlib rather than ``exec(compile(...))`` deliberately.
+    Nothing here is evaluated as code: only the module names the statement
+    literally names are imported, and only the names it binds are bound, so the
+    replay cannot run anything else that happens to sit in the file. It also
+    keeps scripts/lint_exec_literals.py satisfied without a baseline entry.
+    """
+    namespace = vars(module)
+    if isinstance(statement, ast.Import):
+        for alias in statement.names:
+            importlib.import_module(alias.name)
+            if alias.asname:
+                namespace[alias.asname] = sys.modules[alias.name]
+            else:
+                # `import a.b` binds the TOP package, exactly as Python does.
+                top = alias.name.split(".")[0]
+                namespace[top] = sys.modules[top]
+        return
+    # `from . import x` / `from ..y import z`: resolve against the module's own
+    # package, which is what the statement meant where it was written.
+    name = "." * statement.level + (statement.module or "")
+    source = importlib.import_module(
+        name, package = getattr(module, "__package__", None)
+    )
+    for alias in statement.names:
+        try:
+            value = getattr(source, alias.name)
+        except AttributeError:
+            # `from a import b` where b is a submodule not yet imported. When it
+            # is not that either, report the name that is actually missing:
+            # letting the submodule attempt surface instead turns "cannot import
+            # name 'ImageNetInfo' from 'timm.data'", which says what is wrong,
+            # into "No module named 'timm.data.ImageNetInfo'", which does not.
+            try:
+                value = importlib.import_module(f"{source.__name__}.{alias.name}")
+            except ImportError:
+                raise ImportError(
+                    f"cannot import name {alias.name!r} from {source.__name__!r}"
+                ) from None
+        namespace[alias.asname or alias.name] = value
+
+
+def _replay_skipped_guarded_imports(iu, backend) -> bool:
     """
     Run the ``if is_<backend>_available(): import <backend>`` blocks that were
-    skipped when the module was first imported.
+    skipped when the module was first imported. False if any of them raised.
 
     Refreshing the availability flag is not enough on its own. A transformers
     modeling file guards its dependency import at module scope, so a module
@@ -300,14 +382,20 @@ def _replay_skipped_guarded_imports(iu, backend) -> None:
     availability guard are executed, and only when the name they would bind is
     still missing, so this cannot introduce an import the module did not
     already ask for. Anything unrecognised is left alone.
+
+    A replay that raises is reported rather than swallowed. The statement comes
+    from a module that guards this exact backend, so a failure there means the
+    consumer still has no binding, and letting ``requires_backends`` through in
+    that state is the NameError this function exists to prevent.
     """
     guard = f"is_{backend.replace('-', '_')}_available"
     try:
         passes = bool(getattr(iu, guard)())
     except Exception:
-        return
+        return True
     if not passes:
-        return
+        return True
+    ok = True
     for module in list(sys.modules.values()):
         name = getattr(module, "__name__", "")
         if name != "transformers" and not name.startswith("transformers."):
@@ -344,22 +432,23 @@ def _replay_skipped_guarded_imports(iu, backend) -> None:
             for statement in node.body:
                 if not isinstance(statement, (ast.Import, ast.ImportFrom)):
                     continue
+                if any(alias.name == "*" for alias in statement.names):
+                    # A star import binds whatever the target exports; there is
+                    # no name to check against, so it is left alone.
+                    continue
                 bound = _names_bound_by(statement)
                 if not bound or all(hasattr(module, each) for each in bound):
                     continue
                 try:
-                    # Compiled against the module's own globals, so a relative
-                    # `from .x import y` resolves the same way it did at import.
-                    exec(
-                        compile(
-                            ast.Module(body = [statement], type_ignores = []),
-                            path,
-                            "exec",
-                        ),
-                        vars(module),
+                    _perform_import(statement, module)
+                except Exception as exception:
+                    ok = False
+                    logger.warning(
+                        f"Unsloth: {backend} installed, but replaying "
+                        f"`{ast.unparse(statement)}` in {module.__name__} failed: "
+                        f"{type(exception).__name__}: {exception}"
                     )
-                except Exception:
-                    pass
+    return ok
 
 
 def patch_requires_backends_autoinstall():
@@ -411,8 +500,12 @@ def patch_requires_backends_autoinstall():
                 _refresh_backend_availability(iu, b)
                 # A modeling file imported before the install skipped its own
                 # guarded `import <b>`, so letting the retry succeed without
-                # this turns an ImportError into a NameError deeper in.
-                _replay_skipped_guarded_imports(iu, b)
+                # this turns an ImportError into a NameError deeper in. If the
+                # replay itself fails the consumer is still unbound, so the
+                # original ImportError, which at least names the package, is
+                # the better error to leave the caller with.
+                if not _replay_skipped_guarded_imports(iu, b):
+                    raise
             return _orig(obj, backends)
 
     requires_backends._unsloth_patched = True

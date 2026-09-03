@@ -284,6 +284,20 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+# Same value set as huggingface_hub.constants.ENV_VARS_TRUE_VALUES, and the same
+# rule temporary_patches/notebook_deps.py applies to the identically named flag.
+# Duplicated rather than imported: notebook_deps pulls in the temporary-patches
+# package, which this module must not depend on. Anything not recognised as true
+# disables, so an unparseable value keeps the conservative do-not-install
+# behaviour while true / yes / on enable rather than silently opting out.
+_AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _auto_install_enabled() -> bool:
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1").strip().upper() \
+        in _AUTO_INSTALL_TRUE_VALUES
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -349,7 +363,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
     # reachable only when input() raised, so a non-interactive stdin that feeds a
     # newline returned normally and installed anyway, and Colab/Kaggle skip the
     # prompt block entirely so it never applied there at all.
-    if os.environ.get("UNSLOTH_AUTO_INSTALL", "1") != "1":
+    if not _auto_install_enabled():
         raise RuntimeError(
             f"Unsloth: Execution of `{install_cmd}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
             "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"

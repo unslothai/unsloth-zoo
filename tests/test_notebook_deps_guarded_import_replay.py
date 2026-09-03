@@ -36,6 +36,7 @@ nothing can reach pip or the network.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
 import types
@@ -169,6 +170,40 @@ def test_nothing_runs_while_the_backend_is_still_unavailable(tmp_path, monkeypat
     notebook_deps._replay_skipped_guarded_imports(iu, BACKEND)
 
     assert not hasattr(module, BACKEND)
+
+
+BROKEN = f"""
+if {GUARD}():
+    from {BACKEND} import this_name_does_not_exist
+"""
+
+
+def test_a_replay_that_fails_is_reported_not_swallowed(tmp_path, monkeypatch, iu):
+    # A statement that cannot be replayed leaves the consumer unbound, so
+    # swallowing it hands the caller the NameError this function exists to
+    # prevent. It has to be visible and it has to be reported as a failure.
+    _load(
+        tmp_path, monkeypatch, "transformers.models.fake.modeling_broken", BROKEN, False
+    )
+
+    iu.available = True
+    assert notebook_deps._replay_skipped_guarded_imports(iu, BACKEND) is False
+
+
+def test_a_missing_name_is_reported_as_a_missing_name(tmp_path, monkeypatch, iu):
+    # `from a import b` falls back to importing b as a submodule. When that is
+    # not it either, the useful error names the attribute, not a module path
+    # nobody wrote: "cannot import name 'ImageNetInfo' from 'timm.data'" rather
+    # than "No module named 'timm.data.ImageNetInfo'".
+    module = _load(
+        tmp_path, monkeypatch, "transformers.models.fake.modeling_msg", BROKEN, False
+    )
+    statement = ast.parse(BROKEN).body[0].body[0]
+
+    with pytest.raises(ImportError) as exc:
+        notebook_deps._perform_import(statement, module)
+    assert "cannot import name 'this_name_does_not_exist'" in str(exc.value)
+    assert "No module named" not in str(exc.value)
 
 
 def test_the_installer_path_replays_before_letting_the_retry_through(
