@@ -326,6 +326,7 @@ jobs:
             tests/test_llama_cpp_install_consent.py \
             tests/test_gemma3_padding_override_fidelity.py \
             tests/test_notebook_deps_patch_targets.py \
+            tests/test_notebook_deps_guarded_import_replay.py \
             tests/test_vllm_flashinfer_block_reversible.py \
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \

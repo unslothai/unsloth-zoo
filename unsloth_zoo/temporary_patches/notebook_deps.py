@@ -28,6 +28,7 @@
 # the standard offline flags so air-gapped envs keep emitting the
 # upstream ImportError verbatim.
 
+import ast
 import importlib
 import importlib.metadata
 import importlib.util
@@ -272,6 +273,95 @@ def _refresh_backend_availability(iu, backend) -> None:
         pass
 
 
+def _names_bound_by(statement) -> list:
+    """The module-level names an ``import`` / ``from ... import`` statement binds."""
+    if isinstance(statement, ast.Import):
+        # `import a.b` binds `a`; `import a.b as c` binds `c`.
+        return [alias.asname or alias.name.split(".")[0] for alias in statement.names]
+    return [alias.asname or alias.name for alias in statement.names]
+
+
+def _replay_skipped_guarded_imports(iu, backend) -> None:
+    """
+    Run the ``if is_<backend>_available(): import <backend>`` blocks that were
+    skipped when the module was first imported.
+
+    Refreshing the availability flag is not enough on its own. A transformers
+    modeling file guards its dependency import at module scope, so a module
+    imported while the package was missing simply never binds the name, and no
+    later re-check revisits that. Once ``requires_backends`` starts succeeding,
+    the constructor runs on into the body and dies with a bare ``NameError``,
+    which is a strictly worse outcome than the ImportError the install replaced
+    (reproduced against transformers' own timm_wrapper: the wrapper installs
+    timm, the retry passes, and ``timm.create_model`` raises "name 'timm' is
+    not defined").
+
+    Only statements the module itself carries under its own single-call
+    availability guard are executed, and only when the name they would bind is
+    still missing, so this cannot introduce an import the module did not
+    already ask for. Anything unrecognised is left alone.
+    """
+    guard = f"is_{backend.replace('-', '_')}_available"
+    try:
+        passes = bool(getattr(iu, guard)())
+    except Exception:
+        return
+    if not passes:
+        return
+    for module in list(sys.modules.values()):
+        name = getattr(module, "__name__", "")
+        if name != "transformers" and not name.startswith("transformers."):
+            continue
+        path = getattr(module, "__file__", None)
+        if not path or not path.endswith(".py"):
+            continue
+        try:
+            with open(path, encoding = "utf-8") as handle:
+                source = handle.read()
+        except OSError:
+            continue
+        if guard not in source:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            # Exactly `if is_<backend>_available():`. A negated or compound
+            # guard is not necessarily satisfied by this one install, so it is
+            # skipped rather than guessed at.
+            if not (
+                isinstance(test, ast.Call)
+                and isinstance(test.func, ast.Name)
+                and test.func.id == guard
+                and not test.args
+                and not test.keywords
+            ):
+                continue
+            for statement in node.body:
+                if not isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    continue
+                bound = _names_bound_by(statement)
+                if not bound or all(hasattr(module, each) for each in bound):
+                    continue
+                try:
+                    # Compiled against the module's own globals, so a relative
+                    # `from .x import y` resolves the same way it did at import.
+                    exec(
+                        compile(
+                            ast.Module(body = [statement], type_ignores = []),
+                            path,
+                            "exec",
+                        ),
+                        vars(module),
+                    )
+                except Exception:
+                    pass
+
+
 def patch_requires_backends_autoinstall():
     """
     Wrap ``transformers.utils.import_utils.requires_backends`` so that an
@@ -319,6 +409,10 @@ def patch_requires_backends_autoinstall():
                 raise
             for b in installed:
                 _refresh_backend_availability(iu, b)
+                # A modeling file imported before the install skipped its own
+                # guarded `import <b>`, so letting the retry succeed without
+                # this turns an ImportError into a NameError deeper in.
+                _replay_skipped_guarded_imports(iu, b)
             return _orig(obj, backends)
 
     requires_backends._unsloth_patched = True
