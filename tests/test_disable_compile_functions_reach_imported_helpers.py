@@ -16,37 +16,25 @@
 
 """Listing a helper in DISABLE_COMPILE_FUNCTIONS must reach its CALLERS too.
 
-`unsloth_compile_transformers` builds `called_functions` from names that the
-modeling file both calls AND defines::
-
-    defined = re.findall(r"\\bdef[\\s]{1,}" + re.escape(function), full_source, ...)
-    called  = re.findall(r"[\\s]{1,}" + re.escape(function) + r"\\(.+?\\)", full_source, ...)
-    if len(defined) != 0 and len(called) != 0:
-
-so a modeling file that only *imports* a helper never reaches either
-`disable_compile_functions` branch, and `create_new_function` imports the raw
-upstream function into the generated module. transformers >= 5.9 moved the
-vision grid helpers into `transformers/vision_utils.py`, and at 5.16.1 47 of the
-61 (modeling file, helper) import pairs are imported-only. Two of those land
-inside a `fullgraph = True` region::
+`unsloth_compile_transformers` builds `called_functions` only from names the modeling
+file both calls AND defines, so a file that merely *imports* a helper reaches neither
+`disable_compile_functions` branch and `create_new_function` imports the raw upstream
+function into the generated module. transformers >= 5.9 moved the vision grid helpers
+into `transformers/vision_utils.py`, and at 5.16.1 47 of the 61 (modeling file,
+helper) import pairs are imported-only. Two land inside a `fullgraph = True` region::
 
     MiniMaxM3VL3DRotaryEmbedding.forward       -> get_vision_position_ids
     Kimi_K25VisionPositionEmbeddings.forward   -> get_vision_interpolation_indices_and_weights
 
-which on torch < 2.10 ends the first vision forward with
+which on torch < 2.10 ends the first vision forward with "Backend compiler inductor
+failed with aten._local_scalar_dense.default ... grid_thw.tolist()".
 
-    torch._dynamo.exc.Unsupported: Backend compiler exception
-    Backend compiler `inductor` failed with aten._local_scalar_dense.default
-      ... in get_vision_position_ids: grid_thw.tolist()
+The fix demotes any caller of a listed helper to `fullgraph = False`. Re-emitting the
+helper as `@torch.compiler.disable` instead would not do: a disabled callee is itself
+a graph break, which under `fullgraph = True` is the same hard error.
 
-The fix demotes any caller of a listed helper to `fullgraph = False`. Demoting the
-caller, rather than only re-emitting the helper as `@torch.compiler.disable`, is
-deliberate: a disabled callee is itself a graph break, and a graph break under
-`fullgraph = True` is a hard error, so disabling alone swaps one crash for another.
-
-The first two tests are pure source inspection and run anywhere. The last one
-drives the real rewriter and is skipped below transformers 5.9, where the shared
-vision_utils does not exist.
+The first two tests are source inspection and run anywhere; the last drives the real
+rewriter and is skipped below transformers 5.9.
 """
 
 import inspect
@@ -67,15 +55,15 @@ def test_bare_calls_are_detected_and_attribute_calls_are_not():
     """The detector has to see an imported helper and ignore a same-named method.
 
     qwen3_vl, glm4v, qwen2_5_vl and paddleocr_vl all define a METHOD called
-    `get_vision_position_ids` next to the module-level import, so matching the
-    bare name would demote modules that never touch the helper.
+    `get_vision_position_ids`, so matching the bare name would demote modules that
+    never touch the helper.
     """
     listed = DISABLE_COMPILE_FUNCTIONS[0]
 
     assert calls_disable_compile_function(
         f"    x = {listed}(grid_thw, 2)\n", DISABLE_COMPILE_FUNCTIONS
     ) == [listed]
-    # whitespace between name and paren, and a call as the very first token
+    # whitespace between name and paren
     assert calls_disable_compile_function(
         f"    x = {listed} (grid_thw)\n", DISABLE_COMPILE_FUNCTIONS
     ) == [listed]
@@ -86,11 +74,11 @@ def test_bare_calls_are_detected_and_attribute_calls_are_not():
     assert calls_disable_compile_function(
         f"    x = vision_utils.{listed}(grid_thw, 2)\n", DISABLE_COMPILE_FUNCTIONS
     ) == []
-    # a longer name that merely ends with a listed one must not match
+    # a longer name ending with a listed one must not match
     assert calls_disable_compile_function(
         f"    x = wrapped_{listed}(grid_thw, 2)\n", DISABLE_COMPILE_FUNCTIONS
     ) == []
-    # a mention that is not a call (a docstring, an export list) must not match
+    # a mention that is not a call must not match
     assert calls_disable_compile_function(
         f'    """See {listed} for details."""\n', DISABLE_COMPILE_FUNCTIONS
     ) == []
@@ -99,10 +87,9 @@ def test_bare_calls_are_detected_and_attribute_calls_are_not():
 def test_every_fullgraph_emit_site_consults_the_detector():
     """All three places that can stamp fullgraph = True have to ask.
 
-    The module scan (`no_fullgraph_modules`) plus both generated-source emit
-    sites in `compile_function_calls`. Miss one and an imported helper is
-    inlined into a fullgraph region again, which the runtime tests here cannot
-    see because they do not go through the rewriter.
+    The module scan (`no_fullgraph_modules`) plus both generated-source emit sites.
+    Miss one and an imported helper is inlined into a fullgraph region again, which
+    the tests here cannot see since they do not go through the rewriter.
     """
     source = inspect.getsource(compiler_module)
     assert source.count("calls_disable_compile_function(") == 4, (
@@ -122,8 +109,8 @@ except Exception:
     pass
 
 
-# Runs the rewriter for real, so it goes in its own interpreter: it sets
-# `__UNSLOTH_PATCHED__` on the modeling module and writes a cache directory.
+# Its own interpreter: the rewriter sets `__UNSLOTH_PATCHED__` on the modeling
+# module and writes a cache directory.
 _CHILD = r'''
 import os, sys, json, importlib, io, contextlib
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
@@ -175,27 +162,24 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
     """The regression itself, end to end through the real rewriter.
 
     minimax_m3_vl only imports `get_vision_position_ids`, so it is never in
-    `called_functions` and the generated module calls the raw upstream helper.
-    The forward that calls it must therefore be emitted `fullgraph = False`, and
-    calling it must produce position embeddings rather than a Dynamo error.
+    `called_functions` and the generated module calls the raw upstream helper. The
+    forward must therefore be emitted `fullgraph = False`, and calling it must give
+    position embeddings rather than a Dynamo error.
     """
     # conftest's GPU-free harness does not reach a subprocess, and importing
     # unsloth_zoo on a GPU-less runner would otherwise go looking for one.
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
-    # Pin the child to THIS checkout. Without it the subprocess imports whatever
-    # unsloth_zoo is installed in site-packages, so the test silently reports on
-    # a different copy of compiler.py than the one under review.
+    # Pin the child to THIS checkout, else it imports the site-packages unsloth_zoo
+    # and reports on a different copy of compiler.py.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join(
         [repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
-    # The core-drift job sets UNSLOTH_COMPILE_DISABLE=1 at job level, and this
-    # copies the whole environment. Inheriting it makes unsloth_compile_transformers
-    # force disable=True, so the forward is emitted @torch.compiler.disable instead
-    # of the torch_compile_with_fallback this test is about, and the assertion below
-    # fails for a reason unrelated to the regression. Drop it for the child.
+    # The core-drift job sets UNSLOTH_COMPILE_DISABLE=1 job-wide; inheriting it forces
+    # disable=True, so the forward is emitted @torch.compiler.disable rather than the
+    # torch_compile_with_fallback this test is about.
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     result = subprocess.run(
         [sys.executable, "-c", _CHILD],
@@ -215,7 +199,7 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
     assert payload is not None, result.stdout[-4000:]
 
     generated = payload["generated"]
-    # The premise: the helper really is imported raw rather than re-emitted.
+    # The premise: the helper is imported raw rather than re-emitted.
     assert "def get_vision_position_ids(" not in generated, (
         "minimax_m3_vl now defines the helper itself; pick another model type "
         "that only imports it, or this test proves nothing."
@@ -231,14 +215,11 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
         + decorators[-400:]
     )
 
-    # The decorator asserted above IS the regression guard: emitting this forward
-    # fullgraph = True is precisely the bug, and that check is deterministic and
-    # runs everywhere. Actually calling the forward is a bonus end-to-end check
-    # that additionally needs a working inductor toolchain. A bare CI runner has
-    # no Triton and its inductor CPU backend can fail outright, which says nothing
-    # about this change, so tolerate exactly that and nothing else. The regression
-    # this test exists for surfaces as torch._dynamo.exc.Unsupported, a different
-    # type, so it is still caught here.
+    # The decorator asserted above IS the regression guard, and it runs everywhere.
+    # Actually calling the forward is a bonus that also needs a working inductor
+    # toolchain, which a bare Triton-less CI runner may not have, so tolerate exactly
+    # that failure. The regression surfaces as torch._dynamo.exc.Unsupported instead,
+    # so it is still caught.
     if payload.get("error_type") == "BackendCompilerFailed":
         pytest.skip(f"inductor cannot compile here ({payload['error']}); decorator asserted above")
     assert payload["error"] is None, payload["error"]
