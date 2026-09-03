@@ -2679,11 +2679,23 @@ def load_vllm(
     # since installed nvcc/ninja and reset UNSLOTH_VLLM_NO_FLASHINFER=0 gets a
     # fresh probe (find_spec reports the package as absent while the block is in
     # place) instead of a process that can never reach FlashInfer again.
-    if os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+    _no_flashinfer = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "0"
+    if not _no_flashinfer:
         _unblock_flashinfer_import()
     if _clear_flashinfer_env_on_hip():
         pass
-    elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+    elif _no_flashinfer:
+        # Honour an opt-out the caller set BEFORE load_vllm, which is exactly what
+        # the JIT-failure guidance further down tells them to do. Skipping our own
+        # setup is not enough: an installed FlashInfer stays importable, so vLLM
+        # selects it on its own (it is the default on Blackwell) and hits the very
+        # JIT failure the opt-out exists to avoid.
+        if importlib.util.find_spec("flashinfer") is not None:
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                del os.environ["VLLM_ATTENTION_BACKEND"]
+            _block_flashinfer_import()
+    elif importlib.util.find_spec("flashinfer"):
         # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
         # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
         _has_nvcc = (

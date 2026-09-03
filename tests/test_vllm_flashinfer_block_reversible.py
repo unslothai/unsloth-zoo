@@ -114,3 +114,43 @@ def test_load_vllm_lifts_the_block_when_the_opt_out_is_cleared(fake_flashinfer):
     assert unblock != -1, "load_vllm never lifts a previously installed block"
     assert probe != -1
     assert unblock < probe, "the block must be lifted before the FlashInfer probe"
+
+
+def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfer):
+    """vLLM's `has_flashinfer()` is `importlib.util.find_spec("flashinfer") is None`,
+    so blocking the import is what actually stops it selecting the backend."""
+    assert importlib.util.find_spec("flashinfer") is not None
+    vllm_utils._block_flashinfer_import()
+    assert importlib.util.find_spec("flashinfer") is None
+    assert _import_flashinfer_fails()
+
+
+def test_a_preset_opt_out_still_blocks_flashinfer():
+    """`UNSLOTH_VLLM_NO_FLASHINFER=1` set BEFORE load_vllm is the workaround this
+    module prints on a JIT failure. Skipping our own setup is not enough: an
+    installed FlashInfer would stay importable and vLLM would select it anyway,
+    so the opt-out path has to reach _block_flashinfer_import() too."""
+    import inspect
+
+    source = inspect.getsource(vllm_utils.load_vllm)
+    optout = source.find("elif _no_flashinfer:")
+    assert optout != -1, "load_vllm has no explicit pre-set opt-out branch"
+    probe = source.find('elif importlib.util.find_spec("flashinfer"):')
+    assert probe != -1, "the toolchain probe branch is gone"
+    assert optout < probe, "the opt-out must be handled before the toolchain probe"
+
+    # the opt-out branch must actually block, not merely skip our tuning
+    branch = source[optout:probe]
+    assert "_block_flashinfer_import()" in branch, branch
+    assert 'os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"' in branch, branch
+
+
+def test_the_opt_out_branch_is_guarded_on_flashinfer_being_installed():
+    """Nothing to block when the package is absent; do not invent state."""
+    import inspect
+
+    source = inspect.getsource(vllm_utils.load_vllm)
+    optout = source.find("elif _no_flashinfer:")
+    probe = source.find('elif importlib.util.find_spec("flashinfer"):')
+    branch = source[optout:probe]
+    assert 'find_spec("flashinfer") is not None' in branch, branch

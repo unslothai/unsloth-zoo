@@ -137,7 +137,7 @@ def record_installs(monkeypatch):
         return False        # "install failed" -> the wrapper re-raises
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
-    monkeypatch.setattr(notebook_deps, "_AUTO_INSTALL", True)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
     monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
     return calls
 
@@ -393,7 +393,7 @@ def test_successful_install_invalidates_the_cached_availability_probe(monkeypatc
         return True
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
-    monkeypatch.setattr(notebook_deps, "_AUTO_INSTALL", True)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
     monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
 
     notebook_deps.patch_requires_backends_autoinstall()
@@ -484,7 +484,7 @@ def test_a_failed_install_is_not_marked_available(monkeypatch):
         return pkg == _BACKEND      # `av` cannot be installed here
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
-    monkeypatch.setattr(notebook_deps, "_AUTO_INSTALL", True)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
     monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
 
     notebook_deps.patch_requires_backends_autoinstall()
@@ -622,3 +622,133 @@ def test_pip_install_does_not_hand_a_mismatched_kernel_to_uv(
     assert notebook_deps._pip_install("addict") is True
     assert [c[0] for c in commands] == [sys.executable], commands
     assert "--user" in commands[0]
+
+
+# ---------------------------------------------------------------------------
+# 6. UNSLOTH_AUTO_INSTALL is read at the moment of the attempt.
+#
+# `import unsloth` imports this module (and runs the hooks at import time), so
+# the documented opt-out is routinely set AFTER that: before loading a model,
+# or straight after `_run_install`'s warning names the variable. Captured once
+# at import, the opt-out would be honoured only by callers who happened to set
+# it before the very first Unsloth import, and everyone else would get pip run
+# against an explicit refusal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def package_manager_spy(monkeypatch):
+    """Record every command the module would hand to uv/pip, run none of them."""
+    commands = []
+
+    def _run(cmd, *args, **kwargs):
+        commands.append(list(cmd))
+        return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
+    monkeypatch.setattr(notebook_deps, "_attempted", set())
+    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    return commands
+
+
+@pytest.fixture
+def fake_dynamic_module_utils(monkeypatch):
+    """Synthetic `transformers.dynamic_module_utils` raising the Deepseek-OCR
+    style "This modeling file requires ..." ImportError."""
+    def check_imports(filename):
+        raise ImportError(
+            "This modeling file requires the following packages that were not "
+            "found in your environment: addict. Run `pip install addict`"
+        )
+
+    dmu = types.ModuleType("transformers.dynamic_module_utils")
+    dmu.check_imports = check_imports
+    root = types.ModuleType("transformers")
+    root.dynamic_module_utils = dmu
+    monkeypatch.setitem(sys.modules, "transformers", root)
+    monkeypatch.setitem(sys.modules, "transformers.dynamic_module_utils", dmu)
+    return dmu
+
+
+def test_requires_backends_honours_an_opt_out_set_after_import(
+    fake_transformers, package_manager_spy, monkeypatch
+):
+    # Spied one level above pip as well, because the allow-listed package may
+    # already be importable on the machine running the test, in which case the
+    # installer returns before it would have reached uv/pip.
+    reached = []
+    monkeypatch.setattr(
+        notebook_deps, "_try_install_and_import",
+        lambda pkg: reached.append(pkg) or False,
+    )
+    notebook_deps.patch_requires_backends_autoinstall()
+    # Only now, exactly as a user reacting to the auto-install warning does.
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+
+    with pytest.raises(ImportError):
+        fake_transformers.utils.requires_backends(_Consumer, [_BACKEND])
+    assert reached == [], f"the opt-out was ignored and the installer ran: {reached}"
+    assert package_manager_spy == []
+
+
+def test_check_imports_honours_an_opt_out_set_after_import(
+    fake_dynamic_module_utils, package_manager_spy, monkeypatch
+):
+    notebook_deps.patch_check_imports_autoinstall()
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+
+    with pytest.raises(ImportError):
+        fake_dynamic_module_utils.check_imports("modeling_deepseekocr.py")
+    assert package_manager_spy == []
+
+
+def test_the_ipython_chain_repair_honours_an_opt_out_set_after_import(
+    package_manager_spy, monkeypatch
+):
+    reached = []
+    monkeypatch.setattr(
+        notebook_deps, "_try_install_and_import",
+        lambda pkg: reached.append(pkg) or False,
+    )
+    monkeypatch.setattr(notebook_deps, "_ipython_chain_is_broken", lambda: True)
+    # traitlets absent, so the repair would have something to install.
+    monkeypatch.setattr(notebook_deps, "importlib", types.SimpleNamespace(
+        util = types.SimpleNamespace(find_spec = lambda name: None),
+    ))
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+
+    notebook_deps._ensure_notebook_chain()
+    assert reached == []
+    assert package_manager_spy == []
+
+
+def test_the_installer_itself_honours_an_opt_out_set_after_import(
+    package_manager_spy, monkeypatch
+):
+    """The gate the two wrappers share, reached directly."""
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    assert notebook_deps._try_install_and_import("addict") is False
+    assert package_manager_spy == []
+
+
+def test_clearing_the_opt_out_at_runtime_re_enables_the_installer(
+    fake_transformers, monkeypatch
+):
+    """The same liveness in the other direction, so the fix cannot be "always off"."""
+    reached = []
+    monkeypatch.setattr(
+        notebook_deps, "_try_install_and_import",
+        lambda pkg: reached.append(pkg) or False,
+    )
+    monkeypatch.setattr(notebook_deps, "_NO_NETWORK", False)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    notebook_deps.patch_requires_backends_autoinstall()
+
+    with pytest.raises(ImportError):
+        fake_transformers.utils.requires_backends(_Consumer, [_BACKEND])
+    assert reached == []
+
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    with pytest.raises(ImportError):
+        fake_transformers.utils.requires_backends(_Consumer, [_BACKEND])
+    assert reached == [_BACKEND]

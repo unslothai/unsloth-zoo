@@ -67,7 +67,14 @@ _ALLOW_LIST = {
     "sentencepiece": None,           # tokenizers
 }
 
-_AUTO_INSTALL = os.environ.get("UNSLOTH_AUTO_INSTALL", "1") == "1"
+def _auto_install_enabled() -> bool:
+    # Read at the attempt, not at import. `import unsloth` imports this module,
+    # so a caller following the warning in _run_install sets the variable after
+    # that; a module level constant would still say enabled and pip would run
+    # against an explicit opt-out. llama_cpp.py reads it at call time too.
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1") == "1"
+
+
 _NO_NETWORK = (
     os.environ.get("UNSLOTH_OFFLINE", "0") == "1"
     or os.environ.get("HF_HUB_OFFLINE", "0") == "1"
@@ -193,7 +200,7 @@ def _pip_install(pkg: str) -> bool:
 def _try_install_and_import(pkg: str) -> bool:
     if pkg not in _ALLOW_LIST:
         return False
-    if not _AUTO_INSTALL or _NO_NETWORK:
+    if not _auto_install_enabled() or _NO_NETWORK:
         return False
     import_name = _ALLOW_LIST[pkg] or pkg.replace("-", "_")
     if importlib.util.find_spec(import_name) is not None:
@@ -290,7 +297,7 @@ def patch_requires_backends_autoinstall():
         try:
             return _orig(obj, backends)
         except ImportError:
-            if not _AUTO_INSTALL or _NO_NETWORK:
+            if not _auto_install_enabled() or _NO_NETWORK:
                 raise
             wanted_iter = backends if isinstance(backends, (list, tuple)) else [backends]
             wanted = [b for b in wanted_iter if isinstance(b, str) and b in _ALLOW_LIST]
@@ -336,7 +343,7 @@ def patch_check_imports_autoinstall():
         try:
             return _orig(filename)
         except ImportError as e:
-            if not _AUTO_INSTALL or _NO_NETWORK:
+            if not _auto_install_enabled() or _NO_NETWORK:
                 raise
             msg = str(e)
             if "This modeling file requires" not in msg:
@@ -384,7 +391,7 @@ def _ensure_notebook_chain():
     only ``traitlets`` is touched today; expand only when a new failure mode
     appears.
     """
-    if not _AUTO_INSTALL or _NO_NETWORK:
+    if not _auto_install_enabled() or _NO_NETWORK:
         return
     if not _ipython_chain_is_broken():
         return
