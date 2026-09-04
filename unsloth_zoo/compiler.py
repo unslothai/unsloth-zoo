@@ -152,7 +152,37 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+
+    # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
+    # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
+    # Deliberately NOT gated on torch version: pytorch#162354 does make four of them
+    # traceable, but on torch 2.9.1 / 2.10.0 / 2.11.0 window_index still dies on
+    # GuardOnDataDependentSymNode and bilinear_indices on its deprecation warning, and a
+    # `torch < 2.10` gate would put the crash back for qwen2_5_vl and qwen2_5_omni on the
+    # default install. Listing the traceable ones anyway costs one demoted caller across
+    # 10 VL model types, since every VL vision forward is already off fullgraph through an
+    # earlier tier. bilinear_indices, deprecated at 5.16 and imported by no modeling file
+    # today, is listed so a model going back to it stays uncompiled.
+    "get_vision_position_ids",
+    "get_vision_cu_seqlens",
+    "get_vision_attention_seqlens",
+    "get_vision_window_index",
+    "get_vision_interpolation_indices_and_weights",
+    "get_vision_bilinear_indices_and_weights",
 ]
+
+
+def calls_disable_compile_function(source, disable_compile_functions):
+    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: a superset of the
+    `called_functions` test above, which also wants `def <name>` locally and so misses
+    imported-only helpers. `[^\\w.]` excludes attribute calls: qwen3_vl, glm4v and
+    qwen2_5_vl define a method of the same name."""
+    return sorted(
+        name
+        for name in disable_compile_functions
+        if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
+    )
+
 
 # Re-exported from .model_lists so callers can keep using
 # `from unsloth_zoo.compiler import FORCE_FLOAT32`.
@@ -4928,6 +4958,20 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
+        # Tier 3: an imported-only callee is never in `called_functions`, so Dynamo inlines
+        # the raw upstream helper. Demote the CALLER; `@torch.compiler.disable` on the
+        # helper is no alternative, a disabled callee is itself a fullgraph break.
+        called_disabled = calls_disable_compile_function(
+            source, disable_compile_functions
+        )
+        if fullgraph and len(called_disabled) != 0:
+            print(
+                f"Unsloth: Will compile {module} without fullgraph since it calls "
+                f"{', '.join(called_disabled)}, which cannot be traced."
+            )
+            no_fullgraph_modules.add(module)
+        pass
+
         if (
             fullgraph
             and len(output_capture_target_names) > 0
@@ -5463,7 +5507,10 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
+                    parameters, disable_compile_functions
+                )
+                parameters = f"@torch_compile_with_fallback(fullgraph = {_fullgraph}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -5527,7 +5574,10 @@ def unsloth_compile_transformers(
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch_compile_with_fallback(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
+                        source, disable_compile_functions
+                    )
+                    source = f"@torch_compile_with_fallback(fullgraph = {_fullgraph}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
