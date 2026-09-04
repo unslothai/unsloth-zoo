@@ -14,12 +14,17 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The merged_16bit config must describe the weights the merge actually writes (#969).
+"""The merged_16bit config and weights must describe the same model (#969).
 
 `merge_and_overwrite_lora` takes its weights from the resolved base checkpoint but used to
 save `model.config`, which `text_only = True` has already replaced with the nested text
 config, so a `gemma3_text` config landed next to full VLM weights. Nothing raised: every
 tensor was silently re-initialized on reload, so a finetune could be served untrained.
+
+There are two ways to make the pair agree, and this suite covers both. A `text_only` merge
+drops the vision and audio tensors and exports the text model that was asked for. When the
+text weights cannot be located in the base checkpoint the drop stands down, and the export
+falls back to the whole VLM under a config that describes it -- correct, just larger.
 
 The fixture is the real shape -- a text-only decoder whose `_name_or_path` points at a VLM
 checkpoint. Passing is not "no exception" (the bug threw none) but the saved architecture
@@ -94,15 +99,33 @@ def _saved_config(out_dir):
 
 
 def _reload_info(out_dir):
-    """Reload as the architecture the saved config declares and return loading info."""
+    """Reload as the architecture the saved config declares and return loading info.
+
+    Which class that is depends on what the export decided to be: a text_only merge writes a
+    causal LM and the fallback writes the VLM. Reading it off `architectures` keeps the test
+    honest about the checkpoint in front of it instead of assuming either one.
+    """
     import transformers as T
-    _, info = T.AutoModelForImageTextToText.from_pretrained(
-        out_dir, output_loading_info=True, local_files_only=True)
+    declared = (_saved_config(out_dir).get("architectures") or [None])[0]
+    auto = getattr(T, declared, None) if declared else None
+    if auto is None: auto = T.AutoModelForImageTextToText
+    _, info = auto.from_pretrained(out_dir, output_loading_info=True, local_files_only=True)
     return info
 
 
-def test_text_only_export_config_matches_written_weights(tmp_path):
-    """#969: a text_only export must declare the VLM it actually wrote."""
+def _assert_clean_reload(out_dir):
+    info = _reload_info(out_dir)
+    for field in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
+        assert not info.get(field), f"{field}: {info.get(field)[:6]}"
+
+
+def test_text_only_export_drops_the_vision_tower(tmp_path):
+    """#969 second direction: a text_only export is the text model that was asked for.
+
+    The config and the weights have to agree, which #1073 achieved by declaring the VLM the
+    merge had written. This is the other way round: the vision tensors go, the text tensors
+    take their text-only names, and the export becomes the causal LM the load requested.
+    """
     H.set_offline_cpu_env()
     base_dir, cfg = _write_vlm_base(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -110,19 +133,116 @@ def test_text_only_export_config_matches_written_weights(tmp_path):
     pm = _attach_lora(_text_only_model(cfg, base_dir))
     H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
 
-    # transformers 5 flattens the VLM prefixes, so match on a substring, not the key name.
+    base_written = list(H.read_safetensors_dir(base_dir))
+    assert any("vision" in k for k in base_written), "fixture holds no vision weights to drop"
+
     written = list(H.read_safetensors_dir(out_dir))
-    assert any("vision" in k for k in written), f"fixture wrote no vision weights: {written[:4]}"
+    assert written, "the export wrote nothing"
+    leftover = [k for k in written if "vision" in k or "audio" in k or "projector" in k]
+    assert not leftover, f"vision/audio tensors survived the text_only export: {leftover[:4]}"
+    assert any(k.startswith("model.layers.") for k in written), (
+        f"text tensors were not renamed into the text-only namespace: {written[:4]}")
 
-    base, saved = _saved_config(base_dir), _saved_config(out_dir)
-    assert saved.get("model_type") == base.get("model_type") != "gemma3_text", (
+    saved = _saved_config(out_dir)
+    assert saved.get("model_type") == "gemma3_text", (
         f"saved config describes {saved.get('model_type')!r}, not the written weights")
-    assert saved.get("architectures") == base.get("architectures") and saved.get("architectures"), (
-        f"saved architectures {saved.get('architectures')!r} do not match the weights")
+    assert saved.get("architectures") == ["Gemma3ForCausalLM"], (
+        f"saved architectures {saved.get('architectures')!r} do not name the written model")
 
-    info = _reload_info(out_dir)
-    for field in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
-        assert not info.get(field), f"{field}: {info.get(field)[:6]}"
+    _assert_clean_reload(out_dir)
+
+
+def test_text_only_export_is_smaller_than_the_base(tmp_path):
+    """The saving is the point, so measure it. How large it is depends on the model: the
+    tower is 10% of gemma-3-4b-it and most of an omni checkpoint, so only pin the direction.
+    """
+    H.set_offline_cpu_env()
+    base_dir, cfg = _write_vlm_base(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+
+    pm = _attach_lora(_text_only_model(cfg, base_dir))
+    H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
+
+    def weight_bytes(d):
+        return sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d)
+                   if f.endswith(".safetensors"))
+
+    assert weight_bytes(out_dir) < weight_bytes(base_dir), (
+        "the text_only export is no smaller than the VLM it came from")
+
+
+def test_index_and_shards_agree_after_the_drop(tmp_path):
+    """A stale index outlives the tensors it names, and the reload dies on files not there."""
+    H.set_offline_cpu_env()
+    base_dir, cfg = _write_vlm_base(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+
+    pm = _attach_lora(_text_only_model(cfg, base_dir))
+    H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
+
+    index_path = os.path.join(out_dir, "model.safetensors.index.json")
+    shards = sorted(f for f in os.listdir(out_dir) if f.endswith(".safetensors"))
+    if not os.path.exists(index_path):
+        assert shards == ["model.safetensors"], (
+            f"no index, so there must be exactly one shard, found {shards}")
+        return
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+    assert sorted(set(weight_map.values())) == shards, (
+        f"index names {sorted(set(weight_map.values()))} but the directory holds {shards}")
+    assert set(weight_map) == set(H.read_safetensors_dir(out_dir)), (
+        "the index and the shards disagree about which tensors exist")
+
+
+def test_low_disk_space_still_drops_without_a_push(tmp_path):
+    """Only the upload half of low_disk_space_usage blocks the drop, so keep the guard narrow.
+
+    That combination uploads and removes each shard inside the merge loop under a name chosen
+    before the drop changes how many shards there are, which is why it stands down. Saving to
+    a local directory removes nothing early, so there is no reason to give up the drop there.
+    """
+    H.set_offline_cpu_env()
+    base_dir, cfg = _write_vlm_base(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+
+    pm = _attach_lora(_text_only_model(cfg, base_dir))
+    H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32, low_disk_space_usage=True)
+
+    written = list(H.read_safetensors_dir(out_dir))
+    assert written, "the export wrote nothing"
+    assert not [k for k in written if "vision" in k], "low_disk_space_usage skipped the drop"
+    _assert_clean_reload(out_dir)
+
+
+def test_remap_failure_keeps_the_whole_checkpoint(tmp_path, monkeypatch):
+    """When the text weights cannot be placed, fall back to #1073 rather than guess.
+
+    Writing a checkpoint whose tensors the code could not account for is what #969 was, so
+    the drop is the thing that gives way, and it has to say so.
+    """
+    import unsloth_zoo.saving_utils as SU
+
+    H.set_offline_cpu_env()
+    base_dir, cfg = _write_vlm_base(tmp_path)
+    out_dir = os.path.join(str(tmp_path), "merged")
+    pm = _attach_lora(_text_only_model(cfg, base_dir))
+
+    def boom(*args, **kwargs):
+        raise SU.TextOnlyRemapError("forced remap failure")
+
+    monkeypatch.setattr(SU, "_text_only_key_map", boom)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        H.run_merge(pm, base_dir, out_dir, save_dtype=torch.float32)
+
+    assert any("could not separate the text weights" in str(w.message) for w in caught), (
+        "the export silently kept the vision tensors")
+    written = list(H.read_safetensors_dir(out_dir))
+    assert any("vision" in k for k in written), "the fallback dropped weights anyway"
+    assert _saved_config(out_dir).get("model_type") == _saved_config(base_dir).get("model_type"), (
+        "the fallback must still describe the weights it wrote (#1073)")
+
+    _assert_clean_reload(out_dir)
 
 
 def test_text_only_export_preserves_resized_vocab(tmp_path):
@@ -148,7 +268,7 @@ def test_text_only_export_preserves_resized_vocab(tmp_path):
     assert embed.shape[0] == new_vocab, "the merge did not write the resized embedding"
 
     saved = _saved_config(out_dir)
-    declared = saved.get("text_config", {}).get("vocab_size", saved.get("vocab_size"))
+    declared = saved.get("text_config", {}).get("vocab_size") or saved.get("vocab_size")
     assert declared == new_vocab, (
         f"config declares vocab {declared} beside {embed.shape[0]} embedding rows")
 
