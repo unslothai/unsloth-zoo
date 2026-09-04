@@ -308,6 +308,22 @@ def _is_module_stub(mod):
     return mod is not None and getattr(mod, "__file__", None) is None
 
 
+def _is_unsloth_bnb_stub(mod):
+    """Whether this is the bitsandbytes stub `import unsloth_zoo` installs for itself.
+
+    `unsloth_zoo/__init__.py` calls `bitsandbytes_stub.inject_into_sys_modules()` when no
+    real bitsandbytes is installed, and `_BnbFinder` then builds each submodule on demand
+    with this spec origin. That is the package behaving as designed on a host without the
+    real one, not a test substituting a module, and unlike the partial substitute this
+    guard was written for it answers every attribute rather than a chosen few.
+
+    The parent `bitsandbytes` already escapes the check below because the stub module has
+    a `__file__` of its own; its submodules are bare ModuleType and do not, which is the
+    only reason the first test to import unsloth_zoo was reported as a leak.
+    """
+    return getattr(getattr(mod, "__spec__", None), "origin", None) == "bitsandbytes_stub"
+
+
 def pytest_runtest_setup(item):
     import sys as _sys
 
@@ -334,10 +350,12 @@ def pytest_runtest_teardown(item, nextitem):
         now = _sys.modules.get(name)
         if now is was:
             continue
-        if was is None and not _is_module_stub(now):
-            # Nothing was there and the test imported the real thing. That is an
-            # import, not a swap, and flagging it would fail every test that touches
-            # the package.
+        if was is None and (not _is_module_stub(now) or _is_unsloth_bnb_stub(now)):
+            # Nothing was there, and the test either imported the real thing or merely
+            # imported unsloth_zoo, which installs its own bitsandbytes stub. Both are
+            # imports rather than swaps, and flagging either would fail every test that
+            # touches the package. A real module replaced by the stub is still a swap and
+            # still reported, because `was` is not None there.
             continue
         leaked.append(name)
     if leaked:
