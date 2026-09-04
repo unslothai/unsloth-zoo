@@ -18,9 +18,11 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import inspect
+import textwrap
 import math
 import os
 import sys
@@ -28,10 +30,10 @@ import threading
 import types
 import warnings
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
-from numbers import Integral
-from typing import Any, Literal, Sequence
+from numbers import Integral, Real
+from typing import Any, Callable, Iterator, Literal, Sequence
 
 
 _TEXT_EVENT_FIELDS = frozenset(("uid", "token", "logprobs", "finish_reason"))
@@ -128,11 +130,16 @@ class SamplingParams:
     top_p: float = 0.0
     top_k: int = 0
     min_p: float = 0.0
+    seed: int | None = None
 
     def __post_init__(self):
         temperature = float(self.temperature)
         top_p = float(self.top_p)
         min_p = float(self.min_p)
+        if self.seed is not None:
+            if isinstance(self.seed, bool) or not isinstance(self.seed, Integral):
+                raise TypeError("seed must be an integer or None.")
+            object.__setattr__(self, "seed", int(self.seed) % (2**64))
         if not math.isfinite(temperature) or temperature < 0:
             raise ValueError("temperature must be a finite value >= 0.")
         if not math.isfinite(top_p) or not 0 <= top_p <= 1:
@@ -176,6 +183,22 @@ class GenerationDefaults:
         )
         if self.max_kv_size is not None:
             _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
+        if self.kv_bits is not None:
+            if isinstance(self.kv_bits, bool) or not isinstance(self.kv_bits, Real):
+                raise TypeError("defaults.kv_bits must be a number.")
+            if not math.isfinite(self.kv_bits) or self.kv_bits <= 0:
+                raise ValueError("defaults.kv_bits must be a finite positive number.")
+        if self.kv_group_size is not None:
+            _validate_positive_int(self.kv_group_size, "defaults.kv_group_size")
+        if self.kv_quant_scheme is not None and not isinstance(self.kv_quant_scheme, str):
+            raise TypeError("defaults.kv_quant_scheme must be a string.")
+        if self.quantized_kv_start is not None:
+            if isinstance(self.quantized_kv_start, bool) or not isinstance(
+                self.quantized_kv_start, Integral
+            ):
+                raise TypeError("defaults.quantized_kv_start must be an integer.")
+            if self.quantized_kv_start < 0:
+                raise ValueError("defaults.quantized_kv_start must not be negative.")
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
@@ -202,6 +225,10 @@ class GenerationRequest:
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
     release batches it. At most one of ``image`` and ``audio`` per request.
+
+    ``logits_processors`` are this row's own ``(tokens, logits) -> logits`` callables,
+    run in order on its slice before it draws, and shown the same history on every path
+    so a row answers the same batched or alone. They keep state: never share them.
     """
 
     prompt: str | None = None
@@ -210,17 +237,31 @@ class GenerationRequest:
     audio: Any | None = None
     max_tokens: int | None = None
     sampling: SamplingParams | None = None
+    logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
+
+    def __post_init__(self):
+        if self.logits_processors is None:
+            return
+        try:
+            processors = tuple(self.logits_processors)
+        except TypeError as exc:
+            raise TypeError(
+                "logits_processors must be a sequence of callables."
+            ) from exc
+        if any(not callable(processor) for processor in processors):
+            raise TypeError("Every logits processor must be callable.")
+        object.__setattr__(self, "logits_processors", processors)
 
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """Sampled-token output with text from the backend's streaming detokenizer."""
 
     token_ids: list[int]
     text: str
     logprobs: list[float]
     finish_reason: Literal["stop", "length", "stop_string"]
     stop_match: str | None = None
+    prompt_token_count: int = 0
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -300,6 +341,11 @@ def _validate_text_requests(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+    _validate_text_defaults(defaults)
+    return validated
+
+
+def _validate_text_defaults(defaults: GenerationDefaults) -> None:
     refused_kv = [
         name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
     ]
@@ -309,7 +355,137 @@ def _validate_text_requests(
             f"mlx-lm text path (installed: {_installed_mlx_lm_version()}); "
             "omit these controls."
         )
-    return validated
+
+
+def _kv_quant_options(defaults: GenerationDefaults) -> dict:
+    """The caller's KV-quant controls, which validation has already vetted."""
+    return {
+        name: getattr(defaults, name)
+        for name in _KV_QUANT_CONTROLS
+        if getattr(defaults, name) is not None
+    }
+
+
+def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:
+    """The controls a batch cache is built with.
+
+    A sequential decode quantizes a turboquant cache once it reaches the start; a batch
+    decides at construction, so mlx-vlm's default start (5000) leaves a shorter batch
+    unquantized for good. Building from the first token is what was asked.
+    """
+    options = _kv_quant_options(defaults)
+    if "quantized_kv_start" not in options and _vlm_turboquant(defaults):
+        options["quantized_kv_start"] = 0
+    return options
+
+
+def _vlm_turboquant(defaults: GenerationDefaults) -> bool:
+    """Whether these controls make mlx-vlm build a turboquant cache."""
+    if defaults.kv_bits is None:
+        return False
+    try:
+        return bool(_resolve_vlm_batch_module().turboquant_enabled(
+            defaults.kv_bits, defaults.kv_quant_scheme))
+    except Exception:
+        return False
+
+
+def _vlm_kv_controls_refused(defaults: GenerationDefaults) -> list[str]:
+    """The KV-quant controls set here that mlx-vlm would drop rather than apply."""
+    requested = [
+        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
+    ]
+    if not requested:
+        return []
+    try:
+        accepted = inspect.signature(
+            _resolve_vlm_batch_module().BatchGenerator.__init__
+        ).parameters
+    except Exception:
+        return requested
+    refused = [name for name in requested if name not in accepted]
+    scheme = defaults.kv_quant_scheme
+    if scheme is not None and "kv_quant_scheme" not in refused and scheme not in _vlm_kv_quant_schemes():
+        # Any other name quietly resolves to uniform.
+        refused.append("kv_quant_scheme")
+    if defaults.kv_bits is None:
+        # Every other control reads off kv_bits, so without it none of them build anything.
+        refused += [name for name in requested if name != "kv_bits" and name not in refused]
+        return refused
+    turbo = _vlm_turboquant(defaults)
+    # Fractional bits make the cache turboquant whatever the scheme says; a turboquant cache
+    # takes no group size; quantized_kv_start gates only a turboquant cache.
+    dropped = ["kv_group_size"] if turbo else ["quantized_kv_start"]
+    if turbo and scheme is not None and scheme != "turboquant":
+        dropped.append("kv_quant_scheme")
+    refused += [name for name in dropped if name in requested and name not in refused]
+    return refused
+
+
+def _vlm_kv_quant_schemes() -> tuple[str, ...]:
+    """The scheme names the installed mlx-vlm resolves."""
+    try:
+        from mlx_vlm import kv_quant
+
+        return (kv_quant.UNIFORM_SCHEME, kv_quant.TURBOQUANT_SCHEME)
+    except Exception:
+        return ("uniform", "turboquant")
+
+
+def vlm_batch_adds_special_tokens(model, processor) -> bool:
+    """Whether a batched prompt is tokenized with the tokenizer's own special tokens.
+
+    A Gemma template writes ``<bos>`` itself, so a processor carrying one must not add
+    another. A caller whose rendered prompt already opens with the BOS text strips it
+    when this is true, or the batch would see two.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type in ("gemma3", "gemma3n", "gemma4", "gemma4_unified"):
+        return getattr(processor, "chat_template", None) is None
+    return True
+
+
+def _vlm_quantized_cache_gap(model, defaults: GenerationDefaults) -> str | None:
+    """Why mlx-vlm would refuse to quantize this model's batch cache, or None.
+
+    It refuses while building the batch, after the rows were admitted, for a cache
+    that converts itself (``to_batch``); asked here so a caller can decline first.
+    """
+    if defaults.kv_bits is None:
+        return None
+    make_cache = getattr(getattr(model, "language_model", model), "make_cache", None)
+    if not callable(make_cache):
+        return None
+    try:
+        from mlx_vlm.models.cache import should_quantize_kv_layer
+    except ImportError:
+        should_quantize_kv_layer = lambda index, count: True  # noqa: E731
+    try:
+        entries = list(make_cache())
+    except Exception:
+        return None
+    for index, entry in enumerate(entries):
+        if hasattr(entry, "to_batch") and should_quantize_kv_layer(index, len(entries)):
+            return (
+                f"{type(entry).__name__} keeps model-specific cache state that "
+                f"{_installed_mlx_vlm_version()} cannot quantize across a batch; "
+                "omit kv_bits."
+            )
+    return None
+
+
+def _unpadded_lengths(mask) -> list[int] | None:
+    """Each row's own prompt length from the attention mask, or None without one.
+
+    mlx-vlm left-pads a prefill batch to its widest prompt, so the padded width is
+    not what a shorter row cost.
+    """
+    if mask is None:
+        return None
+    try:
+        return [int(n) for n in mask.sum(axis=-1).tolist()]
+    except Exception:
+        return None
 
 
 def _validate_vlm_requests(
@@ -343,6 +519,11 @@ def _validate_vlm_requests(
         if isinstance(request.image, os.PathLike):
             # mlx-vlm's loader opens str paths only.
             validated[index] = replace(request, image=os.fspath(request.image))
+    _validate_vlm_defaults(defaults)
+    return validated
+
+
+def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -351,17 +532,12 @@ def _validate_vlm_requests(
             "batched vision generation (got "
             f"{defaults.prefill_batch_size} > {defaults.completion_batch_size})."
         )
-    refused_kv = [
-        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
-    ]
+    refused_kv = _vlm_kv_controls_refused(defaults)
     if refused_kv:
-        # Whether these bound anything depends on the release, the rest of the
-        # configuration, and the model's own cache classes, which upstream
-        # resolves per layer. None is forwarded rather than promise a bound
-        # that may not exist.
         raise ValueError(
-            f"{' and '.join(refused_kv)} are not forwarded by this engine's "
-            "batched vision path; omit these controls, or use model.generate."
+            f"{' and '.join(refused_kv)} would be dropped rather than applied by "
+            f"{_installed_mlx_vlm_version()}'s batch generator; omit these "
+            "controls, or use model.generate."
         )
     if defaults.max_kv_size is not None:
         # No supported BatchGenerator takes a KV-window control, so say so rather
@@ -371,7 +547,6 @@ def _validate_vlm_requests(
             f"{_installed_mlx_vlm_version()} exposes no KV-window control on "
             "its batch generator. Omit it, or use model.generate."
         )
-    return validated
 
 
 def _api_shape_error(details: str) -> RuntimeError:
@@ -476,6 +651,171 @@ def _probe_sampler_api(sample_utils_module):
         raise _api_shape_error("make_sampler call signature is incompatible") from exc
 
 
+def _draws_seeded(sampling: SamplingParams) -> bool:
+    return sampling.seed is not None and sampling.temperature != 0
+
+
+def _seeded_sampler(sample_utils_module, params: SamplingParams):
+    """``make_sampler``'s chain drawing from a request key instead of global RNG."""
+    import mlx.core as mx
+
+    if params.temperature == 0:
+        return lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+    stages = []
+    if 0 < params.top_p < 1.0:
+        stages.append(lambda x: sample_utils_module.apply_top_p(x, params.top_p))
+    if params.min_p != 0.0:
+        stages.append(lambda x: sample_utils_module.apply_min_p(x, params.min_p, 1))
+    if params.top_k > 0:
+        stages.append(lambda x: sample_utils_module.apply_top_k(x, params.top_k))
+
+    state = {"key": mx.random.key(params.seed)}
+
+    def sampler(logprobs):
+        for stage in stages:
+            logprobs = stage(logprobs)
+        state["key"], subkey = mx.random.split(state["key"])
+        return mx.random.categorical(logprobs * (1 / params.temperature), key=subkey)
+
+    return sampler
+
+
+def _sampler_key(params: SamplingParams):
+    return (params.temperature, params.top_p, params.top_k, params.min_p)
+
+
+def _sampler_for(sample_utils_module, params: SamplingParams, make_sampler):
+    if _draws_seeded(params):
+        return _seeded_sampler(sample_utils_module, params)
+    return make_sampler(
+        temp=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        min_p=params.min_p,
+    )
+
+
+def _sequential_history(processor):
+    """A processor shown only the last prompt token and what followed it.
+
+    How much prompt a processor sees is otherwise an accident of the prefill, and a
+    repetition penalty windows recent tokens, so that accident would decide the reply.
+    """
+    state = {"offset": None}
+
+    def _shown(tokens, logits):
+        if state["offset"] is None:
+            state["offset"] = max(int(tokens.shape[0]) - 1, 0)
+        return processor(tokens[state["offset"] :], logits)
+
+    return _shown
+
+
+def _row_processors(request: GenerationRequest) -> list:
+    return [_sequential_history(fn) for fn in (request.logits_processors or ())]
+
+
+class _PerRowSampler:
+
+    def __init__(self, params, *, sample_utils_module, make_sampler):
+        self._sample_utils = sample_utils_module
+        self._make_sampler = make_sampler
+        self._params = list(params)
+        self._by_uid: dict[Any, Any] = {}
+        self._samplers: dict[Any, Any] = {}
+        self._generator = None
+        self.row_uids: list[Any] = []
+
+    def bind_uids(self, uids) -> None:
+        if len(uids) != len(self._params):
+            raise RuntimeError(
+                f"batch admitted {len(uids)} rows for {len(self._params)} "
+                "requests; per-row sampling cannot be matched to rows."
+            )
+        self._by_uid.clear()
+        self.row_uids.clear()
+        for uid, params in zip(uids, self._params):
+            self.register(uid, params)
+
+    def register(self, uid, params: SamplingParams) -> None:
+        self._by_uid[uid] = params
+        self.row_uids.append(uid)
+
+    def release(self, uid) -> None:
+        self._by_uid.pop(uid, None)
+        self._samplers.pop(uid, None)
+        if uid in self.row_uids:
+            self.row_uids.remove(uid)
+
+    def release_all(self) -> None:
+        self._by_uid.clear()
+        self._samplers.clear()
+        self.row_uids.clear()
+
+    def bind_generator(self, generator) -> None:
+        self._generator = generator
+
+    def _row_sampler(self, uid):
+        sampler = self._samplers.get(uid)
+        if sampler is None:
+            params = self._by_uid.get(uid)
+            if params is None:
+                raise RuntimeError(
+                    f"{_installed_mlx_vlm_version()} drew a row this batch was "
+                    "not given, so per-row sampling cannot be matched to rows."
+                )
+            sampler = _sampler_for(self._sample_utils, params, self._make_sampler)
+            self._samplers[uid] = sampler
+        return sampler
+
+    def _drawing_uids(self, width, positions):
+
+        if self._generator is not None and positions is not None:
+            name = (
+                "_prompt_batch"
+                if all(position == 0 for position in positions)
+                else "_generation_batch"
+            )
+            batch = getattr(self._generator, name, _MISSING)
+            if batch is not _MISSING:
+                uids = list(getattr(batch, "uids", ()) or ())
+                if len(uids) != width:
+                    raise RuntimeError(
+                        f"{_installed_mlx_vlm_version()} drew {width} rows from a "
+                        f"{name.lstrip('_').replace('_', ' ')} holding {len(uids)}, "
+                        "so per-row sampling cannot be matched to rows."
+                    )
+                return uids
+        if width != len(self.row_uids):
+            raise RuntimeError(
+                f"{_installed_mlx_vlm_version()} stepped a batch of {width} rows "
+                f"while {len(self.row_uids)} were tracked as live, so per-row "
+                "sampling cannot be matched to rows. Give every request in a "
+                "batch the same sampling settings and no seed, or pin a release "
+                "whose batch admits and retires rows through its event stream."
+            )
+        return self.row_uids
+
+    def sample_target(self, logprobs, *, row_ids=None, positions=None):
+        return self._draw(logprobs, positions)
+
+    def __call__(self, logprobs):
+        return self._draw(logprobs, None)
+
+    def _draw(self, logprobs, positions):
+        import mlx.core as mx
+
+        uids = self._drawing_uids(logprobs.shape[0], positions)
+        return mx.concatenate(
+            [
+                self._row_sampler(uid)(logprobs[row : row + 1])
+                for row, uid in enumerate(uids)
+            ],
+            axis=0,
+        )
+
+
 def _iter_model_modules(model) -> list[Any]:
     named_modules = getattr(model, "named_modules", None)
     if callable(named_modules):
@@ -553,6 +893,14 @@ def _restore_metal_limits(snapshot: dict[str, int] | None):
         raise first_error
 
 
+def _require_evaluable(model):
+    """The model's eval(), or a refusal: what switches a model out of training."""
+    switch = getattr(model, "eval", None)
+    if not callable(switch):
+        raise TypeError("generation_mode requires a model with eval().")
+    return switch
+
+
 @contextmanager
 def generation_mode(model):
     """Temporarily switch a model to eval mode and steward global MLX limits.
@@ -574,10 +922,7 @@ def generation_mode(model):
         if _GENERATION_MODE_DEPTH == 0:
             _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
         training_states = _snapshot_training_flags(model)
-        eval_model = getattr(model, "eval", None)
-        if not callable(eval_model):
-            raise TypeError("generation_mode requires a model with eval().")
-        eval_model()
+        _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
         yield model
@@ -850,6 +1195,51 @@ def _install_arrays_cache_advance_fix():
             _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED = True
 
 
+@dataclass(frozen=True)
+class GenerationEvent:
+    """One row's progress through a batch, in the order the batch produced it.
+
+    ``prompt_tokens`` and ``generated_tokens`` are the row's counts so far, carried on
+    every event so a caller that stops a batch early can still report usage. ``result``
+    arrives only when the row ends on its own.
+    """
+
+    index: int
+    delta: str = ""
+    result: GenerationResult | None = None
+    prompt_tokens: int = 0
+    generated_tokens: int = 0
+
+
+class BatchRowRefused(ValueError):
+    """A row a batch will not take, for what it is rather than for being wrong."""
+
+
+def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEvent]:
+    delta = state.release()
+    if delta:
+        yield GenerationEvent(
+            index=index,
+            delta=delta,
+            prompt_tokens=state.prompt_token_count,
+            generated_tokens=len(state.token_ids),
+        )
+
+
+def _finished_events(
+    index: int,
+    state: "_PendingResult",
+    tokenizer,
+) -> Iterator[GenerationEvent]:
+    yield GenerationEvent(
+        index=index,
+        delta=state.release(),
+        result=state.result(tokenizer),
+        prompt_tokens=state.prompt_token_count,
+        generated_tokens=len(state.token_ids),
+    )
+
+
 class _StopStringScanner:
     """Incrementally search new detokenized text with longest-stop lookback."""
 
@@ -960,15 +1350,28 @@ def _replay_stream_text(detokenizer, token_ids: Sequence[int]) -> str:
     return text + detokenizer.last_segment
 
 
+def _cancelled_result(tokenizer, state: "_PendingResult") -> GenerationResult:
+    if state.finish_reason is None:
+        state.finish(tokenizer, "stop")
+    return state.result(tokenizer)
+
+
 @dataclass
 class _PendingResult:
     detokenizer: Any
     scanner: _StopStringScanner
+    prompt_token_count: int = 0
     token_ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     text: str = ""
+    released: int = 0
     finish_reason: Literal["stop", "length", "stop_string"] | None = None
     stop_match: str | None = None
+
+    def release(self) -> str:
+        delta = self.text[self.released :]
+        self.released = len(self.text)
+        return delta
 
     def _apply_stop_match(
         self,
@@ -990,6 +1393,7 @@ class _PendingResult:
         del self.token_ids[keep:]
         del self.logprobs[keep:]
         self.text = _replay_stream_text(self.detokenizer, self.token_ids)
+        self.released = min(self.released, len(self.text))
         self.finish_reason = "stop_string"
 
     def add_terminal(self, token: int, logprob: float):
@@ -1024,6 +1428,7 @@ class _PendingResult:
             logprobs=list(self.logprobs),
             finish_reason=self.finish_reason,
             stop_match=self.stop_match,
+            prompt_token_count=self.prompt_token_count,
         )
 
 
@@ -1072,6 +1477,178 @@ def _sampled_logprob(event) -> float:
     return float(value)
 
 
+def _warn_preserving(
+    what: str,
+    active_error: BaseException,
+    secondary: BaseException,
+) -> None:
+    """Report a second failure that must not replace the error already in flight."""
+    try:
+        warnings.warn(
+            f"{what} failed while preserving an active "
+            f"{type(active_error).__name__}: {secondary}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    except BaseException:
+        pass
+
+
+class _TextBatchSession:
+    """One mlx-lm ``BatchGenerator`` with its row set left open."""
+
+    def __init__(self, adapter: "_TextBatchAdapter"):
+        self.adapter = adapter
+        defaults = adapter.defaults
+        self.generator = adapter.batch_generator_type(
+            adapter.model,
+            max_tokens=defaults.max_tokens,
+            stop_tokens=_eos_stop_tokens(adapter.tokenizer),
+            prefill_batch_size=defaults.prefill_batch_size,
+            completion_batch_size=defaults.completion_batch_size,
+            max_kv_size=defaults.max_kv_size,
+        )
+        self._row_signature = None
+        self._pending: dict[int, _PendingResult] = {}
+        self._row_of: dict[int, int] = {}
+        self._uid_of: dict[int, int] = {}
+        self._next_row = 0
+        self.usable = True
+
+    @property
+    def rows_in_flight(self) -> int:
+        return len(self._pending)
+
+    def add(self, request: GenerationRequest) -> int:
+        adapter = self.adapter
+        defaults = adapter.defaults
+        prompt = _encode_prompt(adapter.tokenizer, request)
+        params = request.sampling or defaults.sampling
+        sampler = (
+            _seeded_sampler(adapter.sample_utils, params)
+            if params.seed is not None
+            else adapter.make_sampler(
+                temp=params.temperature,
+                top_p=params.top_p,
+                top_k=params.top_k,
+                min_p=params.min_p,
+            )
+        )
+        try:
+            uids = self.generator.insert(
+                [prompt],
+                max_tokens=[int(request.max_tokens or defaults.max_tokens)],
+                samplers=[sampler],
+                logits_processors=[_row_processors(request)],
+            )
+        except BaseException:
+            self.usable = False
+            raise
+        try:
+            if len(uids) != 1:
+                raise RuntimeError(
+                    f"mlx-lm answered a one-prompt insert with {len(uids)} uids."
+                )
+            uid = uids[0]
+            state = _PendingResult(
+                detokenizer=_new_detokenizer(adapter.tokenizer),
+                scanner=_StopStringScanner(defaults.stop_strings),
+                prompt_token_count=len(prompt),
+            )
+        except BaseException as active_error:
+            try:
+                self.generator.remove(list(uids))
+            except BaseException as rollback_error:
+                self.usable = False
+                _warn_preserving(
+                    "handing a rejected row back to mlx-lm",
+                    active_error,
+                    rollback_error,
+                )
+            raise
+        row = self._next_row
+        self._next_row += 1
+        self._pending[uid] = state
+        self._row_of[uid] = row
+        self._uid_of[row] = uid
+        return row
+
+    def cancel(self, row: int) -> bool:
+        return self._take_back(row) is not None
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        state = self._take_back(row)
+        return None if state is None else _cancelled_result(self.adapter.tokenizer, state)
+
+    def _take_back(self, row: int) -> "_PendingResult | None":
+        uid = self._uid_of.get(row)
+        if uid is None or uid not in self._pending:
+            return None
+        try:
+            self.generator.remove([uid])
+        except BaseException:
+            self.usable = False
+            raise
+        state = self._pending[uid]
+        self._retire(uid)
+        return state
+
+    def step(self) -> Iterator[GenerationEvent]:
+        if not self._pending:
+            return
+        try:
+            responses = self.generator.next_generated()
+            if not responses:
+                raise RuntimeError(
+                    "mlx-lm ended its event stream before every request "
+                    "reported a finish reason."
+                )
+            for response in responses:
+                yield from self._consume(response)
+        except BaseException:
+            self.usable = False
+            raise
+
+    def close(self):
+        self.generator.close()
+
+    def _retire(self, uid: int):
+        row = self._row_of.pop(uid, None)
+        self._pending.pop(uid, None)
+        if row is not None:
+            self._uid_of.pop(row, None)
+
+    def _consume(self, response) -> Iterator[GenerationEvent]:
+        state = self._pending.get(response.uid)
+        if state is None:
+            return
+        row = self._row_of[response.uid]
+        finish_reason = response.finish_reason
+        if finish_reason is None:
+            stopped = state.append(
+                self.adapter.tokenizer,
+                int(response.token),
+                _sampled_logprob(response),
+            )
+            if not stopped:
+                yield from _text_events(row, state)
+                return
+            self.generator.remove([response.uid])
+            yield from _finished_events(row, state, self.adapter.tokenizer)
+            self._retire(response.uid)
+            return
+        if finish_reason not in ("stop", "length"):
+            raise RuntimeError(
+                "mlx-lm emitted an unsupported finish reason: "
+                f"{finish_reason!r}."
+            )
+        if finish_reason == "length":
+            state.add_terminal(int(response.token), _sampled_logprob(response))
+        state.finish(self.adapter.tokenizer, finish_reason)
+        yield from _finished_events(row, state, self.adapter.tokenizer)
+        self._retire(response.uid)
+
+
 class _TextBatchAdapter:
     def __init__(self, model, tokenizer, defaults: GenerationDefaults):
         generate_module = importlib.import_module("mlx_lm.generate")
@@ -1080,97 +1657,25 @@ class _TextBatchAdapter:
         _probe_sampler_api(sample_utils_module)
         self.batch_generator_type = generate_module.BatchGenerator
         self.make_sampler = sample_utils_module.make_sampler
+        self.sample_utils = sample_utils_module
         self.model = model
         self.tokenizer = tokenizer
         self.defaults = defaults
 
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        prompts = [_encode_prompt(self.tokenizer, request) for request in requests]
-        max_tokens = [
-            int(request.max_tokens or self.defaults.max_tokens)
-            for request in requests
-        ]
-        sampling = [
-            request.sampling or self.defaults.sampling
-            for request in requests
-        ]
-        samplers = [
-            self.make_sampler(
-                temp=params.temperature,
-                top_p=params.top_p,
-                top_k=params.top_k,
-                min_p=params.min_p,
-            )
-            for params in sampling
-        ]
-        generator = self.batch_generator_type(
-            self.model,
-            max_tokens=self.defaults.max_tokens,
-            stop_tokens=_eos_stop_tokens(self.tokenizer),
-            prefill_batch_size=self.defaults.prefill_batch_size,
-            completion_batch_size=self.defaults.completion_batch_size,
-            max_kv_size=self.defaults.max_kv_size,
-        )
+    def stream(self, requests: Sequence[GenerationRequest]) -> Iterator[GenerationEvent]:
+        session = _TextBatchSession(self)
         active_error = None
         try:
-            uids = generator.insert(
-                prompts,
-                max_tokens=max_tokens,
-                samplers=samplers,
-                logits_processors=[[] for _ in requests],
-            )
-            pending = {
-                uid: _PendingResult(
-                    detokenizer=_new_detokenizer(self.tokenizer),
-                    scanner=_StopStringScanner(self.defaults.stop_strings),
-                )
-                for uid in uids
-            }
-            completed: dict[int, GenerationResult] = {}
-            while pending:
-                events = generator.next_generated()
-                if not events:
-                    raise RuntimeError(
-                        "mlx-lm ended its event stream before every request "
-                        "reported a finish reason."
-                    )
-                for event in events:
-                    state = pending.get(event.uid)
-                    if state is None:
-                        continue
-                    finish_reason = event.finish_reason
-                    if finish_reason is None:
-                        stopped = state.append(
-                            self.tokenizer,
-                            int(event.token),
-                            _sampled_logprob(event),
-                        )
-                        if stopped:
-                            generator.remove([event.uid])
-                            completed[event.uid] = state.result(self.tokenizer)
-                            del pending[event.uid]
-                            continue
-                        continue
-                    if finish_reason not in ("stop", "length"):
-                        raise RuntimeError(
-                            "mlx-lm emitted an unsupported finish reason: "
-                            f"{finish_reason!r}."
-                        )
-                    if finish_reason == "length":
-                        state.add_terminal(
-                            int(event.token),
-                            _sampled_logprob(event),
-                        )
-                    state.finish(self.tokenizer, finish_reason)
-                    completed[event.uid] = state.result(self.tokenizer)
-                    del pending[event.uid]
-            return [completed[uid] for uid in uids]
+            for request in requests:
+                session.add(request)
+            while session.rows_in_flight:
+                yield from session.step()
         except BaseException as exc:
             active_error = exc
             raise
         finally:
             try:
-                generator.close()
+                session.close()
             except BaseException as close_error:
                 if active_error is None:
                     raise
@@ -1286,6 +1791,207 @@ def _probe_vlm_api(batch_module):
     return constructor, insert, _resolve_cancel(generator)
 
 
+def _statements(body):
+
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield node
+        yield from _statements(list(ast.iter_child_nodes(node)))
+
+
+def _draws_by_position(owner, method) -> bool:
+    """Whether this draw hands the sampler the rows and positions it draws at."""
+
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(owner, method))))
+    except (AttributeError, OSError, TypeError, SyntaxError, IndentationError):
+        return False
+    definition = tree.body[0] if tree.body else None
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for node in _statements(definition.body):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func
+        name = (
+            called.attr if isinstance(called, ast.Attribute)
+            else called.id if isinstance(called, ast.Name)
+            else None
+        )
+        if name != "_sample_with_positions":
+            continue
+        given = {keyword.arg: keyword.value for keyword in node.keywords}
+        if not {"row_ids", "positions"}.issubset(given):
+            continue
+        if any(
+            isinstance(given[argument], ast.Constant) and given[argument].value is None
+            for argument in ("row_ids", "positions")
+        ):
+            continue
+        return True
+    return False
+
+
+def _vlm_batches_observable(batch_module) -> bool:
+
+    generator = getattr(batch_module, "BatchGenerator", None)
+    code = getattr(getattr(generator, "__init__", None), "__code__", None)
+    if not {"_prompt_batch", "_generation_batch"}.issubset(
+        getattr(code, "co_names", ())
+    ):
+        return False
+    return _draws_by_position(
+        getattr(batch_module, "PromptProcessingBatch", None), "generate"
+    ) and _draws_by_position(
+        getattr(batch_module, "GenerationBatch", None), "_step"
+    )
+
+
+_LAYER_MAJOR_PROMPT_KWARGS = frozenset({"deepstack_visual_embeds"})
+
+
+def _padded_prompt_kwargs(batch_module) -> frozenset:
+
+    return frozenset({
+        "inputs_embeds",
+        *(getattr(batch_module, "_SEQUENCE_ALIGNED_PROMPT_KWARGS", None) or ()),
+    })
+
+
+def _row_shape(key, value, padded: frozenset):
+
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        if isinstance(value, (list, tuple)):
+            return (type(value).__name__,
+                    tuple(_row_shape(key, item, padded) for item in value))
+        if value is None or isinstance(value, (str, bytes, int, float, bool)):
+            return value
+        return type(value).__name__
+    shape = list(shape)
+    if key in padded:
+        axis = 2 if key == "position_ids" and len(shape) == 3 else 1
+        if axis < len(shape):
+            shape[axis] = None
+    return tuple(shape)
+
+
+def _row_signature(prepared: dict, padded: frozenset) -> dict:
+    return {key: _row_shape(key, value, padded) for key, value in prepared.items()}
+
+
+def _own_body(method):
+
+    source = textwrap.dedent(inspect.getsource(method))
+    definition = ast.parse(source).body[0]
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise TypeError("not a function definition")
+    nested = {
+        inner for node in ast.walk(definition)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        and node is not definition
+        for inner in ast.walk(node)
+    }
+    return [node for node in ast.walk(definition) if node not in nested]
+
+
+def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
+    """Whether preparing a request leaves anything on this model.
+
+    Follows the helpers the method calls on itself, since several models assign one call
+    down. A ``self.<name>(...)`` with no readable body is a submodule being run -- every
+    vision model runs its tower that way -- and is stepped over. A binding counts wherever
+    its target leads back to ``self``; mutating a container the model already holds does
+    not, nor does reaching ``self`` indirectly.
+    """
+
+    seen = set()
+
+    def follows(name, entry = False) -> bool:
+        if name in seen:
+            return False
+        seen.add(name)
+        try:
+            body = _own_body(getattr(model, name))
+        except (AttributeError, OSError, TypeError, SyntaxError, IndentationError):
+            return entry
+        calls = set()
+        for node in body:
+            targets = (
+                list(node.targets) if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor,
+                                     ast.comprehension))
+                else [item.optional_vars for item in node.items if item.optional_vars]
+                if isinstance(node, (ast.With, ast.AsyncWith))
+                else []
+            )
+            while targets:
+                target = targets.pop()
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    targets.extend(target.elts)
+                    continue
+                if isinstance(target, ast.Starred):
+                    targets.append(target.value)
+                    continue
+                while isinstance(target, (ast.Attribute, ast.Subscript)):
+                    target = target.value
+                if isinstance(target, ast.Name) and target.id == "self":
+                    return True
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "setattr"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "self"
+                ):
+                    return True
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    calls.add(node.func.attr)
+        return any(follows(call) for call in sorted(calls))
+
+    return follows(method, entry = True)
+
+
+def _require_streamable_vlm(adapter: "_VLMBatchAdapter") -> None:
+
+    if not adapter.per_row_prompt_kwargs:
+        raise ValueError(
+            f"{_installed_mlx_vlm_version()} admits one set of embeddings for a "
+            "whole prefill batch, so a vision row cannot join a batch it was not "
+            "preprocessed with. Generate with generate_batch or stream_batch, or "
+            "upgrade mlx-vlm."
+        )
+    if not adapter.batches_observable:
+        raise ValueError(
+            f"{_installed_mlx_vlm_version()} does not let a sampler tell which "
+            "row it is drawing for, which a batch that widens while it decodes "
+            "needs. Generate with generate_batch or stream_batch, or upgrade "
+            "mlx-vlm."
+        )
+    if not callable(getattr(adapter.batch_module, "_chunked_prefill_enabled", None)):
+        raise ValueError(
+            f"{_installed_mlx_vlm_version()} settles how to prefill when the "
+            "batch is built, before any prompt has arrived, so a row whose model "
+            "needs its prompt prefilled in one pass would be chunked anyway. "
+            "Generate with generate_batch or stream_batch, which build a batch "
+            "around the prompts it holds, or upgrade mlx-vlm."
+        )
+    if _keeps_what_it_prepared(adapter.model):
+        raise ValueError(
+            "This model keeps what it worked out about one request, which a "
+            "batch admitting requests one at a time would hand to whichever "
+            "prepared last. Generate it with generate_batch or stream_batch, "
+            "which prepare a whole batch together."
+        )
+
+
 def _resolve_cancel(generator):
     """How this generator cancels one sequence, decided once.
 
@@ -1353,6 +2059,36 @@ def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[
     return rows
 
 
+def _resolve_vlm_batch_module():
+
+    batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
+    if batch_module is None:
+        raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
+    # Bind the module the class is DEFINED in, where the private helpers live.
+    defining = getattr(batch_module.BatchGenerator, "__module__", None)
+    if defining and defining != batch_module.__name__:
+        try:
+            batch_module = importlib.import_module(defining)
+        except Exception:
+            pass
+    return batch_module
+
+
+def row_logits_processors_unavailable_reason() -> str | None:
+    """Why a batched vision row here cannot carry its own logits processors."""
+
+    try:
+        _, insert_params, _ = _probe_vlm_api(_resolve_vlm_batch_module())
+    except Exception as refusal:
+        return str(refusal)
+    if "logits_processors" in insert_params:
+        return None
+    return (
+        f"{_installed_mlx_vlm_version()} takes no per-row logits processors, "
+        "so a batched vision reply cannot carry a penalty or bias"
+    )
+
+
 class _VLMBatchAdapter:
     """Event-level adapter over mlx-vlm's BatchGenerator.
 
@@ -1361,18 +2097,10 @@ class _VLMBatchAdapter:
     release's chunked-prefill policy, and the wired-limit window.
     """
 
-    def __init__(self, model, processor, defaults: GenerationDefaults):
-        batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
-        if batch_module is None:
-            raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
-        # Bind the module the class is DEFINED in: that is where the private
-        # helpers and event class live, however the package re-exports them.
-        defining = getattr(batch_module.BatchGenerator, "__module__", None)
-        if defining and defining != batch_module.__name__:
-            try:
-                batch_module = importlib.import_module(defining)
-            except Exception:
-                pass
+    def __init__(
+        self, model, processor, defaults: GenerationDefaults, *, audio_warn_stacklevel = 3,
+    ):
+        batch_module = _resolve_vlm_batch_module()
         (
             self.constructor_params,
             insert_params,
@@ -1381,6 +2109,9 @@ class _VLMBatchAdapter:
         self.batch_module = batch_module
         self.generator_type = batch_module.BatchGenerator
         self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
+        self.row_logits_processors = "logits_processors" in insert_params
+        self.batches_observable = _vlm_batches_observable(batch_module)
+        self.padded_prompt_kwargs = _padded_prompt_kwargs(batch_module)
         self.stream_module = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
         utils = importlib.import_module("mlx_vlm.utils")
         self.prepare_inputs = utils.prepare_inputs
@@ -1388,9 +2119,11 @@ class _VLMBatchAdapter:
         sample_utils = importlib.import_module("mlx_lm.sample_utils")
         _probe_sampler_api(sample_utils)
         self.make_sampler = sample_utils.make_sampler
+        self.sample_utils = sample_utils
         self.model = model
         self.processor = processor
         self.defaults = defaults
+        self.audio_warn_stacklevel = audio_warn_stacklevel
 
     def _wired_limit(self):
         """Raise the wired limit, which ``generation_mode`` restores but never raises."""
@@ -1418,11 +2151,7 @@ class _VLMBatchAdapter:
             return _null_context()
 
     def _add_special_tokens(self) -> bool:
-        config = getattr(self.model, "config", None)
-        model_type = getattr(config, "model_type", None)
-        if model_type in ("gemma3", "gemma3n", "gemma4", "gemma4_unified"):
-            return getattr(self.processor, "chat_template", None) is None
-        return True
+        return vlm_batch_adds_special_tokens(self.model, self.processor)
 
     def _chunked_prefill_kwargs(self, *, input_ids=None, prefill_kwargs=None) -> dict:
         """Apply the release's chunked-prefill policy, which needs real inputs."""
@@ -1455,6 +2184,17 @@ class _VLMBatchAdapter:
         if callable(upstream) and callable(mrope_aware):
             return upstream(prompt_kwargs, batch_size)
         return _split_prompt_kwargs_fallback(prompt_kwargs, batch_size)
+
+    def _row_logits_processors(self, requests) -> list[list] | None:
+        rows = [_row_processors(request) for request in requests]
+        if not any(rows):
+            return None
+        if not self.row_logits_processors:
+            raise _vlm_api_shape_error(
+                "BatchGenerator.insert does not take logits_processors, so a "
+                "request cannot carry a penalty or bias into a batch"
+            )
+        return rows
 
     def _admission_stalled(self, generator) -> bool | None:
         """True when no prompt can ever be admitted; None when unobservable.
@@ -1491,18 +2231,13 @@ class _VLMBatchAdapter:
         # Prompt length is part of the key: preprocessing stacks a group without
         # padding, so mixing lengths raises instead of generating. Grouping by
         # length keeps varied batches working, at the cost of smaller groups.
-        sampling = request.sampling or self.defaults.sampling
         shape = self._image_shape(request.image)
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        return (
-            sampling.temperature,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-            request.image is None,
-            shape,
-            len(tokenizer.encode(request.prompt)),
-        )
+        key = (request.image is None, shape, len(tokenizer.encode(request.prompt)))
+        if self.batches_observable:
+            return key
+        sampling = request.sampling or self.defaults.sampling
+        return (_sampler_key(sampling), *key)
 
     def _decode_image(self, request: GenerationRequest) -> GenerationRequest:
         """Load a path or URL image once, before grouping.
@@ -1552,52 +2287,46 @@ class _VLMBatchAdapter:
             f"Got {type(image).__name__}."
         )
 
-    def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+    def stream(self, requests: Sequence[GenerationRequest]) -> Iterator[GenerationEvent]:
         requests = [self._decode_image(request) for request in requests]
-        results: list[GenerationResult | None] = [None] * len(requests)
-        audio_indices = [
+        audio_rows = [
             index for index, request in enumerate(requests) if request.audio is not None
         ]
-        if audio_indices:
-            # No supported release batches audio.
+        if audio_rows:
             warnings.warn(
-                f"{len(audio_indices)} audio request(s) decode one at a time: "
+                f"{len(audio_rows)} audio request(s) decode one at a time: "
                 f"{_installed_mlx_vlm_version()} batches text and images only.",
                 RuntimeWarning,
-                stacklevel=3,
+                stacklevel = self.audio_warn_stacklevel,
             )
-            for index in audio_indices:
-                results[index] = self._generate_sequentially(requests[index])
+        for index in audio_rows:
+            yield from self._stream_sequentially(index, requests[index])
         groups: dict[Any, list[int]] = {}
         for index, request in enumerate(requests):
             if request.audio is None:
                 groups.setdefault(self._group_key(request), []).append(index)
-        # Older releases slice shared kwargs from row zero on every prefill
-        # batch, pairing later prompts with earlier embeddings, so they run one
-        # chunk per generator. Per-row releases keep the configured sizes.
-        capacity = (
-            None
-            if self.per_row_prompt_kwargs
-            else min(
-                self.defaults.prefill_batch_size,
-                self.defaults.completion_batch_size,
-            )
-        )
         for indices in groups.values():
+            inferred_rows = not self.batches_observable and any(
+                _draws_seeded(requests[index].sampling or self.defaults.sampling)
+                for index in indices
+            )
+            capacity = (
+                None
+                if self.per_row_prompt_kwargs and not inferred_rows
+                else min(
+                    self.defaults.prefill_batch_size,
+                    self.defaults.completion_batch_size,
+                )
+            )
             step = capacity or len(indices)
             for start in range(0, len(indices), step):
-                chunk = indices[start : start + step]
-                for index, result in zip(chunk, self._run_chunk(requests, chunk)):
-                    results[index] = result
-        if any(result is None for result in results):
-            raise RuntimeError(
-                "Internal error: batched vision generation produced no result "
-                f"for {sum(result is None for result in results)} of "
-                f"{len(results)} requests."
-            )
-        return results
+                yield from self._run_chunk(requests, indices[start : start + step])
 
-    def _generate_sequentially(self, request: GenerationRequest) -> GenerationResult:
+    def _stream_sequentially(
+        self,
+        index: int,
+        request: GenerationRequest,
+    ) -> Iterator[GenerationEvent]:
         """One audio request through the release's sequential stream.
 
         The stream's terminal event carries no new token: it repeats the last
@@ -1623,27 +2352,38 @@ class _VLMBatchAdapter:
             request.prompt,
             audio=request.audio,
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
-            sampler=self.make_sampler(
-                temp=sampling.temperature,
-                top_p=sampling.top_p,
-                top_k=sampling.top_k,
-                min_p=sampling.min_p,
+            logits_processors=_row_processors(request),
+            **_kv_quant_options(self.defaults),
+            sampler=(
+                _seeded_sampler(self.sample_utils, sampling)
+                if _draws_seeded(sampling)
+                else self.make_sampler(
+                    temp=sampling.temperature,
+                    top_p=sampling.top_p,
+                    top_k=sampling.top_k,
+                    min_p=sampling.min_p,
+                )
             ),
         )
         for event in events:
+            if previous is None:
+                state.prompt_token_count = int(getattr(event, "prompt_tokens", 0) or 0)
             if previous is not None and state.append(
                 tokenizer,
                 int(previous.token),
                 _event_logprob(previous),
             ):
-                return state.result(tokenizer)
+                yield from _finished_events(index, state, tokenizer)
+                return
+            if previous is not None:
+                yield from _text_events(index, state)
             previous = event
         if previous is None:
             raise RuntimeError(
                 "mlx-vlm produced no events for an audio request."
             )
         state.finish(tokenizer, self._terminal_reason(previous, tokenizer))
-        return state.result(tokenizer)
+        yield from _finished_events(index, state, tokenizer)
 
     @staticmethod
     def _terminal_reason(event, tokenizer) -> Literal["stop", "length"]:
@@ -1673,12 +2413,15 @@ class _VLMBatchAdapter:
         self,
         requests: Sequence[GenerationRequest],
         indices: Sequence[int],
-    ) -> list[GenerationResult]:
+    ) -> Iterator[GenerationEvent]:
         chunk = [requests[index] for index in indices]
         batch_size = len(chunk)
         prompts = [request.prompt for request in chunk]
         images = [request.image for request in chunk if request.image is not None]
-        sampling = chunk[0].sampling or self.defaults.sampling
+        row_sampling = [
+            request.sampling or self.defaults.sampling for request in chunk
+        ]
+        sampling = row_sampling[0]
         config = getattr(self.model, "config", None)
         inputs = self.prepare_inputs(
             self.processor,
@@ -1716,12 +2459,23 @@ class _VLMBatchAdapter:
                 min_p=sampling.min_p,
             ),
         }
+        row_sampler = None
+        if any(_draws_seeded(params) for params in row_sampling) or len(
+            {_sampler_key(params) for params in row_sampling}
+        ) > 1:
+            row_sampler = _PerRowSampler(
+                row_sampling,
+                sample_utils_module=self.sample_utils,
+                make_sampler=self.make_sampler,
+            )
+            options["sampler"] = row_sampler
         if "compute_logprobs" in self.constructor_params:
-            # The public helper turns this off, but logprobs are contract here.
             options["compute_logprobs"] = True
+        options.update(_batch_kv_quant_options(self.defaults))
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
         ]
+        row_processors = self._row_logits_processors(chunk)
         generator = None
         active_error = None
         try:
@@ -1732,8 +2486,6 @@ class _VLMBatchAdapter:
                     mask=mask,
                     **data_kwargs,
                 )
-                # Optional fields enumerate as None and would overwrite valid
-                # prepare_inputs values; upstream filters them the same way.
                 gen_kwargs = {**data_kwargs, **{
                     key: value
                     for key, value in embedding_output.to_dict().items()
@@ -1756,18 +2508,23 @@ class _VLMBatchAdapter:
                     **options,
                 )
                 token_ids = input_ids.tolist()
+                insert_kwargs = {}
                 if self.per_row_prompt_kwargs:
-                    uids = generator.insert(
-                        token_ids,
-                        max_tokens,
-                        prompt_kwargs=self._split_prompt_kwargs(
-                            gen_kwargs,
-                            batch_size,
-                        ),
+                    insert_kwargs["prompt_kwargs"] = self._split_prompt_kwargs(
+                        gen_kwargs,
+                        batch_size,
                     )
-                else:
-                    uids = generator.insert(token_ids, max_tokens)
-                return self._drive(generator, uids, gen_kwargs)
+                if row_processors is not None:
+                    insert_kwargs["logits_processors"] = row_processors
+                uids = generator.insert(token_ids, max_tokens, **insert_kwargs)
+                if row_sampler is not None:
+                    row_sampler.bind_uids(uids)
+                    row_sampler.bind_generator(generator)
+                yield from self._drive(
+                    generator, uids, indices, gen_kwargs, row_sampler,
+                    prompt_token_count=len(token_ids[0]),
+                    prompt_token_counts=_unpadded_lengths(mask),
+                )
         except BaseException as exc:
             active_error = exc
             raise
@@ -1789,17 +2546,34 @@ class _VLMBatchAdapter:
                     except BaseException:
                         pass
 
-    def _drive(self, generator, uids, gen_kwargs) -> list[GenerationResult]:
+    def _drive(
+        self,
+        generator,
+        uids,
+        indices,
+        gen_kwargs,
+        row_sampler=None,
+        prompt_token_count=0,
+        prompt_token_counts=None,
+    ) -> Iterator[GenerationEvent]:
+        """Report the chunk's rows, charging each its own prompt count, or
+        ``prompt_token_count`` to every row when none are given."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        if prompt_token_counts is None:
+            prompt_token_counts = [prompt_token_count] * len(uids)
         pending = {
             uid: _PendingResult(
                 detokenizer=_new_detokenizer(tokenizer, require_independent=True),
                 scanner=_StopStringScanner(self.defaults.stop_strings),
+                prompt_token_count=count,
             )
-            for uid in uids
+            for uid, count in zip(uids, prompt_token_counts)
         }
-        completed: dict[int, GenerationResult] = {}
+        row_of = dict(zip(uids, indices))
+        live = list(uids)
         while pending:
+            if row_sampler is not None:
+                row_sampler.row_uids = list(live)
             if self.per_row_prompt_kwargs:
                 if not generator.has_work:
                     raise RuntimeError(
@@ -1820,24 +2594,27 @@ class _VLMBatchAdapter:
                     )
                 continue
             for event in events:
+                finish_reason = event.finish_reason
+                if finish_reason is not None and event.uid in live:
+                    live.remove(event.uid)
                 state = pending.get(event.uid)
                 if state is None:
                     continue
-                finish_reason = event.finish_reason
                 if finish_reason is None:
                     stopped = state.append(
                         tokenizer,
                         int(event.token),
                         _event_logprob(event),
                     )
-                    if stopped:
-                        # Where the release cannot cancel, the sequence keeps
-                        # decoding upstream and its later events are ignored;
-                        # results match either way, only wasted decode differs.
-                        if self.cancel is not None:
-                            self.cancel(generator, event.uid)
-                        completed[event.uid] = state.result(tokenizer)
-                        del pending[event.uid]
+                    if not stopped:
+                        yield from _text_events(row_of[event.uid], state)
+                        continue
+                    if self.cancel is not None:
+                        self.cancel(generator, event.uid)
+                        if event.uid in live:
+                            live.remove(event.uid)
+                    yield from _finished_events(row_of[event.uid], state, tokenizer)
+                    del pending[event.uid]
                     continue
                 if finish_reason not in ("stop", "length"):
                     raise RuntimeError(
@@ -1847,9 +2624,8 @@ class _VLMBatchAdapter:
                 if finish_reason == "length":
                     state.add_terminal(int(event.token), _event_logprob(event))
                 state.finish(tokenizer, finish_reason)
-                completed[event.uid] = state.result(tokenizer)
+                yield from _finished_events(row_of[event.uid], state, tokenizer)
                 del pending[event.uid]
-        return [completed[uid] for uid in uids]
 
 
 @contextmanager
@@ -1871,23 +2647,498 @@ def generate_batch(
     with them.
     """
 
+    results: list[GenerationResult | None] = [None] * len(requests)
+    for event in _stream_batch(
+        model, tokenizer_or_processor, requests, defaults=defaults,
+        audio_warn_stacklevel=3,
+    ):
+        if event.result is not None:
+            results[event.index] = event.result
+    if any(result is None for result in results):
+        raise RuntimeError(
+            "Internal error: batched generation produced no result for "
+            f"{sum(result is None for result in results)} of {len(results)} requests."
+        )
+    return results
+
+
+class _VLMBatchSession:
+    """One mlx-vlm ``BatchGenerator`` with its row set left open."""
+
+    def __init__(self, adapter: "_VLMBatchAdapter"):
+        self.adapter = adapter
+        self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
+        self.sampler = _PerRowSampler(
+            (),
+            sample_utils_module = adapter.sample_utils,
+            make_sampler = adapter.make_sampler,
+        )
+        self._row_signature = None
+        self._pending: dict[int, _PendingResult] = {}
+        self._row_of: dict[int, int] = {}
+        self._uid_of: dict[int, int] = {}
+        self._next_row = 0
+        self.usable = True
+        self._stack = ExitStack()
+        try:
+            self._stack.enter_context(adapter._wired_limit())
+            self.generator = self._open()
+        except BaseException:
+            self._stack.close()
+            raise
+
+    @property
+    def rows_in_flight(self) -> int:
+        return len(self._pending)
+
+    def add(self, request: GenerationRequest) -> int:
+        adapter = self.adapter
+        defaults = adapter.defaults
+        if request.audio is not None:
+            raise BatchRowRefused(
+                "An audio request decodes on its own and cannot join a batch; "
+                "generate it with generate_batch or stream_batch."
+            )
+        if request.logits_processors and not adapter.row_logits_processors:
+            raise BatchRowRefused(
+                "This mlx-vlm's batch cannot carry a row's own logits processors."
+            )
+        input_ids, prompt_kwargs = self._prepare(request)
+        row_processors = adapter._row_logits_processors([request])
+        token_ids = input_ids.tolist()
+        insert_kwargs = {
+            "prompt_kwargs": adapter._split_prompt_kwargs(prompt_kwargs, 1),
+        }
+        if row_processors is not None:
+            insert_kwargs["logits_processors"] = row_processors
+        try:
+            uids = self.generator.insert(
+                token_ids,
+                [int(request.max_tokens or defaults.max_tokens)],
+                **insert_kwargs,
+            )
+        except BaseException:
+            self.usable = False
+            raise
+        try:
+            if len(uids) != 1:
+                raise RuntimeError(
+                    f"mlx-vlm answered a one-prompt insert with {len(uids)} uids."
+                )
+            uid = uids[0]
+            state = _PendingResult(
+                detokenizer = _new_detokenizer(
+                    self.tokenizer, require_independent = True,
+                ),
+                scanner = _StopStringScanner(defaults.stop_strings),
+                prompt_token_count = len(token_ids[0]),
+            )
+        except BaseException as active_error:
+            try:
+                for admitted in uids:
+                    if not self._withdraw(admitted):
+                        self.usable = False
+            except BaseException as rollback_error:
+                self.usable = False
+                _warn_preserving(
+                    "handing a rejected row back to mlx-vlm",
+                    active_error,
+                    rollback_error,
+                )
+            raise
+        row = self._next_row
+        self._next_row += 1
+        self._pending[uid] = state
+        self._row_of[uid] = row
+        self._uid_of[row] = uid
+        self.sampler.register(uid, request.sampling or defaults.sampling)
+        self._row_signature = _row_signature(
+            prompt_kwargs, adapter.padded_prompt_kwargs)
+        return row
+
+    def cancel(self, row: int) -> bool:
+        return self._take_back(row) is not None
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        state = self._take_back(row)
+        return None if state is None else _cancelled_result(self.tokenizer, state)
+
+    def _take_back(self, row: int) -> "_PendingResult | None":
+        uid = self._uid_of.get(row)
+        if uid is None or uid not in self._pending:
+            return None
+        try:
+            withdrawn = self._withdraw(uid)
+        except BaseException:
+            self.usable = False
+            raise
+        if not withdrawn:
+            return None
+        state = self._pending[uid]
+        self._retire(uid)
+        return state
+
+    def step(self) -> Iterator[GenerationEvent]:
+        if not self._pending:
+            return
+        try:
+            if not self.generator.has_work:
+                raise RuntimeError(
+                    "mlx-vlm ended its event stream before every request "
+                    "reported a finish reason."
+                )
+            _, events = self.generator.next()
+            if not events:
+                if self.adapter._admission_stalled(self.generator):
+                    raise self.adapter._stall_error()
+                return
+            for event in events:
+                yield from self._consume(event)
+        except BaseException:
+            self.usable = False
+            raise
+
+    def close(self):
+        closer = getattr(self.generator, "close", None)
+        try:
+            if callable(closer):
+                closer()
+        finally:
+            self.sampler.bind_generator(None)
+            self.sampler.release_all()
+            self.generator = None
+            self._row_signature = None
+            self._pending.clear()
+            self._row_of.clear()
+            self._uid_of.clear()
+            self._stack.close()
+
+    def _prepare(self, request: GenerationRequest):
+
+        adapter = self.adapter
+        request = adapter._decode_image(request)
+        config = getattr(adapter.model, "config", None)
+        inputs = adapter.prepare_inputs(
+            adapter.processor,
+            images = None if request.image is None else [request.image],
+            audio = None,
+            prompts = [request.prompt],
+            image_token_index = getattr(config, "image_token_index", None),
+            resize_shape = None,
+            add_special_tokens = adapter._add_special_tokens(),
+            pad_to_uniform_size = False,
+        )
+        input_ids = inputs.get("input_ids")
+        data_kwargs = {
+            key: value
+            for key, value in inputs.items()
+            if key not in ("input_ids", "pixel_values", "attention_mask")
+        }
+        embedding_output = adapter.model.get_input_embeddings(
+            input_ids,
+            inputs.get("pixel_values"),
+            mask = inputs.get("attention_mask"),
+            **data_kwargs,
+        )
+        embeddings = embedding_output.to_dict()
+        prepared = {**data_kwargs, **{
+            key: value
+            for key, value in embeddings.items()
+            if value is not None
+        }}
+        layered = sorted(_LAYER_MAJOR_PROMPT_KWARGS.intersection(prepared))
+        if layered:
+            raise BatchRowRefused(
+                f"This request comes back with {', '.join(layered)} per layer, "
+                "which merging lines up as though the layers were rows. "
+                "Generate it with generate_batch or stream_batch, which prepare "
+                "a whole batch together."
+            )
+        signature = _row_signature(prepared, adapter.padded_prompt_kwargs)
+        if self._row_signature is not None and signature != self._row_signature:
+            differing = sorted(
+                key for key in set(signature) | set(self._row_signature)
+                if signature.get(key, _MISSING) != self._row_signature.get(key, _MISSING)
+            )
+            raise BatchRowRefused(
+                f"This request prepares {', '.join(differing)} unlike the "
+                "batch's other requests, which merging lines up against rows "
+                "that do not match it. Generate it with generate_batch or "
+                "stream_batch, which prepare a whole batch together."
+            )
+        return input_ids, prepared
+
+    def _open(self):
+
+        adapter = self.adapter
+        defaults = adapter.defaults
+        options = {
+            "prefill_batch_size": defaults.prefill_batch_size,
+            "completion_batch_size": defaults.completion_batch_size,
+            "sampler": self.sampler,
+            "compute_logprobs": True,
+            **_batch_kv_quant_options(defaults),
+        }
+        generator = adapter.generator_type(
+            adapter.model.language_model,
+            adapter.processor,
+            **{
+                key: value
+                for key, value in options.items()
+                if key in adapter.constructor_params
+            },
+        )
+        self.sampler.bind_generator(generator)
+        return generator
+
+    def _withdraw(self, uid: int) -> bool:
+
+        if self.adapter.cancel is None:
+            return False
+        return self.adapter.cancel(self.generator, uid) is not False
+
+    def _retire(self, uid: int):
+
+        row = self._row_of.pop(uid, None)
+        self._pending.pop(uid, None)
+        if row is not None:
+            self._uid_of.pop(row, None)
+        self.sampler.release(uid)
+        if not self._pending:
+            self._row_signature = None
+
+    def _consume(self, event) -> Iterator[GenerationEvent]:
+        tokenizer = self.tokenizer
+        state = self._pending.get(event.uid)
+        if state is None:
+            return
+        row = self._row_of[event.uid]
+        finish_reason = event.finish_reason
+        if finish_reason is None:
+            stopped = state.append(tokenizer, int(event.token), _event_logprob(event))
+            if not stopped:
+                yield from _text_events(row, state)
+                return
+            if not self._withdraw(event.uid):
+                self.usable = False
+            yield from _finished_events(row, state, tokenizer)
+            self._retire(event.uid)
+            return
+        if finish_reason not in ("stop", "length"):
+            raise RuntimeError(
+                f"mlx-vlm emitted an unsupported finish reason: {finish_reason!r}."
+            )
+        if finish_reason == "length":
+            state.add_terminal(int(event.token), _event_logprob(event))
+        state.finish(tokenizer, finish_reason)
+        yield from _finished_events(row, state, tokenizer)
+        self._retire(event.uid)
+
+
+def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
+    """What a stream settles before it takes anything: vision or not, and the adapter."""
+    if bool(getattr(model, "_is_vlm_model", False)):
+        _validate_vlm_defaults(defaults)
+        gap = _vlm_quantized_cache_gap(model, defaults)
+        if gap is not None:
+            raise ValueError(gap)
+    else:
+        _validate_text_defaults(defaults)
+    if defaults.stop_strings:
+        raise ValueError(
+            "BatchStream cannot apply stop_strings: they cut on token "
+            "boundaries, which would retract text already streamed. Scan "
+            "the deltas for them instead."
+        )
+    is_vlm = bool(getattr(model, "_is_vlm_model", False))
+    if is_vlm:
+        tokenizer = getattr(model, "_processor", None) or tokenizer
+    if tokenizer is None:
+        raise ValueError(
+            "Batched generation requires a processor."
+            if is_vlm
+            else "Text batched generation requires a tokenizer."
+        )
+    if is_vlm:
+        adapter = _VLMBatchAdapter(model, tokenizer, defaults)
+        _require_streamable_vlm(adapter)
+    else:
+        adapter = _TextBatchAdapter(model, tokenizer, defaults)
+    return is_vlm, adapter
+
+
+def stream_unavailable_reason(
+    model,
+    tokenizer = None,
+    *,
+    defaults: GenerationDefaults | None = None,
+) -> str | None:
+    """Why ``BatchStream`` would refuse this model, or None. Asked before committing."""
     if defaults is None:
         defaults = GenerationDefaults()
     if not isinstance(defaults, GenerationDefaults):
         raise TypeError("defaults must be GenerationDefaults.")
-    # Routing follows the model, not the request: a vision model preprocesses
-    # text-only prompts too.
+    try:
+        _stream_setup(model, tokenizer, defaults)
+        _require_evaluable(model)
+    except Exception as refusal:
+        return str(refusal)
+    return None
+
+
+class BatchStream:
+    """A batch left open: rows join and leave while the batch decodes.
+
+    A row joins immediately, but which admitted row prefills next is the underlying
+    generator's decision, not this one's. mlx-lm takes them in arrival order; mlx-vlm
+    sorts its unprocessed prompts shortest-first on every insert, so a long vision
+    prompt waits behind shorter ones that arrived after it. Rows already decoding are
+    unaffected either way.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        *,
+        defaults: GenerationDefaults | None = None,
+    ):
+        if defaults is None:
+            defaults = GenerationDefaults()
+        if not isinstance(defaults, GenerationDefaults):
+            raise TypeError("defaults must be GenerationDefaults.")
+        _install_arrays_cache_advance_fix()
+        is_vlm, adapter = _stream_setup(model, tokenizer, defaults)
+        self._stack = ExitStack()
+        self._session = None
+        self._is_vlm = is_vlm
+        self._closed = False
+        self._owner = (threading.get_ident(), _current_async_task())
+        try:
+            self._stack.enter_context(generation_mode(model))
+            self._stack.enter_context(_generation_cache_hygiene())
+            self._session = (
+                _VLMBatchSession(adapter) if is_vlm else _TextBatchSession(adapter)
+            )
+            self._stack.callback(self._session.close)
+        except BaseException as active_error:
+            try:
+                self._stack.close()
+            except BaseException as close_error:
+                _warn_preserving("tearing the batch down", active_error, close_error)
+            raise
+
+    def __enter__(self) -> "BatchStream":
+        return self
+
+    def __exit__(self, _exc_type, active_error, _traceback) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if active_error is None:
+                raise
+            _warn_preserving("tearing the batch down", active_error, close_error)
+
+
+
+    @property
+    def rows_in_flight(self) -> int:
+        return 0 if self._session is None else self._session.rows_in_flight
+
+    def add(self, request: GenerationRequest) -> int:
+        session = self._require_open()
+        validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
+        (validated,) = validate([request], session.adapter.defaults)
+        return session.add(validated)
+
+    def cancel(self, row: int) -> bool:
+        return self._require_open().cancel(row)
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        """The same, answering with what the row managed rather than whether it was
+        still there to withdraw.
+        """
+        return self._require_open().withdraw(row)
+
+    def step(self) -> list[GenerationEvent]:
+        """What the batch produced in one decode step."""
+        return list(self._require_open().step())
+
+    def close(self) -> None:
+        """Release the batch and the generation lock. Safe to call twice."""
+        if self._closed:
+            return
+        self._require_owner()
+        self._closed = True
+        self._session = None
+        self._stack.close()
+
+    def _require_open(self):
+        if self._session is None:
+            raise RuntimeError("This BatchStream is closed.")
+        self._require_owner()
+        if not self._session.usable:
+            raise RuntimeError(
+                "This BatchStream holds a batch neither it nor the engine can "
+                "answer for, left by an earlier call that failed partway. "
+                "Close it and open another."
+            )
+        return self._session
+
+    def _require_owner(self) -> None:
+        current = (threading.get_ident(), _current_async_task())
+        if current == self._owner:
+            return
+        raise RuntimeError(
+            "This BatchStream belongs to the thread and task that opened it: "
+            "the generation lock it holds can only be released there."
+        )
+
+
+def stream_batch(
+    model,
+    tokenizer_or_processor,
+    requests: Sequence[GenerationRequest],
+    *,
+    defaults: GenerationDefaults | None = None,
+) -> Iterator[GenerationEvent]:
+    """``generate_batch``, reporting each row as it goes."""
+    if defaults is not None and not isinstance(defaults, GenerationDefaults):
+        raise TypeError("defaults must be GenerationDefaults.")
+    if defaults is not None and defaults.stop_strings:
+        raise ValueError(
+            "stream_batch cannot apply stop_strings: they cut on token "
+            "boundaries, which would retract text already streamed. Scan the "
+            "deltas for them instead, or use generate_batch."
+        )
+    return _stream_batch(
+        model, tokenizer_or_processor, requests, defaults=defaults,
+    )
+
+
+def _stream_batch(
+    model,
+    tokenizer_or_processor,
+    requests: Sequence[GenerationRequest],
+    *,
+    defaults: GenerationDefaults | None = None,
+    audio_warn_stacklevel: int = 2,
+) -> Iterator[GenerationEvent]:
+    if defaults is None:
+        defaults = GenerationDefaults()
+    if not isinstance(defaults, GenerationDefaults):
+        raise TypeError("defaults must be GenerationDefaults.")
     is_vlm = bool(getattr(model, "_is_vlm_model", False))
     validated = (
         _validate_vlm_requests(requests, defaults)
         if is_vlm
         else _validate_text_requests(requests, defaults)
     )
+    if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
+        raise ValueError(gap)
     if not validated:
-        return []
+        return
     if is_vlm:
-        # A text-only multimodal load stays on the vision path but publishes its
-        # inner tokenizer, which cannot drive mlx-vlm preprocessing.
         tokenizer_or_processor = (
             getattr(model, "_processor", None) or tokenizer_or_processor
         )
@@ -1901,11 +3152,14 @@ def generate_batch(
     with generation_mode(model):
         with _generation_cache_hygiene():
             adapter = (
-                _VLMBatchAdapter(model, tokenizer_or_processor, defaults)
+                _VLMBatchAdapter(
+                    model, tokenizer_or_processor, defaults,
+                    audio_warn_stacklevel = audio_warn_stacklevel + 1,
+                )
                 if is_vlm
                 else _TextBatchAdapter(model, tokenizer_or_processor, defaults)
             )
-            return adapter.generate(validated)
+            yield from adapter.stream(validated)
 
 
 def fast_generate(
@@ -1975,11 +3229,18 @@ def fast_generate(
 
 
 __all__ = [
+    "BatchRowRefused",
+    "BatchStream",
     "GenerationDefaults",
+    "GenerationEvent",
     "GenerationRequest",
     "GenerationResult",
     "SamplingParams",
     "fast_generate",
     "generate_batch",
     "generation_mode",
+    "row_logits_processors_unavailable_reason",
+    "stream_batch",
+    "stream_unavailable_reason",
+    "vlm_batch_adds_special_tokens",
 ]

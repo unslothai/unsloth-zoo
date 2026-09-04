@@ -97,25 +97,25 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
     # The cache patch must be installed before any decoding runs.
     order = []
     real_install = generate_module._install_arrays_cache_advance_fix
-    real_adapter_generate = generate_module._TextBatchAdapter.generate
+    real_adapter_stream = generate_module._TextBatchAdapter.stream
 
     def record_install():
         order.append("install")
         return real_install()
 
-    def record_generate(self, requests):
-        order.append("generate")
-        return real_adapter_generate(self, requests)
+    def record_stream(self, requests):
+        order.append("stream")
+        return real_adapter_stream(self, requests)
 
     generate_module._install_arrays_cache_advance_fix = record_install
-    generate_module._TextBatchAdapter.generate = record_generate
+    generate_module._TextBatchAdapter.stream = record_stream
     try:
         batched = generate_batch(model, tokenizer, requests, defaults=defaults)
     finally:
         generate_module._install_arrays_cache_advance_fix = real_install
-        generate_module._TextBatchAdapter.generate = real_adapter_generate
+        generate_module._TextBatchAdapter.stream = real_adapter_stream
     from mlx_lm.models.cache import ArraysCache
-    assert order == ["install", "generate"]
+    assert order == ["install", "stream"]
     assert generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
     assert isinstance(ArraysCache.left_padding, property)
     sequential = []
@@ -406,3 +406,30 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     left.extend(right)
     assert left.left_padding.tolist() == [-2, 2, 2]
     assert left.lengths.tolist() == [4, 7, -2]
+
+
+def test_a_penalised_row_answers_the_same_batched_and_alone():
+    """A row shown its whole prompt is penalised against text it never sees alone, and the
+    two prompts differ in length, so one offset cannot serve both rows."""
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults, GenerationRequest, generate_batch,
+    )
+
+    model, tokenizer = load(MODEL)
+    prompts = ("red red red red red red red red. Name a colour:", "one one one. Count:")
+    penalty = dict(repetition_penalty = 1.6, repetition_context_size = 20)
+    batched = generate_batch(model, tokenizer, [
+        GenerationRequest(prompt = prompt, max_tokens = 12,
+                          logits_processors = make_logits_processors(**penalty))
+        for prompt in prompts
+    ], defaults = GenerationDefaults())
+
+    for prompt, result in zip(prompts, batched):
+        alone = [int(event.token) for event in stream_generate(
+            model, tokenizer, tokenizer.encode(prompt, add_special_tokens = False),
+            max_tokens = 12, sampler = make_sampler(temp = 0.0),
+            logits_processors = make_logits_processors(**penalty),
+        ) if event.finish_reason != "stop"]
+        assert result.token_ids == alone, prompt
