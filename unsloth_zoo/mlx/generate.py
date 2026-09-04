@@ -32,7 +32,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, Callable, Iterator, Literal, Sequence
 
 
@@ -183,6 +183,22 @@ class GenerationDefaults:
         )
         if self.max_kv_size is not None:
             _validate_positive_int(self.max_kv_size, "defaults.max_kv_size")
+        if self.kv_bits is not None:
+            if isinstance(self.kv_bits, bool) or not isinstance(self.kv_bits, Real):
+                raise TypeError("defaults.kv_bits must be a number.")
+            if not math.isfinite(self.kv_bits) or self.kv_bits <= 0:
+                raise ValueError("defaults.kv_bits must be a finite positive number.")
+        if self.kv_group_size is not None:
+            _validate_positive_int(self.kv_group_size, "defaults.kv_group_size")
+        if self.kv_quant_scheme is not None and not isinstance(self.kv_quant_scheme, str):
+            raise TypeError("defaults.kv_quant_scheme must be a string.")
+        if self.quantized_kv_start is not None:
+            if isinstance(self.quantized_kv_start, bool) or not isinstance(
+                self.quantized_kv_start, Integral
+            ):
+                raise TypeError("defaults.quantized_kv_start must be an integer.")
+            if self.quantized_kv_start < 0:
+                raise ValueError("defaults.quantized_kv_start must not be negative.")
         if not isinstance(self.sampling, SamplingParams):
             raise TypeError("defaults.sampling must be SamplingParams.")
         stops = _normalize_stop_strings(self.stop_strings)
@@ -2683,6 +2699,10 @@ class _VLMBatchSession:
                 "An audio request decodes on its own and cannot join a batch; "
                 "generate it with generate_batch or stream_batch."
             )
+        if request.logits_processors and not adapter.row_logits_processors:
+            raise BatchRowRefused(
+                "This mlx-vlm's batch cannot carry a row's own logits processors."
+            )
         input_ids, prompt_kwargs = self._prepare(request)
         row_processors = adapter._row_logits_processors([request])
         token_ids = input_ids.tolist()
@@ -3222,4 +3242,5 @@ __all__ = [
     "row_logits_processors_unavailable_reason",
     "stream_batch",
     "stream_unavailable_reason",
+    "vlm_batch_adds_special_tokens",
 ]

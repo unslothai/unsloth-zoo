@@ -1509,6 +1509,15 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
                      defaults = GenerationDefaults(stop_strings = ("X",)))
 
 
+def test_kv_quant_controls_and_processor_rows_are_refused_before_they_reach_a_cache():
+    assert [type(pytest.raises((TypeError, ValueError), GenerationDefaults, **kw).value) for kw in ({"kv_bits": True}, {"kv_bits": float("nan")}, {"kv_bits": float("inf")}, {"kv_group_size": True}, {"kv_group_size": -1}, {"kv_quant_scheme": 3}, {"quantized_kv_start": -1})] == [TypeError, ValueError, ValueError, TypeError, ValueError, TypeError, ValueError] and GenerationDefaults(kv_bits = 4.5, kv_group_size = 32, kv_quant_scheme = "turboquant", quantized_kv_start = 0).kv_bits == 4.5  # noqa: E501
+    with contextlib.closing(_vlm_session()) as session:
+        session.adapter.row_logits_processors = False
+        with pytest.raises(ValueError, match = "cannot carry") as refusal:
+            session.add(GenerationRequest(prompt = "p", logits_processors = [lambda tokens, logits: logits]))
+        assert type(refusal.value).__name__ == "BatchRowRefused" and session.usable and session.add(GenerationRequest(prompt = "p")) == 0  # noqa: E501
+
+
 def test_the_preflight_refuses_defaults_every_add_would():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
     assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
