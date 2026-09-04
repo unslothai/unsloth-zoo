@@ -736,6 +736,12 @@ def patch_vllm_graph_capture():
     import time
     from functools import wraps
 
+    # vLLM may not be installed; bail out instead of NameError on `vllm.__version__`.
+    try:
+        import vllm
+    except ImportError:
+        return
+
     @contextmanager
     def suppress_gc_collect():
         original_gc_collect = gc.collect
@@ -2221,6 +2227,37 @@ def _clear_flashinfer_env_on_hip():
     return True
 
 
+# Modules evicted by `_block_flashinfer_import`; None means absent before the block.
+_UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
+
+
+def _block_flashinfer_import():
+    # None in sys.modules is the documented "this module fails to import" marker.
+    try:
+        for _name in list(sys.modules):
+            if _name == "flashinfer" or _name.startswith("flashinfer."):
+                _UNSLOTH_BLOCKED_FLASHINFER_MODULES.setdefault(_name, sys.modules[_name])
+                del sys.modules[_name]
+        _UNSLOTH_BLOCKED_FLASHINFER_MODULES.setdefault("flashinfer", None)
+        sys.modules["flashinfer"] = None
+    except Exception:
+        pass
+
+
+def _unblock_flashinfer_import():
+    # The block is process wide, so without this it outlives the load_vllm() call.
+    if not _UNSLOTH_BLOCKED_FLASHINFER_MODULES: return
+    try:
+        if sys.modules.get("flashinfer", False) is None:
+            del sys.modules["flashinfer"]
+        for _name, _module in _UNSLOTH_BLOCKED_FLASHINFER_MODULES.items():
+            if _module is not None and _name not in sys.modules:
+                sys.modules[_name] = _module
+        _UNSLOTH_BLOCKED_FLASHINFER_MODULES.clear()
+    except Exception:
+        pass
+
+
 # Allocator config env vars. PYTORCH_CUDA_ALLOC_CONF is the legacy NVIDIA one,
 # PYTORCH_HIP_ALLOC_CONF the legacy AMD/ROCm one, PYTORCH_ALLOC_CONF the unified
 # one read from torch 2.10 onwards. All three must be checked on every platform.
@@ -2429,6 +2466,16 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
+    # `vllm_version` only exists when vllm was importable at module load; raise something actionable.
+    if "vllm_version" not in globals():
+        raise ImportError(
+            "vLLM is required for `load_vllm`/SyntheticDataKit/`fast_inference=True` "
+            "but it was not installed when unsloth_zoo was imported. Install it with "
+            "`pip install vllm` (CUDA only; no wheel exists for arm64/aarch64 as of "
+            "this writing) and then RESTART the runtime or kernel: this module binds "
+            "its vLLM state at import, so installing into a live session is not enough."
+        )
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # vLLM standby (sleep mode) corrupts the CuMemAllocator sleep/wake cycle for
     # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
@@ -2616,9 +2663,25 @@ def load_vllm(
     # See https://docs.vllm.ai/en/latest/serving/env_vars.html
     # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
     # On AMD, vLLM uses its built-in paged attention instead.
+    # Lift a previous call's block when the opt-out is clear: find_spec reports the package
+    # absent while it is in place, so nvcc/ninja installed since would never count.
+    _no_flashinfer = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "0"
+    if not _no_flashinfer:
+        _unblock_flashinfer_import()
     if _clear_flashinfer_env_on_hip():
         pass
-    elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+    elif _no_flashinfer:
+        # Clear a FORCED selection whether or not the package is here: an inherited
+        # VLLM_USE_FLASHINFER_SAMPLER=1 sends vLLM's TopKTopPSampler into an unguarded
+        # `from flashinfer import ...`, so an absent FlashInfer raises instead of falling back.
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+            del os.environ["VLLM_ATTENTION_BACKEND"]
+        # Skipping our own setup is not enough: an installed FlashInfer stays importable, so
+        # vLLM selects it itself (the Blackwell default) and hits the JIT failure we opted out of.
+        if importlib.util.find_spec("flashinfer") is not None:
+            _block_flashinfer_import()
+    elif importlib.util.find_spec("flashinfer"):
         # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
         # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
         _has_nvcc = (
@@ -2647,13 +2710,17 @@ def load_vllm(
                 f"      Install cuda-compat / the CUDA toolkit's stubs, or point LIBRARY_PATH\n"
                 f"      at a directory containing libcuda.so (a symlink to libcuda.so.1 or to\n"
                 f"      /usr/local/cuda/compat/libcuda.so is enough).\n"
+                f"  Then set UNSLOTH_VLLM_NO_FLASHINFER=0 to use FlashInfer again in this session.\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
-            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
-            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
-                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
+            # Env vars alone do not work: vLLM dropped VLLM_ATTENTION_BACKEND in 0.13.0, so the
+            # del below is a no-op there and FLASHINFER is still picked on sm_100/sm_120.
+            # Blocking the import makes get_attn_backend_cls's own try/except pick FLASH_ATTN.
+            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+            os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
+            _block_flashinfer_import()
         else:
             # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
             if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
@@ -2682,6 +2749,12 @@ def load_vllm(
             else:
                 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+    else:
+        # FlashInfer is simply not installed, but an inherited forced selection still has to
+        # go: vLLM's TopKTopPSampler imports flashinfer unguarded.
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+            del os.environ["VLLM_ATTENTION_BACKEND"]
     pass
 
     # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0

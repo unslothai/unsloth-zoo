@@ -334,6 +334,13 @@ def patch_Gemma3Processor():
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
 
+        # Probe before _merge_kwargs folds in padding=False. Presence, not value: padding=None means do-not-pad.
+        _user_set_padding = "padding" in kwargs
+        if not _user_set_padding:
+            _text_kwargs = kwargs.get("text_kwargs", None)
+            if isinstance(_text_kwargs, dict):
+                _user_set_padding = "padding" in _text_kwargs
+
         output_kwargs = self._merge_kwargs(
             Gemma3ProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -403,6 +410,13 @@ def patch_Gemma3Processor():
             # Expand placeholder image tokens to the full image token sequence
             text = [prompt.replace(self.boi_token, self.full_image_sequence) for prompt in text]
 
+        # TRL GRPO passes no padding=, and the padding=False default makes ragged completions
+        # break the stacking below. Runs after image expansion so `text` is final.
+        _padding_before_override = output_kwargs["text_kwargs"].get("padding", False)
+        _padding_is_disabled = _padding_before_override in (False, None, "do_not_pad")
+        if not _user_set_padding and _padding_is_disabled and isinstance(text, (list, tuple)) and len(text) > 1:
+            output_kwargs["text_kwargs"]["padding"] = "longest"
+
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", True)
@@ -413,10 +427,10 @@ def patch_Gemma3Processor():
             getattr(self.tokenizer, "padding_side", "left")
         # HF derives truncation from padding + max_length (max_length with padding=False and no explicit
         # truncation truncates). We drop padding to pad manually, so pin the truncation the tokenizer would
-        # have used from the original padding, keeping truncation behaviour identical.
+        # have used from the caller's padding, taken before the longest-padding override above.
         max_length = output_kwargs["text_kwargs"].get("max_length", None)
         output_kwargs["text_kwargs"]["truncation"] = _resolve_truncation(
-            padding, output_kwargs["text_kwargs"].get("truncation", None), max_length)
+            _padding_before_override, output_kwargs["text_kwargs"].get("truncation", None), max_length)
         text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"])
         # ignore the tokenizer's uninitialised model_max_length sentinel (~1e30) for "max_length" padding
         _mml = getattr(self.tokenizer, "model_max_length", None)

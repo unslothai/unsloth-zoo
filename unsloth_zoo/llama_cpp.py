@@ -284,8 +284,24 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+# Duplicated from notebook_deps._TRUE_VALUES so this module does not import temporary_patches.
+_AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _auto_install_enabled() -> bool:
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1").strip().upper() \
+        in _AUTO_INSTALL_TRUE_VALUES
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Before the platform branch: the Windows arm returns early, so a later opt-out would miss winget.
+    if not _auto_install_enabled():
+        raise RuntimeError(
+            f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
 
     if IS_WINDOWS:
         # Per-package winget config aligned with setup.ps1
@@ -346,7 +362,24 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        # Non-interactive contexts raise on input(); treat that as an implicit ENTER.
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except (EOFError, RuntimeError) as exception:
+            # Same RuntimeError for a lost stdout/stderr, so re-raise unless stdin is gone.
+            if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
+            # Only a non-terminal stdin is consent: on a TTY, EOFError is Ctrl-D.
+            try:
+                _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
+            except Exception:
+                _stdin_is_a_tty = False
+            if _stdin_is_a_tty:
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
