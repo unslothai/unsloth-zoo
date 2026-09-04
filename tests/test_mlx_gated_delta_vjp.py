@@ -402,8 +402,8 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
     g = mx.zeros((1, 8, 2))
     ok_v = mx.zeros((1, 8, 2, 16))
     bad_v = mx.zeros((1, 8, 2, 30))
-    assert gv.gated_delta_kernel_supported(q, g, None, ok_v)
-    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v)
+    assert gv.gated_delta_kernel_supported(q, g, None, ok_v, q)
+    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v, q)
 
 
 # -- training window and index detachment -------------------------------------
