@@ -49,6 +49,7 @@ import math
 import time
 import warnings
 import os
+import inspect
 from functools import lru_cache
 from collections.abc import Mapping
 
@@ -786,13 +787,34 @@ def _check_audio_sampling_rate(sampling_rate, target_sampling_rate):
         )
 
 
+# Transformers processors do not agree on what to call the audio sub-processor:
+# `attributes` is ["feature_extractor", "tokenizer"] for Qwen2-Audio, Voxtral,
+# Whisper and most speech models, but ["audio_processor", "tokenizer"] for
+# Granite-Speech and ["image_processor", "audio_processor", "tokenizer"] for
+# Phi-4-multimodal. Resolve it in ONE place: the constructor gate, the
+# padding-side normalisation and the sampling-rate read must agree on what
+# counts as audio support, and updating one without the others is exactly how
+# this collator ended up admitting processors it then could not serve.
+_AUDIO_SUB_PROCESSOR_ATTRS = ("feature_extractor", "audio_processor")
+
+
+def _audio_sub_processors(processor):
+    # Every audio sub-processor the processor exposes, in preference order.
+    # Empty means "no audio support" -- the gate's rejection condition.
+    subs = []
+    for attr in _AUDIO_SUB_PROCESSOR_ATTRS:
+        sub = getattr(processor, attr, None)
+        if sub is not None: subs.append(sub)
+    return subs
+
+
 def _fix_audio_feature_extractor_padding_side(processor):
     # The loader's padding_side="left" (a text setting) leaks into the audio
     # feature extractor via from_pretrained. Frame-validity masks assume right
     # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
-    feature_extractor = getattr(processor, "feature_extractor", None)
-    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
-        feature_extractor.padding_side = "right"
+    for sub in _audio_sub_processors(processor):
+        if getattr(sub, "padding_side", None) == "left":
+            sub.padding_side = "right"
 
 
 @lru_cache(maxsize=1)
@@ -845,6 +867,40 @@ def _resolve_audio_dict(audio, sampling_rate=None):
     return value
 
 
+# Content-part keys that can carry an audio payload, in priority order.
+#
+# "audio", "url" and "path" mirror transformers' generic chat-template audio
+# loader (processing_utils.py, `for key in ["audio", "url", "path"]` inside
+# ProcessorMixin.apply_chat_template), which is what most audio templates parse.
+#
+# "audio_url" is the Qwen family's spelling: Qwen2AudioProcessor's built-in chat
+# template branches on `'audio' in content or 'audio_url' in content` (see
+# transformers/models/qwen2_audio/processing_qwen2_audio.py, default_chat_template)
+# and the processor's own docstring example uses {"type": "audio", "audio_url": ...};
+# Qwen2.5-Omni and Qwen3-Omni document the same shape. Without it the template
+# renders an <|AUDIO|> placeholder while no clip is collected, so the example
+# either raises here or reaches the model with a token/feature mismatch.
+_AUDIO_CONTENT_KEYS = ("audio", "url", "path", "audio_url")
+_AUDIO_CONTENT_KEYS_TEXT = ", ".join(f"`{k}`" for k in _AUDIO_CONTENT_KEYS[:-1]) + \
+    f" or `{_AUDIO_CONTENT_KEYS[-1]}`"
+
+
+def _audio_payload_from_content(ele):
+    # First usable payload among the accepted keys. Only `is None` counts as
+    # absent -- a bare truthiness test would raise on a numpy waveform
+    # ("truth value of an array with more than one element is ambiguous"),
+    # which the previous `ele.get("url") or ele.get("path")` chain did for any
+    # array passed under a string key.
+    for key in _AUDIO_CONTENT_KEYS:
+        value = ele.get(key)
+        if value is None: continue
+        # An empty string is not a loadable path or URL: fall through to the
+        # next key, matching the previous chain's behaviour for "" .
+        if isinstance(value, str) and not value: continue
+        return value
+    return None
+
+
 def extract_audio_info(
     conversations: Union[List[Dict], List[List[Dict]]],
     sampling_rate: int = None,
@@ -861,15 +917,13 @@ def extract_audio_info(
                 for ele in content:
                     if not (isinstance(ele, dict) and ele.get("type") == "audio"):
                         continue
-                    audio = ele.get("audio")
-                    # Feature extractors also accept local paths and URLs as strings
-                    if audio is None:
-                        audio = ele.get("url") or ele.get("path")
+                    audio = _audio_payload_from_content(ele)
                     if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
-                            "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
+                            "Unsloth: an audio content part has no "
+                            f"{_AUDIO_CONTENT_KEYS_TEXT} data, "
                             "so the clip cannot be loaded and the example would train as text only."
                         )
                     audio_inputs.append(audio)
@@ -988,6 +1042,40 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+# Keywords a processor's __call__ can name its audio argument, in the order the
+# collator prefers them. Every audio processor in transformers that accepts
+# audio names one of these; the two that name the plural (Clap, SeamlessM4T)
+# also name the singular, so today the singular always wins.
+_AUDIO_CALL_KWARGS = ("audio", "audios")
+
+
+def _audio_call_kwarg(processor):
+    # Which keyword `processor(text=..., <kwarg>=clips)` must use, or None when
+    # __call__ names no audio argument at all (VoxtralProcessor, WhisperProcessor,
+    # MusicgenProcessor, ... -- these cannot batch audio through this collator).
+    #
+    # Callers must use the returned name rather than a hard-coded "audio":
+    # deciding admission on one spelling and then sending the other means an
+    # `audios=`-only processor constructs successfully and then loses its clips
+    # (the unexpected `audio=` is swallowed by **kwargs while the parameter the
+    # processor actually reads stays None), or raises an unexpected-keyword
+    # TypeError on the first audio batch.
+    #
+    # Capability check rather than a class-name check, so a processor added to
+    # transformers later is classified by what it accepts. The limit of a
+    # signature check is a processor that takes audio only through **kwargs with
+    # no named parameter; none in transformers does that today. If __call__
+    # cannot be introspected at all (a minimal stub), fail open with the
+    # historical spelling rather than regress a processor that works.
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return _AUDIO_CALL_KWARGS[0]
+    for name in _AUDIO_CALL_KWARGS:
+        if name in params: return name
+    return None
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -997,6 +1085,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "audio_call_kwarg",
     )
 
     def __init__(
@@ -1020,8 +1109,46 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
-            raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        # Accept image processors, audio-only processors, and combined
+        # vision+audio processors. Reject only a bare text tokenizer.
+        # getattr(...) is None rather than hasattr so a processor that defines
+        # image_processor and sets it to None is treated as not having one; the
+        # audio side goes through the shared _audio_sub_processors resolution.
+        if (
+            getattr(processor, "image_processor", None) is None
+            and not _audio_sub_processors(processor)
+        ):
+            raise TypeError(
+                "Unsloth: UnslothVisionDataCollator requires an image or audio processor!"
+            )
+
+        # Resolve, once, the keyword this processor names its audio argument.
+        # This is both the admission test and the keyword every audio call site
+        # in this class uses, so the keyword sent can never drift from the
+        # keyword accepted -- see _audio_call_kwarg for why that matters.
+        audio_call_kwarg = _audio_call_kwarg(processor)
+
+        # An audio-only processor (no image_processor) reaches the collator's
+        # audio path, which calls self.processor(text=..., <audio kwarg>=...).
+        # Some audio processors accept no audio argument at all -- notably
+        # transformers' VoxtralProcessor, whose __call__ is (text, **kwargs) and
+        # which raises when the rendered text contains its audio token (it
+        # requires audio to go through apply_chat_template). Such a processor
+        # passes the acceptance guard above (it has a feature_extractor) but then
+        # fails inside the collate call, so reject it up front instead.
+        if getattr(processor, "image_processor", None) is None and audio_call_kwarg is None:
+            raise TypeError(
+                f"Unsloth: UnslothVisionDataCollator does not yet support "
+                f"{type(processor).__name__}: its processor __call__ takes no "
+                "`audio=` argument, so audio cannot be batched through the "
+                "collator (e.g. VoxtralProcessor requires audio to go through "
+                "apply_chat_template and rejects text containing its audio "
+                "token). Prepare audio with processor.apply_chat_template("
+                "..., tokenize=True, return_dict=True) instead."
+            )
+        # Vision-only processors name no audio argument and never send one
+        # (`audios` stays empty), so the historical spelling is a safe default.
+        self.audio_call_kwarg = audio_call_kwarg or "audio"
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
@@ -1129,29 +1256,54 @@ class UnslothVisionDataCollator:
 
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        try:
+        #
+        # Probe with the modality this processor actually has: an audio-only
+        # processor's chat template need not understand an {"type": "image"}
+        # part, and probing it with one can fail construction for a model the
+        # collator can otherwise serve.
+        modality_part = {"type": "image"} if \
+            getattr(processor, "image_processor", None) is not None else {"type": "audio"}
+        def _probe(user_content, assistant_content):
             processor.apply_chat_template([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Hello!"}]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "How can I help you?"}]}
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content},
             ])
+        list_user = [modality_part, {"type": "text", "text": "Hello!"}]
+        try:
+            _probe(list_user, [{"type": "text", "text": "How can I help you?"}])
             self.assistant_single_content = False
         except TypeError:
             try:
-                processor.apply_chat_template([
-                    {"role": "user", "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Hello!"}]},
-                    {"role": "assistant", "content": "How can I help you?"}
-                ])
+                _probe(list_user, "How can I help you?")
                 self.assistant_single_content = True
                 print(
                     f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
                     "text field for assistant roles!\n"\
                     "We will auto fix the data collator to support it!"
                 )
+            except TypeError as list_content_error:
+                # Some speech chat templates concatenate message["content"]
+                # straight into the prompt ('...' + message['content'] + '...'),
+                # so they accept only plain strings for EVERY role and raise
+                # "can only concatenate str (not list) to str" on both probes
+                # above -- Granite-Speech is one. The collator normalises all
+                # message content INTO content parts
+                # (_validate_and_normalize_first_message), so such a template
+                # cannot be rendered here at all. Say so at construction rather
+                # than letting it fail on the first batch, matching how an
+                # audio processor with no `audio=` argument is handled.
+                try:
+                    _probe("Hello!", "How can I help you?")
+                except Exception:
+                    _raise_chat_template_error(list_content_error, processor, model)
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator does not yet support "
+                    f"{type(processor).__name__}: its chat template accepts only "
+                    "plain-string message content, while the collator renders "
+                    "messages as content parts ([{'type': 'text', ...}]). "
+                    "Tokenize with processor.apply_chat_template(..., tokenize=True) "
+                    "and pass audio through the processor directly instead."
+                ) from list_content_error
             except Exception as e:
                 _raise_chat_template_error(e, processor, model)
         except Exception as e:
@@ -1233,7 +1385,10 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 proc_kwargs[k] = v
         if audios:
-            proc_kwargs["audio"] = audios
+            # Send the keyword __init__ verified this processor names. getattr
+            # with a default because instances built via __new__ (several tests
+            # do) leave the slot unset; the collator has always sent `audio=`.
+            proc_kwargs[getattr(self, "audio_call_kwarg", None) or "audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self.processor(**proc_kwargs)
@@ -1326,8 +1481,15 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
-        feature_extractor = getattr(self.processor, "feature_extractor", None)
-        target_sr = getattr(feature_extractor, "sampling_rate", None)
+        # Read the expected sampling rate from whichever audio sub-processor the
+        # processor exposes (same resolution the gate admitted it on). Without
+        # this, an audio_processor-only processor yields target_sr=None and the
+        # sampling-rate check is skipped, so a clip decoded at the wrong rate
+        # would be trained on silently instead of raising _check_audio_sampling_rate.
+        target_sr = None
+        for audio_sub in _audio_sub_processors(self.processor):
+            target_sr = getattr(audio_sub, "sampling_rate", None)
+            if target_sr is not None: break
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
@@ -1399,14 +1561,7 @@ class UnslothVisionDataCollator:
             normalized.append(clip)
         return normalized
 
-    def _truncate_sequence_tensors(self, batch, seq_len):
-        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
-        # input_features [B, frames, mel] or input_features_mask [B, frames].
-        new_len = self.max_seq_length
-        keys = [
-            k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
-            if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
-        ]
+    def _audio_token_ids(self, device):
         tok = getattr(self.processor, "tokenizer", self.processor)
         audio_tokens = list(AUDIO_TOKENS)
         if getattr(tok, "audio_token", None) is not None:
@@ -1415,12 +1570,37 @@ class UnslothVisionDataCollator:
         # get_padding_tokens_ids); excluding it keeps a truncated unk text token from being
         # miscounted as an audio token and tripping the alignment check below.
         unk_id = getattr(tok, "unk_token_id", None)
-        audio_ids = torch.tensor(
+        return torch.tensor(
             [i for i in tok.convert_tokens_to_ids(audio_tokens)
              if isinstance(i, int) and i >= 0 and i != unk_id],
-            device=batch["input_ids"].device,
+            device=device,
         )
-        n_audio = int(torch.isin(batch["input_ids"], audio_ids).sum())
+
+    def _check_audio_tokens_survived(self, before_ids, after_ids, new_len):
+        # Truncation may only remove text: the audio feature tensors keep their
+        # full width, so dropping expanded audio placeholders leaves the model
+        # splicing N audio embeddings into fewer than N slots. Shared by the
+        # __call__ path (_truncate_sequence_tensors) and the prompt/completion
+        # path (_truncate_by_side) -- checking only one of them lets the other
+        # corrupt the batch silently.
+        audio_ids = self._audio_token_ids(before_ids.device)
+        if audio_ids.numel() == 0: return
+        if int(torch.isin(after_ids, audio_ids).sum()) == \
+           int(torch.isin(before_ids, audio_ids).sum()): return
+        raise ValueError(
+            f"Unsloth: max_seq_length = {new_len} cuts into the expanded audio tokens, which "
+            "breaks audio alignment at model forward. Increase max_seq_length or shorten the audio."
+        )
+
+    def _truncate_sequence_tensors(self, batch, seq_len):
+        # Slice only per-token tensors. Matching on shape[-1] == seq_len can clip
+        # input_features [B, frames, mel] or input_features_mask [B, frames].
+        new_len = self.max_seq_length
+        keys = [
+            k for k in ("input_ids", "attention_mask", "token_type_ids", "mm_token_type_ids")
+            if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
+        ]
+        pre_truncation_ids = batch["input_ids"]
         if self._tokenizer_padding_side() == "left":
             # Keep each row's first new_len content tokens and re-pad on the left,
             # otherwise short rows keep only their left padding.
@@ -1432,11 +1612,7 @@ class UnslothVisionDataCollator:
         else:
             for k in keys:
                 batch[k] = batch[k][..., :new_len]
-        if int(torch.isin(batch["input_ids"], audio_ids).sum()) != n_audio:
-            raise ValueError(
-                f"Unsloth: max_seq_length = {new_len} cuts into the expanded audio tokens, which "
-                "breaks audio alignment at model forward. Increase max_seq_length or shorten the audio."
-            )
+        self._check_audio_tokens_survived(pre_truncation_ids, batch["input_ids"], new_len)
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
@@ -1622,6 +1798,11 @@ class UnslothVisionDataCollator:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
         sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
 
+        # Same guard the __call__ path applies in _truncate_sequence_tensors: the
+        # prompt batch's input_features are carried through at full width, so
+        # slicing away audio placeholders here would desync audio at forward.
+        self._check_audio_tokens_survived(input_ids, input_ids[:, sl], max_len)
+
         input_ids       = input_ids[:, sl]
         attention_mask  = attention_mask[:, sl]
         completion_mask = completion_mask[:, sl]
@@ -1734,7 +1915,8 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
         if audios:
-            prompt_kwargs["audio"] = audios
+            # Same keyword as the __call__ path above; see the note there.
+            prompt_kwargs[getattr(self, "audio_call_kwarg", None) or "audio"] = audios
 
         proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
         # Encode completions (RIGHT pad) text-only
