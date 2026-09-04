@@ -153,12 +153,21 @@ DISABLE_COMPILE_FUNCTIONS = [
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
 
-    # transformers 5.9+ VL files import these; their `grid_thw.tolist()` builds shapes
-    # from unbacked SymInts, so fullgraph = True is a hard UserError on the first vision
-    # forward. Needs transformers >= 5.9 AND torch < 2.10 (pytorch 48dbd60df48,
-    # pytorch#162354, swapped guard_size_oblivious for guard_or_true), and we support
-    # torch well below 2.10. bilinear_indices, deprecated at 5.16 and imported by no
-    # modeling file today, is listed so a model going back to it stays uncompiled.
+    # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
+    # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
+    # Deliberately NOT gated on torch version. pytorch 48dbd60df48 (pytorch#162354)
+    # swapped guard_size_oblivious for guard_or_true and does make four of them
+    # traceable, but measured on torch 2.9.1 / 2.10.0 / 2.11.0 against transformers
+    # 5.16.1, window_index still dies on GuardOnDataDependentSymNode at
+    # `cu_window_seqlens.extend(cu_seqlens_tmp.tolist())` and bilinear_indices on its
+    # deprecation warning; on transformers 5.14.1, attention_seqlens and
+    # interpolation_indices break on torch 2.11 too. A `torch < 2.10` gate would put the
+    # crash back for qwen2_5_vl and qwen2_5_omni on the default install. Listing the
+    # traceable ones anyway costs one demoted caller across 10 VL model types
+    # (minimax_m3_vl's 3DRotaryEmbedding), because every VL vision forward is already
+    # off fullgraph through an earlier tier. bilinear_indices, deprecated at 5.16 and
+    # imported by no modeling file today, is listed so a model going back to it stays
+    # uncompiled.
     "get_vision_position_ids",
     "get_vision_cu_seqlens",
     "get_vision_attention_seqlens",
