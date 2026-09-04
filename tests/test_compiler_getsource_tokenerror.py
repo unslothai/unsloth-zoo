@@ -68,6 +68,13 @@ def _run(body: str, cache_dir: Path, timeout: int = 900):
     env = dict(os.environ)
     env["UNSLOTH_COMPILE_LOCATION"] = str(cache_dir)
     env["UNSLOTH_COMPILE_DISABLE"] = "1"
+    # On a CPU-only runner the zoo's get_device_type raises "Unsloth cannot find
+    # any torch accelerator" during the child's import, before either TokenError
+    # handler is reached. It does not today, but only because tests/conftest.py
+    # does os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1") at import and this
+    # copy of os.environ carries it. Measured: neuter that one conftest line and
+    # all three tests here die on the import. That is too far away to rely on.
+    env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     return subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True, text=True, timeout=timeout, env=env,
@@ -178,4 +185,26 @@ def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
     assert out["hits"] > 0, (
         "no getsource call resolved into the compile folder, so the dtype "
         "patcher's TokenError handler was never exercised"
+    )
+
+
+def test_the_probe_sets_cpu_mode_itself_rather_than_inheriting_it():
+    """The subprocess must not depend on conftest for its own importability.
+
+    A fresh interpreter inherits none of pytest's setup. These probes ran on a
+    CPU-only runner only because tests/conftest.py sets UNSLOTH_ALLOW_CPU at
+    import time and dict(os.environ) happened to carry it into the child;
+    neutering that single line makes every test in this file die inside the
+    child's `import unsloth_zoo.compiler`, before the handlers under test.
+
+    The checkout pin is already handled: the generated script starts with
+    sys.path.insert(0, ROOT), so the child imports this tree and not an
+    installed copy. Only the CPU flag was missing.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    setup = source[source.index("env = dict(os.environ)"):source.index("return subprocess.run(")]
+    assert 'env.setdefault("UNSLOTH_ALLOW_CPU", "1")' in setup
+    assert "sys.path.insert(0, {str(ROOT)!r})" in source, (
+        "the child must keep pinning this checkout, or it validates a "
+        "different compiler.py than the one under review"
     )
