@@ -337,6 +337,137 @@ def _validate_text_requests(
     return validated
 
 
+def _kv_quant_options(defaults: GenerationDefaults) -> dict:
+    """The caller's KV-quant controls, which validation has already vetted."""
+    return {
+        name: getattr(defaults, name)
+        for name in _KV_QUANT_CONTROLS
+        if getattr(defaults, name) is not None
+    }
+
+
+def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:
+    """The controls a batch cache is built with.
+
+    A sequential decode quantizes a turboquant cache once it reaches the start; a batch
+    decides at construction, so mlx-vlm's default start (5000) leaves a shorter batch
+    unquantized for good. Building from the first token is what was asked.
+    """
+    options = _kv_quant_options(defaults)
+    if "quantized_kv_start" not in options and _vlm_turboquant(defaults):
+        options["quantized_kv_start"] = 0
+    return options
+
+
+def _vlm_turboquant(defaults: GenerationDefaults) -> bool:
+    """Whether these controls make mlx-vlm build a turboquant cache."""
+    if defaults.kv_bits is None:
+        return False
+    try:
+        return bool(_resolve_vlm_batch_module().turboquant_enabled(
+            defaults.kv_bits, defaults.kv_quant_scheme))
+    except Exception:
+        return False
+
+
+def _vlm_kv_controls_refused(defaults: GenerationDefaults) -> list[str]:
+    """The KV-quant controls set here that mlx-vlm would drop rather than apply."""
+    requested = [
+        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
+    ]
+    if not requested:
+        return []
+    try:
+        accepted = inspect.signature(
+            _resolve_vlm_batch_module().BatchGenerator.__init__
+        ).parameters
+    except Exception:
+        return requested
+    refused = [name for name in requested if name not in accepted]
+    scheme = defaults.kv_quant_scheme
+    if scheme is not None and "kv_quant_scheme" not in refused and scheme not in _vlm_kv_quant_schemes():
+        # Any other name quietly resolves to uniform.
+        refused.append("kv_quant_scheme")
+    if defaults.kv_bits is None:
+        # Every other control reads off kv_bits, so without it none of them build anything.
+        refused += [name for name in requested if name != "kv_bits" and name not in refused]
+        return refused
+    turbo = _vlm_turboquant(defaults)
+    # Fractional bits make the cache turboquant whatever the scheme says; a turboquant cache
+    # takes no group size; quantized_kv_start gates only a turboquant cache.
+    dropped = ["kv_group_size"] if turbo else ["quantized_kv_start"]
+    if turbo and scheme is not None and scheme != "turboquant":
+        dropped.append("kv_quant_scheme")
+    refused += [name for name in dropped if name in requested and name not in refused]
+    return refused
+
+
+def _vlm_kv_quant_schemes() -> tuple[str, ...]:
+    """The scheme names the installed mlx-vlm resolves."""
+    try:
+        from mlx_vlm import kv_quant
+
+        return (kv_quant.UNIFORM_SCHEME, kv_quant.TURBOQUANT_SCHEME)
+    except Exception:
+        return ("uniform", "turboquant")
+
+
+def vlm_batch_adds_special_tokens(model, processor) -> bool:
+    """Whether a batched prompt is tokenized with the tokenizer's own special tokens.
+
+    A Gemma template writes ``<bos>`` itself, so a processor carrying one must not add
+    another. A caller whose rendered prompt already opens with the BOS text strips it
+    when this is true, or the batch would see two.
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type in ("gemma3", "gemma3n", "gemma4", "gemma4_unified"):
+        return getattr(processor, "chat_template", None) is None
+    return True
+
+
+def _vlm_quantized_cache_gap(model, defaults: GenerationDefaults) -> str | None:
+    """Why mlx-vlm would refuse to quantize this model's batch cache, or None.
+
+    It refuses while building the batch, after the rows were admitted, for a cache
+    that converts itself (``to_batch``); asked here so a caller can decline first.
+    """
+    if defaults.kv_bits is None:
+        return None
+    make_cache = getattr(getattr(model, "language_model", model), "make_cache", None)
+    if not callable(make_cache):
+        return None
+    try:
+        from mlx_vlm.models.cache import should_quantize_kv_layer
+    except ImportError:
+        should_quantize_kv_layer = lambda index, count: True  # noqa: E731
+    try:
+        entries = list(make_cache())
+    except Exception:
+        return None
+    for index, entry in enumerate(entries):
+        if hasattr(entry, "to_batch") and should_quantize_kv_layer(index, len(entries)):
+            return (
+                f"{type(entry).__name__} keeps model-specific cache state that "
+                f"{_installed_mlx_vlm_version()} cannot quantize across a batch; "
+                "omit kv_bits."
+            )
+    return None
+
+
+def _unpadded_lengths(mask) -> list[int] | None:
+    """Each row's own prompt length from the attention mask, or None without one.
+
+    mlx-vlm left-pads a prefill batch to its widest prompt, so the padded width is
+    not what a shorter row cost.
+    """
+    if mask is None:
+        return None
+    try:
+        return [int(n) for n in mask.sum(axis=-1).tolist()]
+    except Exception:
+        return None
+
+
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -376,16 +507,12 @@ def _validate_vlm_requests(
             "batched vision generation (got "
             f"{defaults.prefill_batch_size} > {defaults.completion_batch_size})."
         )
-    refused_kv = [
-        name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
-    ]
+    refused_kv = _vlm_kv_controls_refused(defaults)
     if refused_kv:
-        # quantized_kv_start does not reach mlx-vlm's batch cache builder, so quantization
-        # begins at the first token where the sequential path waits. The other controls
-        # are inert without kv_bits.
         raise ValueError(
-            f"{' and '.join(refused_kv)} are not forwarded by this engine's "
-            "batched vision path; omit these controls, or use model.generate."
+            f"{' and '.join(refused_kv)} would be dropped rather than applied by "
+            f"{_installed_mlx_vlm_version()}'s batch generator; omit these "
+            "controls, or use model.generate."
         )
     if defaults.max_kv_size is not None:
         # No supported BatchGenerator takes a KV-window control, so say so rather
@@ -2000,11 +2127,7 @@ class _VLMBatchAdapter:
             return _null_context()
 
     def _add_special_tokens(self) -> bool:
-        config = getattr(self.model, "config", None)
-        model_type = getattr(config, "model_type", None)
-        if model_type in ("gemma3", "gemma3n", "gemma4", "gemma4_unified"):
-            return getattr(self.processor, "chat_template", None) is None
-        return True
+        return vlm_batch_adds_special_tokens(self.model, self.processor)
 
     def _chunked_prefill_kwargs(self, *, input_ids=None, prefill_kwargs=None) -> dict:
         """Apply the release's chunked-prefill policy, which needs real inputs."""
@@ -2206,6 +2329,7 @@ class _VLMBatchAdapter:
             audio=request.audio,
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
             logits_processors=_row_processors(request),
+            **_kv_quant_options(self.defaults),
             sampler=(
                 _seeded_sampler(self.sample_utils, sampling)
                 if _draws_seeded(sampling)
@@ -2323,6 +2447,7 @@ class _VLMBatchAdapter:
             options["sampler"] = row_sampler
         if "compute_logprobs" in self.constructor_params:
             options["compute_logprobs"] = True
+        options.update(_batch_kv_quant_options(self.defaults))
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
         ]
@@ -2374,6 +2499,7 @@ class _VLMBatchAdapter:
                 yield from self._drive(
                     generator, uids, indices, gen_kwargs, row_sampler,
                     prompt_token_count=len(token_ids[0]),
+                    prompt_token_counts=_unpadded_lengths(mask),
                 )
         except BaseException as exc:
             active_error = exc
@@ -2404,16 +2530,20 @@ class _VLMBatchAdapter:
         gen_kwargs,
         row_sampler=None,
         prompt_token_count=0,
+        prompt_token_counts=None,
     ) -> Iterator[GenerationEvent]:
-        """Report the chunk's rows, charging ``prompt_token_count`` to each."""
+        """Report the chunk's rows, charging each its own prompt count, or
+        ``prompt_token_count`` to every row when none are given."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        if prompt_token_counts is None:
+            prompt_token_counts = [prompt_token_count] * len(uids)
         pending = {
             uid: _PendingResult(
                 detokenizer=_new_detokenizer(tokenizer, require_independent=True),
                 scanner=_StopStringScanner(self.defaults.stop_strings),
-                prompt_token_count=prompt_token_count,
+                prompt_token_count=count,
             )
-            for uid in uids
+            for uid, count in zip(uids, prompt_token_counts)
         }
         row_of = dict(zip(uids, indices))
         live = list(uids)
@@ -2719,6 +2849,7 @@ class _VLMBatchSession:
             "completion_batch_size": defaults.completion_batch_size,
             "sampler": self.sampler,
             "compute_logprobs": True,
+            **_batch_kv_quant_options(defaults),
         }
         generator = adapter.generator_type(
             adapter.model.language_model,
@@ -2778,6 +2909,16 @@ class _VLMBatchSession:
 
 def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
     """What a stream settles before it takes anything: vision or not, and the adapter."""
+    if bool(getattr(model, "_is_vlm_model", False)):
+        refused = _vlm_kv_controls_refused(defaults)
+        if refused:
+            raise ValueError(
+                f"{' and '.join(refused)} would be dropped rather than applied by "
+                f"{_installed_mlx_vlm_version()}'s batch generator; omit these controls."
+            )
+        gap = _vlm_quantized_cache_gap(model, defaults)
+        if gap is not None:
+            raise ValueError(gap)
     if defaults.stop_strings:
         raise ValueError(
             "BatchStream cannot apply stop_strings: they cut on token "
@@ -2968,6 +3109,8 @@ def _stream_batch(
         if is_vlm
         else _validate_text_requests(requests, defaults)
     )
+    if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
+        raise ValueError(gap)
     if not validated:
         return
     if is_vlm:

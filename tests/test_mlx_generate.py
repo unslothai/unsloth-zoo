@@ -495,14 +495,16 @@ def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     cases = ((GenerationRequest(prompt_token_ids=[1]), GenerationDefaults(), "rendered prompt string"),
         (GenerationRequest(prompt=""), GenerationDefaults(), "must not be empty"),
         (GenerationRequest(prompt="a"), GenerationDefaults(max_kv_size=64), "max_kv_size is not supported"),
-        # One that stopped being refused would reach generation and be dropped.
-        *((GenerationRequest(prompt="a"), GenerationDefaults(**{name: value}),
-           "not forwarded by this engine")
-          for name, value in (("kv_bits", 4), ("kv_group_size", 64),
-                              ("kv_quant_scheme", "affine"), ("quantized_kv_start", 100))))
+        # One mlx-vlm would drop rather than apply is refused: an inert start or bogus scheme,
+        # a group size on a turboquant cache, an explicit scheme that fractional bits override.
+        *((GenerationRequest(prompt="a"), GenerationDefaults(**kw), f"{name} would be dropped")
+          for kw, name in (({"kv_bits": 4, "quantized_kv_start": 100}, "quantized_kv_start"), ({"kv_bits": 4, "kv_quant_scheme": "bogus"}, "kv_quant_scheme"), ({"kv_bits": 4, "kv_quant_scheme": "turboquant", "kv_group_size": 32}, "kv_group_size"), ({"kv_bits": 4.5, "kv_quant_scheme": "uniform"}, "kv_quant_scheme"))))  # noqa: E501
     for request, defaults, message in cases:
         with pytest.raises(ValueError, match=message):
             _validate_vlm_requests([request], defaults)
+    # Forwarded, not refused: mlx-vlm's cache builder applies these.
+    accepted = ({"kv_group_size": 32}, {"kv_quant_scheme": "uniform"}, {"kv_quant_scheme": "turboquant"}, {"kv_bits": 4.5}, {"kv_bits": 4.5, "quantized_kv_start": 9})  # noqa: E501
+    assert all(_validate_vlm_requests([GenerationRequest(prompt="a")], GenerationDefaults(**{"kv_bits": 4, **kw})) for kw in accepted)  # noqa: E501
     # Path images normalize to str once: mlx-vlm's loader opens str only, and
     # grouping and preprocessing must see the same value.
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
@@ -599,9 +601,10 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
                    types.SimpleNamespace(to_dict=lambda: {"inputs_embeds": "E", "position_ids": None}))
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.defaults, adapter.per_row_prompt_kwargs = GenerationDefaults(), True
+    adapter.defaults = GenerationDefaults(kv_bits=4, kv_quant_scheme="turboquant")
+    adapter.per_row_prompt_kwargs = True
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens"}  # noqa: E501
+    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler", "stop_tokens", "kv_bits", "kv_quant_scheme", "quantized_kv_start"}  # noqa: E501
     adapter.prepare_inputs = lambda *a, **k: {"input_ids": ids, "extra": "D", "position_ids": "P"}  # noqa: E501
     adapter.make_sampler = lambda **k: object()
     adapter._add_special_tokens = lambda: True
@@ -625,6 +628,8 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     assert seen["kwargs"]["extra"] == "D"
     # A None embedding field must not overwrite a valid preprocessing value.
     assert seen["kwargs"]["position_ids"] == "P"
+    # The KV-quant controls reach the constructor that builds the cache, turboquant from token one.
+    assert [seen["ctor"][n] for n in ("kv_bits", "kv_quant_scheme", "quantized_kv_start")] == [4, "turboquant", 0]
     # Per-row keeps configured sizes; EOS stays with the processor.
     assert (seen["ctor"]["prefill_batch_size"], seen["ctor"]["completion_batch_size"]) == (8, 32)
     assert "stop_tokens" not in seen["ctor"]
@@ -1018,6 +1023,24 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert shown == [[6]]
 
 
+def test_an_audio_row_decodes_with_the_quantization_the_batch_was_given():
+    from unsloth_zoo.mlx.generate import _KV_QUANT_CONTROLS, _validate_vlm_requests
+    # Each one validation accepts, as given: a sequential turboquant row keeps mlx-vlm's own start.
+    for kw in ({"kv_bits": 4, "kv_group_size": 32, "kv_quant_scheme": "uniform"}, {"kv_bits": 4, "kv_quant_scheme": "turboquant", "quantized_kv_start": 9}, {"kv_bits": 4.5}):  # noqa: E501
+        adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
+        adapter.defaults = GenerationDefaults(**kw)
+        assert _validate_vlm_requests([GenerationRequest(prompt = "p", audio = "a.wav")], adapter.defaults)
+        _audio_row(adapter, GenerationRequest(prompt = "p", audio = "a.wav"))
+        assert {k: v for k, v in adapter.stream_calls[0][1].items() if k in _KV_QUANT_CONTROLS} == kw
+
+
+def test_a_turboquant_batch_without_a_start_quantizes_from_the_first_token():
+    from unsloth_zoo.mlx.generate import _batch_kv_quant_options
+    for kw in ({"kv_bits": 4.5}, {"kv_bits": 4, "kv_quant_scheme": "turboquant"}):
+        assert _batch_kv_quant_options(GenerationDefaults(**kw)) == {**kw, "quantized_kv_start": 0}
+    assert _batch_kv_quant_options(GenerationDefaults(kv_bits = 4)) == {"kv_bits": 4}  # uniform: start stays mlx-vlm's
+
+
 def test_audio_fallback_honours_stop_strings():
     # Audio reaches the same scanner: "<ST" + "OP>" completes the stop string.
     result, _streamed = _audio_row(
@@ -1358,10 +1381,20 @@ def _vlm_adapter(generator_type = None):
     return adapter
 
 
-def _vlm_session(generator_type = None):
+def _vlm_session(generator_type = None, **defaults):
     from unsloth_zoo.mlx.generate import _VLMBatchSession
 
-    return _VLMBatchSession(_vlm_adapter(generator_type))
+    adapter = _vlm_adapter(generator_type)
+    adapter.defaults = GenerationDefaults(max_tokens = 5, **defaults)
+    adapter.constructor_params = adapter.constructor_params | set(defaults)
+    return _VLMBatchSession(adapter)
+
+
+def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
+    with contextlib.closing(_vlm_session(kv_bits = 8, kv_group_size = 32)) as session:
+        assert [session.generator.kwargs[n] for n in ("kv_bits", "kv_group_size")] == [8, 32]
+    with contextlib.closing(_vlm_session(kv_bits = 4, kv_quant_scheme = "turboquant", quantized_kv_start = None)) as session:  # noqa: E501
+        assert session.generator.kwargs["quantized_kv_start"] == 0  # from the first token, not mlx-vlm's 5000
 
 
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
@@ -1474,3 +1507,28 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
     with pytest.raises(ValueError, match="cannot apply stop_strings"):
         stream_batch(object(), object(), [],
                      defaults = GenerationDefaults(stop_strings = ("X",)))
+
+
+def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
+    from unsloth_zoo.mlx.generate import stream_unavailable_reason
+
+    _SideCache = type("_SideCache", (), {"to_batch": lambda self, left_padding: self})
+    caches = [object(), _SideCache(), object()]
+    model = types.SimpleNamespace(_is_vlm_model = True, language_model = types.SimpleNamespace(make_cache = lambda: list(caches)))  # noqa: E501
+    gap = lambda **kw: stream_unavailable_reason(model, object(), defaults = GenerationDefaults(kv_bits = 8, **kw)) or ""  # noqa: E501,E731
+    assert "cannot quantize across a batch" in gap()
+    assert "kv_quant_scheme would be dropped" in gap(kv_quant_scheme = "bogus")  # refused before the cache is looked at
+    caches[1], caches[2] = caches[2], caches[1]  # only in the last layer, which stays unquantized
+    assert "cannot quantize" not in gap()
+
+
+def test_a_prefill_batch_charges_each_row_its_own_prompt_and_not_the_padded_width():
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _unpadded_lengths
+
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.per_row_prompt_kwargs, adapter.defaults = True, GenerationDefaults()
+    adapter.processor = types.SimpleNamespace(tokenizer = _CharTokenizer())
+    generator = _vlm_stub(True, events = [[(0, 3, "stop"), (1, 3, "stop")]])(object(), object())
+    mask = types.SimpleNamespace(sum = lambda axis: {-1: types.SimpleNamespace(tolist = lambda: [1.0, 11.0])}[axis])  # noqa: E501
+    results = _results(adapter._drive(generator, [0, 1], [0, 1], {}, prompt_token_counts = _unpadded_lengths(mask)))  # noqa: E501
+    assert [r.prompt_token_count for r in results] == [1, 11]
