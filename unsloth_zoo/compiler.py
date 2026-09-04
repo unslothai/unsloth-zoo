@@ -4183,12 +4183,15 @@ def _patch_torch_dtype_modules(
 
             try:
                 source = inspect.getsource(function.forward).rstrip()
-            except (OSError, TypeError):
+            except (OSError, TypeError, tokenize.TokenError):
                 # A forward built by exec, or one whose file has gone. Unguarded
                 # the OSError propagates out of FastModel.from_pretrained and
                 # the model does not load, over source we only wanted in order
                 # to patch a dtype cast. `get_compiler_config` above only covers
                 # torch.compile wrappers.
+                #
+                # TokenError subclasses Exception directly, so neither catch above sees it: getsource
+                # can read our generated forward mid-rewrite. linecache.checkcache() is NOT the fix (findsource calls it).
                 #
                 # The precondition is not fully characterised: two plain Qwen
                 # loads do not trigger it, and after such a load no torch.nn
@@ -4479,11 +4482,13 @@ def unsloth_compile_transformers(
     functions = dir(modeling_file)
     try:
         full_source = inspect.getsource(modeling_file)
-    except (OSError, TypeError) as exception:
+    except (OSError, TypeError, tokenize.TokenError) as exception:
         # Everything below is source-level feature detection, so with no source
         # there is nothing to do. Unguarded the OSError propagates out of
         # FastModel.from_pretrained and the model fails to LOAD, over a file we
         # only wanted in order to make it faster.
+        #
+        # TokenError is dead here (module: getsourcelines never calls getblock), kept for symmetry.
         #
         # Return rather than continue with an empty string: checks of the form
         # `"_supports_sdpa = False" not in full_source` are TRUE on empty and
