@@ -44,6 +44,7 @@ enable paths the model never claimed to support. Slower is fine; wrong is not.
 
 import ast
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -66,6 +67,58 @@ def _guard_region() -> str:
     return SRC[max(0, i - 400):i + 2200]
 
 
+def _caught_names(handler) -> set:
+    """The exception names an `except` clause catches, spelled as they are written."""
+    node = handler.type
+    if node is None:
+        return set()
+    parts = node.elts if isinstance(node, ast.Tuple) else [node]
+    return {ast.unparse(part) for part in parts}
+
+
+def _catches(caught: set, name: str) -> bool:
+    """Whether `name` is caught under a spelling this module can actually resolve.
+
+    A bare `TokenError` is not interchangeable with `tokenize.TokenError` here:
+    compiler.py imports the module and not the name, so an unqualified handler
+    would raise NameError at the moment it is asked to handle a failure.
+    """
+    if name in caught:
+        return True
+    bare = name.rsplit(".", 1)[-1]
+    return bare in caught and re.search(
+        rf"^from [\w.]+ import [^\n]*\b{bare}\b", SRC, re.M
+    ) is not None
+
+
+def _getsource_guards(call: str) -> list:
+    """What every `try` whose body calls `call` catches, one union per `try`.
+
+    Read off the parse, not matched as one spelling: a wider guard is a stronger
+    premise, yet #1149 widening it to `tokenize.TokenError` failed three tests here
+    while catching strictly more. A union per `try` rather than a set per handler,
+    because `except OSError:` beside `except TypeError:` guards the call exactly as
+    well as the single tuple does.
+
+    The nearest enclosing `try` only. An outer `try` unparses its whole body, so it
+    contains the call too, but a handler out there for something unrelated is not the
+    thing guarding this call and must not be asked to catch what this one catches.
+    """
+    matching = [
+        node for node in ast.walk(ast.parse(SRC))
+        if isinstance(node, ast.Try)
+        and any(call in ast.unparse(stmt) for stmt in node.body)
+    ]
+    return [
+        set().union(set(), *(_caught_names(h) for h in node.handlers))
+        for node in matching
+        if not any(
+            other is not node and any(d is other for d in ast.walk(node))
+            for other in matching
+        )
+    ]
+
+
 # ---- the guard ------------------------------------------------------------
 
 def test_getsource_is_wrapped():
@@ -76,8 +129,13 @@ def test_getsource_is_wrapped():
 
 def test_it_catches_what_getsource_actually_raises():
     """OSError for unreadable source, TypeError for a built-in or C module."""
-    region = _guard_region()
-    assert "except (OSError, TypeError)" in region
+    guards = _getsource_guards("inspect.getsource(modeling_file)")
+    assert guards, "the modeling-file getsource is no longer inside a try"
+    for caught in guards:
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
+            f"the modeling-file guard stopped catching one of them: {sorted(caught)}")
+    # Widened by #1149: getblock's TokenError subclasses Exception directly.
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_the_real_exception_type_is_oserror():
@@ -170,9 +228,12 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    region = _nn_patch_region()
-    assert "try:" in region
-    assert "except (OSError, TypeError)" in region
+    guards = _getsource_guards("inspect.getsource(function.forward)")
+    assert guards, "the forward getsource is no longer inside a try"
+    for caught in guards:
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
+            f"the forward guard stopped catching one of them: {sorted(caught)}")
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
@@ -217,7 +278,13 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    assert SRC.count("except (OSError, TypeError)") >= 2
+    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(function.forward)"}
+    for call in sites:
+        guards = _getsource_guards(call)
+        assert guards and all(
+            _catches(c, "OSError") and _catches(c, "TypeError") for c in guards
+        ), (
+            f"{call} is unguarded, so an unreadable source is fatal again")
 
 
 # ---- what the fallback must still do -------------------------------------
