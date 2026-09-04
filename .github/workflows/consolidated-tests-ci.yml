@@ -314,6 +314,16 @@ jobs:
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
         #
+        # The two compiled-cache files cover create_new_function's distributed
+        # protocol: the rank-local guard that let one rank skip a broadcast and
+        # hang the group under torchrun, and the digest agreement that stops two
+        # ranks importing different generated implementations. They are CPU-pure
+        # (the gloo file spawns two local ranks over a file:// rendezvous, no
+        # ports and no GPU) and take about 15 seconds together. Listing them here
+        # is the whole point of this block: 42 of the 44 fail against the code
+        # they fix, so left to --collect-only they would prove only that they
+        # import, which is the failure every paragraph above already describes.
+        #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
         # y` binds to whatever `tests` package is importable; unsloth's CI runs
@@ -359,6 +369,8 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_compiled_cache_collective.py \
+            tests/test_compiled_cache_collective_gloo.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
