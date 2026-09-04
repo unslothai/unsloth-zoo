@@ -111,6 +111,45 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+def topk_to_routing_tensors(router_indices, routing_weights, n_expts_tot):
+    """Order the router's top-k picks expert-major, as triton_kernels.routing does.
+
+    This is triton_kernels.routing.routing_torch from its sort step onward, fed the
+    router's own weights instead of recomputing softmax(logits): GptOssTopKRouter
+    has already softmaxed over the top-k, so pushing its scores back through
+    routing() would normalise them a second time.
+
+    router_indices:  (n_tokens, top_k) expert id per pick.
+    routing_weights: (n_tokens, n_expts_tot) dense scores, zero off the top-k.
+
+    Returns (gate_scal, expt_hist, combine_indx, dispatch_indx):
+      gate_scal     (n_tokens * top_k,)  pick weights in expert-major order
+      expt_hist     (n_expts_tot,) int32 picks per expert
+      combine_indx  (n_tokens * top_k,) int32 expert-major position -> flat pick slot
+      dispatch_indx its inverse
+    """
+    n_tokens, top_k = router_indices.shape
+    if routing_weights.shape != (n_tokens, n_expts_tot):
+        raise ValueError(
+            f"routing_weights must be dense (n_tokens, n_experts) = {(n_tokens, n_expts_tot)}, "
+            f"got {tuple(routing_weights.shape)}"
+        )
+    expt_indx = router_indices.to(torch.int64)
+    expt_scal = torch.gather(routing_weights, 1, expt_indx)
+    # routing_torch sorts each token's picks by expert id before flattening
+    expt_indx, order = torch.sort(expt_indx, dim = 1)
+    expt_scal = torch.gather(expt_scal, 1, order)
+    expt_indx = expt_indx.reshape(-1)
+    expt_scal = expt_scal.reshape(-1)
+    # then sorts all picks by expert id so each expert's rows are contiguous
+    combine_indx = torch.argsort(expt_indx, stable = True)
+    dispatch_indx = torch.argsort(combine_indx, stable = True)
+    gate_scal = expt_scal[combine_indx]
+    expt_hist = torch.bincount(expt_indx, minlength = n_expts_tot).to(torch.int32)
+    return gate_scal, expt_hist, combine_indx.to(torch.int32), dispatch_indx.to(torch.int32)
+pass
+
+
 def patch_gpt_oss():
     try:
         import triton_kernels
@@ -274,6 +313,27 @@ def patch_gpt_oss():
 
     pass
 
+    def routing_from_topk(router_indices, routing_weights, n_expts_tot):
+        """RoutingData / GatherIndx / ScatterIndx from the HF router's (indices, scores)."""
+        import triton_kernels.routing as tk_routing
+        n_expts_act = router_indices.shape[-1]
+        n_gates = router_indices.numel()
+        with torch_cuda_device(routing_weights.device):
+            gate_scal, expt_hist, combine_indx, dispatch_indx = topk_to_routing_tensors(
+                router_indices, routing_weights, n_expts_tot,
+            )
+            # newer triton_kernels precompute the tile metadata on the torch side;
+            # older ones derive it inside matmul_ogs from expt_hist.
+            compute_expt_data_torch = getattr(tk_routing, "compute_expt_data_torch", None)
+            expt_data = None
+            if compute_expt_data_torch is not None:
+                expt_data = compute_expt_data_torch(expt_hist, n_expts_tot, n_gates)
+        gather_idx = tk_routing.GatherIndx(src_indx = combine_indx, dst_indx = dispatch_indx)
+        scatter_idx = tk_routing.ScatterIndx(src_indx = dispatch_indx, dst_indx = combine_indx)
+        routing_data = tk_routing.RoutingData(gate_scal, expt_hist, n_expts_tot, n_expts_act, expt_data)
+        return routing_data, gather_idx, scatter_idx
+    pass
+
     class Mxfp4GptOssExperts(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -387,8 +447,31 @@ def patch_gpt_oss():
             self.__dict__["_down_proj"] = value
 
         def forward(
-            self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx
+            self,
+            hidden_states: torch.Tensor,
+            routing_data = None,
+            gather_idx = None,
+            scatter_idx = None,
+            *,
+            router_indices = None,
+            routing_weights = None,
         ) -> torch.Tensor:
+            # mlp_forward below passes triton routing structures positionally;
+            # transformers >= 4.57 and the GptOssMLP path further down call
+            # experts(hidden_states, router_indices=..., routing_weights=...) with
+            # hidden_states still (batch, seq, hidden).
+            leading_shape = None
+            if routing_data is None:
+                if router_indices is None or routing_weights is None:
+                    raise TypeError(
+                        "Mxfp4GptOssExperts.forward needs either (routing_data, gather_idx, scatter_idx) "
+                        "or router_indices= and routing_weights="
+                    )
+                leading_shape = hidden_states.shape[:-1]
+                hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+                routing_data, gather_idx, scatter_idx = routing_from_topk(
+                    router_indices, routing_weights, self.num_experts,
+                )
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
@@ -420,6 +503,8 @@ def patch_gpt_oss():
                         gather_idx,
                         scatter_idx,
                     )
+            if leading_shape is not None:
+                intermediate_cache3 = intermediate_cache3.reshape(*leading_shape, intermediate_cache3.shape[-1])
             return intermediate_cache3
 
         pass
