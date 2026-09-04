@@ -128,6 +128,26 @@ def _pip_command(pkg: str) -> list:
     return cmd
 
 
+def _add_user_site() -> None:
+    """Put a user site directory that this install has just CREATED on sys.path.
+
+    site.addusersitepackages adds it only ``if os.path.isdir(user_site)``, and that is
+    evaluated at interpreter start, so the FIRST --user install of a session leaves the
+    package importable by nothing: the caller re-raises the original ImportError and
+    the user is told to install what they have just installed. addsitedir dedupes
+    against the current sys.path, so calling this twice is harmless."""
+    try:
+        if not site.ENABLE_USER_SITE:
+            # -s, PYTHONNOUSERSITE or a venv: the interpreter was told to ignore the
+            # user site, and pip's --user would have refused too. Do not override that.
+            return
+        user_site = site.getusersitepackages()
+        if user_site and os.path.isdir(user_site) and user_site not in sys.path:
+            site.addsitedir(user_site)
+    except Exception:
+        pass
+
+
 def _run_install(pkg: str, cmd: list) -> tuple:
     """Run one installer command. Returns ``(succeeded, retry_with_pip)``."""
     logger.warning(
@@ -141,6 +161,8 @@ def _run_install(pkg: str, cmd: list) -> tuple:
         return False, False
     if r.returncode == 0:
         importlib.invalidate_caches()
+        if "--user" in cmd:
+            _add_user_site()
         try:
             list(importlib.metadata.distributions())
         except Exception:
