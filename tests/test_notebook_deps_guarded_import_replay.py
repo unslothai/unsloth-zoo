@@ -359,3 +359,134 @@ def test_the_installer_path_replays_before_letting_the_retry_through(
         "the retry was allowed to succeed while the consumer module still had "
         "no binding for the backend it guards"
     )
+
+
+# A guard body does not only import. transformers/audio_utils.py has
+#
+#     if is_torchcodec_available():
+#         TORCHCODEC_VERSION = version.parse(importlib.metadata.version("torchcodec"))
+#
+# and load_audio then reads TORCHCODEC_VERSION as soon as the probe says yes. Replaying
+# the imports alone turns the ImportError into `NameError: name 'TORCHCODEC_VERSION' is
+# not defined`, which is the exact failure this whole file exists to prevent.
+
+ASSIGNS_STATE = f"""
+RELOADS.append(1)
+if {GUARD}():
+    import {BACKEND}
+    VERSION_TAG = {BACKEND}.dumps({{"v": 1}})
+
+
+def use():
+    return VERSION_TAG
+"""
+
+IMPORTS_ONLY = f"""
+RELOADS.append(1)
+if {GUARD}():
+    import {BACKEND}
+"""
+
+
+def _load_reloadable(tmp_path, monkeypatch, iu, leaf, source):
+    """A module importlib.reload can actually re-run: a real file plus a parent package
+    in sys.modules whose __path__ contains it, which is what reload looks the spec up
+    through. The guard reads the live flag, so a reload sees the installed state."""
+    package = "transformers.models.unsloth_reload_probe"
+    directory = tmp_path / "pkg"
+    directory.mkdir(exist_ok = True)
+    parent = types.ModuleType(package)
+    parent.__path__ = [str(directory)]
+    monkeypatch.setitem(sys.modules, package, parent)
+
+    path = directory / (leaf + ".py")
+    path.write_text(source, encoding = "utf-8")
+    name = f"{package}.{leaf}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    module.RELOADS = []
+    setattr(module, GUARD, lambda: iu.available)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_guarded_assignment_is_bound_too(tmp_path, monkeypatch, iu):
+    module = _load_reloadable(tmp_path, monkeypatch, iu, "assigns_state", ASSIGNS_STATE)
+    assert not hasattr(module, "VERSION_TAG"), "precondition: the guard was skipped"
+
+    iu.available = True
+    assert notebook_deps._replay_skipped_guarded_imports(iu, BACKEND) is True
+
+    assert hasattr(module, "VERSION_TAG"), (
+        "the guard body's assignment is still unbound, so the caller the install was "
+        "supposed to rescue raises NameError instead of working"
+    )
+    assert module.use() == '{"v": 1}'
+
+
+def test_a_function_that_was_already_imported_elsewhere_sees_the_new_state(
+    tmp_path, monkeypatch, iu
+):
+    """reload re-runs the module in the SAME __dict__, so `from x import use` in some
+    other module keeps working. A fresh import under a new name would not do this."""
+    module = _load_reloadable(tmp_path, monkeypatch, iu, "stale_ref", ASSIGNS_STATE)
+    stale = module.use
+
+    iu.available = True
+    notebook_deps._replay_skipped_guarded_imports(iu, BACKEND)
+
+    assert stale is not module.use, "reload rebinds the attribute"
+    assert stale() == '{"v": 1}', "but the old function object shares the refreshed globals"
+
+
+def test_a_module_with_only_guarded_imports_is_not_re_run(tmp_path, monkeypatch, iu):
+    """Blast radius: re-running a module is the fallback for state an import replay
+    cannot bind, not the mechanism. Everything else keeps the targeted path."""
+    module = _load_reloadable(tmp_path, monkeypatch, iu, "imports_only", IMPORTS_ONLY)
+    assert module.RELOADS == [1]
+
+    iu.available = True
+    notebook_deps._replay_skipped_guarded_imports(iu, BACKEND)
+
+    assert hasattr(module, BACKEND)
+    assert module.RELOADS == [1], "the module was re-run when a plain import would do"
+
+
+def test_the_re_run_really_is_what_binds_it(tmp_path, monkeypatch, iu):
+    """Non-vacuity for the test above: this module IS re-run, and once only."""
+    module = _load_reloadable(tmp_path, monkeypatch, iu, "counted", ASSIGNS_STATE)
+    assert module.RELOADS == [1]
+
+    iu.available = True
+    notebook_deps._replay_skipped_guarded_imports(iu, BACKEND)
+
+    assert module.RELOADS == [1, 1]
+
+
+def test_a_failing_re_run_is_reported_rather_than_waved_through(tmp_path, monkeypatch, iu):
+    module = _load_reloadable(tmp_path, monkeypatch, iu, "boom", ASSIGNS_STATE)
+
+    def _explode(mod):
+        raise RuntimeError("re-import failed")
+
+    monkeypatch.setattr(notebook_deps.importlib, "reload", _explode)
+    iu.available = True
+
+    assert notebook_deps._replay_skipped_guarded_imports(iu, BACKEND) is False, (
+        "the wrapper re-raises the original ImportError on False; silently returning "
+        "True here hands the caller a NameError instead"
+    )
+
+
+def test_the_transformers_package_itself_is_never_re_run(monkeypatch, iu):
+    """The lazy-module entry point. Re-running it is far more than binding one name."""
+    root = types.ModuleType("transformers")
+    root.__file__ = "/nonexistent/transformers/__init__.py"
+    tree = ast.parse(f"if {GUARD}():\n    STATE = 1\n")
+
+    calls = []
+    monkeypatch.setattr(notebook_deps.importlib, "reload", lambda m: calls.append(m))
+
+    assert notebook_deps._rerun_for_guarded_state(root, tree, GUARD, BACKEND) is True
+    assert calls == []

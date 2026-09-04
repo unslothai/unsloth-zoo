@@ -279,6 +279,44 @@ def _statement_imports(statement, import_name) -> bool:
     return statement.level == 0 and (statement.module or "").split(".")[0] == import_name
 
 
+def _is_backend_guard(node, guard) -> bool:
+    """A bare ``if is_<backend>_available():`` at module scope. Negated and compound
+    guards are skipped rather than guessed at."""
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == guard
+        and not test.args
+        and not test.keywords
+    )
+
+
+def _names_bound_without_importing(body) -> list:
+    """Names a guard body binds by something other than an import.
+
+    transformers/audio_utils.py guards an ASSIGNMENT, not an import:
+    ``if is_torchcodec_available(): TORCHCODEC_VERSION = version.parse(...)``. Replaying
+    that statement by statement would mean evaluating an arbitrary expression, so only
+    the names are collected here and the module is re-run instead."""
+    names = []
+    for statement in body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(statement, ast.Assign):
+            names.extend(
+                target.id for target in statement.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(statement, ast.AnnAssign):
+            if isinstance(statement.target, ast.Name) and statement.value is not None:
+                names.append(statement.target.id)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(statement.name)
+    return names
+
+
 def _skipped_import_statements(tree, guard, import_name) -> list:
     """Top-level import statements conditional on this backend. Two shapes: the ``if
     is_<backend>_available():`` guard leaves the name absent, while ``try: import x /
@@ -287,14 +325,7 @@ def _skipped_import_statements(tree, guard, import_name) -> list:
     out = []
     for node in tree.body:
         if isinstance(node, ast.If):
-            test = node.test
-            if not (
-                isinstance(test, ast.Call)
-                and isinstance(test.func, ast.Name)
-                and test.func.id == guard
-                and not test.args
-                and not test.keywords
-            ):
+            if not _is_backend_guard(node, guard):
                 continue
             out.extend(
                 statement for statement in node.body
@@ -369,7 +400,46 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
                     f"`{ast.unparse(statement)}` in {module.__name__} failed: "
                     f"{type(exception).__name__}: {exception}"
                 )
+        if not _rerun_for_guarded_state(module, tree, guard, backend):
+            ok = False
     return ok
+
+
+def _rerun_for_guarded_state(module, tree, guard, backend) -> bool:
+    """Re-import ``module`` when its guard body binds state an import replay cannot.
+
+    ``importlib.reload`` re-runs the module in the SAME ``__dict__``, so a function
+    another module already imported by name sees the new global too, which a fresh
+    import under a new name would not give. The top-level ``transformers`` package is
+    never reloaded: it is the lazy-module entry point and re-running it is far more
+    than this needs."""
+    if module.__name__ == "transformers":
+        return True
+    missing = [
+        name
+        for node in tree.body
+        if _is_backend_guard(node, guard)
+        for name in _names_bound_without_importing(node.body)
+        if not hasattr(module, name)
+    ]
+    if not missing:
+        return True
+    try:
+        importlib.reload(module)
+    except Exception as exception:
+        logger.warning(
+            f"Unsloth: {backend} installed, but re-running {module.__name__} to bind "
+            f"{', '.join(missing)} failed: {type(exception).__name__}: {exception}"
+        )
+        return False
+    still = [name for name in missing if not hasattr(module, name)]
+    if still:
+        logger.warning(
+            f"Unsloth: {backend} installed, but {module.__name__} still does not "
+            f"define {', '.join(still)}; restart the kernel to pick it up."
+        )
+        return False
+    return True
 
 
 def patch_requires_backends_autoinstall():
