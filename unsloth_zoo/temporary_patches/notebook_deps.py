@@ -464,6 +464,24 @@ def _rerun_for_guarded_state(module, tree, guard, backend) -> bool:
     return True
 
 
+def _is_dummy_export(obj) -> bool:
+    """Whether ``obj`` is one of transformers' generated ``utils/dummy_*_objects.py``
+    stand-ins.
+
+    When a backend is missing at ``import transformers``, ``__init__``'s
+    ``_import_structure`` binds the PUBLIC name to a stub whose entire body is
+    ``requires_backends(...)`` -- e.g. ``convert_slow_tokenizer`` in
+    ``dummy_sentencepiece_and_tokenizers_objects.py``. Installing the backend later
+    refreshes availability but does not rebuild that lazy export, so a retry that now
+    SUCCEEDS lets the stub run to completion and hand the caller ``None`` (or an inert
+    instance) instead of the real object. That is worse than the ImportError it
+    replaced, so the wrapper says restart instead of returning."""
+    module = getattr(obj, "__module__", None)
+    if not isinstance(module, str):
+        module = getattr(type(obj), "__module__", None)
+    return isinstance(module, str) and module.startswith("transformers.utils.dummy_")
+
+
 def patch_requires_backends_autoinstall():
     """Wrap ``requires_backends`` so an allow-listed missing backend triggers a one-shot
     pip install and a retry. The original ImportError is preserved on failure, so error
@@ -485,7 +503,7 @@ def patch_requires_backends_autoinstall():
     def requires_backends(obj, backends):
         try:
             return _orig(obj, backends)
-        except ImportError:
+        except ImportError as original:
             if not _auto_install_enabled() or _no_network():
                 raise
             wanted_iter = backends if isinstance(backends, (list, tuple)) else [backends]
@@ -503,6 +521,16 @@ def patch_requires_backends_autoinstall():
                 # ImportError at least names the package.
                 if not _replay_skipped_guarded_imports(iu, b):
                     raise
+            if _is_dummy_export(obj):
+                # Returning here would run the dummy body to completion and give the
+                # caller None / an inert object. Keep the original message and add
+                # what actually fixes it.
+                raise ImportError(
+                    f"{original}\n"
+                    f"Unsloth: `{'`, `'.join(installed)}` is now installed, but "
+                    f"transformers bound this object to a placeholder when it was "
+                    f"first imported without it. Please restart the runtime/kernel."
+                ) from None
             return _orig(obj, backends)
 
     requires_backends._unsloth_patched = True
