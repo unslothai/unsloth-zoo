@@ -6392,24 +6392,516 @@ def _patch_mlx_saving(model, tokenizer):
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
 
 
+# Searched first, so a tree that resolves today keeps resolving the same way.
+_VISION_GROUP_ATTRS = ("vision_tower", "vision_model", "vision_encoder")
+_PROJECTOR_GROUP_ATTRS = (
+    "multi_modal_projector", "mm_projector", "connector", "aligner",
+    "embed_vision",
+)
+_VISION_ROLE_TOKENS = frozenset((
+    "vision", "visual", "vit", "image", "img", "pixel", "siglip", "clip", "sam",
+))
+_PROJECTOR_ROLE_TOKENS = frozenset((
+    "projector", "projection", "proj", "connector", "aligner", "align",
+    "merger", "merge", "resampler", "mlp1",
+))
+# The subset naming the role outright; "proj", "merge" and "align" also occur
+# on modules that are not connectors.
+_STRONG_PROJECTOR_TOKENS = frozenset((
+    "projector", "projection", "connector", "aligner", "merger", "resampler",
+    "mlp1",
+))
+# `audio_projection` is shaped exactly like a vision connector, so only the
+# modality in the name separates them.
+_OTHER_MODALITY_TOKENS = frozenset((
+    "audio", "sound", "speech", "voice", "wav", "mel", "talker",
+))
+_NON_VISION_ROLE_TOKENS = _OTHER_MODALITY_TOKENS | frozenset(("language", "text"))
+# Whole words, not substrings: "sam" occurs inside `itok_upsampler`.
+_ROLE_TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _role_tokens(name):
+    tokens = set()
+    for token in _ROLE_TOKEN_SPLIT.split(str(name)):
+        if not token:
+            continue
+        token = token.lower()
+        tokens.add(token)
+        # A plural names the same role: `layerwise_projectors`.
+        if len(token) > 3 and token.endswith("s"):
+            tokens.add(token[:-1])
+    return frozenset(tokens)
+
+
+def _has_role_token(name, tokens):
+    return bool(_role_tokens(name) & tokens)
+
+
+def _reads_as(name, module, tokens):
+    return (_has_role_token(name, tokens)
+            or _has_role_token(type(module).__name__, tokens))
+
+
+def _named_child_modules(module):
+    # A list-valued attribute is flattened to `attr.i`.
+    import mlx.nn as nn
+    try:
+        children = module.children()
+    except Exception:
+        return []
+    found = []
+    for name, child in children.items():
+        if isinstance(child, nn.Module):
+            found.append((name, child))
+        elif isinstance(child, list):
+            found.extend(
+                (f"{name}.{index}", item)
+                for index, item in enumerate(child)
+                if isinstance(item, nn.Module)
+            )
+    return found
+
+
+def _child_names(module):
+    return sorted({name.rpartition(".")[0] or name
+                   for name, _ in _named_child_modules(module)})
+
+
+def _navigate(owner, path):
+    node = owner
+    for segment in str(path).split("."):
+        if node is None:
+            return None
+        try:
+            node = node[int(segment)]
+        except (ValueError, TypeError):
+            node = getattr(node, segment, None)
+        except (IndexError, KeyError):
+            return None
+    return node
+
+
+def _set_child(parent, leaf, value):
+    try:
+        parent[int(leaf)] = value
+    except (ValueError, TypeError):
+        setattr(parent, leaf, value)
+
+
+def _subtree_linears(module):
+    types = _mlx_lora_base_types()
+    return [
+        (name, child) for name, child in module.named_modules()
+        if isinstance(child, types)
+    ]
+
+
+def _leaf_name(path):
+    for token in reversed(str(path).split(".")):
+        if token and not token.isdigit():
+            return token
+    return str(path)
+
+
+def _subtree_linear_leaf_names(module):
+    return sorted({_leaf_name(path) for path, _ in _subtree_linears(module)})
+
+
+def _holds_text_decoder(module):
+    # Anchored on `embed_tokens`, not the type: towers carry position embeddings.
+    return any(
+        hasattr(child, "embed_tokens") for _, child in module.named_modules()
+    )
+
+
+def _config_hidden_size(config, depth):
+    if config is None:
+        return None
+    if depth > 1:
+        for field in ("text_config", "thinker_config", "language_config"):
+            size = _config_hidden_size(getattr(config, field, None), depth - 1)
+            if size:
+                return size
+    for field in ("hidden_size", "d_model"):
+        size = getattr(config, field, None)
+        if isinstance(size, int) and size > 0:
+            return size
+    return None
+
+
+def _text_hidden_size(model):
+    # The embedding carries the width whatever the config calls the field.
+    import mlx.nn as nn
+    from .utils import _embedding_dims
+    for _, child in model.named_modules():
+        embed = getattr(child, "embed_tokens", None)
+        if isinstance(embed, (nn.Embedding, nn.QuantizedEmbedding)):
+            return _embedding_dims(embed)[1]
+    return _config_hidden_size(getattr(model, "config", None), 3)
+
+
+def _feeds_text_width(name, module, text_hidden_size):
+    """Whether ``module`` hands its output to the decoder.
+
+    A head merely running at that width fits too, so a weakly named candidate
+    must change width somewhere.
+    """
+    if not text_hidden_size:
+        return False
+    text_hidden_size = int(text_hidden_size)
+    reaches = changes = False
+    from .utils import _linear_semantic_dims
+    for _, linear in _subtree_linears(module):
+        out_dim, in_dim = _linear_semantic_dims(linear)
+        reaches = reaches or out_dim == text_hidden_size
+        changes = changes or in_dim != text_hidden_size
+    if not reaches:
+        return False
+    return changes or _reads_as(name, module, _STRONG_PROJECTOR_TOKENS)
+
+
+def _resolve_vision_group(model):
+    import mlx.nn as nn
+    from .utils import _get_text_model
+
+    for attr in _VISION_GROUP_ATTRS:
+        module = getattr(model, attr, None)
+        if isinstance(module, nn.Module):
+            return model, attr, attr, module
+    return _search_vision_group(model, "", _get_text_model(model), 2)
+
+
+def _search_vision_group(owner, owner_path, text_model, depth):
+    """Image encoder below ``owner``, by the role its name or class reads as."""
+    found, containers = [], []
+    for name, child in _named_child_modules(owner):
+        if child is text_model or _has_role_token(name, _NON_VISION_ROLE_TOKENS):
+            continue
+        path = f"{owner_path}.{name}" if owner_path else name
+        # A child holding the decoder is a container, not a tower.
+        if _holds_text_decoder(child):
+            containers.append((child, path))
+        elif _reads_as(name, child, _VISION_ROLE_TOKENS):
+            found.append((owner, name, path, child))
+    if found:
+        return found[0]
+    if depth > 1:
+        for child, path in containers:
+            found = _search_vision_group(child, path, text_model, depth - 1)
+            if found[0] is not None:
+                return found
+    return None, None, None, None
+
+
+def _projector_candidates(owner, owner_path, skip, text_hidden_size):
+    found = []
+    for name, child in _named_child_modules(owner):
+        if any(child is s for s in skip):
+            continue
+        if not _reads_as(name, child, _PROJECTOR_ROLE_TOKENS):
+            continue
+        if _reads_as(name, child, _OTHER_MODALITY_TOKENS):
+            continue
+        # The decoder is what a connector feeds, not something it holds.
+        if _holds_text_decoder(child):
+            continue
+        if not _feeds_text_width(name, child, text_hidden_size):
+            continue
+        path = f"{owner_path}.{name}" if owner_path else name
+        found.append((owner, name, path, child))
+    return found
+
+
+def _resolve_projector_group(model, vision_owner=None, vision_module=None,
+                             vision_path=None):
+    """``(owner, attr, path, module)`` entries for the vision-to-text connector.
+
+    Not always one module, so every candidate at the first root that has any is
+    returned, one level deep so per-block output projections are not among them.
+    """
+    import mlx.nn as nn
+    from .utils import _get_text_model
+
+    for attr in _PROJECTOR_GROUP_ATTRS:
+        module = getattr(model, attr, None)
+        if isinstance(module, nn.Module):
+            # Alone: joining it with others would adapt more than today.
+            return [(model, attr, attr, module)]
+
+    text_hidden_size = _text_hidden_size(model)
+    skip = (_get_text_model(model), vision_module)
+    roots = [(model, "")]
+    if vision_owner is not None and vision_owner is not model:
+        roots.append((vision_owner, vision_path.rsplit(".", 1)[0]))
+    if vision_module is not None:
+        roots.append((vision_module, vision_path))
+    for root, root_path in roots:
+        candidates = _projector_candidates(root, root_path, skip, text_hidden_size)
+        if candidates:
+            return candidates
+    return []
+
+
+def _raise_vision_unresolved(flag, model):
+    raise ValueError(
+        f"Unsloth: {flag}=True, but no vision tower was found. Looked for a "
+        f"module named one of {list(_VISION_GROUP_ATTRS)!r}, then any module "
+        f"beside or below them whose name or class reads as an image encoder. "
+        f"This model's top-level modules are "
+        f"{_child_names(model)!r}. If one of "
+        f"those is the vision tower, please report the architecture; otherwise "
+        f"set {flag}=False."
+    )
+
+
+def _raise_projector_unresolved(model, vision_path, vision_module):
+    searched = _child_names(model)
+    if vision_module is not None:
+        searched += [f"{vision_path}.{name}"
+                    for name in _child_names(vision_module)]
+    raise ValueError(
+        "Unsloth: train_projector=True, but no vision-to-text projector was "
+        f"found. Looked for a module named one of {list(_PROJECTOR_GROUP_ATTRS)!r}, "
+        "then any module beside or below the vision tower whose name or class "
+        "reads as a connector and that projects to the decoder's hidden size. "
+        f"The modules searched were {searched!r}. If one of those is the "
+        "projector, please report the architecture; otherwise set "
+        "train_projector=False."
+    )
+
+
+# The enclosing block names the role even where the leaf does not.
+_ATTENTION_PATH_TOKENS = frozenset(("attn", "attention", "att"))
+_MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu", "ff"))
+# Neither table lists `proj` or `dense`, which say that a linear projects
+# without saying what it projects.
+_ATTENTION_LEAVES = frozenset((
+    "q", "k", "v", "o", "kv", "qkv", "wq", "wk", "wv", "wo", "wkv", "wqkv",
+    "query", "key", "value", "out",
+))
+_MLP_LEAVES = frozenset((
+    "fc", "fc0", "fc1", "fc2", "fc3", "w1", "w2", "w3", "gate", "up", "down",
+    "c_fc", "linear1", "linear2",
+))
+
+def _decides(segment):
+    """Whether ``segment`` names a gate or a router rather than a projection.
+
+    `gate_proj` says what it projects into; `shared_expert_gate` does not.
+    """
+    tokens = _role_tokens(segment)
+    if not tokens & {"gate", "router"}:
+        return False
+    return not (tokens - {"gate", "router"}) & (_MLP_LEAVES | {"proj"})
+
+
+def _linear_role(path):
+    """``"attention"``, ``"mlp"``, ``"gate"`` or ``None`` for ``path``.
+
+    An enclosing block outranks the names below it — afmoe's attention holds a
+    `gate_proj` — and a gate outranks the block.
+    """
+    segments = str(path).lower().split(".")
+    # A gate outranks its enclosing block and reaches the subtree below it:
+    # ZAYA's router is a small MLP, and adapting it trains the routing decision.
+    if any(_decides(segment) for segment in segments):
+        return "gate"
+    for segment in reversed(segments):
+        tokens = _role_tokens(segment)
+        if tokens & _ATTENTION_PATH_TOKENS:
+            return "attention"
+        if tokens & _MLP_PATH_TOKENS:
+            return "mlp"
+    for segment in reversed(segments):
+        names = _role_tokens(segment)
+        if names & _ATTENTION_LEAVES:
+            return "attention"
+        if names & _MLP_LEAVES:
+            return "mlp"
+    return None
+
+
+def _under_any(path, prefixes):
+    return any(path == p or path.startswith(f"{p}.") for p in prefixes)
+
+
+def _projects(linear):
+    """Whether ``linear`` emits more than one number per token.
+
+    A single unit is a scale, a gate or a head rather than a projection, and Kimi
+    K3 reads that weight directly rather than calling the layer. The output axis
+    is second from last for a plain linear and for a fused expert stack alike,
+    the stack counting its experts along the first.
+    """
+    return int(linear.weight.shape[-2]) > 1
+
+
+def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
+    """``module``'s linears by role, one whose role cannot be read left alone."""
+    wanted = {"attention": attention, "mlp": mlp}
+    paths = [path for path, linear in _subtree_linears(module)
+             if not _under_any(path, skip_subtrees) and _projects(linear)]
+    roles = {path: _linear_role(path) for path in paths}
+    # A projection naming no role takes the role of the linears beside it, where
+    # those agree; a patch embedding sits alone, so nothing lends it one.
+    for path, role in list(roles.items()):
+        if role:
+            continue
+        parent = path.rpartition(".")[0]
+        beside = {roles[other] for other in paths
+                  if other != path and other.rpartition(".")[0] == parent}
+        beside &= wanted.keys()
+        if len(beside) == 1:
+            roles[path] = beside.pop()
+    return [path for path in paths if wanted.get(roles[path], False)]
+
+
+def _raise_empty_target_modules():
+    raise ValueError(
+        "Unsloth: target_modules became empty after filtering by "
+        "finetune_attention_modules / finetune_mlp_modules. Enable at least one "
+        "of these flags."
+    )
+
+
+def _raise_group_empty(flag, role, module_path, module, target_modules=None):
+    leaf_names = _subtree_linear_leaf_names(module)
+    if target_modules is None or not leaf_names:
+        raise ValueError(
+            f"Unsloth: {flag}=True, but the {role} at {module_path!r} holds no "
+            f"linear layer to adapt. Its modules are "
+            f"{_child_names(module)!r}. Set "
+            f"{flag}=False."
+        )
+    raise ValueError(
+        f"Unsloth: {flag}=True selected no LoRA target inside the {role} at "
+        f"{module_path!r}. target_modules={list(target_modules)!r} matched none "
+        f"of its linear layers, which are named {leaf_names!r}. Pass "
+        f"target_modules with names from that list to train the {role}, or set "
+        f"{flag}=False."
+    )
+
+
+def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
+                    train_vision, train_projector, targets_defaulted,
+                    finetune_attention_modules, finetune_mlp_modules,
+                    dry_run):
+    """Adapt the vision tower and connector, returning what each flag selected.
+
+    The ``dry_run`` pass is the only source of refusals and warnings: raising
+    later would leave adapters for the retry to stack on.
+    """
+    # The tower of a wrapper loaded text-only still resolves and adapts, but the
+    # text forward returns before reaching it, so those adapters never train.
+    if dry_run and getattr(model, "_unsloth_text_only_vlm", False):
+        for flag, requested in (
+            (vision_flag, train_vision),
+            ("train_projector", train_projector),
+        ):
+            if requested:
+                warnings.warn(
+                    f"Unsloth: {flag}=True, but this model was loaded with "
+                    "text_only=True. Its vision tower is still attached, so "
+                    "the flag will wrap adapters that the text-only forward "
+                    "pass never reaches and never trains. Reload with "
+                    f"text_only=False to train the vision path, or set "
+                    f"{flag}=False.",
+                    stacklevel=3,   # name `get_peft_model`'s caller
+                )
+    (vision_owner, vision_attr, vision_path,
+     vision_module) = _resolve_vision_group(model)
+    projector_path = None
+    if train_vision and vision_module is None:
+        _raise_vision_unresolved(vision_flag, model)
+    # Also resolved when nothing will adapt it, so the tower pass can skip it.
+    projector_entries = (
+        _resolve_projector_group(model, vision_owner, vision_module, vision_path)
+        if train_projector or (train_vision and targets_defaulted) else []
+    )
+    if train_projector:
+        if not projector_entries:
+            _raise_projector_unresolved(model, vision_path, vision_module)
+        projector_path = projector_entries[0][2]
+        if len(projector_entries) > 1:
+            projector_path = projector_path.rpartition(".")[0]
+
+    # Adapting a nested connector here would stack on the projector pass's base.
+    nested_projectors = [
+        attr for owner, attr, _, _ in projector_entries
+        if owner is vision_module
+    ]
+
+    vision_lora_count = 0
+    if train_vision:
+        tower_owner = model if vision_owner is None else vision_owner
+        if targets_defaulted:
+            # The canonical names are a decoder vocabulary this code chose
+            # rather than one the caller asked for, and a tower rarely speaks it.
+            role_paths = _role_selected_paths(
+                vision_module, finetune_attention_modules,
+                finetune_mlp_modules, skip_subtrees=nested_projectors,
+            )
+            if role_paths:
+                vision_lora_count = _lora_walk_module(
+                    tower_owner, vision_attr, lora_config, None,
+                    match_paths=set(role_paths), dry_run=dry_run,
+                )
+        else:
+            # The caller named these, so they decide inside a nested connector
+            # too, unless the projector pass is the one adapting it.
+            vision_lora_count = _lora_walk_module(
+                tower_owner, vision_attr, lora_config, target_modules,
+                skip_subtrees=nested_projectors, dry_run=dry_run,
+            )
+    projector_lora_count = 0
+    if train_projector:
+        for p_owner, p_attr, _, _ in projector_entries:
+            projector_lora_count += _lora_walk_module(
+                p_owner, p_attr, lora_config,
+                target_modules=(), match_all_linear=True, dry_run=dry_run,
+            )
+
+    # Not a no-op: the run looks healthy while the decoder trains alone.
+    if train_vision and vision_lora_count == 0:
+        if isinstance(target_modules, list) and len(target_modules) == 0:
+            _raise_empty_target_modules()
+        _raise_group_empty(
+            vision_flag, "vision tower", vision_path, vision_module,
+            target_modules,
+        )
+    if train_projector and projector_lora_count == 0:
+        _raise_group_empty(
+            "train_projector", "projector", projector_path,
+            projector_entries[0][3],
+        )
+    return vision_lora_count, projector_lora_count
+
+
 def _lora_walk_module(
-    model,
+    owner,
+    attr_name,
     lora_config,
     target_modules,
-    attr_names,
     *,
     match_all_linear=False,
+    skip_subtrees=(),
+    match_paths=None,
+    dry_run=False,
 ):
-    """Walk a module tree and replace matching Linear/QuantizedLinear with LoRA.
-
-    Used for vision encoders that don't have the flat `.layers` structure
-    expected by mlx-lm's `linear_to_lora_layers`.
-    """
+    """LoRA for encoders and connectors, which lack the flat `.layers` structure
+    mlx-lm's `linear_to_lora_layers` expects."""
     import mlx.nn as nn
     try:
         from mlx_lm.tuner.lora import LoRALinear
     except ImportError:
-        return
+        return 0
+
+    root = _navigate(owner, attr_name) if attr_name else None
+    if root is None:
+        return 0
+    root_base, _, root_leaf = str(attr_name).rpartition(".")
+    root_parent = _navigate(owner, root_base) if root_base else owner
 
     if target_modules is None:
         match_all_linear = True
@@ -6418,47 +6910,34 @@ def _lora_walk_module(
         target_modules = set(target_modules or ())
 
     replacements = 0
-
-    for attr_name in attr_names:
-        root = getattr(model, attr_name, None)
-        if root is None:
+    for name, child in list(root.named_modules()):
+        if _under_any(name, skip_subtrees):
             continue
-
-        def _walk(module):
-            nonlocal replacements
-            for name, child in list(module.named_modules()):
-                if not match_all_linear and not _lora_name_matches_target(name, target_modules):
-                    continue
-                if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
-                    lora_layer = _lora_from_base_compat(
-                        LoRALinear,
-                        child,
-                        rank=lora_config["rank"],
-                        scale=lora_config["scale"],
-                        dropout=lora_config.get("dropout", 0.0),
-                    )
-                    replacements += 1
-                    if name == "":
-                        setattr(model, attr_name, lora_layer)
-                        continue
-                    # Navigate to parent and replace. The final segment can
-                    # be a numeric string (list index) for some VLM trees
-                    # like Qwen2.5-VL's vision merger.
-                    parts = name.split(".")
-                    parent = root
-                    for p in parts[:-1]:
-                        try:
-                            parent = parent[int(p)]
-                        except (ValueError, TypeError):
-                            parent = getattr(parent, p)
-                    leaf = parts[-1]
-                    try:
-                        parent[int(leaf)] = lora_layer
-                    except (ValueError, TypeError):
-                        setattr(parent, leaf, lora_layer)
-
-        _walk(root)
-        break  # These are alternative names for the same component — stop after first hit
+        if match_paths is not None:
+            if name not in match_paths:
+                continue
+        elif not match_all_linear and not _lora_name_matches_target(name, target_modules):
+            continue
+        if not isinstance(child, (nn.Linear, nn.QuantizedLinear)):
+            continue
+        if dry_run:
+            # Building it would draw from the executing pass's RNG.
+            replacements += 1
+            continue
+        lora_layer = _lora_from_base_compat(
+            LoRALinear,
+            child,
+            rank=lora_config["rank"],
+            scale=lora_config["scale"],
+            dropout=lora_config.get("dropout", 0.0),
+        )
+        replacements += 1
+        if name == "":
+            _set_child(root_parent, root_leaf, lora_layer)
+            continue
+        parent_path, _, leaf = name.rpartition(".")
+        parent = _navigate(root, parent_path) if parent_path else root
+        _set_child(parent, leaf, lora_layer)
     return replacements
 
 
@@ -6478,6 +6957,20 @@ def _resolve_lora_keys(model, target_modules):
                 keys.add(name)
 
     return keys
+
+
+def _language_lora_keys(model, target_modules, targets_defaulted,
+                        attention, mlp):
+    """Layer-local mlx-lm LoRA keys for the decoder.
+
+    Read the way the tower is, where the names are this code's own.
+    """
+    if targets_defaulted:
+        keys = set()
+        for root in _mlx_language_layers(model):
+            keys.update(_role_selected_paths(root, attention, mlp))
+        return keys
+    return _resolve_lora_keys(model, target_modules)
 
 
 def _raise_no_lora_targets(target_modules):
@@ -7996,9 +8489,13 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
+        targets_defaulted = target_modules is None
+
         # finetune_vision_layers (None = use train_vision arg; bool overrides it)
+        vision_flag = "train_vision"
         if finetune_vision_layers is not None:
             train_vision = bool(finetune_vision_layers)
+            vision_flag = "finetune_vision_layers"
 
 
         # "all-linear" means every nn.Linear (fused QKV, MoE routers/experts,
@@ -8082,13 +8579,6 @@ class FastMLXModel:
         _cpt_lm_head_keys = (
             {_cpt_lm_head_lora_path} if _cpt_lm_head_lora_path else set()
         )
-        # Record the registered full-module weight keys so the trainer scopes
-        # embedding_learning_rate to exactly these tensors, whatever the layout.
-        model._unsloth_cpt_full_module_weight_keys = (
-            _full_module_weight_keys(model, _cpt_full_specs)
-            if _cpt_full_specs else set()
-        )
-
         lora_config = {
             "rank": r,
             "alpha": lora_alpha,
@@ -8099,6 +8589,21 @@ class FastMLXModel:
         is_vlm = getattr(model, "_is_vlm_model", False)
 
         if is_vlm:
+            # Decide, and refuse, before anything is modified.
+            _vlm_group_lora(
+                model, lora_config, target_modules, vision_flag=vision_flag,
+                train_vision=train_vision, train_projector=train_projector,
+                targets_defaulted=targets_defaulted,
+                finetune_attention_modules=finetune_attention_modules,
+                finetune_mlp_modules=finetune_mlp_modules, dry_run=True,
+            )
+
+            # Scopes embedding_learning_rate to exactly these tensors.
+            model._unsloth_cpt_full_module_weight_keys = (
+                _full_module_weight_keys(model, _cpt_full_specs)
+                if _cpt_full_specs else set()
+            )
+
             # Freeze everything, then apply LoRA selectively.
             _fix_missing_no_grad(model)
             _fix_gemma4_kv_sharing(model)
@@ -8120,7 +8625,9 @@ class FastMLXModel:
                 if finetune_last_n_layers is not None and num_layers > 0:
                     num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
                 language_lora_keys = (
-                    _resolve_lora_keys(lm, target_modules)
+                    _language_lora_keys(
+                        lm, target_modules, targets_defaulted,
+                        finetune_attention_modules, finetune_mlp_modules)
                     if finetune_language_layers else None
                 )
                 language_lora_keys = set(language_lora_keys or set()) | _vlm_lm_head_keys
@@ -8139,34 +8646,15 @@ class FastMLXModel:
                         config={**lora_config, "keys": language_lora_keys},
                     )
 
-            # Optionally LoRA the vision tower.
-            vision_lora_count = 0
-            if train_vision:
-                vision_lora_count = _lora_walk_module(
-                    model,
-                    lora_config,
-                    target_modules,
-                    attr_names=("vision_tower", "vision_model", "vision_encoder"),
-                )
-
-            # Optionally LoRA the projector/connector. LoRA beats unfreezing
-            # raw weights since many projectors are QuantizedLinear and MLX
-            # can't backprop into quantized weights.
-            projector_lora_count = 0
-            if train_projector:
-                projector_lora_count = _lora_walk_module(
-                    model,
-                    lora_config,
-                    target_modules=(),
-                    attr_names=(
-                        "multi_modal_projector",
-                        "mm_projector",
-                        "connector",
-                        "aligner",
-                        "embed_vision",
-                    ),
-                    match_all_linear=True,
-                )
+            # LoRA beats unfreezing raw weights since many projectors are
+            # QuantizedLinear and MLX can't backprop into quantized weights.
+            (vision_lora_count, projector_lora_count) = _vlm_group_lora(
+                model, lora_config, target_modules, vision_flag=vision_flag,
+                train_vision=train_vision, train_projector=train_projector,
+                targets_defaulted=targets_defaulted,
+                finetune_attention_modules=finetune_attention_modules,
+                finetune_mlp_modules=finetune_mlp_modules, dry_run=False,
+            )
 
             if (
                 language_lora_count == 0
@@ -8184,11 +8672,7 @@ class FastMLXModel:
                         "finetune_attention_modules=False, finetune_mlp_modules=True."
                     )
                 if isinstance(target_modules, list) and len(target_modules) == 0:
-                    raise ValueError(
-                        "Unsloth: target_modules became empty after filtering by "
-                        "finetune_attention_modules / finetune_mlp_modules. Enable "
-                        "at least one of these flags."
-                    )
+                    _raise_empty_target_modules()
                 _raise_no_lora_targets(target_modules)
 
             # Unfreeze all LoRA params across the tree.
@@ -8196,8 +8680,27 @@ class FastMLXModel:
             # CPT full modules (embed_tokens / lm_head weight).
             _unfreeze_full_modules(_cpt_full_specs)
         else:
-            # Text-only path. _fix_missing_no_grad handles modules using
-            # __new__ without __init__ (e.g. Gemma4 AudioRelativePosition...).
+            # No tower to adapt, and nothing to name in an error either.
+            for flag, requested in (
+                (vision_flag, train_vision), ("train_projector", train_projector),
+            ):
+                if requested:
+                    warnings.warn(
+                        f"Unsloth: {flag}=True, but this model has no vision "
+                        "path — it was loaded as text-only, so there is no "
+                        f"vision tower or projector to adapt. Set {flag}=False, "
+                        "or load the model with text_only=False if it is a VLM.",
+                        stacklevel=2,
+                    )
+
+            # Scopes embedding_learning_rate to exactly these tensors.
+            model._unsloth_cpt_full_module_weight_keys = (
+                _full_module_weight_keys(model, _cpt_full_specs)
+                if _cpt_full_specs else set()
+            )
+
+            # _fix_missing_no_grad handles modules using __new__ without
+            # __init__ (e.g. Gemma4 AudioRelativePosition...).
             _fix_missing_no_grad(model)
 
             num_layers = len(_mlx_language_layers(model))
@@ -8205,7 +8708,9 @@ class FastMLXModel:
                 num_layers = max(1, min(int(finetune_last_n_layers), num_layers))
             # Layer LoRA keys plus the lm_head key (a root module, not a layer).
             language_lora_keys = (
-                _resolve_lora_keys(model, target_modules)
+                _language_lora_keys(
+                    model, target_modules, targets_defaulted,
+                    finetune_attention_modules, finetune_mlp_modules)
                 if finetune_language_layers else None
             )
             if _cpt_lm_head_keys or _cpt_full_specs:
