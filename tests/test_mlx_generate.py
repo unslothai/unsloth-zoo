@@ -1468,4 +1468,9 @@ def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch
     assert seen[1 - carrying] == [[]]
     assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
 
-
+def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
+    with pytest.raises(TypeError, match="must be GenerationDefaults"):
+        stream_batch(object(), object(), [], defaults = {"stop_strings": ()})
+    with pytest.raises(ValueError, match="cannot apply stop_strings"):
+        stream_batch(object(), object(), [],
+                     defaults = GenerationDefaults(stop_strings = ("X",)))

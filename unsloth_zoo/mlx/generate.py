@@ -2937,6 +2937,8 @@ def stream_batch(
     defaults: GenerationDefaults | None = None,
 ) -> Iterator[GenerationEvent]:
     """``generate_batch``, reporting each row as it goes."""
+    if defaults is not None and not isinstance(defaults, GenerationDefaults):
+        raise TypeError("defaults must be GenerationDefaults.")
     if defaults is not None and defaults.stop_strings:
         raise ValueError(
             "stream_batch cannot apply stop_strings: they cut on token "
