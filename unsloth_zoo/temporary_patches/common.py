@@ -52,8 +52,7 @@ def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
-    # Honour unsloth/_gpu_init's single-worker forcing; without this the options dict
-    # still passes the multi-worker default over the env var.
+    # Honour _gpu_init's single-worker forcing; the options dict would otherwise override the env var.
     if os.environ.get("TORCHINDUCTOR_COMPILE_THREADS") == "1":
         return 1
     cpu_count = os.cpu_count()

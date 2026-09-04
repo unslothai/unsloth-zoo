@@ -284,8 +284,7 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
-# Duplicated from notebook_deps._TRUE_VALUES rather than imported: importing it would
-# make this module depend on the temporary-patches package.
+# Duplicated from notebook_deps._TRUE_VALUES so this module does not import temporary_patches.
 _AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
 
 
@@ -297,8 +296,7 @@ def _auto_install_enabled() -> bool:
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
-    # Before the platform branch: the Windows arm returns from inside its own loop, so
-    # an opt-out placed below it would never cover winget.
+    # Before the platform branch: the Windows arm returns early, so a later opt-out would miss winget.
     if not _auto_install_enabled():
         raise RuntimeError(
             f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
@@ -364,8 +362,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        # Non-interactive contexts (Docker without a TTY, headless CI) raise on
-        # input(); treat that as an implicit ENTER.
+        # Non-interactive contexts raise on input(); treat that as an implicit ENTER.
         try:
             acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
         except (EOFError, RuntimeError) as exception:

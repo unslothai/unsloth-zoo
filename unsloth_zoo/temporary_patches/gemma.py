@@ -334,8 +334,7 @@ def patch_Gemma3Processor():
         if text is None and images is None:
             raise ValueError("Provide at least one of `text` or `images`.")
 
-        # Probed BEFORE _merge_kwargs, which folds in the padding=False default. Key
-        # PRESENCE, not value: padding=None is a real caller choice (do-not-pad).
+        # Probe before _merge_kwargs folds in padding=False. Presence, not value: padding=None means do-not-pad.
         _user_set_padding = "padding" in kwargs
         if not _user_set_padding:
             _text_kwargs = kwargs.get("text_kwargs", None)
@@ -411,11 +410,8 @@ def patch_Gemma3Processor():
             # Expand placeholder image tokens to the full image token sequence
             text = [prompt.replace(self.boi_token, self.full_image_sequence) for prompt in text]
 
-        # TRL GRPO passes no padding=, and the upstream padding=False default makes
-        # ragged completions blow up the stacking below. After the image token expansion
-        # so `text` is final, and only when the merged padding is still disabled.
-        # _padding_before_override feeds _resolve_truncation, which derives implicit
-        # truncation from padding + max_length and would drop max_length if fed "longest".
+        # TRL GRPO passes no padding=, and the padding=False default makes ragged completions
+        # break the stacking below. Runs after image expansion so `text` is final.
         _padding_before_override = output_kwargs["text_kwargs"].get("padding", False)
         _padding_is_disabled = _padding_before_override in (False, None, "do_not_pad")
         if not _user_set_padding and _padding_is_disabled and isinstance(text, (list, tuple)) and len(text) > 1:

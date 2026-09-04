@@ -16,10 +16,9 @@
 
 """Fidelity tests for the Gemma3Processor automatic longest-padding override.
 
-The forced padding="longest" must not leak into two things the caller still controls:
-an explicitly supplied padding (padding=None means do-not-pad, so key presence is what
-counts), and the truncation HF derives from (max_length, padding is False, truncation
-unset) -> "longest_first", which reading the forced value would silently discard.
+The forced padding="longest" must not leak into an explicitly supplied padding (padding=None
+means do-not-pad, so key presence is what counts), nor into the truncation HF derives from
+(max_length, padding False, truncation unset) -> "longest_first".
 """
 import pytest
 
@@ -34,8 +33,7 @@ LONG = " ".join(f"w{i}" for i in range(30))   # 30 words -> 31 ids after the str
 
 
 class _StubTokenizer:
-    """Minimal stand-in for the Gemma3 tokenizer: doubled BOS, PreTrainedTokenizerBase
-    truncation semantics, and it records the kwargs it was handed."""
+    """Gemma3 tokenizer stand-in: doubled BOS, HF truncation semantics, records its kwargs."""
     bos_token_id = BOS
     pad_token_id = PAD
     image_token_id = 99
@@ -106,8 +104,7 @@ def test_explicit_padding_max_length_still_honoured(processor):
 
 
 def test_max_length_alone_keeps_implicit_truncation(processor):
-    # HF truncates on (max_length, no padding, no truncation); forcing "longest" padding
-    # must not disable that.
+    # HF truncates on (max_length, no padding, no truncation); forcing "longest" must not stop that.
     out = processor(text = [LONG, SHORT], max_length = 8, return_tensors = None)
     assert processor.tokenizer.last_kwargs["truncation"] == "longest_first"
     assert max(row_lengths(out)) <= 8, row_lengths(out)
@@ -140,8 +137,7 @@ def test_explicit_truncation_preserved(processor):
 
 @pytest.fixture(scope = "module")
 def processor_tokenizer_padded():
-    """Same stub, but the TOKENIZER was initialized with padding="max_length": _merge_kwargs
-    copies that over the _defaults even with empty per-call kwargs."""
+    """Same stub, but the tokenizer was initialized with padding="max_length"."""
     original_call = Gemma3Processor.__call__
     patch_Gemma3Processor()
     if "unsloth_zoo" not in getattr(Gemma3Processor.__call__, "__code__", original_call.__code__).co_filename:
@@ -159,8 +155,7 @@ def processor_tokenizer_padded():
 
 
 def test_tokenizer_init_padding_is_not_overridden(processor_tokenizer_padded):
-    # _merge_kwargs puts the tokenizer's init padding in text_kwargs, so the automatic
-    # "longest" must stand down.
+    # _merge_kwargs puts the init padding in text_kwargs, so the automatic "longest" stands down.
     out = processor_tokenizer_padded(text = [SHORT, LONG], return_tensors = None)
     assert row_lengths(out) == [40, 40], row_lengths(out)
 

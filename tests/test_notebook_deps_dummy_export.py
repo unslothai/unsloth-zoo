@@ -16,12 +16,10 @@
 
 """Installing a backend does not un-dummy an export transformers already froze.
 
-`transformers/__init__.py` picks between the real module and a generated
-`utils/dummy_*_objects.py` stub at import time, so a session that imported it without
-sentencepiece has `convert_slow_tokenizer` bound to a body that is nothing but
-`requires_backends(...)`. Once the auto-installer makes that call succeed the stub runs
-to completion and RETURNS None: the caller gets bad data where it used to get a clear
-ImportError. The wrapper has to refuse instead.
+`transformers/__init__.py` picks the real module or a generated `utils/dummy_*_objects.py`
+stub at import time, so a session imported without sentencepiece has `convert_slow_tokenizer`
+bound to a body that is only `requires_backends(...)`. Once the auto-installer makes that
+call succeed the stub runs to completion and returns None, so the wrapper has to refuse.
 """
 
 from __future__ import annotations
@@ -38,8 +36,7 @@ DUMMY_MODULE = "transformers.utils.dummy_sentencepiece_and_tokenizers_objects"
 
 @pytest.fixture
 def patched(monkeypatch):
-    """Install the wrapper over a `requires_backends` that fails once, then succeeds
-    (which is exactly what happens after the backend is really installed)."""
+    """Wrapper over a `requires_backends` that fails once, then succeeds, as a real install does."""
     iu = importlib.import_module("transformers.utils.import_utils")
     calls = {"n": 0}
 
@@ -104,8 +101,7 @@ def test_a_real_object_still_succeeds_after_the_install(patched):
 
 
 def test_transformers_really_freezes_this_export_onto_a_dummy():
-    """Premise pin. If upstream ever stops generating dummy objects the guard above is
-    dead code and should be deleted rather than left to rot."""
+    """Premise pin: if upstream stops generating dummy objects the guard above is dead code."""
     import inspect
 
     import transformers

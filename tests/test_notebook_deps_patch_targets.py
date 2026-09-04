@@ -14,10 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Two things silently defeated the auto-installer: modeling files import
-`requires_backends` from `transformers.utils`, a separate name bound to the same object,
-so patching only `import_utils` leaves them unwrapped; and `uv pip install` resolves its
-target from VIRTUAL_ENV/CONDA_PREFIX, so without `--python` the package lands elsewhere.
+"""Two things silently defeated the auto-installer: modeling files import `requires_backends`
+from `transformers.utils`, a separate name bound to the same object, so patching only
+`import_utils` leaves them unwrapped; and `uv pip install` without `--python` resolves its
+target from VIRTUAL_ENV/CONDA_PREFIX and installs elsewhere.
 """
 
 from __future__ import annotations
@@ -33,8 +33,7 @@ import pytest
 notebook_deps = importlib.import_module("unsloth_zoo.temporary_patches.notebook_deps")
 
 
-# Served out of sys.modules: importing unsloth_zoo already patched the real
-# transformers, so only a synthetic tree starts unpatched.
+# Served out of sys.modules: importing unsloth_zoo already patched the real transformers.
 
 _BACKEND = "timm"
 
@@ -57,8 +56,7 @@ fake_transformers_state = {"available": {}}
 
 @pytest.fixture
 def fake_transformers(monkeypatch):
-    """Synthetic `transformers` tree: the definition, the public re-export, and a
-    consumer that copied the function into its own globals."""
+    """Synthetic `transformers` tree: definition, public re-export, and a consumer copy."""
     fake_transformers_state["available"] = {_BACKEND: False}
     original = _make_original()
 
@@ -157,8 +155,7 @@ def test_all_aliases_share_one_wrapper_object(fake_transformers):
 def test_second_pass_does_not_double_wrap_but_still_rebinds_new_modules(
     fake_transformers, monkeypatch
 ):
-    """The second pass must not stack another wrapper, but must still reach a module
-    imported in between that holds its own copy of the original."""
+    """No second wrapper, but a module imported in between must still be rebound."""
     notebook_deps.patch_requires_backends_autoinstall()
     wrapper = fake_transformers.import_utils.requires_backends
 
@@ -288,8 +285,7 @@ def test_repeated_requests_for_the_same_package_run_once(install_spy):
 
 
 def _fake_lru_cached_transformers(monkeypatch, installed):
-    """Synthetic transformers shaped like 5.x: the `BACKENDS_MAPPING` probe is an
-    `lru_cache` wrapper."""
+    """Synthetic transformers shaped like 5.x: the probe is an `lru_cache` wrapper."""
 
     @functools.lru_cache(maxsize = None)
     def is_backend_available():
@@ -325,8 +321,7 @@ def _fake_lru_cached_transformers(monkeypatch, installed):
 
 
 def test_successful_install_invalidates_the_cached_availability_probe(monkeypatch):
-    """The 5.x lru_cache has already cached False, so without clearing it the retry
-    raises the very ImportError the install just removed."""
+    """The 5.x lru_cache already cached False, so the retry would re-raise without a clear."""
     installed = {_BACKEND: False}
     import_utils = _fake_lru_cached_transformers(monkeypatch, installed)
 
@@ -364,8 +359,7 @@ _SECOND_BACKEND = "av"
 
 
 def _fake_flag_based_transformers(monkeypatch, installed):
-    """Synthetic transformers shaped like 4.x: a module level ``_<backend>_available``
-    flag and no ``cache_clear`` on the mapping entry (as in 4.57.6)."""
+    """Synthetic transformers shaped like 4.x: a ``_<backend>_available`` flag, no cache_clear."""
     import_utils = types.ModuleType("transformers.utils.import_utils")
 
     def _probe(backend):
@@ -404,8 +398,7 @@ def _fake_flag_based_transformers(monkeypatch, installed):
 
 
 def test_a_failed_install_is_not_marked_available(monkeypatch):
-    """One backend installs, another does not: refreshing both would set
-    `_<backend>_available = True` for the missing one and let the retry through."""
+    """One backend installs, another does not: refreshing both would wave the retry through."""
     import_utils = _fake_flag_based_transformers(
         monkeypatch, {_BACKEND: False, _SECOND_BACKEND: False}
     )
@@ -427,8 +420,7 @@ def test_a_failed_install_is_not_marked_available(monkeypatch):
     assert getattr(import_utils, f"_{_BACKEND}_available") is True
 
 
-# `_in_venv()` gates both whether uv is used and whether `_pip_command` falls back to
-# `--user`, so under the interpreter A / environment B mismatch it misroutes both.
+# `_in_venv()` gates both uv usage and the `--user` fallback, so an A/B mismatch misroutes both.
 
 
 @pytest.fixture
@@ -510,8 +502,7 @@ def test_pip_command_keeps_user_off_a_real_venv(two_environments, unwritable_sit
 def test_pip_install_does_not_hand_a_mismatched_kernel_to_uv(
     two_environments, unwritable_site, monkeypatch,
 ):
-    """uv has no user-site fallback and its "Permission denied (os error 13)" matches
-    no retry trigger, so the install must not be routed to uv here at all."""
+    """uv has no user-site fallback and its permission error triggers no retry, so avoid it."""
     commands = []
 
     def _run(cmd, *args, **kwargs):
@@ -672,8 +663,7 @@ HF_TRUE_SPELLINGS = ["1", "on", "ON", "true", "True", "TRUE", "yes", "Yes", "YES
 @pytest.mark.parametrize("flag", ["UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"])
 @pytest.mark.parametrize("value", HF_TRUE_SPELLINGS)
 def test_every_truthy_spelling_hugging_face_accepts_counts_as_offline(monkeypatch, flag, value):
-    """huggingface_hub reads these as `value.upper() in {"1", "ON", "TRUE", "YES"}`,
-    so accepting only "1" left pip running under HF_HUB_OFFLINE=true."""
+    """huggingface_hub accepts 1/ON/TRUE/YES, so taking only "1" left pip running under =true."""
     for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setenv(flag, value)
@@ -702,8 +692,7 @@ def test_anything_not_recognised_as_true_still_disables_auto_install(monkeypatch
 
 
 def test_a_resolvable_but_unimportable_package_is_not_reported_as_installed(monkeypatch):
-    """find_spec proves discoverability, not that the package imports; calling that a
-    successful install downgrades the ImportError into a NameError deeper in."""
+    """find_spec proves discoverability, not importability; calling it success hides a NameError."""
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
     for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)

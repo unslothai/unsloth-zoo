@@ -115,8 +115,7 @@ def test_a_blocked_flashinfer_is_invisible_to_the_probe_vllm_uses(fake_flashinfe
 
 
 def test_a_preset_opt_out_still_blocks_flashinfer():
-    """A pre-set opt-out must still block: an installed FlashInfer stays importable
-    and vLLM selects it anyway."""
+    """A pre-set opt-out must still block: an installed FlashInfer is selected by vLLM anyway."""
     import inspect
 
     source = inspect.getsource(vllm_utils.load_vllm)
@@ -133,9 +132,8 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
 
 
 def _flashinfer_chain():
-    """The `if _clear_flashinfer_env_on_hip() / elif _no_flashinfer / elif find_spec`
-    chain in load_vllm, as AST. Structure, not substrings: which statements sit inside
-    the find_spec guard is the whole question here."""
+    """load_vllm's FlashInfer branch chain as AST: which statements sit inside the
+    find_spec guard is the whole question, so structure rather than substrings."""
     import ast
     import inspect
     import textwrap
@@ -152,8 +150,7 @@ def _flashinfer_chain():
 
 
 def _clears_forced_selection(body):
-    """True when this statement list writes VLLM_USE_FLASHINFER_SAMPLER=0 itself,
-    rather than somewhere nested inside a guard."""
+    """True when this statement list writes VLLM_USE_FLASHINFER_SAMPLER=0 itself, not nested."""
     import ast
 
     for stmt in body:
@@ -171,11 +168,9 @@ def _clears_forced_selection(body):
 
 
 def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
-    """A forced selection has to be cleared whether or not FlashInfer is installed:
-    vLLM's TopKTopPSampler does a bare `from flashinfer import ...` with no try/except,
-    so an inherited VLLM_USE_FLASHINFER_SAMPLER=1 with the package absent is a
-    ModuleNotFoundError, not a fallback. _clear_flashinfer_env_on_hip already answers
-    this the same way for ROCm."""
+    """A forced selection has to be cleared whether or not FlashInfer is installed: vLLM's
+    TopKTopPSampler does an unguarded `from flashinfer import ...`, so an inherited
+    VLLM_USE_FLASHINFER_SAMPLER=1 with the package absent raises instead of falling back."""
     import ast
 
     node = _flashinfer_chain()
@@ -204,8 +199,7 @@ def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
 
 
 def test_the_default_path_clears_a_forced_selection_too():
-    """No opt-out, not ROCm, FlashInfer simply absent: the commoner shape, and the same
-    unguarded import in vLLM is waiting at the end of it."""
+    """No opt-out, not ROCm, FlashInfer absent: the same unguarded vLLM import waits there."""
     import ast
 
     node = _flashinfer_chain()

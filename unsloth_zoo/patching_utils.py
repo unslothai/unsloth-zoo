@@ -181,8 +181,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     else:
         DEBUGGING = ""
         os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-        # Preserve unsloth/_gpu_init's single-worker forcing: cgroup-pinned containers
-        # spawn Inductor subprocess workers that cannot see the GPU.
+        # Keep _gpu_init's single-worker forcing: cgroup-pinned containers spawn Inductor workers blind to the GPU.
         if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") != "1":
             os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
         os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)

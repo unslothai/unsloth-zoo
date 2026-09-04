@@ -159,8 +159,7 @@ if {GUARD}():
     from {BACKEND} import this_name_does_not_exist
 """
 
-# The try/except shape BINDS the name to None (transformers 5.5's
-# tokenization_utils_sentencepiece), so a hasattr-based missing test never rebinds.
+# The try/except shape BINDS the name to None, so a hasattr-based missing test never rebinds.
 
 FAKE_BACKEND = "unsloth_replay_probe_pkg"
 
@@ -194,16 +193,14 @@ except ImportError:
 
 @pytest.fixture
 def fake_backend(tmp_path, monkeypatch):
-    """Genuinely absent at import and present later: the directory joins sys.path only
-    afterwards, so the consumer really does take its except branch."""
+    """Absent at import, present later: the directory joins sys.path only afterwards."""
     site = tmp_path / "site"
     site.mkdir()
     (site / f"{FAKE_BACKEND}.py").write_text("VALUE = 42\n", encoding = "utf-8")
     sys.modules.pop(FAKE_BACKEND, None)
 
     def install():
-        # syspath_prepend, never a bare sys.path.insert: the bare form is not undone at
-        # teardown, so a later consumer never takes its except branch.
+        # syspath_prepend, not sys.path.insert: the bare form is not undone at teardown.
         monkeypatch.syspath_prepend(str(site))
 
     yield install
@@ -308,11 +305,8 @@ def test_a_missing_name_is_reported_as_a_missing_name(tmp_path, monkeypatch, iu)
 def test_the_installer_path_replays_before_letting_the_retry_through(
     tmp_path, monkeypatch, iu
 ):
-    """The wrapper must replay, not just refresh the availability flag.
-
-    Pins the ordering end to end: a consumer whose guarded import was skipped
-    has the name bound by the time the retried `requires_backends` returns.
-    """
+    """The wrapper must replay, not just refresh the availability flag: a consumer whose
+    guarded import was skipped is bound by the time the retried call returns."""
     module = _load(
         tmp_path, monkeypatch, "transformers.models.fake.modeling_ordered", PLAIN, False
     )
@@ -361,14 +355,9 @@ def test_the_installer_path_replays_before_letting_the_retry_through(
     )
 
 
-# A guard body does not only import. transformers/audio_utils.py has
-#
-#     if is_torchcodec_available():
-#         TORCHCODEC_VERSION = version.parse(importlib.metadata.version("torchcodec"))
-#
-# and load_audio then reads TORCHCODEC_VERSION as soon as the probe says yes. Replaying
-# the imports alone turns the ImportError into `NameError: name 'TORCHCODEC_VERSION' is
-# not defined`, which is the exact failure this whole file exists to prevent.
+# A guard body does not only import: transformers/audio_utils.py assigns TORCHCODEC_VERSION
+# under its guard, and load_audio reads it as soon as the probe says yes. Replaying the
+# imports alone turns the ImportError into a NameError.
 
 ASSIGNS_STATE = f"""
 RELOADS.append(1)
@@ -389,9 +378,8 @@ if {GUARD}():
 
 
 def _load_reloadable(tmp_path, monkeypatch, iu, leaf, source):
-    """A module importlib.reload can actually re-run: a real file plus a parent package
-    in sys.modules whose __path__ contains it, which is what reload looks the spec up
-    through. The guard reads the live flag, so a reload sees the installed state."""
+    """A module importlib.reload can re-run: a real file plus a parent package in sys.modules
+    whose __path__ contains it, which is what reload looks the spec up through."""
     package = "transformers.models.unsloth_reload_probe"
     directory = tmp_path / "pkg"
     directory.mkdir(exist_ok = True)
@@ -428,8 +416,7 @@ def test_a_guarded_assignment_is_bound_too(tmp_path, monkeypatch, iu):
 def test_a_function_that_was_already_imported_elsewhere_sees_the_new_state(
     tmp_path, monkeypatch, iu
 ):
-    """reload re-runs the module in the SAME __dict__, so `from x import use` in some
-    other module keeps working. A fresh import under a new name would not do this."""
+    """reload re-runs in the SAME __dict__, so `from x import use` elsewhere keeps working."""
     module = _load_reloadable(tmp_path, monkeypatch, iu, "stale_ref", ASSIGNS_STATE)
     stale = module.use
 
@@ -441,8 +428,7 @@ def test_a_function_that_was_already_imported_elsewhere_sees_the_new_state(
 
 
 def test_a_module_with_only_guarded_imports_is_not_re_run(tmp_path, monkeypatch, iu):
-    """Blast radius: re-running a module is the fallback for state an import replay
-    cannot bind, not the mechanism. Everything else keeps the targeted path."""
+    """Blast radius: re-running is the fallback for state an import replay cannot bind."""
     module = _load_reloadable(tmp_path, monkeypatch, iu, "imports_only", IMPORTS_ONLY)
     assert module.RELOADS == [1]
 

@@ -16,11 +16,10 @@
 
 """A --user install has to reach sys.path in the session that ran it.
 
-site.addusersitepackages adds the user site only `if os.path.isdir(user_site)`, and
-that is decided at interpreter start. So on a non-root system interpreter with no user
-site yet, the first --user install creates the directory and nothing can import out of
-it: the auto-installer changes the environment and then re-raises the very ImportError
-it was invoking pip to fix, telling the user to install what they have just installed.
+site.addusersitepackages adds the user site only `if os.path.isdir(user_site)`, decided at
+interpreter start. On a non-root interpreter with no user site yet, the first --user install
+creates the directory and nothing can import out of it, so the auto-installer would re-raise
+the very ImportError it ran pip to fix.
 """
 
 from __future__ import annotations
@@ -39,8 +38,7 @@ notebook_deps = importlib.import_module("unsloth_zoo.temporary_patches.notebook_
 
 @pytest.fixture
 def fresh_user_site(tmp_path, monkeypatch):
-    """A user site that does not exist yet, created by the 'install', with sys.path
-    restored afterwards so one test cannot leak a path into the next."""
+    """A user site that does not exist yet, created by the 'install'; sys.path is restored after."""
     target = tmp_path / "usersite"
     monkeypatch.setattr(site, "getusersitepackages", lambda: str(target))
     monkeypatch.setattr(site, "ENABLE_USER_SITE", True, raising = False)
@@ -80,8 +78,7 @@ def test_an_install_without_user_leaves_sys_path_alone(fresh_user_site):
 
 
 def test_a_disabled_user_site_is_not_overridden(fresh_user_site, monkeypatch):
-    """-s, PYTHONNOUSERSITE or a venv: the interpreter was told to ignore the user
-    site, and pip's --user would have refused too, so adding it back is not ours."""
+    """-s, PYTHONNOUSERSITE or a venv: pip's --user would have refused too, so do not add it back."""
     monkeypatch.setattr(site, "ENABLE_USER_SITE", False, raising = False)
 
     ok, _ = notebook_deps._run_install("snac", ["pip", "install", "--user", "snac"])
@@ -111,8 +108,7 @@ def test_a_failed_install_adds_nothing(fresh_user_site, monkeypatch):
 
 
 def test_the_stdlib_really_gates_on_the_directory_existing():
-    """Premise pin. If CPython ever starts adding a user site that does not exist yet,
-    the helper above becomes dead code and should go rather than linger."""
+    """Premise pin: if CPython adds a user site that does not exist yet, the helper is dead code."""
     import inspect
 
     src = inspect.getsource(site)

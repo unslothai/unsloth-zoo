@@ -132,8 +132,7 @@ def test_a_stdin_whose_isatty_raises_is_not_treated_as_a_terminal(installer, mon
 
 
 def test_the_real_builtin_input_raises_RuntimeError_when_stdin_is_None(monkeypatch):
-    """Pin CPython's real behaviour: `sys.stdin = None` raises RuntimeError, NOT
-    EOFError, so a test stubbing the pair asserts a combination that cannot occur."""
+    """Pin CPython: `sys.stdin = None` raises RuntimeError, not EOFError."""
     monkeypatch.setattr(llama_cpp.sys, "stdin", None)
     with pytest.raises(RuntimeError, match = "lost sys.stdin"):
         input("prompt")
@@ -168,8 +167,7 @@ def test_stdin_None_respects_the_opt_out(monkeypatch):
 
 
 def test_a_non_interactive_stdin_that_answers_still_respects_the_opt_out(installer):
-    """The opt-out must be checked before the prompt: a headless stdin is not always a
-    closed one (`docker run -i` feeds a newline), so input() returns and never raises."""
+    """A headless stdin is not always a closed one (`docker run -i` feeds a newline)."""
     with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
         installer("", isatty = False, auto_install = "0")
     assert installer.calls == [], "UNSLOTH_AUTO_INSTALL=0 still ran the installer"
@@ -205,8 +203,7 @@ def test_colab_and_kaggle_still_install_without_the_opt_out(monkeypatch, hosted)
 
 
 def test_the_opt_out_covers_the_windows_branch(monkeypatch):
-    # The Windows arm returns from inside its own loop, so an opt-out placed after the
-    # platform branch never reached winget.
+    # The Windows arm returns early, so an opt-out after the platform branch never reached winget.
     calls = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", True)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -251,8 +248,7 @@ def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch
 
 @pytest.mark.skipif(os.name != "posix", reason = "fd 0 is closed with a POSIX shell redirect")
 def test_a_closed_fd0_really_produces_a_None_stdin():
-    """The unstubbed precondition: fd 0 closed gives `sys.stdin is None`, and the real
-    `input()` then raises RuntimeError, not EOFError."""
+    """Unstubbed precondition: fd 0 closed gives `sys.stdin is None` and a RuntimeError."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ)
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
