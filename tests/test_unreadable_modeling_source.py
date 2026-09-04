@@ -55,12 +55,17 @@ sys.path.insert(0, str(ROOT))
 COMPILER = ROOT / "unsloth_zoo" / "compiler.py"
 SRC = COMPILER.read_text(encoding="utf-8")
 
+# The clause both guards must carry. tokenize.TokenError subclasses Exception directly, so
+# OSError/TypeError alone let it through (#1149); the pin names the full tuple so a guard
+# that quietly drops a member fails here rather than at model load.
+GUARD = "except (OSError, TypeError, tokenize.TokenError)"
+
 
 def _guard_region() -> str:
     """The modeling-file guard and its handler.
 
-    Anchored on the call, not on "except (OSError, TypeError)": the torch
-    forward guard uses the same clause and is defined earlier in the file.
+    Anchored on the call, not on GUARD: the torch forward guard uses the same
+    clause and is defined earlier in the file.
     """
     i = SRC.index("full_source = inspect.getsource(modeling_file)")
     return SRC[max(0, i - 400):i + 2200]
@@ -75,9 +80,10 @@ def test_getsource_is_wrapped():
 
 
 def test_it_catches_what_getsource_actually_raises():
-    """OSError for unreadable source, TypeError for a built-in or C module."""
+    """OSError for unreadable source, TypeError for a built-in or C module,
+    TokenError for a generated forward read mid-rewrite."""
     region = _guard_region()
-    assert "except (OSError, TypeError)" in region
+    assert GUARD in region
 
 
 def test_the_real_exception_type_is_oserror():
@@ -172,7 +178,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
     """
     region = _nn_patch_region()
     assert "try:" in region
-    assert "except (OSError, TypeError)" in region
+    assert GUARD in region
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
@@ -217,7 +223,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    assert SRC.count("except (OSError, TypeError)") >= 2
+    assert SRC.count(GUARD) >= 2
 
 
 # ---- what the fallback must still do -------------------------------------
