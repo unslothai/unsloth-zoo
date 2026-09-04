@@ -16,9 +16,7 @@
 
 """Listing a helper in DISABLE_COMPILE_FUNCTIONS must reach its CALLERS too.
 `called_functions` holds only names the modeling file both calls AND defines, so an
-imported-only helper is imported raw for Dynamo to inline. The fix demotes the CALLER;
-`@torch.compiler.disable` on the helper would not do, a disabled callee is itself a
-graph break and that is the same hard error under fullgraph."""
+imported-only helper is imported raw for Dynamo to inline, and the CALLER is demoted."""
 
 import inspect
 import os
@@ -35,8 +33,8 @@ from unsloth_zoo.compiler import (
 
 
 def test_bare_calls_are_detected_and_attribute_calls_are_not():
-    """qwen3_vl, glm4v, qwen2_5_vl and paddleocr_vl each define a METHOD of the same
-    name, so a bare-name match would demote modules that never touch the helper."""
+    """Several VL files define a METHOD of the same name, so matching those would demote
+    modules that never touch the helper."""
     listed = DISABLE_COMPILE_FUNCTIONS[0]
 
     assert calls_disable_compile_function(
@@ -61,8 +59,7 @@ def test_bare_calls_are_detected_and_attribute_calls_are_not():
 
 
 def test_every_fullgraph_emit_site_consults_the_detector():
-    """Miss one of the three emit sites and an imported helper is inlined into a
-    fullgraph region again, unseen by tests that do not go through the rewriter."""
+    """Miss one emit site and an imported helper is inlined into a fullgraph region again."""
     source = inspect.getsource(compiler_module)
     assert source.count("calls_disable_compile_function(") == 4, (
         "expected one definition plus three call sites (module scan + the two "
@@ -134,14 +131,12 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
-    # Pin the child to THIS checkout, else it imports the site-packages unsloth_zoo and
-    # reports on a different compiler.py (a false green).
+    # Pin the child to THIS checkout, else it reports on the site-packages compiler.py.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join(
         [repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
-    # Inheriting the core-drift job's UNSLOTH_COMPILE_DISABLE=1 forces disable=True, so
-    # the forward is emitted @torch.compiler.disable, not torch_compile_with_fallback.
+    # An inherited UNSLOTH_COMPILE_DISABLE=1 forces disable=True and emits the wrong decorator.
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     result = subprocess.run(
         [sys.executable, "-c", _CHILD],
@@ -176,8 +171,8 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
         + decorators[-400:]
     )
 
-    # Bonus check; a bare CI runner may lack a working inductor, and the regression
-    # itself surfaces as a different exception type.
+    # Bonus check: a bare CI runner may lack a working inductor, and the regression itself
+    # surfaces as a different exception type.
     if payload.get("error_type") == "BackendCompilerFailed":
         pytest.skip(f"inductor cannot compile here ({payload['error']}); decorator asserted above")
     assert payload["error"] is None, payload["error"]

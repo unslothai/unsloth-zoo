@@ -155,19 +155,14 @@ DISABLE_COMPILE_FUNCTIONS = [
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
-    # Deliberately NOT gated on torch version. pytorch 48dbd60df48 (pytorch#162354)
-    # swapped guard_size_oblivious for guard_or_true and does make four of them
-    # traceable, but measured on torch 2.9.1 / 2.10.0 / 2.11.0 against transformers
-    # 5.16.1, window_index still dies on GuardOnDataDependentSymNode at
-    # `cu_window_seqlens.extend(cu_seqlens_tmp.tolist())` and bilinear_indices on its
-    # deprecation warning; on transformers 5.14.1, attention_seqlens and
-    # interpolation_indices break on torch 2.11 too. A `torch < 2.10` gate would put the
-    # crash back for qwen2_5_vl and qwen2_5_omni on the default install. Listing the
-    # traceable ones anyway costs one demoted caller across 10 VL model types
-    # (minimax_m3_vl's 3DRotaryEmbedding), because every VL vision forward is already
-    # off fullgraph through an earlier tier. bilinear_indices, deprecated at 5.16 and
-    # imported by no modeling file today, is listed so a model going back to it stays
-    # uncompiled.
+    # Deliberately NOT gated on torch version: pytorch#162354 does make four of them
+    # traceable, but on torch 2.9.1 / 2.10.0 / 2.11.0 window_index still dies on
+    # GuardOnDataDependentSymNode and bilinear_indices on its deprecation warning, and a
+    # `torch < 2.10` gate would put the crash back for qwen2_5_vl and qwen2_5_omni on the
+    # default install. Listing the traceable ones anyway costs one demoted caller across
+    # 10 VL model types, since every VL vision forward is already off fullgraph through an
+    # earlier tier. bilinear_indices, deprecated at 5.16 and imported by no modeling file
+    # today, is listed so a model going back to it stays uncompiled.
     "get_vision_position_ids",
     "get_vision_cu_seqlens",
     "get_vision_attention_seqlens",
@@ -178,10 +173,10 @@ DISABLE_COMPILE_FUNCTIONS = [
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
-    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: deliberately a
-    superset of the `called_functions` test one level up, which also requires
-    `def <name>` locally and so misses every imported-only helper. `[^\\w.]` excludes
-    attribute calls; qwen3_vl, glm4v and qwen2_5_vl define a METHOD of the same name."""
+    """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: a superset of the
+    `called_functions` test above, which also wants `def <name>` locally and so misses
+    imported-only helpers. `[^\\w.]` excludes attribute calls: qwen3_vl, glm4v and
+    qwen2_5_vl define a method of the same name."""
     return sorted(
         name
         for name in disable_compile_functions
@@ -4963,10 +4958,9 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Tier 3: an imported-only callee is never in `called_functions`, so the raw
-        # upstream helper is imported for Dynamo to inline. Demote the CALLER; marking
-        # the helper `@torch.compiler.disable` is not an alternative, a disabled callee
-        # is itself a graph break and that is the same hard error under fullgraph.
+        # Tier 3: an imported-only callee is never in `called_functions`, so Dynamo inlines
+        # the raw upstream helper. Demote the CALLER; `@torch.compiler.disable` on the
+        # helper is no alternative, a disabled callee is itself a fullgraph break.
         called_disabled = calls_disable_compile_function(
             source, disable_compile_functions
         )
