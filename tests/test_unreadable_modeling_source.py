@@ -77,7 +77,7 @@ def test_getsource_is_wrapped():
 def test_it_catches_what_getsource_actually_raises():
     """OSError for unreadable source, TypeError for a built-in or C module."""
     region = _guard_region()
-    assert "except (OSError, TypeError)" in region
+    assert "except (OSError, TypeError, tokenize.TokenError)" in region
 
 
 def test_the_real_exception_type_is_oserror():
@@ -172,7 +172,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
     """
     region = _nn_patch_region()
     assert "try:" in region
-    assert "except (OSError, TypeError)" in region
+    assert "except (OSError, TypeError, tokenize.TokenError)" in region
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
@@ -217,7 +217,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    assert SRC.count("except (OSError, TypeError)") >= 2
+    assert SRC.count("except (OSError, TypeError, tokenize.TokenError)") >= 2
 
 
 # ---- what the fallback must still do -------------------------------------
