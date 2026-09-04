@@ -70,12 +70,15 @@ def _auto_install_enabled() -> bool:
 
 
 def _no_network() -> bool:
-    # Read at the attempt (a notebook can go offline later). Only the two flags huggingface_hub
-    # honours; unsloth_zoo/__init__.py cross-syncs HF_DATASETS_OFFLINE into them.
+    # Read at the attempt (a notebook can go offline later). The cross-sync in
+    # unsloth_zoo/__init__.py establishes that any one of the three Hugging Face flags
+    # implies all three, but it runs once at import, so a flag set afterwards is only
+    # seen if it is read here. All four are therefore checked at the attempt.
     return (
         _env_is_true("UNSLOTH_OFFLINE")
         or _env_is_true("HF_HUB_OFFLINE")
         or _env_is_true("TRANSFORMERS_OFFLINE")
+        or _env_is_true("HF_DATASETS_OFFLINE")
     )
 _attempted: set = set()
 

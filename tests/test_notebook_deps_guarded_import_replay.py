@@ -336,7 +336,7 @@ def test_the_installer_path_replays_before_letting_the_retry_through(
         monkeypatch.setitem(sys.modules, name, mod)
 
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setitem(notebook_deps._ALLOW_LIST, BACKEND, None)
 

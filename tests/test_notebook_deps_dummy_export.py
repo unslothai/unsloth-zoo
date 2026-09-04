@@ -48,7 +48,7 @@ def patched(monkeypatch):
 
     monkeypatch.setattr(iu, "requires_backends", original, raising = False)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for offline in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for offline in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(offline, raising = False)
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", lambda pkg: True)
     monkeypatch.setattr(
@@ -119,7 +119,7 @@ def patched_still_missing(monkeypatch):
 
     monkeypatch.setattr(iu, "requires_backends", original, raising = False)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for offline in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for offline in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(offline, raising = False)
     monkeypatch.setattr(
         notebook_deps, "_try_install_and_import", lambda pkg: pkg in notebook_deps._ALLOW_LIST

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import os
 import sys
 import types
 
@@ -103,7 +104,7 @@ def record_installs(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
     return calls
 
@@ -333,7 +334,7 @@ def test_successful_install_invalidates_the_cached_availability_probe(monkeypatc
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
 
     notebook_deps.patch_requires_backends_autoinstall()
@@ -408,7 +409,7 @@ def test_a_failed_install_is_not_marked_available(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "_try_install_and_import", _stub)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
 
     notebook_deps.patch_requires_backends_autoinstall()
@@ -537,7 +538,7 @@ def package_manager_spy(monkeypatch):
 
     monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
     monkeypatch.setattr(notebook_deps, "_attempted", set())
-    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
     return commands
 
@@ -623,7 +624,7 @@ def test_clearing_the_opt_out_at_runtime_re_enables_the_installer(
         notebook_deps, "_try_install_and_import",
         lambda pkg: reached.append(pkg) or False,
     )
-    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
     notebook_deps.patch_requires_backends_autoinstall()
@@ -641,11 +642,11 @@ def test_clearing_the_opt_out_at_runtime_re_enables_the_installer(
 def test_going_offline_after_import_stops_the_installer(monkeypatch):
     """The offline flags must be read at the attempt, not captured at import."""
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     assert notebook_deps._no_network() is False
 
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.setenv(off, "1")
         assert notebook_deps._no_network() is True, off
         calls = []
@@ -655,16 +656,55 @@ def test_going_offline_after_import_stops_the_installer(monkeypatch):
         monkeypatch.delenv(off, raising = False)
 
 
+def test_the_datasets_offline_flag_set_after_import_also_stops_the_installer(monkeypatch):
+    """The import-time cross-sync cannot see a flag set later, so `_no_network` must read it."""
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        monkeypatch.delenv(off, raising = False)
+
+    # Only HF_DATASETS_OFFLINE, exactly as a notebook cell setting it post-import leaves things:
+    # unsloth_zoo/__init__.py already ran, so the other two are still unset.
+    monkeypatch.setenv("HF_DATASETS_OFFLINE", "1")
+    assert os.environ.get("HF_HUB_OFFLINE") is None
+    assert os.environ.get("TRANSFORMERS_OFFLINE") is None
+
+    assert notebook_deps._no_network() is True
+    calls = []
+    monkeypatch.setattr(notebook_deps, "_pip_install", lambda p: calls.append(p) or True)
+    assert notebook_deps._try_install_and_import("timm") is False
+    assert calls == [], "HF_DATASETS_OFFLINE=1 still reached the installer"
+
+
+def test_no_network_reads_every_flag_the_cross_sync_calls_offline():
+    """`unsloth_zoo/__init__.py` says any one of the three implies all three; honour all three."""
+    import ast
+    import inspect
+
+    read = {
+        node.args[0].value
+        for node in ast.walk(ast.parse(inspect.getsource(notebook_deps._no_network)))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "_env_is_true"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    assert read == {
+        "UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+    }, read
+
 
 
 HF_TRUE_SPELLINGS = ["1", "on", "ON", "true", "True", "TRUE", "yes", "Yes", "YES"]
 
 
-@pytest.mark.parametrize("flag", ["UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"])
+@pytest.mark.parametrize(
+    "flag",
+    ["UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"],
+)
 @pytest.mark.parametrize("value", HF_TRUE_SPELLINGS)
 def test_every_truthy_spelling_hugging_face_accepts_counts_as_offline(monkeypatch, flag, value):
     """huggingface_hub accepts 1/ON/TRUE/YES, so taking only "1" left pip running under =true."""
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setenv(flag, value)
     assert notebook_deps._no_network() is True, f"{flag}={value}"
@@ -672,7 +712,7 @@ def test_every_truthy_spelling_hugging_face_accepts_counts_as_offline(monkeypatc
 
 @pytest.mark.parametrize("value", ["0", "off", "false", "no", "", "  "])
 def test_falsey_and_unset_offline_flags_are_not_offline(monkeypatch, value):
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setenv("HF_HUB_OFFLINE", value)
     assert notebook_deps._no_network() is False, value
@@ -694,7 +734,7 @@ def test_anything_not_recognised_as_true_still_disables_auto_install(monkeypatch
 def test_a_resolvable_but_unimportable_package_is_not_reported_as_installed(monkeypatch):
     """find_spec proves discoverability, not importability; calling it success hides a NameError."""
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setattr(
         notebook_deps.importlib.util, "find_spec", lambda name: object()
@@ -715,7 +755,7 @@ def test_a_resolvable_but_unimportable_package_is_not_reported_as_installed(monk
 
 def test_an_importable_package_is_reported_without_reinstalling(monkeypatch):
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
-    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    for off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(off, raising = False)
     monkeypatch.setattr(
         notebook_deps.importlib.util, "find_spec", lambda name: object()
