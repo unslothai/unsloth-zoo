@@ -67,11 +67,8 @@ def _guard_region() -> str:
 
 
 def _caught_names(handler) -> set:
-    """The exception names an `except` clause catches, however it is spelled.
-
-    The trailing attribute, so `tokenize.TokenError` and a bare `TokenError`
-    read alike.
-    """
+    """Names an `except` catches, by trailing attribute, so `tokenize.TokenError`
+    and a bare `TokenError` read alike."""
     node = handler.type
     if node is None:
         return set()
@@ -82,10 +79,9 @@ def _caught_names(handler) -> set:
 def _getsource_guards(call: str) -> list:
     """What every `try` whose body calls `call` catches, one entry per handler.
 
-    Read off the parsed handler rather than searched for as the literal
-    `except (OSError, TypeError)`. Widening a guard is how this file's own
-    premise gets stronger, and #1149 widening it to `tokenize.TokenError`
-    failed three tests here while catching strictly more.
+    Read off the parse, not matched as one spelling: a wider guard is a
+    stronger premise, yet #1149 widening it to `tokenize.TokenError` failed
+    three tests here while catching strictly more.
     """
     guards = []
     for node in ast.walk(ast.parse(SRC)):
@@ -112,8 +108,7 @@ def test_it_catches_what_getsource_actually_raises():
     for caught in guards:
         assert {"OSError", "TypeError"} <= caught, (
             f"the modeling-file guard stopped catching one of them: {sorted(caught)}")
-    # Widened by #1149: getblock raises TokenError, which subclasses Exception
-    # directly, so neither of the other two sees it.
+    # Widened by #1149: getblock's TokenError subclasses Exception directly.
     assert any("TokenError" in caught for caught in guards)
 
 
