@@ -42,6 +42,25 @@ sys.path.insert(0, str(ROOT))
 
 from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
+
+@pytest.fixture(autouse = True)
+def _clear_latches():
+    """The latch is process-global and keyed by label, and every `_wrap` below
+    reuses "TestMod", so the first fallback would leak into every later test."""
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    # Left set by an earlier test file, the give-up arms here read "a compiled
+    # pack is outstanding" and end the step instead of falling back.
+    _packed = U._PACKED_COMPILED_IN_CHECKPOINT
+    U._PACKED_COMPILED_IN_CHECKPOINT = False
+    yield
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    U._PACKED_COMPILED_IN_CHECKPOINT = _packed
+
+
 DISABLE_MSG = (
     "Skip calling `torch.compiler.disable()`d function\n"
     "  Explanation: Skip calling function "

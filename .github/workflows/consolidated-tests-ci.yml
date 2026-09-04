@@ -299,6 +299,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
+        # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
+        #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one
         # shipped broken for the same reason this comment keeps repeating -- the
@@ -359,6 +363,7 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_disabled_hook_checkpoint_guard.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

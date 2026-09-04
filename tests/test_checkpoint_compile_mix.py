@@ -443,3 +443,118 @@ def test_the_last_sequential_segment_is_outside_every_region():
     is packed while it executes and eager is safe there even when the earlier
     segments are non-reentrant."""
     assert _sequential_walk(2, False) == [True, True, False, False]
+
+
+# ---- the disabled-hook arm, which used to flip with no question asked -----
+
+def _disabled_hook_error():
+    """Dynamo's refusal to inline a `torch.compiler.disable`d callable."""
+    import torch._dynamo.exc as exc
+    cls = getattr(exc, "Unsupported", None)
+    if cls is None:
+        pytest.skip("this torch has no torch._dynamo.exc.Unsupported")
+    try:
+        return cls(
+            "Skip calling `torch.compiler.disable()`d function\n"
+            "  Explanation: Skip calling function `requires_grad_pre_hook` "
+            "since it was wrapped with `torch.compiler.disable`\n"
+            "  Hint: Remove the `torch.compiler.disable` call"
+        )
+    except Exception:
+        pytest.skip("Unsupported cannot be constructed on this torch")
+
+
+@pytest.fixture
+def hook_label():
+    label = "test_disabled_hook_under_checkpoint"
+    for s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+              U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        s.discard(label)
+    packed = U._PACKED_COMPILED_IN_CHECKPOINT
+    yield label
+    for s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+              U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        s.discard(label)
+    U._PACKED_COMPILED_IN_CHECKPOINT = packed
+    U._RAISED_INSIDE_CHECKPOINT = False
+    U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+@pytest.mark.skipif(
+    U._in_non_reentrant_checkpoint() is None,
+    reason = "torch < 2.8 cannot report whether a checkpoint region is live",
+)
+def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label):
+    """The Gemma4 abort.
+
+    Dynamo only discovers a disabled hook while TRACING, so this arm fires on a
+    recompile, routinely the backward recompute of a region whose forward already
+    packed compiled. It used to set `state["eager"]` and run eager on the spot,
+    with none of the checkpoint question the other give-up arms ask, and torch
+    raised CheckpointError about recomputed tensors having different metadata,
+    with `_LATCHED_EAGER_LABELS` still empty because this arm recorded nothing.
+    """
+    calls = {"n": 0}
+
+    def compiled(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _disabled_hook_error()
+
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+
+    def region(x):
+        # First call packs compiled, so the region owes a compiled recompute.
+        assert fn(x) == "compiled"
+        # A later trace in the same region refuses. Eager here is the abort.
+        return fn(x) * x
+
+    with pytest.raises(Exception) as ei:
+        checkpoint(region, torch.randn(4, 4, requires_grad = True),
+                   use_reentrant = False)
+    message = str(ei.value)
+    assert "torch.compiler.disable" in message, message[:200]
+
+    assert hook_label in U._LATCHED_EAGER_LABELS, "the flip must be recorded"
+    assert hook_label in U._RECENT_EAGER_LABELS, "and as this step's evidence"
+    assert U._RAISED_INSIDE_CHECKPOINT, "the abandoned region must be settled"
+    assert fn._unsloth_fallback_state["eager"], "the retry has to be eager"
+
+    # `ei` roots the traceback, hence the abandoned generator and its still
+    # installed hooks -- the case `_settle_abandoned_checkpoint_generator` covers.
+    del ei
+    U.apply_pending_eager_fallbacks()
+    assert U._in_non_reentrant_checkpoint() is False, "the region never closed"
+
+
+@pytest.mark.skipif(
+    U._in_non_reentrant_checkpoint() is None,
+    reason = "torch < 2.8 cannot report whether a checkpoint region is live",
+)
+def test_a_disabled_hook_still_falls_back_when_nothing_packed_compiled(hook_label):
+    """The majority case must not regress: a refusal on the FIRST call means
+    nothing compiled was packed by this label, so eager pack and eager recompute
+    agree. Turning that into a dead step would cost users a working run."""
+    def compiled(*args, **kwargs):
+        raise _disabled_hook_error()
+
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+
+    out = checkpoint(lambda x: fn(x) and x * 2,
+                     torch.randn(4, 4, requires_grad = True),
+                     use_reentrant = False)
+    out.sum().backward()
+    assert fn._unsloth_fallback_state["eager"]
+    assert not U._RAISED_INSIDE_CHECKPOINT, "nothing was stranded"
+
+
+def test_a_disabled_hook_outside_any_region_is_unchanged(hook_label):
+    def compiled(*args, **kwargs):
+        raise _disabled_hook_error()
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+    assert fn() == "eager"
+    assert not U._RAISED_INSIDE_CHECKPOINT
