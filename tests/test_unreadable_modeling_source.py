@@ -44,6 +44,7 @@ enable paths the model never claimed to support. Slower is fine; wrong is not.
 
 import ast
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -67,21 +68,37 @@ def _guard_region() -> str:
 
 
 def _caught_names(handler) -> set:
-    """Names an `except` catches, by trailing attribute, so `tokenize.TokenError`
-    and a bare `TokenError` read alike."""
+    """The exception names an `except` clause catches, spelled as they are written."""
     node = handler.type
     if node is None:
         return set()
     parts = node.elts if isinstance(node, ast.Tuple) else [node]
-    return {ast.unparse(part).rsplit(".", 1)[-1] for part in parts}
+    return {ast.unparse(part) for part in parts}
+
+
+def _catches(caught: set, name: str) -> bool:
+    """Whether `name` is caught under a spelling this module can actually resolve.
+
+    A bare `TokenError` is not interchangeable with `tokenize.TokenError` here:
+    compiler.py imports the module and not the name, so an unqualified handler
+    would raise NameError at the moment it is asked to handle a failure.
+    """
+    if name in caught:
+        return True
+    bare = name.rsplit(".", 1)[-1]
+    return bare in caught and re.search(
+        rf"^from [\w.]+ import [^\n]*\b{bare}\b", SRC, re.M
+    ) is not None
 
 
 def _getsource_guards(call: str) -> list:
-    """What every `try` whose body calls `call` catches, one entry per handler.
+    """What every `try` whose body calls `call` catches, one union per `try`.
 
-    Read off the parse, not matched as one spelling: a wider guard is a
-    stronger premise, yet #1149 widening it to `tokenize.TokenError` failed
-    three tests here while catching strictly more.
+    Read off the parse, not matched as one spelling: a wider guard is a stronger
+    premise, yet #1149 widening it to `tokenize.TokenError` failed three tests here
+    while catching strictly more. A union per `try` rather than a set per handler,
+    because `except OSError:` beside `except TypeError:` guards the call exactly as
+    well as the single tuple does.
     """
     guards = []
     for node in ast.walk(ast.parse(SRC)):
@@ -89,7 +106,7 @@ def _getsource_guards(call: str) -> list:
             continue
         if not any(call in ast.unparse(stmt) for stmt in node.body):
             continue
-        guards.extend(_caught_names(handler) for handler in node.handlers)
+        guards.append(set().union(set(), *(_caught_names(h) for h in node.handlers)))
     return guards
 
 
@@ -106,10 +123,10 @@ def test_it_catches_what_getsource_actually_raises():
     guards = _getsource_guards("inspect.getsource(modeling_file)")
     assert guards, "the modeling-file getsource is no longer inside a try"
     for caught in guards:
-        assert {"OSError", "TypeError"} <= caught, (
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
             f"the modeling-file guard stopped catching one of them: {sorted(caught)}")
     # Widened by #1149: getblock's TokenError subclasses Exception directly.
-    assert any("TokenError" in caught for caught in guards)
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_the_real_exception_type_is_oserror():
@@ -205,9 +222,9 @@ def test_the_nn_forward_patch_loop_is_guarded():
     guards = _getsource_guards("inspect.getsource(function.forward)")
     assert guards, "the forward getsource is no longer inside a try"
     for caught in guards:
-        assert {"OSError", "TypeError"} <= caught, (
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
             f"the forward guard stopped catching one of them: {sorted(caught)}")
-    assert any("TokenError" in caught for caught in guards)
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
@@ -255,7 +272,9 @@ def test_both_getsource_guards_are_present():
     sites = {"inspect.getsource(modeling_file)", "inspect.getsource(function.forward)"}
     for call in sites:
         guards = _getsource_guards(call)
-        assert guards and all({"OSError", "TypeError"} <= c for c in guards), (
+        assert guards and all(
+            _catches(c, "OSError") and _catches(c, "TypeError") for c in guards
+        ), (
             f"{call} is unguarded, so an unreadable source is fatal again")
 
 
