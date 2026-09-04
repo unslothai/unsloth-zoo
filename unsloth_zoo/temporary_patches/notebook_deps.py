@@ -495,6 +495,12 @@ def patch_requires_backends_autoinstall():
                 # On replay failure the consumer is still unbound; the original error names the package.
                 if not _replay_skipped_guarded_imports(iu, b):
                     raise
+            try:
+                # A dummy can want backends this allow list does not carry, as
+                # `["timm", "torchvision"]` does; a restart cannot supply those.
+                result = _orig(obj, backends)
+            except ImportError as remaining:
+                raise remaining from None
             if _is_dummy_export(obj):
                 # Returning would run the dummy body and hand back None; say what fixes it.
                 raise ImportError(
@@ -503,7 +509,7 @@ def patch_requires_backends_autoinstall():
                     f"transformers bound this object to a placeholder when it was "
                     f"first imported without it. Please restart the runtime/kernel."
                 ) from None
-            return _orig(obj, backends)
+            return result
 
     requires_backends._unsloth_patched = True
     requires_backends._unsloth_original = _orig

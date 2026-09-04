@@ -100,6 +100,78 @@ def test_a_real_object_still_succeeds_after_the_install(patched):
     assert patched(_RealTokenizer, ["sentencepiece"]) is None
 
 
+MULTI_MODULE = (
+    "transformers.utils.dummy_essentia_and_librosa_and_pretty_midi_and_scipy_and_torch_objects"
+)
+MULTI_BACKENDS = ["essentia", "librosa", "pretty_midi", "scipy", "torch"]
+
+
+@pytest.fixture
+def patched_still_missing(monkeypatch):
+    """Wrapper over a `requires_backends` that keeps failing, as an unlisted backend does."""
+    iu = importlib.import_module("transformers.utils.import_utils")
+
+    def original(obj, backends):
+        raise ImportError(
+            "Pop2PianoFeatureExtractor requires the essentia library but it was not "
+            "found in your environment."
+        )
+
+    monkeypatch.setattr(iu, "requires_backends", original, raising = False)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    for offline in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        monkeypatch.delenv(offline, raising = False)
+    monkeypatch.setattr(
+        notebook_deps, "_try_install_and_import", lambda pkg: pkg in notebook_deps._ALLOW_LIST
+    )
+    monkeypatch.setattr(
+        notebook_deps, "_replay_skipped_guarded_imports", lambda iu, b: True
+    )
+
+    notebook_deps.patch_requires_backends_autoinstall()
+    return iu.requires_backends
+
+
+class _MultiBackendDummy:
+    pass
+
+
+_MultiBackendDummy.__module__ = MULTI_MODULE
+
+
+def test_a_still_unsatisfied_dummy_keeps_the_dependency_error(patched_still_missing):
+    """`scipy` being present says nothing about `essentia`, and restarting cannot supply it."""
+    with pytest.raises(ImportError) as caught:
+        patched_still_missing(_MultiBackendDummy(), MULTI_BACKENDS)
+
+    message = str(caught.value)
+    assert "essentia" in message, message
+    assert "restart" not in message.lower(), (
+        "a restart cannot install a backend this allow list does not carry"
+    )
+    assert "is now installed" not in message, message
+
+
+def test_transformers_really_requests_backends_outside_the_allow_list():
+    """Premise pin: the mixed-backend dummies the guard above exists for."""
+    import inspect
+
+    timm_dummies = importlib.import_module(
+        "transformers.utils.dummy_timm_and_torchvision_objects"
+    )
+    source = inspect.getsource(timm_dummies)
+    assert 'requires_backends(self, ["timm", "torchvision"])' in source, source
+    assert "timm" in notebook_deps._ALLOW_LIST
+    assert "torchvision" not in notebook_deps._ALLOW_LIST
+
+    multi = importlib.import_module(MULTI_MODULE)
+    multi_source = inspect.getsource(multi)
+    requested = ", ".join(f'"{each}"' for each in MULTI_BACKENDS)
+    assert f"requires_backends(self, [{requested}])" in multi_source, multi_source
+    assert "scipy" in notebook_deps._ALLOW_LIST
+    assert "essentia" not in notebook_deps._ALLOW_LIST
+
+
 def test_transformers_really_freezes_this_export_onto_a_dummy():
     """Premise pin: if upstream stops generating dummy objects the guard above is dead code."""
     import inspect
