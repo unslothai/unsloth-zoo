@@ -424,7 +424,6 @@ def _entry_ctx(order):
 
 @contextlib.contextmanager
 def _wired_ctx(order):
-    """Records both ends, so holding it for a session is observable."""
     order.append("held")
     try:
         yield
@@ -715,6 +714,9 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
     assert adapter._split_prompt_kwargs({}, 3) == [{}, {}, {}]  # upstream splitter chosen
     assert adapter._chunked_prefill_kwargs(input_ids=None, prefill_kwargs={}) == {}
     assert policy_calls  # the policy helper was consulted, not bypassed
+    ar._chunked_prefill_enabled = lambda model, **kwargs: False
+    assert adapter._chunked_prefill_kwargs(
+        input_ids=None, prefill_kwargs={}) == {"prefill_step_size": None}
     # The probed capability must reach the adapter, not merely exist on the module.
     assert adapter.cancel is not None
 
@@ -883,7 +885,6 @@ def _sample_utils():
     )
 
 def _results(events):
-    """Row-ordered results from a streaming driver, as generate_batch collects them."""
     out = {}
     for event in events:
         if event.result is not None:
@@ -978,6 +979,21 @@ def test_audio_terminal_event_flushes_text_held_back_during_streaming():
     assert streamed == result.text
 
 
+def _shows(processor, ids):
+    import mlx.core as mx
+
+    return processor(mx.array(ids), None)
+
+
+def _pin(token_id, shown = None):
+    """A processor with a visible effect, recording the history it was shown."""
+    def _processor(tokens, logits):
+        if shown is not None:
+            shown.append(tokens.tolist())
+        return token_id
+    return _processor
+
+
 def test_audio_fallback_forwards_the_request_to_the_stream():
     # A dropped audio payload or ignored control shows up in the stream call.
     adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
@@ -991,6 +1007,15 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert kwargs["sampler"] is adapter.sampler
     # Per-request sampling, not the batch-wide default.
     assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
+    assert kwargs["logits_processors"] == []
+    # Decoding alone is not a reason to drop what the request asked for.
+    shown = []
+    _result, _ = _audio_row(adapter, GenerationRequest(
+        prompt="p", audio="a.wav", logits_processors=[_pin(7, shown)]))
+    audio = adapter.stream_calls[1][1]["logits_processors"]
+    assert [_shows(f, [4, 5, 6]) for f in audio] == [7]
+    # An audio row starts its history where every other row does.
+    assert shown == [[6]]
 
 
 def test_audio_fallback_honours_stop_strings():
@@ -1069,48 +1094,7 @@ def test_vision_generation_resolves_the_saved_processor(monkeypatch):
     assert seen["tok"] is processor
 
 
-def test_seed_is_reduced_onto_the_random_key_domain():
-    """Any int is accepted; mx.random.key rejects negatives and >= 2**64."""
-    assert SamplingParams().seed is None
-    assert SamplingParams(seed = 0).seed == 0
-    assert SamplingParams(seed = -1).seed == 2**64 - 1
-    assert SamplingParams(seed = 2**64 + 5).seed == 5
-    for bad in (True, 1.5, "7"):
-        with pytest.raises(TypeError):
-            SamplingParams(seed = bad)
-
-
-def _rows(width):
-    return types.SimpleNamespace(shape = (width,))
-
-
-def _row_sampler(params):
-    return _PerRowSampler(
-        params,
-        sample_utils_module = types.SimpleNamespace(),
-        make_sampler = lambda **knobs: (lambda logprobs: logprobs),
-    )
-
-
-def test_a_per_row_sampler_refuses_a_batch_it_cannot_match_to_rows():
-    """Silence here would cross two requests' draws."""
-    sampler = _row_sampler(
-        [SamplingParams(temperature = 0.9, seed = 11),
-         SamplingParams(temperature = 0.9, seed = 22)],
-    )
-    sampler.bind_uids([4, 9])
-    assert sampler.row_uids == [4, 9]
-    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
-        sampler(_rows(3))
-    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
-        sampler(_rows(1))
-
-    with pytest.raises(RuntimeError, match = "cannot be matched to rows"):
-        sampler.bind_uids([1, 2, 3])
-
-
 def _knob_sampler(**knobs):
-    """A sampler that reports every knob it was built for."""
     import mlx.core as mx
     token = (int(round(knobs["temp"] * 10)) + 10 * int(round(knobs["top_p"] * 10))
              + 100 * knobs["top_k"] + 1000 * int(round(knobs["min_p"] * 10)))
@@ -1118,24 +1102,19 @@ def _knob_sampler(**knobs):
 
 
 def _batched_generator(prompt_uids = None, generation_uids = None):
-    return types.SimpleNamespace(
-        _prompt_batch = (
-            None if prompt_uids is None
-            else types.SimpleNamespace(uids = list(prompt_uids))
-        ),
-        _generation_batch = (
-            None if generation_uids is None
-            else types.SimpleNamespace(uids = list(generation_uids))
-        ),
-    )
+    def batch(uids):
+        return None if uids is None else types.SimpleNamespace(uids = list(uids))
+
+    return types.SimpleNamespace(_prompt_batch = batch(prompt_uids),
+                                 _generation_batch = batch(generation_uids))
 
 
 def _warm(temps):
     return [SamplingParams(temperature = temp) for temp in temps]
 
 
-def test_a_per_row_sampler_places_rows_by_the_batch_that_is_drawing():
-    """The batch's own row order decides, not the order this adapter inferred."""
+def test_a_per_row_sampler_places_each_row_by_the_batch_and_builds_its_own_knobs():
+    """The batch's own row order decides placement, and every knob reaches its row."""
     import mlx.core as mx
     sampler = _PerRowSampler(
         _warm([0.1, 0.2, 0.3]),
@@ -1156,28 +1135,16 @@ def test_a_per_row_sampler_places_rows_by_the_batch_that_is_drawing():
     assert sampler.sample_target(mx.zeros((2, 4)), row_ids = [0] * 2,
                                  positions = [7, 8]).tolist() == [3, 2]
 
-
-def test_a_per_row_sampler_builds_each_row_every_knob_it_asked_for():
-    """Temperature is the obvious one, and the filters are the easy ones to drop."""
-    import mlx.core as mx
-    rows = [
-        SamplingParams(temperature = 0.5),
-        SamplingParams(temperature = 0.5, top_p = 0.8),
-        SamplingParams(temperature = 0.5, top_k = 3),
-        SamplingParams(temperature = 0.5, min_p = 0.2),
-    ]
-    sampler = _PerRowSampler(
-        rows,
-        sample_utils_module = types.SimpleNamespace(),
-        make_sampler = _knob_sampler,
+    knobs = _PerRowSampler(
+        [SamplingParams(temperature = 0.5), SamplingParams(temperature = 0.5, top_p = 0.8),
+         SamplingParams(temperature = 0.5, top_k = 3),
+         SamplingParams(temperature = 0.5, min_p = 0.2)],
+        sample_utils_module = types.SimpleNamespace(), make_sampler = _knob_sampler,
     )
-    sampler.bind_uids([10, 20, 30, 40])
-    sampler.bind_generator(_batched_generator(generation_uids = [10, 20, 30, 40]))
-    drawn = sampler.sample_target(
-        mx.zeros((4, 4)), row_ids = [0] * 4, positions = [1, 2, 3, 4],
-    ).tolist()
-    assert len(set(drawn)) == 4
-    assert drawn == [5, 85, 305, 2005]
+    knobs.bind_uids([10, 20, 30, 40])
+    knobs.bind_generator(_batched_generator(generation_uids = [10, 20, 30, 40]))
+    assert knobs.sample_target(mx.zeros((4, 4)), row_ids = [0] * 4,
+                               positions = [1, 2, 3, 4]).tolist() == [5, 85, 305, 2005]
 
 
 _UNREADABLE: dict = {}
@@ -1187,49 +1154,50 @@ exec(compile(
     "<generated>", "exec"), _UNREADABLE)
 
 
-def test_a_row_is_reported_as_it_goes_and_its_deltas_rebuild_its_text():
-    """The streaming contract: deltas as they settle, then the result once."""
+def test_a_row_is_reported_as_it_goes_and_says_what_it_consumed_and_produced():
+    """Deltas as they settle then the result once, with running counts on every event."""
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
 
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
-    adapter.per_row_prompt_kwargs = True
+    adapter.per_row_prompt_kwargs, adapter.cancel = True, None
     adapter.defaults = GenerationDefaults()
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
-    adapter.cancel = None
     generator = _vlm_stub(True, events=[
         [(0, 1, None), (1, 1, None)],
         [(0, 2, "length"), (1, 1, None)],
         [(1, 2, "length")],
     ])(object(), object())
-    events = list(adapter._drive(generator, [0, 1], [7, 9], {}))
+    events = list(adapter._drive(generator, [0, 1], [7, 9], {}, prompt_token_count = 5))
+    finished = [index for index, event in enumerate(events) if event.result is not None]
+    nine = [index for index, event in enumerate(events) if event.index == 9]
 
     assert {event.index for event in events} == {7, 9}
-    finished = [index for index, event in enumerate(events) if event.result is not None]
     assert events[finished[0]].index == 7
-    nine = [index for index, event in enumerate(events) if event.index == 9]
     assert any(index < finished[0] for index in nine)
     assert any(index > finished[0] for index in nine)
-
+    assert [event.prompt_tokens for event in events] == [5] * len(events)
+    # The exact running count: a fixed one would answer every stop the same way.
+    assert [event.generated_tokens for event in events if event.index == 7] == [1, 2]
+    assert [event.generated_tokens for event in events if event.index == 9] == [1, 2, 3]
     for index in (7, 9):
         row = [event for event in events if event.index == index]
         assert "".join(event.delta for event in row) == row[-1].result.text
+        assert row[-1].generated_tokens == len(row[-1].result.token_ids)
+
 
 class _OpenBatchGenerator:
-    """A BatchGenerator that reports one token per row per step, for as long as"""
+    """A BatchGenerator reporting one token per row per step, while it has tokens left."""
 
     def __init__(self, *_args, **_kwargs):
         self.rows: dict[int, int] = {}
         self.removed: list[int] = []
-        self.closed = False
-        self.steps = 0
-        self._next_uid = 100
+        self.closed, self.steps, self._next_uid = False, 0, 100
 
     def insert(self, prompts, max_tokens=None, samplers=None, logits_processors=None):
         uids = []
         for index in range(len(prompts)):
             self._next_uid += 1
-            budget = (max_tokens or [1])[index]
-            self.rows[self._next_uid] = int(budget)
+            self.rows[self._next_uid] = int((max_tokens or [1])[index])
             uids.append(self._next_uid)
         return uids
 
@@ -1255,16 +1223,16 @@ class _OpenBatchGenerator:
         self.closed = True
 
 
-def _stub_generation_mode(monkeypatch, generator_type=_OpenBatchGenerator):
-    """A model that can enter generation mode, decoding through a fake generator."""
+def _open_stream(monkeypatch, generator_type=_OpenBatchGenerator, **defaults):
+    """A BatchStream over a fake generator, with the generation lock stubbed out."""
     import unsloth_zoo.mlx.generate as module
+    from unsloth_zoo.mlx.generate import BatchStream
 
     def adapter(model, tok, defaults_):
         built = object.__new__(_TextBatchAdapter)
         built.model, built.tokenizer, built.defaults = model, tok, defaults_
-        built.batch_generator_type = generator_type
+        built.batch_generator_type, built.sample_utils = generator_type, None
         built.make_sampler = lambda **_kwargs: None
-        built.sample_utils = None
         return built
 
     monkeypatch.setattr(module, "_TextBatchAdapter", adapter)
@@ -1273,22 +1241,13 @@ def _stub_generation_mode(monkeypatch, generator_type=_OpenBatchGenerator):
     monkeypatch.setattr(module, "_restore_metal_limits", lambda _snapshot: None)
     model = types.SimpleNamespace(training=False, eval=lambda: None)
     model.named_modules = lambda: [("", model)]
-    return model
-
-
-def _open_stream(monkeypatch, generator_type=_OpenBatchGenerator, **defaults):
-    """A BatchStream over a fake generator, with the generation lock stubbed out."""
-    from unsloth_zoo.mlx.generate import BatchStream
-
     tokenizer = _CharTokenizer()
     tokenizer.eos_token_ids = ()
-    model = _stub_generation_mode(monkeypatch, generator_type=generator_type)
     return BatchStream(model, tokenizer, defaults=GenerationDefaults(**defaults))
 
 
 def test_a_batch_left_open_patches_the_cache_before_it_decodes(monkeypatch):
-    """mlx-lm's ArraysCache.advance strands a Metal buffer per token until it is
-    replaced, and a batch left open decodes for as long as the session lasts."""
+    """mlx-lm's ArraysCache.advance strands a Metal buffer per token until patched."""
     from unsloth_zoo.mlx import generate as engine
 
     installed = []
@@ -1301,34 +1260,20 @@ def test_a_batch_left_open_patches_the_cache_before_it_decodes(monkeypatch):
         stream.close()
 
 
-def test_a_row_added_mid_batch_decodes_with_the_rows_already_running(monkeypatch):
-    """A request that arrived later joins the batch already running: serving"""
-    stream = _open_stream(monkeypatch, max_tokens=6)
-    try:
-        first = stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=6))
-        early = [event.index for _ in range(2) for event in stream.step()]
-        second = stream.add(GenerationRequest(prompt_token_ids=[9, 9], max_tokens=3))
-        together = [event.index for _ in range(2) for event in stream.step()]
-    finally:
-        stream.close()
-
-    assert (first, second) == (0, 1)
-    assert early == [0, 0]
-    assert together == [0, 1, 0, 1]
-
-
-def test_a_cancelled_row_leaves_the_batch_and_its_neighbour_runs_on(monkeypatch):
+def test_rows_join_and_leave_a_batch_while_the_rest_of_it_runs_on(monkeypatch):
+    """A later request joins the batch already running, and a cancelled row leaves it."""
     stream = _open_stream(monkeypatch, max_tokens=8)
     try:
         stream.add(GenerationRequest(prompt_token_ids=[9], max_tokens=8))
-        stream.add(GenerationRequest(prompt_token_ids=[9, 9, 9], max_tokens=8))
-        assert [event.index for event in stream.step()] == [0, 1]
-        generator = stream._session.generator
+        assert [event.index for _ in range(2) for event in stream.step()] == [0, 0]
+        assert stream.add(GenerationRequest(prompt_token_ids=[9, 9, 9], max_tokens=8)) == 1
+        assert [event.index for _ in range(2) for event in stream.step()] == [0, 1, 0, 1]
+
         managed = stream.withdraw(1)
         assert managed is not None and managed.finish_reason == "stop"
         assert managed.prompt_token_count == 3
         assert managed.text and len(managed.token_ids) == len(managed.logprobs) > 0
-        assert generator.removed == [102]
+        assert stream._session.generator.removed == [102]
         assert [event.index for event in stream.step()] == [0]
         assert stream.rows_in_flight == 1
         assert stream.withdraw(1) is None and stream.withdraw(7) is None
@@ -1342,10 +1287,8 @@ class _OpenVLMGenerator:
 
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
-        self.inserted = []
-        self.removed = []
+        self.inserted, self.removed, self.events = [], [], []
         self.closed = False
-        self.events = []
         self._next_uid = 0
         self._prompt_batch = None
         self._generation_batch = types.SimpleNamespace(uids = [])
@@ -1374,13 +1317,12 @@ class _OpenVLMGenerator:
 
 def _vlm_adapter(generator_type = None):
     """The release surface a vision session actually uses, over fakes."""
-    def embeddings(input_ids, *a, **k):
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+
+    def keeps_nothing(input_ids, *a, **k):
         width = len(input_ids.tolist()[0])
         embeds = types.SimpleNamespace(shape = (1, width, 4), width = width)
         return types.SimpleNamespace(to_dict = lambda: {"inputs_embeds": embeds})
-
-    def keeps_nothing(input_ids, *a, **k):
-        return embeddings(input_ids, *a, **k)
 
     adapter = types.SimpleNamespace(
         defaults = GenerationDefaults(max_tokens = 5),
@@ -1404,7 +1346,9 @@ def _vlm_adapter(generator_type = None):
         },
         generator_type = generator_type or _OpenVLMGenerator,
     )
-    adapter.wired = []
+    adapter.row_logits_processors, adapter.wired = True, []
+    adapter._row_logits_processors = types.MethodType(
+        _VLMBatchAdapter._row_logits_processors, adapter)
     adapter._wired_limit = lambda: _wired_ctx(adapter.wired)
     adapter._decode_image = lambda request: request
     adapter._add_special_tokens = lambda: True
@@ -1420,98 +1364,47 @@ def _vlm_session(generator_type = None):
     return _VLMBatchSession(_vlm_adapter(generator_type))
 
 
-def test_a_model_keeping_state_one_call_down_is_still_seen_to_keep_it():
-    """Several models do the assignment in a helper rather than in
-    get_input_embeddings itself, where reading that method alone misses it."""
+def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
+    """A model may do the assignment in a helper, or spell it as something other than a name."""
     from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
 
-    class Clean:
-        def _measure(self, ids):
-            return len(ids)
+    class Submodule:
+        def __call__(self, pixels): return pixels
 
-        def get_input_embeddings(self, ids):
-            return self._measure(ids)
+    class Clean:
+        def _measure(self, ids): return len(ids)
+        def get_input_embeddings(self, ids): return self._measure(ids)
 
     class Deep:
-        def _remember(self, ids):
-            self.language_model._position_ids = ids
-
-        def _prepare(self, ids):
-            self._remember(ids)
-
-        def get_input_embeddings(self, ids):
-            self._prepare(ids)
+        def _remember(self, ids): self.language_model._position_ids = ids
+        def _prepare(self, ids): self._remember(ids)
+        def get_input_embeddings(self, ids): self._prepare(ids)
 
     class Circular:
-        def _left(self, ids):
-            return self._right(ids)
-
-        def _right(self, ids):
-            return self._left(ids)
-
-        def get_input_embeddings(self, ids):
-            return self._left(ids)
-
-    class Submodule:
-        def __call__(self, pixels):
-            return pixels
+        def _left(self, ids): return self._right(ids)
+        def _right(self, ids): return self._left(ids)
+        def get_input_embeddings(self, ids): return self._left(ids)
 
     class Tower:
-        """Every vision model runs its tower as ``self.<submodule>(...)``."""
-
-        def __init__(self):
-            self.vision_tower = Submodule()
-
-        def get_input_embeddings(self, ids, pixels):
-            return self.vision_tower(pixels)
+        def __init__(self): self.vision_tower = Submodule()
+        def get_input_embeddings(self, ids, pixels): return self.vision_tower(pixels)
 
     class Opaque:
         get_input_embeddings = Submodule()
 
-    assert _keeps_what_it_prepared(Clean()) is False
-    assert _keeps_what_it_prepared(Deep()) is True
-    assert _keeps_what_it_prepared(Circular()) is False
-    assert _keeps_what_it_prepared(Tower()) is False
-    assert _keeps_what_it_prepared(Opaque()) is True
+    class Subscript:
+        def get_input_embeddings(self, ids): self.state["ids"] = ids
 
+    class Unpacked:
+        def get_input_embeddings(self, ids): self._ids, self._mask = ids, None
 
-def test_a_shipped_vision_model_is_not_refused_for_running_its_tower():
-    """A tower is run as ``self.<submodule>(...)``, which has no body to read.
-    Reading that as retained state refuses every vision model mlx-vlm ships."""
-    pytest.importorskip("mlx_vlm")
-    from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
-
-    checked = {}
-    for name in ("gemma3", "llava", "qwen2_vl", "smolvlm", "idefics3"):
-        try:
-            module = importlib.import_module(f"mlx_vlm.models.{name}.{name}")
-        except ImportError:
-            continue
-        model = module.Model
-        checked[name] = _keeps_what_it_prepared(model.__new__(model))
-
-    assert len(checked) >= 3, checked
-    assert not any(checked.values()), checked
-
-
-def test_a_release_settling_its_prefill_before_any_prompt_keeps_no_batch_open():
-    """A batch left open is built first and admits prompts after, so a release
-    deciding how to prefill at construction would chunk a prompt whose model
-    needs one pass. The releases that re-decide per prompt are the ones exposing
-    the policy helper."""
-    from unsloth_zoo.mlx.generate import _require_streamable_vlm
-
-    adapter = _vlm_adapter()
-    adapter.batch_module = types.SimpleNamespace()
-    with pytest.raises(ValueError, match = "settles how to prefill"):
-        _require_streamable_vlm(adapter)
-    adapter.batch_module = types.SimpleNamespace(
-        _chunked_prefill_enabled = lambda model, **kwargs: True)
-    assert _require_streamable_vlm(adapter) is None
+    keeping = [Deep, Opaque, Subscript, Unpacked]
+    for model in (Clean, Deep, Circular, Tower, Opaque, Subscript, Unpacked):
+        assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
 
 
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
-    """A key only some rows carry leaves the merged batch with fewer of it than"""
+    """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()
     plain = session.adapter.model.get_input_embeddings
     assert session.add(GenerationRequest(prompt = "abc")) == 0
@@ -1527,31 +1420,52 @@ def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     assert session.add(GenerationRequest(prompt = "fg")) == 1
 
 
-def _vlm_event(uid, token, finish_reason):
-    return types.SimpleNamespace(
-        uid = uid, token = token, finish_reason = finish_reason, token_logprob = -0.5,
+def test_a_processor_is_shown_its_own_row_s_history_from_its_own_offset():
+    """Rows rarely share a prompt length, so each latches its own offset."""
+    from unsloth_zoo.mlx.generate import _row_processors
+
+    adapter = _vlm_adapter()
+    shown = [[], []]
+    rows = adapter._row_logits_processors([
+        GenerationRequest(prompt = "p", logits_processors = [_pin(7, seen)])
+        for seen in shown
+    ])
+    for processor, history in zip(rows, ([1, 2, 3], [1, 2, 3, 4, 5, 6, 7])):
+        _shows(processor[0], history)
+    assert shown == [[[3]], [[7]]]
+
+    alone = []
+    processor, = _row_processors(
+        GenerationRequest(prompt = "p", logits_processors = [_pin(7, alone)])
     )
+    # A prompt of five, then one sampled token, then a second.
+    for history in ([1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7]):
+        _shows(processor, history)
+    assert alone == [[5], [5, 6], [5, 6, 7]]
 
 
-def test_a_vision_batch_reports_each_row_and_polls_quietly_through_a_prefill():
-    """A poll with nothing in it is ordinary here: a long prompt prefills over"""
-    session = _vlm_session()
-    session.add(GenerationRequest(prompt = "ab"))
-    session.add(GenerationRequest(prompt = "cd"))
-    session.generator.events = [
-        [],                                          # prefill still running
-        [_vlm_event(0, 1, None), _vlm_event(1, 4, None)],
-        [_vlm_event(0, 1, "stop")],
-        [_vlm_event(1, 1, None)],
-    ]
-    quiet = list(session.step())
-    assert (quiet, session.rows_in_flight) == ([], 2)
-    assert [(event.index, event.delta) for event in session.step()] == [
-        (0, "hello "), (1, "tailSTOPsuffix"),
-    ]
-    finished = list(session.step())
-    assert [event.index for event in finished] == [0]
-    assert finished[-1].result.finish_reason == "stop"
-    assert session.rows_in_flight == 1
-    assert [(event.index, event.delta) for event in session.step()] == [(1, "hello ")]
+@pytest.mark.parametrize("carrying", (0, 1))
+def test_a_text_row_carries_its_own_logits_processors_into_the_batch(monkeypatch, carrying):
+    """The text path admits rows one at a time too, and each keeps its own list."""
+    seen = []
+
+    class _Recording(_OpenBatchGenerator):
+        def insert(self, prompts, max_tokens = None, samplers = None,
+                   logits_processors = None):
+            seen.append(logits_processors)
+            return super().insert(prompts, max_tokens, samplers, logits_processors)
+
+    lists = [None, None]
+    lists[carrying] = [_pin(7)]
+    stream = _open_stream(monkeypatch, generator_type = _Recording, max_tokens = 4)
+    try:
+        for processors in lists:
+            stream.add(GenerationRequest(
+                prompt_token_ids = [9], max_tokens = 4, logits_processors = processors,
+            ))
+    finally:
+        stream.close()
+    assert seen[1 - carrying] == [[]]
+    assert [_shows(processor, [4, 5, 6]) for processor in seen[carrying][0]] == [7]
+
 

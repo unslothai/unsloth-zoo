@@ -406,3 +406,30 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     left.extend(right)
     assert left.left_padding.tolist() == [-2, 2, 2]
     assert left.lengths.tolist() == [4, 7, -2]
+
+
+def test_a_penalised_row_answers_the_same_batched_and_alone():
+    """A row shown its whole prompt is penalised against text it never sees alone, and the
+    two prompts differ in length, so one offset cannot serve both rows."""
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults, GenerationRequest, generate_batch,
+    )
+
+    model, tokenizer = load(MODEL)
+    prompts = ("red red red red red red red red. Name a colour:", "one one one. Count:")
+    penalty = dict(repetition_penalty = 1.6, repetition_context_size = 20)
+    batched = generate_batch(model, tokenizer, [
+        GenerationRequest(prompt = prompt, max_tokens = 12,
+                          logits_processors = make_logits_processors(**penalty))
+        for prompt in prompts
+    ], defaults = GenerationDefaults())
+
+    for prompt, result in zip(prompts, batched):
+        alone = [int(event.token) for event in stream_generate(
+            model, tokenizer, tokenizer.encode(prompt, add_special_tokens = False),
+            max_tokens = 12, sampler = make_sampler(temp = 0.0),
+            logits_processors = make_logits_processors(**penalty),
+        ) if event.finish_reason != "stop"]
+        assert result.token_ids == alone, prompt

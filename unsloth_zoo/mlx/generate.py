@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from numbers import Integral
-from typing import Any, Iterator, Literal, Sequence
+from typing import Any, Callable, Iterator, Literal, Sequence
 
 
 _TEXT_EVENT_FIELDS = frozenset(("uid", "token", "logprobs", "finish_reason"))
@@ -209,6 +209,10 @@ class GenerationRequest:
     bytes and file-like objects are rejected. ``audio`` (vision models only) is
     accepted but decodes one request at a time, since no supported mlx-vlm
     release batches it. At most one of ``image`` and ``audio`` per request.
+
+    ``logits_processors`` are this row's own ``(tokens, logits) -> logits`` callables,
+    run in order on its slice before it draws, and shown the same history on every path
+    so a row answers the same batched or alone. They keep state: never share them.
     """
 
     prompt: str | None = None
@@ -217,11 +221,24 @@ class GenerationRequest:
     audio: Any | None = None
     max_tokens: int | None = None
     sampling: SamplingParams | None = None
+    logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
+
+    def __post_init__(self):
+        if self.logits_processors is None:
+            return
+        try:
+            processors = tuple(self.logits_processors)
+        except TypeError as exc:
+            raise TypeError(
+                "logits_processors must be a sequence of callables."
+            ) from exc
+        if any(not callable(processor) for processor in processors):
+            raise TypeError("Every logits processor must be callable.")
+        object.__setattr__(self, "logits_processors", processors)
 
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """One row's outcome: its sampled tokens, their text, and what the prompt cost."""
 
     token_ids: list[int]
     text: str
@@ -363,10 +380,9 @@ def _validate_vlm_requests(
         name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
     ]
     if refused_kv:
-        # Whether these bound anything depends on the release, the rest of the
-        # configuration, and the model's own cache classes, which upstream
-        # resolves per layer. None is forwarded rather than promise a bound
-        # that may not exist.
+        # quantized_kv_start does not reach mlx-vlm's batch cache builder, so quantization
+        # begins at the first token where the sequential path waits. The other controls
+        # are inert without kv_bits.
         raise ValueError(
             f"{' and '.join(refused_kv)} are not forwarded by this engine's "
             "batched vision path; omit these controls, or use model.generate."
@@ -485,7 +501,6 @@ def _probe_sampler_api(sample_utils_module):
 
 
 def _draws_seeded(sampling: SamplingParams) -> bool:
-    """Whether this request's seed changes anything: argmax draws nothing."""
     return sampling.seed is not None and sampling.temperature != 0
 
 
@@ -516,12 +531,10 @@ def _seeded_sampler(sample_utils_module, params: SamplingParams):
 
 
 def _sampler_key(params: SamplingParams):
-    """The settings one sampler can serve. A seed is not among them: rows"""
     return (params.temperature, params.top_p, params.top_k, params.min_p)
 
 
 def _sampler_for(sample_utils_module, params: SamplingParams, make_sampler):
-    """The sampler one request's settings ask for."""
     if _draws_seeded(params):
         return _seeded_sampler(sample_utils_module, params)
     return make_sampler(
@@ -532,8 +545,27 @@ def _sampler_for(sample_utils_module, params: SamplingParams, make_sampler):
     )
 
 
+def _sequential_history(processor):
+    """A processor shown only the last prompt token and what followed it.
+
+    How much prompt a processor sees is otherwise an accident of the prefill, and a
+    repetition penalty windows recent tokens, so that accident would decide the reply.
+    """
+    state = {"offset": None}
+
+    def _shown(tokens, logits):
+        if state["offset"] is None:
+            state["offset"] = max(int(tokens.shape[0]) - 1, 0)
+        return processor(tokens[state["offset"] :], logits)
+
+    return _shown
+
+
+def _row_processors(request: GenerationRequest) -> list:
+    return [_sequential_history(fn) for fn in (request.logits_processors or ())]
+
+
 class _PerRowSampler:
-    """One sampler per row for a backend that takes only one for the batch."""
 
     def __init__(self, params, *, sample_utils_module, make_sampler):
         self._sample_utils = sample_utils_module
@@ -556,19 +588,16 @@ class _PerRowSampler:
             self.register(uid, params)
 
     def register(self, uid, params: SamplingParams) -> None:
-        """Take one more row, for a caller that learns them one at a time."""
         self._by_uid[uid] = params
         self.row_uids.append(uid)
 
     def release(self, uid) -> None:
-        """Forget a row the batch can no longer draw."""
         self._by_uid.pop(uid, None)
         self._samplers.pop(uid, None)
         if uid in self.row_uids:
             self.row_uids.remove(uid)
 
     def release_all(self) -> None:
-        """Forget every row at once, for a batch that has gone."""
         self._by_uid.clear()
         self._samplers.clear()
         self.row_uids.clear()
@@ -590,7 +619,6 @@ class _PerRowSampler:
         return sampler
 
     def _drawing_uids(self, width, positions):
-        """The rows of this draw, in the order their logprobs are stacked."""
 
         if self._generator is not None and positions is not None:
             name = (
@@ -715,7 +743,7 @@ def _restore_metal_limits(snapshot: dict[str, int] | None):
 
 
 def _require_evaluable(model):
-    """The model's eval(), or a refusal: what generation mode needs to switch a model"""
+    """The model's eval(), or a refusal: what switches a model out of training."""
     switch = getattr(model, "eval", None)
     if not callable(switch):
         raise TypeError("generation_mode requires a model with eval().")
@@ -1018,11 +1046,18 @@ def _install_arrays_cache_advance_fix():
 
 @dataclass(frozen=True)
 class GenerationEvent:
-    """One row's progress through a batch, in the order the batch produced it."""
+    """One row's progress through a batch, in the order the batch produced it.
+
+    ``prompt_tokens`` and ``generated_tokens`` are the row's counts so far, carried on
+    every event so a caller that stops a batch early can still report usage. ``result``
+    arrives only when the row ends on its own.
+    """
 
     index: int
     delta: str = ""
     result: GenerationResult | None = None
+    prompt_tokens: int = 0
+    generated_tokens: int = 0
 
 
 class BatchRowRefused(ValueError):
@@ -1032,7 +1067,12 @@ class BatchRowRefused(ValueError):
 def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEvent]:
     delta = state.release()
     if delta:
-        yield GenerationEvent(index=index, delta=delta)
+        yield GenerationEvent(
+            index=index,
+            delta=delta,
+            prompt_tokens=state.prompt_token_count,
+            generated_tokens=len(state.token_ids),
+        )
 
 
 def _finished_events(
@@ -1044,6 +1084,8 @@ def _finished_events(
         index=index,
         delta=state.release(),
         result=state.result(tokenizer),
+        prompt_tokens=state.prompt_token_count,
+        generated_tokens=len(state.token_ids),
     )
 
 
@@ -1158,7 +1200,6 @@ def _replay_stream_text(detokenizer, token_ids: Sequence[int]) -> str:
 
 
 def _cancelled_result(tokenizer, state: "_PendingResult") -> GenerationResult:
-    """What a row had managed when it was withdrawn."""
     if state.finish_reason is None:
         state.finish(tokenizer, "stop")
     return state.result(tokenizer)
@@ -1177,7 +1218,6 @@ class _PendingResult:
     stop_match: str | None = None
 
     def release(self) -> str:
-        """Text this row has not handed out yet."""
         delta = self.text[self.released :]
         self.released = len(self.text)
         return delta
@@ -1348,7 +1388,7 @@ class _TextBatchSession:
                 [prompt],
                 max_tokens=[int(request.max_tokens or defaults.max_tokens)],
                 samplers=[sampler],
-                logits_processors=[[]],
+                logits_processors=[_row_processors(request)],
             )
         except BaseException:
             self.usable = False
@@ -1383,16 +1423,13 @@ class _TextBatchSession:
         return row
 
     def cancel(self, row: int) -> bool:
-        """Withdraw a row. False if it was never added, or has already ended."""
         return self._take_back(row) is not None
 
     def withdraw(self, row: int) -> GenerationResult | None:
-        """Withdraw a row, answering with what it managed."""
         state = self._take_back(row)
         return None if state is None else _cancelled_result(self.adapter.tokenizer, state)
 
     def _take_back(self, row: int) -> "_PendingResult | None":
-        """Take a row out of the batch, answering with what it was holding."""
         uid = self._uid_of.get(row)
         if uid is None or uid not in self._pending:
             return None
@@ -1406,7 +1443,6 @@ class _TextBatchSession:
         return state
 
     def step(self) -> Iterator[GenerationEvent]:
-        """One decode step's worth of events, or none while no row is in flight."""
         if not self._pending:
             return
         try:
@@ -1605,7 +1641,6 @@ def _probe_vlm_api(batch_module):
 
 
 def _statements(body):
-    """Every node written in this body, skipping nested definitions."""
 
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
@@ -1648,7 +1683,6 @@ def _draws_by_position(owner, method) -> bool:
 
 
 def _vlm_batches_observable(batch_module) -> bool:
-    """Whether a sampler can tell which of a release's rows a draw is for."""
 
     generator = getattr(batch_module, "BatchGenerator", None)
     code = getattr(getattr(generator, "__init__", None), "__code__", None)
@@ -1667,7 +1701,6 @@ _LAYER_MAJOR_PROMPT_KWARGS = frozenset({"deepstack_visual_embeds"})
 
 
 def _padded_prompt_kwargs(batch_module) -> frozenset:
-    """The keys this release stretches to the batch's longest prompt."""
 
     return frozenset({
         "inputs_embeds",
@@ -1676,7 +1709,6 @@ def _padded_prompt_kwargs(batch_module) -> frozenset:
 
 
 def _row_shape(key, value, padded: frozenset):
-    """What a row's value has to match in the batch's other rows."""
 
     shape = getattr(value, "shape", None)
     if shape is None:
@@ -1699,7 +1731,6 @@ def _row_signature(prepared: dict, padded: frozenset) -> dict:
 
 
 def _own_body(method):
-    """One method's own statements, minus anything nested inside it."""
 
     source = textwrap.dedent(inspect.getsource(method))
     definition = ast.parse(source).body[0]
@@ -1717,12 +1748,11 @@ def _own_body(method):
 def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
     """Whether preparing a request leaves anything on this model.
 
-    Follows the helpers the method calls on itself: several models do the
-    assignment one call down, where reading the method alone would not see it.
-    A ``self.<name>(...)`` with no readable body is a submodule being run --
-    every vision model runs its tower that way -- and is stepped over. Only the
-    prepare method itself being unreadable counts as keeping something, since
-    then nothing at all is known about it.
+    Follows the helpers the method calls on itself, since several models assign one call
+    down. A ``self.<name>(...)`` with no readable body is a submodule being run -- every
+    vision model runs its tower that way -- and is stepped over. A binding counts wherever
+    its target leads back to ``self``; mutating a container the model already holds does
+    not, nor does reaching ``self`` indirectly.
     """
 
     seen = set()
@@ -1739,28 +1769,46 @@ def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
         for node in body:
             targets = (
                 list(node.targets) if isinstance(node, ast.Assign)
-                else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                else [node.target]
+                if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor,
+                                     ast.comprehension))
+                else [item.optional_vars for item in node.items if item.optional_vars]
+                if isinstance(node, (ast.With, ast.AsyncWith))
                 else []
             )
-            for target in targets:
-                while isinstance(target, ast.Attribute):
+            while targets:
+                target = targets.pop()
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    targets.extend(target.elts)
+                    continue
+                if isinstance(target, ast.Starred):
+                    targets.append(target.value)
+                    continue
+                while isinstance(target, (ast.Attribute, ast.Subscript)):
                     target = target.value
                 if isinstance(target, ast.Name) and target.id == "self":
                     return True
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                calls.add(node.func.attr)
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "setattr"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "self"
+                ):
+                    return True
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    calls.add(node.func.attr)
         return any(follows(call) for call in sorted(calls))
 
     return follows(method, entry = True)
 
 
 def _require_streamable_vlm(adapter: "_VLMBatchAdapter") -> None:
-    """Refuse a release that cannot keep a vision batch open."""
 
     if not adapter.per_row_prompt_kwargs:
         raise ValueError(
@@ -1860,6 +1908,36 @@ def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[
     return rows
 
 
+def _resolve_vlm_batch_module():
+
+    batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
+    if batch_module is None:
+        raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
+    # Bind the module the class is DEFINED in, where the private helpers live.
+    defining = getattr(batch_module.BatchGenerator, "__module__", None)
+    if defining and defining != batch_module.__name__:
+        try:
+            batch_module = importlib.import_module(defining)
+        except Exception:
+            pass
+    return batch_module
+
+
+def row_logits_processors_unavailable_reason() -> str | None:
+    """Why a batched vision row here cannot carry its own logits processors."""
+
+    try:
+        _, insert_params, _ = _probe_vlm_api(_resolve_vlm_batch_module())
+    except Exception as refusal:
+        return str(refusal)
+    if "logits_processors" in insert_params:
+        return None
+    return (
+        f"{_installed_mlx_vlm_version()} takes no per-row logits processors, "
+        "so a batched vision reply cannot carry a penalty or bias"
+    )
+
+
 class _VLMBatchAdapter:
     """Event-level adapter over mlx-vlm's BatchGenerator.
 
@@ -1871,17 +1949,7 @@ class _VLMBatchAdapter:
     def __init__(
         self, model, processor, defaults: GenerationDefaults, *, audio_warn_stacklevel = 3,
     ):
-        batch_module = _resolve_module_attr(_VLM_BATCH_MODULES, "BatchGenerator")
-        if batch_module is None:
-            raise _vlm_api_shape_error("no importable module exposes BatchGenerator")
-        # Bind the module the class is DEFINED in: that is where the private
-        # helpers and event class live, however the package re-exports them.
-        defining = getattr(batch_module.BatchGenerator, "__module__", None)
-        if defining and defining != batch_module.__name__:
-            try:
-                batch_module = importlib.import_module(defining)
-            except Exception:
-                pass
+        batch_module = _resolve_vlm_batch_module()
         (
             self.constructor_params,
             insert_params,
@@ -1890,6 +1958,7 @@ class _VLMBatchAdapter:
         self.batch_module = batch_module
         self.generator_type = batch_module.BatchGenerator
         self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
+        self.row_logits_processors = "logits_processors" in insert_params
         self.batches_observable = _vlm_batches_observable(batch_module)
         self.padded_prompt_kwargs = _padded_prompt_kwargs(batch_module)
         self.stream_module = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
@@ -1968,6 +2037,17 @@ class _VLMBatchAdapter:
         if callable(upstream) and callable(mrope_aware):
             return upstream(prompt_kwargs, batch_size)
         return _split_prompt_kwargs_fallback(prompt_kwargs, batch_size)
+
+    def _row_logits_processors(self, requests) -> list[list] | None:
+        rows = [_row_processors(request) for request in requests]
+        if not any(rows):
+            return None
+        if not self.row_logits_processors:
+            raise _vlm_api_shape_error(
+                "BatchGenerator.insert does not take logits_processors, so a "
+                "request cannot carry a penalty or bias into a batch"
+            )
+        return rows
 
     def _admission_stalled(self, generator) -> bool | None:
         """True when no prompt can ever be admitted; None when unobservable.
@@ -2125,6 +2205,7 @@ class _VLMBatchAdapter:
             request.prompt,
             audio=request.audio,
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
+            logits_processors=_row_processors(request),
             sampler=(
                 _seeded_sampler(self.sample_utils, sampling)
                 if _draws_seeded(sampling)
@@ -2245,6 +2326,7 @@ class _VLMBatchAdapter:
         max_tokens = [
             int(request.max_tokens or self.defaults.max_tokens) for request in chunk
         ]
+        row_processors = self._row_logits_processors(chunk)
         generator = None
         active_error = None
         try:
@@ -2277,17 +2359,15 @@ class _VLMBatchAdapter:
                     **options,
                 )
                 token_ids = input_ids.tolist()
+                insert_kwargs = {}
                 if self.per_row_prompt_kwargs:
-                    uids = generator.insert(
-                        token_ids,
-                        max_tokens,
-                        prompt_kwargs=self._split_prompt_kwargs(
-                            gen_kwargs,
-                            batch_size,
-                        ),
+                    insert_kwargs["prompt_kwargs"] = self._split_prompt_kwargs(
+                        gen_kwargs,
+                        batch_size,
                     )
-                else:
-                    uids = generator.insert(token_ids, max_tokens)
+                if row_processors is not None:
+                    insert_kwargs["logits_processors"] = row_processors
+                uids = generator.insert(token_ids, max_tokens, **insert_kwargs)
                 if row_sampler is not None:
                     row_sampler.bind_uids(uids)
                     row_sampler.bind_generator(generator)
@@ -2325,7 +2405,7 @@ class _VLMBatchAdapter:
         row_sampler=None,
         prompt_token_count=0,
     ) -> Iterator[GenerationEvent]:
-        """Report the chunk's rows. ``prompt_token_count`` is what it prefilled,"""
+        """Report the chunk's rows, charging ``prompt_token_count`` to each."""
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         pending = {
             uid: _PendingResult(
@@ -2466,12 +2546,18 @@ class _VLMBatchSession:
                 "generate it with generate_batch or stream_batch."
             )
         input_ids, prompt_kwargs = self._prepare(request)
+        row_processors = adapter._row_logits_processors([request])
         token_ids = input_ids.tolist()
+        insert_kwargs = {
+            "prompt_kwargs": adapter._split_prompt_kwargs(prompt_kwargs, 1),
+        }
+        if row_processors is not None:
+            insert_kwargs["logits_processors"] = row_processors
         try:
             uids = self.generator.insert(
                 token_ids,
                 [int(request.max_tokens or defaults.max_tokens)],
-                prompt_kwargs = adapter._split_prompt_kwargs(prompt_kwargs, 1),
+                **insert_kwargs,
             )
         except BaseException:
             self.usable = False
@@ -2513,16 +2599,13 @@ class _VLMBatchSession:
         return row
 
     def cancel(self, row: int) -> bool:
-        """Withdraw a row. False if it was never added, has already ended, or the"""
         return self._take_back(row) is not None
 
     def withdraw(self, row: int) -> GenerationResult | None:
-        """Withdraw a row, answering with what it managed."""
         state = self._take_back(row)
         return None if state is None else _cancelled_result(self.tokenizer, state)
 
     def _take_back(self, row: int) -> "_PendingResult | None":
-        """Take a row out of the batch, answering with what it was holding."""
         uid = self._uid_of.get(row)
         if uid is None or uid not in self._pending:
             return None
@@ -2538,7 +2621,6 @@ class _VLMBatchSession:
         return state
 
     def step(self) -> Iterator[GenerationEvent]:
-        """One decode step's worth of events, or none while no row is in flight."""
         if not self._pending:
             return
         try:
@@ -2574,7 +2656,6 @@ class _VLMBatchSession:
             self._stack.close()
 
     def _prepare(self, request: GenerationRequest):
-        """One request's token ids and the embeddings it is admitted with."""
 
         adapter = self.adapter
         request = adapter._decode_image(request)
@@ -2630,7 +2711,6 @@ class _VLMBatchSession:
         return input_ids, prepared
 
     def _open(self):
-        """The batch, built for the whole session."""
 
         adapter = self.adapter
         defaults = adapter.defaults
@@ -2653,14 +2733,12 @@ class _VLMBatchSession:
         return generator
 
     def _withdraw(self, uid: int) -> bool:
-        """Hand a row back, and say whether the batch took it."""
 
         if self.adapter.cancel is None:
             return False
         return self.adapter.cancel(self.generator, uid) is not False
 
     def _retire(self, uid: int):
-        """Let a row go, once the batch can no longer draw it."""
 
         row = self._row_of.pop(uid, None)
         self._pending.pop(uid, None)
@@ -2699,7 +2777,7 @@ class _VLMBatchSession:
 
 
 def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
-    """What a stream settles before it takes anything: the request it was asked"""
+    """What a stream settles before it takes anything: vision or not, and the adapter."""
     if defaults.stop_strings:
         raise ValueError(
             "BatchStream cannot apply stop_strings: they cut on token "
@@ -2729,7 +2807,7 @@ def stream_unavailable_reason(
     *,
     defaults: GenerationDefaults | None = None,
 ) -> str | None:
-    """Why ``BatchStream`` would refuse this model here, or None if nothing here"""
+    """Why ``BatchStream`` would refuse this model, or None. Asked before committing."""
     if defaults is None:
         defaults = GenerationDefaults()
     if not isinstance(defaults, GenerationDefaults):
@@ -2743,7 +2821,14 @@ def stream_unavailable_reason(
 
 
 class BatchStream:
-    """A batch left open: rows join and leave while the batch decodes."""
+    """A batch left open: rows join and leave while the batch decodes.
+
+    A row joins immediately, but which admitted row prefills next is the underlying
+    generator's decision, not this one's. mlx-lm takes them in arrival order; mlx-vlm
+    sorts its unprocessed prompts shortest-first on every insert, so a long vision
+    prompt waits behind shorter ones that arrived after it. Rows already decoding are
+    unaffected either way.
+    """
 
     def __init__(
         self,
@@ -2792,22 +2877,21 @@ class BatchStream:
 
     @property
     def rows_in_flight(self) -> int:
-        """Rows added and not yet finished or cancelled."""
         return 0 if self._session is None else self._session.rows_in_flight
 
     def add(self, request: GenerationRequest) -> int:
-        """Admit one request, and answer with the row number reporting it."""
         session = self._require_open()
         validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
         (validated,) = validate([request], session.adapter.defaults)
         return session.add(validated)
 
     def cancel(self, row: int) -> bool:
-        """Withdraw a row, answering whether it is gone."""
         return self._require_open().cancel(row)
 
     def withdraw(self, row: int) -> GenerationResult | None:
-        """The same, answering with what the row managed rather than whether it"""
+        """The same, answering with what the row managed rather than whether it was
+        still there to withdraw.
+        """
         return self._require_open().withdraw(row)
 
     def step(self) -> list[GenerationEvent]:
@@ -2985,6 +3069,7 @@ __all__ = [
     "fast_generate",
     "generate_batch",
     "generation_mode",
+    "row_logits_processors_unavailable_reason",
     "stream_batch",
     "stream_unavailable_reason",
 ]
