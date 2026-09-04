@@ -325,6 +325,11 @@ def _validate_text_requests(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
             )
+    _validate_text_defaults(defaults)
+    return validated
+
+
+def _validate_text_defaults(defaults: GenerationDefaults) -> None:
     refused_kv = [
         name for name in _KV_QUANT_CONTROLS if getattr(defaults, name) is not None
     ]
@@ -334,7 +339,6 @@ def _validate_text_requests(
             f"mlx-lm text path (installed: {_installed_mlx_lm_version()}); "
             "omit these controls."
         )
-    return validated
 
 
 def _kv_quant_options(defaults: GenerationDefaults) -> dict:
@@ -499,6 +503,11 @@ def _validate_vlm_requests(
         if isinstance(request.image, os.PathLike):
             # mlx-vlm's loader opens str paths only.
             validated[index] = replace(request, image=os.fspath(request.image))
+    _validate_vlm_defaults(defaults)
+    return validated
+
+
+def _validate_vlm_defaults(defaults: GenerationDefaults) -> None:
     if defaults.prefill_batch_size > defaults.completion_batch_size:
         # An inverted pair never admits anything on mlx-vlm, so generation would
         # hang. mlx-lm normalizes the two, so this is vision-specific.
@@ -522,7 +531,6 @@ def _validate_vlm_requests(
             f"{_installed_mlx_vlm_version()} exposes no KV-window control on "
             "its batch generator. Omit it, or use model.generate."
         )
-    return validated
 
 
 def _api_shape_error(details: str) -> RuntimeError:
@@ -2910,15 +2918,12 @@ class _VLMBatchSession:
 def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
     """What a stream settles before it takes anything: vision or not, and the adapter."""
     if bool(getattr(model, "_is_vlm_model", False)):
-        refused = _vlm_kv_controls_refused(defaults)
-        if refused:
-            raise ValueError(
-                f"{' and '.join(refused)} would be dropped rather than applied by "
-                f"{_installed_mlx_vlm_version()}'s batch generator; omit these controls."
-            )
+        _validate_vlm_defaults(defaults)
         gap = _vlm_quantized_cache_gap(model, defaults)
         if gap is not None:
             raise ValueError(gap)
+    else:
+        _validate_text_defaults(defaults)
     if defaults.stop_strings:
         raise ValueError(
             "BatchStream cannot apply stop_strings: they cut on token "

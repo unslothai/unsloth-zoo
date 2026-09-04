@@ -1509,6 +1509,11 @@ def test_stream_batch_checks_the_defaults_type_before_reading_stop_strings():
                      defaults = GenerationDefaults(stop_strings = ("X",)))
 
 
+def test_the_preflight_refuses_defaults_every_add_would():
+    from unsloth_zoo.mlx.generate import stream_unavailable_reason
+    assert all(m in stream_unavailable_reason(types.SimpleNamespace(**model), object(), defaults = GenerationDefaults(**kw)) for model, kw, m in (({}, {"kv_bits": 8}, "not forwarded"), ({"_is_vlm_model": True, "language_model": object()}, {"max_kv_size": 64}, "max_kv_size"), ({"_is_vlm_model": True, "language_model": object()}, {"prefill_batch_size": 4, "completion_batch_size": 2}, "must not exceed")))  # noqa: E501
+
+
 def test_a_cache_with_model_specific_state_refuses_a_quantized_batch_before_it_starts():
     from unsloth_zoo.mlx.generate import stream_unavailable_reason
 
