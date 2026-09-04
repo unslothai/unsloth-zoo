@@ -2473,8 +2473,10 @@ def load_vllm(
     if "vllm_version" not in globals():
         raise ImportError(
             "vLLM is required for `load_vllm`/SyntheticDataKit/`fast_inference=True` "
-            "but it is not installed. Install it with `pip install vllm` (CUDA only; "
-            "no wheel exists for arm64/aarch64 as of this writing)."
+            "but it was not installed when unsloth_zoo was imported. Install it with "
+            "`pip install vllm` (CUDA only; no wheel exists for arm64/aarch64 as of "
+            "this writing) and then RESTART the runtime or kernel: this module binds "
+            "its vLLM state at import, so installing into a live session is not enough."
         )
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -2672,13 +2674,19 @@ def load_vllm(
     if _clear_flashinfer_env_on_hip():
         pass
     elif _no_flashinfer:
-        # Skipping our own setup is not enough for a pre-set opt-out: an installed
-        # FlashInfer stays importable, so vLLM selects it itself (the Blackwell default)
-        # and hits the very JIT failure the opt-out exists to avoid.
+        # Clear a FORCED selection whether or not the package is here, the way
+        # _clear_flashinfer_env_on_hip already does for ROCm. An inherited
+        # VLLM_USE_FLASHINFER_SAMPLER=1 sends vLLM's TopKTopPSampler into a bare
+        # `from flashinfer import ...` with no try/except, so an absent FlashInfer is a
+        # ModuleNotFoundError rather than a fallback.
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+            del os.environ["VLLM_ATTENTION_BACKEND"]
+        # Only the import blocker needs the package present. Skipping our own setup is
+        # not enough for a pre-set opt-out: an installed FlashInfer stays importable, so
+        # vLLM selects it itself (the Blackwell default) and hits the very JIT failure
+        # the opt-out exists to avoid.
         if importlib.util.find_spec("flashinfer") is not None:
-            os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
-            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                del os.environ["VLLM_ATTENTION_BACKEND"]
             _block_flashinfer_import()
     elif importlib.util.find_spec("flashinfer"):
         # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
@@ -2712,9 +2720,10 @@ def load_vllm(
                 f"  Then set UNSLOTH_VLLM_NO_FLASHINFER=0 to use FlashInfer again in this session.\n"
                 f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
             )
-            # Env vars alone do not work: vllm 0.19.1 ignores VLLM_ATTENTION_BACKEND and
-            # still picks FLASHINFER on sm_100/sm_120. Blocking the import makes
-            # get_attn_backend_cls's own try/except pick FLASH_ATTN instead.
+            # Env vars alone do not work: vLLM dropped VLLM_ATTENTION_BACKEND in 0.13.0
+            # for --attention-backend / AttentionConfig, so on 0.13+ the del below is a
+            # no-op and vLLM still picks FLASHINFER on sm_100/sm_120. Blocking the
+            # import makes get_attn_backend_cls's own try/except pick FLASH_ATTN.
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
@@ -2748,6 +2757,13 @@ def load_vllm(
             else:
                 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+    else:
+        # No opt-out, not ROCm, and FlashInfer is simply not installed. An inherited
+        # forced selection still has to go, for the same reason as the opt-out arm
+        # above: vLLM's TopKTopPSampler imports flashinfer unguarded.
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+            del os.environ["VLLM_ATTENTION_BACKEND"]
     pass
 
     # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0

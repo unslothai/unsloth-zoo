@@ -132,11 +132,84 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
     assert 'os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"' in branch, branch
 
 
-def test_the_opt_out_branch_is_guarded_on_flashinfer_being_installed():
+def _flashinfer_chain():
+    """The `if _clear_flashinfer_env_on_hip() / elif _no_flashinfer / elif find_spec`
+    chain in load_vllm, as AST. Structure, not substrings: which statements sit inside
+    the find_spec guard is the whole question here."""
+    import ast
     import inspect
+    import textwrap
 
-    source = inspect.getsource(vllm_utils.load_vllm)
-    optout = source.find("elif _no_flashinfer:")
-    probe = source.find('elif importlib.util.find_spec("flashinfer"):')
-    branch = source[optout:probe]
-    assert 'find_spec("flashinfer") is not None' in branch, branch
+    tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and getattr(node.test.func, "id", "") == "_clear_flashinfer_env_on_hip"
+        ):
+            return node
+    raise AssertionError("the FlashInfer branch chain is gone")
+
+
+def _clears_forced_selection(body):
+    """True when this statement list writes VLLM_USE_FLASHINFER_SAMPLER=0 itself,
+    rather than somewhere nested inside a guard."""
+    import ast
+
+    for stmt in body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        for target in stmt.targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and getattr(target.value, "attr", "") == "environ"
+                and getattr(target.slice, "value", "") == "VLLM_USE_FLASHINFER_SAMPLER"
+                and getattr(stmt.value, "value", "") == "0"
+            ):
+                return True
+    return False
+
+
+def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
+    """A forced selection has to be cleared whether or not FlashInfer is installed:
+    vLLM's TopKTopPSampler does a bare `from flashinfer import ...` with no try/except,
+    so an inherited VLLM_USE_FLASHINFER_SAMPLER=1 with the package absent is a
+    ModuleNotFoundError, not a fallback. _clear_flashinfer_env_on_hip already answers
+    this the same way for ROCm."""
+    import ast
+
+    node = _flashinfer_chain()
+    optout = node.orelse[0]
+    assert isinstance(optout, ast.If) and getattr(optout.test, "id", "") == "_no_flashinfer"
+
+    assert _clears_forced_selection(optout.body), (
+        "the env cleanup is nested under the package-presence check again"
+    )
+
+    guards = [
+        stmt
+        for stmt in optout.body
+        if isinstance(stmt, ast.If) and "find_spec" in ast.dump(stmt.test)
+    ]
+    assert len(guards) == 1, ast.dump(optout)
+    assert not _clears_forced_selection(guards[0].body)
+    calls = [
+        getattr(getattr(stmt, "value", None), "func", None)
+        for stmt in guards[0].body
+        if isinstance(stmt, ast.Expr)
+    ]
+    assert [getattr(c, "id", "") for c in calls] == ["_block_flashinfer_import"], ast.dump(
+        guards[0]
+    )
+
+
+def test_the_default_path_clears_a_forced_selection_too():
+    """No opt-out, not ROCm, FlashInfer simply absent: the commoner shape, and the same
+    unguarded import in vLLM is waiting at the end of it."""
+    import ast
+
+    node = _flashinfer_chain()
+    while node.orelse and len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+        node = node.orelse[0]
+    assert node.orelse, "the chain has no final else, so an absent FlashInfer clears nothing"
+    assert _clears_forced_selection(node.orelse)
