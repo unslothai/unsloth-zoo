@@ -137,6 +137,9 @@ jobs:
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
+              # Per-lane generated-source dir: else 3.10 imports a cache 3.13 wrote.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
@@ -715,6 +718,10 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
+              # Per-lane generated-source dir, absolute (compiler.py puts it on sys.path):
+              # concurrent lanes sharing one checkout rewrite the default cache under a reader.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 set -x &&
@@ -772,6 +779,7 @@ jobs:
                   tests/test_upstream_source_patterns.py \
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
+                  tests/test_compiler_getsource_tokenerror.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
