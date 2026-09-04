@@ -99,15 +99,24 @@ def _getsource_guards(call: str) -> list:
     while catching strictly more. A union per `try` rather than a set per handler,
     because `except OSError:` beside `except TypeError:` guards the call exactly as
     well as the single tuple does.
+
+    The nearest enclosing `try` only. An outer `try` unparses its whole body, so it
+    contains the call too, but a handler out there for something unrelated is not the
+    thing guarding this call and must not be asked to catch what this one catches.
     """
-    guards = []
-    for node in ast.walk(ast.parse(SRC)):
-        if not isinstance(node, ast.Try):
-            continue
-        if not any(call in ast.unparse(stmt) for stmt in node.body):
-            continue
-        guards.append(set().union(set(), *(_caught_names(h) for h in node.handlers)))
-    return guards
+    matching = [
+        node for node in ast.walk(ast.parse(SRC))
+        if isinstance(node, ast.Try)
+        and any(call in ast.unparse(stmt) for stmt in node.body)
+    ]
+    return [
+        set().union(set(), *(_caught_names(h) for h in node.handlers))
+        for node in matching
+        if not any(
+            other is not node and any(d is other for d in ast.walk(node))
+            for other in matching
+        )
+    ]
 
 
 # ---- the guard ------------------------------------------------------------
