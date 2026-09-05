@@ -59,8 +59,7 @@ def test_matches_full_sdpa_fp32(S, w, H, Hkv, d):
 
 
 def test_batch_general_matches_full_sdpa_fp32():
-    # The banded core is batch-general (the router drops the batch == 1 gate), so
-    # a B > 1 unpadded band must match full SDPA + band mask on every element.
+    # The banded core is batch-general (the router drops the batch == 1 gate).
     torch.manual_seed(2)
     B, S, w, H, Hkv, d = 3, 300, 64, 8, 2, 32
     q = torch.randn(B, H, S, d)
@@ -92,9 +91,7 @@ def test_gradients_match_fp32():
 
 
 def test_mask_is_plain_band_defers_while_compiling(monkeypatch):
-    # Under torch.compile the .item() verdict and the tensor-attribute write are
-    # untraceable, so while compiling the probe must return False and route to the
-    # original SDPA regardless of the mask contents (here a genuine band).
+    # Under torch.compile the .item() verdict is untraceable, so the probe defers.
     S, w = 128, 32
     band = _band_mask_full(S, w)[None, None].clone()
     assert _mask_is_plain_band(band.clone(), S, w)          # eager: a real band is accepted
@@ -103,8 +100,7 @@ def test_mask_is_plain_band_defers_while_compiling(monkeypatch):
 
 
 def test_block_mask_cache_is_bounded(monkeypatch):
-    # Varying sequence lengths yield many distinct (w, nb) keys; the FIFO bound
-    # must keep _MASK_CACHE from growing without limit (cap 8).
+    # Many distinct (w, nb) keys: the FIFO bound caps _MASK_CACHE at 8.
     monkeypatch.setattr(gba, "_MASK_CACHE", {})
     w = 8
     for nb in range(1, 40):
@@ -119,7 +115,6 @@ def test_block_mask_block0_masks_phantom_prev():
     assert m.shape == (nb, 1, w, 2 * w)
     # Block 0 must not attend the (padded) previous block.
     assert not m[0, 0, :, :w].any()
-    # Later blocks follow the same local band for every block index.
     assert torch.equal(m[1], m[2])
 
 
@@ -135,8 +130,8 @@ def test_mask_is_plain_band_detection():
 
 
 def test_mask_is_plain_band_rejects_non_probe_violation():
-    # A band broken only at an interior row (a packed-sequence boundary) must be
-    # rejected: the verifier checks every row, not a sampled subset.
+    # A band broken at an interior row (a packed-sequence boundary) must be rejected:
+    # the verifier checks every row, not a sampled subset.
     S, w = 128, 32
     packed = _band_mask_full(S, w)[None, None].clone()
     packed[..., 50, 40] = False    # drop an in-band key at a non-probe row
@@ -144,8 +139,7 @@ def test_mask_is_plain_band_rejects_non_probe_violation():
 
 
 def test_mask_is_plain_band_rejects_per_head_mask():
-    # A 4D mask with a head dim > 1 cannot be honoured by the single block mask
-    # applied to every head, so it must be rejected even if head 0 is a band.
+    # A head dim > 1 cannot be honoured by one block mask shared across heads.
     S, w = 128, 32
     band = _band_mask_full(S, w)
     per_head = band[None, None].expand(1, 4, S, S).clone()   # (1, 4, S, S)
@@ -154,9 +148,7 @@ def test_mask_is_plain_band_rejects_per_head_mask():
 
 
 def test_mask_is_plain_band_rejects_per_batch_padding():
-    # The probe validates every batch element, not just batch 0: a batch whose
-    # element 0 is a full band but a later element carries padding must be
-    # rejected so the fast path never runs on an unhonoured padded sample.
+    # Every batch element is validated, so the fast path never runs on a padded one.
     S, w = 128, 32
     band = _band_mask_full(S, w)                              # (S, S)
     batched = band[None, None].expand(1, 1, S, S).clone()
@@ -168,8 +160,7 @@ def test_mask_is_plain_band_rejects_per_batch_padding():
 
 
 def test_mask_is_plain_band_rejects_inband_bias():
-    # A finite in-band bias (soft penalty) must be rejected: the banded path
-    # swaps in a boolean block mask and would silently drop the bias.
+    # A finite in-band bias must be rejected: the boolean block mask would drop it.
     S, w = 128, 32
     band = _band_mask_full(S, w)
     biased = torch.where(band, -5.0, float("-inf")).to(torch.float32)[None, None]
@@ -226,9 +217,8 @@ class Gemma4SlidingFake:
 
 @pytest.mark.parametrize("with_mask", [False, True])
 def test_router_falls_back_to_banded_without_flash(monkeypatch, with_mask):
-    # With flash-attn forced unavailable the unified wrapper must route a sliding
-    # Gemma-4 plain-band case through _banded_sdpa_core (never the wrapped SDPA)
-    # and match full SDPA + band mask. Runs on CPU regardless of flash-attn.
+    # Without flash-attn a sliding Gemma-4 plain band must route through
+    # _banded_sdpa_core, never the wrapped SDPA. Runs on CPU regardless of flash-attn.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setattr(gf, "_HAS_FA2", False)
@@ -272,8 +262,7 @@ def test_router_falls_back_to_banded_without_flash(monkeypatch, with_mask):
 
 
 def test_router_force_banded_env_skips_flash(monkeypatch):
-    # UNSLOTH_BANDED_SDPA=1 must force the banded kernel even when flash-attn is
-    # importable: the flash function must never be called.
+    # UNSLOTH_BANDED_SDPA=1 forces the banded kernel even when flash-attn imports.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     def _flash_should_not_run(*a, **kw):
@@ -312,8 +301,7 @@ def test_router_force_banded_env_skips_flash(monkeypatch):
 
 
 def test_router_kill_switch_defers_to_sdpa(monkeypatch):
-    # UNSLOTH_GEMMA4_FLASH_SLIDING=0 must disable both fast kernels and defer to
-    # the wrapped SDPA, neither FA2 nor banded may engage.
+    # UNSLOTH_GEMMA4_FLASH_SLIDING=0 disables both kernels: no FA2, no banded.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setattr(gf, "_HAS_FA2", False)

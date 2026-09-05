@@ -94,7 +94,6 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
         GenerationRequest(prompt="Two plus two equals", max_tokens=8),
     ]
     defaults = GenerationDefaults()
-    # The cache patch must be installed before any decoding runs.
     order = []
     real_install = generate_module._install_arrays_cache_advance_fix
     real_adapter_generate = generate_module._TextBatchAdapter.generate
@@ -186,8 +185,6 @@ def test_compiled_training_state_survives_generation():
         # Sampling consumes the global RNG stream, so the same seed reproduces.
         result, repeat = [types.SimpleNamespace(token_ids=sample(11))], sample(11)
         assert result[0].token_ids and repeat == result[0].token_ids
-        # Parameters untouched, block runs in eval with the checkpoint patch
-        # installed, flags restored, and the compiled step keeps training.
         assert snapshot() == state_after_train
         assert (False, True) in model.layers[0].seen_states
         assert hasattr(_CompileBlock, "_orig_call")
@@ -223,7 +220,6 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     results = generate_batch(model, processor, requests, defaults=defaults)
     assert len(results) == 3
     for result in results:
-        # The RL contract: ids come from sampled events, logprobs align to them.
         assert result.token_ids
         assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
         assert result.finish_reason in ("stop", "length")
@@ -234,16 +230,12 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     events = [event for event in stream_generate(
         model, processor, requests[0].prompt, image=[requests[0].image],
         max_tokens=4, sampler=make_sampler(temp=0.0))]
-    # The terminal event contributes text only: its token is the stopping token,
-    # or a repeat of the last body token when the budget ran out.
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
     assert results[0].logprobs == pytest.approx(
         [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
     assert results[0].text == "".join(event.text for event in events)
-    # Derived from the stream, not our own rule: fewer body events than the
-    # budget means it stopped early.
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
     # Chunking must not pair a prompt with an earlier chunk's embeddings.
@@ -253,7 +245,6 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     # Concurrent sequences must not share a detokenizer buffer, so text must
     # match too, not just ids.
     assert [item.text for item in chunked] == [item.text for item in results]
-    # Independent buffers: no result may carry another's decoded text appended.
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
 
 
@@ -274,13 +265,10 @@ def test_vlm_stop_strings_cut_generation_through_the_public_path():
     free = generate_batch(model, processor, [request],
                           defaults=GenerationDefaults(max_tokens=12))[0]
     assert len(free.text) > 1
-    # The whole public path must carry stop strings, not just the event loop.
     stop = free.text[1]
     stopped = generate_batch(model, processor, [request], defaults=GenerationDefaults(
         max_tokens=12, stop_strings=(stop,)))[0]
     assert (stopped.finish_reason, stopped.stop_match) == ("stop_string", stop)
-    # Trimming is token-aligned: whole tokens before the match survive, possibly
-    # none, and never the stop string itself.
     assert free.text.startswith(stopped.text) and stop not in stopped.text
     assert len(stopped.token_ids) < len(free.token_ids)
 
@@ -312,7 +300,6 @@ def test_arrays_cache_advance_patch_only_replaces_the_body_it_reproduces():
                 self.left_padding += N
 
     class Decrementing(Incrementing):
-        # A matcher that reached for an instance trips this instead of passing quietly.
         def __init__(self):
             raise AssertionError("candidacy must not instantiate the candidate")
 
@@ -381,7 +368,6 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     assert (batch.lengths.tolist(), batch.left_padding.tolist()) == ([2], [-1])
     batch.advance(3)
     batch.prepare(lengths=[7])
-    # Re-arming a field replaces it outright, deferred count included.
     assert batch.lengths.tolist() == [7]
     batch.finalize()
     batch.advance(5)
@@ -394,7 +380,6 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     legacy.advance(1)
     assert legacy.left_padding.tolist() == [1] and legacy.lengths is None
 
-    # extend() concatenates two caches carrying different deferred counts.
     left = ArraysCache(1)
     left[0] = mx.zeros((2, 4))
     left.left_padding, left.lengths = mx.array([0, 4]), mx.array([6, 9])

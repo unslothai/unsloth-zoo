@@ -166,8 +166,7 @@ def test_convert_to_gguf_reconciles_mtp_config_to_index(llama_cpp, tmp_path, has
     updated = json.loads(config_path.read_text(encoding = "utf-8"))
     assert "unsloth_fixed_mtp" not in updated
     assert "unsloth_fixed_mtp" not in updated["text_config"]
-    # The declaration survives either way: kept as-is with MTP tensors, and kept
-    # because `--no-mtp` carries the intent without them.
+    # The declaration survives either way: `--no-mtp` carries the intent.
     assert "mtp_num_hidden_layers" in updated
     assert "mtp_num_hidden_layers" in updated["text_config"]
     command, = _read_converter_commands(tmp_path)
@@ -554,8 +553,7 @@ def test_convert_to_gguf_retries_with_no_mtp_after_the_inference_assertion(llama
         ("  File \"qwen.py\", line 303\n    assert self.opt_num_mtp_layers != 0\nAssertionError\n", True),
         ("AssertionError: something else entirely\n", False),
         ("INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n", False),
-        # Both words, different lines: a recognised head that then failed for
-        # another reason keeps it.
+        # Both words, different lines: a recognised head that failed otherwise.
         (
             "INFO:hf-to-gguf:opt_num_mtp_layers resolved to 1\n"
             "AssertionError: tensor shape mismatch\n",
@@ -618,8 +616,7 @@ def test_convert_to_gguf_refuses_to_retry_when_the_checkpoint_has_mtp_tensors(ll
     carry a head must surface the disagreement, not export a reduced GGUF."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    # No declaration, the shape that reaches the assertion, but the head is
-    # there, indexed past the trunk.
+    # No declaration, but the head is there, indexed past the trunk.
     (model_dir / "config.json").write_text(
         json.dumps(
             {

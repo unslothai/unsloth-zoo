@@ -199,17 +199,16 @@ def test_enrich_does_not_raise_on_module_with_none_tensors():
 
 
 def test_infer_rank_rejects_one_dimensional_lora_b():
-    # A bare 1D lora_b means the pair is half-built; rank inference would
-    # otherwise read shape[-1] from lora_a and persist nonsense metadata.
+    # Half-built pair: without the guard the raw-array branch returns lora_a's
+    # shape[-1] and persists nonsense rank metadata.
     mlx_utils = _load_utils()
     bad = _FakeLoRAModule((512, 4), (4,))
     assert mlx_utils._infer_mlx_lora_rank(bad) is None
 
 
 def test_normalize_mlx_lora_module_paths_handles_string_input():
-    # Hand-authored adapter_config.json files sometimes store a single
-    # path as a bare string; the loader must convert it to a single-
-    # element list rather than iterating its characters.
+    # Hand-authored adapter_config.json files store a single path as a bare
+    # string; it must be wrapped, not iterated character by character.
     _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
 
@@ -222,17 +221,14 @@ def test_normalize_mlx_lora_module_paths_handles_string_input():
 
 
 def test_infer_rank_rejects_switch_lora_b_without_expert_prefix():
-    # MoE/Switch lora_a (num_experts, rank, in_dims) paired with bare 2D
-    # lora_b (out_dims, rank) is malformed; the helper must reject it
-    # instead of returning a plausible rank.
+    # MoE/Switch lora_a (num_experts, rank, in_dims) paired with a bare 2D
+    # lora_b (out_dims, rank) is malformed, not a plausible rank.
     mlx_utils = _load_utils()
     bad = _FakeLoRAModule((8, 4, 512), (512, 4))
     assert mlx_utils._infer_mlx_lora_rank(bad) is None
 
 
 def test_enrich_normalizes_string_explicit_path():
-    # A caller-supplied single-string path must be normalized to a list so
-    # the loader does not iterate it character-by-character.
     mlx_utils = _load_utils()
     model = _FakeModel([
         ("layers.0.q_proj", _FakeLoRAModule((512, 4), (4, 512), scale=2.0,
@@ -313,9 +309,6 @@ def test_trainer_metadata_loop_returns_none_when_no_lora_modules():
 
 
 def test_trainer_metadata_loop_returns_none_when_rank_inference_fails():
-    # Module has lora_a/lora_b but _infer_mlx_lora_rank returns None
-    # (e.g. 1-D lora_b). Trainer must not persist the old placeholder
-    # rank=8 / scale=1.0 / dropout=0.0 defaults.
     one_d_lora = _FakeLoRAModule(lora_a=(8, 4), lora_b=(8,))
     model = _FakeModel([("layers.0.q_proj", one_d_lora)])
     assert _trainer_loop_metadata(model) == (None, None, None)
@@ -348,13 +341,12 @@ def test_trainer_metadata_loop_coerces_mxarray_scale_safely():
     _, scale_wide,   _ = _trainer_loop_metadata(_FakeModel([("q", m_wide)]))
 
     assert scale_zero_d == 2.5
-    assert scale_wide == 1.0  # safe fallback, not a crash
+    assert scale_wide == 1.0
 
 
 def _build_trainer_adapter_dict(rank, scale, dropout, num_layers, hf_repo=""):
-    # Mirror the dict-building gate in MLXTrainer.save_model: keys are only
-    # included when their source values are valid, so reload sees no
-    # placeholder sentinels.
+    # Mirrors the dict-building gate in MLXTrainer.save_model: keys are only
+    # included when their source values are valid, so reload sees no sentinels.
     cfg = {
         "fine_tune_type": "lora",
         "peft_type": "LORA",
@@ -395,9 +387,7 @@ def test_trainer_adapter_dict_omits_rank_when_inference_failed():
 
 
 def test_normalize_mlx_lora_module_paths_handles_dict_input():
-    # Older / hand-authored configs sometimes group paths by tower.
-    # Dict input must flatten into a list, not silently return [].
-    _load_utils()  # installs mlx torch simulation so loader imports cleanly
+    _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
 
     grouped = {"language": ["layers.0.q_proj"], "vision": ["vision.proj"]}
@@ -406,8 +396,8 @@ def test_normalize_mlx_lora_module_paths_handles_dict_input():
 
 
 def test_normalize_mlx_lora_module_paths_handles_pathlike_elements():
-    # pathlib.Path elements in the saved list must coerce via os.fspath,
-    # not be silently dropped by the isinstance(p, str) gate.
+    # pathlib.Path elements must coerce via os.fspath, not be dropped by the
+    # isinstance(p, str) gate.
     import pathlib
     _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
@@ -419,7 +409,6 @@ def test_normalize_mlx_lora_module_paths_handles_pathlike_elements():
 
 
 def test_normalize_mlx_lora_module_paths_handles_bare_pathlike():
-    # A bare pathlib.Path (not wrapped in a list) should also coerce.
     import pathlib
     _load_utils()
     from unsloth_zoo.mlx.loader import _normalize_mlx_lora_module_paths
@@ -431,8 +420,7 @@ def test_normalize_mlx_lora_module_paths_handles_bare_pathlike():
 
 
 def test_enrich_mlx_adapter_config_normalizes_dict_explicit_paths():
-    # Save-side path normalization must accept the same shapes the load
-    # side does: dict-grouped paths, pathlib.Path elements, set, etc.
+    # Save-side normalization must accept the shapes the load side does.
     # Otherwise vision/projector LoRA topology is silently erased before
     # it reaches adapter_config.json.
     mlx_utils = _load_utils()
@@ -497,10 +485,8 @@ def test_enrich_mlx_adapter_config_coerces_mxarray_scale_without_aborting():
         _FakeModel([("vision.q_proj", m_zerod)]), {},
     )
 
-    # Both must complete with metadata and module-path list, not silently
-    # abandon after the float() raise.
     assert cfg_wide.get("unsloth_mlx_lora_module_paths") == ["vision.q_proj"]
-    assert cfg_wide.get("scale") == 1.0  # safe fallback
+    assert cfg_wide.get("scale") == 1.0
     assert cfg_wide.get("rank") == 4
     assert cfg_zd.get("unsloth_mlx_lora_module_paths") == ["vision.q_proj"]
     assert cfg_zd.get("scale") == 0.5

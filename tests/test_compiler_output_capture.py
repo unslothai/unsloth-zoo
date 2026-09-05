@@ -1,5 +1,4 @@
-# Tests for the transformers v5 output capture helpers in unsloth_zoo.compiler:
-# patch_output_capture_targets and calls_output_capture_target.
+# Tests for the transformers v5 output capture helpers in unsloth_zoo.compiler.
 
 import types
 
@@ -80,7 +79,6 @@ def test_retargets_specs_to_replacement_classes():
     # Bare classes without a replacement stay untouched.
     assert flags["hidden_states"] is FakeDecoderLayer
 
-    # List and tuple specs keep their container type and are retargeted.
     assert isinstance(flags["attentions"], list)
     assert flags["attentions"][0].target_class is ReplacementAttention
     assert flags["attentions"][0].index == 1

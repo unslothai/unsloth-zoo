@@ -107,14 +107,12 @@ def test_text_override_detects_from_configured_template():
     override_markers = get_parts(override)
     assert native_markers != override_markers, (native_markers, override_markers)
 
-    # No override -> resolver leaves the tokenizer's own template in force.
     tok0 = _new_tok(); tok0.chat_template = CHATML
     tr0 = _Trainer(tok0, _Args(chat_template=None))
     resolved0 = T._resolve_response_mask_tokenizer(tok0)
     detect0 = T._resolve_autodetect_template_source(tr0, tok0, resolved0)
     assert get_parts(detect0) == native_markers
 
-    # Override set -> resolver applies it, so detection reflects the override.
     tok1 = _new_tok(); tok1.chat_template = CHATML
     tr1 = _Trainer(tok1, _Args(chat_template=INST))
     resolved1 = T._resolve_response_mask_tokenizer(tok1)
@@ -144,7 +142,6 @@ def test_vlm_processor_only_template_is_used_for_detection():
     assert detect is proc
     assert get_parts(detect) == expected
 
-    # And the full wrapper builds a mask function without raising.
     fn = T.train_on_responses_only(tr, return_function=True)
     assert callable(fn)
 
@@ -155,18 +152,16 @@ def test_vlm_override_aligns_with_who_applies_the_mask():
     trainer.processor when the trainer applies it to its own batches (return_function=False)."""
     T, get_parts = _load()
 
-    # trainer.processor renders ChatML; the caller overrides with an INST processor.
     trainer_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(CHATML))
     override_proc = _ProcessorOnly(_new_tok_none(), _new_tok_with(INST))
     tr = _Trainer(trainer_proc, _Args(), is_vlm=True, processor=trainer_proc)
     resolved = T._resolve_response_mask_tokenizer(override_proc)
 
-    # return_function=True: caller renders with the override -> honor it.
     detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=True)
     assert detect is override_proc
 
-    # return_function=False: trainer renders batches with trainer.processor -> detect from that,
-    # otherwise the mask is built for one template and applied to text from another.
+    # return_function=False: the trainer renders batches with trainer.processor, so detect
+    # from that, otherwise the mask is built for one template and applied to text from another.
     detect = T._resolve_autodetect_template_source(tr, override_proc, resolved, return_function=False)
     assert detect is trainer_proc
 
@@ -176,8 +171,8 @@ def test_explicit_markers_bypass_template_resolution():
     require a chat_template and must return a working mask function."""
     T, _ = _load()
     inner = _new_tok(); inner.chat_template = None
-    proc = _ProcessorOnly(inner, _new_tok())  # render tok irrelevant here
-    proc.chat_template = None                  # no template anywhere
+    proc = _ProcessorOnly(inner, _new_tok())
+    proc.chat_template = None
     tr = _Trainer(proc, _Args(), is_vlm=True, processor=proc)
     fn = T.train_on_responses_only(
         tr, instruction_part="[INST]", response_part="[/INST]",
@@ -259,7 +254,7 @@ def test_processor_template_preferred_over_inner_when_both_present():
     """When both the processor and its inner tokenizer carry a chat_template, detection must
     render with the processor's (what VLM batching uses), not the inner tokenizer's."""
     _, get_parts = _load()
-    proc = _ProcessorOnly(_new_tok_with(CHATML), _new_tok_with(INST))  # inner=ChatML, render=INST
+    proc = _ProcessorOnly(_new_tok_with(CHATML), _new_tok_with(INST))
     proc.tokenizer.chat_template = CHATML   # inner tokenizer ALSO has a (different) template
     assert get_parts(proc) == get_parts(_new_tok_with(INST))  # processor (INST) wins
 

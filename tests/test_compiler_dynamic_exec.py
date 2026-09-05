@@ -56,8 +56,7 @@ def _compile_disabled(monkeypatch):
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
 
 
-# Model types the zoo compiler drives end-to-end (from
-# unsloth_compile_transformers call sites and test_apply_fused_lm_head).
+# Model types the zoo compiler drives end-to-end (from its call sites).
 KNOWN_MODEL_TYPES = [
     "llama",
     "llama4",
@@ -115,9 +114,7 @@ def _load_modeling(model_type: str):
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present but raising on the way in: gemma3n's config imports
-        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
-        # drive either way, but say which.
+        # gemma3n's config imports ImageNetInfo from a timm.data that dropped it.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
@@ -164,9 +161,7 @@ def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
         pass
 
 
-# Per-rewriter tests against real transformers source. gemma3 is the
-# canonical driver: it exercises almost every rewriter path (RMSNorm,
-# sliding-window attn, RoPE, MoE routing, projector, ForConditionalGeneration).
+# gemma3 is the canonical driver: RMSNorm, sliding attn, RoPE, MoE, ForCondGen.
 
 
 @pytest.fixture(scope="module")
@@ -534,10 +529,8 @@ def test_replace_with_grouped_query_attention_inserts_enable_gqa():
     )
 
 
-# End-to-end: unsloth_compile_transformers(model_type=X) chains every
-# rewriter and emits unsloth_compiled_module_<type>.py to
-# unsloth_compiled_cache/ (see ``unsloth_zoo/compiler.py:66-67``
-# COMBINED_UNSLOTH_NAME). Drive per known model type, AST-parse the cache.
+# unsloth_compile_transformers(X) emits unsloth_compiled_module_<type>.py
+# (``unsloth_zoo/compiler.py:66-67``).
 
 
 def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
@@ -545,7 +538,6 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
 
-    # Clear __UNSLOTH_PATCHED__ so the pipeline rebuilds each time.
     try:
         mod = importlib.import_module(
             f"transformers.models.{model_type}.modeling_{model_type}",
@@ -556,9 +548,7 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present but raising on the way in: gemma3n's config imports
-        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
-        # drive either way, but say which.
+        # gemma3n's config imports ImageNetInfo from a timm.data that dropped it.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
@@ -664,8 +654,8 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     )
 
 
-# AST validity of constant source blocks in compiler.py, exec()'d verbatim
-# by ``create_new_function`` (see ``unsloth_zoo/compiler.py:801-1126``).
+# Constant source blocks exec()'d verbatim by ``create_new_function``
+# (``unsloth_zoo/compiler.py:801-1126``).
 
 
 @pytest.mark.parametrize(
@@ -685,9 +675,7 @@ def test_compiler_constant_source_blocks_parse(const_name):
     block = getattr(compiler, const_name, None)
     if block is None:
         pytest.skip(f"{const_name} not present (renamed?)")
-    # replace_gradient_checkpointing template has LAYER / ARGS /
-    # MODULELIST_ITEM / $ placeholders substituted in the rewriter;
-    # substitute representative values here so the parser sees real source.
+    # The rewriter substitutes LAYER / ARGS / MODULELIST_ITEM / $; do the same.
     if const_name == "replace_gradient_checkpointing":
         block = (
             block.replace("LAYER", "layer")

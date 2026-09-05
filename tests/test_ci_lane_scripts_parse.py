@@ -109,13 +109,10 @@ def test_no_double_backslash_continuations(workflow: str, job: str, name: str, r
 
 
 # The twenty drift files the fused Core lane inherited from the three matrix cells it
-# replaced. Named rather than counted: the risk this guard exists for is a continuation
-# that silently DROPS files, and a name tells you which one went missing where a count
-# only tells you that one did. Adding a drift file is routine and must not fail here --
-# an exact count made #1114 (which legitimately added the mxfp4 load-path file) turn this
-# guard red, so the fix for a real bug was blocked by the test meant to protect it.
-# Removing a file from the lane is the deliberate act: drop it from this set too, in the
-# same commit, and the reviewer sees the coverage shrink.
+# replaced. Named rather than counted: a name tells you which file a dropped
+# continuation lost. An exact count made #1114 (which legitimately added the mxfp4
+# load-path file) turn this guard red. Removing a file from the lane is the deliberate
+# act: drop it from this set in the same commit.
 _FUSED_CORE_LANE_REQUIRED = frozenset({
     "tests/test_compiler_dynamic_exec.py",
     "tests/test_compiler_rewriter_exhaustive.py",
@@ -152,7 +149,6 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
 
     body = run[run.index("-m pytest"):]
     body = body[: body.index("|| trc=$?")]
-    # Join the continuations the way the shell does, then read off what is left.
     joined = body.replace("\\\n", " ")
     files = re.findall(r"tests/\S+\.py", joined)
 
@@ -162,8 +158,8 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
         f"matrix cells it replaced each ran all of them, so dropping one silently "
         f"narrows upstream-drift coverage. Lane currently runs: {sorted(files)}"
     )
-    # A name repeated across continuations parses as two entries and would mask a drop
-    # from the set check above, which is order- and multiplicity-blind.
+    # A repeated name would mask a drop from the set check above, which is
+    # multiplicity-blind.
     duplicated = sorted({name for name in files if files.count(name) > 1})
     assert not duplicated, (
         f"the fused Core lane names {duplicated} more than once; pytest would collect "
@@ -175,15 +171,11 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
     )
 
 
-# A lane records its own exit status in the background, and that status is all the
-# job ever learns about it. The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`,
-# and a brace group reports only cmdN -- so every earlier failure was recorded as
-# rc=0, the "could not be built" guard never fired, and the job continued with a
-# half-built venv. A truncated mlx download surfaced two steps later as
-# ModuleNotFoundError, with the build step green.
-#
-# `set -e` inside the group does NOT help: it sits on the left of `|| rc=$?`, where
-# POSIX ignores errexit. `&&`-chaining does, so the first failure becomes rc.
+# The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`, and a brace group reports
+# only cmdN -- so every earlier failure was recorded as rc=0 and the job continued
+# with a half-built venv: a truncated mlx download surfaced two steps later as
+# ModuleNotFoundError, with the build step green. `set -e` inside the group does NOT
+# help: it sits on the left of `|| rc=$?`, where POSIX ignores errexit.
 
 def _capture_groups(run: str) -> list[str]:
     """Bodies of every `{ ... } > ... || rc=$?` status-capture group in a lane."""

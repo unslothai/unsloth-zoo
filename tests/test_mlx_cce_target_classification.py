@@ -8,10 +8,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # MLX CCE target-classification coverage on non-Apple-Silicon hosts via the
-# simulation shim. tests/test_mlx_runtime_cce_compile.py gates on real Metal
-# and skips under the shim, leaving the pure-Python validation, in-vocab
-# ignore_index precedence, and logit_softcap fallback paths uncovered on Linux
-# CI. This file fills those gaps.
+# simulation shim. tests/test_mlx_runtime_cce_compile.py gates on real Metal and
+# skips under the shim, leaving these paths uncovered on Linux CI.
 
 from __future__ import annotations
 
@@ -35,9 +33,7 @@ def _expected_valid_loss(vocab_size: int) -> float:
     return math.log(float(vocab_size))
 
 
-# ----------------------------------------------------------------------
 # Pure-Python validation: shape, length, zero-token mismatch
-# ----------------------------------------------------------------------
 
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
     import mlx.core as mx
@@ -133,9 +129,7 @@ def test_runtime_cce_chunk_plan_cache_canonicalizes_bounds_and_recreates():
     assert cache_info()["misses"] > misses_before
 
 
-# ----------------------------------------------------------------------
 # In-vocab ignore_index must take precedence over invalid classification
-# ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("ignore_index", [0, 5, 31])
 def test_in_vocab_ignore_index_zero_loss_not_nan(ignore_index):
@@ -188,9 +182,7 @@ def test_in_vocab_ignore_index_does_not_poison_other_rows():
     assert losses[3].item() == pytest.approx(_expected_valid_loss(vocab_size), rel=1e-5)
 
 
-# ----------------------------------------------------------------------
 # logit_softcap > 0 must preserve NaN poisoning for invalid labels
-# ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("bad_target", [-1, 32])
 def test_softcap_invalid_label_poisons_loss(bad_target):

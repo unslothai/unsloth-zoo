@@ -587,8 +587,6 @@ Path(sys.argv[1], f"rank{world.rank()}.json").write_text(json.dumps(payload))
         and "trainer_state.json" in rank["resume_adapter_only"]
         for rank in ranks
     ), [rank["resume_adapter_only"] for rank in ranks]
-    # A directory that is not adapter-shaped keeps the coordinated
-    # visibility message, which warm-start guidance would not fit.
     assert all(
         "not visible on every rank" in rank["resume_no_adapters"]
         and "FastMLXModel.from_pretrained" not in rank["resume_no_adapters"]
