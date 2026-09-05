@@ -54,6 +54,7 @@ from .compile import (
     normalize_mlx_patch_mode,
     trace_compile_application,
 )
+from .attention import install_quantized_attention
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -6819,6 +6820,12 @@ def _coerce_list_extra_special_tokens():
     PreTrainedTokenizerBase.__init__ = patched_init
 
 
+def _finish_load(model, tokenizer):
+    """The single exit from a load, so the patch installs after the runtimes the load imports."""
+    install_quantized_attention()
+    return model, tokenizer
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -7181,7 +7188,7 @@ class FastMLXModel:
             model._src_path = local_path
             model._unsloth_base_revision = revision
             model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
-            return model, tokenizer
+            return _finish_load(model, tokenizer)
 
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
@@ -7524,7 +7531,7 @@ class FastMLXModel:
                             "base_quantized_source"
                         )
                     _patch_mlx_saving(model, tokenizer)
-                    return model, tokenizer
+                    return _finish_load(model, tokenizer)
             except Exception as e:
                 # Preserve Unsloth-tagged Value/Import/RuntimeError so
                 # adapter-config failures aren't swallowed into a base-model
@@ -7827,7 +7834,7 @@ class FastMLXModel:
             _run_with_vlm_config_view(_patch_mlx_saving, model, public_target)
             if vlm_config_view_owner is not None:
                 vlm_config_view_owner.transfer_to(model)
-            return model, public_target
+            return _finish_load(model, public_target)
         else:
             # Text path via mlx-lm (original behavior)
             quant_state = _ensure_quantization_compatible(
@@ -7932,7 +7939,7 @@ class FastMLXModel:
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
-            return model, tokenizer
+            return _finish_load(model, tokenizer)
 
     @staticmethod
     def get_peft_model(

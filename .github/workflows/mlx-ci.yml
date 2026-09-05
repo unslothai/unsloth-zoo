@@ -171,6 +171,12 @@ jobs:
         # trimming, the audio fallback contract, and request validation.
         run: python -m pytest tests/test_mlx_generate.py -v -rs
 
+      - name: tests/test_mlx_attention_metal.py
+        # Quantized-KV attention routed to the fused kernel: the tie against the
+        # runtime's own path, agreement with both runtimes, the transient on a
+        # real cache view, and the installer.
+        run: python -m pytest tests/test_mlx_attention_metal.py -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
