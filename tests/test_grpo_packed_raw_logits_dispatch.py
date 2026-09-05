@@ -41,12 +41,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding = "utf-8")
-# One shared parse: nodes from separate parses never compare equal, which would
-# make the containment tests below vacuous.
+# One shared parse: nodes from separate parses never compare equal, which would make
+# the containment tests below vacuous.
 TREE = ast.parse(SRC)
 
 
-# ---- the message ----------------------------------------------------------
+# the message
 
 def _mismatched_call(fn, torch):
     """Vocab-wide logits where hidden states are expected, as an unpatched
@@ -79,7 +79,7 @@ def test_the_width_mismatch_names_both_operands():
     assert "32" in message and "128" in message, message
 
 
-# ---- the dispatch ---------------------------------------------------------
+# the dispatch
 
 def _packed_block():
     """The packed call inside `grpo_accumulated_loss`, located by AST so

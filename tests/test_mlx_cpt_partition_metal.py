@@ -89,7 +89,6 @@ def test_untied_cpt_partition_lr_key_and_save_reload():
     assert {"lm_head.lora_a", "lm_head.lora_b"} <= trainable
     assert "lm_head.weight" not in trainable
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
-    # Save keeps the full module; a reloaded model (no marker) saves it too.
     from unsloth_zoo.mlx.loader import _mlx_save_lora_adapters  # noqa: E402
     d, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
     _mlx_save_lora_adapters(m, d)
@@ -103,12 +102,11 @@ def test_tied_trains_shared_matrix_and_rejects_lm_head():
     m = _tiny(tied=True)
     _peft(m, target_modules=["embed_tokens"], finetune_language_layers=False)
     assert m._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
-    # Co-requesting lm_head trains the shared matrix rather than erroring.
     m2 = _tiny(tied=True)
     _peft(m2, target_modules=["embed_tokens", "lm_head"], finetune_language_layers=False)
     assert m2._unsloth_cpt_full_module_weight_keys == {"model.embed_tokens.weight"}
     trn = set(dict(mu.tree_flatten(m2.trainable_parameters())))
-    assert not any(k.startswith("lm_head") for k in trn)  # tied: no separate head
+    assert not any(k.startswith("lm_head") for k in trn)
     with pytest.raises(ValueError, match="tied"):
         _peft(_tiny(tied=True), target_modules=["lm_head"])
 
@@ -151,7 +149,6 @@ def test_all_linear_expands_inside_a_mixed_cpt_target_list():
     assert {"lm_head.lora_a", "lm_head.lora_b"} <= trn
     assert any(k.endswith("q_proj.lora_a") for k in trn)
 
-    # Set form, and a duplicate sentinel, resolve the same way.
     s = _tiny()
     _peft(s, target_modules={"all-linear", "embed_tokens", "lm_head"})
     trn = set(dict(mu.tree_flatten(s.trainable_parameters())))
@@ -160,8 +157,8 @@ def test_all_linear_expands_inside_a_mixed_cpt_target_list():
 
 
 def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
-    # No LoRA anywhere, so the artifact is stamped fine_tune_type="full" with
-    # no exact LoRA paths and reload takes the pathless route. mlx-lm's
+    # No LoRA anywhere, so the artifact is stamped fine_tune_type="full" with no
+    # exact LoRA paths and reload takes the pathless route. mlx-lm's
     # load_adapters never freezes, so without a selective freeze every base
     # tensor came back trainable and the scoped-LR keys were lost.
     import json
@@ -194,7 +191,6 @@ def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
         "model.embed_tokens.weight"}
     assert mx.array_equal(r.model.embed_tokens.weight, m.model.embed_tokens.weight)
 
-    # A full-module head-only checkpoint restores the head, nothing else.
     hm = _tiny()
     _peft(hm, target_modules=[], modules_to_save=["lm_head"])
     hd = tempfile.mkdtemp()
@@ -208,7 +204,6 @@ def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
     assert getattr(hr, "_unsloth_cpt_full_module_weight_keys", set()) == {
         "lm_head.weight"}
 
-    # A whole-model artifact is a real full fine-tune: keep it unfrozen.
     fd = tempfile.mkdtemp()
     whole = _tiny()
     mx.save_safetensors(
@@ -217,14 +212,12 @@ def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
     )
     assert not _is_partial_mlx_checkpoint(
         _tiny(), os.path.join(fd, "adapters.safetensors"))
-    # full_finetuning=True never freezes either.
     ff = _load_pathless_mlx_adapter(_tiny(), d, weights, cfg, True)
     assert len(dict(mu.tree_flatten(ff.trainable_parameters()))) == len(
         dict(mu.tree_flatten(ff.parameters())))
 
 
 def test_set_target_modules_respects_finetune_filters():
-    # A set selection must still honor finetune_attention_modules=False.
     m = _tiny()
     _peft(m, target_modules={"q_proj", "embed_tokens"},
           finetune_attention_modules=False)
@@ -280,7 +273,6 @@ class _WrappedHead(nn.Module):
 
 
 def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
-    # An unwrappable head must warn, not abort; modules_to_save still trains it.
     m = _tiny(); m.lm_head = _WrappedHead()
     with pytest.warns(UserWarning, match="cannot wrap as a LoRA layer"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -302,7 +294,6 @@ def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
     assert keys == {"lm_head.ln.weight", "lm_head.linear.weight"}
     trainable = set(dict(mu.tree_flatten(m.trainable_parameters())))
     assert keys <= trainable
-    # A plain Linear / Embedding full module keeps the exact previous key.
     plain = _tiny()
     _peft(plain, target_modules=["q_proj", "embed_tokens"],
           modules_to_save=["lm_head"])
@@ -319,7 +310,6 @@ def test_quantized_child_of_a_wrapper_head_is_rejected():
         m.lm_head.linear, group_size=32, bits=4)
     with pytest.raises(ValueError, match=r"quantized module at 'lm_head\.linear'"):
         _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
-    # A directly quantized full module still reports its own path.
     e = _tiny()
     e.model.embed_tokens = nn.QuantizedEmbedding.from_embedding(
         e.model.embed_tokens, group_size=32, bits=4)
@@ -369,7 +359,6 @@ def test_root_lm_head_lora_is_attached_outside_the_layer_walk():
     assert {"lm_head.lora_a", "lm_head.lora_b"} <= trn
     assert any(k.endswith("q_proj.lora_a") for k in trn)
 
-    # CPT recipe: an lm_head adapter plus a full embedding, no layer targets.
     cpt = _tiny()
     _peft(cpt, target_modules=["embed_tokens", "lm_head"])
     trn = set(dict(mu.tree_flatten(cpt.trainable_parameters())))

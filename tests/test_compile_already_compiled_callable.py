@@ -86,7 +86,7 @@ def _run_with_compile_enabled(body):
     return done.stdout
 
 
-# ---- the unwrap itself ----------------------------------------------------
+# ---- the unwrap itself ----
 
 def test_unwrap_already_compiled_returns_the_eager_original():
     from unsloth_zoo.temporary_patches.common import unwrap_already_compiled
@@ -103,7 +103,6 @@ def test_unwrap_already_compiled_returns_the_eager_original():
 
     assert unwrap_already_compiled(fallback_wrapper) is eager
     assert unwrap_already_compiled(compiled) is eager
-    # A plain function is handed straight back; nothing to unwrap.
     assert unwrap_already_compiled(eager) is eager
 
 
@@ -154,7 +153,7 @@ def test_unwrap_already_compiled_keeps_a_bound_method_bound():
     assert unwrap_already_compiled(bound) is bound
 
 
-# ---- the funnel -----------------------------------------------------------
+# ---- the funnel ----
 
 def test_torch_compile_hands_torch_the_eager_function():
     """Version independent: observe WHICH callable reaches `torch.compile`.

@@ -147,11 +147,9 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
 
 
 # ------------------------------------------- false negatives are the bad kind
-#
 # False when the link would have succeeded silently disables FlashInfer on a
 # machine where it works; True when the link then fails merely restores the
-# pre-check behaviour. The two tests below cover the two ways the first,
-# dangerous mistake was reachable.
+# pre-check behaviour. Below: the two ways the first mistake was reachable.
 
 
 def test_a_stub_in_a_default_linker_directory_counts(tmp_path):

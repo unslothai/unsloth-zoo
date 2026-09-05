@@ -70,10 +70,8 @@ def _run(body: str, cache_dir: Path, timeout: int = 900):
     env["UNSLOTH_COMPILE_DISABLE"] = "1"
     # On a CPU-only runner the zoo's get_device_type raises "Unsloth cannot find
     # any torch accelerator" during the child's import, before either TokenError
-    # handler is reached. It does not today, but only because tests/conftest.py
-    # does os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1") at import and this
-    # copy of os.environ carries it. Measured: neuter that one conftest line and
-    # all three tests here die on the import. That is too far away to rely on.
+    # handler is reached. Measured: neuter tests/conftest.py's UNSLOTH_ALLOW_CPU
+    # setdefault and all three tests here die on the import.
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
     return subprocess.run(
         [sys.executable, "-c", script],

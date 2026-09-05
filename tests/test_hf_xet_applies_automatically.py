@@ -145,8 +145,7 @@ def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performa
     """, {"HF_XET_CACHE": str(xet_cache), "HF_HOME": str(tmp_path / "hf")})
 
     # Judge the flag with the parser the tuning code uses: it strips and lowercases, so a raw
-    # membership test would let "True" or " on " through while the process is in fact sized for
-    # high performance -- the regression back, in a different spelling.
+    # membership test would let "True" or " on " through -- the regression back, respelled.
     from unsloth_zoo.hf_xet_tuning import _is_true
 
     assert not _is_true(result["hp"]), (

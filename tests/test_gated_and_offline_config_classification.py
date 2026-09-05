@@ -61,9 +61,8 @@ from unsloth_zoo import saving_utils
 _REPO = "ns/base-bnb-4bit"
 _NF4 = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"}
 
-# Same shape as test_quant_status_transport_errors.py: the Hub branch of
-# `check_model_quantization_status` is reached only when `os.path.exists(name)` is
-# False while `check_local_model_exists(name)` still finds a copy.
+# Same shape as test_quant_status_transport_errors.py: the Hub branch is reached
+# only when `os.path.exists(name)` is False while `check_local_model_exists` hits.
 _REQUESTED = "Outputs/MyModel"
 _ON_DISK = ("outputs", "mymodel")
 
@@ -361,9 +360,8 @@ def test_a_healthy_hub_base_is_used_when_the_local_config_cannot_be_read(monkeyp
     def fake_ls(self, path, detail = True, **kwargs):
         return [{"name": f"{path}/model.safetensors"}]
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
-    # The Hub serves a readable config for the same name. Stubbed at the download, not at
-    # `check_model_quantization_status`, so the real function runs on both sides: the
-    # directory reaches the real parser and the real raise, which is the subject here.
+    # The Hub serves a readable config for the same name. Stubbed at the download, not
+    # at `check_model_quantization_status`, so the directory still reaches the real raise.
     good_config = tmp_path / "hub-config.json"
     good_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
     import huggingface_hub

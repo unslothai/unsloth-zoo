@@ -58,8 +58,7 @@ def test_every_inference_branch_applies_the_softcap():
 
 def test_training_and_inference_use_the_same_transform_order():
     src = _template_source()
-    # scale multiply, then scale divide, then softcap. Any arm that applies the
-    # transforms must do so in this order, otherwise the two paths differ.
+    # scale multiply, then scale divide, then softcap, or the two paths differ.
     order = re.compile(
         r"logits = logits \* \(\\\\2\).*?logits = logits / \(\\\\3\).*?torch\.tanh\(logits\)",
         re.S,

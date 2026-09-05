@@ -75,7 +75,6 @@ def _lora_config(base_model_name_or_path):
     )
 
 
-# --- adapter-name unwrapping -------------------------------------------------
 
 def test_single_adapter_dict_with_non_default_name_resolves(local_llama_base):
     """`get_peft_model(..., adapter_name = "my_adapter")` produces a peft_config keyed
@@ -131,7 +130,6 @@ def test_config_object_without_to_dict_raises():
         get_transformers_model_type(NoToDict())
 
 
-# --- paths that already worked must be byte-identical ------------------------
 
 def test_plain_transformers_config_unchanged():
     from transformers import LlamaConfig

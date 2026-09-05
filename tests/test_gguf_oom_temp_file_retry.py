@@ -42,7 +42,6 @@ from unsloth_zoo.llama_cpp import (  # noqa: E402
 )
 
 
-# ---- recognising the kill --------------------------------------------------
 
 def test_sigkill_from_the_message():
     assert _converter_was_oom_killed(
@@ -70,7 +69,6 @@ def test_a_nonzero_exit_is_not_a_kill():
     assert not _converter_was_oom_killed(_Called())
 
 
-# ---- building the retry ----------------------------------------------------
 
 BASE = ["/usr/bin/python3", "/root/.unsloth/llama.cpp/unsloth_convert_hf_to_gguf.py",
         "--outfile", "model.F16.gguf", "--outtype", "f16",
@@ -127,7 +125,6 @@ def test_the_result_is_a_new_list():
     assert "--split-max-size" in BASE, "the caller's command must not be mutated"
 
 
-# ---- how the run loop uses it ----------------------------------------------
 
 def _loop_src():
     src = (ROOT / "unsloth_zoo" / "llama_cpp.py").read_text(encoding="utf-8")
@@ -157,7 +154,6 @@ def test_the_dependency_repair_retry_is_independent():
     assert body.index("attempted_repair") < body.index("attempted_temp_file = True")
 
 
-# ---- clearing what the killed run left behind ------------------------------
 
 def _touch(directory, name, data = b"GGUF"):
     path = directory / name
@@ -214,13 +210,9 @@ def test_the_paths_include_the_file_and_its_shards(tmp_path):
 
 
 def test_the_retry_clears_the_old_output_first():
-    # Anchored on the OOM branch. The loop grew a second `command = retry`, for
-    # a converter that rejects --no-mtp, and a bare index() finds that one
-    # first. That retry re-runs the same command minus one flag, keeps
-    # --split-max-size and so overwrites the same paths, which is why it has no
-    # cleanup; only the OOM retry drops --split-max-size and can leave the
-    # killed run's shards behind. Searching from the kill check keeps the
-    # assertion on the branch that actually needs it.
+    # Anchored on the OOM branch: the loop grew a second `command = retry`, for a
+    # converter that rejects --no-mtp, that a bare index() finds first. Only the OOM
+    # retry drops --split-max-size and can leave the killed run's shards behind.
     body = _loop_src()
     oom = body.index("_converter_was_oom_killed(e)")
     assert body.index("_remove_gguf_outputs(output_file)", oom) < body.index("command = retry", oom)

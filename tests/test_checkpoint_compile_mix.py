@@ -41,17 +41,13 @@ from torch.utils.checkpoint import checkpoint
 from unsloth_zoo.temporary_patches import utils as U
 
 
-# aot_eager, not inductor: this file tests the compile-mode switch and what
-# autograd saves, both of which AOTAutograd already covers. Inductor adds a C++
-# codegen step that fails for reasons of its own once an earlier test touched
-# the inductor config -- why these passed alone and failed in a full run.
+# aot_eager, not inductor: inductor's C++ codegen fails once an earlier test touched its config.
 _BACKEND = "aot_eager"
 
 
 def _norm(w, x, k):
-    # `k` is a plain int, so Dynamo specialises on its value and every block
-    # forces a fresh compilation. A real vision run exhausts the cache the same
-    # way, one guard per shape rather than per constant.
+    # `k` is a plain int, so Dynamo specialises on it and every block recompiles, the
+    # way a real vision run exhausts the cache one guard a shape.
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w * (1.0 + 0.0 * k)
 
 
@@ -99,25 +95,18 @@ def dynamo_limits():
     saved = {n: getattr(dynamo.config, n) for n in names
              if hasattr(dynamo.config, n)}
     n_wrappers = len(U._EAGER_FALLBACK_WRAPPERS)
-    # These tests end with a bump deliberately outstanding, so the bookkeeping
-    # has to come back too: left behind, a later fallback restores this test's
-    # limit of 2 over the process default, or finds the allowance spent. Running
-    # out also takes EVERY live borrower eager, including the package's own
-    # patched kernels, which would stay latched for the rest of the worker.
+    # These tests end with a bump deliberately outstanding: left behind, a later
+    # fallback restores this test's limit of 2 over the process default, or finds the
+    # allowance spent and takes EVERY live borrower eager.
     saved_states = [(_w, dict(_w._unsloth_fallback_state))
                     for _w in (_r() for _r in U._EAGER_FALLBACK_WRAPPERS)
                     if _w is not None]
     saved_global = U._GLOBAL_BUMPS
     saved_orig = dict(U._ORIGINAL_RECOMPILE_LIMITS)
-    # Deep copy: the map is {bumped value: the value it came from} with lists
-    # appended to and popped in place, so copying it as a set broke the restore
-    # chain, and copying only the outer layers let a test that settles a debt
-    # mutate the snapshot teardown restores from.
+    # Deep copy: the lists are mutated in place, so a shallow copy let a settled debt mutate the snapshot.
     saved_bumped = {k: {kk: list(vv) for kk, vv in v.items()}
                     for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
-    # The give-up decision is kept by LABEL, so it outlives the wrapper. Every
-    # test here reuses "test_norm", so an earlier latch would start the next
-    # one already eager.
+    # The give-up decision is kept by LABEL, and every test here reuses "test_norm".
     U._LATCHED_EAGER_LABELS.discard("test_norm")
     U._PENDING_EAGER_LABELS.discard("test_norm")
     try:
@@ -125,9 +114,7 @@ def dynamo_limits():
     finally:
         for n, v in saved.items():
             setattr(dynamo.config, n, v)
-        # Drop only what died: the registry is process-wide, and a module
-        # imported during these tests appends its own kernels past the mark, so
-        # truncating deregistered gemma/gemma4/qwen3 for the rest of the worker.
+        # Process-wide registry: truncating past the mark deregistered gemma/gemma4/qwen3.
         _tail = [_r for _r in U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
                  if _r() is not None]
         del U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
@@ -154,8 +141,7 @@ def test_exhausted_recompile_cache_does_not_break_the_backward(dynamo_limits):
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    # Before the fix this raises: the first blocks pack compiled activations,
-    # the fallback flips to eager mid-forward, and the recompute disagrees.
+    # Before the fix this raises: eager mid-forward disagrees with what was packed compiled.
     _run_checkpointed_step(fn)
 
     state = fn._unsloth_fallback_state
@@ -184,9 +170,7 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    # Deny the loan at its source: pinning `_GLOBAL_BUMPS` stopped working once
-    # the allowance became a live measurement rather than a stored count, and
-    # the retry silently succeeded.
+    # Pinning `_GLOBAL_BUMPS` stopped working once the allowance became a live measurement.
     real_bump = U._bump_recompile_limits
     U._bump_recompile_limits = lambda *a, **k: False
     try:
@@ -199,9 +183,7 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
     assert state["eager"], "the wrapper must latch so the retry is consistent"
     assert state["bumps"] == 0, "no budget was borrowed"
 
-    # The promise is that the caller can retry the step. torch holds
-    # `with _checkpoint_hook(...)` open across the generator's yield, so our
-    # raise abandons it with the hooks installed; the boundary settles that.
+    # torch holds `_checkpoint_hook` open across the yield, so the raise abandons it installed.
     U.apply_pending_eager_fallbacks()
     def plain(x): return torch.nn.functional.softmax(x * 2, dim = -1)
     checkpoint(plain, torch.randn(4, 4, requires_grad = True),
@@ -334,8 +316,6 @@ def test_pending_switch_is_applied_at_the_step_boundary(dynamo_limits):
     assert fn._unsloth_fallback_state["eager"]
     assert not fn._unsloth_fallback_state["pending_eager"]
 
-    # A second call is a no-op, and the next step is now consistently eager,
-    # so the backward keeps working.
     assert U.apply_pending_eager_fallbacks() == 0
     _run_checkpointed_step(fn)
 
@@ -363,8 +343,7 @@ def test_settlement_retries_until_the_generator_is_actually_collected():
             cycle = {"exc": exc}                # a cycle, as raising through
             cycle["self"] = cycle               # compiled frames leaves
             U._RAISED_INSIDE_CHECKPOINT = True
-            # The step boundary the caller reaches before retrying: the
-            # traceback is still live, so no collection can finalise anything.
+            # The traceback is still live, so no collection can finalise anything.
             U.apply_pending_eager_fallbacks()
             assert U._in_non_reentrant_checkpoint() is True, "hooks already gone"
 
