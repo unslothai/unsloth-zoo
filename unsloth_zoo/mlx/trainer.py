@@ -1987,6 +1987,40 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
     raise ValueError("max_steps must be > 0 when using streaming mode.")
 
 
+def _warn_resume_adapter_mismatch(model, adapter_file):
+    """Say so when a checkpoint does not cover the LoRA modules now wrapped.
+
+    Resume binds with ``strict=False``, so an adapter saved when selection was
+    narrower loads without complaint and leaves the modules it does not name at
+    their initialisation. They train from scratch while the optimizer state
+    restored beside them describes the older, smaller parameter tree.
+    """
+    import warnings
+    if not os.path.exists(adapter_file):
+        return
+    try:
+        saved = set(mx.load(adapter_file).keys())
+        live = {f"{name}.{leaf}"
+                for name, _ in iter_mlx_lora_modules(model)
+                for leaf in ("lora_a", "lora_b")}
+    except Exception:
+        return                              # never block a resume to report on it
+    uncovered = sorted(name.rpartition(".")[0] for name in live - saved
+                       if name.endswith(".lora_a"))
+    if not uncovered:
+        return
+    warnings.warn(
+        f"Unsloth: resuming from {adapter_file!r}, which has no weights for "
+        f"{len(uncovered)} of the LoRA modules now attached "
+        f"(for example {uncovered[:3]!r}). Those modules restart from their "
+        "initialisation while the restored optimizer state describes the "
+        "checkpoint's own module set. This happens when the checkpoint was "
+        "written by a version that selected fewer modules. Pass the same "
+        "target_modules the checkpoint was trained with to resume exactly.",
+        stacklevel=2,
+    )
+
+
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
@@ -5285,6 +5319,9 @@ class MLXTrainer:
                 #    already has LoRA wrappers applied (Unsloth pipeline does
                 #    get_peft_model before training); strict=False ensures
                 #    only the LoRA params match and base weights are untouched.
+                _warn_resume_adapter_mismatch(
+                    model, f"{_resume_from}/adapters.safetensors",
+                )
                 model.load_weights(
                     f"{_resume_from}/adapters.safetensors", strict=False,
                 )
