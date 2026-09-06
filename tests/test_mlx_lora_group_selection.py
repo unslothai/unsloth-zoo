@@ -273,3 +273,18 @@ def test_a_nested_connector_is_adapted_whichever_pass_owns_it(
     assert not [name for name, module in model.named_modules()
                 if hasattr(module, "lora_a")
                 and hasattr(getattr(module, "linear", None), "lora_a")]
+
+
+def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
+    # The canonical list is substituted internally, so quoting it back sends
+    # the caller to change an argument they never passed.
+    model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
+    with pytest.raises(ValueError) as excinfo:
+        _peft(model, finetune_vision_layers=True)
+    assert "target_modules" not in str(excinfo.value)
+    assert "'patch_dense'" in str(excinfo.value)
+    # A vocabulary the caller did pass is still worth naming back to them.
+    model = _vlm(tower=_tower(merger=_GLM_MERGER))
+    with pytest.raises(ValueError) as excinfo:
+        _peft(model, finetune_vision_layers=True, target_modules=["q_proj"])
+    assert "target_modules=['q_proj']" in str(excinfo.value)

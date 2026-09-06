@@ -6998,7 +6998,9 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
             _raise_empty_target_modules()
         _raise_group_empty(
             vision_flag, "vision tower", vision_path, vision_module,
-            target_modules,
+            # Naming a list the caller never passed sends them to fix the wrong
+            # thing; on the defaulted path the tower itself is the whole story.
+            None if targets_defaulted else target_modules,
         )
     if train_projector and projector_lora_count == 0:
         _raise_group_empty(
