@@ -1247,9 +1247,22 @@ def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
 
 @pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
 def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
-    """mlx_lm names these modules after the raw config spelling."""
+    """mlx_lm names these modules after the raw config spelling.
+
+    Asserted on the resolved module name, which is what this change decides.
+    Reaching the class as well needs mlx_lm to import, and it does not everywhere:
+    `mlx_lm/utils.py` imports `resource`, a Unix-only stdlib module, so on Windows
+    -- where mlx now does ship a wheel -- every one of these resolves to None for
+    a reason that has nothing to do with hyphens.
+    """
     from unsloth_zoo.mlx import loader
 
+    assert loader._mlx_lm_module_name(model_type) == model_type
+
+    try:
+        import mlx_lm  # noqa: F401
+    except Exception as error:
+        pytest.skip(f"installed mlx_lm does not import here ({error})")
     assert loader._get_mlx_lm_model_class(model_type) is not None
 
 
