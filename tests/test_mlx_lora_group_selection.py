@@ -288,3 +288,20 @@ def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
     with pytest.raises(ValueError) as excinfo:
         _peft(model, finetune_vision_layers=True, target_modules=["q_proj"])
     assert "target_modules=['q_proj']" in str(excinfo.value)
+
+
+# Routed experts are selectable, so the pass that adapts them must know the same
+# module types selection does: a mixed tower silently trained only its ordinary
+# linears, and a tower holding nothing else refused as though it were empty.
+@pytest.mark.parametrize("mixed", [True, False],
+                         ids=["beside ordinary linears", "alone in the tower"])
+def test_a_tower_holding_routed_experts_adapts_them(mixed):
+    switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
+    block = {"mlp": {"switch_mlp": lambda: switch_layers.SwitchLinear(VISION, VISION, 4)}}
+    if mixed:
+        block["attn"] = {"qkv": (VISION, VISION * 3), "proj": (VISION, VISION)}
+    model = _vlm(tower=_build({"blocks": [block], "patch_embed": {}}))
+    _peft(model, finetune_vision_layers=True)
+    adapted = _adapters(model, "vision_tower")
+    assert "blocks.0.mlp.switch_mlp" in adapted
+    assert ("blocks.0.attn.qkv" in adapted) is mixed

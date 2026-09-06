@@ -7023,9 +7023,10 @@ def _lora_walk_module(
 ):
     """LoRA for encoders and connectors, which lack the flat `.layers` structure
     mlx-lm's `linear_to_lora_layers` expects."""
-    import mlx.nn as nn
     try:
-        from mlx_lm.tuner.lora import LoRALinear
+        # The same specs selection reads, so the walk adapts every type
+        # `_role_selected_paths` can hand it, routed experts included.
+        specs = _mlx_lora_type_specs()
     except ImportError:
         return 0
 
@@ -7050,14 +7051,15 @@ def _lora_walk_module(
                 continue
         elif not match_all_linear and not _lora_name_matches_target(name, target_modules):
             continue
-        if not isinstance(child, (nn.Linear, nn.QuantizedLinear)):
+        spec = _mlx_lora_spec_for_module(child, specs)
+        if spec is None:
             continue
         if dry_run:
             # Building it would draw from the executing pass's RNG.
             replacements += 1
             continue
         lora_layer = _lora_from_base_compat(
-            LoRALinear,
+            spec.wrapper_type,
             child,
             rank=lora_config["rank"],
             scale=lora_config["scale"],
