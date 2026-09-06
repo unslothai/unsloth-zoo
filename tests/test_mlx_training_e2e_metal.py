@@ -925,6 +925,7 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+    assert reloaded._unsloth_reloaded_parameter_keys == aux
 
 
 @metal_only
