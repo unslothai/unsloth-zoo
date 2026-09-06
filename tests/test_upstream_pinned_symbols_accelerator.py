@@ -36,23 +36,16 @@ import pytest
 import torch
 
 
-# ---------------------------------------------------------------------------
-# 1. device_type.device_synchronize / device_empty_cache / device_is_bf16_supported
-#    must tolerate a partial torch.xpu build that exposes is_available() but
-#    lacks the specific call (synchronize / empty_cache / is_bf16_supported).
-#
-#    Covers commits:
-#      - 35dc451 Guard XPU empty_cache call against partial torch.xpu builds
-#      - e08c1df Guard XPU synchronize call against partial torch.xpu builds
-#      - 2564f39 Route GGUF merge cache flushes and MoE expert merges
-#                through active backend (introduced device_empty_cache)
-#      - d631837 Route VLM GGUF mmproj bf16 check through active backend
-#                (introduced device_is_bf16_supported)
-#
-#    The existing test_backend_device_helpers.py covers the happy path; this
-#    test pins the PARTIAL-BUILD case where torch.xpu.is_available is True
-#    but the specific symbol is missing.
-# ---------------------------------------------------------------------------
+# Covers commits:
+#   - 35dc451 Guard XPU empty_cache call against partial torch.xpu builds
+#   - e08c1df Guard XPU synchronize call against partial torch.xpu builds
+#   - 2564f39 Route GGUF merge cache flushes and MoE expert merges
+#             through active backend (introduced device_empty_cache)
+#   - d631837 Route VLM GGUF mmproj bf16 check through active backend
+#             (introduced device_is_bf16_supported)
+# The existing test_backend_device_helpers.py covers the happy path; this
+# test pins the PARTIAL-BUILD case where torch.xpu.is_available is True
+# but the specific symbol is missing.
 
 def test_xpu_partial_build_all_three_helpers_silent_no_op():
     """All three device_type helpers must no-op (not AttributeError) on a
@@ -79,28 +72,21 @@ def test_xpu_partial_build_all_three_helpers_silent_no_op():
     with mock.patch.object(dt, "DEVICE_TYPE", "xpu"), \
          mock.patch.object(torch, "cuda", fake_cuda), \
          mock.patch.object(torch, "xpu", PartialXpu(), create=True):
-        # None of these may raise. The whole regression class is "raises
-        # AttributeError because the partial xpu build is missing one of
-        # the three call names".
         dt.device_synchronize()
         dt.device_empty_cache()
         assert dt.device_is_bf16_supported() is False
 
 
-# ---------------------------------------------------------------------------
-# 2. saving_utils._active_merge_device() must take NO positional args and
-#    cascade cuda -> xpu -> mps -> cpu.
-#
-#    Covers commit:
-#      - fd58aa1 saving_utils: route LoRA merge through accelerator-family probe
-#      - 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs + restore
-#                device-agnostic LoRA merge
-#
-#    The pre-fix signature was _active_merge_device(W) which (a) silently
-#    dropped MPS, (b) propagated W.device.index across families. This
-#    pin asserts the no-arg shape AND the MPS-wins-when-only-mps branch
-#    which the previous DEVICE_TYPE_TORCH-only routing dropped.
-# ---------------------------------------------------------------------------
+# saving_utils._active_merge_device() must take NO positional args and
+# cascade cuda -> xpu -> mps -> cpu.
+# Covers commits:
+#   - fd58aa1 saving_utils: route LoRA merge through accelerator-family probe
+#   - 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs + restore
+#             device-agnostic LoRA merge
+# The pre-fix signature was _active_merge_device(W) which (a) silently
+# dropped MPS, (b) propagated W.device.index across families. This
+# pin asserts the no-arg shape AND the MPS-wins-when-only-mps branch
+# which the previous DEVICE_TYPE_TORCH-only routing dropped.
 
 def test_active_merge_device_mps_branch_pinned():
     """_active_merge_device() returns "mps" on Apple Silicon (no cuda/xpu).
@@ -111,8 +97,6 @@ def test_active_merge_device_mps_branch_pinned():
 
     _active_merge_device.cache_clear()
     try:
-        # No required positional args. Pre-fix took W; signature change
-        # alone would crash every callsite if reverted.
         import inspect
         sig = inspect.signature(_active_merge_device)
         required = [
@@ -129,8 +113,6 @@ def test_active_merge_device_mps_branch_pinned():
             "across accelerator families."
         )
 
-        # Spoof: only MPS available. The cuda-only cascade pre-fix dropped
-        # this branch entirely; this assertion is the canary.
         with mock.patch.object(torch.cuda, "is_available", return_value=False):
             xpu_ctx = (
                 mock.patch.object(torch.xpu, "is_available", return_value=False)
@@ -154,19 +136,10 @@ class _NullCtx:
     def __exit__(self, *a): return False
 
 
-# ---------------------------------------------------------------------------
-# 3. MoE-expert _active_merge_device() callsites in saving_utils.py.
-#
-#    Covers commit:
-#      - 2564f39 (introduced)
-#      - fd58aa1 (refactored to no-arg helper)
-#
-#    Pre-fix the five MoE expert helpers (_merge_moe_gate_expert,
-#    _merge_moe_up_expert, _merge_moe_down_proj_expert,
-#    _merge_moe_fused_gate_up_expert, _merge_moe_fused_down_proj_expert)
-#    fell back to CPU on XPU due to hardcoded .to("cuda", ...). This pin
-#    asserts those callsites still go through the helper.
-# ---------------------------------------------------------------------------
+# MoE-expert _active_merge_device() callsites in saving_utils.py.
+# Covers commits 2564f39 (introduced) and fd58aa1 (refactored to no-arg helper).
+# Pre-fix the five MoE expert helpers fell back to CPU on XPU due to
+# hardcoded .to("cuda", ...).
 
 def test_moe_expert_merges_call_active_merge_device():
     """The five MoE-expert merge helpers must route their .to(...) calls
@@ -230,18 +203,11 @@ def test_moe_expert_merges_call_active_merge_device():
         )
 
 
-# ---------------------------------------------------------------------------
-# 4. mx.metal memory APIs migrated to the modern non-namespaced form.
-#
-#    Covers commit:
-#      - 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs +
-#                restore device-agnostic LoRA merge
-#
-#    The deprecated form (mx.metal.set_memory_limit / .set_cache_limit)
-#    prints a warning every training run; the modern form is
-#    mx.set_memory_limit / mx.set_cache_limit / mx.set_wired_limit.
-#    The MLX shim exposes both, so this test pins the trainer source.
-# ---------------------------------------------------------------------------
+# Covers commit 70b93ad fix(mlx): migrate deprecated mx.metal memory APIs +
+# restore device-agnostic LoRA merge.
+# The deprecated form (mx.metal.set_memory_limit / .set_cache_limit)
+# prints a warning every training run. The MLX shim exposes both forms,
+# so this test pins the trainer source.
 
 def test_mlx_trainer_uses_modern_memory_apis_only():
     """unsloth_zoo.mlx.trainer must call the non-namespaced memory APIs
@@ -267,7 +233,6 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
     )
     src = mlx_trainer_path.read_text()
 
-    # The deprecated forms must NOT appear.
     assert "mx.metal.set_memory_limit" not in src, (
         "Deprecated mx.metal.set_memory_limit call resurfaced; "
         "regresses commit 70b93ad."
@@ -277,23 +242,16 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
         "regresses commit 70b93ad."
     )
 
-    # The modern forms must appear.
     for modern in ("mx.set_memory_limit", "mx.set_cache_limit", "mx.set_wired_limit"):
         assert modern in src, f"Expected modern API {modern} missing from {mlx_trainer_path.name}"
 
 
-# ---------------------------------------------------------------------------
-# 5. Apple-Silicon stub injection on __init__ (3 sub-bugs from 2053539).
-#
-#    Covers commit:
-#      - 2053539 fix(mlx): repair stub injection on Apple Silicon (3 sub-bugs)
-#
-#    Sub-bugs:
-#      a. Inverted gate: stubs were inside `if not _SKIP_GPU_INIT:`. Fix
-#         moved them under `if _SKIP_GPU_INIT:`.
-#      b. Wrong function name: install_*_stub vs the real inject_into_sys_modules.
-#      c. _Noop.__call__ silently returned None — fix raises NotImplementedError.
-# ---------------------------------------------------------------------------
+# Covers commit 2053539 fix(mlx): repair stub injection on Apple Silicon.
+# Sub-bugs:
+#   a. Inverted gate: stubs were inside `if not _SKIP_GPU_INIT:`. Fix
+#      moved them under `if _SKIP_GPU_INIT:`.
+#   b. Wrong function name: install_*_stub vs the real inject_into_sys_modules.
+#   c. _Noop.__call__ silently returned None — fix raises NotImplementedError.
 
 def test_apple_silicon_stub_injection_entrypoints_pinned():
     """Sub-bugs (a) and (b) of commit 2053539. The init module must gate
@@ -308,7 +266,6 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
     ) / "__init__.py"
     src = init_path.read_text()
 
-    # Sub-bug (b): the real entry point is inject_into_sys_modules.
     assert "inject_into_sys_modules" in src, (
         "Stub injection entry point inject_into_sys_modules vanished from "
         "unsloth_zoo/__init__.py — regresses commit 2053539 sub-bug (b)."
@@ -318,8 +275,7 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
     assert "install_bitsandbytes_stub" not in src
 
     # Sub-bug (a): the gate must be positive `if _SKIP_GPU_INIT:` not
-    # `if not _SKIP_GPU_INIT:` around the injection block. We look for the
-    # exact positive line.
+    # `if not _SKIP_GPU_INIT:` around the injection block.
     assert "if _SKIP_GPU_INIT:" in src, (
         "Apple-Silicon stub-injection gate flipped — regresses commit "
         "2053539 sub-bug (a)."
@@ -338,9 +294,8 @@ def test_stub_noop_call_raises_not_returns_none():
         noop = mod._Noop("test.symbol")
         with pytest.raises(NotImplementedError, match="test.symbol"):
             noop()
-        # Optional-feature probes still work:
-        assert bool(noop) is False  # __bool__ pass-through
-        sub = noop.some_attr        # attribute chaining returns another _Noop
+        assert bool(noop) is False
+        sub = noop.some_attr
         assert sub is not noop
         with pytest.raises(NotImplementedError, match="test.symbol.some_attr"):
             sub()
@@ -574,7 +529,6 @@ def test_lifting_the_bnb_stub_exposes_the_real_wheel_then_puts_the_stub_back():
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes"] is real
         assert loader._REAL_BITSANDBYTES_MODULES["bitsandbytes._ops"] is real_ops
 
-        # Second call: the cached real modules are reinstated rather than re-imported.
         with loader._lifted_bitsandbytes_stub():
             assert sys.modules["bitsandbytes"] is real
             assert sys.modules["bitsandbytes._ops"] is real_ops
@@ -727,17 +681,11 @@ def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
         assert stub_finder in sys.meta_path, "the stub finder was not put back"
 
 
-# ---------------------------------------------------------------------------
-# 6. mlx_loader rejects full_finetuning against a pre-quantized repo.
-#
-#    Covers commit:
-#      - 7d2bb95 fix(mlx): reject full_finetuning against pre-quantized
-#                repos loudly
-#
-#    Without this guard, the CCE backward returns mx.zeros for quantized
-#    weight grads, so the user "trains" but most of the model never
-#    updates. The detection helper is _get_existing_mlx_quantization.
-# ---------------------------------------------------------------------------
+# mlx_loader rejects full_finetuning against a pre-quantized repo.
+# Covers commit 7d2bb95 fix(mlx): reject full_finetuning against pre-quantized
+# repos loudly.
+# Without this guard, the CCE backward returns mx.zeros for quantized
+# weight grads, so the user "trains" but most of the model never updates.
 
 def test_get_existing_mlx_quantization_detects_both_keys():
     """The detection helper must recognise BOTH the 'quantization' (MLX
@@ -776,17 +724,12 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     )
 
 
-# ---------------------------------------------------------------------------
-# 7. target_modules='all-linear' must collect EVERY nn.Linear name.
-#
-#    Covers commit:
-#      - 7f8b0ca fix(mlx): make target_modules='all-linear' actually mean
-#                every nn.Linear
-#
-#    Pre-fix, "all-linear" was silently rewritten to None and collapsed to
-#    the canonical 7-name list. For Qwen3.5 that dropped the GatedDelta
-#    in_proj_* and out_proj from LoRA targeting entirely.
-# ---------------------------------------------------------------------------
+# target_modules='all-linear' must collect EVERY nn.Linear name.
+# Covers commit 7f8b0ca fix(mlx): make target_modules='all-linear' actually
+# mean every nn.Linear.
+# Pre-fix, "all-linear" was silently rewritten to None and collapsed to
+# the canonical 7-name list. For Qwen3.5 that dropped the GatedDelta
+# in_proj_* and out_proj from LoRA targeting entirely.
 
 def test_collect_all_linear_target_names_finds_qkv_and_moe():
     """_collect_all_linear_target_names must discover fused-QKV names
@@ -860,7 +803,6 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
         f"An EMPTY result here means the walk matched nothing at all -- check the MLX stack "
         f"before suspecting the targeting logic."
     )
-    # Plus the extras the pre-fix collapse dropped.
     extras = {"in_proj_qkv", "in_proj_z", "out_proj",
               "router", "w1", "qkv"}
     missing = extras - names
@@ -870,19 +812,10 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     )
 
 
-# ---------------------------------------------------------------------------
-# 8. patch_gated_delta routes training (state=None) through the efficient
-#    custom-VJP path, not the kernel.
-#
-#    Covers commit:
-#      - 46866ce fix(mlx): correct GatedDeltaNet VJP mask handling +
-#                actually run it
-#
-#    Pre-fix patched_gated_delta_update fell through to gated_delta_kernel
-#    on Metal (the default use_kernel=True branch), making the custom VJP
-#    dead code. The fix unconditionally routes training calls
-#    (state is None on entry) through gated_delta_ops_efficient.
-# ---------------------------------------------------------------------------
+# Covers commit 46866ce fix(mlx): correct GatedDeltaNet VJP mask handling +
+# actually run it.
+# Pre-fix patched_gated_delta_update fell through to gated_delta_kernel on
+# Metal (the default use_kernel=True branch), making the custom VJP dead code.
 
 def test_patch_gated_delta_routes_training_through_efficient_path():
     """Pin the routing predicate in patch_gated_delta. The patched
@@ -895,7 +828,6 @@ def test_patch_gated_delta_routes_training_through_efficient_path():
     pkg_loc = importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
     src = (pathlib.Path(pkg_loc) / "gated_delta_vjp.py").read_text()
 
-    # The training-call routing line is the regression-net.
     # The fix added `is_training_call = state is None` and then the
     # unconditional `if is_training_call: return gated_delta_ops_efficient(...)`
     # branch BEFORE the kernel branch. Both must be present.
@@ -905,7 +837,6 @@ def test_patch_gated_delta_routes_training_through_efficient_path():
         "use_kernel=True."
     )
     assert "gated_delta_ops_efficient" in src
-    # And the training branch must come before the kernel fallthrough.
     idx_eff = src.find("if is_training_call:")
     idx_kernel = src.find("gated_delta_kernel(")
     assert idx_eff != -1 and idx_kernel != -1

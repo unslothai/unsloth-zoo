@@ -41,10 +41,6 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
     """Did the import fail because OUR target is gone, rather than a dependency?
 
@@ -152,9 +148,7 @@ def _assert_positional_arity_at_least(
 pytest.importorskip("transformers")
 
 
-# ===========================================================================
 # transformers.modeling_utils.checkpoint (gradient_checkpointing.py:232/234/246)
-# ===========================================================================
 
 def test_torch_checkpoint_function_first_positional_arg():
     """gradient_checkpointing.py:222 defines
@@ -192,9 +186,7 @@ def test_transformers_modeling_utils_checkpoint_symbol_present():
         )
 
 
-# ===========================================================================
 # transformers.integrations.bitsandbytes._replace_with_bnb_linear
-# ===========================================================================
 
 def test_replace_with_bnb_linear_signature():
     """patching_utils.py:682 ``inspect.getsource(_replace_with_bnb_linear)``
@@ -232,9 +224,7 @@ def test_replace_with_bnb_linear_signature():
     )
 
 
-# ===========================================================================
 # transformers.modeling_utils.PreTrainedModel.loss_function (loss_utils.py:145)
-# ===========================================================================
 
 def test_pretrained_model_loss_function_exists():
     """loss_utils.py:143-146 unwraps
@@ -278,9 +268,7 @@ def test_fixed_cross_entropy_signature():
     )
 
 
-# ===========================================================================
 # transformers Trainer (training_utils.py:354-355 and compiler.py:4040)
-# ===========================================================================
 
 def test_Trainer_get_optimizer_cls_and_kwargs_signature():
     """training_utils.py:354 calls
@@ -327,9 +315,7 @@ def test_Trainer_inner_training_loop_signature_preserved():
     )
 
 
-# ===========================================================================
 # transformers.set_seed / get_scheduler / seed_worker / DataCollator*
-# ===========================================================================
 
 def test_set_seed_signature():
     """training_utils.py:20 -- first positional must be ``seed``."""
@@ -390,9 +376,7 @@ def test_DataCollatorForSeq2Seq_signature():
     )
 
 
-# ===========================================================================
 # TrainingArguments (temporary_patches/misc.py:1334)
-# ===========================================================================
 
 def test_TrainingArguments_to_dict_signature():
     """temporary_patches/misc.py:1334-1343 wraps
@@ -420,9 +404,7 @@ def test_TrainingArguments_get_warmup_steps_signature():
     )
 
 
-# ===========================================================================
 # PretrainedConfig (patching_utils.py:244-273)
-# ===========================================================================
 
 def test_PretrainedConfig_to_dict_signature():
     """patching_utils.py:256-259 wraps ``PretrainedConfig.to_dict`` with
@@ -444,9 +426,7 @@ def test_PretrainedConfig_to_dict_signature():
         )
 
 
-# ===========================================================================
 # PushToHubMixin.push_to_hub (saving_utils.py:76)
-# ===========================================================================
 
 def test_PushToHubMixin_push_to_hub_signature():
     """saving_utils.py:76 uses ``PushToHubMixin`` as a mixin base. Pin
@@ -459,9 +439,7 @@ def test_PushToHubMixin_push_to_hub_signature():
     )
 
 
-# ===========================================================================
 # accelerate.init_empty_weights (empty_model.py:238, 322)
-# ===========================================================================
 
 def test_accelerate_init_empty_weights_signature():
     """empty_model.py:252 / 329 -- ``with init_empty_weights(include_buffers
@@ -475,9 +453,7 @@ def test_accelerate_init_empty_weights_signature():
     )
 
 
-# ===========================================================================
 # Masking-utils + GPT-OSS overrides
-# ===========================================================================
 
 def test_masking_utils_create_causal_mask_signature():
     """gpt_oss.py:2178-2182 wraps
@@ -527,9 +503,7 @@ def test_masking_utils_create_masks_for_generate_signature():
         )
 
 
-# ===========================================================================
 # Gemma3 forward / norm / mlp overrides (temporary_patches/gemma.py)
-# ===========================================================================
 
 def test_gemma3_apply_rotary_pos_emb_signature():
     """gemma.py:399 -- ``apply_rotary_pos_emb(query_states, key_states,
@@ -632,9 +606,7 @@ def test_Gemma3Attention_forward_signature():
     )
 
 
-# ===========================================================================
 # Gemma3n overrides (temporary_patches/gemma3n.py)
-# ===========================================================================
 
 def test_Gemma3nMultimodalEmbedder_forward_signature():
     """gemma3n.py:88 patches
@@ -691,9 +663,7 @@ def test_Gemma3nModel_get_placeholder_mask_signature():
     )
 
 
-# ===========================================================================
 # Ministral overrides (temporary_patches/ministral.py)
-# ===========================================================================
 
 def test_MinistralAttention_forward_signature():
     """ministral.py:99 patches MinistralAttention.forward (relaxed). Pin
@@ -775,9 +745,7 @@ def test_ministral_apply_rotary_pos_emb_signature():
     )
 
 
-# ===========================================================================
 # GPT-OSS class-level monkey-patches (temporary_patches/gpt_oss.py)
-# ===========================================================================
 
 def test_GptOssExperts_class_present_and_init_takes_config():
     """gpt_oss.py:1060/1070/1849/1858 monkey-patch ``GptOssExperts``.
@@ -875,9 +843,7 @@ def test_GptOssPreTrainedModel_init_weights_signature():
     )
 
 
-# ===========================================================================
 # Mxfp4 integrations (temporary_patches/gpt_oss.py)
-# ===========================================================================
 
 def test_mxfp4_swizzle_mxfp4_signature():
     """gpt_oss.py:190 patches
@@ -933,9 +899,7 @@ def test_mxfp4_mlp_forward_signature():
     )
 
 
-# ===========================================================================
 # AutoHfQuantizer.merge_quantization_configs (misc.py:153)
-# ===========================================================================
 
 def test_AutoHfQuantizer_merge_quantization_configs_signature():
     """misc.py:153 patches
@@ -949,9 +913,7 @@ def test_AutoHfQuantizer_merge_quantization_configs_signature():
     )
 
 
-# ===========================================================================
 # Granitemoehybrid + CSM (misc.py:1061 / 770)
-# ===========================================================================
 
 def test_GraniteMoeHybridMambaLayer_cuda_kernels_forward_signature():
     """misc.py:1061 patches ``GraniteMoeHybridMambaLayer.cuda_kernels_forward
@@ -992,9 +954,7 @@ def test_CsmForConditionalGeneration_merge_input_ids_signature():
     )
 
 
-# ===========================================================================
 # Mllama vision encoder layer (misc.py:1172)
-# ===========================================================================
 
 def test_MllamaVisionEncoderLayer_forward_signature():
     """misc.py:1146-1172 -- ``MllamaVisionEncoderLayer.forward(self,
@@ -1016,9 +976,7 @@ def test_MllamaVisionEncoderLayer_forward_signature():
         )
 
 
-# ===========================================================================
 # Siglip encoder layer (misc.py:1228)
-# ===========================================================================
 
 def test_SiglipEncoderLayer_forward_signature():
     """misc.py:1187-1228 -- ``SiglipEncoderLayer.forward(self, hidden_states,
@@ -1032,9 +990,7 @@ def test_SiglipEncoderLayer_forward_signature():
     )
 
 
-# ===========================================================================
 # Qwen3 MoE (qwen3_moe / qwen3_vl_moe / qwen3_next_moe)
-# ===========================================================================
 
 def test_Qwen3MoeSparseMoeBlock_forward_signature():
     """qwen3_moe.py patches ``Qwen3MoeSparseMoeBlock.forward(self,
@@ -1116,9 +1072,7 @@ def test_Qwen3NextSparseMoeBlock_forward_signature():
     )
 
 
-# ===========================================================================
 # Deepseek-V3 MoE (deepseek_v3_moe.py)
-# ===========================================================================
 
 def test_DeepseekV3MoE_forward_signature():
     """deepseek_v3_moe.py:125 patches ``DeepseekV3MoE.forward(self,
@@ -1161,9 +1115,7 @@ def test_DeepseekV3ForCausalLM_forward_signature():
     )
 
 
-# ===========================================================================
 # PEFT (temporary_patches/misc.py:1281 dispatch_bnb_4bit wrap)
-# ===========================================================================
 
 def test_peft_dispatch_bnb_4bit_signature():
     """misc.py:1297 wraps ``peft.tuners.lora.bnb.dispatch_bnb_4bit`` with
@@ -1211,9 +1163,7 @@ def test_peft_get_peft_model_signature():
     )
 
 
-# ===========================================================================
 # Cache utilities (gemma4.py, qwen3_moe etc)
-# ===========================================================================
 
 def test_DynamicCache_importable():
     """gemma4.py:308/460 -- ``from transformers.cache_utils import
@@ -1225,9 +1175,7 @@ def test_DynamicCache_importable():
         pytest.fail("DRIFT DETECTED: StaticCache is no longer callable.")
 
 
-# ===========================================================================
 # Bitsandbytes patch (bitsandbytes.py:108)
-# ===========================================================================
 
 def test_bnb_Linear4bit_forward_signature():
     """bitsandbytes.py:108 patches
@@ -1246,9 +1194,7 @@ def test_bnb_Linear4bit_forward_signature():
     )
 
 
-# ===========================================================================
 # vllm (vllm_utils.py + temporary_patches/misc.py:1402)
-# ===========================================================================
 
 def test_vllm_SamplingParams_constructor():
     """vllm_utils.py's ``grpo_update_SamplingParams`` filters by

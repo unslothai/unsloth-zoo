@@ -120,7 +120,6 @@ def test_orientation_primitive_returns_none_on_square():
 
 def test_logical_expert_shape_prefers_original_shape_after_linear_unwrap():
     class _PackedParam:
-        # Physical shape is packed; logical shape is recorded separately.
         shape = (2048, 1)
         _original_shape = (4, 128, 64)
 

@@ -118,8 +118,6 @@ def _ServerError(message = "503 Server Error: Service Unavailable"):
     return _hub_http_error(message)
 
 
-# A transport failure on the config fetch must raise, not answer "unquantized".
-
 _TRANSPORT_ERRORS = [
     pytest.param(_RateLimited, id = "rate-limited-429"),
     pytest.param(_ServerError, id = "server-error-503"),
@@ -400,8 +398,6 @@ def test_an_exactly_named_local_directory_never_reaches_the_config_fetch(
     assert resolved[4] == "nf4"
 
 
-# A disabled repo is a fact about the repo, not about the network.
-
 def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch):
     """`DisabledRepoError` is the one Hub 4xx that does NOT subclass
     `RepositoryNotFoundError`, so unless named explicitly it reaches the catch-all and is
@@ -423,8 +419,6 @@ def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch)
 
     assert saving_utils.check_hf_model_exists("ns/disabled") is False
 
-
-# The Hub API takes a repo id and a revision, not every address `ls` accepts.
 
 @pytest.mark.parametrize("given, expected_repo, expected_revision", [
     pytest.param("ns/name",           "ns/name", None,  id = "plain"),

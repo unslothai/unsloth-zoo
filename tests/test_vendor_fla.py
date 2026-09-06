@@ -126,9 +126,6 @@ def test_no_autorun_suppresses_import_time_injection():
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
-# ---------------------------------------------------------------------------
-# CPU-safe structural / symbol-resolution checks
-# ---------------------------------------------------------------------------
 def test_vendored_tree_layout():
     assert VENDORED.is_dir(), VENDORED
     assert (VENDORED / "LICENSE").is_file()
@@ -155,7 +152,6 @@ def test_vendored_tree_layout():
 
 
 def test_pruned_and_kept_files():
-    # naive.py (only einops dependency) dropped
     assert not (VENDORED / "ops" / "gated_delta_rule" / "naive.py").exists()
 
     tilelang = VENDORED / "ops" / "common" / "backends" / "tilelang"
@@ -223,9 +219,6 @@ def test_backported_blackwell_hopper_fixes_present():
     assert "TRITON_ABOVE_3_7_1," in utils_init
 
 
-# ---------------------------------------------------------------------------
-# Import hygiene (fresh interpreter)
-# ---------------------------------------------------------------------------
 _HYGIENE_SUBPROCESS = textwrap.dedent(
     """
     import os, sys
@@ -282,9 +275,7 @@ def test_import_hygiene_subprocess():
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
-# ---------------------------------------------------------------------------
-# The decode-kernel name Transformers resolves but fla does not export
-# ---------------------------------------------------------------------------
+# The decode-kernel name Transformers resolves but fla does not export.
 
 class _FakeGatedDeltaModule:
     """Stand-in for fla.ops.gated_delta_rule, so the additivity rules can be
@@ -416,9 +407,7 @@ def test_decode_alias_resolves_through_transformers_subprocess():
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
-# ---------------------------------------------------------------------------
-# Caller-aware availability probe (uncovered models keep the pure-torch path)
-# ---------------------------------------------------------------------------
+# Caller-aware availability probe: uncovered models keep the pure-torch path.
 
 def test_probe_covers_only_vendor_complete_models():
     from unsloth_zoo.temporary_patches.fla_vendor import _vendored_availability_probe
@@ -491,9 +480,7 @@ def test_version_strictly_after():
     assert _version_strictly_after("0.5.2", "0.5.1") is True
     assert _version_strictly_after("0.5.1", "0.5.1") is False
     assert _version_strictly_after("0.5.0", "0.5.1") is False
-    # A dev/nightly of the same release is not counted as newer.
     assert _version_strictly_after("0.5.1.dev3", "0.5.1") is False
-    # A dev build of a later release is newer.
     assert _version_strictly_after("0.6.0.dev1", "0.5.1") is True
     # Unparseable input is conservatively not-newer.
     assert _version_strictly_after("not-a-version", "0.5.1") is False
@@ -570,8 +557,6 @@ def test_hopper_bad_triton_range_is_suspect_but_still_supported():
         assert _hopper_dqkwg_suspect(hopper, tri) is want_on_hopper, ver
         assert _hopper_dqkwg_suspect(blackwell, tri) is False, ver
 
-    # The key inversion: being suspect no longer disables injection. The support
-    # gate must not consult the Hopper predicate at all any more.
     import inspect
 
     from unsloth_zoo.temporary_patches.fla_vendor import _torch_triton_cuda_supported
@@ -639,11 +624,8 @@ def test_hopper_at_nonzero_device_index_trips_guard():
     bad = types.SimpleNamespace(__version__="3.6.0")   # in [3.4.0, 3.7.1)
     ok = types.SimpleNamespace(__version__="3.7.1")    # patched Triton
 
-    # A Hopper card at cuda:1 must trip the guard in the bad Triton range.
     assert _hopper_dqkwg_suspect(ada_then_hopper, bad) is True
-    # Same host, patched Triton: no skip.
     assert _hopper_dqkwg_suspect(ada_then_hopper, ok) is False
-    # No Hopper on any index: never skip.
     assert _hopper_dqkwg_suspect(ada_only, bad) is False
 
 
@@ -673,9 +655,7 @@ def test_blackwell_import_device_scans_visible_devices():
     assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (9, 0)}, 0)) is None
 
 
-# ---------------------------------------------------------------------------
-# Pruned TileLang backend cannot import a broken external tilelang
-# ---------------------------------------------------------------------------
+# Pruned TileLang backend cannot import a broken external tilelang.
 _TILELANG_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
     """
     import os, sys, pathlib, tempfile
@@ -741,9 +721,7 @@ def test_broken_tilelang_does_not_abort_dispatch_subprocess():
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
-# ---------------------------------------------------------------------------
-# Pruned IntraCard CP backend cannot be re-enabled into the missing module
-# ---------------------------------------------------------------------------
+# Pruned IntraCard CP backend cannot be re-enabled into the missing module.
 _INTRACARD_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
     """
     import os, sys
@@ -821,9 +799,7 @@ def test_failed_injection_restores_backend_env(monkeypatch, tmp_path):
     assert "FLA_INTRACARD_CP" not in os.environ
 
 
-# ---------------------------------------------------------------------------
-# Force-rebind: replacing an already-loaded real fla under the escape hatch
-# ---------------------------------------------------------------------------
+# Force-rebind: replacing an already-loaded real fla under the escape hatch.
 _FORCE_REBIND_SUBPROCESS = textwrap.dedent(
     """
     import os, sys, types
@@ -885,9 +861,7 @@ def test_force_rebinds_already_loaded_real_fla_subprocess():
     assert proc.returncode == 0, f"stderr=\n{proc.stderr}"
 
 
-# ---------------------------------------------------------------------------
-# Kernel-hub closures frozen by an import that happened before fla was live
-# ---------------------------------------------------------------------------
+# Kernel-hub closures frozen by an import that happened before fla was live.
 
 def _has_kernel_hub_fallback() -> bool:
     # use_kernel_func_from_hub_with_fallback arrived with huggingface/transformers#47630.

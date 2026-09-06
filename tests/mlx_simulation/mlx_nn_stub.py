@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Unsloth Zoo - Utilities for Unsloth
-# MLX nn stub — Module base + common layers + losses + value_and_grad
 """
 mlx.nn — neural network primitives.
 
@@ -41,11 +39,9 @@ import torch
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
 # nn.Module — lightweight wrapper around torch.nn.Module that mimics MLX's
 # dict-derived parameter model.  MLX's Module IS a dict; here we keep a
 # torch.nn.Module under the hood and expose MLX-flavored API on top.
-# ---------------------------------------------------------------------------
 class Module:
     """Lightweight stand-in for mlx.nn.Module.
 
@@ -123,7 +119,6 @@ class Module:
         yield prefix, self
         seen = {id(self)}
         for attr_name, attr_val in vars(self).items():
-            # plain Module attribute
             if isinstance(attr_val, Module) and id(attr_val) not in seen:
                 seen.add(id(attr_val))
                 sub_prefix = f"{prefix}.{attr_name}" if prefix else attr_name
@@ -135,7 +130,6 @@ class Module:
                         seen.add(id(item))
                         sub_prefix = f"{prefix}.{attr_name}.{i}" if prefix else f"{attr_name}.{i}"
                         yield from item.named_modules(sub_prefix)
-            # dict of Modules
             elif isinstance(attr_val, dict):
                 for k, item in attr_val.items():
                     if isinstance(item, Module) and id(item) not in seen:
@@ -321,10 +315,8 @@ class AvgPool2d(Module):
         return self.pool(x)
 
 
-# ---------------------------------------------------------------------------
 # Quantized layers — dequantize on each forward.  Phase 4 wires these to
 # mlx_helpers/quant.py for affine bit-layouts.
-# ---------------------------------------------------------------------------
 class QuantizedLinear(Module):
     def __init__(self, in_features, out_features, bias=True, group_size=64, bits=4, mode="affine"):
         super().__init__()
@@ -374,11 +366,9 @@ class QuantizedEmbedding(Module):
         return F.embedding(x, w_fp)
 
 
-# ---------------------------------------------------------------------------
 # value_and_grad — MLX's `nn.value_and_grad(model, fn)` returns a function
 # that computes (loss, grads) where grads is a tree shaped like the model's
 # trainable parameters.  See mlx_helpers/value_and_grad.py for the real impl.
-# ---------------------------------------------------------------------------
 def value_and_grad(model, fn=None):
     """mlx.nn.value_and_grad(model, fn) -> (model_aware_loss_and_grad).
 
@@ -392,13 +382,9 @@ def value_and_grad(model, fn=None):
     return nn_value_and_grad(model, fn)
 
 
-# ---------------------------------------------------------------------------
-# Losses
-# ---------------------------------------------------------------------------
 def _ce_loss(logits, targets, axis=-1, weights=None, label_smoothing=0.0,
              reduction="mean", **kw):
     if axis != -1:
-        # rotate target axis last
         logits = logits.movedim(axis, -1)
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_targets = targets.reshape(-1).long()
@@ -427,9 +413,7 @@ losses_module.l1_loss = _l1_loss
 losses_module.binary_cross_entropy = _binary_ce_loss
 
 
-# ---------------------------------------------------------------------------
 # Initializers (returns callables that fill a tensor of given shape)
-# ---------------------------------------------------------------------------
 def _init_constant(value):
     def _init(shape, dtype=torch.float32):
         return torch.full(shape, value, dtype=dtype)
@@ -455,9 +439,7 @@ init_module.normal = _init_normal
 init_module.uniform = _init_uniform
 
 
-# ---------------------------------------------------------------------------
 # Module-level __getattr__: any unknown nn.X returns _Noop.
-# ---------------------------------------------------------------------------
 from . import mlx_stub  # for _Noop
 
 __path__ = []

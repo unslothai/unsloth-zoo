@@ -40,7 +40,6 @@ import torch.nn as nn
 from unsloth_zoo.peft_utils import get_peft_regex
 
 
-# ----------------------------------------------------------------------------- helpers
 def _add(root: nn.Module, path: str, leaf_module: nn.Module):
     *mids, leaf = path.split(".")
     cur = root
@@ -85,7 +84,6 @@ def leaf(name):
     return name.rsplit(".", 1)[-1]
 
 
-# ----------------------------------------------------------------------------- fixtures
 def _text_stack(prefix, n=2, heads=("q_proj", "k_proj", "v_proj", "o_proj"),
                 mlp=("gate_proj", "up_proj", "down_proj")):
     out = []
@@ -95,7 +93,6 @@ def _text_stack(prefix, n=2, heads=("q_proj", "k_proj", "v_proj", "o_proj"),
     return out
 
 
-# Existing architectures (no Gemma embedder / no audio LoRA target today).
 LLAMA      = _text_stack("language_model.layers") + ["lm_head"]
 QWEN3      = _text_stack("language_model.layers") + ["lm_head"]
 QWEN2_VL   = (_text_stack("language_model.layers")
@@ -197,7 +194,6 @@ def _gemma4(size="E2B"):
     return FakeModel(lin, others, name=f"unsloth/gemma-4-{size}-it", model_type="gemma4")
 
 
-# ----------------------------------------------------------------------------- tests
 @pytest.mark.parametrize("arch_name", list(NON_GEMMA_ARCHS) + list(AUDIO_ARCHS))
 @pytest.mark.parametrize("flags", FLAG_COMBOS)
 def test_audio_flag_off_is_inert(arch_name, flags):
@@ -269,7 +265,6 @@ def test_gemma_audio_attaches(builder, name):
                                  finetune_audio_layers=False), ns)
     assert not any(".audio_tower." in n or n.endswith("embed_audio.embedding_projection") for n in off)
 
-    # WITH the fix.
     on = matched(get_peft_regex(model, finetune_vision_layers=False,
                                 finetune_language_layers=True,
                                 finetune_audio_layers=True), ns)
@@ -277,7 +272,6 @@ def test_gemma_audio_attaches(builder, name):
     assert audio_hits, f"{name}: audio_tower got 0 LoRA targets"
     assert any(n.endswith("embed_audio.embedding_projection") for n in on), f"{name}: projector missed"
 
-    # The conformer feed-forward + attention + lconv leaves attach.
     leaves = {leaf(n) for n in audio_hits}
     assert {"ffw_layer_1", "ffw_layer_2"} <= leaves
     assert {"linear_start", "linear_end"} <= leaves
@@ -288,7 +282,6 @@ def test_gemma_audio_attaches(builder, name):
     assert not any(n.endswith("depthwise_conv1d") for n in on)
     assert not any(n.endswith(".conv") or n.endswith("_norm") or n.endswith(".norm") for n in on)
 
-    # Language stack unchanged off<->on.
     assert {n for n in off if ".language_model." in n} == {n for n in on if ".language_model." in n}
 
 
@@ -372,10 +365,8 @@ def test_gemma4_audio_matches_inner_linear_not_wrapper(builder, name):
         return ".audio_tower." in n or "embed_audio" in n or "embed_vision" in n
     bad = [n for n in all_module_names(model) if _ours(n) and n not in lin and re.fullmatch(r, n)]
     assert not bad, f"{name}: regex matched non-Linear audio/embedder modules (wrappers?): {bad[:6]}"
-    # The inner ".linear" audio Linears DO attach.
     inner = [n for n in lin if ".audio_tower." in n and n.endswith(".linear")]
     assert inner and all(re.fullmatch(r, n) for n in inner), f"{name}: inner audio Linears not matched"
-    # ...and bare audio Linears (subsample/output projections) still attach.
     bare = [n for n in lin if ".audio_tower." in n and not n.endswith(".linear")]
     assert bare and all(re.fullmatch(r, n) for n in bare), f"{name}: bare audio Linears not matched"
 
@@ -396,8 +387,6 @@ def test_explicit_leaf_matches_full_segment_not_prefix():
 
 
 def test_audio_respects_attn_mlp_flags():
-    # attention off, mlp on: the conformer attention leaves (q/k/v/post) must not
-    # attach, but the feed-forward leaves must.
     model = _gemma3n()
     ns = linear_names(model)
     on = matched(get_peft_regex(model, finetune_vision_layers=False,
@@ -450,7 +439,6 @@ def test_embedder_branches_gated_to_gemma_model_type():
                                 finetune_language_layers=True), ns)
     assert not any(n.endswith(tuple(shared)) for n in on), \
         f"non-Gemma embedder Linears wrongly targeted: {[n for n in on if n.endswith(tuple(shared))]}"
-    # The very same module names DO attach on a Gemma model.
     gem = _gemma4("12B")
     gon = matched(get_peft_regex(gem, finetune_vision_layers=True,
                                  finetune_language_layers=True), linear_names(gem))
@@ -462,7 +450,6 @@ def test_projector_branches_gated_under_mlp_flag():
     # runs (finetune_mlp_modules=False) must not pick them up; mlp-on must.
     model = _gemma3n()
     ns = linear_names(model)
-    # attention-only -> no projectors
     attn_only = matched(get_peft_regex(model, finetune_vision_layers=True,
                                        finetune_language_layers=True,
                                        finetune_attention_modules=True,
@@ -472,7 +459,6 @@ def test_projector_branches_gated_under_mlp_flag():
         "vision projector attached under attention-only"
     assert not any(n.endswith("embed_audio.embedding_projection") for n in attn_only), \
         "audio projector attached under attention-only"
-    # mlp-on -> projectors present
     mlp_on = matched(get_peft_regex(model, finetune_vision_layers=True,
                                     finetune_language_layers=True,
                                     finetune_attention_modules=False,
@@ -484,7 +470,6 @@ def test_projector_branches_gated_under_mlp_flag():
 
 def test_guard_allows_audio_only_and_blocks_nothing_selected():
     model = _gemma3n()
-    # nothing selected -> raises
     with pytest.raises(RuntimeError):
         get_peft_regex(model, finetune_vision_layers=False,
                        finetune_language_layers=False, finetune_audio_layers=False)

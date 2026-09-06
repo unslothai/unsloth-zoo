@@ -127,8 +127,6 @@ def test_get_batch_samples_still_returns_the_documented_pair():
     )
 
 
-# Numerical: the guard is what makes accumulated gradients match a single batch.
-
 def _tiny_model():
     """A token normalising loss: sum / count when a count is given, mean otherwise.
 
@@ -256,9 +254,6 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
     )
 
 
-
-# Packed / padding-free boundary counting.
-#
 # The N-1 internal boundaries of a packed row are not training positions, but
 # subtracting N-1 double counts every boundary a collator already masked with
 # -100 (TRL >= 0.23.1 labels[position_ids == 0] = -100, completion_only_loss /
@@ -516,7 +511,6 @@ def test_applying_the_boundary_removal_twice_is_idempotent():
     first = _counted(batch)
     second = _counted(batch)
     assert first == second == 7, f"first {first}, second {second}"
-    # And the caller's batch must come back unharmed.
     assert int((batch["labels"] != -100).sum()) == 7, (
         "the counting path mutated the caller's labels"
     )

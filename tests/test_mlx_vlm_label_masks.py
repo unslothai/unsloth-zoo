@@ -1443,7 +1443,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
         completion_only_loss=False)
     assert off["labels"].dtype == off["input_ids"].dtype
 
-    # MLX-returning processors flag host_valued=False, nested too; reject raises first.
     assert _vlm_inputs_host_valued(
         {"input_ids": np.array([[1]])}) is True
     assert _vlm_inputs_host_valued(
@@ -1474,7 +1473,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
             yield_host_staged=True))
     assert probe.pulls == 0 and probe.epochs == []
 
-    # Value-carrying closures finalize through the legacy pipeline unchanged.
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
     def _value_closure(mask_batch):
         width = len(mask_batch["input_ids"][0])
@@ -1553,7 +1551,6 @@ def test_vlm_prefetch_identity_laziness_and_masked_rejection():
     assert prefetched == sync  # bit-for-bit consumer-visible sequence
     assert control["prefetcher"].close()
 
-    # Trainer wiring: eligibility, control registration, and cleanup.
     shell_probe = _LifecycleVLMRows(6)
     trainer = _vlm_trainer_shell_for(shell_probe, prefetch=2)
     _b, shell_stream = trainer._prepare_data(is_vlm=True)
@@ -1909,11 +1906,9 @@ def test_a_natively_shared_backbone_gets_no_legacy_slots():
     # Native: no slots at all, so `cache` stays unset and every layer runs.
     assert _build_shared_kv_caches(_model(4, 2, native=True)) is None
 
-    # Legacy backbones still get exactly one slot per producer layer.
     legacy = _build_shared_kv_caches(_model(4, 2, native=False))
     assert legacy is not None and len(legacy) == 2
 
-    # And a stack that shares nothing is unaffected either way.
     assert _build_shared_kv_caches(_model(4, 0, native=False)) is None
     assert _build_shared_kv_caches(_model(4, 0, native=True)) is None
 
@@ -2116,7 +2111,6 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     assert _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=None),
         mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
-    # But it is replaced once the token types are there.
     replaced = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product),
         mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
@@ -2142,7 +2136,6 @@ def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
     got = wrapped(object(), mx_.zeros((1, 4), dtype=mx_.int32), None,
                   mx_.ones((1, 4), dtype=mx_.int32),
                   token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
-    # Upstream still runs and still sees its kwargs.
     assert "token_type_ids" in seen["kwargs"]
     # And its all-visible mask does not survive: the suffix cannot read ahead.
     assert got.attention_mask_4d is not outer_product
@@ -2182,7 +2175,6 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
 
     assert seen["mask"] is not outer_product
     assert not np.asarray(seen["mask"]).reshape(4, 4)[2, 3]
-    # And nothing is left pending once the call returns.
     assert _paligemma_pending_token_types() is None
 
 
@@ -2267,7 +2259,6 @@ def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
     for thread in threads:
         thread.join(timeout=10)
 
-    # Each caller saw its own token types, not the other's.
     for name, mark in marks.items():
         assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
     assert _paligemma_pending_token_types() is None
@@ -2374,7 +2365,6 @@ def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
         model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
     assert not _fix_gemma3n_altup_batch(model)
     assert cls.correct is fixed, "an already-correct release must be left alone"
-# --- Audio input collation -------------------------------------------------
 
 
 class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
@@ -2641,7 +2631,6 @@ def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
     batch, is_pc = _finalized_collate([pc_row], processor, 16, None,
                                       return_prompt_completion=True)
     assert is_pc and "input_features" in batch
-
 
 
 def test_placeholders_without_features_are_rejected(monkeypatch):
@@ -3268,8 +3257,6 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
 
     # Same family name, so the repair is reached, but not independently
     # copyable -- correcting either would correct the caller's own processor.
-    # A copy that is the original, and one that keeps its own attributes but
-    # writes just that hook through -- the narrowest sharing there is.
     for cls in (type("Gemma4Processor", (Gemma4Processor,),
                      {"__copy__": lambda self: self}),
                 type("Gemma4Processor", (_ForwardsTheHook,), {})):
@@ -3341,7 +3328,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
 
     model = _Model()
     original = model.get_input_embeddings
-    # Every caller taking a hold is told so, and releases exactly one.
     assert install_audio_merge_patch(model, 1) is True
     assert install_audio_merge_patch(model, 1) is True    # second holder
     assert remove_audio_merge_patch(model) is False       # first release
@@ -3355,7 +3341,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
     install_audio_merge_patch(model, 1)
     remove_audio_merge_patch(model)
     assert model.get_input_embeddings() == "instance wrapper"
-
 
 
 def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
@@ -3560,7 +3545,6 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
 
     # The real checkpoint's shape: model_type present, neither index declared.
     assert _phi4mm_token_ids({"model_type": "phi4mm"}) == expected
-    # A config that does declare them wins over the defaults.
     assert _phi4mm_token_ids(
         {"image_token_index": -7, "audio_token_index": 11}
     ) == (-7, 11)
@@ -3714,8 +3698,6 @@ def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
     assert _raw_row_has_audio({"messages": messages}) is True
     assert _raw_row_has_audio(messages) is True, "the same row, unwrapped"
 
-    # An unqualified family must still be refused when the formatter hides the
-    # clips, which is the whole point of scanning before formatting.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     monkeypatch.setattr(
@@ -3746,11 +3728,9 @@ def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
     row = {"role": "user", "content": [{"type": "audio", "audio": clip},
                                        {"type": "text", "text": "transcribe"}]}
 
-    # Supported: collation turns this row into exactly one message.
     assert len(_normalize_vlm_messages(row)) == 1
     assert _raw_row_has_audio(row) is True
 
-    # A message dict carrying no audio must not be gated.
     assert _raw_row_has_audio(
         {"role": "user", "content": [{"type": "text", "text": "hi"}]}
     ) is False
@@ -3858,7 +3838,6 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
                     assert np.array_equal(
                         np.asarray(clip), ramp["array"]), (part, content)
 
-    # A type outside the audio spellings is never rewritten.
     kept = _normalize_vlm_messages(
         [{"role": "user", "content": [{"type": "video", "video": "v.mp4"}]}])
     assert kept[0]["content"][0]["type"] == "video"
@@ -5235,7 +5214,6 @@ def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
         prompt_utils, "qwen3_omni_moe", messages, num_images = 1, num_audios = 2, kwargs = {},
     )
 
-    # One audio is missing conversation-wide; it goes to the anchor only.
     assert [part.get("type") for part in template[0]["content"]] == ["image", "audio", "text"]
     assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
 

@@ -108,9 +108,6 @@ def test_save_lora_adapters_keeps_only_lora_tensors(tmp_path):
 
 
 def test_save_lora_adapters_does_not_leak_paths_containing_lora_(tmp_path):
-    # Anchor-on-modules filter must drop a non-LoRA tensor whose path
-    # happens to contain "lora_" (e.g. a routing layer literally named
-    # `lora_router`).
     from unsloth_zoo.mlx.utils import save_lora_adapters
 
     real = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -173,8 +170,6 @@ class _MockHalfLoRA:
 
 
 def _make_model_with_named_modules(layers):
-    # Variant of _make_model that exposes upper- and lower-case LoRA attr
-    # pairs when listing parameters.
     class _M:
         def __init__(self):
             for k, v in layers.items():
@@ -210,11 +205,6 @@ def _make_model_with_named_modules(layers):
 
 
 def test_collect_lora_helper_skips_uppercase_only_module(tmp_path):
-    # mlx-lm reload only recreates lowercase lora_a/lora_b wrappers, so
-    # adapter tensors saved under uppercase keys can never bind back to
-    # the recreated wrappers. The collector must skip these modules and
-    # save_lora_adapters must raise rather than silently produce an
-    # unreloadable artifact.
     from unsloth_zoo.mlx.utils import (
         collect_mlx_lora_adapter_tensors,
         save_lora_adapters,
@@ -230,9 +220,6 @@ def test_collect_lora_helper_skips_uppercase_only_module(tmp_path):
 
 
 def test_collect_lora_helper_drops_half_adapter_module(tmp_path):
-    # A module that only exposes lora_a (no lora_b) cannot be reloaded; the
-    # collector must skip it so save_lora_adapters surfaces the empty-set
-    # error rather than write a half-broken adapter file.
     from unsloth_zoo.mlx.utils import (
         collect_mlx_lora_adapter_tensors,
         save_lora_adapters,
@@ -294,8 +281,6 @@ def test_collect_lora_helper_finds_adapters_after_reload():
             }
 
         def trainable_parameters(self):
-            # mimic the post-reload state where adapter tensors are not
-            # explicitly marked trainable.
             return {"up_proj.weight": plain.weight}
 
         def named_modules(self):
@@ -539,8 +524,6 @@ def test_save_pretrained_merged_lora_mixed_external_drops_inside_lora_base(tmp_p
                 "embed_tokens.weight": embed,
             }
         def trainable_parameters(self):
-            # mimic reload: base weight inside the LoRA module is unfrozen
-            # AND user intentionally trains the embedding.
             return self.parameters()
         def named_modules(self):
             yield "", self
@@ -560,9 +543,6 @@ def test_save_pretrained_merged_lora_mixed_external_drops_inside_lora_base(tmp_p
 
 
 def test_save_pretrained_merged_lora_strips_accidental_trainable_base_tensors(tmp_path):
-    # After a reload, base weights such as q_proj.weight may end up
-    # marked trainable. save_method="lora" must still ship a lean
-    # adapter file rather than leaking those base tensors.
     from unsloth_zoo.mlx.utils import save_pretrained_merged
 
     lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -602,9 +582,6 @@ def test_save_pretrained_merged_lora_strips_accidental_trainable_base_tensors(tm
 
 
 def test_save_pretrained_merged_merged_methods_skip_lora_collection(tmp_path, monkeypatch):
-    # Merged exports (merged_16bit / merged_4bit) must not call the
-    # adapter collector; the lora-only presence check belongs inside
-    # the method == "lora" branch.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     collect_calls = []
@@ -779,8 +756,6 @@ def test_save_pretrained_merged_lora_method_preserves_external_trainables(
 def test_save_pretrained_merged_lora_method_pure_lora_uses_lean_writer(
     tmp_path, monkeypatch
 ):
-    # When no non-LoRA tensor is trainable, the public API keeps the lean
-    # adapter-only artifact (no over-eager routing to the trainable writer).
     from unsloth_zoo.mlx import utils as mlx_utils
 
     lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -834,10 +809,6 @@ def test_save_pretrained_merged_lora_method_pure_lora_uses_lean_writer(
 def test_save_trainable_adapters_preserves_frozen_lora_alongside_trainable_norm(
     tmp_path,
 ):
-    # After a checkpoint reload + norm-only fine-tune, the LoRA pair lives
-    # in parameters() but is absent from trainable_parameters(). The
-    # checkpoint writer must still emit the LoRA tensors so the saved
-    # artifact remains a valid, reloadable adapter file.
     from unsloth_zoo.mlx.utils import save_trainable_adapters
 
     lora = _MockLoRALinear(8, 16, 4, 1.0, _MockDropoutKeepProb(0.0))
@@ -1026,7 +997,6 @@ def test_save_trainable_adapters_drops_quantized_base_scales_biases(tmp_path):
     assert "q_proj.weight" not in keys
     assert "q_proj.scales" not in keys
     assert "q_proj.biases" not in keys
-    # Singular `.bias` is a legitimate Linear bias, not quantization state.
     assert "q_proj.bias" in keys
 
 
@@ -1130,8 +1100,6 @@ def test_save_trainable_adapters_preserves_bias_under_lora_wrapped_linear(tmp_pa
     from safetensors.torch import load_file
 
     class _LoRALinearWithBias:
-        # Path: q_proj has lora_a / lora_b plus the wrapped base
-        # Linear's weight + bias (flattened to q_proj.weight, q_proj.bias).
         def __init__(self):
             self.lora_a = _t.zeros(4, 8)
             self.lora_b = _t.zeros(8, 4)
@@ -1162,8 +1130,6 @@ def test_save_trainable_adapters_preserves_bias_under_lora_wrapped_linear(tmp_pa
     save_trainable_adapters(_Model(), out)
     keys = set(load_file(out / "adapters.safetensors").keys())
 
-    # LoRA tensors kept; base weight inside LoRA dropped; bias kept;
-    # external weight kept.
     assert "q_proj.lora_a" in keys
     assert "q_proj.lora_b" in keys
     assert "q_proj.weight" not in keys
@@ -1186,7 +1152,6 @@ def test_enrich_stamps_fine_tune_type_full_when_no_lora_modules(tmp_path):
 
     cfg = _enrich_mlx_adapter_config(_Model(), {})
     assert cfg.get("fine_tune_type") == "full", cfg
-    # Should NOT have peft_type=LORA on a full-finetune save.
     assert cfg.get("peft_type") is None or cfg.get("peft_type") != "LORA", cfg
 
 
@@ -1254,7 +1219,6 @@ def test_is_lm_head_trainable_skips_base_weight_under_lora_wrapped_lm_head(monke
         def named_modules(self):
             yield "lm_head", self._lm
 
-    # lm_head.weight under a LoRA-wrapped lm_head must be filtered out;
     # the trainable check should return False (LoRA-only training). The
     # descriptor is stubbed to resolve this head so the leaked-base filter
     # is actually on the decision path (an unresolved head would return
@@ -1312,7 +1276,6 @@ def test_push_lora_adapters_uses_allow_patterns_to_avoid_stale_uploads(
     patterns = sent["allow_patterns"]
     assert "adapters.safetensors" in patterns
     assert "adapter_config.json" in patterns
-    # No catch-all that would re-include the stale merged-model shard.
     assert "*.safetensors" not in patterns
     assert "*" not in patterns
 
@@ -1380,7 +1343,6 @@ def test_collect_lora_skips_unrelated_m_attribute_on_non_dora_module():
             yield "q_proj", _MockLoRAWithUnrelatedM()
 
     tensors = collect_mlx_lora_adapter_tensors(_Model())
-    # lora_a / lora_b must be collected; `m` must not (non-DoRA class).
     assert "q_proj.lora_a" in tensors
     assert "q_proj.lora_b" in tensors
     assert "q_proj.m" not in tensors
@@ -1445,9 +1407,6 @@ def test_push_to_hub_merged_honors_create_pr_via_upload_folder(
         create_pr=True,
     )
 
-    # Custom commit_message + create_pr=True must route through
-    # upload_folder so both reach the Hub. upload_large_folder would
-    # silently drop them.
     assert len(calls["folder"]) == 1, calls
     assert calls["large"] == [], calls
     sent = calls["folder"][0]
@@ -1504,9 +1463,6 @@ def test_push_to_hub_merged_revision_alone_keeps_large_folder_route(
 def test_push_to_hub_merged_uses_large_folder_when_no_custom_metadata(
     tmp_path, monkeypatch,
 ):
-    # When the caller did NOT pass custom commit metadata, prefer
-    # upload_large_folder so multi-GB merged dirs get chunked uploads
-    # with resume. This preserves the original large-merge behavior.
     import huggingface_hub
     from unsloth_zoo.mlx.utils import push_to_hub_merged
 
@@ -1546,9 +1502,6 @@ def test_push_to_hub_merged_uses_large_folder_when_no_custom_metadata(
 def test_push_lora_adapters_falls_back_to_large_folder_when_unavailable(
     tmp_path, monkeypatch,
 ):
-    # On a hypothetical environment without upload_folder (or with a
-    # TypeError signature mismatch), the helper should still complete the
-    # upload via upload_large_folder rather than crash silently.
     import huggingface_hub
     from unsloth_zoo.mlx.utils import _push_lora_adapters_to_hub
 

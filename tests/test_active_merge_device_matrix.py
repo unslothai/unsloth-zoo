@@ -34,10 +34,6 @@ import pytest
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Profile definition
-# ---------------------------------------------------------------------------
-
 @dataclass
 class AcceleratorProfile:
     name: str
@@ -90,10 +86,6 @@ PROFILES = [
 PROFILE_IDS = [p.name for p in PROFILES]
 
 
-# ---------------------------------------------------------------------------
-# Spoofing fixture
-# ---------------------------------------------------------------------------
-
 @pytest.fixture
 def spoof_accelerator(monkeypatch):
     """Apply an AcceleratorProfile to torch in-process and clear the
@@ -129,10 +121,6 @@ def spoof_accelerator(monkeypatch):
 
     _active_merge_device.cache_clear()
 
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("profile", PROFILES, ids=PROFILE_IDS)
 def test_active_merge_device_cascade(profile, spoof_accelerator):

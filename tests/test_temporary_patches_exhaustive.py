@@ -194,7 +194,6 @@ def _maybe_skip_if_patched(cls, method_name: str, zoo_file: str) -> None:
     storage_key = _original_attr_name(cls, method_name)
     original = getattr(cls, storage_key, None)
     if original is not None:
-        # We have the upstream original stashed; tests use it directly.
         return
     qualname = getattr(live, "__qualname__", "") or ""
     if ".<locals>." in qualname and qualname.split(".", 1)[0].startswith("patch_"):
@@ -436,7 +435,6 @@ def test_deepseek_v3_moe_forward_single_positional():
         pytest.skip(f"DeepseekV3MoE absent on transformers {_TX_VERSION}")
     fwd = _assert_method_exists(cls, "forward", "deepseek_v3_moe.py")
     params = _param_names(fwd)
-    # Drop "self".
     params = [p for p in params if p != "self"]
     required = [p for p in inspect.signature(fwd).parameters.values()
                 if p.name != "self" and p.default is inspect.Parameter.empty
@@ -477,7 +475,6 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
         zoo_file="deepseek_v3_moe.py",
         label="DeepseekV3ForCausalLM.forward",
     )
-    # output_router_logits: explicit param OR **kwargs passthrough.
     if "output_router_logits" not in _param_names(fwd) and not _has_var_keyword(fwd):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/deepseek_v3_moe.py:171 "
@@ -2514,8 +2511,6 @@ def test_gemma3_processor_kwargs_class_present():
         )
 
 
-# gemma3n.py additional pins.
-
 def test_gemma3n_for_conditional_generation_class_present():
     """gemma3n.py patches Gemma3nModel.get_placeholder_mask; pin
     Gemma3nForConditionalGeneration."""
@@ -2646,8 +2641,6 @@ def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
             )
 
 
-# Caches the patches require.
-
 def test_static_cache_class_present():
     """gemma.py:255 isinstance(past_key_values, StaticCache)."""
     cu = importlib.import_module("transformers.cache_utils")
@@ -2698,8 +2691,6 @@ def test_hybrid_cache_class_present():
     )
 
 
-# bitsandbytes.py: Linear4bit __init__ signature pin.
-
 def test_bitsandbytes_linear4bit_init_signature():
     """bitsandbytes.py:46-47 needs
     ``bitsandbytes.nn.modules.Linear4bit.__init__(input_features,
@@ -2720,8 +2711,6 @@ def test_bitsandbytes_linear4bit_init_signature():
     )
 
 
-# pixtral.py: PixtralVisionConfig.
-
 def test_pixtral_vision_config_class_present():
     """pixtral.py:36 reads self.config attrs; pin PixtralVisionConfig."""
     cls = _try_get_class(
@@ -2735,8 +2724,6 @@ def test_pixtral_vision_config_class_present():
             f"{_TX_VERSION}"
         )
 
-
-# gemma3n.py: Gemma3nTextConfig pin (AltUp.predict config typing).
 
 def test_gemma3n_text_config_class_present():
     """gemma3n.py:101-114 reads
@@ -2762,8 +2749,6 @@ def test_gemma3n_text_config_class_present():
             )
 
 
-# Auto-attention function dictionary for gemma3 patch chain.
-
 def test_gemma3_eager_attention_forward_kwargs_supported():
     """gemma.py:407-412 calls ``eager_attention_forward(...,
     dropout, scaling, sliding_window, **kwargs)``."""
@@ -2776,8 +2761,6 @@ def test_gemma3_eager_attention_forward_kwargs_supported():
             f"{inspect.signature(eager_attention_forward)}"
         )
 
-
-# Sanity: temporary_patches/ inventory.
 
 def test_temporary_patches_directory_has_expected_files():
     """Pin the floor set of patch files; new files OK, missing -> DRIFT."""
@@ -2811,10 +2794,8 @@ def test_a_broken_dependency_is_not_reported_as_upstream_drift():
     timm dropped, so eight tests announced "missing on transformers 4.57.6"
     about classes transformers 4.57.6 ships.
     """
-    # Absent module: still None, so the callers still judge it.
     assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
 
-    # Present but raising, on a dependency of its own: skipped, not blamed.
     module_name = "_zoo_probe_broken_import"
     module = types.ModuleType(module_name)
 

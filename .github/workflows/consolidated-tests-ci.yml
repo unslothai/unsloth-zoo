@@ -299,6 +299,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
+        # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
+        #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one
         # shipped broken for the same reason this comment keeps repeating -- the
@@ -369,6 +373,7 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_disabled_hook_checkpoint_guard.py \
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             -v
@@ -780,6 +785,8 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_vision_utils_grid_helpers_eager.py \
+                  tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \

@@ -127,8 +127,6 @@ def _draw_after_seed(seed):
     return _draw()
 
 
-# --- Key arithmetic ---
-
 @pytest.mark.parametrize("seed", [
     0, 1, 2**31 - 1, 2**31, 2**32 - 1, 2**32, 2**63 - 1, 2**63, 2**64 - 1,
     _SPLIT_KEY_SEED,
@@ -293,8 +291,6 @@ def test_an_unreadable_state_does_not_warn():
             assert _mlx_rng_key() is None
 
 
-# --- _preserved_preprocessing_rng ---
-
 def test_preserved_preprocessing_rng_rewinds_the_mlx_key():
     mx.random.seed(99)
     expected = _draw()
@@ -331,8 +327,6 @@ def test_preserved_preprocessing_rng_is_inert_when_the_state_is_unreadable():
             with _preserved_preprocessing_rng():
                 raise KeyError("inner")
 
-
-# --- Compile fallback ---
 
 class _TinyLM(nn.Module):
     def __init__(self):
@@ -462,7 +456,6 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
             node = parents[node]
             yield node
 
-    # Both restores must sit on a recovery branch and precede its eager retry.
     # The branch type is not pinned: single-process recovers inside `except`,
     # DDP inside an `if` after the try (it syncs ranks first).
     for restore in restores:

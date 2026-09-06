@@ -159,7 +159,6 @@ def test_operator_itemgetter_still_works():
 
 
 def test_class_helpers_still_work():
-    # Generated helpers are occasionally written as a small class.
     source = (
         "def matmul(A, B):\n"
         "    class Base:\n"
@@ -236,7 +235,6 @@ def test_dunder_method_definitions_are_denied():
 
 
 def test_ordinary_dunder_methods_still_allowed():
-    # __init__ and the comparison protocol are ordinary in helper classes.
     source = (
         "def matmul(A, B):\n"
         "    class Node:\n"
@@ -297,8 +295,6 @@ def test_clock_setters_denied_but_clocks_readable():
 
 
 def test_not_implemented_is_available():
-    # The comparison dunders we allow are expected to return NotImplemented
-    # for operands they do not handle.
     source = (
         "def matmul(A, B):\n"
         "    class N:\n"

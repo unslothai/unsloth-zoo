@@ -131,13 +131,11 @@ def test_fp8_dense_dequantizes_and_drops_scales(tmp_path):
 
     with safe_open(str(shard), framework="pt", device="cpu") as f:
         keys = list(f.keys())
-        # No FP8 left, no dangling scale companions.
         assert all(f.get_tensor(k).dtype != torch.float8_e4m3fn for k in keys)
         assert not any(k.endswith(("weight_scale", "weight_scale_inv", "input_scale")) for k in keys)
         # Dequantized weight matches the real value within FP8 round-trip tolerance.
         merged = f.get_tensor("model.layers.0.mlp.down_proj.weight").float()
         assert torch.allclose(merged, W_real, atol=0.05)
-        # bf16 passthrough tensor preserved.
         assert "lm_head.weight" in keys
 
 
@@ -180,7 +178,7 @@ def test_fp8_dense_missing_scale_raises(tmp_path):
 
     W_fp8, _ = _fp8_quant_channel(torch.randn(16, 16) * 0.1)
     shard = tmp_path / "model.safetensors"
-    _write_shard(shard, {"model.layers.0.mlp.up_proj.weight": W_fp8})  # no companion scale
+    _write_shard(shard, {"model.layers.0.mlp.up_proj.weight": W_fp8})
 
     with pytest.raises(RuntimeError, match="weight_scale"):
         _merge_and_overwrite_lora(
@@ -204,7 +202,6 @@ def test_fp8_quant_config_detection():
         "quant_method": "compressed-tensors",
         "config_groups": {"group_0": {"weights": {"type": "float", "num_bits": 8}}},
     })
-    # Non-FP8 schemes must NOT be reclassified.
     assert not _is_fp8_quant_config({"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"})
     assert not _is_fp8_quant_config({"quant_method": "mxfp4"})
     # Microscaling FP8 (mxfp8) carries its own block scales, not dense FP8.
@@ -337,7 +334,6 @@ def _run_cross_shard_merge(tmp_path, weight_in, scale_in, process_order):
             keys |= set(f.keys())
             if "model.layers.0.mlp.down_proj.weight" in f.keys():
                 merged = f.get_tensor("model.layers.0.mlp.down_proj.weight")
-    # Weight dequantized via cross-shard scale; orphaned scale dropped; other tensor kept.
     assert merged is not None and merged.dtype == torch.bfloat16
     assert torch.allclose(merged.float(), W_real, atol=0.05)
     assert "model.layers.0.mlp.down_proj.weight_scale" not in keys
@@ -589,7 +585,7 @@ def test_fp8_e5m2_dequantizes(tmp_path):
     amax = W_real.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
     scale = (amax / 57344.0).to(torch.float32)  # e5m2 max ~57344
     q = (W_real / scale).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
-    ref = q.to(torch.float32) * scale  # the correct dequantization
+    ref = q.to(torch.float32) * scale
     shard = tmp_path / "model.safetensors"
     _write_shard(shard, {
         "model.layers.0.mlp.down_proj.weight": q,
@@ -624,7 +620,7 @@ def test_fp8_fused_expert_underscore_scale(tmp_path):
     shard = tmp_path / "model.safetensors"
     _write_shard(shard, {
         "model.layers.0.mlp.experts.gate_up_proj": W_fp8,
-        "model.layers.0.mlp.experts.gate_up_proj_scale_inv": scale,  # underscore naming
+        "model.layers.0.mlp.experts.gate_up_proj_scale_inv": scale,
     })
 
     _merge_and_overwrite_lora(
@@ -635,7 +631,7 @@ def test_fp8_fused_expert_underscore_scale(tmp_path):
 
     with safe_open(str(shard), framework="pt", device="cpu") as f:
         keys = list(f.keys())
-        assert "model.layers.0.mlp.experts.gate_up_proj_scale_inv" not in keys  # scale dropped
+        assert "model.layers.0.mlp.experts.gate_up_proj_scale_inv" not in keys
         merged = f.get_tensor("model.layers.0.mlp.experts.gate_up_proj").float()
     assert torch.allclose(merged, W_real, atol=0.05)
 
@@ -708,10 +704,8 @@ def test_fp8_keeps_non_companion_scale_tensors(tmp_path):
 
     with safe_open(str(shard), framework="pt", device="cpu") as f:
         keys = set(f.keys())
-        # FP8 companion dropped, weight dequantized.
         assert "model.layers.0.mlp.down_proj.weight_scale" not in keys
         assert f.get_tensor("model.layers.0.mlp.down_proj.weight").dtype == torch.bfloat16
-        # Unrelated *_scale / *_scale_inv tensors preserved (not FP8 companions).
         for k in ("model.layers.0.mlp.router.per_expert_scale", "model.embed_scale",
                   "logit_scale", "model.layers.0.attn.k_scale_inv"):
             assert k in keys, f"{k} was wrongly dropped"
@@ -740,9 +734,7 @@ def test_fp8_preserves_non_fp8_buffer_dtypes(tmp_path):
     )
 
     with safe_open(str(shard), framework="pt", device="cpu") as f:
-        # FP8 weight dequantized to output_dtype.
         assert f.get_tensor("model.layers.0.self_attn.q_proj.weight").dtype == torch.bfloat16
-        # Buffers keep their original dtypes.
         assert f.get_tensor("model.rotary_emb.inv_freq").dtype == torch.float32
         assert f.get_tensor("model.layers.0.attn.bias_mask").dtype == torch.bool
         ids = f.get_tensor("model.position_ids")

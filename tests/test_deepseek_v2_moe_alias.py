@@ -90,8 +90,7 @@ def test_noop_when_neither_name_present(monkeypatch):
 
 
 def test_noop_when_module_import_fails(monkeypatch):
-    # None in sys.modules makes importlib.import_module raise ImportError; the
-    # function's try/except must swallow it.
+    # None in sys.modules makes import_module raise ImportError, which the try/except must swallow.
     _set_tf_version(monkeypatch, "5.0.0")
     monkeypatch.setitem(sys.modules, _LEAF, None)
 

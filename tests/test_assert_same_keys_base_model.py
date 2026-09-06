@@ -76,10 +76,8 @@ class _PeftLike(nn.Module):
 
 
 def test_assert_same_keys_survives_peft_base_without_model():
-    # The exact layout PR #95 reports: base_model present, but it has no `.model`.
     base = _BaseNoModel()
     model = _PeftLikeNoInnerModel(base)
-    # The shared helper must stop at base_model (per-level guard) and not raise.
     assert find_lora_base_model(model) is base
     # new_state_dict is built the way create_lora_statistics does: from find_lora_base_model(model).
     new_state_dict = dict(base.state_dict())  # {"linear.weight": ...}
@@ -88,7 +86,6 @@ def test_assert_same_keys_survives_peft_base_without_model():
 
 
 def test_assert_same_keys_normal_peft_layout_unchanged():
-    # Standard PEFT layout (base_model.model present) must behave exactly as before.
     inner = _Inner()
     model = _PeftLike(_LoraModel(inner))
     assert find_lora_base_model(model) is inner

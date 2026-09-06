@@ -34,7 +34,6 @@ def test_saving_utils_uses_registry_not_inline_helpers():
     helpers live in moe_utils_fp8.py and are imported in."""
     from unsloth_zoo import saving_utils
 
-    # Inline FP8 helpers removed from saving_utils.
     for sym in (
         "_FP8_E4M3_MAX",
         "_fp8_dequant_blockwise",
@@ -46,7 +45,6 @@ def test_saving_utils_uses_registry_not_inline_helpers():
             f"saving_utils still defines {sym!r}; it should live in moe_utils_fp8."
         )
 
-    # Registry entry points wired in.
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         apply_moe_quant_load,
         _MOE_QUANT_UNSAFE,
@@ -210,7 +208,6 @@ def test_fp8_handler_partial_block_needs_block_size():
     assert W_inferred is not _MOE_QUANT_UNSAFE
     err_inferred = (W_inferred.float() - W_real).abs().max().item()
 
-    # With configured block size: correct 128x128 tiling -> matches the real weight.
     W_block, requant = _fp8_save_handler(file, header, "X.weight", block_size=(128, 128))
     assert W_block is not _MOE_QUANT_UNSAFE
     err_block = (W_block.float() - W_real).abs().max().item()
@@ -280,7 +277,6 @@ def test_fp8_handler_per_channel_scale_with_block_size_merges():
     assert loaded[0] is not _MOE_QUANT_UNSAFE, "per-channel scale wrongly rejected"
     W_bf16, requant = loaded
     assert (W_bf16.float() - W_real).abs().max().item() < 0.05
-    # Requant round-trips and preserves the (rows, 1) grid.
     _new_fp8, _dtype, extras = requant(W_bf16)
     _key, new_scale, _sd = extras[0]
     assert tuple(new_scale.shape) == (rows, 1)

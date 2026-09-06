@@ -59,9 +59,6 @@ from importlib.machinery import ModuleSpec
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Permissive module + Noop sentinel — same shape as triton_stub.
-# ---------------------------------------------------------------------------
 class _PermissiveModule(types.ModuleType):
     """Module where any missing attribute returns a `_Noop`.
 
@@ -124,9 +121,6 @@ def _make_module(name, attrs=None):
     return mod
 
 
-# ---------------------------------------------------------------------------
-# Meta-path finder — catches any `import mlx.X.Y.Z` not seeded explicitly.
-# ---------------------------------------------------------------------------
 class _MLXLoader:
     def create_module(self, spec):
         return _make_module(spec.name)
@@ -147,7 +141,6 @@ class _MLXFinder(MetaPathFinder):
     _loader = _MLXLoader()
 
     def find_spec(self, fullname, path, target=None):
-        # Match top-level 'mlx', 'mlx_lm', 'mlx_vlm' or any submodule.
         for prefix in _MLX_PREFIXES:
             if fullname == prefix or fullname.startswith(prefix + "."):
                 if fullname not in sys.modules:
@@ -211,7 +204,6 @@ unsignedinteger = "unsignedinteger"
 inexact = "inexact"
 
 
-# Special scalars
 inf = math.inf
 nan = math.nan
 
@@ -273,7 +265,7 @@ def default_device():
 
 
 def set_default_device(device):
-    pass  # no-op
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +339,6 @@ def depends(*args):
     """mx.depends — explicit dependency edge. No-op in eager torch."""
     return None
 
-
-# ---------------------------------------------------------------------------
-# Tier 2: trivial passthroughs to torch.
-# ---------------------------------------------------------------------------
-# Reductions / elementwise / shape ops mapped 1:1.
 
 class _ArrayMeta(type):
     """Metaclass that makes any torch.Tensor an instance of mx.array.
@@ -525,7 +512,6 @@ def topk(a, k, axis=-1, **kw):
     return torch.topk(a, k=k, dim=axis)
 
 
-# Constructors
 def zeros(shape, dtype=None, **kw):
     if isinstance(shape, int): shape = (shape,)
     return torch.zeros(*shape, dtype=dtype)
@@ -551,7 +537,6 @@ def identity(n, dtype=None, **kw):
     return torch.eye(n, dtype=dtype)
 
 
-# Shape ops
 def reshape(a, shape, **kw): return a.reshape(*shape) if isinstance(shape, (tuple, list)) else a.reshape(shape)
 def flatten(a, start_axis=0, end_axis=-1, **kw): return torch.flatten(a, start_dim=start_axis, end_dim=end_axis)
 def squeeze(a, axis=None, **kw):
@@ -628,7 +613,6 @@ def meshgrid(*xs, indexing="xy", **kw):
     return tuple(torch.meshgrid(*xs, indexing=indexing))
 
 
-# Bitwise
 def bitwise_and(a, b, **kw): return torch.bitwise_and(a, b)
 def bitwise_or(a, b, **kw): return torch.bitwise_or(a, b)
 def bitwise_xor(a, b, **kw): return torch.bitwise_xor(a, b)
@@ -663,10 +647,6 @@ globals()["slice"] = slice_
 def contiguous(a, **kw):
     return a.contiguous() if hasattr(a, "contiguous") else a
 
-
-# ---------------------------------------------------------------------------
-# Submodules: random, linalg, fft, fast, metal, cuda, distributed
-# ---------------------------------------------------------------------------
 
 # --- mx.random — JAX-style key plumbing on top of torch.Generator ----
 def _rng_seed(s):
@@ -733,7 +713,6 @@ random = _make_module("mlx.core.random", {
 })
 
 
-# --- mx.linalg ---
 def _la_norm(a, ord=None, axis=None, keepdims=False, **kw):
     return torch.linalg.norm(a, ord=ord, dim=axis, keepdim=keepdims)
 
@@ -752,7 +731,6 @@ linalg = _make_module("mlx.core.linalg", {
 })
 
 
-# --- mx.fft ---
 fft_mod = _make_module("mlx.core.fft", {
     "fft":   lambda a, **kw: torch.fft.fft(a),
     "ifft":  lambda a, **kw: torch.fft.ifft(a),
@@ -767,7 +745,6 @@ fft_mod = _make_module("mlx.core.fft", {
 })
 
 
-# --- mx.fast ---
 def _fast_sdpa(q, k, v, scale=None, mask=None, **kw):
     return torch.nn.functional.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, scale=scale, is_causal=False)
@@ -822,7 +799,6 @@ fast = _make_module("mlx.core.fast", {
 })
 
 
-# --- mx.metal ---
 def _metal_is_available():
     return False  # we're pretending to be Apple but with no actual Metal
 
@@ -859,13 +835,11 @@ metal = _make_module("mlx.core.metal", {
 })
 
 
-# --- mx.cuda ---
 cuda = _make_module("mlx.core.cuda", {
     "is_available": lambda: torch.cuda.is_available(),
 })
 
 
-# --- mx.distributed ---
 def _dist_is_available(): return False
 def _dist_init(*args, **kw): return None
 def _dist_pass(x, *args, **kw): return x
@@ -887,9 +861,6 @@ distributed = _make_module("mlx.core.distributed", {
 })
 
 
-# ---------------------------------------------------------------------------
-# Saving / loading — safetensors + npz
-# ---------------------------------------------------------------------------
 def save_safetensors(path, arrays, metadata=None, **kw):
     from safetensors.torch import save_file
     if not isinstance(arrays, dict):
@@ -937,7 +908,6 @@ def savez_compressed(path, **arrays):
 
 
 # ---------------------------------------------------------------------------
-# Lazy-graph functions: compile, checkpoint, eval, vmap, grad, custom_function
 # Bodies live in mlx_helpers.compile_passthrough and mlx_helpers.custom_function.
 # ---------------------------------------------------------------------------
 def compile(fn=None, inputs=None, outputs=None, shapeless=False, **kw):
@@ -1024,10 +994,6 @@ def quantize(*args, **kw):
     )
 
 
-# ---------------------------------------------------------------------------
-# inject_into_sys_modules — registers this module under `mlx`/`mlx.core`
-# plus all named submodules.
-# ---------------------------------------------------------------------------
 def inject_into_sys_modules():
     """Install the meta-path finder and register seeded submodules."""
     import builtins

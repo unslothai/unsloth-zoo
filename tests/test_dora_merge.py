@@ -64,7 +64,6 @@ def test_dora_merge_matches_peft():
             with torch.no_grad():
                 p.add_(torch.randn_like(p) * 0.1)
 
-    # Ground truth: PEFT's own DoRA merge.
     merged_peft = copy.deepcopy(pm).merge_and_unload()
     W_peft = None
     for n, p in merged_peft.named_parameters():

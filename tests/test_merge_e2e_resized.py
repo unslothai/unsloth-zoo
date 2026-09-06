@@ -101,10 +101,8 @@ def _check(base, merged, ref_embed, ref_head, adapted, dtype):
 
     assert merged[embed_key].shape[0] == NEW_VOCAB
     assert merged[head_key].shape[0] == NEW_VOCAB
-    # resized weights written through exactly
     assert torch.equal(merged[embed_key], ref_embed), "resized embed mismatch"
     assert torch.equal(merged[head_key], ref_head), "resized lm_head mismatch"
-    # old vocab rows preserved from the base
     assert torch.equal(merged[embed_key][: base[embed_key].shape[0]], base[embed_key]), \
         "old embed rows not preserved"
 

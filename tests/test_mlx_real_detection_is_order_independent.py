@@ -161,7 +161,6 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
     )
 
 
-# --------------------------------------------------------------------------- #
 # The same rule, asked of the VALUE rather than of the source.
 #
 # Everything above is syntactic: it proves a module consults mlx_is_simulated(),
@@ -170,7 +169,6 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
 # gate computed before the module installs its own shim would pass too. So each
 # gate is also EVALUATED, in a subprocess with the shim already up, which is the
 # state a sibling module leaves behind during collection.
-# --------------------------------------------------------------------------- #
 
 def _gate_assignments(tree: ast.AST) -> set:
     """Module-level names whose value is derived from a real-mlx probe.

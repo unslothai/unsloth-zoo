@@ -2540,14 +2540,12 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
         first_conversion="f16",
     )
 
-    # Prebuilt-first is attempted on every platform.
     assert "install_llama_cpp" in calls
     # Export only needs the CPU-only llama-quantize, so gpu_support=False on every
     # platform. On macOS this still resolves the universal unslothai/llama.cpp
     # Metal bundle (same archive from the CPU selector), and the Metal source build
     # is handled by the macOS helper below, not by this flag.
     assert gpu_support_seen["value"] is False
-    # The macOS source helper is reached only on the darwin apt-get path.
     assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
 
 
@@ -2732,7 +2730,6 @@ def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="will not be removed"):
         mutils._install_llama_cpp_macos(str(folder))
 
-    # The user's directory and its contents must be left fully intact.
     assert folder.is_dir()
     assert (folder / "important.txt").read_text() == "precious user file"
 
@@ -3073,7 +3070,6 @@ def test_imatrix_file_true_resolves_the_upstream_gguf_repo(monkeypatch, tmp_path
 
     assert seen["looked_up"] == ["unsloth/Missing-GGUF", "unsloth/TestModel-GGUF"]
     assert seen["token"] == "hf_token"
-    # The download must be authenticated too, and aimed at the repo that actually had the file.
     assert seen["downloaded"] == {
         "repo_id": "unsloth/TestModel-GGUF", "filename": upstream_name, "token": "hf_token",
     }
@@ -3351,7 +3347,6 @@ def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch,
     assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
 
 
-# --- _is_trusted_local_llama_cpp_dir path semantics -------------------------
 # `pip install <dir>` runs that directory's build backend, so the containment
 # check that guards it has to be exact. These cover the ways a naive prefix
 # comparison goes wrong.
@@ -3406,7 +3401,6 @@ def test_trusted_dir_rejects_cwd_relative_checkout(monkeypatch, tmp_path):
     monkeypatch.chdir(cwd)
     assert _trusted(monkeypatch, "llama.cpp", home) is False
     assert _trusted(monkeypatch, os.path.join(".", "llama.cpp"), home) is False
-    # An operator who names that same directory does get the local install.
     assert _trusted(monkeypatch, "llama.cpp", home, env_value=cwd / "llama.cpp") is True
 
 
@@ -3419,7 +3413,6 @@ def test_trusted_dir_accepts_operator_named_checkout(monkeypatch, tmp_path):
     assert _trusted(monkeypatch, studio / "gguf-py", home, env_value=studio) is True
     # Whitespace is stripped, matching how Studio itself reads the variable.
     assert _trusted(monkeypatch, studio, home, env_value=f"  {studio}  ") is True
-    # An empty or blank value must not trust anything.
     assert _trusted(monkeypatch, tmp_path / "other", home, env_value="") is False
     assert _trusted(monkeypatch, tmp_path / "other", home, env_value="   ") is False
 

@@ -44,11 +44,6 @@ import sys
 import types
 
 
-# ---------------------------------------------------------------------------
-# 1. GPU-free harness: pre-load device_type so importing unsloth_zoo
-#    without CUDA / XPU / HIP visible doesn't raise.
-# ---------------------------------------------------------------------------
-
 def _has_real_accelerator() -> bool:
     try:
         import torch
@@ -215,24 +210,17 @@ if not _has_real_accelerator():
     _patch_torch_cuda_for_import()
 
 
-# ---------------------------------------------------------------------------
-# 2. Make ``tests/mlx_simulation`` importable as ``mlx_simulation`` for
-#    the MLX-on-torch shim suite.
-# ---------------------------------------------------------------------------
-
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 
-# ---------------------------------------------------------------------------
 # 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM rename,
 #    peft transformers_weight_conversion shim, etc.) by triggering
 #    ``import unsloth``. Fixes live on ``unsloth/import_fixes.py`` and run
 #    at unsloth import time; zoo no longer carries a copy. Security-only
 #    test suites without unsloth installed keep passing -- ImportError is
 #    swallowed below.
-# ---------------------------------------------------------------------------
 
 def _apply_upstream_import_fixes_for_tests() -> None:
     # Let `import unsloth` succeed on a CPU-only CI runner. The flag is

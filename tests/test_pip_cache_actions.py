@@ -308,7 +308,6 @@ def _requires(expr, leaf):
         ands = _split_top(part, "&&")
         if len(ands) > 1:
             return any(restricted(p) for p in ands)
-        # A leaf. `!` anywhere outside a `!=` is a negation we will not reason about.
         if re.search(r"!(?!=)", part):
             return False
         # The leaf must BE the equality, not contain it. Searching inside accepted
@@ -349,7 +348,6 @@ def _requires(expr, leaf):
         # The reversed operand order is the same guard and stays accepted.
         ("'refs/heads/main' == github.ref", True),
         ("always() && (github.ref == 'refs/heads/main' && !cancelled())", True),
-        # An OR restricts only when every branch does.
         (
             "(github.ref == 'refs/heads/main' && always()) "
             "|| (github.ref == 'refs/heads/main' && failure())",
@@ -360,7 +358,6 @@ def _requires(expr, leaf):
     ],
 )
 def test_the_main_only_check_reads_the_expression(expr, restricted):
-    # The guard below is only as good as this predicate, so the predicate is tested too.
     assert _restricted_to_main(expr) is restricted, expr
 
 
@@ -441,7 +438,6 @@ def test_a_downloaded_artifact_is_saved_after_it_is_downloaded():
                     ),
                     default=None,
                 )
-                # No restore above the save is an offender, not "the top of the job".
                 # Position -1 accepted a restore sitting BELOW its save, which writes
                 # the entry every run and reads it never.
                 if restore_at is None:

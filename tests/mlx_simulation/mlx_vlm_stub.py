@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Unsloth Zoo - Utilities for Unsloth
-# mlx_vlm stub — Unsloth inference + permissive submodules for 40+ VLM archs
 """
 mlx_vlm — Vision Language Model wrapper.
 
@@ -48,7 +47,6 @@ def load(*args, **kwargs):
     )
 
 
-# Submodules
 def _pkg(name):
     """Make a module that's also a package (so finders can resolve submodules)."""
     m = types.ModuleType(name)
