@@ -309,9 +309,8 @@ def linear_to_lora_layers(model, num_layers, config):
     layers = _mlx_language_layers(model)
     type_specs = _mlx_lora_type_specs()
     keys = set(config.get("keys") or ())
-    # Roles are read per layer, so one generic name can be attention beside a
-    # qkv and MLP beside an fc1. Applying the union everywhere would wrap it in
-    # both. Keys the caller added on top of the selection are not layer-local.
+    # A generic name is attention beside a qkv and MLP beside an fc1, so the
+    # union cannot be applied layer-wide; caller keys are not layer-local.
     layer_keys = config.get("layer_keys")
     if layer_keys is not None and len(layer_keys) != len(layers):
         layer_keys = None
@@ -340,8 +339,7 @@ def linear_to_lora_layers(model, num_layers, config):
 
     # Root-module pass: a head named in `keys` sits beside the layers, so the
     # layer walk above never reaches it.
-    # `shared` rather than `keys`: a layer-local path like `ff_proj` can name an
-    # unrelated root module too, and only the caller's own keys belong here.
+    # `shared`, not `keys`: a layer-local `ff_proj` can name a root module too.
     root_replacements = [
         (name, _mlx_lora_from_base(module, config, specs=type_specs))
         for name, module in model.named_modules()
@@ -6545,14 +6543,12 @@ _PROJECTOR_ROLE_TOKENS = frozenset((
     "projector", "projection", "proj", "connector", "aligner", "align",
     "merger", "merge", "resampler", "mlp1",
 ))
-# The subset naming the role outright; "proj", "merge" and "align" also occur
-# on modules that are not connectors.
+# Names the role outright; "proj", "merge" and "align" also occur elsewhere.
 _STRONG_PROJECTOR_TOKENS = frozenset((
     "projector", "projection", "connector", "aligner", "merger", "resampler",
     "mlp1",
 ))
-# `audio_projection` is shaped exactly like a vision connector, so only the
-# modality in the name separates them.
+# `audio_projection` is shaped like a vision connector; only the name differs.
 _OTHER_MODALITY_TOKENS = frozenset((
     "audio", "sound", "speech", "voice", "wav", "mel", "talker",
 ))
@@ -6595,8 +6591,7 @@ def _named_child_modules(module):
     for name, child in children.items():
         if isinstance(child, nn.Module):
             found.append((name, child))
-        # Lists and mappings only: mlx does not register a tuple as a container,
-        # and a tuple could not be written back into if it did.
+        # Lists and mappings only: mlx registers no tuple, and none is writable.
         elif isinstance(child, list):
             found.extend(
                 (f"{name}.{index}", item)
@@ -6622,8 +6617,7 @@ def _navigate(owner, path):
     for segment in str(path).split("."):
         if node is None:
             return None
-        # A plain dict is keyed by the segment itself; a Module is a dict too,
-        # so ask for the attribute there rather than reading its own mapping.
+        # A Module is a dict too, so reach its children by attribute, not key.
         if isinstance(node, dict) and not hasattr(node, "named_modules"):
             node = node.get(segment)
             continue
@@ -6641,8 +6635,7 @@ def _set_child(parent, leaf, value):
         parent[leaf] = value
         return
     try:
-        # A Module is a dict, so `parent[0]` would insert an int key beside the
-        # attribute named "0" rather than replacing it.
+        # A Module is a dict: `parent[0]` inserts an int key beside "0".
         if not isinstance(parent, (list, tuple)):
             raise TypeError
         parent[int(leaf)] = value
@@ -6761,8 +6754,8 @@ def _projector_candidates(owner, owner_path, skip, text_hidden_size):
             continue
         if not _reads_as(name, child, _PROJECTOR_ROLE_TOKENS):
             continue
-        # `text_projection` reads as a strong connector and feeds the decoder
-        # width, but it is the text side of the model, not the bridge to it.
+        # `text_projection` reads as a connector but is the text side, not the
+        # bridge to it.
         if _reads_as(name, child, _NON_VISION_ROLE_TOKENS):
             continue
         # The decoder is what a connector feeds, not something it holds.
@@ -6836,8 +6829,7 @@ def _raise_projector_unresolved(model, vision_path, vision_module):
 # The enclosing block names the role even where the leaf does not.
 _ATTENTION_PATH_TOKENS = frozenset(("attn", "attention", "att"))
 _MLP_PATH_TOKENS = frozenset(("mlp", "ffn", "feedforward", "swiglu", "ff"))
-# Neither table lists `proj` or `dense`, which say that a linear projects
-# without saying what it projects.
+# Neither lists `proj` or `dense`: they say a linear projects, not into what.
 _ATTENTION_LEAVES = frozenset((
     "q", "k", "v", "o", "kv", "qkv", "wq", "wk", "wv", "wo", "wkv", "wqkv",
     "query", "key", "value", "out",
@@ -6873,8 +6865,7 @@ def _linear_role(path):
         tokens = _role_tokens(segment)
         if tokens & _ATTENTION_PATH_TOKENS:
             return "attention"
-        # `feed_forward` splits into two tokens, so the compound needs naming
-        # as well as the joined `feedforward` spelling.
+        # `feed_forward` splits in two, so name it beside `feedforward`.
         if tokens & _MLP_PATH_TOKENS or {"feed", "forward"} <= tokens:
             return "mlp"
     for segment in reversed(segments):
@@ -6981,8 +6972,8 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
     The ``dry_run`` pass is the only source of refusals and warnings: raising
     later would leave adapters for the retry to stack on.
     """
-    # The tower of a wrapper loaded text-only still resolves and adapts, but the
-    # text forward returns before reaching it, so those adapters never train.
+    # A text-only wrapper's tower still adapts, but its forward never reaches
+    # those adapters, so they never train.
     if dry_run and getattr(model, "_unsloth_text_only_vlm", False):
         for flag, requested in (
             (vision_flag, train_vision),
@@ -7014,9 +7005,8 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
         if len(projector_entries) > 1:
             projector_path = projector_path.rpartition(".")[0]
 
-    # Adapting a nested connector here would stack on the projector pass's base.
-    # Only that pass earns the skip: with `train_projector` off there is no
-    # second pass, and skipping would drop a connector the tower pass reached.
+    # Skipping a nested connector avoids stacking on the projector pass's base,
+    # so only that pass earns it: with it off, the connector would go unadapted.
     nested_projectors = [
         attr for owner, attr, _, _ in projector_entries
         if owner is vision_module
@@ -7026,8 +7016,8 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
     if train_vision:
         tower_owner = model if vision_owner is None else vision_owner
         if targets_defaulted:
-            # The canonical names are a decoder vocabulary this code chose
-            # rather than one the caller asked for, and a tower rarely speaks it.
+            # The canonical names are this code's own vocabulary, not the
+            # caller's, and a tower rarely speaks it.
             role_paths = _role_selected_paths(
                 vision_module, finetune_attention_modules,
                 finetune_mlp_modules, skip_subtrees=nested_projectors,
@@ -7039,7 +7029,7 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
                 )
         else:
             # The caller named these, so they decide inside a nested connector
-            # too, unless the projector pass is the one adapting it.
+            # too, unless the projector pass adapts it.
             vision_lora_count = _lora_walk_module(
                 tower_owner, vision_attr, lora_config, target_modules,
                 skip_subtrees=nested_projectors, dry_run=dry_run,
@@ -7058,8 +7048,7 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
             _raise_empty_target_modules()
         _raise_group_empty(
             vision_flag, "vision tower", vision_path, vision_module,
-            # Naming a list the caller never passed sends them to fix the wrong
-            # thing; on the defaulted path the tower itself is the whole story.
+            # Quoting a list they never passed sends them to fix the wrong thing.
             None if targets_defaulted else target_modules,
         )
     if train_projector and projector_lora_count == 0:
@@ -7084,8 +7073,7 @@ def _lora_walk_module(
     """LoRA for encoders and connectors, which lack the flat `.layers` structure
     mlx-lm's `linear_to_lora_layers` expects."""
     try:
-        # The same specs selection reads, so the walk adapts every type
-        # `_role_selected_paths` can hand it, routed experts included.
+        # The specs selection reads, so the walk adapts all it is handed.
         specs = _mlx_lora_type_specs()
     except ImportError:
         return 0
@@ -8809,7 +8797,6 @@ class FastMLXModel:
                 if _cpt_full_specs else set()
             )
 
-            # Freeze everything, then apply LoRA selectively.
             _fix_missing_no_grad(model)
             _fix_gemma4_kv_sharing(model)
             model.freeze()
