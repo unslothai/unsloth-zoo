@@ -2638,7 +2638,12 @@ def _get_mlx_lm_model_class(model_type: str):
         return None
     try:
         module = importlib.import_module(f"mlx_lm.models.{module_name}")
-    except Exception:
+    except (Exception, SystemExit):
+        # SystemExit, because mlx_lm ships modules that `exit(1)` at import when
+        # an optional dependency is missing (`mlx_lm/models/olmo.py` without
+        # ai2-olmo). It is not an Exception, so catching only that killed the
+        # whole load here, with no traceback, over a question whose answer is
+        # "mlx_lm cannot build this one".
         return None
     return getattr(module, "Model", None)
 
@@ -2682,7 +2687,9 @@ def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
 
     try:
         module = importlib.import_module(f"mlx_lm.models.{module_name}")
-    except Exception:
+    except (Exception, SystemExit):
+        # See `_get_mlx_lm_model_class`: an `exit(1)` at import must be a skipped
+        # patch, not a dead process. This runs on every mlx_lm text load.
         return
 
     cls = getattr(module, "Model", None)
@@ -2869,7 +2876,7 @@ def _resolve_mlx_vlm_model_class(model_type):
     ):
         try:
             module = importlib.import_module(candidate)
-        except Exception:
+        except (Exception, SystemExit):
             continue
         cls = getattr(module, "Model", None)
         if cls is not None:
