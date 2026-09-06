@@ -26,25 +26,30 @@ nn = pytest.importorskip("mlx.nn")
 RANK, HIDDEN = 4, 8
 
 
-def _lora_module():
+def _lora_module(wrapped=False):
     module = nn.Linear(HIDDEN, HIDDEN)
-    module.lora_a = mx.zeros((HIDDEN, RANK))
-    module.lora_b = mx.zeros((RANK, HIDDEN))
+    if wrapped:                     # adapters held as modules, not arrays
+        module.lora_a = nn.Linear(HIDDEN, RANK)
+        module.lora_b = nn.Linear(RANK, HIDDEN)
+    else:
+        module.lora_a = mx.zeros((HIDDEN, RANK))
+        module.lora_b = mx.zeros((RANK, HIDDEN))
     return module
 
 
-def _model(names):
+def _model(names, wrapped=False):
     model = type("M", (nn.Module,), {})()
     for name in names:
-        setattr(model, name, _lora_module())
+        setattr(model, name, _lora_module(wrapped))
     return model
 
 
-def _checkpoint(tmp_path, names):
+def _checkpoint(tmp_path, names, wrapped=False):
     path = tmp_path / "adapters.safetensors"
+    suffix = ".weight" if wrapped else ""
     mx.save_safetensors(str(path), {
-        f"{name}.{leaf}": mx.zeros((HIDDEN, RANK) if leaf == "lora_a"
-                                   else (RANK, HIDDEN))
+        f"{name}.{leaf}{suffix}": mx.zeros((HIDDEN, RANK) if leaf == "lora_a"
+                                           else (RANK, HIDDEN))
         for name in names for leaf in ("lora_a", "lora_b")})
     return str(path)
 
@@ -57,9 +62,14 @@ def _warn_on(model, path):
     return [str(w.message) for w in caught]
 
 
-def test_a_checkpoint_covering_every_module_is_silent(tmp_path):
+# A wrapper holding its adapters as modules stores them one level down, so the
+# same coverage is spelled `q_proj.lora_a.weight` rather than `q_proj.lora_a`.
+@pytest.mark.parametrize("wrapped", [False, True],
+                         ids=["adapters as arrays", "adapters as modules"])
+def test_a_checkpoint_covering_every_module_is_silent(tmp_path, wrapped):
     names = ["q_proj", "o_proj"]
-    assert _warn_on(_model(names), _checkpoint(tmp_path, names)) == []
+    assert _warn_on(_model(names, wrapped),
+                    _checkpoint(tmp_path, names, wrapped)) == []
 
 
 def test_a_narrower_checkpoint_names_what_it_does_not_cover(tmp_path):

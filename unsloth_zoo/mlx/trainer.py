@@ -2000,13 +2000,19 @@ def _warn_resume_adapter_mismatch(model, adapter_file):
         return
     try:
         saved = set(mx.load(adapter_file).keys())
-        live = {f"{name}.{leaf}"
-                for name, _ in iter_mlx_lora_modules(model)
-                for leaf in ("lora_a", "lora_b")}
+        live = [name for name, _ in iter_mlx_lora_modules(model)]
     except Exception:
         return                              # never block a resume to report on it
-    uncovered = sorted(name.rpartition(".")[0] for name in live - saved
-                       if name.endswith(".lora_a"))
+
+    # An adapter held as a module rather than an array is stored one level down,
+    # so both spellings name the same weights; collect_mlx_lora_adapter_tensors
+    # writes whichever the wrapper uses.
+    def covered(name, leaf):
+        return (f"{name}.{leaf}" in saved
+                or f"{name}.{leaf}.weight" in saved)
+
+    uncovered = sorted(name for name in live
+                       if not (covered(name, "lora_a") and covered(name, "lora_b")))
     if not uncovered:
         return
     warnings.warn(
