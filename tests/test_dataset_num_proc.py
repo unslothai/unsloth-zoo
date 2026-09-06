@@ -19,9 +19,8 @@ from pathlib import Path
 import pytest
 
 try:
-    # Import before the dnp fixture spoofs sys.platform: multiprocess picks its
-    # concrete contexts from it at import time, so a first import under a spoofed
-    # one hands a Windows runner the POSIX fork contexts.
+    # multiprocess picks its contexts from sys.platform at import time; the dnp fixture
+    # spoofs it, and a first import under the spoof hands a Windows runner POSIX fork contexts.
     import multiprocess  # noqa: F401
 except ImportError:
     pass
@@ -45,15 +44,10 @@ def dnp(monkeypatch):
     module = _load_module()
     module.reset_warning_state()
     monkeypatch.delenv(module.NUM_PROC_ENV_VAR, raising = False)
-    # Pin the platform: macOS is refused by policy whatever the start method
-    # says. Platform tests set their own value afterwards, which wins.
+    # macOS is refused by policy whatever the start method says; platform tests re-pin it.
     monkeypatch.setattr(module.sys, "platform", "linux")
-    # Pin the memory ceiling too, at its two sources rather than at the reader,
-    # so the memory tests can still patch either and win. Every count this
-    # module returns is clamped by free RAM and by the cgroup budget, so on a
-    # memory-limited runner a test about the start method or about an explicit
-    # value silently becomes a test of the clamp instead:
-    # `get_dataset_num_proc(6) == 6` returns 4 in a small container.
+    # Pin the memory ceiling at its two sources, not at the reader, so the memory
+    # tests can still win. Unpinned, `get_dataset_num_proc(6) == 6` returns 4 in a container.
     try:
         import psutil
         monkeypatch.setattr(
@@ -61,28 +55,16 @@ def dnp(monkeypatch):
         )
     except ImportError:
         pass
-    # Point this module's cgroup reader at a path that does not exist rather than
-    # stubbing the reader itself, so the tests that are about it can still
-    # install a fixture tree and win.
+    # Point the cgroup reader at a nonexistent path rather than stubbing it, so reader tests win.
     monkeypatch.setattr(module, "CGROUP_ROOT", "/nonexistent-cgroup-root-for-tests")
-    # hf_xet_tuning's readers are neutralised by name instead, and without
-    # requiring the name to be there: pinning hf_xet_tuning.CGROUP_ROOT alone
-    # only works against an installed zoo that has that global. An older one
-    # still exposes the private dir helpers this module prefers, monkeypatch
-    # finds no attribute to pin, and the policy reads the runner's real cgroup --
-    # which in a memory-limited container turns a test about the start method
-    # into a test of the clamp. The tests that are about these readers install
-    # their own unsloth_zoo.hf_xet_tuning in sys.modules, so they are unaffected.
+    # hf_xet_tuning's readers are neutralised by name, without requiring the name:
+    # an older installed zoo has no CGROUP_ROOT to pin, so the policy would read the
+    # runner's real cgroup. Tests about these readers install their own module.
     try:
         from unsloth_zoo import hf_xet_tuning
     except Exception:
-        # Importing the package can fail long after it has imported this
-        # submodule (__init__ pulls in hf_xet_tuning near the top and only
-        # raises "Please install Unsloth" at the end), and the failure removes
-        # unsloth_zoo from sys.modules while leaving unsloth_zoo.hf_xet_tuning
-        # behind. The module under test reaches it through exactly that cache
-        # entry, so treating the failure as absence would leave the real readers
-        # live on the runner's own /sys/fs/cgroup.
+        # unsloth_zoo/__init__ can raise "Please install Unsloth" after importing
+        # hf_xet_tuning, leaving the submodule cached - which is what the policy reaches.
         hf_xet_tuning = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if hf_xet_tuning is not None:
         for name, neutral in (
@@ -155,8 +137,7 @@ def test_serial_as_none_false_preserves_an_explicit_one(monkeypatch, dnp):
     """
     _force_start_method(monkeypatch, dnp, "fork")
     assert dnp.get_dataset_num_proc(1, serial_as_none = False) == 1
-    # 0 and negatives are incoherent but still mean "not parallel", so they land
-    # on the config serial sentinel (1), not on None.
+    # 0 and negatives still mean "not parallel", so they land on the config serial sentinel (1).
     assert dnp.get_dataset_num_proc(0, serial_as_none = False) == 1
     assert dnp.get_dataset_num_proc(-4, serial_as_none = False) == 1
 
@@ -169,7 +150,6 @@ def test_config_layer_never_returns_none_while_forking_is_available(monkeypatch,
     psutil = pytest.importorskip("psutil")
     _force_cpus(monkeypatch, dnp, 64)
 
-    # memory clamp all the way down to serial
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setattr(
         psutil, "virtual_memory", lambda: type("m", (), {"available": 1 * 1024**3})()
@@ -214,11 +194,8 @@ def test_layering_config_then_map_site_is_correct(monkeypatch, dnp):
     cfg = lambda v: dnp.get_dataset_num_proc(v, serial_as_none = False)  # noqa: E731
     site = dnp.get_dataset_num_proc
 
-    # serial stays serial, never auto-inflated
     assert site(cfg(1)) is None
-    # a specific count is honoured end to end
     assert site(cfg(6)) == 6
-    # nothing asked for -> capped auto, and re-applying is idempotent
     assert cfg(None) == dnp.AUTO_NUM_PROC_CAP
     assert site(cfg(None)) == dnp.AUTO_NUM_PROC_CAP
 
@@ -285,7 +262,6 @@ def test_explicit_value_is_clamped_by_memory(monkeypatch, dnp, capsys):
 
 
 def test_explicit_value_is_not_capped_by_the_auto_cap(monkeypatch, dnp):
-    # AUTO_NUM_PROC_CAP bounds auto-sizing only.
     _force_start_method(monkeypatch, dnp, "fork")
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(
@@ -298,7 +274,6 @@ def test_explicit_value_is_not_capped_by_the_auto_cap(monkeypatch, dnp):
 
 
 def test_memory_clamp_is_skipped_without_psutil(monkeypatch, dnp):
-    # No psutil means no memory reading, so honour the request.
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: None)
     _force_start_method(monkeypatch, dnp, "fork")
     assert dnp.get_dataset_num_proc(32) == 32
@@ -326,8 +301,7 @@ def test_env_override_beats_start_method_veto(monkeypatch, dnp):
     assert dnp.get_dataset_num_proc(None) == 24
 
 
-# "1" belongs here as much as "0": it is the value datasets >= 4.1 turns into a
-# Pool(1), so the hatch has its own instance of this PR's headline trap.
+# "1" belongs here as much as "0": datasets >= 4.1 turns it into a Pool(1).
 @pytest.mark.parametrize("raw", ["0", "none", "None", "false", "", "1"])
 def test_env_override_can_force_in_process(monkeypatch, dnp, raw):
     _force_start_method(monkeypatch, dnp, "fork")
@@ -337,10 +311,7 @@ def test_env_override_can_force_in_process(monkeypatch, dnp, raw):
 
 @pytest.mark.parametrize("raw", ["0", "none", "None", "false", "", "1"])
 def test_env_override_in_process_is_encoded_for_the_config_layer(monkeypatch, dnp, raw):
-    # Regression: the env override used to return before _serial(), writing None
-    # into the *config*, read downstream as "auto-size me" -- so the hatch the
-    # dead-worker message recommends raised the worker count instead of removing
-    # it. Config serial is 1, never None.
+    # Regression: the override returned before _serial(), writing None ("auto-size me") into the config.
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, raw)
     assert dnp.get_dataset_num_proc(16, serial_as_none = False) == 1
@@ -350,10 +321,7 @@ def test_env_override_is_uncapped(monkeypatch, dnp):
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "100")
     assert dnp.get_dataset_num_proc(None) == 100
-    # Above the auto cap is the easy half. The memory clamp is the one that
-    # matters: the fixture leaves room for 512 workers, so without pinning it
-    # this asserts nothing about the exemption. map_failure_diagnostics points
-    # users at this hatch on exactly the host where the clamp would bite.
+    # Pin the clamp too: the fixture otherwise leaves room for 512 workers.
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: 2)
     assert dnp.get_dataset_num_proc(None) == 100
     assert dnp.get_dataset_num_proc(4) == 100
@@ -381,8 +349,7 @@ def test_start_method_probe_prefers_multiprocess_and_has_no_side_effects(dnp):
 
     method = dnp.multiprocessing_start_method()
 
-    # Must name a method this host offers: the private default-context chain has
-    # answered "fork" on Windows, which offers only spawn.
+    # The private default-context chain has answered "fork" on Windows, which offers only spawn.
     assert method in multiprocess.get_all_start_methods()
     assert multiprocess.get_start_method(allow_none = True) == before_mp
     assert multiprocessing.get_start_method(allow_none = True) == before_std
@@ -454,7 +421,6 @@ def test_macos_stays_in_process_even_though_multiprocess_forks(monkeypatch, dnp,
     assert dnp.get_dataset_num_proc(None) is None
     assert "macOS" in capsys.readouterr().out
 
-    # The escape hatch still overrides it, and Linux is unaffected.
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "4")
     assert dnp.get_dataset_num_proc(8) == 4
     monkeypatch.delenv(dnp.NUM_PROC_ENV_VAR)
@@ -492,8 +458,7 @@ _DATASETS_MESSAGE = (
 
 
 def test_worker_death_is_reraised_with_context(dnp):
-    # datasets discards the child's exit status, so its message cannot tell an
-    # OOM kill from anything else.
+    # datasets discards the child's exit status, so its message cannot name an OOM kill.
     with pytest.raises(RuntimeError) as caught:
         with dnp.map_failure_diagnostics(8):
             raise RuntimeError(_DATASETS_MESSAGE)
@@ -504,7 +469,6 @@ def test_worker_death_is_reraised_with_context(dnp):
     assert "8GB" in message, "should estimate what those workers cost"
     assert dnp.NUM_PROC_ENV_VAR in message, "must name the escape hatch"
     assert "out-of-memory" in message
-    # The child's traceback must survive.
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert _DATASETS_MESSAGE in str(caught.value.__cause__)
 
@@ -519,7 +483,6 @@ def test_worker_death_diagnostics_handles_in_process_runs(dnp):
 
 
 def test_unrelated_errors_pass_through_untouched(dnp):
-    # Only the dead-worker message is rewritten; other types are not caught.
     original = RuntimeError("CUDA out of memory")
     with pytest.raises(RuntimeError) as caught:
         with dnp.map_failure_diagnostics(4):
@@ -532,9 +495,7 @@ def test_unrelated_errors_pass_through_untouched(dnp):
             raise key
     assert caught_key.value is key
 
-    # The identity assertions above hold under `except Exception` as well, since
-    # the guard re-raises the same object. This one does not: it carries the
-    # dead-worker text, so a widened clause would rewrite it into a RuntimeError.
+    # This one carries the dead-worker text, so a widened `except` would rewrite it.
     lookalike = ValueError(
         "One of the subprocesses has abruptly died during map operation."
     )
@@ -762,8 +723,7 @@ def test_memory_budget_follows_the_cgroup_not_the_host(monkeypatch, dnp):
 
 
 def test_memory_already_spent_in_the_container_is_not_counted_as_free(monkeypatch, dnp):
-    # Otherwise a container that has already spent most of its limit still reads
-    # as having the whole thing available.
+    # Otherwise a container that has spent most of its limit still reads as free.
     psutil = pytest.importorskip("psutil")
     _force_start_method(monkeypatch, dnp, "fork")
     _force_cpus(monkeypatch, dnp, 64)
@@ -779,8 +739,7 @@ def test_memory_already_spent_in_the_container_is_not_counted_as_free(monkeypatc
 
 
 def test_cpu_count_follows_the_affinity_mask(monkeypatch, dnp):
-    # Under taskset or Slurm pinning the host count is not what this process can
-    # run on, and workers would only contend for the cores it does have.
+    # Under taskset or Slurm pinning, the host count is not what this process can run on.
     psutil = pytest.importorskip("psutil")
     monkeypatch.setattr(psutil, "cpu_count", lambda *a, **k: 128)
     monkeypatch.setattr(dnp, "_cgroup_cpu_quota", lambda: None)
@@ -843,8 +802,7 @@ def test_serial_is_one_when_the_two_modules_disagree(monkeypatch, dnp, capsys):
 
 
 def test_serial_stays_none_when_the_zoo_would_refuse_workers_too(monkeypatch, dnp):
-    # macOS: multiprocess forks, stdlib spawns. Its own veto fires, so None is
-    # genuinely in-process there and 1 would be a pool it did not need.
+    # macOS: multiprocess forks, stdlib spawns. Its own veto fires, so None is genuinely in-process.
     _force_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setattr(dnp.sys, "platform", "darwin")
     _force_stdlib_start_method(monkeypatch, dnp, "spawn")
@@ -906,8 +864,7 @@ def test_free_memory_pairs_each_limit_with_its_own_usage(monkeypatch, dnp, tmp_p
     leaf = slice_dir / "session.scope"
     leaf.mkdir(parents = True)
 
-    # The slice caps 32GB and 30 of them are spent, mostly by a sibling; this
-    # leaf has a 16GB cap of its own and has spent 1.
+    # The slice caps 32GB with 30 spent, mostly by a sibling; the leaf caps 16GB with 1 spent.
     (slice_dir / "memory.max").write_text("34359738368\n")
     (slice_dir / "memory.current").write_text("32212254720\n")
     (leaf / "memory.max").write_text("17179869184\n")
@@ -1066,10 +1023,8 @@ def _no_hf_xet_tuning(monkeypatch):
 
 
 def test_no_unsloth_zoo_and_no_cgroup_is_not_a_ceiling(monkeypatch, dnp, tmp_path):
-    # The cgroup tree is pointed away from the host's on purpose: the unaided
-    # reader needs no unsloth_zoo, so leaving it on the real /sys/fs/cgroup would
-    # make the assertion depend on whether the runner is itself in a limited
-    # container, which is how this test would fail on CI and pass on a laptop.
+    # The cgroup tree is pointed away from the host's: the unaided reader needs no
+    # unsloth_zoo, so the real /sys/fs/cgroup would fail on CI and pass on a laptop.
     _no_hf_xet_tuning(monkeypatch)
     monkeypatch.setattr(dnp, "CGROUP_ROOT", str(tmp_path / "absent"))
     monkeypatch.setattr(dnp, "_proc_self_cgroup", lambda: [])
@@ -1113,8 +1068,7 @@ def test_env_forced_serial_is_in_process_on_a_small_split(monkeypatch, dnp):
 
 
 def test_a_memory_starved_explicit_count_is_in_process_on_a_small_split(monkeypatch, dnp):
-    # Same shape without the env var: the memory clamp resolves to serial, and
-    # under the threshold that has an exact encoding.
+    # Same without the env var: the memory clamp resolves to serial, exactly encodable here.
     _force_start_method(monkeypatch, dnp, "fork")
     _force_stdlib_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: 0)
@@ -1222,8 +1176,7 @@ def test_the_unaided_reader_picks_the_right_line_under_systemd_hybrid(
     v2_leaf.mkdir(parents = True)
     (v2_leaf / "memory.max").write_text("8589934592\n")
     (v2_leaf / "memory.current").write_text("6442450944\n")
-    # The v1 controller root exists but names a different path, so reading the
-    # first line instead of the "0::" one would miss the limit entirely.
+    # The v1 controller root names a different path, so reading the first line misses the limit.
     v1_leaf = tmp_path / "memory" / "slurm" / "job_1"
     v1_leaf.mkdir(parents = True)
     (v1_leaf / "memory.limit_in_bytes").write_text("9223372036854771712\n")
@@ -1252,9 +1205,7 @@ def test_a_bool_num_proc_counts_as_auto_for_the_responses_only_resolver(monkeypa
             self.eval_dataset = None
 
     small = _Trainer(_Split(dnp.ZOO_MIN_ROWS_FOR_MULTIPROC - 1))
-    # Passed straight back, so the helper still sees "auto" and its own per-split
-    # guard runs the small split in-process. Reading the bool as an explicit
-    # count instead would hand it a worker pool.
+    # Passed straight back, so the helper still sees "auto" and runs the small split in-process.
     assert dnp.resolve_responses_only_num_proc(small, True) is True
 
 

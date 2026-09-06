@@ -77,8 +77,7 @@ def _seed_bundle(root):
             }
         )
     )
-    # Trusted bundles are owner-only: mirror the tool's 0600 so the reader
-    # accepts them (umask 0002 would otherwise seed 0664).
+    # Trusted bundles are owner-only: mirror the tool's 0600 (umask 0002 seeds 0664).
     if os.name == "posix":
         (key_dir / bundle_name).chmod(0o600)
         (key_dir / "manifest.json").chmod(0o600)
@@ -102,7 +101,6 @@ def _configure_load(monkeypatch, module, root, loaded):
 def test_megacache_default_is_platform_aware_with_kill_switch(monkeypatch):
     module = _load_module()
 
-    # explicit values win on every platform
     for value in ("1", "on", "true", "yes"):
         monkeypatch.setenv("UNSLOTH_MEGA_CACHE", value)
         assert module.megacache_is_enabled() is True
@@ -190,8 +188,7 @@ def test_megacache_does_not_load_through_directory_symlinks(
     if unsafe_component == "root":
         configured_root = tmp_path / "cache-link"
         configured_root.symlink_to(real_root, target_is_directory = True)
-        # realpath follows the link, so the resolved target must itself be
-        # untrusted (world-writable) to be rejected.
+        # realpath follows the link, so the target itself must be world-writable.
         real_root.chmod(0o777)
     else:
         configured_root = tmp_path / "cache"
@@ -338,8 +335,7 @@ def test_megacache_rejects_cache_below_foreign_owned_sticky_parent(monkeypatch, 
     directory.chmod(0o700)
     parent.chmod(0o1777)
 
-    # Sticky bit is not enough: the parent's owner can rename our leaf, so a
-    # foreign-owned sticky parent is rejected.
+    # Sticky is not enough: the parent's owner can rename our leaf.
     real_lstat = module.os.lstat
 
     def foreign_owner(path, *args, **kwargs):
@@ -363,8 +359,7 @@ def test_megacache_does_not_load_a_group_writable_bundle_file(monkeypatch, tmp_p
     key_dir, _ = _seed_bundle(root)
     root.chmod(0o700)
     key_dir.chmod(0o700)
-    # Directories are trusted, but a group-writable bundle file can be rewritten
-    # in place by a same-group attacker along with its checksum.
+    # A group-writable bundle can be rewritten in place with its checksum.
     (key_dir / "megacache-seeded.bin").chmod(0o664)
 
     loaded = []
@@ -380,8 +375,8 @@ def test_megacache_refuses_a_fifo_bundle_without_blocking(tmp_path):
     fifo = tmp_path / "bundle.fifo"
     os.mkfifo(fifo)
     os.chmod(fifo, 0o600)
-    # O_NONBLOCK keeps the open from hanging on a writerless FIFO so the
-    # S_ISREG check can refuse this non-regular file.
+    # O_NONBLOCK keeps the open from hanging on a writerless FIFO, so the S_ISREG
+    # check can refuse this non-regular file.
     assert module._read_trusted_file(fifo, binary = True) is None
 
 
@@ -413,8 +408,7 @@ def test_megacache_ignores_bundle_name_path_traversal(monkeypatch, tmp_path):
 @pytest.mark.skipif(os.name != "posix", reason = "POSIX umask semantics")
 def test_megacache_creates_private_parents_under_lax_umask(tmp_path):
     module = _load_module()
-    # makedirs' mode only clamps the leaf, so a lax umask must not leave a
-    # group-writable parent that the trust walk would then reject.
+    # makedirs' mode only clamps the leaf, not the parents it creates.
     old = os.umask(0o002)
     try:
         nested = tmp_path / "root" / "unsloth" / "mega_cache"
@@ -464,8 +458,7 @@ def test_megacache_save_does_not_repermission_existing_root(monkeypatch, tmp_pat
     module._STATE["loaded_key"] = "deadbeef"
 
     assert module.megacache_save() is True
-    # A configured root the user pointed at keeps its mode; only our own
-    # per-key child is clamped to owner-only.
+    # A configured root keeps its mode; only our per-key child is clamped.
     assert (root.stat().st_mode & 0o777) == 0o755
     assert ((root / "deadbeef").stat().st_mode & 0o777) == 0o700
 
@@ -496,7 +489,6 @@ def test_megacache_save_repairs_group_writable_existing_bundle(monkeypatch, tmp_
     key_dir.chmod(0o700)
     data = b"artifact-bytes"
     bundle_name = "megacache-%s.bin" % hashlib.sha256(data).hexdigest()[:16]
-    # a leftover group-writable bundle at the content-addressed name
     (key_dir / bundle_name).write_bytes(data)
     (key_dir / bundle_name).chmod(0o664)
     fake_torch = types.SimpleNamespace(compiler = types.SimpleNamespace(
@@ -520,8 +512,7 @@ def test_megacache_cache_root_is_symlink_canonicalized(monkeypatch, tmp_path):
     (tmp_path / "trusted").mkdir()
     (tmp_path / "trusted" / "link").symlink_to(
         tmp_path / "attacker", target_is_directory = True)
-    # A symlink followed by ".." resolves differently than abspath collapses it;
-    # _cache_root must return the real path so validation matches actual access.
+    # A symlink followed by ".." resolves differently than abspath collapses it.
     configured = tmp_path / "trusted" / "link" / ".." / "unsafe"
     monkeypatch.setenv("UNSLOTH_MEGA_CACHE_DIR", str(configured))
     root = module._cache_root()
@@ -537,8 +528,7 @@ def test_megacache_permits_private_key_under_root_owned_sticky_root(monkeypatch,
     shared.chmod(0o1777)
     key_dir.chmod(0o700)
 
-    # Present `shared` as a root-owned sticky parent like /tmp: the per-key dir
-    # is still owned by us, so the bundle must load.
+    # Present `shared` as a root-owned sticky parent like /tmp; the key dir is ours.
     fixture_lstat = module.os.lstat
 
     def sticky_root(path, *args, **kwargs):

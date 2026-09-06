@@ -62,9 +62,6 @@ def _is_array(value):
     return not isinstance(value, (tuple, list)) and hasattr(value, "shape")
 
 
-# --- the array-grid families keep an indexable grid -------------------------
-
-
 @pytest.mark.parametrize("model_type", ["glm4v", "glm_ocr", "muse_glimmer"])
 def test_array_grid_families_get_an_indexable_grid(mutils, model_type):
     out = _prepare(mutils, model_type, image_grid_thw = [[1, 2, 2]])
@@ -77,9 +74,6 @@ def test_compile_patched_families_keep_the_traceable_tuple(mutils, model_type):
     # which is why these keep Python tuples.
     out = _prepare(mutils, model_type, image_grid_thw = [[1, 2, 2]])
     assert isinstance(out["image_grid_thw"], tuple)
-
-
-# --- aliases resolve the same way the loader resolves them ------------------
 
 
 def test_an_aliased_config_still_reaches_the_array_form(mutils, remapping):
@@ -103,9 +97,6 @@ def test_the_video_grid_follows_the_image_grid(mutils, remapping):
     )
     assert _is_array(out["image_grid_thw"])
     assert _is_array(out["video_grid_thw"])
-
-
-# --- resolution never becomes a new way to fail -----------------------------
 
 
 def test_an_unlisted_architecture_is_untouched(mutils, remapping):
@@ -147,9 +138,6 @@ def test_a_capitalised_model_type_resolves_like_mlx_vlm_resolves_it(mutils):
     assert mutils._mlx_vlm_canonical_model_type("Muse_Glimmer") == "muse_glimmer"
 
 
-# --- what the losses accept from a model call -------------------------------
-
-
 def test_logits_come_back_from_a_wrapper_and_from_a_raw_array(mutils):
     import types
     array = object()
@@ -163,9 +151,6 @@ def test_a_wrapper_with_no_logits_says_so(mutils):
     import types
     with pytest.raises(ValueError, match="`logits` is None"):
         mutils._model_logits(types.SimpleNamespace(logits=None))
-
-
-# --- generate() picks the processor by presence, not truthiness -------------
 
 
 def test_generate_keeps_a_falsy_processor(monkeypatch):

@@ -466,9 +466,6 @@ def test_the_norm_does_not_materialize_fp32_copies(unsupported):
     assert "inputs.float() * inputs.float()" not in body
 
 
-# --- the fallback's own cost -------------------------------------------------
-
-
 def _backward_matmul_out_usage(out, seed):
     """Which of `torch.matmul`'s calls during `out.backward(seed)` passed `out=`.
 

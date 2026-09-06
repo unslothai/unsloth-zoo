@@ -163,8 +163,6 @@ def test_pg_forward_source_dispatches_on_width():
     assert "lm_head.shape[1]" in src
 
 
-# --- the property the reshape comment protects -------------------------------
-
 @pytest.mark.parametrize("vocab,hidden", [
     (23, 6),    # vocab not divisible by hidden
     (24, 6),    # divisible: reshaping on lm_head's width would silently succeed

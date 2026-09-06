@@ -41,9 +41,6 @@ if not _HAS_METAL:
 metal_only = pytest.mark.skipif(not _HAS_METAL, reason=_SKIP_REASON)
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def _tiny_text_config(full_attention_interval=2):
     """Tiny qwen3_5 TextConfig.
 
@@ -106,9 +103,6 @@ def _gdn_inputs(B=2, T=6, Hk=1, Hv=2, Dk=128, Dv=128, seed=0):
     return q, k, v, a, b, A_log, dt_bias
 
 
-# --------------------------------------------------------------------------- #
-# (a) GDN: unpatched grad through the Metal kernel raises the VJP ValueError
-# --------------------------------------------------------------------------- #
 @metal_only
 def test_gated_delta_kernel_grad_raises_without_patch():
     """Proves the bug exists: differentiating the Metal gated_delta_kernel
@@ -138,9 +132,7 @@ def test_gated_delta_kernel_grad_raises_without_patch():
     assert "vjp" in str(exc.value).lower() or "CustomKernel" in str(exc.value), exc.value
 
 
-# --------------------------------------------------------------------------- #
 # (b) GDN: patch fixes grad; output matches the use_kernel=False reference
-# --------------------------------------------------------------------------- #
 @metal_only
 def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference(monkeypatch):
     import importlib
@@ -189,10 +181,8 @@ def test_patch_gated_delta_vlm_fixes_grad_and_matches_reference(monkeypatch):
                        rtol=2e-2, atol=2e-2)
 
 
-# --------------------------------------------------------------------------- #
 # (c) MRoPE: fused apply is non-differentiable; flip makes grad work; fused vs
 #     fallback forward match
-# --------------------------------------------------------------------------- #
 @metal_only
 def test_disable_fused_mrope_fixes_rotary_grad():
     import mlx_vlm.models.qwen3_5.language as qlang
@@ -206,7 +196,6 @@ def test_disable_fused_mrope_fixes_rotary_grad():
         layer.self_attn.rotary_emb for layer in model.layers if not layer.is_linear
     ]
     assert rotaries, "no rotary modules built"
-    # On Metal the fused kernel path is active.
     assert all(r.fused_apply for r in rotaries), "expected fused_apply True on Metal"
 
     head_dim = cfg.head_dim
@@ -233,7 +222,6 @@ def test_disable_fused_mrope_fixes_rotary_grad():
     except ValueError as exc:
         assert "vjp" in str(exc).lower() or "CustomKernel" in str(exc), exc
 
-    # Apply the fix.
     _disable_fused_mrope(model)
     assert not any(r.fused_apply for r in rotaries), "fused_apply still True after fix"
 
@@ -253,9 +241,7 @@ def test_disable_fused_mrope_fixes_rotary_grad():
     )
 
 
-# --------------------------------------------------------------------------- #
 # (d) End-to-end: one value_and_grad step on a GDN + attention model
-# --------------------------------------------------------------------------- #
 @metal_only
 def test_end_to_end_training_step_all_patches():
     import mlx_vlm.models.qwen3_5.language as qlang

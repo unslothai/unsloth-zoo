@@ -119,8 +119,6 @@ def _getsource_guards(call: str) -> list:
     ]
 
 
-# ---- the guard ------------------------------------------------------------
-
 def test_getsource_is_wrapped():
     region = _guard_region()
     assert "try:" in region
@@ -173,8 +171,6 @@ def test_the_warning_says_the_model_still_works():
         "a warning during model load must say whether it is fatal")
 
 
-# ---- what must be preserved ----------------------------------------------
-
 def test_lora_patching_happens_before_the_guard():
     """Returning early is only acceptable because the LoRA forwards have
     already been patched by this point."""
@@ -206,8 +202,6 @@ def test_a_bare_return_is_the_functions_contract():
     assert returns, "expected early returns in this function"
     assert any(r.value is None for r in returns)
 
-
-# ---- the second site: loading a SECOND model in one process --------------
 
 def _nn_patch_region() -> str:
     i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
@@ -287,8 +281,6 @@ def test_both_getsource_guards_are_present():
             f"{call} is unguarded, so an unreadable source is fatal again")
 
 
-# ---- what the fallback must still do -------------------------------------
-#
 # Returning early is a degradation, and a degradation has to be honest about
 # which of the surrounding work it gave up. Three separate questions, and they
 # do not have the same answer.
@@ -410,9 +402,6 @@ def test_gradient_accumulation_needs_that_same_source():
             and patch_gradient_accumulation(modeling, name) is not None
         ]
     assert patched == []
-
-
-# ---- the wrapper that stands in for an unreadable torch forward ----------
 
 
 class _Weighted:

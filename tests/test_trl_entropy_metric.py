@@ -115,8 +115,6 @@ def patched():
     sft.entropy_from_logits = original
 
 
-# ---- it degrades instead of failing --------------------------------------
-
 def test_the_unsloth_sentinel_no_longer_raises(patched):
     trl_utils, _, _ = patched
     assert float(trl_utils.entropy_from_logits(EmptyLogits())) == 0.0
@@ -146,8 +144,6 @@ def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
     assert float(torch.sum(e * mask) / mask.sum()) == 0.0
     assert float(torch.mean(e)) == 0.0
 
-
-# ---- and survives the gather trl does next -------------------------------
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
@@ -205,8 +201,6 @@ def test_the_fallback_stays_on_cpu_for_a_cpu_run(patched, monkeypatch):
     assert trl_utils.entropy_from_logits(EmptyLogits()).device.type == "cpu"
 
 
-# ---- and does not quietly break the metric for everyone else -------------
-
 def test_real_logits_are_untouched(patched):
     """The patch must be invisible when logits do exist -- otherwise it turns
     a working metric into a zero for every non-Unsloth user of trl."""
@@ -221,8 +215,6 @@ def test_a_genuine_error_still_raises(patched):
     with pytest.raises(Exception):
         trl_utils.entropy_from_logits("not logits at all")
 
-
-# ---- where it is installed ------------------------------------------------
 
 def test_it_patches_the_module_the_caller_actually_reads(patched):
     """sft_trainer.py does `from ..trainer.utils import entropy_from_logits`,
@@ -246,8 +238,6 @@ def test_it_is_registered(patched):
     assert any(getattr(f, "__name__", "") == "patch_trl_entropy_from_logits"
                for f in TEMPORARY_PATCHES)
 
-
-# ---- the source ----------------------------------------------------------
 
 def _src():
     return (ROOT / "unsloth_zoo" / "temporary_patches" / "misc.py").read_text(encoding="utf-8")

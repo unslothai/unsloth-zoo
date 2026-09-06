@@ -235,7 +235,6 @@ def test_extractor_fallback_warns_when_dims_mismatch(caplog):
 
     assert first.shape == (E, weird_dim, R)
     assert second.shape == (E, R, weird_dim)
-    # At least one warning record mentions the extractor.
     assert any(
         "Qwen MoE LoRA extractor could not match either layout" in rec.getMessage()
         for rec in caplog.records

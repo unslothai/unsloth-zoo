@@ -519,8 +519,6 @@ def test_a_trainer_that_asked_for_outputs_still_gets_them():
     assert outputs is pair[1]
 
 
-# ---- an output object with no logits at all is somebody else's bug ---------
-
 def test_a_missing_logits_attribute_still_raises(sft):
     """`getattr(outputs, "logits", None)` would call an absent attribute
     unusable and retry with the metrics off, turning a broken output contract
@@ -551,8 +549,6 @@ def test_an_explicit_none_logits_is_still_the_sentinel(sft):
     self, _ = _run_steps(sft, None, steps = 2)
     assert self._metrics["train"]["mean_token_accuracy"] == []
 
-
-# ---- the two warnings must not contradict each other ----------------------
 
 def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft, caplog):
     """The entropy patch promises "Entropy will be reported as 0.0". When the
@@ -602,8 +598,6 @@ def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
         Trainer.compute_loss = original
         flag[0] = was
 
-
-# ---- nothing may leave an empty metric list behind ------------------------
 
 def _log_would_divide_by_zero(self):
     """Names of metrics trl's own `log` would choke on.
@@ -677,8 +671,6 @@ def test_a_metric_the_probe_only_extended_is_truncated_not_dropped(sft):
     assert self._metrics["train"]["mean_token_accuracy"] == [0.5, 0.75]
 
 
-# ---- the public positional call shape -------------------------------------
-
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
     """`compute_loss(model, inputs, False, ...)` is a legal public call. Adding
@@ -702,8 +694,6 @@ def test_a_positional_return_outputs_is_replaced_not_duplicated(sft, sentinel):
         Trainer.compute_loss = original
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25]
 
-
-# ---- eval and predict, where the caller already asked for outputs ---------
 
 @pytest.mark.parametrize("sentinel", SENTINELS)
 def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
@@ -732,8 +722,6 @@ def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
         Trainer.compute_loss = original
     assert self._metrics["train"]["aux_loss"] == [0.25, 0.25, 0.25]
 
-
-# ---- a retry that also fails must not latch the trainer -------------------
 
 def test_a_failing_retry_does_not_latch_the_fast_path():
     """If the logits are wanted by something other than the metric block

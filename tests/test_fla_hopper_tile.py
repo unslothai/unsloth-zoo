@@ -66,11 +66,6 @@ def _load_vendored_fla():
     return chunk_o
 
 
-# ---------------------------------------------------------------------------
-# 1. Tile selection: BK must never land on 64 in the affected range
-# ---------------------------------------------------------------------------
-
-
 _KEEP = object()
 
 
@@ -189,8 +184,6 @@ def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
     )
     chunk_o._device_is_nvidia_hopper.cache_clear()
     try:
-        # hopper=False -> the module global does NOT report Hopper, exactly as on a
-        # host whose device 0 is not Hopper. The tensor's device does.
         got = _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)
         assert got["BK"] == 32, (
             "a Hopper device that the import-time global missed still selected the "
@@ -206,11 +199,6 @@ def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
     monkeypatch.undo()
     chunk_o._device_is_nvidia_hopper.cache_clear()
     assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=False)["BK"] == 64
-
-
-# ---------------------------------------------------------------------------
-# 2. The override is a tiling change, not an algebra change
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
@@ -272,11 +260,6 @@ def test_bk_override_does_not_change_gradients(monkeypatch):
         denom = a.norm().clamp_min(1e-12)
         rel = (a - b).norm() / denom
         assert rel < 5e-3, f"{name}: BK=32 diverged from BK=64 (rel L2 {rel:.3e})"
-
-
-# ---------------------------------------------------------------------------
-# 3. No fla is left bound unpatched on a suspect host (the #5276 crash path)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -597,7 +580,6 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
         else:
             slow_inside.set()
             fast_done.wait(5)
-        # What the real kernel launcher reads, at exactly this moment.
         if chunk_o.IS_NVIDIA_HOPPER:
             raise RuntimeError(f"{tag}: blanket #640 guard fired mid-call")
         seen[tag] = 128 if chunk_o.check_shared_mem("hopper", 0) else 32
@@ -633,13 +615,7 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
     # Both concurrent calls asked for K=64, so both must get the safe 32-wide tile;
     # neither may have had its override cancelled by the other's restore.
     assert seen == {"fast": 32, "slow": 32}, seen
-    # And nothing is left behind on either thread.
     assert fv._installed_fla_forcing_small_tile() is False
-
-
-# ---------------------------------------------------------------------------
-# 4. The opt-out
-# ---------------------------------------------------------------------------
 
 
 def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
@@ -784,11 +760,6 @@ def test_opt_out_is_inert_off_hopper(monkeypatch, fake_gated_delta_modeling):
         assert mod.chunk_gated_delta_rule is not None
 
 
-# ---------------------------------------------------------------------------
-# 5. End to end: a real gated-deltanet model trains on a simulated Hopper
-# ---------------------------------------------------------------------------
-
-
 def _has_qwen3_next() -> bool:
     import importlib.util
 
@@ -858,11 +829,6 @@ def test_qwen3_next_trains_with_simulated_hopper_tile(monkeypatch):
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads, "no gradients were produced"
     assert all(torch.isfinite(g).all() for g in grads), "non-finite gradients"
-
-
-# ---------------------------------------------------------------------------
-# 6. Non-Hopper hosts are untouched
-# ---------------------------------------------------------------------------
 
 
 def test_this_blackwell_host_is_not_suspect():
@@ -1073,7 +1039,6 @@ def test_installed_patch_leaves_non_hopper_tensors_alone(monkeypatch):
         "a non-Hopper tensor must not be forced onto the narrow tile"
     )
 
-    # Same call on a device reported as Hopper does take the override.
     monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: True)
     chunk_o.chunk_bwd_dqkwg(q=k, k=k, v=k, do=k, h=None, dh=None, g=g)
     assert seen["small_tile"] is True, "a Hopper tensor at K=64 must take the override"
@@ -1098,7 +1063,6 @@ def test_vendored_guard_uses_the_tensor_device_not_device_zero(monkeypatch):
     monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: False)
     assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 64
 
-    # Tensor on Hopper while the global says otherwise: step down.
     monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: True)
     assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 32
 
